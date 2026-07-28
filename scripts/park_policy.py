@@ -104,7 +104,7 @@
 import argparse
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 # The machine-owned soft hold for SOURCE ISSUES (capacity/decline/budget parks). Ensured on
@@ -219,6 +219,33 @@ AUTO_READMISSION_MAX = 2
 # point of #797 — nothing about a HUMAN's attention has been established either, so the exit must
 # be a machine-owned retirement, never a page.
 PARK_MACHINE_TERMINAL_GENERATIONS = AUTO_READMISSION_MAX
+# [sparq-org/sparq#4911] HOW FAR APART THE TWO WRITES OF ONE PARK OPERATION MAY LAND and still be
+# evidence about each other (machine_receipted_park's binding window). One park operation writes
+# TWO things — a machine-readable receipt and a label — and when the two halves are written under
+# DIFFERENT credentials (the alias defect: an orchestration script holding the maintainer's PAT
+# applies the label, while the App-authenticated workflow posts the receipt) the actor identity no
+# longer joins them. The only thing left that does is time.
+#
+# THE VALUE IS THE DISPATCH TICK PERIOD (dispatch.yml `cron: 3,13,23,33,43,53 * * * *` — 600 s),
+# and the derivation is a property of the WRITER, not of the population it happens to admit:
+# every park decision is made by a sweep that runs once per tick, so two park decisions about the
+# same PR are at least one tick apart, and two writes CLOSER than one tick therefore cannot belong
+# to two different decisions.
+#
+# MEASURED against that claim on the live sparq population 2026-07-28 (31 open `review:parked` PRs
+# + their 21 provenance-linked source issues, 46 park-label applications, LIST API `--paginate`):
+# where the bot wrote BOTH halves the receipt lands 0-2 s BEFORE the label (n=15, receipt-first),
+# and EVERY other bot receipt-to-label distance on the same PR is >= 8263 s — a different episode.
+# The single mixed-credential case (#3620: alias label 08:54:39, bot `class=capacity cause=partition`
+# receipt 08:56:05) sits at 86 s, and the next-nearest alias distance anywhere in the population is
+# 2793 s. Nothing in the live data falls between 86 s and 2793 s, so any N in that ~45-minute gap
+# behaves identically here; 600 s is the one with a mechanism behind it rather than a fitted one.
+#
+# Deliberately NOT the tighter 2 s bound the same-operation population supports: the mixed-credential
+# shape is not that operation. Its label comes from the alias program and its receipt from a LATER
+# App-authenticated workflow run, so same-program call latency is the wrong reference class — and at
+# 2 s this admission would be inert on the very population it exists for.
+PARK_RECEIPT_BINDING_SECONDS = 600
 # ---------------------------------------------------------------------------------------------
 # [registry #764] THE ABSORBING-PARK EXIT. `park_ladder_decision` has five outcomes; three of them
 # neither attempt work nor advance the generation counter, so an item that lands on one lands on
@@ -693,8 +720,13 @@ def park_application_view(repo, pr_number, issue_number, fetch_events, is_human=
     PROVEN HUMAN (the strict maintainer probe; `is_human=None` can prove nothing and yields False)
     applied a park at that latest instant. `human_labels` is the sorted tuple of the park labels a
     proven human applied AT that latest instant — WHICH label, not merely that there was one; it is
-    empty whenever `latest_was_human` is False. `readable` is False on ANY read/shape failure, and
-    every caller's documented fail direction on that is to STAY PARKED.
+    empty whenever `latest_was_human` is False. `machine_park_instants` is the ascending tuple of
+    every park application NOT made by a proven human, across both surfaces — what
+    machine_receipted_park needs to tell a receipt that describes the machine's OWN label write from
+    one that describes a park written under a human's credential (sparq-org/sparq#4911); it is
+    derived from the SAME walk rather than a second traversal, for the reason the extraction note
+    below gives. `readable` is False on ANY read/shape failure, and every caller's documented fail
+    direction on that is to STAY PARKED.
 
     WHY `human_labels` EXISTS (registry: human-applied machine park). `latest_was_human` alone
     conflates two states with opposite correct answers, and the conflation was a permanent stall by
@@ -728,9 +760,9 @@ def park_application_view(repo, pr_number, issue_number, fetch_events, is_human=
         except Exception as exc:  # noqa: BLE001 — ambiguity stays parked
             log(f"readmission unknown: timeline read failed for {repo}#{number} ({exc}); "
                 "the capacity park stands")
-            return None, False, (), (), None, False
+            return None, False, (), (), None, (), False
     if not rows:
-        return None, False, (), (), None, True
+        return None, False, (), (), None, (), True
     latest = max(instant for instant, _l, _login, _h in rows)
     at_latest = [row for row in rows if row[0] == latest]
     # An instant tie between a human and a machine application resolves toward HUMAN-OWNED: the
@@ -760,8 +792,14 @@ def park_application_view(repo, pr_number, issue_number, fetch_events, is_human=
     foreign = [instant for instant, _l, login, _h in rows
                if login not in appliers and instant < latest]
     previous = max(foreign) if foreign else None
+    # EVERY non-human park application, not only the ones before `latest`: rule 5 of
+    # machine_receipted_park asks whether a receipt is already spoken for by a machine's own label
+    # write, and a machine write at or after the human's (an instant tie, or the machine re-parking
+    # moments later) claims a receipt just as firmly as an earlier one does.
+    machine_park_instants = tuple(sorted(instant for instant, _l, _login, human in rows
+                                         if not human))
     return (latest, latest_human, tuple(sorted(human_labels)), tuple(sorted(human_logins)),
-            previous, True)
+            previous, machine_park_instants, True)
 
 
 def human_park_capacity_proof(reason_records):
@@ -940,6 +978,115 @@ def parsed_park_instant(value):
     return value if isinstance(value, datetime) else parse_ts(value)
 
 
+def machine_receipted_park(parked_at, previous_parked_at, reason_records, bot_login,
+                           machine_park_instants=(),
+                           window_seconds=PARK_RECEIPT_BINDING_SECONDS):
+    """(machine_written, detail) — whether the park application at `parked_at` was WRITTEN BY THE
+    MACHINE even though a proven human's CREDENTIAL applied the label.
+
+    THE DEFECT (sparq-org/sparq#4911). Orchestration scripts run under the maintainer's PAT, so a
+    park those scripts write arrives on the timeline signed `jeswr`, passes the strict maintainer
+    probe, and is classified human-applied. The automation escalates to a human, signs the
+    escalation AS that human, and then refuses to clear it because a human signed it. Ownership was
+    being read off the ACTOR, which under a shared credential is not evidence about INTENT at all.
+
+    THE SEPARATION THIS PREDICATE MAKES, and the one it must not get wrong: *the machine wrote this
+    under a human's credential* versus *a human decided this*. It answers the first ONLY, from the
+    machine's own durable receipt, and every ambiguity answers "human" — because wrongly clearing a
+    hold a human meant is strictly worse than leaving a machine park stuck.
+
+    ALL of the following must hold; anything else refuses:
+
+      1. THE RECEIPT IS THE APP'S OWN. `bot_login` names the App identity and the record's `login`
+         must equal it. This is the SAME trust root park_reason_records applies, restated at the
+         boundary that consumes it: the receipt is the one artefact in this decision that a shared
+         human credential cannot mint, and re-checking it here means a caller that hands over an
+         unfiltered list cannot turn a third party's comment into proof of machine authorship. NO
+         `bot_login` => nothing is trusted => the whole path is inert, which is why the
+         capacity_park_admission keyword defaults to "" (a caller that forgets to wire it gets the
+         pre-#4911 behaviour, never a false admission).
+      2. THE RECEIPT CLASSIFIES THE PARK AS CAPACITY (`class=capacity`). A question-class receipt
+         is not permission to clear anything, and parse_park_reason has already dropped any marker
+         whose class contradicts its cause.
+      3. IT IS INSIDE THE BINDING WINDOW — `window_seconds` either side of the label write
+         (PARK_RECEIPT_BINDING_SECONDS; see that constant for the derivation and its measurement).
+         TWO-SIDED deliberately: same-credential writers are receipt-FIRST, but the mixed-credential
+         shape this exists for posts the receipt AFTER the label (the alias program labels; a later
+         App-authenticated run receipts), so a one-sided window would miss exactly the population.
+      4. IT IS INSIDE THIS PARK'S OWN EPISODE — strictly after the previous park application. The
+         same lower bound park_instance_attested uses, and for the same reason: a receipt from a
+         CLOSED earlier episode says nothing about the application being cleared now.
+      5. NO MACHINE-APPLIED PARK LIES WITHIN THE WINDOW OF THAT RECEIPT. This is the conjunct that
+         keeps a GENUINE human park safe, and without it the predicate is unsound. Consider the bot
+         parking normally (receipt at T-1 s, its own label at T) and a maintainer deliberately
+         parking the same PR ten minutes later: the human's application is the latest, the bot's
+         receipt is inside the window, and rules 1-4 would hand the human's hold to the machine. But
+         that receipt is ALREADY SPOKEN FOR — it describes the machine's own label write — and a
+         receipt can only bind one application. When the machine labelled it itself, the human's
+         later write is a separate act with no receipt of its own, and it stays human.
+
+    `machine_park_instants` are the instants of park applications NOT made by a proven human, as
+    park_application_view derives them; an unparseable one refuses (a machine write we cannot place
+    could be the one claiming the receipt).
+
+    WHAT THIS DOES NOT DO. It does not touch `needs:user` semantics, human_owned_holds, or the
+    sticky human-unpark veto, and it is reached only AFTER the label the actor applied has been
+    proven MACHINE-owned (human_park_is_machine_owned) and the PR's whole receipt history has been
+    proven free of any non-capacity classification (human_park_capacity_proof). It replaces neither:
+    it is an ALTERNATIVE instance binding beside park_instance_attested, for the case where the
+    machine — not a human converting a mis-escalation — is what wrote the park.
+
+    HONEST COVERAGE, measured before the code was written (see the PR body): of the 31 open
+    `review:parked` sparq PRs, 9 are refused re-admission on the actor axis, and only ONE of those 9
+    carries a bot park-reason receipt of any kind. The other 8 carry no machine-readable receipt on
+    either surface, so NO receipt-based predicate can reach them; they remain stuck, and the fix for
+    them is upstream — the park writers must receipt under whatever credential they hold, and stop
+    holding the maintainer's."""
+    if not bot_login:
+        return False, ("no App identity was supplied, so no receipt can be trusted to prove the "
+                       "machine wrote this park")
+    if parked_at is None:
+        return False, "the park application instant is unknown, so no receipt can bind to it"
+    if isinstance(window_seconds, bool) or not isinstance(window_seconds, (int, float)) \
+            or window_seconds < 0:
+        return False, f"the receipt binding window {window_seconds!r} is not a usable span"
+    try:
+        park_instant = parsed_park_instant(parked_at)
+        previous = None if previous_parked_at is None else parsed_park_instant(previous_parked_at)
+    except (ValueError, TypeError):
+        return False, "the park application instants are unreadable, so nothing can bind to them"
+    for record in reason_records or ():
+        if not isinstance(record, dict):
+            continue
+        if str(record.get("login", "")).casefold() != str(bot_login).casefold():
+            continue                      # not the App's own receipt — proves nothing (rule 1)
+        if record.get("class") != PARK_CLASS_CAPACITY:
+            continue                      # a question is never machine-owned (rule 2)
+        if not valid_timestamp(record.get("at")):
+            continue                      # an unplaceable receipt binds no instance
+        receipt = parse_ts(record["at"])
+        distance = abs((receipt - park_instant).total_seconds())
+        if distance > window_seconds:
+            continue                      # too far to be the same operation (rule 3)
+        if previous is not None and receipt <= previous:
+            continue                      # belongs to a CLOSED earlier episode (rule 4)
+        try:
+            claimed = any(
+                abs((parsed_park_instant(instant) - receipt).total_seconds()) <= window_seconds
+                for instant in machine_park_instants or ())
+        except (ValueError, TypeError):
+            claimed = True                # an unplaceable machine write refuses (rule 5)
+        if claimed:
+            continue
+        return True, (
+            f"the bot's own class=capacity cause={record.get('cause')} park receipt at "
+            f"{canonical_ts(record['at'])} was written {int(distance)}s from this park "
+            f"application and is claimed by no machine label write — the park was MACHINE-written "
+            f"under a human credential")
+    return False, ("no bot-authored class=capacity park receipt is bound to this park application, "
+                   "so nothing proves the machine wrote it under a human credential")
+
+
 def human_park_is_machine_owned(latest_was_human, human_labels):
     """Whether a park a PROVEN HUMAN applied may still be evaluated by the AUTOMATIC path: True
     iff the human applied at least one park label and EVERY label they applied at the latest
@@ -971,7 +1118,7 @@ def park_applications(repo, pr_number, issue_number, fetch_events, is_human=None
     Deliberately a projection of the ONE walk rather than a second walk: a duplicate traversal is
     exactly how the human path and the automatic path would come to disagree about when a park was
     applied, which is the drift the extraction note below exists to prevent."""
-    latest, latest_human, _labels, _logins, _previous, readable = park_application_view(
+    latest, latest_human, _labels, _logins, _previous, _machine, readable = park_application_view(
         repo, pr_number, issue_number, fetch_events, is_human=is_human, log=log)
     return latest, latest_human, readable
 
@@ -1270,7 +1417,7 @@ def park_census_summary(records):
 def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_human=None,
                             log=print, consumed=frozenset(), auto_receipts=(),
                             auto_marker_count=None, auto_evidence=None, live_holds=(),
-                            census=None, reason_records=(), attestations=()):
+                            census=None, reason_records=(), attestations=(), bot_login=""):
     """Whether a MACHINE capacity park may be re-admitted now, and on WHOSE authority
     (invariant 3). Returns (action, evidence, detail), where `evidence` is None or
     {"key", "at"} — the recovery event's durable identity plus its canonical recovery stamp, i.e.
@@ -1320,6 +1467,12 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
     deliberately NOT an ambiguity — the actor chose the label whose description promises this exit —
     and it proceeds under every one of those gates unchanged.
 
+    `bot_login` names the App identity whose receipts are trusted, and it is the ONE thing that
+    enables machine_receipted_park's alternative instance binding (sparq-org/sparq#4911: a park the
+    machine wrote under the maintainer's PAT). It defaults to "" — the pre-#4911 behaviour exactly —
+    so a caller that never wires it can only ever be MORE conservative, never less: the binding is
+    inert without a trust root, and an inert binding refuses.
+
     `census`, when a list is passed, receives EXACTLY ONE row for this decision (the `occupancy`
     out-list idiom used elsewhere in this pipeline):
     {"repo", "number", "code", "exit", "detail"} — where `code` is a G5 taxonomy code and `exit`
@@ -1342,7 +1495,8 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
         return _answer(
             None, None, PARK_REFUSAL_HUMAN_HOLD,
             f"human-owned hold(s) live ({'/'.join(held)}) — never auto-re-admitted")
-    latest_park, human_park, human_park_labels, human_park_logins, previous_park, readable = \
+    latest_park, human_park, human_park_labels, human_park_logins, previous_park, \
+        machine_park_instants, readable = \
         park_application_view(repo, pr_number, issue_number, fetch_events, is_human=is_human,
                               log=log)
     if not readable:
@@ -1375,8 +1529,24 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
         attested, how = park_instance_attested(
             attestations, latest_park, previous_park, human_park_logins)
         if not attested:
-            return _answer(None, None, PARK_REFUSAL_HUMAN_APPLIED_UNBOUND,
-                           f"a human applied the machine soft hold and {why}, but {how}")
+            # [sparq-org/sparq#4911] THE SECOND WAY TO BIND AN INSTANCE, for the case the
+            # attestation cannot express: the park was not a human's decision at all — it was the
+            # MACHINE'S OWN WRITE, made under the maintainer's PAT. The attestation above is a
+            # record a human leaves when they CONVERT a mis-escalated hold; nothing is converting
+            # anything here, so no such record exists or should. What does exist is the App's own
+            # receipt for this park, and machine_receipted_park binds it to THIS application (see
+            # that predicate for all five conjuncts, including the one that keeps a genuine human
+            # park safe). Reached only after the label-ownership and whole-history class gates
+            # above have both already passed.
+            machine_written, why_machine = machine_receipted_park(
+                latest_park, previous_park, reason_records, bot_login,
+                machine_park_instants=machine_park_instants)
+            if not machine_written:
+                return _answer(
+                    None, None, PARK_REFUSAL_HUMAN_APPLIED_UNBOUND,
+                    f"a human applied the machine soft hold and {why}, but {how}; and "
+                    f"{why_machine}")
+            how = why_machine
         # Both gates hold. Proceed into exactly the same evidence-gated path a bot-applied park
         # takes — nothing below is relaxed: the live human-owned-hold refusal above already ran,
         # the recovery must still be STRICTLY after this application, its evidence key is still
@@ -1385,7 +1555,8 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
             f"({'/'.join(human_park_labels)} at "
             f"{canonical_ts(latest_park.isoformat())}): the actor selected the machine-owned soft "
             f"hold AND {why} — evaluating the ordinary machine exit under every unchanged gate "
-            "(a human-owned hold, or an unclassified park, would have refused above)")
+            f"(a human-owned hold, or an unclassified park, would have refused above); the "
+            f"instance binding is: {how}")
     parked_at = canonical_ts(latest_park.isoformat()) if latest_park is not None else None
     for receipt in auto_receipts:
         stamp = receipt.get("at") if isinstance(receipt, dict) else None
@@ -1886,11 +2057,19 @@ def parse_park_reason(body, log=print):
 
 
 def park_reason_records(comments, bot_login, log=print):
-    """Every well-formed park-reason marker across the BOT's OWN comments, oldest first.
+    """Every well-formed park-reason marker across the BOT's OWN comments, oldest first, as
+    {"class", "cause", "gen", "head", "at", "login"}.
 
     Only the orchestration bot's comments are receipts — the same trust filter
     park_generation_cutoffs / auto_readmission_records apply — so a third party cannot forge a
-    cause and talk a park out of the human terminal. Without a `bot_login` nothing is trusted."""
+    cause and talk a park out of the human terminal. Without a `bot_login` nothing is trusted.
+
+    `at` / `login` are the COMMENT's own creation stamp and author, carried alongside the parsed
+    marker rather than discarded (sparq-org/sparq#4911). human_park_capacity_proof asks a
+    whole-history question and needs neither; machine_receipted_park asks an INSTANCE question —
+    "was THIS park application the machine's own write?" — which is answerable only against the
+    receipt's own timestamp, and re-checks `login` at its own boundary so the trust root is stated
+    where it is consumed rather than inherited from whoever built the list."""
     if not bot_login:
         return []
     records = []
@@ -1902,7 +2081,7 @@ def park_reason_records(comments, bot_login, log=print):
             continue
         record = parse_park_reason(str(comment.get("body", "")), log=log)
         if record:
-            records.append(record)
+            records.append({**record, "at": comment.get("created_at"), "login": login})
     return records
 
 
@@ -3192,7 +3371,7 @@ def _self_test():
           (False, (), ()))
     check("(e2) an unreadable surface yields no attribution at all",
           park_application_view("o/r", 41, 404, fetch, is_human=trusted,
-                                log=logs.append), (None, False, (), (), None, False))
+                                log=logs.append), (None, False, (), (), None, (), False))
     # park_applications MUST stay exactly park_application_view's projection. Nothing in production
     # reads the projection's `latest_was_human` element today (capacity_park_readmitted and groom
     # both discard it), so without this the element could silently drift to a constant — measured:
@@ -3204,7 +3383,7 @@ def _self_test():
         view = park_application_view("o/r", 41, 7, fetch, is_human=trusted)
         check(f"(e2) park_applications is exactly the view's projection for {note}",
               park_applications("o/r", 41, 7, fetch, is_human=trusted),
-              (view[0], view[1], view[5]))
+              (view[0], view[1], view[6]))
     check("(e2) ...and the MACHINE-applied case reports human=False (not vacuous)",
           park_applications("o/r", 41, 7, fetch, is_human=trusted)[1], False)
     timelines[41] = [human_pr_park]
@@ -3261,7 +3440,8 @@ def _self_test():
            "classifies this park episode as class=capacity cause=budget, but no park-"
            "misescalation attestation by the actor that applied this park falls inside this "
            "park's window — the capacity classification is about the PR's history, not about "
-           "this park application"))
+           "this park application; and no App identity was supplied, so no receipt can be "
+           "trusted to prove the machine wrote this park"))
     check("(e4) ...and it is censused as HUMAN-TERMINAL under its OWN code, distinguishable from "
           "\"never classified\"",
           (lambda rows: [(row["code"], row["exit"]) for row in rows])(
@@ -3493,7 +3673,191 @@ def _self_test():
               (receipt("budget"), receipt("injection")))[0]),
            attempt(lambda: human_park_capacity_proof(
                (receipt("injection"), receipt("budget")))[0])], [False, False])
+
+    # ---- (e5) [sparq-org/sparq#4911] THE PARK THE MACHINE WROTE UNDER THE MAINTAINER'S PAT ----
+    #
+    # THE DEFECT. Orchestration scripts hold the maintainer's PAT, so their park labels arrive
+    # signed `jeswr`, pass the strict maintainer probe, and are read as a human's decision. The
+    # loop escalates to a human, signs the escalation AS that human, and refuses to clear it
+    # because a human signed it. Ownership was read off the ACTOR, and under a shared credential
+    # the actor is not evidence about intent.
+    #
+    # THE BINDING, and the ONE thing it must never do: clear a hold a human meant. Every row below
+    # that is not the live shape is a way of being wrong, and every one of them refuses.
+    #
+    # MEASURED SCOPE, stated here because the code cannot say it: of the 31 open `review:parked`
+    # sparq PRs on 2026-07-28, 9 are refused on the actor axis and exactly ONE (#3620) carries a
+    # bot park-reason receipt at all. This binding reaches that one. The other 8 carry NO
+    # machine-readable receipt on either surface, so no receipt-based predicate can reach them —
+    # they stay parked, and the remedy is upstream (receipt under whatever credential you hold,
+    # and stop holding the maintainer's).
+    app_bot = "sparq-orchestrator[bot]"
+    alias_park_at = "2026-07-28T08:54:39Z"          # #3620: `jeswr` applies review:parked
+    alias_receipt_at = "2026-07-28T08:56:05Z"       # ...and the APP receipts it 86s later
+    alias_evidence = evidence_at("openai/a/9", "2026-07-28T09:30:00Z")
+
+    def park_receipt(cause, at, login=app_bot, park_class=None):
+        """A park-reason record in the shape park_reason_records now returns."""
+        return {"class": park_class or park_cause_class(cause), "cause": cause,
+                "gen": None, "head": None, "at": at, "login": login}
+
+    # THE REAL #3620 TIMELINE, verbatim: a bot `needs:user` on 2026-07-19, then two alias
+    # `review:parked` applications, the newest of which is the one that must clear.
+    timelines[41] = [event("labeled", "needs:user", "2026-07-19T17:32:35Z", app_bot),
+                     event("labeled", "review:parked", "2026-07-25T23:37:10Z", "jeswr"),
+                     event("labeled", "review:parked", alias_park_at, "jeswr")]
+    timelines[7] = []
+    live_receipt = (park_receipt("partition", alias_receipt_at),)
+    logs.clear()
+    check("(e5) THE LIVE sparq #3620 SHAPE: the alias applied review:parked at 08:54:39Z and the "
+          "APP posted its class=capacity cause=partition receipt 86s later — MACHINE-written "
+          "under a human credential, and re-admitted",
+          admit(reason_records=live_receipt, attestations=(), bot_login=app_bot,
+                log=logs.append, auto_evidence=alias_evidence)[0], "auto-mint")
+    check("(e5) ...and the admission NAMES the binding that fired, so the two instance bindings "
+          "are distinguishable in the log",
+          any("the instance binding is: the bot's own class=capacity cause=partition park "
+              "receipt at 2026-07-28T08:56:05Z was written 86s from this park application and "
+              "is claimed by no machine label write" in line for line in logs), True)
+    # THE TRUST ROOT, and the default that keeps a forgetful caller SAFE rather than sorry.
+    check("(e5) with NO App identity the binding is INERT — the pre-#4911 refusal, unchanged",
+          admit(reason_records=live_receipt, attestations=(), auto_evidence=alias_evidence)[0],
+          None)
+    check("(e5) a receipt authored by the MAINTAINER'S OWN credential is not a receipt — the one "
+          "artefact a shared human credential must not be able to mint",
+          admit(reason_records=(park_receipt("partition", alias_receipt_at, login="jeswr"),),
+                attestations=(), bot_login=app_bot, auto_evidence=alias_evidence)[0], None)
+    check("(e5) ...and neither is a THIRD PARTY's (anyone can comment on a public repo)",
+          admit(reason_records=(park_receipt("partition", alias_receipt_at, login="drive-by"),),
+                attestations=(), bot_login=app_bot, auto_evidence=alias_evidence)[0], None)
+    # THE WINDOW, at its exact boundary in both directions. 600s is PARK_RECEIPT_BINDING_SECONDS.
+    check("(e5) a receipt EXACTLY at the window edge binds (<=, not <), on both sides",
+          [admit(reason_records=(park_receipt("partition", "2026-07-28T09:04:39Z"),),
+                 attestations=(), bot_login=app_bot, auto_evidence=alias_evidence)[0],
+           admit(reason_records=(park_receipt("partition", "2026-07-28T08:44:39Z"),),
+                 attestations=(), bot_login=app_bot, auto_evidence=alias_evidence)[0]],
+          ["auto-mint", "auto-mint"])
+    check("(e5) ...and ONE SECOND past it does not, on both sides",
+          [admit(reason_records=(park_receipt("partition", "2026-07-28T09:04:40Z"),),
+                 attestations=(), bot_login=app_bot, auto_evidence=alias_evidence)[0],
+           admit(reason_records=(park_receipt("partition", "2026-07-28T08:44:38Z"),),
+                 attestations=(), bot_login=app_bot, auto_evidence=alias_evidence)[0]],
+          [None, None])
+    check("(e5) the window is READ FROM THE CONSTANT, not hard-coded: the edge tracks it",
+          attempt(lambda: [machine_receipted_park(
+              parse_ts(alias_park_at), None,
+              (park_receipt("partition",
+                            canonical_ts((parse_ts(alias_park_at)
+                                          + timedelta(seconds=offset)).isoformat())),),
+              app_bot)[0]
+              for offset in (PARK_RECEIPT_BINDING_SECONDS, PARK_RECEIPT_BINDING_SECONDS + 1)]),
+          [True, False])
+    check("(e5) a malformed/absent receipt stamp binds nothing",
+          [admit(reason_records=(park_receipt("partition", "zzz"),), attestations=(),
+                 bot_login=app_bot, auto_evidence=alias_evidence)[0],
+           admit(reason_records=(park_receipt("partition", None),), attestations=(),
+                 bot_login=app_bot, auto_evidence=alias_evidence)[0]], [None, None])
+    check("(e5) a receipt at or before the PREVIOUS park application belongs to a CLOSED episode",
+          admit(reason_records=(park_receipt("partition", "2026-07-19T17:32:35Z"),),
+                attestations=(), bot_login=app_bot, auto_evidence=alias_evidence)[0], None)
+    # THE HUMAN TERMINAL IS UNTOUCHED. `needs:user` means what it always meant, whoever wrote it,
+    # and a receipt bound to it changes nothing: the label-ownership gate refuses first.
+    timelines[41] = [event("labeled", "needs:user", alias_park_at, "jeswr")]
+    check("(e5) an alias-applied needs:user with a perfectly bound receipt STILL refuses — the "
+          "defect is who may WRITE the label, never what the label MEANS",
+          (lambda out: (admit(reason_records=live_receipt, attestations=(), bot_login=app_bot,
+                              census=out, auto_evidence=alias_evidence)[0],
+                        out[0]["code"]))([]),
+          (None, PARK_REFUSAL_HUMAN_APPLIED))
+    timelines[41] = [event("labeled", "review:parked", alias_park_at, "jeswr")]
+    check("(e5) a LIVE human-owned hold still refuses before the binding is ever consulted",
+          admit(reason_records=live_receipt, attestations=(), bot_login=app_bot,
+                live_holds=["needs:user"], auto_evidence=alias_evidence)[0], None)
+    check("(e5) the whole-history class gate still governs: a question receipt ANYWHERE refuses "
+          "before any instance binding is reached",
+          (lambda out: (admit(reason_records=(park_receipt("injection", "2026-07-27T00:00:00Z"),
+                                              park_receipt("partition", alias_receipt_at)),
+                              attestations=(), bot_login=app_bot, census=out,
+                              auto_evidence=alias_evidence), out[0]["code"])[1])([]),
+          PARK_REFUSAL_HUMAN_APPLIED_UNCLASSIFIED)
+    #
+    # RULE 5 — THE CONJUNCT THAT KEEPS A GENUINE HUMAN PARK SAFE, and the pair that proves it is
+    # not decoration. A receipt can only describe ONE label write. When the machine wrote its own
+    # label beside that receipt, the receipt is spoken for, and a human parking the same PR minutes
+    # later is a SEPARATE act with no receipt of its own — it stays human.
+    #
+    # The two fixtures differ in ONE instant: where the machine's own park sits relative to the
+    # receipt. Inside the window it claims the receipt and the human hold stands; a full tick away
+    # it cannot be the same decision, so the receipt belongs to the write it is actually near.
+    deliberate_human_park = "2026-07-28T08:59:38Z"
+    claimed_receipt = (park_receipt("partition", "2026-07-28T08:54:41Z"),)
+    timelines[41] = [event("labeled", "review:parked", "2026-07-28T08:54:39Z", app_bot),
+                     event("labeled", "review:parked", deliberate_human_park, "jeswr")]
+    check("(e5) RULE 5: a receipt ALREADY CLAIMED by the machine's own label write cannot be "
+          "re-used to machine-own a human park applied minutes later",
+          admit(reason_records=claimed_receipt, attestations=(), bot_login=app_bot,
+                auto_evidence=alias_evidence)[0], None)
+    timelines[41] = [event("labeled", "review:parked", "2026-07-28T08:44:00Z", app_bot),
+                     event("labeled", "review:parked", deliberate_human_park, "jeswr")]
+    check("(e5) ...and with that machine write a FULL TICK away from the receipt — too far to be "
+          "the same decision — the same receipt binds the alias write instead",
+          admit(reason_records=claimed_receipt, attestations=(), bot_login=app_bot,
+                auto_evidence=alias_evidence)[0], "auto-mint")
+    # The predicate DIRECTLY, through `attempt`, including the branches production cannot reach.
+    check("(e5) predicate: an unknown park instant binds nothing, and SAYS SO",
+          attempt(lambda: machine_receipted_park(None, None, live_receipt, app_bot)),
+          (False, "the park application instant is unknown, so no receipt can bind to it"))
+    check("(e5) predicate: no App identity refuses with its OWN reason, not the generic one",
+          attempt(lambda: machine_receipted_park(parse_ts(alias_park_at), None,
+                                                 live_receipt, "")),
+          (False, "no App identity was supplied, so no receipt can be trusted to prove the "
+                  "machine wrote this park"))
+    check("(e5) predicate: an unusable window span refuses rather than defaulting to something",
+          [attempt(lambda: machine_receipted_park(parse_ts(alias_park_at), None, live_receipt,
+                                                  app_bot, window_seconds=span)[0])
+           for span in (-1, None, "600", True)], [False] * 4)
+    check("(e5) predicate: an UNPLACEABLE machine park refuses — a write we cannot locate could "
+          "be the one claiming the receipt",
+          attempt(lambda: machine_receipted_park(
+              parse_ts(alias_park_at), None, live_receipt, app_bot,
+              machine_park_instants=("zzz",))[0]), False)
+    check("(e5) predicate: a non-dict record, and an empty record set, bind nothing",
+          [attempt(lambda: machine_receipted_park(parse_ts(alias_park_at), None,
+                                                  ("garbage",), app_bot)[0]),
+           attempt(lambda: machine_receipted_park(parse_ts(alias_park_at), None, (), app_bot)[0]),
+           attempt(lambda: machine_receipted_park(parse_ts(alias_park_at), None, None,
+                                                  app_bot)[0])], [False, False, False])
+    check("(e5) predicate: EVERY question-class cause in the taxonomy refuses the binding, so "
+          "rule 2 is a class test rather than one blocked cause",
+          sorted({attempt(lambda cause=cause: machine_receipted_park(
+              parse_ts(alias_park_at), None,
+              (park_receipt(cause, alias_receipt_at),), app_bot)[0])
+              for cause, klass in PARK_CAUSES.items() if klass == PARK_CLASS_QUESTION},
+              key=str), [False])
+    check("(e5) predicate: and every CAPACITY cause binds, so it is not one whitelisted cause",
+          sorted({attempt(lambda cause=cause: machine_receipted_park(
+              parse_ts(alias_park_at), None,
+              (park_receipt(cause, alias_receipt_at),), app_bot)[0])
+              for cause, klass in PARK_CAUSES.items() if klass == PARK_CLASS_CAPACITY},
+              key=str), [True])
+    # park_reason_records must CARRY the stamp and author the binding reads. Without this the
+    # predicate is handed records whose `at` is always absent and refuses every time — a silent
+    # no-op that no admission-level row could distinguish from "no receipt exists".
+    check("(e5) park_reason_records carries the receipt's OWN stamp and author",
+          park_reason_records([{"user": {"login": app_bot}, "created_at": alias_receipt_at,
+                                "body": f"parking\n\n{park_reason_marker('partition')}"}],
+                              app_bot, log=logs.append),
+          [{"class": PARK_CLASS_CAPACITY, "cause": "partition", "gen": None, "head": None,
+            "at": alias_receipt_at, "login": app_bot}])
+    check("(e5) ...and the view exposes the MACHINE-applied park instants rule 5 needs",
+          (lambda: (timelines.__setitem__(41, [
+              event("labeled", "review:parked", "2026-07-28T08:54:39Z", app_bot),
+              event("labeled", "review:parked", deliberate_human_park, "jeswr")]),
+                    park_application_view("o/r", 41, 7, fetch, is_human=trusted)[5])[-1])(),
+          (parse_ts("2026-07-28T08:54:39Z"),))
     timelines[41] = [human_pr_park]
+    timelines[7] = []
+
     check("(e2) MACHINE_OWNED_PARK_LABELS is exactly the machine subset of READMISSION_LABELS",
           (sorted(MACHINE_OWNED_PARK_LABELS),
            sorted(set(READMISSION_LABELS) - MACHINE_OWNED_PARK_LABELS)),
