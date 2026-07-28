@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 931,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "83ce32c9e38a2bdfb4387530708760a2167acb94",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly attributes a successfully released unsafe review/fix claim to the existing `unsafe-claim` defer category before continuing. This prevents `finish_pending()` from misclassifying the post-claim refusal as a lane-qualified pre-claim defer, while preserving the distinct fail-loud `unsafe-claim-release-failed` path and its lane error. The added self-test is non-vacuous: it covers both release outcomes, exact shared and fix-lane histogram buckets, absence of fallback/double-counting, lane health, and zero-dispatch ledger behavior. No trust check is weakened and no new token, permission, workflow-injection, or default-allow surface is introduced.",
+  "verdict": "approve"
+ }
+}
