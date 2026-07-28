@@ -88,23 +88,37 @@
 # the secret_ref LINE alone would flip status:available around a credential no worker can use.
 # A 404, a missing PAT, or an unprovable probe fails closed before resume is ever granted.
 #
-# CREATE-ONCE REGISTRATION fix (#394): the two activation paths were hardened (round 2 of #383) to
-# refuse unless EXACTLY ONE exact-title account issue exists, but that is defensive-only — the
-# register step still called `gh issue create` without proving the title was free, and GitHub
-# permits duplicate issue titles. A second `acctNN` record wedges the account permanently (neither
-# path will relabel an arbitrary one, and the slot's claim ref is never released). GitHub offers NO
-# atomic create-if-title-absent, and the claim ref (#186) only serializes writers INSIDE the
-# protocol — so a read-then-create sequence cannot by itself exclude an outside writer (anyone can
-# open an issue on a public repo). Registration therefore does not rely on the pre-create read: it
-# reads first only to refuse cheaply on an already-taken title, and then RE-PROVES uniqueness AFTER
-# `gh issue create`, through the strongly-consistent issues API, fully paginated, pull requests
-# excluded. A record is trusted only if that post-create read shows the created issue as the SOLE
-# exact-title match; on any other outcome (a concurrent duplicate, or a listing that cannot be read)
-# the run RETRACTS ITS OWN record — renamed out of the `acctNN` namespace, `account` label removed,
-# closed — and fails. Retraction is deterministic because the retracting run is the only writer that
-# knows which issue it created, so the ambiguous pair is resolved, never merely detected later. The
-# always() alarm's register branch carries the recovery: a re-apply allocates a FRESH slot, because
-# the conflicting title is in the slot union.
+# REGISTRATION IS NEVER THE SOURCE OF A DUPLICATE (#394): the two activation paths were hardened
+# (round 2 of #383) to refuse unless EXACTLY ONE exact-title account issue exists, but that is
+# defensive-only — the register step still called `gh issue create` without proving the title was
+# free, and GitHub permits duplicate issue titles, so a retried or partially-recovered enrollment
+# could itself MINT the second `acctNN` record that wedges the account permanently (neither path
+# will relabel an arbitrary one, and the slot's claim ref is never released). Registration now
+# refuses cheaply on an already-taken title, and after `gh issue create` RE-READS — through the
+# strongly-consistent issues API, fully paginated, pull requests excluded — to prove the issue it
+# just created is the SOLE exact-title match. On any other outcome (a duplicate that landed
+# concurrently, or a listing that cannot be read) it RETRACTS ITS OWN record — renamed out of the
+# `acctNN` namespace, `account` label removed, closed — and fails. Retraction is deterministic
+# because the retracting run is the only writer that knows which issue it created.
+#
+# WHAT THAT DOES *NOT* ESTABLISH — read this before trusting the word "unique" below (review round
+# 2 of #394). An exact issue title is NOT a write-gated capability on a public repo: anyone can
+# open an issue with any title, and `.github/ISSUE_TEMPLATE/account.yml` applies the `account`
+# label on their behalf, so even the label is not a capability barrier. GitHub offers no atomic
+# create-if-title-absent, and the claim ref (#186) serializes only writers INSIDE the protocol.
+# So NO read — before the create, after it, or any further one added later — can make "exactly one
+# exact-title issue" a DURABLE property: a duplicate may land after the post-create proof and
+# before this step exits, or an hour after it exits. The guarantee is therefore bounded, and is
+# stated that way deliberately: this protocol never ITSELF leaves a second record, and never
+# reports success over an ambiguity it can observe. A duplicate filed afterwards by a writer
+# outside the protocol stays possible and is NOT prevented — which is exactly why both activation
+# paths keep their exactly-one gate (they REFUSE; they never mis-activate an arbitrary record) and
+# why the always() alarm's register branch carries the recovery: a re-apply allocates a FRESH slot,
+# because the conflicting title is in the slot union. A durable create-once identity has to be
+# bound to something a public writer cannot forge — the write-gated `refs/acct-claims/` namespace,
+# or the created issue number recorded in it — rather than to a title. That is a cross-cutting
+# redesign of the identity contract (#186 claim refs, both activation paths, select_account_issues'
+# `acct<digits>` title grammar) and is tracked separately rather than smuggled in here.
 #
 # GRANT-SCOPING fix (#579, re-filed from #190; the closed PR #260 preserves six prior review
 # rounds): enrollment used to append the new handle to EVERY `account_pool` row in
@@ -829,26 +843,35 @@ jobs:
           printf '%s\n' "$body" | python3 scripts/select-and-claim.py \
             --validate-account-record --account-handle "$HANDLE"
           # >>> register-uniqueness — EXECUTED by scripts/grant-account.py --self-test (#394).
-          # REGISTRATION IS CREATE-ONCE. Both activation paths (the inline one below and the
-          # post-merge `activate` job) require EXACTLY ONE exact-title account issue, so a second
-          # `acctNN` record wedges the account permanently: neither path will relabel an arbitrary
-          # one, and no automated recovery can tell them apart. The store step proved this slot free
-          # from the COMPLETE union (claim refs + acctNN titles in any state + ACCTNN_TOKEN secrets
-          # at both scopes) and then took the claim ref, which defeats every protocol-observing
-          # writer — but any writer OUTSIDE the protocol (a hand-filed issue; anyone can open an
-          # issue on a public repo) can still land an `acctNN` title afterwards.
+          # REGISTRATION MUST NOT BE THE SOURCE OF A DUPLICATE. Both activation paths (the inline
+          # one below and the post-merge `activate` job) require EXACTLY ONE exact-title account
+          # issue, so a second `acctNN` record wedges the account permanently: neither path will
+          # relabel an arbitrary one, and no automated recovery can tell them apart. The store step
+          # proved this slot free from the COMPLETE union (claim refs + acctNN titles in any state +
+          # ACCTNN_TOKEN secrets at both scopes) and then took the claim ref, which defeats every
+          # protocol-observing writer — but any writer OUTSIDE the protocol (a hand-filed issue;
+          # anyone can open an issue on a public repo, and the `account` issue FORM even applies the
+          # `account` label for them) can still land an `acctNN` title afterwards.
           #
-          # A check-then-create sequence CANNOT close that window: GitHub has no atomic
-          # create-if-title-absent, and the claim ref does not serialize writers outside the
-          # protocol, so any read before the create is only a cheap early refusal — never a proof.
-          # The invariant is therefore established AFTER the create, where the outcome is finally
-          # observable: the record counts as registered only if a re-read shows the issue we just
-          # created as the SOLE exact-title match. Anything else — a concurrent duplicate, or a
-          # listing that cannot be read — RETRACTS OUR OWN record (the only issue whose number this
-          # run knows) out of the `acctNN` namespace and fails closed, so the ambiguous pair is
-          # RESOLVED here rather than left for an activation path to refuse forever. The retraction
-          # is deterministic and terminates: an outside writer runs no protocol and retracts
-          # nothing, and no second protocol run can hold this slot's claim ref.
+          # READ THE SCOPE OF THIS GUARD BEFORE EXTENDING IT (review round 2). It is NOT a
+          # create-once primitive and cannot be turned into one by adding reads: GitHub has no
+          # atomic create-if-title-absent, the claim ref does not serialize writers outside the
+          # protocol, and no read can observe a write that happens after it. So an outside duplicate
+          # landing after the post-create re-read — before this step exits, or an hour later — is
+          # NOT prevented here, and the self-test EXECUTES that interleaving rather than leaving it
+          # to prose. What is enforced is narrower and still worth having: this run never itself
+          # leaves a second record, and never reports success over an ambiguity it can observe. The
+          # pre-create read is a cheap early refusal on an already-taken title (never a proof); the
+          # post-create re-read is the accountability check on OUR OWN write — the record counts as
+          # registered only if we are the SOLE exact-title match at that moment, and on anything
+          # else (a duplicate that landed concurrently, or a listing that cannot be read) we RETRACT
+          # the one issue whose number this run knows, out of the `acctNN` namespace, and fail
+          # closed. That retraction is deterministic and terminates: an outside writer runs no
+          # protocol and retracts nothing, and no second protocol run can hold this slot's claim
+          # ref. Duplicates this cannot see remain the activation paths' exactly-one gate to refuse
+          # (fail closed, never mis-activate) with recovery on the always() alarm — and a durable
+          # fix means binding identity to the write-gated `refs/acct-claims/` namespace instead of
+          # to a title, which is a separate redesign (see the file header).
           #
           # Read through the ISSUES API, not `gh issue list --search`: the search index is eventually
           # consistent, and a title created seconds ago — exactly the window this guards — may not be
@@ -1308,7 +1331,7 @@ jobs:
           elif [ "$POLICY_PR" != success ]; then
             comment "🚨 **$HANDLE** is registered \`status:pending\` (secret \`$SECRET\` stored) but the account_pool policy PR was NOT opened (policy-PR: \`$POLICY_PR\`). The account is safely non-allocatable but will never activate until it is in \`policy/repos.toml\` account_pool. **Recovery:** check the step log first — if the grant was REFUSED (#579), the \`grant:<owner>/<repo>\` labels on this request no longer match the targets recorded on the \`$HANDLE\` account issue, or they no longer name \`enabled = true\` policy rows; restore them to exactly that set. If instead the refusal says \`$HANDLE\` is ALREADY in the policy account_pool but no merged, ROW-SCOPED \`account-pool/$HANDLE\` PR accounts for **each authorized row**, the membership of the untraced rows was not established by a checked grant PR — that is deliberate (#616 review finding 1: shape is not provenance; round 4: and a checked PR for a DIFFERENT row is not provenance for this one). Establish it properly: open an \`account-pool/$HANDLE\` PR editing ONLY the granted rows (if the entry is stale, remove it first in its own PR), let it merge, and activation follows. Then re-apply \`set-up-account\` — enrollment resumes \`$HANDLE\` on the same slot and re-drives the PR (#211); or open it manually (head branch \`account-pool/$HANDLE\`, editing ONLY the granted rows) — on merge it activates automatically."
           elif [ "$ACTIVATE_INLINE" != success ]; then
-            comment "🚨 **$HANDLE** was stored, registered \`status:pending\`, and its handle was ALREADY in master \`account_pool\` (no policy PR needed), but the INLINE activation FAILED (activate: \`$ACTIVATE_INLINE\`) — the account may still be \`status:pending\` and this request may still be open despite policy being in place, so no false success was claimed. **Recovery:** confirm there is exactly one \`$HANDLE\` account issue and flip it to \`status:available\` (or re-apply \`set-up-account\`); re-merging/re-triggering the account_pool PR also drives the \`activate\` job to flip it."
+            comment "🚨 **$HANDLE** was stored, registered \`status:pending\`, and its handle was ALREADY in master \`account_pool\` (no policy PR needed), but the INLINE activation FAILED (activate: \`$ACTIVATE_INLINE\`) — the account may still be \`status:pending\` and this request may still be open despite policy being in place, so no false success was claimed. **Recovery:** confirm there is exactly one \`$HANDLE\` account issue and flip it to \`status:available\` (or re-apply \`set-up-account\`); re-merging/re-triggering the account_pool PR also drives the \`activate\` job to flip it. If the log says TWO were found, a duplicate title was filed from OUTSIDE this enrollment — possible at any moment on a public repo, since #394 proves uniqueness only up to registration's own post-create read. Resolve it by RETRACTING THE INTRUDER, not the broker's record: identify the issue this run created (the register step logged its number), then rename the OTHER one out of the \`acctNN\` namespace, drop its \`account\` label and close it, so exactly one \`$HANDLE\` record remains — then re-trigger activation."
           else
             echo "enrollment consistent: $HANDLE pending; activation awaits account_pool PR merge"
           fi
@@ -1374,11 +1397,13 @@ jobs:
           # Require EXACTLY ONE exact-title match, matching the inline activation invariant: a
           # `[...][0]` first-match pick would silently relabel an arbitrary duplicate, so zero OR
           # two+ matches fail closed on ambiguous identity rather than mutating the wrong account
-          # (round 2 of #383). This stays DEFENCE IN DEPTH after #394 made registration create-once
-          # (a record is registered only once re-proven the sole exact-title issue after creation,
-          # and otherwise retracts itself): this job runs the base-ref copy of the file on a
-          # different event, and an acctNN title can be hand-filed by anyone at any later moment, so
-          # activation never assumes registration was the only writer.
+          # (round 2 of #383). #394 stopped registration from being a SOURCE of duplicates (it
+          # retracts its own record unless re-proven the sole exact-title issue after creation), but
+          # it could not make title uniqueness durable — an acctNN title can be hand-filed by anyone
+          # at any later moment, including after that proof. So this gate is not defence in depth
+          # against a solved problem: it is the LOAD-BEARING refusal for every duplicate
+          # registration cannot see, and it must stay exactly-one. This job also runs the base-ref
+          # copy of the file on a different event, so it never assumes registration ran at all.
           mapfile -t nums < <(gh issue list -R "$REPO" --state all --search "\"$handle\" in:title" \
                   --json number,title --jq ".[]|select(.title==\"$handle\")|.number")
           if [ "${#nums[@]}" -ne 1 ]; then

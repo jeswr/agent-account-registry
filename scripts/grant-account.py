@@ -2141,17 +2141,26 @@ else:
           (1, ["status:pending"], []))
 
     # ------------------------------------------------------------------------------------------
-    # [#394] REGISTRATION IS CREATE-ONCE — EXECUTED. Round 2 of #383 made both activation paths
-    # refuse unless EXACTLY ONE exact-title account issue exists, so a duplicate `acctNN` record
-    # WEDGES the account permanently: no automated path can tell two records apart, and the slot's
-    # claim ref is never released. That defence sits downstream of the defect — the register step
-    # created the record without proving the title was free, and GitHub permits duplicate titles.
-    # A read-then-create sequence CANNOT establish create-once on its own: GitHub exposes no atomic
-    # create-if-title-absent, and the claim ref (#186) serializes only writers inside the protocol,
-    # so a pre-create read is a cheap early refusal and nothing more. The invariant is established
-    # AFTER the create, where the outcome is finally observable — the record counts as registered
-    # only if a re-read shows it as the SOLE exact-title issue, and otherwise the run RETRACTS the
-    # record it created. That whole protocol is RUN, not asserted in prose: the REAL fragment,
+    # [#394] REGISTRATION IS NEVER THE SOURCE OF A DUPLICATE — EXECUTED. Round 2 of #383 made both
+    # activation paths refuse unless EXACTLY ONE exact-title account issue exists, so a duplicate
+    # `acctNN` record WEDGES the account permanently: no automated path can tell two records apart,
+    # and the slot's claim ref is never released. That defence sits downstream of the defect — the
+    # register step created the record without proving the title was free, and GitHub permits
+    # duplicate titles, so a retried enrollment could MINT the second record itself.
+    #
+    # THE BOUND ON WHAT IS PROVEN HERE (review round 2), because a row below asserts it: this is
+    # NOT create-once and cannot be made so by adding reads. GitHub exposes no atomic
+    # create-if-title-absent, an issue title is not a write-gated capability on a public repo (the
+    # `account` issue FORM even applies the `account` label for an arbitrary author), the claim ref
+    # (#186) serializes only writers inside the protocol, and no read observes a write that happens
+    # after it. What IS enforced: the run never itself leaves a second record and never reports
+    # success over an ambiguity it can observe — a pre-create read as a cheap early refusal, and a
+    # post-create re-read after which the record counts as registered only if it is the SOLE
+    # exact-title issue, the run otherwise RETRACTING the record it created. A duplicate landing
+    # after that re-read is the residual window, and the `outsider_late` row below EXECUTES it:
+    # the run succeeds, two exact-title records remain, and the state that leaves is fed straight
+    # into the activate harness to prove the consequence is a fail-closed REFUSAL, never a
+    # mis-activation. That whole protocol is RUN, not asserted in prose: the REAL fragment,
     # against a fake `gh` that serves the issue listing, MINTS the issues the fragment creates,
     # applies its retraction edits and RECORDS every call — so the observation is the fragment's
     # exit code plus which records still occupy the exact `acct07` title when it is done, which is
@@ -2165,8 +2174,10 @@ else:
     # What the fake MODELS rather than executes: `--jq` projects each issue to `<number> <title>`
     # and drops pull requests, so the fake serves lines already in that shape. The EXACT-title
     # decision — the part that can fail OPEN — is the fragment's own, and the near-miss rows below
-    # drive it. The `outsider` scenario is the ADVERSARIAL INTERLEAVING named in review round 1: a
-    # same-title issue appearing after the pre-create listing and before the create lands.
+    # drive it. Two adversarial interleavings are executed, not described: `outsider` (review round
+    # 1) lands a same-title issue after the pre-create listing and before the create — the ordering
+    # the post-create proof catches — and `outsider_late` (review round 2) lands one after the
+    # post-create listing has already been SERVED, the ordering no read can catch.
     # ------------------------------------------------------------------------------------------
     register_fragment = workflow_block(workflow, "register", "register-uniqueness")
     register_gh = r'''#!/usr/bin/env python3
@@ -2214,6 +2225,14 @@ if argv[:1] == ["api"]:
         print(str(number) + " " + title)
     for record in state["created"]:
         print(str(record["number"]) + " " + record["title"])
+    # THE RESIDUAL WINDOW: the outside writer's issue lands AFTER this listing was served. No read
+    # can observe a write that happens after it, so the fragment cannot detect this one and must
+    # not pretend to — the row driving this asserts the honest outcome, not a refusal.
+    late = state.get("outsider_late")
+    if late is not None and late[0] == state["listings"]:
+        state["issues"].append(late[1])
+        state.pop("outsider_late")
+        save()
 elif argv[:2] == ["label", "create"]:
     sys.exit(1)                      # the normal case: the label already exists
 elif argv[:2] == ["issue", "create"]:
@@ -2319,6 +2338,33 @@ else:
     # retraction runs, so an outage can never leave a record this run could not vouch for.
     check("[#394] EXECUTED register: an unreadable POST-create listing retracts and fails closed",
           register_view([[9, "acct08"]], fail_listings=[2]), (1, []))
+    # THE RESIDUAL WINDOW (review round 2). Every row above lands the outsider somewhere a read can
+    # still see it. Here it lands after the post-create listing has already been SERVED — the
+    # interleaving NO read can close, because a further uniqueness read would only move the same
+    # window. So this row asserts the honest outcome rather than a refusal the fragment cannot
+    # deliver: the run SUCCEEDS, nothing is retracted, and two exact-title records remain. It exists
+    # so the bound is pinned by an executed test — if a later change claims to have made
+    # registration create-once, this row is where that claim has to be confronted. The two rows are
+    # COUPLED on purpose: the numbers this one leaves behind are the activate harness's input below,
+    # so a fragment that left only ONE record here would flip that row red too (activation would
+    # succeed where it is asserted to refuse) rather than silently weakening the pair.
+    late_code, late_calls, late_state = run_register(
+        [[9, "acct08"]], outsider_late=[2, [6, "acct07"]], next_number=5)
+    late_titled = ([str(number) for number, title in late_state["issues"] if title == "acct07"]
+                   + [str(record["number"]) for record in late_state["created"]
+                      if record["title"] == "acct07"])
+    check("[#394 r2] EXECUTED register: a duplicate landing AFTER the post-create proof is NOT "
+          "caught — the run succeeds, retracts nothing, and two exact-title records remain",
+          (late_code, sorted(late_titled),
+           [call[:2] for call in late_calls].count(["issue", "edit"])),
+          (0, ["5", "6"], 0))
+    # ...and the CONSEQUENCE of that window is bounded, executed rather than argued: the very pair
+    # of numbers the run above left behind is fed into the activate harness, which must REFUSE on
+    # ambiguous identity. Registration's residual window can cost a wedged account (recoverable, and
+    # the always() alarm documents retracting the intruder); it can never cost a mis-activation.
+    check("[#394 r2] EXECUTED: the state that window leaves is REFUSED by activation, never "
+          "mis-activated",
+          activated_view(issue_numbers=late_titled), (1, ["status:pending"], False, False))
     # If the retraction itself cannot be applied the step must still FAIL — loudly, having tried —
     # rather than exiting 0 over a record it knows may be one of two.
     stuck_code, stuck_calls, stuck_state = run_register(
@@ -2363,6 +2409,13 @@ else:
           ("#394" in alarm, "do **not** hand-create a second" in alarm,
            "allocates a FRESH slot" in alarm, "RETRACTED" in alarm),
           (True, True, True, True))
+    # ...and (review round 2) the RESIDUAL window has an owner too: when the duplicate lands after
+    # registration succeeded, the failure surfaces on the activation branch, where the operator must
+    # retract the INTRUDER rather than the broker's record — the opposite choice destroys the record
+    # whose credential is actually stored.
+    check("[#394 r2] the alarm's activation branch owns the post-registration duplicate",
+          ("RETRACTING THE INTRUDER" in alarm, "If the log says TWO were found" in alarm),
+          (True, True))
 
     template = (root / ".github/ISSUE_TEMPLATE/set-up-account.yml").read_text(encoding="utf-8")
     form = strip_yaml_comments(template)
