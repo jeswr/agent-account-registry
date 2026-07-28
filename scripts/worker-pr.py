@@ -10704,6 +10704,17 @@ def _self_test():
         check("[#869] SITE review_outcome/injection: parks QUESTION with cause=injection",
               (oc_kwargs[-1].get("park_class"), oc_kwargs[-1].get("park_cause"))
               if oc_kwargs else None, ("question", "injection"))
+        # [registry #869] THE LOCKSTEP CLEAR'S OWN RED TEST. Every row here reads `oc_kwargs[-1]`,
+        # so a run that parks NOTHING must leave the list EMPTY — otherwise `[-1]` silently
+        # returns the PREVIOUS run's park and the row passes for the wrong reason. This runs
+        # immediately after a park, so the list is non-empty going in and only the clear can empty
+        # it. #903 reshaped `run_fix_outcome`'s signature underneath this PR, and a take-theirs
+        # resolution would have dropped exactly that clear; without this row nothing would have
+        # noticed (MEASURED: removing both clears left the whole suite green).
+        run_fix_outcome()                          # a re-review outcome — it parks nothing
+        check("[#869] a run that parks nothing leaves NO stale park kwargs behind "
+              "(the oc_reasons/oc_kwargs lockstep clear is load-bearing)",
+              (oc_calls, oc_kwargs), (["state:needs"], []))
         run_fix_outcome(injection="true")
         emitted_injection_prose["fix"] = oc_reasons[-1] if oc_reasons else ""
         check("[#869] SITE fix_outcome/injection: parks QUESTION with cause=injection",
