@@ -1713,6 +1713,14 @@
    "run_id": "30348695959.1"
   },
   {
+   "ts": 1785233063,
+   "provider": "openai",
+   "account": "dc2d751954080e13",
+   "model_alias": "sol",
+   "exit_class": "success",
+   "run_id": "30349084735.1"
+  },
+  {
    "ts": 1785233066,
    "provider": "openai",
    "account": "dc2d751954080e13",
