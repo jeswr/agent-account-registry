@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1090,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2f3bd214b4bf4e1e7bb34994643b8b9f6d319679",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`resolve_local_branch()` accepts any name returned under `refs/heads/`, but it does not establish that this is a direct ref. Git allows (including via `git symbolic-ref`) `refs/heads/ledger-purge` to point at `refs/remotes/origin/ledger`. The accepted name remains `refs/heads/ledger-purge`, while ref updates ordinarily dereference symbolic refs; filter-branch can consequently move the remote-tracking target through the accepted alias. The tests cover shorthand resolution but no symbolic-ref alias, so the stated one-local-branch boundary is still bypassable.",
+    "file": "scripts/ledger-history-purge.py",
+    "fix_hint": "Before scanning or invoking filter-branch, require the resolved `refs/heads/...` name to be a direct ref (refuse it if `git symbolic-ref -q <full-name>` succeeds), and keep using the validated full name. Add a real fixture whose `refs/heads/...` symbolic ref targets `refs/remotes/origin/ledger`; assert rewrite refuses before creating `refs/original/` and that both the target and alias remain unchanged, alongside the existing direct-local-branch accept case.",
+    "severity": "major",
+    "title": "A symbolic ref under refs/heads can redirect the rewrite outside the local branch namespace"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nBoth round-1 findings are materially addressed: rewrite operations now use a resolved full ref, and commit records use NUL framing with real control-byte coverage. However, the local-only boundary still trusts the namespace spelling without rejecting symbolic refs. Git permits a ref under `refs/heads/` to be symbolic; updates through such a ref normally dereference it. A crafted local-looking symbolic ref can therefore point at `refs/remotes/origin/ledger`, pass `resolve_local_branch()`, and let filter-branch update the remote-tracking ref that the guard promises never to touch. This is a new major trust-boundary finding, so progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
