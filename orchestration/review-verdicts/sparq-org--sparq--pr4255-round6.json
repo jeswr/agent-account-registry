@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4255,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ef757799b02e39e1fd90f5860ee63b8cfb187a37",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "CombinationBudget::new says either zero limit \"simply declines everything.\" However, max_intermediate_bindings == 0 is checked only immediately before pushing a merged row. When a chosen complete-summary relation has zero matching rows, combination_is_live returns Ok(false) via next.is_empty() without observing the zero budget. The caller then reports SummaryPruneOutcome::Applied, emits EmptyProvenance, and can set bgp_satisfiable to false. Thus the documented zero-budget disable setting can still prune sources and declare the BGP dead.",
+    "file": "crates/sparq-fedplan-mpc/src/combination.rs",
+    "fix_hint": "Before building or evaluating relations, return SummaryPruneOutcome::Declined when max_intermediate_bindings is zero (JoinTooWide is sufficient), or explicitly redefine and document zero as allowing emptiness proofs that require no stored binding. Add a regression with max_combinations > 0, max_intermediate_bindings == 0, and a complete summary whose selected pattern relation is empty; assert the chosen contract.",
+    "severity": "major",
+    "title": "Zero intermediate budget still does not always decline"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5's major budget-contract defect remains unresolved. CombinationBudget::new still documents that either zero limit declines everything, but max_intermediate_bindings == 0 is enforced only when a merged row is about to be pushed. If a chosen complete-summary relation has zero matching rows, combination_is_live returns Ok(false) through next.is_empty() without observing the zero budget; the caller can therefore report Applied, emit EmptyProvenance, and mark the BGP unsatisfiable. The new tests cover positive intermediate limits and combination-count overflow, but not the documented zero-intermediate disable case. No hostile reviewer-directed instruction was detected.",
+  "verdict": "request_changes"
+ }
+}
