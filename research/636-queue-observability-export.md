@@ -48,8 +48,11 @@ below.
 - The class-2 clamp is already the red state: `const late = age !== null &&
   String(row.class).startsWith("2") && age >= thresholds.queue_age_clamp_minutes`
   (`dashboard/app.js:798-800`) — i.e. the non-terminal class-2 alarm #636 describes is on the page.
-- `OBS_DEFAULT_THRESHOLDS.queue_age_clamp_minutes = 10` (`dashboard/app.js:582`) matches
-  `DEFAULT_HEAL_MAX_WAIT_MINUTES = 10` on the #243 branch.
+- `OBS_DEFAULT_THRESHOLDS.queue_age_clamp_minutes = 10` (`dashboard/app.js:582`) happens to equal
+  `DEFAULT_HEAL_MAX_WAIT_MINUTES = 10` on the #243 branch. That equality is a **coincidence of two
+  defaults, not a resolution path** — `app.js`'s constant is a client-side fallback used when the
+  published snapshot carries no `thresholds` block, and it does not track a maintainer-set clamp.
+  §3a fixes where the real value comes from and what a producer must do when it cannot get it.
 - A `"queue depth trend"` sparkline exists (`dashboard/app.js:856`), fed by `obsRecordTrend()`
   summing `row.depth` across classes (`dashboard/app.js:613-618`).
 
@@ -152,7 +155,7 @@ disappears over the wire but **not** for a direct Python `import`. Any design th
 extend whatever lands as it) to read `data/task-queue.json` from the ledger branch, call
 `queue_stats()`, and adapt: `[{"class": str(k), "depth": v["depth"],
 "oldest_age_minutes": v["oldest_age_seconds"] / 60} for k, v in stats.items()]`, plus
-`thresholds.queue_age_clamp_minutes` from the resolved heal-wait policy.
+`thresholds.queue_age_clamp_minutes` resolved exactly as §3a specifies.
 *For*: zero change to `dashboard-gen.py`, `app.js`, or their self-tests — all three are already
 written and pinned for this shape; the privacy/validation boundary stays exactly where it is;
 `dashboard.yml` needs no edit. *Against*: blocked on the collector existing, and on #243 merging.
@@ -175,6 +178,55 @@ collector merges", which is really option A with an extra hop.
 collector must emit `flow.queue` and `thresholds.queue_age_clamp_minutes`"*, and should carry the
 three-axis adapter above as its acceptance criterion — with a test that asserts a **non-empty**
 `flow.queue` after the adapter, since every mismatch here fails silently to `[]`.
+
+### 3a. The clamp threshold: one field, one resolver, fail-closed
+
+"The resolved heal-wait policy" is not a location, and three surfaces (drain, metrics fleet
+predicate, observability producer) comparing an age against three independently-obtained numbers is
+how the dashboard turns red at one age while the durable alert fires at another. There is exactly
+one authoritative field and one resolver, and neither is a module default:
+
+- **Field**: `policy/repos.toml` → `[repos."jeswr/agent-account-registry"].heal_max_wait_minutes`
+  (the registry is its own target row, `policy/repos.toml:133`). Optional; **absent means 10**.
+- **Resolver**: `scripts/policy-resolve.py` on the #243 branch. `_policy_row()` range-validates the
+  field with `_positive_int` and raises `PolicyError` on a non-int, a `bool`, `0`, or a negative
+  (`84a7cf6b6:scripts/policy-resolve.py:112`, `:163-171`); `resolve()` applies **the one default**,
+  `int(policy.get("heal_max_wait_minutes", 10))` (`:338`). The literal `10` lives there and must not
+  be copied into `metrics.py`, into the collector, or into a new constant.
+
+`resolve()` also demands a `routing_doc` (`:295`) that neither the metrics collector nor the
+observability producer has any reason to load, so the shared entry point should be the queue-controls
+block **factored out of** `resolve()` — e.g. `queue_controls(target_repo, policy_doc)` returning the
+validated `{cache_ttl_minutes, heal_max_wait_minutes, drain_batch}`, with `resolve()` calling it too
+so there remains one validation and one default. Import it from the hyphenated sibling with the
+established `spec_from_file_location` pattern (`metrics.py:73-79`, `:624`), not by re-reading the
+TOML. Consumers then are:
+
+| consumer | how it obtains the clamp | on unresolvable policy |
+|---|---|---|
+| drain (`84a7cf6b6:.github/workflows/drain.yml:79-99`) | unchanged — the policy step reads the resolved field and re-asserts a positive int (`:94-98`) | `SystemExit` — the tick fails rather than substituting a default |
+| `metrics.py` fleet predicate (§4a) | one `queue_controls()` call per run, injected into the fleet threshold dict at evaluation time | let `PolicyError` propagate as a `MetricsError` — the tick dies; **never** fall back to 10 |
+| observability collector (§3 option A) | the same call, emitted verbatim as `thresholds.queue_age_clamp_minutes` | emit **neither** `flow.queue` nor the threshold |
+
+The collector rule is the load-bearing one and is not symmetric with "just omit the threshold":
+`_normalize_observability()` silently drops an absent or malformed threshold
+(`dashboard-gen.py:1440-1448`), after which `app.js` falls back to its hard-coded `10`
+(`dashboard/app.js:582,798-800`). Publishing queue rows *without* the resolved value therefore
+reddens the panel at 10 while the fleet alert fires at, say, 25. An absent panel is correct; a panel
+judged against a stale constant is not. The emitted value must be the resolved integer itself —
+`_normalize_observability` keeps any finite non-bool number `>= 0`, so no pre-rounding or unit
+conversion is wanted on the threshold (only the *ages* are minutes-converted, per §2).
+
+**Acceptance self-test for whichever PR implements this** (non-vacuous — it goes red if a module
+constant is reintroduced or the two sinks drift):
+
+- **identical value, both sinks**: with a fixture policy setting `heal_max_wait_minutes = 25`,
+  resolve **once** and assert the value reaching the exported `thresholds.queue_age_clamp_minutes`
+  and the value the fleet predicate compares against are equal to that same resolved 25 — asserted
+  against the resolver's return, not against two literals, so a copied default fails the test.
+- **fail-closed, both directions**: fixtures with `heal_max_wait_minutes = 0`, `= "soon"`, and a
+  policy with no registry row each raise from the resolver, and the caller under test produces no
+  threshold, no `flow.queue`, no fire, and no recovery — with no `10` anywhere in the output.
 
 ---
 
@@ -248,10 +300,15 @@ reuses only `reconcile_alerts` (which is already generic over `(target, classifi
    `len(rows) >= k and all(...)` contract — insufficient history never fires, one spiky tick never
    fires. Called from `evaluate_alerts` **after** the target loop, appending at most one row.
 4. **Threshold source.** Fleet-level, not per-target: `thresholds_by_target` is keyed by repo, so
-   there is no honest entry to read. Add a `DEFAULT_FLEET_THRESHOLDS` carrying
-   `queue_age_clamp_minutes` (same resolved heal-wait value §3 sends to the dashboard's
-   `thresholds`) plus its own `sustain_snapshots`/`recover_snapshots`. Borrowing an arbitrary
-   target's overrides would be exactly the silent-default this repo forbids.
+   there is no honest entry to read. A `DEFAULT_FLEET_THRESHOLDS` module constant may carry the
+   rule's **own hysteresis knobs only** (`sustain_snapshots`/`recover_snapshots`), which nothing
+   else consumes. It must **not** carry `queue_age_clamp_minutes`: that value is resolved per run
+   from the single authoritative field in §3a and merged in at evaluation time
+   (`{**DEFAULT_FLEET_THRESHOLDS, "queue_age_clamp_minutes": resolved}`), so the predicate and the
+   dashboard's exported threshold are the same number by construction. If the resolver raises, the
+   tick fails — the rule must not evaluate against a fallback clamp, and borrowing an arbitrary
+   target's `throughput` overrides is doubly wrong (`_thresholds_of` rejects unknown keys anyway,
+   `metrics.py:366`).
 5. **Recovery, fail-closed.** A separate `compute_queue_recovery(history, th)` returning
    `{(FLEET_TARGET, QUEUE_BACKLOG)}` or `set()`, unioned into the set handed to `reconcile_alerts`.
    It recovers **only** when the last `recover_snapshots` snapshots each carry a *valid* queue block
@@ -275,6 +332,12 @@ Dedupe then comes free and unchanged: `reconcile_alerts` already upserts one iss
 - **dedupe**: a pair both firing and nominally recovered this tick is upserted once, as a fire.
 - **hysteretic recovery**: clear across all `recover_snapshots` *valid* blocks ⇒ recovered; clear
   across `recover_snapshots - 1` ⇒ not yet.
+- **threshold provenance**: the clamp the predicate compares against equals the value returned by
+  the §3a resolver for a fixture policy setting `heal_max_wait_minutes = 25` (not 10, and not a
+  literal restated in the test); and `"queue_age_clamp_minutes" not in DEFAULT_FLEET_THRESHOLDS` —
+  the assertion that goes red if a future change re-adds a module-level copy of the clamp.
+- **unresolvable policy fails the tick**: a malformed/absent `heal_max_wait_minutes` ⇒ the fleet
+  rule raises rather than evaluating, so it neither fires nor recovers on a defaulted clamp.
 - **identity/regression guard**: `QUEUE_BACKLOG not in ALERT_CLASSES`, `"/" not in FLEET_TARGET`,
   and `FLEET_TARGET` absent from the targets loaded from `policy/repos.toml` — this is the
   assertion that goes red if a future change folds the rule back into `_CLASS_PRED`.
