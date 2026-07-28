@@ -19084,12 +19084,34 @@ def _branch_is_statically_dead(test, field):
     return not value if field == "body" else bool(value)
 
 
+# A nested `def`/`async def`/`lambda` is a DEFERRED execution scope: its body runs when the callable
+# is CALLED, not when the enclosing statement is reached. `if False:` is only the obvious way to
+# park a statement where it never runs — `def _later(): <the statement>` with no caller is the same
+# defect wearing a definition, and the enclosing loop still lexically "contains" it.
+#
+# `ClassDef` is deliberately NOT here, which is the one judgement call in this tuple. A class BODY
+# executes exactly where the `class` statement executes, so a statement written there really does
+# run once per enclosing pass and pruning it would make this helper under-report live code. A
+# METHOD inside that body does not run — but a method is a `FunctionDef`, so it is already stopped
+# one level down. Traversing the class and stopping at its `def`s gets both halves right;
+# blanket-pruning the `ClassDef` would get the second half right by accident.
+#
+# `FunctionDef` and `AsyncFunctionDef` are each pinned by a named mutant in
+# `_starvation_sweep_self_test`. `Lambda` is unpinnable BY CONSTRUCTION and declared so rather than
+# quietly carried: a lambda body is a single expression, so it can hold neither a `for` nor an
+# `AugAssign`, and no statement-level search can reach through one. It is here for this helper's
+# contract — a future expression-level caller — not for a mutant it could ever kill.
+_SCOPE_BOUNDARIES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
 def _live_nodes(node):
-    """Yield `node` and every descendant that a constant-false guard does not already kill.
+    """Yield `node` and every descendant that RUNS whenever `node` runs: no constant-false guard
+    kills it, and no nested execution scope defers it.
 
     `ast.walk` sees the whole subtree, so it cannot tell a statement that RUNS from one buried
-    under `if False:` — the dead-code mutant that satisfies a structural claim while shipping
-    nothing. A `while`'s `orelse` runs when the loop finishes, so only its `body` is killable."""
+    under `if False:` — or one parked in an uncalled nested `def` — which is the dead-code mutant
+    that satisfies a structural claim while shipping nothing. A `while`'s `orelse` runs when the
+    loop finishes, so only its `body` is killable."""
     yield node
     for field, value in ast.iter_fields(node):
         if isinstance(node, ast.If) and field in ("body", "orelse") \
@@ -19099,7 +19121,7 @@ def _live_nodes(node):
                 and _branch_is_statically_dead(node.test, field):
             continue
         for child in (value if isinstance(value, list) else [value]):
-            if isinstance(child, ast.AST):
+            if isinstance(child, ast.AST) and not isinstance(child, _SCOPE_BOUNDARIES):
                 yield from _live_nodes(child)
 
 
@@ -19137,10 +19159,15 @@ def _escalation_call_site(source):
     rather than silently fall through it), and the counter's inner subscript must be that exact
     `cause` NAME, un-rebound inside the loop. Reachability is decided on live ancestry
     (`_live_nodes`), so the docstring's "not a dead branch" claim is now something the code
-    actually enforces. SEVEN mutants in `_starvation_sweep_self_test` — hard-coded key, four
-    dead-branch shapes (`if False:` on the counter and on the WHOLE loop, `while False:`, an
-    `if True:`/`else:` counter), a rebound cause, and a cause never unpacked at all — must each
-    drive this back to None."""
+    actually enforces — and, [#677 round 2], "not deferred into a nested scope" too: a counter
+    moved into an uncalled `def`/`async def`/class-body method under the loop is as silent as one
+    under `if False:`, so `_live_nodes` stops at the callable boundaries (and, deliberately, NOT at
+    a class body, which does execute in place — see `_SCOPE_BOUNDARIES`). ELEVEN mutants in
+    `_starvation_sweep_self_test` — hard-coded key, four dead-branch shapes (`if False:` on the
+    counter and on the WHOLE loop, `while False:`, an `if True:`/`else:` counter), three
+    nested-scope shapes (an uncalled `def`, an `async def`, a class-body method), two rebound
+    causes (in the loop body, and via a `nonlocal` helper the loop calls), and a cause never
+    unpacked at all — must each drive this back to None."""
     tree = ast.parse(source)
     for func in ast.walk(tree):
         if not isinstance(func, ast.FunctionDef) or func.name.endswith("_self_test"):
@@ -19160,12 +19187,14 @@ def _escalation_call_site(source):
                     and all(isinstance(elt, ast.Name) for elt in target.elts)):
                 continue
             cause = target.elts[1].id
-            body = list(_live_nodes(loop))
+            # The VETO scans the whole subtree (`ast.walk`), not just the live nodes: narrowing a
+            # veto would WIDEN what this certifies, so reachability pruning is applied only to the
+            # search for the counter below, never to the reasons to refuse.
             if any(isinstance(node, ast.Name) and node.id == cause
                    and isinstance(node.ctx, ast.Store) and node is not target.elts[1]
-                   for node in body):
+                   for node in ast.walk(loop)):
                 continue      # the cause name is reassigned in the loop -> no longer this row's
-            for stmt in body:
+            for stmt in _live_nodes(loop):
                 if (isinstance(stmt, ast.AugAssign) and isinstance(stmt.op, ast.Add)
                         and isinstance(stmt.target, ast.Subscript)
                         and getattr(stmt.target.value, "id", None) == "defer_reasons"
@@ -20350,8 +20379,38 @@ def _starvation_sweep_self_test():
                    "            else:\n"
                    "                defer_reasons[STARVATION_STUCK_BUCKETS[_stuck_cause]] += 1\n"),
           )),
+        # ...and the three nested-scope shapes: the counter still lexically sits inside the loop,
+        # but nothing ever calls the scope that holds it, so the histogram goes silent exactly as
+        # it does under `if False:` — the mutants a walk-the-whole-subtree helper waves through.
+        ("the counter parked in a nested `def` the loop never calls",
+         ((_count, "            def _count_later():\n"
+                   "                defer_reasons[STARVATION_STUCK_BUCKETS[_stuck_cause]] += 1\n"),
+          )),
+        ("the counter parked in a nested `async def` the loop never awaits",
+         ((_count, "            async def _count_later():\n"
+                   "                defer_reasons[STARVATION_STUCK_BUCKETS[_stuck_cause]] += 1\n"),
+          )),
+        # This one reaches its `def` THROUGH a `class`: the class body is traversed (it executes in
+        # place), the method inside it is not (it does not) — the shape the boundary set gets right
+        # by descending into `ClassDef` and stopping at `FunctionDef`, rather than pruning both.
+        ("the counter parked in a class-body method the loop never calls",
+         ((_count, "            class _Counter:\n"
+                   "                def run(self):\n"
+                   "                    defer_reasons["
+                   "STARVATION_STUCK_BUCKETS[_stuck_cause]] += 1\n"),
+          )),
         ("the cause rebound to a constant before the count",
          ((_count, "            _stuck_cause = GLOBAL_CAUSE_NO_PROVENANCE\n"
+                   "            defer_reasons[STARVATION_STUCK_BUCKETS[_stuck_cause]] += 1\n"),
+          )),
+        # The rebind hidden in a nested scope that IS called — the one shape the scope boundary
+        # above would otherwise hide from the veto. Files every row under one bucket, so it must
+        # red; only a veto that scans the WHOLE subtree sees it.
+        ("the cause rebound by a nested `nonlocal` helper the loop calls",
+         ((_count, "            def _rebind():\n"
+                   "                nonlocal _stuck_cause\n"
+                   "                _stuck_cause = GLOBAL_CAUSE_NO_PROVENANCE\n"
+                   "            _rebind()\n"
                    "            defer_reasons[STARVATION_STUCK_BUCKETS[_stuck_cause]] += 1\n"),
           )),
         ("the cause never unpacked from the pair at all",
@@ -20373,10 +20432,26 @@ def _starvation_sweep_self_test():
         assert _escalation_call_site(_mutant) is None, (
             f"the #677 call-site seam accepted a mutant with {_mutant_why} — it proves the counter "
             "EXISTS, not that it files each holder under the cause the sweep returned")
+    # THE ACCEPT DIRECTION, for the one boundary a kill cannot pin. Every mutant above proves the
+    # scope boundary REFUSES enough; nothing above proves it does not refuse too much, because
+    # over-pruning only ever returns None and a None is what the mutants want. A class BODY executes
+    # exactly where its `class` statement does, so a counter written there IS reached once per row
+    # and must still certify — which is what stops `ClassDef` being swept into `_SCOPE_BOUNDARIES`
+    # alongside the callables on the grounds that it "looks like a scope too".
+    assert _seam_src.count(_count) == 1, "the #677 accept-direction anchor no longer matches"
+    _class_body = _seam_src.replace(
+        _count, "            class _Counter:\n"
+                "                defer_reasons[STARVATION_STUCK_BUCKETS[_stuck_cause]] += 1\n")
+    ast.parse(_class_body)
+    assert _escalation_call_site(_class_body) == "dispatch", (
+        "the #677 call-site seam refused a counter in a live CLASS BODY — the scope boundary has "
+        "been widened past the deferred scopes into code that does run, so it now under-reports "
+        "live statements and the proof it certifies is narrower than the one it documents")
     print("  ok   #772/#677 call-site seam (AST): the production tick ITERATES the escalation and "
           "COUNTS every holder under ITS OWN cause — a deleted call site, a dropped counter, and "
-          "7 per-cause mutants (hard-coded bucket, 4 dead-branch shapes, rebound cause, cause "
-          "never unpacked) each red here")
+          "11 per-cause mutants (hard-coded bucket, 4 dead-branch shapes, 3 nested-scope shapes, "
+          "2 rebound causes, cause never unpacked) each red here, and a live class-body counter "
+          "still certifies, so the scope boundary cannot creep past the deferred scopes")
 
     # ---- [registry #822] THE PARK CALL SITE, on the PARSED tree -------------------------------
     # The pure-function tests prove `starvation_park_targets` returns the whole batch. NONE of them
