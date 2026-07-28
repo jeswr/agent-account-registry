@@ -4,6 +4,9 @@
 # with an EXACT-MATCH trust for jeswr (the maintainer) and for the registry orchestrator App bot; a
 # third-party author is quarantined (trust:untrusted) and its content is NEVER inspected. A trusted
 # author's issue is statically triaged (role/priority/status) by scripts/triage.py — no model call.
+# CLEARING that quarantine is authorized by the EVENT ACTOR's own write+ permission, never by the
+# event's TYPE: `triage` permission can move labels but is not trusted here, so a triage-role actor
+# stripping `trust:untrusted` gets it restored. The quarantine step carries the whole argument.
 #
 # Minimal by design (do not over-build): reuses the sparq template and the registry's own
 # scripts/triage.py. actionlint-clean; least privilege (issues:write, contents:read only).
@@ -53,24 +56,48 @@ jobs:
       REPO: ${{ github.repository }}
       NUM: ${{ github.event.issue.number }}
       AUTHOR: ${{ github.event.issue.user.login }}
+      # The login that emitted THIS event, and which event it is. On opened/edited/reopened the
+      # actor is normally the author; on labeled/unlabeled it is whoever moved the labels, which
+      # the author's trust says NOTHING about (PR #998 r1 f1). Both are judged below.
+      ACTOR: ${{ github.event.sender.login }}
+      ACTION: ${{ github.event.action }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Trust-gate the author (exact-match maintainer/App, else repo permission)
+      - name: Trust-gate the AUTHOR and the label-event ACTOR (exact-match maintainer/App, else repo permission)
         id: trust
         run: |
           set -euo pipefail
           # Exact-match trust for the maintainer and the registry App bot login — never a blanket
           # [bot] trust (a spoofed bot-suffixed author from some other App must not pass).
-          if [ "$AUTHOR" = "$MAINTAINER_LOGIN" ] || [ "$AUTHOR" = "$APP_BOT_LOGIN" ]; then
-            echo "trusted=1" >> "$GITHUB_OUTPUT"
-            exit 0
+          # WRITE+ ONLY: `triage` and `read` are deliberately NOT trusted, and `triage` is exactly
+          # the permission that can move an issue's labels — see the ACTOR probe below.
+          trust_of() {
+            if [ "$1" = "$MAINTAINER_LOGIN" ] || [ "$1" = "$APP_BOT_LOGIN" ]; then
+              echo 1
+              return
+            fi
+            perm=$(gh api "repos/$REPO/collaborators/$1/permission" --jq .permission 2>/dev/null || echo none)
+            case "$perm" in
+              admin|maintain|write) echo 1 ;;
+              *) echo 0 ;;
+            esac
+          }
+          author_trusted=$(trust_of "$AUTHOR")
+          if [ "$ACTOR" = "$AUTHOR" ]; then
+            actor_trusted="$author_trusted"
+          else
+            actor_trusted=$(trust_of "$ACTOR")
           fi
-          perm=$(gh api "repos/$REPO/collaborators/$AUTHOR/permission" --jq .permission 2>/dev/null || echo none)
-          case "$perm" in
-            admin|maintain|write) echo "trusted=1" >> "$GITHUB_OUTPUT" ;;
-            *) echo "trusted=0" >> "$GITHUB_OUTPUT" ;;
-          esac
+          echo "trusted=$author_trusted" >> "$GITHUB_OUTPUT"
+          # ONE definition of the quarantine rule, and it lives in Python where the self-test can
+          # EXECUTE it over the whole (event x author-trust x actor-trust) matrix — a second copy
+          # spelled as a workflow `if:` expression would be a mutually-masking duplicate (AGENTS.md
+          # pre-flight 4) that no test could kill. No `|| <fallback>` here for the same reason: if
+          # the decision cannot be computed the step goes RED and the job stops, which is the only
+          # honest outcome — a fallback would be that second definition.
+          quarantine=$(python3 scripts/triage.py --quarantine-decision --action "$ACTION" --author-trusted "$author_trusted" --actor-trusted "$actor_trusted")
+          echo "quarantine=$quarantine" >> "$GITHUB_OUTPUT"
 
       # PR #595 finding 5: the QUARANTINE labels are a TRUST BOUNDARY, so their write is fail-loud.
       # It used to carry `|| true`: a failed edit left third-party content with NO trust:untrusted
@@ -81,18 +108,22 @@ jobs:
       # it emits a ::warning rather than vanishing. scripts/triage.py --self-test statically
       # asserts this shape so the `|| true` cannot come back on the label write.
       #
-      # CONTENT EVENTS ONLY (#607). The trust GATE above still runs on every event type — an
-      # untrusted author's issue still never reaches the classifier below and its content is still
-      # never inspected. What is scoped here is the quarantine MUTATION, because a
-      # `labeled`/`unlabeled` event carries no new author content (GitHub only lets an actor with
-      # triage/write permission label an issue, so a third party cannot emit one), and re-running
-      # this on `unlabeled` would REVERT the maintainer's own approval: removing `trust:untrusted`
-      # is the affordance this step's own comment advertises, and it would be re-added within
-      # seconds, leaving every third-party issue permanently unapprovable — plus one more notice
-      # comment per label touch. This is an ALLOWLIST, not an exclusion, so a future event type has
-      # to be judged explicitly instead of silently inheriting the quarantine write.
+      # AUTHORIZED BY THE ACTOR, NEVER BY THE EVENT TYPE (#607; PR #998 r1 f1). The first cut of
+      # #607 exempted `labeled`/`unlabeled` from the quarantine write on the premise that only a
+      # triage/write actor can emit one, so no third party could. That premise contradicts this
+      # workflow's OWN trust rule: `triage` is not write+, so a triage-role collaborator is
+      # UNTRUSTED here — and triage permission is precisely the permission that manages labels.
+      # With the exemption, such an actor could strip `trust:untrusted` and nothing would put it
+      # back, clearing the hard gate that ready-issues.py / curate-frontier.py / dispatch-claim.py
+      # read, on an issue whose AUTHOR is still untrusted. So the decision is now taken from the
+      # ACTOR's own permission: `steps.trust.quarantine` is 0 only when the author is trusted, or
+      # when a WRITE+ actor asserted the label set on a label event (the deliberate un-quarantine).
+      # Every other event — including an `unlabeled` by a triage-role or drive-by actor — RESTORES
+      # `trust:untrusted` and `status:untriaged` via the idempotent `--add-label` write below.
+      # The rule itself is a single Python function so it is executable and testable; see
+      # `quarantine_required()` in scripts/triage.py, pinned by its `--self-test` truth table.
       - name: Quarantine + notify (untrusted author)
-        if: steps.trust.outputs.trusted != '1' && contains(fromJSON('["opened","edited","reopened"]'), github.event.action)
+        if: steps.trust.outputs.quarantine == '1'
         run: |
           set -euo pipefail
           gh issue edit "$NUM" -R "$REPO" --add-label trust:untrusted --add-label status:untriaged

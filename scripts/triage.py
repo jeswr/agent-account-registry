@@ -321,6 +321,60 @@ def triage(labels, issue_type="task", trusted=True, known_labels=None):
 
 
 # ---------------------------------------------------------------------------------------------------
+# QUARANTINE AUTHORIZATION — who may clear `trust:untrusted` (#607; PR #998 round 1 finding 1).
+#
+# `triage-issue.yml` fires on label events (#607) so a lost triage label is reclassified at the
+# moment of the regression. That trigger also means the workflow now SEES a `trust:untrusted`
+# removal, and it has to decide what to do about one. The first cut decided by EVENT TYPE — label
+# events were exempted from the quarantine write, on the premise that only a triage/write actor can
+# label an issue so no third party could emit one. That premise contradicts the workflow's own trust
+# rule: trust there is write+ (admin/maintain/write) exactly as in scripts/trust-gate.py, so a
+# `triage`-role collaborator is UNTRUSTED — and `triage` is precisely the permission that manages
+# labels. Under an event-type exemption such an actor could strip `trust:untrusted` off a
+# third-party issue and nothing would restore it, clearing the hard gate that ready-issues.py,
+# curate-frontier.py and dispatch-claim.py all read off that one label.
+#
+# So authorization is bound to the ACTOR that emitted the event, not to the event's type.
+
+# The events on which a WRITE+ actor is asserting the label set deliberately — the only place a
+# maintainer's un-quarantine can be honoured. Every other event re-asserts quarantine.
+TRUSTED_ACTOR_LABEL_EVENTS = ("labeled", "unlabeled")
+
+
+def _trust_flag(value):
+    """A trust flag is TRUE only for the exact string ``'1'`` (or a real ``True``).
+
+    Fail-closed coercion, and it lives in the pure function rather than in an untested CLI line:
+    an empty/unset shell variable, ``'true'``, ``'none'`` or any other spelling reads as UNTRUSTED,
+    which can only ever ADD quarantine.
+    """
+    return value is True or str(value).strip() == "1"
+
+
+def quarantine_required(action, author_trusted, actor_trusted):
+    """Must this event (re-)apply the `trust:untrusted` + `status:untriaged` quarantine? FAIL-CLOSED.
+
+    `action` is the issue event's `action` (opened/edited/reopened/labeled/unlabeled/...);
+    `author_trusted` is the ISSUE AUTHOR's write+ verdict; `actor_trusted` is the write+ verdict for
+    the login that emitted THIS event. The two are independent probes — the author's trust says
+    nothing about who just moved the labels.
+
+    True unless one of exactly two things holds:
+      * the AUTHOR is trusted — there is nothing to quarantine; or
+      * a TRUSTED ACTOR asserted the label set on a label event — the deliberate maintainer
+        un-quarantine, the one path that may clear the gate.
+
+    Everything else — an untrusted actor's `unlabeled`, an unknown/new event type, an unreadable
+    trust flag — returns True, i.e. RESTORES the quarantine. The caller's write is `--add-label`,
+    which is idempotent: it re-adds a stripped label and is a no-op when the label is still there,
+    so this same answer covers both "keep quarantined" and "put the gate back".
+    """
+    if _trust_flag(author_trusted):
+        return False
+    return not (str(action).strip() in TRUSTED_ACTOR_LABEL_EVENTS and _trust_flag(actor_trusted))
+
+
+# ---------------------------------------------------------------------------------------------------
 # LIVE APPLICATION — the fail-closed, order-controlled mutation (#582).
 
 def apply_triage(current, result, edit, view, warn=None, read_state=None):
@@ -1258,23 +1312,143 @@ def _self_test():
     chk("[#607] the classifier step is gated by TRUST ALONE (no event-type condition), so it DOES "
         "run on labeled/unlabeled",
         step_if(wf_step("Static triage (trusted author)")), "steps.trust.outputs.trusted == '1'")
-    # ...while the quarantine MUTATION is scoped to the CONTENT events by an ALLOWLIST: a
-    # `labeled`/`unlabeled` event carries no new author content (only an actor with triage/write
-    # permission can emit one), and re-applying it on `unlabeled` would revert the maintainer's own
-    # `trust:untrusted` removal — the sole approval affordance — within seconds. Pinned as the WHOLE
-    # expression: a substring check survives `&& false` and survives a widened allowlist.
+    # -----------------------------------------------------------------------------------------------
+    # [PR #998 round 1, findings 1+2] QUARANTINE REMOVAL IS AUTHORIZED BY THE **ACTOR**, NEVER BY THE
+    # EVENT TYPE. #607's first cut exempted `labeled`/`unlabeled` from the quarantine write because
+    # "only a triage/write actor can label an issue". That premise contradicts the trust rule three
+    # steps up: trust is write+ (admin/maintain/write), so a `triage`-role collaborator is UNTRUSTED
+    # here — and `triage` is exactly the permission that manages labels. Under the exemption such an
+    # actor could strip `trust:untrusted` off a THIRD-PARTY issue and nothing would restore it,
+    # clearing the hard gate ready-issues.py / curate-frontier.py / dispatch-claim.py read. Round 1
+    # finding 2 is why this section exists at all: the shipped checks pinned the trigger list, the
+    # `if:` strings and `triage()` fixed points, and NEVER constructed the case the change created —
+    # an external author with a DISTINCT label-event actor. These rows do.
+    trust_body = wf_step("Trust-gate the AUTHOR and the label-event ACTOR")
+    chk("[#998 f1] the job binds ACTOR to the event SENDER (never the issue author) and ACTION to "
+        "the event action",
+        (bool(re.search(r"\n      ACTOR: \$\{\{ github\.event\.sender\.login \}\}", wf_body)),
+         bool(re.search(r"\n      ACTION: \$\{\{ github\.event\.action \}\}", wf_body))), (True, True))
+    chk("[#998 f1] the trust step probes the ACTOR's permission SEPARATELY from the author's — the "
+        "author's trust says nothing about who just moved the labels",
+        (bool(re.search(r'author_trusted=\$\(trust_of "\$AUTHOR"\)', trust_body)),
+         bool(re.search(r'actor_trusted=\$\(trust_of "\$ACTOR"\)', trust_body))), (True, True))
+    # EXACT SET, not containment: adding `triage|` here is the whole vulnerability and a substring
+    # check would not see it.
+    perm_arm = re.search(r'case "\$perm" in\n\s*([a-z|]+)\) echo 1', trust_body)
+    chk("[#998 f1] WRITE+ ONLY: the permissions that grant trust are EXACTLY admin/maintain/write — "
+        "`triage` (which CAN move labels) and `read` are not among them",
+        sorted(perm_arm.group(1).split("|")) if perm_arm else [], ["admin", "maintain", "write"])
+    chk("[#998 f1] the trust step emits the `quarantine` output the gate below reads, and computes "
+        "it by CALLING this module — ONE definition of the rule, no YAML copy no test could kill",
+        (bool(re.search(r'quarantine=\$\(python3 scripts/triage\.py --quarantine-decision\b',
+                        trust_body)),
+         'echo "quarantine=$quarantine" >> "$GITHUB_OUTPUT"' in trust_body), (True, True))
+    # Pinned as the WHOLE expression: a substring check survives `&& false`, and the second row
+    # kills a re-introduced event-type allowlist (the exact defect round 1 found) by name.
     quarantine_if = step_if(quarantine_body)
-    chk("[#607] the quarantine step's `if:` is EXACTLY the trust gate AND the content-event "
-        "allowlist",
-        quarantine_if,
-        "steps.trust.outputs.trusted != '1' && "
-        "contains(fromJSON('[\"opened\",\"edited\",\"reopened\"]'), github.event.action)")
-    allowlist = re.search(r"fromJSON\('(\[[^']*\])'\)", quarantine_if)
-    quarantined_on = sorted(json.loads(allowlist.group(1))) if allowlist else []
-    chk("[#607] the allowlist PARTITIONS the trigger set — content events quarantine, label events "
-        "never do, and no trigger type is left unjudged",
-        (quarantined_on, sorted(set(trigger_types) - set(quarantined_on))),
-        (["edited", "opened", "reopened"], ["labeled", "unlabeled"]))
+    chk("[#998 f1] the quarantine step's `if:` is EXACTLY the module's decision",
+        quarantine_if, "steps.trust.outputs.quarantine == '1'")
+    chk("[#998 f1] the gate names NO event type — an event-type allowlist here would be a second, "
+        "untestable copy of the rule",
+        ("github.event.action" in quarantine_if, "contains(" in quarantine_if), (False, False))
+    chk("[#998 f1] the quarantine write RESTORES a stripped gate: an idempotent `--add-label` of "
+        "BOTH labels, so the same decision covers keep-quarantined and put-the-gate-back",
+        bool(re.search(r"gh issue edit .*--add-label trust:untrusted --add-label status:untriaged",
+                       quarantine_body)), True)
+
+    # THE DECISION, EXECUTED over the full matrix. Every expected value below is written out BY HAND
+    # (AGENTS.md pre-flight 2b): none of it is computed from TRUSTED_ACTOR_LABEL_EVENTS or from
+    # quarantine_required(), so widening that constant — or inverting the rule — cannot move the code
+    # and its expectation together. The ACTIONS are cross-checked against the workflow's OWN trigger
+    # list read above, so a new trigger type that nobody judged reds the coverage row.
+    quarantine_table = {
+        # untrusted AUTHOR + untrusted ACTOR — EVERY event re-asserts the gate, label events included.
+        # `("unlabeled", "0", "0")` IS the reported hole: a triage-role actor stripping the label.
+        ("opened", "0", "0"): "1", ("edited", "0", "0"): "1", ("reopened", "0", "0"): "1",
+        ("labeled", "0", "0"): "1", ("unlabeled", "0", "0"): "1",
+        # untrusted AUTHOR + WRITE+ ACTOR — only a LABEL event is the deliberate un-quarantine; a
+        # content event still quarantines (a maintainer editing a third-party issue approves nothing).
+        ("opened", "0", "1"): "1", ("edited", "0", "1"): "1", ("reopened", "0", "1"): "1",
+        ("labeled", "0", "1"): "0", ("unlabeled", "0", "1"): "0",
+        # trusted AUTHOR — there is nothing to quarantine, whoever the actor is.
+        ("opened", "1", "0"): "0", ("edited", "1", "0"): "0", ("reopened", "1", "0"): "0",
+        ("labeled", "1", "0"): "0", ("unlabeled", "1", "0"): "0",
+        ("opened", "1", "1"): "0", ("edited", "1", "1"): "0", ("reopened", "1", "1"): "0",
+        ("labeled", "1", "1"): "0", ("unlabeled", "1", "1"): "0",
+    }
+    chk("[#998 f2] the truth table judges EVERY trigger type the workflow subscribes to",
+        sorted({row[0] for row in quarantine_table}), trigger_types)
+    chk("[#998 f2] ...crossed with both trust axes independently — 4 rows per event, none missing",
+        len(quarantine_table), 4 * len(trigger_types))
+    chk("[#998 f2] quarantine_required() matches the hand-written truth table on every row",
+        sorted(row for row, want in quarantine_table.items()
+               if ("1" if quarantine_required(*row) else "0") != want), [])
+    # The two headline rows, named so a regression says WHICH direction broke (pre-flight 9).
+    chk("[#998 f1] THE HOLE: external author, `trust:untrusted` stripped by a TRIAGE-role actor -> "
+        "the quarantine is RESTORED, so the removal never clears the downstream hard gate",
+        quarantine_required("unlabeled", "0", "0"), True)
+    chk("[#998 f1] ...and the genuinely authorized path still works: a WRITE+ actor's removal stands",
+        quarantine_required("unlabeled", "0", "1"), False)
+    chk("[#998 f1] those two differ ONLY in the ACTOR's permission — the decision is actor-bound, "
+        "not event-bound",
+        quarantine_required("unlabeled", "0", "0") == quarantine_required("unlabeled", "0", "1"),
+        False)
+    for why, action, author_trust, actor_trust in (
+            ("an event type nobody judged", "deleted", "0", "1"),
+            ("a missing action (unset shell variable)", "", "0", "1"),
+            ("an unreadable ACTOR flag", "unlabeled", "0", "true"),
+            ("an unreadable AUTHOR flag", "opened", "yes", "1"),
+            ("an empty AUTHOR flag", "labeled", "", "0")):
+        chk(f"[#998 f1] FAIL-CLOSED: {why} still quarantines",
+            quarantine_required(action, author_trust, actor_trust), True)
+
+    # END-TO-END on the workflow's OWN argv (pre-flight 9/11: check the evidence path, not the
+    # object it names). The tokens come from the workflow FILE with the shell variables substituted,
+    # so a renamed flag, a dropped `--actor-trusted`, or a swapped argument order lands here.
+    def decide_via_cli(action, author_trust, actor_trust):
+        argv = next((a for a in workflow_argvs(
+            triage_wf, "triage.py",
+            {"ACTION": action, "author_trusted": author_trust, "actor_trusted": actor_trust,
+             "REPO": "o/r", "NUM": "7"}) if "--quarantine-decision" in a), None)
+        if argv is None:
+            return "NO --quarantine-decision INVOCATION IN THE WORKFLOW"
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = main(list(argv))
+        return (code, buffer.getvalue().strip())
+    chk("[#998 f2] END-TO-END on the workflow's argv: external author, triage-role actor strips "
+        "`trust:untrusted` -> the CLI says QUARANTINE",
+        decide_via_cli("unlabeled", "0", "0"), (0, "1"))
+    chk("[#998 f2] END-TO-END on the workflow's argv: external author, WRITE+ maintainer removes it "
+        "-> the CLI says LEAVE IT REMOVED",
+        decide_via_cli("unlabeled", "0", "1"), (0, "0"))
+    chk("[#998 f2] END-TO-END on the workflow's argv: a triage-role actor cannot clear the gate by "
+        "ADDING a label either",
+        decide_via_cli("labeled", "0", "0"), (0, "1"))
+    # The two ASYMMETRIC rows. Every case above happens to agree under a SWAP of the two trust
+    # arguments at the call site — 0/0 is symmetric and `unlabeled` 0/1 reads the same either way, a
+    # value-identical survivor (AGENTS.md pre-flight 4), measured surviving before these were added.
+    # These two DISAGREE under the swap, so `--author-trusted "$actor_trusted" --actor-trusted
+    # "$author_trusted"` dies here.
+    chk("[#998 f2] END-TO-END: a WRITE+ maintainer touching a THIRD-PARTY issue's CONTENT approves "
+        "nothing — the author is still untrusted, so it quarantines",
+        decide_via_cli("opened", "0", "1"), (0, "1"))
+    chk("[#998 f2] END-TO-END: a trusted author's issue is never quarantined, whoever the actor is",
+        decide_via_cli("opened", "1", "0"), (0, "0"))
+    # THE DEFAULTS ARE THE UNTRUSTED SPELLING. The workflow passes every flag today, so a fail-OPEN
+    # default is invisible to every row above — but it is what a dropped argument falls back on, and
+    # a `default="1"` on either flag was measured SURVIVING before these two rows existed. Each row
+    # omits exactly the flag it pins.
+    def decide_bare(*argv):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = main(["--quarantine-decision", *argv])
+        return (code, buffer.getvalue().strip())
+    chk("[#998 f1] FAIL-CLOSED DEFAULT: with no trust flags at all, the decision is QUARANTINE",
+        decide_bare(), (0, "1"))
+    chk("[#998 f1] FAIL-CLOSED DEFAULT: a dropped `--actor-trusted` on a label event does NOT "
+        "authorize the removal",
+        decide_bare("--action", "unlabeled", "--author-trusted", "0"), (0, "1"))
 
     # NO SELF-TRIGGER LOOP. The primary reason is GitHub's own rule — a write made with the
     # repository's GITHUB_TOKEN starts no workflow run (the rule dispatch.yml's dead `workflow_run`
@@ -1340,6 +1514,14 @@ def build_parser():
     ap.add_argument("--number", default="")
     ap.add_argument("--known-labels", default="",
                     help="comma-separated repo label set; enables the #582 existence check")
+    # The quarantine authorization decision triage-issue.yml gates its quarantine step on. Prints
+    # `1` (apply/restore the quarantine) or `0`. Defaults are the UNTRUSTED spelling on every flag,
+    # so a dropped argument fails closed to `1` rather than silently un-quarantining.
+    ap.add_argument("--quarantine-decision", action="store_true",
+                    help="print 1/0: must this issue event (re-)apply the quarantine labels?")
+    ap.add_argument("--action", default="", help="the issue event action (opened/unlabeled/...)")
+    ap.add_argument("--author-trusted", default="0", help="1 if the issue AUTHOR is write+")
+    ap.add_argument("--actor-trusted", default="0", help="1 if the event ACTOR is write+")
     return ap
 
 
@@ -1348,6 +1530,9 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.self_test:
         return _self_test()
+    if a.quarantine_decision:
+        print("1" if quarantine_required(a.action, a.author_trusted, a.actor_trusted) else "0")
+        return 0
     if a.apply:
         if not a.repo or not a.number:
             ap.error("--apply requires --repo and --number")
