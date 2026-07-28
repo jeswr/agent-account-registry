@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4578,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7b30d26a849cb5a560e057f473d6e85018daf8c5",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The Reference conversion still calls into_iri(raw), and the generated reference type still stores only a String documented as an IRI. SHACL sh:class applies to value nodes, including blank nodes: a blank node with rdf:type C (directly or through rdfs:subClassOf*) can conform. This loader rejects that valid value with TermType before ValueSource::is_instance_of can evaluate membership. The real-path harness still exercises classified and unclassified named nodes only, so it does not catch the narrowing. This is the same major correctness gap reported in round 3.",
+    "file": "crates/sparq-wrapper-shacl/src/emit.rs",
+    "fix_hint": "Represent a class reference as a node identity that preserves NamedNode versus BlankNode, accept both node kinds in the sh:class conversion while rejecting literals, and change is_instance_of and ClassMembership reporting accordingly. Add compiled-harness cases proving that a classified blank node loads and an unclassified blank node is rejected.",
+    "severity": "major",
+    "title": "sh:class still rejects blank-node instances"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 does not resolve round 3's major correctness finding. The generated sh:class conversion still calls into_iri and the reference newtype still stores only a String described as an IRI, so a blank-node value node that satisfies sh:class through rdf:type/rdfs:subClassOf* is rejected before ValueSource::is_instance_of is called. The compiled harness still tests only named-node class references and contains no conforming or unclassified blank-node sh:class case. This is materially the same major issue at the same severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
