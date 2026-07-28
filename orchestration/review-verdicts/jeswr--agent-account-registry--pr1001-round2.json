@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1001,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "83e0dd63c2b8aab7217f03d488bb684827afa8dc",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe documentation-only change remains correct and complete. Both edits accurately align the runbook with the README's existing public-repository disclosure: handles, limits, and selection logic are intentionally public; token values remain confined to GitHub secrets; and account email/PII remains excluded or redacted. The diff changes no executable control, trust check, workflow gate, audit trail, permissions, or test, and introduces no reviewer-directed instruction.",
+  "verdict": "approve"
+ }
+}
