@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4653,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ed170fa0c39f41fda0ada89678837a583f4192ff",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major graph-union defect. gen_graphs now treats each NULL graph map as contributing no label without erasing surviving sibling or subject/POM labels; emit_row drops a statement only when the combined graph set is empty and at least one declared map produced NULL. The corrected default-graph test now requires the row-2 predicate-object statement to survive through the subject map's rr:defaultGraph, and the focused regression test covers NULL on either side of the union plus mixed sibling graph maps. The implementation and tests consistently preserve the declared-versus-absent graph-map distinction, and no new correctness, soundness, test-validity, or security issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
