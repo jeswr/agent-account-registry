@@ -3600,6 +3600,7 @@ def identity_refusal(repo, pr_number, reason, issue=None, bot_login="",
         print(f"::warning::could not read {repo}#{pr_number} comments for the identity-refusal "
               f"receipt ({exc}); recording the refusal anyway (a missing exit is the defect)")
         already = set()
+
     def _park():
         needs_user(repo, pr_number,
                    f"the review run was refused by the target-App identity gate: {prose}. No "

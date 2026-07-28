@@ -20116,6 +20116,16 @@ def _starvation_sweep_self_test():
     _census_yaml_seam_self_test()
 
     # ---- [registry #972] THE REFUSED REVIEW'S EXIT — seam + executed block -------------------
+    # [registry #979 round-2] The containment-discipline claim is asserted from TWO independent
+    # statements in two different functions, on purpose. MEASURED: tautologising the assertion
+    # inside _identity_refusal_seam_self_test was the ONE mutant of this round that survived —
+    # a single `assert X == []` has no guard but a second, independent assertion of the same
+    # property, and this is it. (The property is deliberately NOT folded into
+    # _identity_refusal_seam_violations: that list is what every seam mutant is judged by, so a
+    # violation present on EVERY document would make every mutant trivially "caught".)
+    _seam_pins = _identity_seam_pin_discipline_violations()
+    assert not _seam_pins, ("#972 seam pin discipline (independent second assertion): "
+                            f"{_seam_pins}")
     _identity_refusal_seam_self_test()
 
 
@@ -21404,6 +21414,47 @@ def _identity_refusal_seam_self_test():
     print(f"  ok   #979 every containment operator surviving in the "
           f"{len(_IDENTITY_SEAM_PIN_FUNCTIONS)} #972 pin functions is DECLARED with the reason "
           "it is not a text check on workflow source (and no declaration is stale)")
+
+    # ---- (0b) [registry #979 round-2] THE VIOLATION BRANCHES NO DOCUMENT MUTANT DRIVES.
+    # Line-granular coverage of the two new executing pins found six such lines; each gets a test
+    # rather than a rationalisation, because an unreachable violation branch is a guard nobody has
+    # shown to work. All of them are POSITIVE-PROOF branches: an unreadable or unrunnable step is
+    # a violation, never a pass.
+    _live_stop = next(s for s in live["jobs"]["run"]["steps"]
+                      if isinstance(s, dict) and s.get("if") == _IDENTITY_SEAM_REFUSE_IF)
+    _live_record = next(s for s in live["jobs"]["outcome"]["steps"]
+                        if isinstance(s, dict) and isinstance(s.get("run"), str)
+                        and "identity-refusal" in s["run"])
+    assert _identity_stop_violations({"run": ["nope"]}) and \
+        _identity_record_violations({"run": ["nope"]}), \
+        "a non-string `run:` on the stop or the recorder must be a VIOLATION, not a crash"
+    # An UNRUNNABLE seam proves nothing, so it is a violation too: point the executor at a shell
+    # that does not exist and both pins must SAY SO rather than returning a clean list.
+    _saved_shell = list(_IDENTITY_SEAM_SHELL)
+    globals()["_IDENTITY_SEAM_SHELL"] = ["/nonexistent/no-such-shell-979", "-e"]
+    try:
+        _unrunnable = (_identity_stop_violations(_live_stop),
+                       _identity_record_violations(_live_record))
+    finally:
+        globals()["_IDENTITY_SEAM_SHELL"] = _saved_shell
+    assert all(any("could not be executed" in v for v in group) for group in _unrunnable), \
+        f"an unrunnable stop/recorder must be a named violation, got {_unrunnable!r}"
+    # The recorder RAN, and the step still failed: a failing recording step takes the outcome job
+    # — and therefore the refusal record — down with it, so it is its own violation.
+    _record_rc = _identity_record_violations({"run": _live_record["run"] + "\nexit 3\n"})
+    assert any("exits 3 even when the recorder succeeds" in v for v in _record_rc), _record_rc
+    # A STALE containment declaration is a violation in its own right (it is the hole a future
+    # containment pin hides in): remove the pin one of them describes and the checker must say so.
+    _stale_source = Path(__file__).resolve().read_text(encoding="utf-8").replace(
+        'if "run" not in (outcome_job.get("needs") or []):',
+        'if not (outcome_job.get("needs") or []):', 1)
+    assert _stale_source != Path(__file__).resolve().read_text(encoding="utf-8"), \
+        "the stale-declaration fixture did not edit the source (it would prove nothing)"
+    _stale = _identity_seam_pin_discipline_violations(_stale_source)
+    assert any("no longer exists" in v for v in _stale), _stale
+    print("  ok   #979 every violation branch of the two executing pins is DRIVEN: non-string "
+          "`run:`, an unrunnable shell, a recorder that ran inside a failing step, and a stale "
+          "containment declaration")
 
     # ---- (A) THE BLOCK ITSELF, EXECUTED. Not a re-implementation: the workflow's own python.
     _, step = _identity_step(live["jobs"]["run"]["steps"])
