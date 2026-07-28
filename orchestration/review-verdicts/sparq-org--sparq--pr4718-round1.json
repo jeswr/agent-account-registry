@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4718,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e0c420263b9e2838c9518dfd75f077ced375baee",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is internally consistent and appropriately scoped as an interim, explicitly oracle-dependent differential-harvest tool. The comparison uses raw parser output rather than store-normalized values, graph results are checked isomorphically, negative cases are honestly described as oracle-rejected rather than proven invalid, and the seeded self-test exercises both positive-result comparison and negative acceptance detection. The research record clearly separates executed evidence, source-read conclusions, suspected follow-up work, and limitations; the two proposed upstream reports match the described RDF 1.2 grammar and parser-state omissions. No correctness, soundness, security, or vacuous-test defect requiring changes was found in the supplied diff.",
+  "verdict": "approve"
+ }
+}
