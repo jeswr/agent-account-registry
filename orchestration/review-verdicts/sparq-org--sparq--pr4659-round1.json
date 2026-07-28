@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4659,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "66f34174643f30cc18482a48e9f79b97efd5dcbb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new fragment correctly adds the default-off sparq-fedplan-mpc crate's sole opt-in feature to the feature-test matrix with tests enabled, and the golden check-run-name snapshot is updated to match. The crate manifest confirms that `fedplan-mpc` is the only non-default feature and enables the complete crate surface plus `sparq-fedplan/fedplan`. The fragment conforms to the assembler's required schema and uses a gate-eligible, unique name. No correctness, soundness, security, or test-validity issue is apparent in the diff. Local execution was unavailable because this checkout lacks PyYAML and the Rust toolchain, so the verdict relies on diff-scoped static verification.",
+  "verdict": "approve"
+ }
+}
