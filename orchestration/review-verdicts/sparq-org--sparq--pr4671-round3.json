@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4671,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b30892af83719530095b1941b911a94ca638a803",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major soundness defect. The design now explicitly states that full forward replay cannot recover multiplicity or required-site provenance when jointly required emit sites produce an identical RDF quad, and it conservatively rejects such overlaps at generation time unless provenance is independently reconstructible. The acceptance plan pins this with a non-vacuous negative case that must reject the identical-quad construction and expressly forbids admitting it through replay, @prefer, or matcher order. The revised admissibility rule also scopes replay to the whole reconstructed derivation and every mandatory emit clause, while retaining generation-time rejection as the default where the proof obligation cannot be discharged. No hostile reviewer-directed instruction was detected; the shell text is clearly reproduction material within the research record.",
+  "verdict": "approve"
+ }
+}
