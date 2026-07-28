@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4825,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7364c63f6e98ac0365fff00842b07063bab5d954",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 6 P0 requires a T1-only crate and \"the 35 migrated tests,\" while P2 later moves the IO/service tiers. The existing 35-test module includes tests for IdleTimeoutStream, MaxRequestsService, upgrade handling, acceptor/handshake behavior, and builder configuration, so those tests cannot compile in the T1-only crate. This also contradicts section 9's admission that the test split was not audited and makes the claimed disjoint phased plan invalid.",
+    "file": "research/transport-hardening-crate-extraction.md",
+    "fix_hint": "Inventory the tests by tier and assign only policy/parser/limiter tests to P0; explicitly assign IO/service tests to P2 and builder/acceptor tests to P3. Replace the unsupported count with verified per-phase counts or omit counts, and make each phase's acceptance tests concrete.",
+    "severity": "major",
+    "title": "P0 cannot migrate all 35 tests into a T1-only crate"
+   },
+   {
+    "body": "Section 3.2 presents limiter.try_acquire() and limiter.try_acquire_ip() as the primary consumer API, then states that only PermittedStream::new is private and must be exposed. In the referenced implementation both ConnectionLimiter::try_acquire and ConnectionLimiter::try_acquire_ip are private (the latter has only a doc-hidden test shim). P1 therefore cannot use the shown seam across a crate boundary, and the design has not specified or reviewed the necessary public guard API.",
+    "file": "research/transport-hardening-crate-extraction.md",
+    "fix_hint": "Correct the API delta and phase specs to include public, documented acquisition methods (and any guard construction/access needed for unknown peers), or design one public atomic admission method that returns the global and per-IP guards together. Include tests for fail-fast global admission, per-IP refusal, unknown-peer fail-open behavior, and release on guard drop.",
+    "severity": "major",
+    "title": "The hand-rolled accept-loop API needs more public surface than documented"
+   }
+  ],
+  "progress": null,
+  "summary": "The design usefully corrects the issue premise, but its staged plan is not internally executable as written. P0 claims all 35 transport tests migrate with the T1-only crate even though many of those tests exercise T2-T4 types, and the proposed primary hand-loop API relies on limiter methods that are currently private despite the record claiming only one constructor needs exposure. These are load-bearing scope/API errors in the bead decomposition, not cosmetic wording.",
+  "verdict": "request_changes"
+ }
+}
