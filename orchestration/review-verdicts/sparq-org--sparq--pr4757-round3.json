@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4757,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8bb6d2ceb676e8d04b72fc5095dc90b677ac22cb",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding. The public documentation now precisely limits nl_query's parity with ask to shared grounding and pre-execution checks, explicitly states that NlqConfig::check_dictionary is default-off for both paths, and discloses that ungrounded predicate/class IRIs may be accepted. The implementation matches that contract: NlqConfig::default() has check_dictionary=false, run_nl_query performs the question guard, parse, forbidden-construct validation, and repair loop without execution, and the added non-vacuous parity test first proves the predicate is absent before confirming both tools accept it. The translate-only behavior, SERVICE refusal, repair/error behavior, and unconfigured-backend failure are also covered by focused tests. No correctness, soundness, security, or vacuity defect remains in the diff.",
+  "verdict": "approve"
+ }
+}
