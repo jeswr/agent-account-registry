@@ -22,16 +22,6 @@
   },
   {
    "account": "488920c2efe2b3fb",
-   "claim_id": "dfc34281774640aba5ce7603d417bd73",
-   "holder": "fix:sparq-org/sparq#4601@dispatch-30324659480.1",
-   "package": "sparq-gpu",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785207817,
-   "expires_at": 1785214117
-  },
-  {
-   "account": "488920c2efe2b3fb",
    "claim_id": "f51e1adeb10746b7a9d538dd53fd3319",
    "holder": "fix:sparq-org/sparq#4678@dispatch-30324659480.1",
    "package": "wrapper",
