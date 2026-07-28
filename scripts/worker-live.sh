@@ -1131,6 +1131,26 @@ _shell_function_body() {
   ' "$file"
 }
 
+# PURE (self-tested): the body of the `run-selftest)` CLI arm, normalised to stripped, comment-free
+# lines. Pinned by EXACT BLOCK because this arm is the one place whose exit code pr-gate.yml trusts
+# for every row -- and a mutant that SUPPRESSES that exit code (`run_enrolled_selftest "$2" || true`)
+# is SELF-MASKING: it discards the status of the very process whose assertions detect it, so no
+# runtime row can kill it through the pr-gate frame. MEASURED: `|| true` -> the row fires (1 FAIL)
+# yet `run-selftest` still exits 0. A source-level assertion is immune to that, because it does not
+# travel through the mutated exit path. (`; true` is NOT such a mutant: under `set -euo pipefail`
+# errexit exits at the non-zero return before it is reached -- measured identical to baseline.)
+_run_selftest_cli_arm() {
+  local file=$1
+  [[ -f "$file" ]] || return 0
+  awk '
+    { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+    line ~ /^#/ || line == "" { next }
+    line == "run-selftest)" { on = 1; print line; next }
+    on && line == ";;" { print line; exit }
+    on { print line }
+  ' "$file"
+}
+
 # PURE (self-tested): how registry_selftest_gate reaches enrolled self-tests, as one comparable
 # value -- how many DIRECT invocations it still contains, and how many go through the sandbox
 # runner. Reverting either call site moves both numbers, so one assertion covers both without two
@@ -5733,6 +5753,31 @@ HOOK
     "$([[ "$cli_rc" -ne 0 ]] && printf refused || printf ran)" "refused"
   chk "and the refusal names ENROLLMENT as the reason, not an incidental failure" \
     "$(grep -c 'is not enrolled in the self-test manifest' <<< "$cli_out")" "1"
+  # The arm's exit code is what pr-gate.yml trusts for EVERY row, so a suppressor added here greens
+  # the whole gate -- and does it while discarding the status that would carry its own detection.
+  # Pin the arm's source by exact block; that assertion does not travel through the mutated path.
+  local expected_arm
+  expected_arm=$(printf '%s\n' 'run-selftest)' \
+    "[[ \$# -eq 2 ]] || die 'usage: worker-live.sh run-selftest <enrolled-script>'" \
+    'case " $FULL_SELFTEST_SUITE " in' \
+    '*" $2 "*) ;;' \
+    '*) die "run-selftest: $2 is not enrolled in the self-test manifest (fail closed)" ;;' \
+    'esac' 'run_enrolled_selftest "$2"' ';;' | paste -sd'|' -)
+  chk "run-selftest CLI arm is EXACTLY the expected block (no exit-code suppressor)" \
+    "$(_run_selftest_cli_arm "$SCRIPT_DIR/worker-live.sh" | paste -sd'|' -)" "$expected_arm"
+  local armfix="$tmp/sandbox/armfix"
+  mkdir -p "$armfix"
+  printf '%s\n' '  run-selftest)' '    run_enrolled_selftest "$2" || true' '    ;;' > "$armfix/or-true.sh"
+  printf '%s\n' '  run-selftest)' '    run_enrolled_selftest "$2"; true' '    ;;' > "$armfix/semi.sh"
+  chk "the arm check is NON-VACUOUS: an '|| true' suppressor no longer matches" \
+    "$([[ "$(_run_selftest_cli_arm "$armfix/or-true.sh" | paste -sd'|' -)" == "$expected_arm" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "the arm check is NON-VACUOUS: a trailing '; true' no longer matches either" \
+    "$([[ "$(_run_selftest_cli_arm "$armfix/semi.sh" | paste -sd'|' -)" == "$expected_arm" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "the arm check fails CLOSED when the file cannot be read" \
+    "$([[ "$(_run_selftest_cli_arm "$armfix/absent.sh" 2>/dev/null | paste -sd'|' -)" == "$expected_arm" ]] \
+       && printf missed || printf caught)" "caught"
 
   # ---- THE YAML SEAM. pr-gate.yml is where the gate actually runs the suite, and a mutation there
   # is invisible to every python assertion in this repo. Pin the loop by EXACT WHOLE-BLOCK match:
