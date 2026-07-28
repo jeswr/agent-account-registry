@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4876,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "83c7e009e55b2e530fc8acfd803580cb1b1263fa",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new text says \"every handler here authorizes through crate::authz\". In the same module, `options_handler` explicitly documents that OPTIONS is not auth-gated and does not call the authorizer. This makes the public security-boundary documentation inaccurate, even though OPTIONS intentionally exposes only method metadata and does not probe resource existence.",
+    "file": "crates/sparq-lws-core/src/ldp/mod.rs",
+    "fix_hint": "Narrow the claim to the resource read and mutation handlers (for example, GET/HEAD/PUT/POST/DELETE/PATCH), and explicitly preserve OPTIONS as the unauthenticated metadata/CORS-preflight exception.",
+    "severity": "major",
+    "title": "Module docs falsely claim every handler performs WAC authorization"
+   }
+  ],
+  "progress": null,
+  "summary": "The marker reconciliation is largely consistent with the implementation and the cited PUT/V4 test exercises the real handler path. However, the new module-level security claim is materially overbroad: it says every LDP handler authorizes through WAC, while OPTIONS is explicitly and intentionally not auth-gated. Because this is an honesty-sensitive description of the authorization boundary, it should be corrected before approval.",
+  "verdict": "request_changes"
+ }
+}
