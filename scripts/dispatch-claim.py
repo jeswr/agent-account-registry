@@ -1714,15 +1714,30 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
     `__global__` exactly as before. The rule reads the target's own attestation instead of a
     config switch that could drift from it.
 
-    WHY THIS BRANCH AND NOT THE OTHER THREE. Only this one invents a reservation the PLAN leg
-    never made. PLAN runs the TARGET's readiness engine, whose PR rule is `_reserving_packages` —
-    declared areas, NO global fallback, and its docstring refuses CLAIM's fallback BY NAME after
-    measuring that adopting it drives the sparq frontier to 0. PLAN cannot see provenance at all,
-    so an unprovenanced PR reserves only its declared areas THERE, PLAN commits a frontier on
-    that basis, and CLAIM then deferred every row of it. `source-no-areas` and `source-unlisted`
-    are different: their source ISSUE is known, and an area-less in-progress issue already
-    reserves `__global__` on the PLAN side under the unchanged CANDIDATE-side `packages_of` rule
-    — so narrowing them here alone would buy nothing and is deliberately NOT done.
+    WHY THIS BRANCH. It invents a reservation the PLAN leg never made. PLAN runs the TARGET's
+    readiness engine, whose PR rule is `_reserving_packages` — declared areas, NO global fallback,
+    and its docstring refuses CLAIM's fallback BY NAME after measuring that adopting it drives the
+    sparq frontier to 0. PLAN cannot see provenance at all, so an unprovenanced PR reserves only
+    its declared areas THERE, PLAN commits a frontier on that basis, and CLAIM then deferred every
+    row of it.
+
+    WHY NOT THE OTHER TWO GLOBAL CAUSES — and the two are NOT alike, which is worth stating
+    because the first draft of this comment said they were:
+      * `source-no-areas` — the source issue is OPEN and carries no `area:`. If it is
+        `status:in-progress*` it ALREADY reserves `__global__` on the PLAN side under the
+        unchanged CANDIDATE-side `packages_of` rule, so narrowing it here alone buys nothing.
+      * `source-unlisted` — the source issue is CLOSED, hence absent from PLAN's occupancy
+        entirely, so this branch invents a reservation PLAN never made in exactly the way the
+        missing-provenance branch does. MEASURED over 101 executed dispatch ticks (2026-07-27
+        12:54Z - 2026-07-28 14:52Z): 14 ticks carried a `__global__` reservation and SEVEN of them
+        — sparq-org/sparq#3620 on six consecutive ticks (source issue #3321, closed 07-25) and
+        #4681 on one (source issue #2781, closed 21s before the tick read it) — were this cause.
+        It is the single largest residual, and it is deliberately NOT narrowed HERE because it
+        cannot be narrowed here ALONE: `enumerate_review_items` emits the same PR as a review row
+        whose package is `__global__` (asserted in this file's own self-test), so narrowing only
+        the reservation would leave the two legs describing the same PR differently — the exact
+        LINKAGE PARITY failure the round-2 P2 note above exists to prevent. Both sides have to
+        move together, which is a separate change.
 
     THE ASSUMPTION, STATED. A target whose PR `area:` labels are NOT derived fail-closed could
     under-reserve here. On the provenanced path PR labels only ever WIDEN a union, so this is the
@@ -16049,9 +16064,20 @@ agent = "impl"
     # THE WHOLE-LANE CONSEQUENCE, at the leg where the frontier actually dies: the sibling rows
     # in OTHER crates survive. `plan_items` names crate-a and crate-b; the holder declares
     # crate-a and crate-z, so crate-b must be kept. Pre-fix this returned [].
-    assert [item["number"] for item in filter_busy_area_items(
-        plan_items, repo, [_stray_labelled], issue_labels, {},
-        leases=[], now=now)] == [9], "one unprovenanced holder must no longer drop every item"
+    # The leg's PRINTED narrowed census is captured from the SAME call, because every other
+    # assertion on that line in this file reads it at ZERO. MEASURED: mutant M10 — passing `[]`
+    # instead of the leg's own `occupancy` to the formatter, so the population is permanently
+    # reported as empty — survived the whole suite until this row existed. That is the exact
+    # vacuity this counter was added to prevent, in the counter itself.
+    _narrow_leg = io.StringIO()
+    with contextlib.redirect_stdout(_narrow_leg):
+        _narrow_kept = filter_busy_area_items(
+            plan_items, repo, [_stray_labelled], issue_labels, {}, leases=[], now=now)
+    assert [item["number"] for item in _narrow_kept] == [9], \
+        "one unprovenanced holder must no longer drop every item"
+    assert ("unprovenanced-narrowed census example/repo: 1 open worker PR(s) have NO registry "
+            "provenance record") in _narrow_leg.getvalue(), _narrow_leg.getvalue()
+    assert "— pr#61." in _narrow_leg.getvalue(), _narrow_leg.getvalue()
     # ...and its OWN crate is still genuinely reserved — the narrowing must not become a release.
     assert filter_busy_area_items(
         [plan_items[0]], repo, [_stray_labelled], issue_labels, {}, leases=[], now=now) == []
@@ -16064,6 +16090,22 @@ agent = "impl"
     assert [row[5] for row in _narrow_occ] == [CAUSE_NO_PROVENANCE_NARROWED], _narrow_occ
     assert unprovenanced_narrowed_holders(_narrow_occ) == [61], _narrow_occ
     assert global_reservation_census(_narrow_occ) == {}, _narrow_occ
+    # A `parked-free` row has already RELEASED its crates, so it is not in this population either
+    # — counting it would report a PR as holding areas it does not hold. Kills dropping the
+    # `row[0] != "busy"` guard.
+    assert unprovenanced_narrowed_holders(
+        [("parked-free", 62, frozenset({"crate-a"}), "parked", True,
+          CAUSE_NO_PROVENANCE_NARROWED)]) == []
+    # A pre-cause 5-tuple is SKIPPED, not indexed. Kills relaxing `len(row) < 6` to `< 5`, which
+    # raises IndexError on the legacy shape this file still constructs in places.
+    assert unprovenanced_narrowed_holders(
+        [("busy", 63, frozenset({"crate-a"}), "not-parked", False)]) == []
+    # Ascending and de-duplicated by construction, whatever order the listing arrived in.
+    assert unprovenanced_narrowed_holders([
+        ("busy", 90, frozenset({"c"}), "not-parked", False, CAUSE_NO_PROVENANCE_NARROWED),
+        ("busy", 12, frozenset({"c"}), "not-parked", False, CAUSE_NO_PROVENANCE_NARROWED),
+        ("busy", 40, frozenset({"c"}), "not-parked", False, GLOBAL_CAUSE_DECLARED),
+    ]) == [12, 90]
     assert CAUSE_NO_PROVENANCE_NARROWED not in GLOBAL_RESERVATION_CAUSES, (
         "a narrowed row never holds `__global__`, so a bucket for it in the global census would "
         "be structurally unreachable")
