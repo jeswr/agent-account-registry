@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4899,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "aff614951f49f73df21bccc87d8a2f6b5de473ab",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 2 labels shape E as `backend.rs::reconstruct_disclosed; pipeline.rs step 5`, but the real `run_federated` path does not call `reconstruct_disclosed`; pipeline step 5 states that the disclosed join result and already-opened verdict are the answer. Thus a threshold pipeline execution has the 64 comparator opens described above, not an additional aggregate reconstruction at step 5. Conversely, the assertion that this table exhausts every `reconstruct`/`reconstruct_degree` call outside `shamir.rs` and tests is contradicted by production call sites such as `hidden_distinct.rs::row_key`, `batched.rs::reconstruct`, and transport routines. This leaves the protocol whose transcript is being composed undefined: it is neither exactly `run_federated` nor all production semi-honest APIs. Since completeness is the record's load-bearing claim, the resulting hybrid argument is not sound as currently scoped.",
+    "file": "research/mpc-simulator-sketch.md",
+    "fix_hint": "Define one exact entry point/configuration as the analyzed protocol (apparently `pipeline::run_federated`) and inventory only the opens reachable from that path. Remove the claimed step-5 aggregate open and shape E from that execution, or separately describe `reconstruct_disclosed` as an alternative API/output path. Replace the repo-wide call-site claim with a reproducible path-scoped enumeration, and explicitly list excluded production surfaces (transport, hidden distinct, batched APIs, authenticated variants) rather than implying they were exhausted.",
+    "severity": "major",
+    "title": "The claimed complete production open inventory includes a nonexistent pipeline step and omits other production opens"
+   }
+  ],
+  "progress": null,
+  "summary": "The new record is carefully caveated, but its central claim of a complete production-path open inventory is not accurate against the cited implementation. In particular, it assigns an aggregate reconstruction to pipeline step 5 even though run_federated never calls reconstruct_disclosed and explicitly says the result and verdict are already available. The document also says the inventory was obtained from every non-test reconstruction call outside shamir.rs, while additional production reconstruction sites exist. Because the hybrid/error-budget argument depends on defining the exact execution and exhaustively inventorying its opens, this ambiguity and false site attribution are major rather than editorial.",
+  "verdict": "request_changes"
+ }
+}
