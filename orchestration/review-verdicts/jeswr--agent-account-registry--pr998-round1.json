@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 998,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "eb85cf5521f7e2206feace89ea3f2c717db437e9",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The trust step grants actionability only for admin/maintain/write (plus exact trusted logins), so a user with GitHub's `triage` role is deliberately untrusted. However, triage permission includes managing issue labels. On an `unlabeled` event caused by such a user removing `trust:untrusted`, `steps.trust.outputs.trusted` is computed from the issue AUTHOR, while the quarantine step is categorically skipped because `unlabeled` is outside its allowlist. The label therefore stays removed. Repository consumers such as `curate-frontier.py` and `ready-issues.py` treat the presence of `trust:untrusted` as the hard gate, so later automation can inspect/stage the third-party issue without a maintainer's approval. The comment's premise that label events are safe because only triage/write actors can emit them conflicts with this workflow's own decision that triage permission is not trusted. This is a direct weakening of a trust check.",
+    "file": ".github/workflows/triage-issue.yml",
+    "fix_hint": "Authorize quarantine removal using evidence from the actual event actor and the established maintainer-approval mechanism (the documented maintainer reaction), not merely the event type. Fail closed by restoring/retaining `trust:untrusted` when an unauthorized actor removes it. Add an end-to-end test where the issue author is external and the label actor has only triage permission; removing the gate must not make the issue actionable. Also test the genuinely authorized approval path.",
+    "severity": "blocker",
+    "title": "Label-event exception lets an untrusted triage-role actor remove quarantine"
+   },
+   {
+    "body": "The added checks assert the exact trigger set, the exact `if:` strings, and pure `triage()` fixed points. None constructs the security-relevant case introduced by this change: an external issue author, a distinct label-event actor, and removal of `trust:untrusted`. Consequently the tests stay green while the new workflow permits a triage-role actor\u2014classified as untrusted by the workflow\u2014to clear the downstream hard gate. The fixed-point tests cannot detect this because they exercise only label classification, not who is allowed to remove quarantine.",
+    "file": "scripts/triage.py",
+    "fix_hint": "Add a non-vacuous workflow/security test that independently varies issue author permission, event actor permission, event action, and current quarantine label. Assert that an unauthorized `unlabeled` event preserves or restores quarantine, and that only SHA-/identity-bound maintainer approval permits the gate to be cleared. Derive expected actor classes independently of the workflow expression under test.",
+    "severity": "major",
+    "title": "New tests pin syntax but never test label-event authorization"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new label-event path weakens the quarantine trust boundary. The workflow intentionally treats `triage` permission as untrusted, but GitHub users with triage permission can apply and remove labels. Because `labeled` and `unlabeled` now trigger the workflow while the quarantine mutation is disabled for both, any triage-role user can remove `trust:untrusted` from a third-party issue without the workflow restoring it. Downstream code uses that label as the hard gate, so this creates an approval path that is not bound to the maintainer reaction required by the repository's trust model. The added static assertions exactly preserve the unsafe workflow expression and do not test actor authority or the resulting end-to-end gate.",
+  "verdict": "request_changes"
+ }
+}
