@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4656,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "47d327fd4c6d79587f91feb5bcadd8c4cdae0f18",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2's major durability finding is addressed. `write_offset` now performs the required sequence on Unix: write and sync the temporary file, atomically rename it over the watermark, then open and sync the containing directory. Errors from the post-rename directory sync propagate without advancing the relay's in-memory watermark, preserving the fail-safe direction toward possible redelivery. The public module documentation explicitly limits the stronger crash-durability guarantee to Unix and explains the weaker non-Unix behavior under the already documented at-least-once/deduplication contract. The focused helper test exercises create and replacement paths, confirms the temporary name is consumed, and includes a Unix-only witness that reaches the parent-directory-open/sync boundary while honestly stating that an in-process unit test cannot prove power-loss durability. No remaining correctness, soundness, test-validity, or security issue is evident in the changed scope.",
+  "verdict": "approve"
+ }
+}
