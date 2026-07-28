@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4849,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b499d6bfc38e8d8e3665d786a77a75816785c6af",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The server now forwards sparq-engine's opt-in dp-planner feature and includes it in the binary crate's default feature set, while preserving the documented no-default-features opt-out and leaving the engine library default unchanged. The new integration tests are non-vacuous for answer equivalence and scoped-state restoration, and the compile-time reference to without_dp_planner verifies that the forwarding reaches the engine feature. Existing engine implementation confirms that the compiled feature starts in Install::Default with the bounded DP configuration, while the existing differential test compares DP and greedy bags against an independent nested-loop reference. Documentation and the HTTP-server skill are updated consistently. No hostile instructions were found in the diff.",
+  "verdict": "approve"
+ }
+}
