@@ -4876,7 +4876,11 @@ def _test_fallback_orphan(chk):
     be recovered. End-to-end against a stateful two-repo gh fake: primary firing delivery fails,
     the fallback create succeeds, the records age out, and the next decide closes the fallback
     issue — with the red direction proving a failed fallback close is NOT confirmed by the
-    primary's steady no-op (pre-fix, decide exited 0 and the issue stayed open forever)."""
+    primary's steady no-op (pre-fix, decide exited 0 and the issue stayed open forever).
+
+    Issue #292 pins the OTHER half of that conjunction, which nothing here discriminated: with the
+    marker open on BOTH routes, a CONFIRMED fallback close must not mask a FAILED primary one.
+    Dropping the `and delivered` in _deliver_alerts survived the whole suite until phase 3."""
     import argparse as _ap
     import types
     global _gh, GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune, read_ledger
@@ -4888,7 +4892,7 @@ def _test_fallback_orphan(chk):
     repos = {priv_repo: {}, reg_repo: {}}
     seq = {"n": 100}
     bad_tokens = {"priv"}          # phase 1: the private token is unusable
-    fail_close = {"on": False}
+    fail_close = {"repos": set()}  # repos whose `issue close` fails, PER ROUTE (#292)
 
     def state_gh(args, token, capture=False):
         repo = args[args.index("-R") + 1] if "-R" in args else None
@@ -4913,7 +4917,7 @@ def _test_fallback_orphan(chk):
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
         num = int(args[2])
         if verb == "close":
-            if fail_close["on"]:
+            if repo in fail_close["repos"]:
                 return types.SimpleNamespace(returncode=1, stdout="", stderr="")
             issues[num]["state"] = "closed"
         elif verb == "edit":
@@ -4924,6 +4928,9 @@ def _test_fallback_orphan(chk):
 
     def reg_states():
         return [i["state"] for _, i in sorted(repos[reg_repo].items())]
+
+    def priv_states():
+        return [i["state"] for _, i in sorted(repos[priv_repo].items())]
 
     fire = {"condition": "provider-outage", "provider": "anthropic", "fire": True, "reason": "r"}
     try:
@@ -4950,13 +4957,37 @@ def _test_fallback_orphan(chk):
 
         # red direction first: the fallback close FAILS -> the primary's steady no-op must not
         # count as delivery (pre-fix, decide exited 0 here with the issue still open).
-        fail_close["on"] = True
+        fail_close["repos"] = {reg_repo}
         chk("fallback-orphan: failed fallback close -> decide exits NONZERO, issue still open",
             (_cmd_decide(ns), reg_states()), (1, ["open"]))
 
-        fail_close["on"] = False
+        fail_close["repos"] = set()
         chk("fallback-orphan: next decide closes the fallback issue and exits 0",
             (_cmd_decide(ns), reg_states()), (0, ["closed"]))
+
+        # phase 3 (issue #292): get the marker open on BOTH routes. A firing tick while the
+        # private token is unusable REOPENS the fallback issue; once the token works again the
+        # next firing tick raises the private issue too, because the primary carries no marker.
+        bad_tokens.add("priv")
+        chk("fallback-orphan: firing re-raise reopens the fallback issue",
+            (_deliver_alerts([fire], "m"), reg_states()), ([], ["open"]))
+        bad_tokens.clear()
+        chk("fallback-orphan: firing on the restored primary raises the private issue too",
+            (_deliver_alerts([fire], "m"), priv_states()), ([], ["open"]))
+
+        # The direction #292 pins: the PRIMARY close fails while the fallback close is CONFIRMED.
+        # Recovery must require BOTH routes, so decide stays NONZERO and the private issue stays
+        # open for the next tick. Without `and delivered` this reads (0, ['closed'], ['open']) —
+        # a confirmed fallback close silently certifying an alert that is still open privately.
+        fail_close["repos"] = {priv_repo}
+        chk("fallback-orphan: a confirmed fallback close does NOT mask a FAILED primary close",
+            (_cmd_decide(ns), reg_states(), priv_states()), (1, ["closed"], ["open"]))
+
+        # phase 4: both routes healthy. The fallback marker is gone, so recovery targets the
+        # primary alone, closes the surviving private issue, and the run goes green.
+        fail_close["repos"] = set()
+        chk("fallback-orphan: the next tick closes the surviving private issue and exits 0",
+            (_cmd_decide(ns), priv_states()), (0, ["closed"]))
     finally:
         _gh = real_gh
         (GitHubAPI, _enabled_provider_accounts, annotate_provider_status,
