@@ -15970,6 +15970,205 @@ agent = "impl"
     print("  ok   registry-758 (e): every declared defer reason has an asserted printed line at "
           "BOTH legs, and the two legs classify the same board identically")
 
+    # ==== [OPUS-5] A MULTI-AREA ITEM RESERVES ITS AREAS, NOT THE WORLD ==========================
+    # The defect: `plan_package` sent 0 OR >=2 areas to `__global__`, so "touches A and B" meant
+    # "touches everything" — 65 of 468 ready issues (13.9%) excluded against every partition on the
+    # board, while 37 of those 65 carried genuinely distinct crates. The labels were right; the
+    # reduction was wrong. Each check below is the counterfactual for ONE call site, so a revert of
+    # that site alone reds a NAMED check rather than a shared suite-wide property.
+    area_repo = "example/repo"
+
+    def area_item(number, *areas, package=None, labels=None):
+        """A plan row carrying `area:*` labels, with the `package` the TARGET planner minted."""
+        return {"number": number, "deferred": False,
+                "labels": (list(labels) if labels is not None
+                           else [f"area:{a}" for a in areas] + ["role:impl", "status:ready"]),
+                "package": package if package is not None else plan_package(list(areas))}
+
+    def lease_on(package, pr=900):
+        return [{"holder": f"{area_repo}#{pr}@run.1", "package": package, "expires_at": 600}]
+
+    # -- (1) the reduction itself -------------------------------------------------------------
+    assert plan_package(["b", "a"]) == plan_package(["a", "b"]) == "a,b", plan_package(["a", "b"])
+    assert plan_package([]) == GLOBAL_PACKAGE and plan_package(["a"]) == "a"
+    assert packages_conflict("a,b", "b,c") and not packages_conflict("a,b", "c,d")
+    assert packages_conflict(GLOBAL_PACKAGE, "a") and packages_conflict("a,b", GLOBAL_PACKAGE)
+    print("  ok   [OPUS-5 partition] the reduction is a SET: {A,B} -> `a,b`, {} -> __global__, and "
+          "two keys conflict iff their sets intersect")
+
+    # -- (2) SAFE_PACKAGE admits the composite and nothing malformed ---------------------------
+    assert SAFE_PACKAGE.fullmatch("a,b") and SAFE_PACKAGE.fullmatch("a") \
+        and SAFE_PACKAGE.fullmatch(GLOBAL_PACKAGE) and SAFE_PACKAGE.fullmatch("a,b,c")
+    for _bad in ("a,", ",a", "a,,b", ",", "a b", "-a,b", "a,-b"):
+        assert not SAFE_PACKAGE.fullmatch(_bad), _bad
+    # ...and the validator that consumes it accepts a real composite plan row end-to-end.
+    _composite_plan = json.loads(json.dumps(fixture))
+    _composite_plan["repositories"][0]["items"][0]["package"] = "sparq-core,sparq-engine"
+    _composite_plan["repositories"][0]["items"][0]["labels"] = sorted(
+        set(_composite_plan["repositories"][0]["items"][0]["labels"])
+        | {"area:sparq-core", "area:sparq-engine"})
+    assert validate_plan(_composite_plan) is _composite_plan
+    print("  ok   [OPUS-5 partition] SAFE_PACKAGE admits a canonical composite key and refuses "
+          "every empty-atom spelling; validate_plan accepts a composite plan row")
+
+    # -- (3) THE RED TEST, at the ASSEMBLE leg -------------------------------------------------
+    # An item labelled {A,B} co-runs with a live reservation on {C} and does NOT co-run with one
+    # on {B}. Reverting `filter_busy_area_items` to `item.get("package")` (the target planner's
+    # `__global__` minting) reds the first of these and nothing else.
+    ab_legacy = area_item(101, "crate-a", "crate-b", package=GLOBAL_PACKAGE)
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert filter_busy_area_items([ab_legacy], area_repo, [], {}, {},
+                                      leases=lease_on("crate-c"), now=0) == [ab_legacy], \
+            "[RED] a {A,B} row must co-run with a {C} reservation at the ASSEMBLE leg"
+        assert filter_busy_area_items([ab_legacy], area_repo, [], {}, {},
+                                      leases=lease_on("crate-b"), now=0) == [], \
+            "[RED] a {A,B} row must NOT co-run with a {B} reservation at the ASSEMBLE leg"
+    # CONTROL A: a ZERO-area row still reserves everything and is still dropped by an unrelated
+    # reservation. THIS IS THE INVERSION TO FEAR — narrowing it would make an item whose blast
+    # radius nobody can name concurrent with all live work.
+    zero_area = area_item(102, labels=["role:impl", "status:ready"], package=GLOBAL_PACKAGE)
+    assert item_partition(zero_area) == GLOBAL_PACKAGE, item_partition(zero_area)
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert filter_busy_area_items([zero_area], area_repo, [], {}, {},
+                                      leases=lease_on("crate-c"), now=0) == [], \
+            "[CONTROL] a ZERO-area row must still be excluded by ANY live reservation"
+    # CONTROL B: two {A} items still exclude — the ordinary one-crate partition is untouched.
+    a_only = area_item(103, "crate-a")
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert filter_busy_area_items([a_only], area_repo, [], {}, {},
+                                      leases=lease_on("crate-a"), now=0) == [], \
+            "[CONTROL] two rows on the same single area must still exclude"
+        assert filter_busy_area_items([a_only], area_repo, [], {}, {},
+                                      leases=lease_on("crate-c"), now=0) == [a_only]
+    print("  ok   [OPUS-5 partition] ASSEMBLE leg: {A,B} co-runs with {C} and not with {B}; a "
+          "ZERO-area row still reserves everything and two {A} rows still exclude")
+
+    # -- (4) THE SAME RED TEST at the CLAIM leg, so the two halves cannot diverge ---------------
+    # Reverting `revalidate_items_against_live_pulls` to `item.get("package")` reds ONLY this one.
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert revalidate_items_against_live_pulls(
+            [ab_legacy], area_repo, [[]], {}, {}, leases=lease_on("crate-c"), now=0) == {101}, \
+            "[RED] a {A,B} row must co-run with a {C} reservation at the CLAIM leg"
+        assert revalidate_items_against_live_pulls(
+            [ab_legacy], area_repo, [[]], {}, {}, leases=lease_on("crate-b"), now=0) == set(), \
+            "[RED] a {A,B} row must NOT co-run with a {B} reservation at the CLAIM leg"
+        assert revalidate_items_against_live_pulls(
+            [zero_area], area_repo, [[]], {}, {}, leases=lease_on("crate-c"), now=0) == set(), \
+            "[CONTROL] a ZERO-area row must still be excluded at the CLAIM leg"
+    # AGREEMENT, decided on the SAME board by both legs over the SAME rows. A widening applied at
+    # one leg and not the other plans work the other refuses, every tick, forever.
+    for _leases, _expect_kept in ((lease_on("crate-c"), True), (lease_on("crate-b"), False),
+                                  (lease_on("crate-a"), False), ([], True)):
+        with contextlib.redirect_stdout(io.StringIO()):
+            _assembled = filter_busy_area_items([ab_legacy], area_repo, [], {}, {},
+                                                leases=_leases, now=0)
+            _claimed = revalidate_items_against_live_pulls([ab_legacy], area_repo, [[]], {}, {},
+                                                           leases=_leases, now=0)
+        assert bool(_assembled) is bool(_claimed) is _expect_kept, (_leases, _assembled, _claimed)
+    print("  ok   [OPUS-5 partition] CLAIM leg decides identically to the ASSEMBLE leg on every "
+          "board tried — the widening is applied at BOTH sites or the scheduler contradicts itself")
+
+    # -- (5) the busy-UNION form: `busy` is a union of ATOMS, so the test is intersection --------
+    # `package in busy` (the membership form) is False for EVERY composite key, so this is the
+    # branch that would silently let a {A,B} row sail past an occupant holding A.
+    _ab_occ = [("busy", 500, frozenset({"crate-a"}), "not-parked", False)]
+    assert partition_defer_attribution("crate-a,crate-b", {"crate-a"}, _ab_occ) == \
+        ("crate-conflict", "crate-a", 500, "not-parked")
+    assert partition_defer_attribution("crate-a,crate-b", {"crate-c"}, _ab_occ) is None
+    # The reported held area is a DETERMINISTIC contended atom that is genuinely in `busy` — the
+    # enum's standing invariant, which a composite key could otherwise violate by reporting itself.
+    _multi_occ = [("busy", 502, frozenset({"crate-b"}), "not-parked", False),
+                  ("busy", 501, frozenset({"crate-a"}), "not-parked", False)]
+    _attr = partition_defer_attribution("crate-a,crate-b", {"crate-a", "crate-b"}, _multi_occ)
+    assert _attr == ("crate-conflict", "crate-a", 501, "not-parked"), _attr
+    assert _attr[1] in {"crate-a", "crate-b"}, _attr
+    # ...and a ZERO-area row is still `cross-cutting-item`, which is now the shape that branch was
+    # always meant to describe.
+    assert partition_defer_attribution(GLOBAL_PACKAGE, {"crate-a"}, _ab_occ)[0] == \
+        "cross-cutting-item"
+    print("  ok   [OPUS-5 partition] the busy union is intersected, not membership-tested, and the "
+          "reported held area is a deterministic atom that is genuinely reserved")
+
+    # -- (6) the cross-lane ledger view uses the same predicate ---------------------------------
+    _sib = lease_on("crate-b,crate-c")
+    assert sibling_lease_conflict(area_repo, set(), {"crate-a", "crate-b"}, _sib, 0) is True
+    assert sibling_lease_conflict(area_repo, set(), {"crate-a"}, _sib, 0) is False
+    assert sibling_lease_conflict(area_repo, set(), {"crate-a,crate-d"}, _sib, 0) is False
+    assert sibling_lease_conflict(area_repo, set(), {"crate-c,crate-d"}, _sib, 0) is True
+    # fail-closed edges are UNCHANGED: an empty candidate set, and a global lease, both exclude.
+    assert sibling_lease_conflict(area_repo, set(), set(), _sib, 0) is True
+    assert sibling_lease_conflict(area_repo, set(), {"crate-a"}, lease_on(GLOBAL_PACKAGE), 0) is True
+    assert sibling_lease_conflict("other/repo", set(), {"crate-b"}, _sib, 0) is False
+    print("  ok   [OPUS-5 partition] sibling_lease_conflict expands composite keys on BOTH sides "
+          "and keeps every fail-closed edge (empty set, __global__ lease, foreign repo)")
+
+    # -- (7) the CROSS-REPOSITORY plan seam ----------------------------------------------------
+    # PLAN runs the TARGET repo's dispatch-plan.py. A target still on the pre-area-set reduction
+    # mints `__global__` for its multi-area rows; rejecting those at _route_check would defer every
+    # one of them forever (the #112 shape, one artifact over). The tolerance is guarded by
+    # ">=2 declared areas" so a ZERO-area row can never be narrowed by it.
+    assert _legacy_global_minting(GLOBAL_PACKAGE, ["a", "b"]) is True
+    assert _legacy_global_minting(GLOBAL_PACKAGE, ["a", "b", "c"]) is True
+    assert _legacy_global_minting(GLOBAL_PACKAGE, []) is False, \
+        "[CONTROL] a ZERO-area row must NEVER be narrowed by the legacy-minting tolerance"
+    assert _legacy_global_minting(GLOBAL_PACKAGE, ["a"]) is False
+    assert _legacy_global_minting(GLOBAL_PACKAGE, ["a", "a"]) is False   # one DISTINCT area
+    assert _legacy_global_minting("a", ["a", "b"]) is False              # only __global__ is legacy
+    assert _legacy_global_minting("a,b", ["a", "b"]) is False            # already canonical
+    # ...and the reservation the legs enforce for such a row is the NARROW one, from its labels.
+    assert item_partition(ab_legacy) == "crate-a,crate-b", item_partition(ab_legacy)
+    assert item_partition(area_item(104, "crate-a", package=GLOBAL_PACKAGE)) == "crate-a"
+    # An item with NO labels field at all falls back to its minted package (fail-closed).
+    assert item_partition({"number": 105, "package": GLOBAL_PACKAGE}) == GLOBAL_PACKAGE
+    assert item_partition({"number": 105}) == GLOBAL_PACKAGE
+    assert item_partition({"number": 105, "package": "crate-a"}) == "crate-a"
+    print("  ok   [OPUS-5 partition] the legacy `__global__` minting from an un-upgraded TARGET "
+          "planner is tolerated ONLY where >=2 labels prove the footprint; a zero-area row is not")
+
+    # -- (8) the reservation census names the shapes -------------------------------------------
+    shape_census = {}
+    with contextlib.redirect_stdout(io.StringIO()):
+        filter_busy_area_items([ab_legacy, zero_area, a_only], area_repo, [], {}, {},
+                               leases=lease_on("crate-a"), now=0, census=shape_census)
+    assert shape_census["by_reservation"] == {
+        "multi-area": {"kept": 0, "deferred": 1},     # {a,b} meets the crate-a lease
+        "global": {"kept": 0, "deferred": 1},         # the zero-area row, excluded by anything
+        "single-area": {"kept": 0, "deferred": 1},    # {a} meets the crate-a lease
+    }, shape_census
+    kept_census = {}
+    with contextlib.redirect_stdout(io.StringIO()):
+        filter_busy_area_items([ab_legacy, zero_area, a_only], area_repo, [], {}, {},
+                               leases=[], now=0, census=kept_census)
+    assert kept_census["by_reservation"] == {
+        "multi-area": {"kept": 1, "deferred": 0},
+        "global": {"kept": 1, "deferred": 0},
+        "single-area": {"kept": 1, "deferred": 0}}, kept_census
+    assert reservation_class(GLOBAL_PACKAGE) == reservation_class("a,") == \
+        reservation_class(None) == "global"
+    assert reservation_class("a") == "single-area" and reservation_class("a,b") == "multi-area"
+    print("  ok   [OPUS-5 partition] the reservation census counts every examined row exactly once "
+          "into its shape, split kept-vs-deferred, with `global` naming the still-over-wide class")
+
+    # -- (9) the IMPL-lane lease is minted from the SAME reservation ----------------------------
+    # Structural, on `dispatch()`'s own AST: a lease minted `__global__` for a row the two legs
+    # treated as {a,b} would seize every partition in the ledger, and worker.yml's adopt step
+    # re-derives from the issue's labels and would refuse it. `item["package"]` here is the revert.
+    _impl_claim_args = [
+        node.args[1] for node in ast.walk(
+            next(fn for fn in ast.parse(Path(__file__).resolve().read_text(encoding="utf-8")).body
+                 if isinstance(fn, ast.FunctionDef) and fn.name == "dispatch"))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "claim" and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "allocator" and len(node.args) > 1]
+    assert _impl_claim_args, "no allocator.claim(...) call found in dispatch()"
+    assert any(isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name)
+               and arg.func.id == "item_partition" for arg in _impl_claim_args), \
+        ("the impl lane must mint its lease from item_partition(item), not the target planner's "
+         "minted item['package'] — otherwise PLAN and the ledger reserve different partitions",
+         [ast.dump(arg) for arg in _impl_claim_args])
+    print("  ok   [OPUS-5 partition] the impl-lane lease is minted from item_partition(item), the "
+          "same reservation both partition legs enforced")
+
     # ---- [registry #758] THE CLAIM CENSUS IS SEALED, AND WIRED AT ITS PRODUCTION CALL SITE ----
     # It shipped as a parameter with no production caller: `revalidate_items_against_live_pulls`
     # accepted `census=` and every test above passed one, but `dispatch()` did not — so the CLAIM
