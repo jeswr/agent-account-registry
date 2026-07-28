@@ -291,11 +291,24 @@ def pull_reference_text(pull):
 
 
 def referenced_issue_numbers(pull):
-    """Every `#<n>` the PR's own title/body names, ascending — the census's CANDIDATE list.
+    """Every `#<n>` the PR's own title/body names — the census's CANDIDATE list, TITLE-FIRST.
+
+    ORDER IS THE WHOLE POINT of the split. This repo's convention puts the source issue in the
+    PR TITLE (`fix(x): … (#N)`) while a body routinely cross-references dozens of others, so a
+    flat ascending walk offers whichever number happens to be lowest — measured on this PR: an
+    unrelated open issue rather than the one it closes. Title references come first, then body
+    references, each ascending, so the first candidate that binds is the one the PR is actually
+    about.
 
     Discovery only. Each candidate is then put through the production `mint_decision`, which
-    re-reads the live issue and applies `issue_mint_refusal`; this function decides nothing."""
-    return sorted({int(match) for match in ISSUE_REF_RE.findall(pull_reference_text(pull))})
+    re-reads the live issue and applies `issue_mint_refusal`; this function decides nothing, and
+    the mint proper takes an explicit `--issue` that this never supplies."""
+    if not isinstance(pull, dict):
+        return []
+    in_title = sorted({int(m) for m in ISSUE_REF_RE.findall(str(pull.get("title") or ""))})
+    in_body = sorted({int(m) for m in ISSUE_REF_RE.findall(str(pull.get("body") or ""))}
+                     - set(in_title))
+    return in_title + in_body
 
 
 def issue_mint_refusal(issue_number, issue, pull, plan_package, global_package,
@@ -1451,7 +1464,15 @@ def _self_test():                                                       # noqa: 
           [n for n in referenced_issue_numbers(_boundary) if not references_issue(_boundary, n)],
           [])
     check("...and discovery finds exactly the word-bounded references",
-          referenced_issue_numbers(_boundary), [7, 41, 412])
+          sorted(referenced_issue_numbers(_boundary)), [7, 41, 412])
+    # TITLE-FIRST, and the RED test is the shape this PR itself hit: a body that cross-references a
+    # LOWER-numbered open issue must not out-rank the source issue named in the title.
+    check("the title's issue is offered FIRST, however low the body's cross-references run",
+          referenced_issue_numbers({"title": "fix(x): thing (#959)",
+                                    "body": "see #287, #112, #1 for context"}),
+          [959, 287, 112, 1][:1] + [1, 112, 287])
+    check("...and a body-only reference is still offered",
+          referenced_issue_numbers({"title": "fix(x): thing", "body": "closes #7"}), [7])
     # The recorded-PR reader is derived from the PRODUCTION path builder, so a record for ANOTHER
     # target repo sharing the directory can never be counted as one of this repo's PRs.
     _listing = [{"name": worker_pr.provenance_path(repo, 685).rpartition("/")[2]},
