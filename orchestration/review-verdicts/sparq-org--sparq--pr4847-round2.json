@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4847,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a915dff50ba494d3095c05eb9aa1164c4ccc85e2",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The scanner recognizes a prefixed name only when `:` immediately follows the initial `is_name_byte` run. SPARQL PN_PREFIX also permits internal `.` characters, so a valid token such as `FILTR.x:item` is scanned first as the bare word `FILTR`, which can yield `FLTR`/`FILTER`-style false diagnostics when the query fails elsewhere. This contradicts the module's guarantee that prefixed names are data and never keyword candidates. The added tests cover hyphenated and Unicode prefixes but not the PN_PREFIX internal-dot production.",
+    "file": "crates/sparq-terse/src/suggest.rs",
+    "fix_hint": "Implement a complete, safely wide PN_PREFIX skip before classifying a run as a bare word, including internal dots while excluding a trailing dot, and then skip PN_LOCAL after the colon. Add an integration regression with an unrelated parse failure and a valid dotted prefix whose first segment is typo-shaped, asserting that `CanaryFailed.suggestions` is empty.",
+    "severity": "major",
+    "title": "Valid dotted prefixes can still be scanned as keyword typos"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-one PN_LOCAL defect is addressed for Unicode, percent-escaped, and backslash-escaped local parts, with a real integration regression that reaches the failed-parse canary. However, the scanner still does not skip every valid prefixed name: PN_PREFIX permits internal dots, while the candidate-word scan stops at a dot and only recognizes a prefix when the colon immediately follows the first run. A valid dotted prefix whose first segment resembles a keyword can therefore produce a false hint. Because this is a new major instance of the same lexical-boundary invariant after the prior local-part fix, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
