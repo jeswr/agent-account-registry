@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4856,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3cfb17f4cd353d05aa274dca4737718372d68fc2",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete for the documented compiled-rules subset. The new lowering preserves Pattern indices for semi-naive evaluation, schedules each component unpack immediately after its producing join, and correctly distinguishes first bindings from checks for variables shared with plain positions, prior atoms, repeated components, multiple quotations, and nested object quotations. Evaluation fails closed for unbound, inline, and non-triple IDs before reading dictionary records, then binds or checks all three structural component IDs without changing multiplicity. Ground quotations use the same validated Dict interning path for facts and compiled symbols, while unsupported variable-bearing conclusions, negation-body quotations, and structurally impossible triple-term shapes fail loudly. The focused correlation test exercises both real engines and compares complete closures before asserting the mismatching candidate is excluded; it is not vacuous. The implementation and documentation are consistent with the RDF 1.2 dictionary design record, including structural opacity and object-only nesting within a triple term. No correctness, soundness, security, test-validity, or hostile-instruction issue was found.",
+  "verdict": "approve"
+ }
+}
