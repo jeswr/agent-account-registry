@@ -1835,7 +1835,19 @@ def partition_defer_attribution(package, busy, occupancy):
     # sail past an occupant holding `a`. The reported held area is the LOWEST-SORTED contended
     # atom, keeping the attribution a deterministic function of the board (same rule as the
     # lowest-PR tie-break) and keeping the enum invariant `held_area in busy` true.
-    contended = sorted((package_areas(package) or frozenset()) & set(busy))
+    #
+    # [#938 review N3] An UNREADABLE key reaches here only if it is not literally `__global__`
+    # (that branch is two lines up), and it must not be intersected as if it named nothing:
+    # `package_areas(...) or frozenset()` would reintroduce the empty set the whole `None`-means-
+    # universal contract exists to avoid, and the row would be KEPT — the single site where an
+    # unreadable key read as "reserves nothing" instead of "reserves everything". It takes the
+    # cross-cutting branch above instead, which is what the key actually means.
+    own = package_areas(package)
+    if own is None:
+        holder, state, packages = holder_of(lambda _packages: True)
+        held = sorted(set(packages) & set(busy)) or sorted(busy)
+        return ("cross-cutting-item", held[0], holder, state)
+    contended = sorted(own & set(busy))
     if contended:
         held_area = contended[0]
         holder, state, _packages = holder_of(lambda packages: held_area in packages)
@@ -16258,6 +16270,18 @@ agent = "impl"
     # always meant to describe.
     assert partition_defer_attribution(GLOBAL_PACKAGE, {"crate-a"}, _ab_occ)[0] == \
         "cross-cutting-item"
+    # [#938 review N3] An UNREADABLE key must take that branch too. `package_areas(...) or
+    # frozenset()` reintroduced the empty set here — the one site where a key nobody can read
+    # intersected NOTHING and the row was KEPT, contradicting the `None`-means-universal contract
+    # `package_areas` is built around. Every unreadable spelling is checked, and the reported held
+    # area is still an area an occupant genuinely holds.
+    for _unreadable in ("crate-a,", ",crate-a", "crate-a,,crate-b", "__global__,crate-a", "", None):
+        _attr_bad = partition_defer_attribution(_unreadable, {"crate-a"}, _ab_occ)
+        assert _attr_bad is not None and _attr_bad[0] == "cross-cutting-item", \
+            (_unreadable, _attr_bad)
+        assert _attr_bad[1] in {"crate-a"}, (_unreadable, _attr_bad)
+    # ...and an unreadable key against an EMPTY board is still not deferred (nobody holds anything).
+    assert partition_defer_attribution("crate-a,", set(), []) is None
     print("  ok   [OPUS-5 partition] the busy union is intersected, not membership-tested, and the "
           "reported held area is a deterministic atom that is genuinely reserved")
 
@@ -16271,6 +16295,16 @@ agent = "impl"
     assert sibling_lease_conflict(area_repo, set(), set(), _sib, 0) is True
     assert sibling_lease_conflict(area_repo, set(), {"crate-a"}, lease_on(GLOBAL_PACKAGE), 0) is True
     assert sibling_lease_conflict("other/repo", set(), {"crate-b"}, _sib, 0) is False
+    # ...and the reason `mine` is EXPANDED into atoms rather than carrying the raw key strings: an
+    # UNREADABLE entry must poison the whole candidate footprint to the universal set. A bare
+    # `area:` label yields the empty atom `""` from `{label[5:] for label in labels ...}`, which is
+    # exactly this input — and the reduction SILENTLY DROPS empty entries, so a `mine |= {package}`
+    # spelling would quietly narrow `{"", "crate-a"}` to `crate-a` and launch into an unknown
+    # footprint. (Found as a mutation survivor; this is the input that distinguishes the two.)
+    assert sibling_lease_conflict(area_repo, set(), {"", "crate-a"}, lease_on("crate-z"), 0) is True, \
+        "an unreadable area atom must make the candidate's whole footprint unknown, not vanish"
+    assert sibling_lease_conflict(area_repo, set(), {"crate-a,", "crate-b"},
+                                  lease_on("crate-z"), 0) is True
     print("  ok   [OPUS-5 partition] sibling_lease_conflict expands composite keys on BOTH sides "
           "and keeps every fail-closed edge (empty set, __global__ lease, foreign repo)")
 
@@ -16318,8 +16352,48 @@ agent = "impl"
     assert reservation_class(GLOBAL_PACKAGE) == reservation_class("a,") == \
         reservation_class(None) == "global"
     assert reservation_class("a") == "single-area" and reservation_class("a,b") == "multi-area"
+    # The CLAIM leg records the KEPT side too. Every other assertion in this file exercises the
+    # claim leg with rows that all DROP, so deleting its kept-side recorder left the suite green
+    # (found as a mutation survivor): the shape census would have reported only refusals.
+    claim_kept_census = {}
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert revalidate_items_against_live_pulls(
+            [ab_legacy, a_only, zero_area], area_repo, [[]], {}, {},
+            leases=[], now=0, census=claim_kept_census) == {101, 103, 102}
+    assert claim_kept_census["by_reservation"] == {
+        "multi-area": {"kept": 1, "deferred": 0},
+        "single-area": {"kept": 1, "deferred": 0},
+        "global": {"kept": 1, "deferred": 0}}, claim_kept_census
+    # ---- A LEG THAT EXAMINED NOTHING still emits every bucket at zero, UNCONDITIONALLY.
+    # "never instrumented", "instrumented but skipped this tick" and "instrumented, no traffic"
+    # must not read alike (registry #753/#754). Two mutants live here and only this row kills
+    # them: wrapping the emission in `if census.get("total")` (the emission then vanishes on
+    # precisely the quiet tick an operator would be interrogating), and dropping the
+    # reservation-census seal (the buckets then exist only when some row happened to be folded).
+    empty_out, empty_census = io.StringIO(), {}
+    with contextlib.redirect_stdout(empty_out):
+        assert filter_busy_area_items([], area_repo, [], {}, {},
+                                      leases=[], now=0, census=empty_census) == []
+    assert empty_out.getvalue().splitlines() == [
+        "assemble-reservations example/repo rows=0 deferred=0 deferred_global=0 "
+        "reserving.single-area=0 reserving.single-area.kept=0 reserving.single-area.deferred=0 "
+        "reserving.multi-area=0 reserving.multi-area.kept=0 reserving.multi-area.deferred=0 "
+        "reserving.global=0 reserving.global.kept=0 reserving.global.deferred=0"], \
+        empty_out.getvalue()
+    assert empty_census["by_reservation"] == {
+        "single-area": {"kept": 0, "deferred": 0},
+        "multi-area": {"kept": 0, "deferred": 0},
+        "global": {"kept": 0, "deferred": 0}}, empty_census
+    empty_claim_out, empty_claim_census = io.StringIO(), {}
+    with contextlib.redirect_stdout(empty_claim_out):
+        assert revalidate_items_against_live_pulls(
+            [], area_repo, [[]], {}, {}, leases=[], now=0, census=empty_claim_census) == set()
+    assert "claim-reservations example/repo rows=0 deferred=0 deferred_global=0" in \
+        empty_claim_out.getvalue(), empty_claim_out.getvalue()
+    assert empty_claim_census["by_reservation"] == empty_census["by_reservation"]
     print("  ok   [OPUS-5 partition] the reservation census counts every examined row exactly once "
-          "into its shape, split kept-vs-deferred, with `global` naming the still-over-wide class")
+          "into its shape, split kept-vs-deferred, on BOTH legs — and a leg that examined NOTHING "
+          "still emits and seals every bucket at zero")
 
     # -- (9) the IMPL-lane lease is minted from the SAME reservation ----------------------------
     # Structural, on `dispatch()`'s own AST: a lease minted `__global__` for a row the two legs
