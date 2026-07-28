@@ -473,10 +473,10 @@ def is_negated(text, keyword_start):
 
 
 def _stripped_title_and_body(title, body):
-    """The title and body stripped as the TWO SEPARATE DOCUMENTS GitHub renders them as, then joined.
+    """The title and body stripped as the TWO SEPARATE DOCUMENTS GitHub renders, then joined.
 
     Concatenating them first was itself a defect, and a measured one: the title occupied line 0, so
-    an indented FIRST body line always had a non-blank line above it and could never be recognised as
+    an indented FIRST body line always had a non-blank line above it and could never be seen as
     the code block GitHub renders it as. The same concatenation let an unclosed ``` or `<!--` in a
     TITLE swallow the whole body, which GitHub — rendering the two independently — never does.
 
@@ -754,8 +754,8 @@ def new_counters(*, mint_cap, comment_cap, apply_changes):
         "comment_deferred_cap": 0,
         "refusals": {},
         # WHY each reason fired, bounded. `refusals` counts reason CODES, and one code —
-        # `mint-refused` — carries two operationally opposite situations: the shared gate declining a
-        # particular pull request (the lane is working) and the lane being unable to run at all (an
+        # `mint-refused` — carries two operationally opposite situations: the shared gate
+        # declining one pull request (the lane is working) and the lane unable to run at all (an
         # unreadable source issue, an alias missing from the routing catalog). Only the passthrough
         # TEXT separates them, and that text reached the log line and the PR comment but never the
         # machine-readable row — so the row could not tell an operator whether the lane was healthy
@@ -1231,13 +1231,14 @@ def _self_test():                                                       # noqa: 
             ("heading, blank, paragraph, then indented",
              "## E\n\nprose\n    Closes #4242", False)):
         binds = closing_issue_candidates("t", body) == [4242]
-        check(f"GitHub ORACLE — {label}: renders as "
-              f"{'CODE, so the sweep must refuse' if github_renders_code else 'PROSE, so the sweep must bind'}",
+        expected = ("CODE, so the sweep must refuse" if github_renders_code
+                    else "PROSE, so the sweep must bind")
+        check(f"GitHub ORACLE — {label}: renders as {expected}",
               binds, not github_renders_code)
     # THE ONE REMAINING DIVERGENCE, asserted as the false negative it is rather than described. A
-    # list-item continuation is prose to GitHub and stripped here; closing it needs real list-context
-    # tracking. Pinned so it cannot silently flip to the MINTING direction, which is what would
-    # actually matter.
+    # list-item continuation is prose to GitHub and stripped here; closing it needs real
+    # list-context tracking. Pinned so it cannot silently flip to the MINTING direction, which
+    # is the thing that would actually matter.
     for label, body in (("a bullet item", "- item\n\n    Closes #4242"),
                         ("a numbered item", "1. item\n\n    Closes #4242"),
                         ("a nested item", "- a\n  - b\n\n    Closes #4242")):
@@ -1617,7 +1618,7 @@ def _self_test():                                                       # noqa: 
         which STOPS a tick whose counters do not account for the population. That is correct
         behaviour, but in the harness a raise out of `sweep()` aborted the run with a traceback
         belonging to no branch: MEASURED, an `enrolled_pulls += 0` mutant killed the suite with
-        `0 FAIL` rows at check 183 of 311, and a `declared`/`all_refs` swap reded one named check and
+        `0 FAIL` rows at check 183 of 311, and a `declared`/`all_refs` swap reded one named check
         then abandoned the remaining 106. Both are now named failures instead."""
 
         def __init__(self, why):
@@ -1631,6 +1632,19 @@ def _self_test():                                                       # noqa: 
         """`recorder.run(**kwargs)`'s census row, or a row whose every field names the raise."""
         row = total(lambda: recorder.run(**kwargs))
         return row if isinstance(row, dict) else _NoCensus(row)
+
+    class _Exploding:
+        """A tick that raises, to prove `run_row` above is not itself an unreached control."""
+
+        @staticmethod
+        def run(**_kwargs):
+            raise SweepError("the tick could not account for its population")
+
+    _exploded = run_row(_Exploding())
+    check("the harness's OWN safety net fires: a tick that raises reports every census field as a "
+          "named marker, so a counter defect reds a check instead of aborting the run",
+          (_exploded["minted"], _exploded["refusals"]),
+          ((("NO CENSUS EMITTED", ("RAISED", "SweepError")),) * 2))
 
     clean = [pull(number=41, body="Closes #7")]
     rec = _Recorder(clean)
@@ -1880,8 +1894,8 @@ def _self_test():                                                       # noqa: 
     # WHY THIS BLOCK EXISTS. Round 2 blocked on "a value pinned through a pure helper while the call
     # site independently re-wires it"; the repair swept `sweep()`'s call sites and STOPPED THERE.
     # `main()` is the call site above those, and it was at 0% line coverage — 26 body lines that no
-    # check reached. MEASURED: 13 one-line edits inside it survived the whole suite. The worst is not
-    # subtle: passing `True` instead of `args.apply` makes a manual dispatch advertised as a
+    # check reached. MEASURED: 13 one-line edits inside it survived the whole suite. The worst is
+    # not subtle: passing `True` instead of `args.apply` makes a manual dispatch advertised as a
     # census-only preview WRITE REAL LEDGER RECORDS, and `--apply` is the entire safety story of an
     # unattended writer.
     #
@@ -2121,8 +2135,8 @@ def _self_test():                                                       # noqa: 
               (("RAISED", "SweepError"), [], True))
     _fake, _readers, parsed = readers_for(
         payloads={"contents/": {"encoding": "base64",
-                                "content": base64.b64encode(b'[models.opus5]\nprovider="anthropic"\n'
-                                                            ).decode()}},
+                                "content": base64.b64encode(
+                                    b'[models.opus5]\nprovider="anthropic"\n').decode()}},
         call=lambda rs: rs[0]("o/r"))
     check("...while the SHIPPED pointer is fetched and parsed",
           parsed, {"models": {"opus5": {"provider": "anthropic"}}})
