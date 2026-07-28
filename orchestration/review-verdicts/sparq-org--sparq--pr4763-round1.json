@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4763,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9973359762b43161de1ad293ca9cd60cb72ab9fe",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`sort_key` uses `canonical_key`, while this change explicitly preserves primitive numeric datatype distinctions (for example integer versus decimal). SPARQL ORDER BY compares numeric operands after numeric promotion, so `1`^^xsd:integer and `1.0`^^xsd:decimal belong to the same sort-key equivalence class and their relative order is unspecified. Splitting them into separate maximal runs can reject two conforming result sequences that differ only by permutation of those tied rows. The added mutation test uses only xsd:integer keys, so it does not catch this false-positive path.",
+    "file": "crates/sparq-difftest/src/multiset.rs",
+    "fix_hint": "Introduce an ORDER-BY-specific equivalence key/comparator that follows SPARQL ordering equality, including cross-datatype numeric promotion and the relevant temporal/string rules, rather than reusing the result-value canonical key. Add a focused test where integer 1 and decimal 1.0 are permuted within a tie and must compare equal, plus a nearby unequal numeric value that must remain a separate run.",
+    "severity": "major",
+    "title": "ORDER BY tie keys do not implement SPARQL numeric ordering equivalence"
+   }
+  ],
+  "progress": null,
+  "summary": "The new value-level and graph/ASK wiring is generally well tested, but the ORDER BY oracle partitions tie runs with the generic canonical term key. That key deliberately preserves primitive numeric datatypes, whereas SPARQL ORDER BY compares numeric literals by promoted numeric value. Consequently conforming engines may legally permute equal-valued integer/decimal/float/double rows, while this harness can split them into distinct runs and report a false differential. The focused tests cover same-datatype integer ties only and do not exercise this cross-datatype ordering invariant.",
+  "verdict": "request_changes"
+ }
+}
