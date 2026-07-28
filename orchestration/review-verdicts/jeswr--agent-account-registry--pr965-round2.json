@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 965,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c2310b4cf5fceefc08608a6d5e4c2946cac6310a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The sweep passes `is_human = lambda login: login.casefold() == args.maintainer.casefold()`, whose default is `jeswr`, into every ownership decision. The shared policy defines a proven human by collaborator permission (`write`, `maintain`, or `admin`), and `worker-pr.py` already implements that strict probe. Consequently, a different authorized maintainer's `labeled` event is treated as non-human by `label_application_machine_owned`; the mutation-boundary check and `clear_hold_with_repair` can then authorize deleting that person's hold. This preserves the prior round's blocker: a genuine human hold can still be erased.",
+    "file": "scripts/adjudicate-stuck.py",
+    "fix_hint": "Use the target-token-backed collaborator-permission probe used by the existing orchestration paths, fail closed when the probe cannot establish ownership, and add a non-vacuous test showing that a write/maintain/admin collaborator other than the configured/default login prevents both PR- and issue-hold deletion.",
+    "severity": "blocker",
+    "title": "Human ownership is reduced to one hard-coded login"
+   },
+   {
+    "body": "Reconciliation is reached only after `admission`, but `admission` refuses when `readmissions_spent >= AUTO_READMISSION_MAX`. If a PR has spent `AUTO_READMISSION_MAX - 1` slots, this sweep posts its receipt and then a later write fails, the receipt raises the live count to the cap. On the next sweep, admission returns `readmissions-spent` and the code records/leaves a human park instead of calling `readmission_writes`. The new replay test starts from zero and therefore misses this boundary case. Thus the receipt-first partial failure from round 1 can still strand the PR permanently after consuming its last slot.",
+    "file": "scripts/adjudicate-stuck.py",
+    "fix_hint": "Recognize and reconcile an incomplete receipt for the same head before applying the cap refusal (without issuing another receipt or budget), and extend the failure-after-each-write test to start at `AUTO_READMISSION_MAX - 1`; every retry must complete with exactly one new receipt.",
+    "severity": "major",
+    "title": "A final-slot receipt still prevents partial-failure reconciliation"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The prior blockers are not fully resolved. The ownership check still recognizes only one configured login as human, so holds applied by any other write/maintain/admin collaborator are classified as machine-owned and may be deleted. In addition, receipt-first reconciliation fails exactly when the interrupted admission consumes the final allowed slot: the next sweep refuses at the cap before reaching the reconciliation planner. The post-delete repair is also best-effort rather than a compare-and-swap, but the concrete identity and cap failures are independently sufficient to reject.",
+  "verdict": "request_changes"
+ }
+}
