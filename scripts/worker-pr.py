@@ -4262,6 +4262,120 @@ def _arm_hold_recheck(repo, pr_number, issue):
     return None, ""
 
 
+# ---- registry #892: THE ARM'S OWN CI READING ------------------------------------------------
+# dispatch-claim.py states the hole in its own words, in the block comment that replaced
+# `_live_strict_gate` (#762): "this repo takes no live CI read on any admission path at all,
+# because nothing here arms on CI (the arm decision is `worker-pr.decide_review`, which accepts
+# no CI argument)". That is true and it is the defect.
+#
+# LIVE EVIDENCE, sparq-org/sparq#4643 (one commit, 175d75b5, pushed 2026-07-27T23:38:52Z):
+#     23:39:34Z  docs-quality quick-gates  FAILURE
+#     23:40:26Z  gate, draft-tier          FAILURE     <- the aggregator concluded RED
+#     23:50:54Z  auto_merge_enabled                    <- armed 10m28s later, on that red head
+#     23:52:08Z  gate                      FAILURE     <- the ready_for_review re-run agrees
+#     00:05:31Z  convert_to_draft + auto_merge_disabled + review:pass -> review:needs
+# `assemble feature matrix` was SKIPPED on that head, not failed, so the red is a real leg
+# failure and not the assemble-matrix artifact this repo has been fooled by before.
+#
+# The retraction at 00:05:31Z was CORRECT: GAP-A re-derived the concluded-red gate on a ready,
+# armed PR and `decide_repair_admission` returned `defuse`. Nothing about the disarm needs
+# fixing, and the reviewed-sha marker was bound and equal to the live head the whole time —
+# there is no arm->bind race here. What is wrong is one layer up: the latch was placed on a head
+# whose aggregator had ALREADY concluded red, so it could never merge, and the very next
+# dispatch tick was guaranteed to retract it. Every such arm buys a round trip and nothing else:
+# `pr ready` + the latch mutation + disable-auto + redraft + two label flips, plus the re-review
+# the re-arm afterwards has to spend.
+#
+# WHY "REFUSE ON RED" AND NOT "REQUIRE GREEN". The stronger rule is unsafe on THIS repo and the
+# repo has already measured why. `repair_gate_conclusion`'s docstring records that 70/277
+# (25.3%) of round-1 review heads had the aggregator still IN PROGRESS at dispatch, and #762
+# records that the strict `gate` name reads "missing" on every sparq DRAFT head (a draft
+# publishes `gate, draft-tier`). A require-green arm would therefore refuse a quarter of the
+# lane on `pending` and the rest on `missing` — which is the #326/#334 clean-status regression
+# the ARM_BACKOFF block below exists to prevent, rebuilt one layer up. So the ONLY new refusal
+# is a CONCLUDED failure. `pending`, `missing`, `unknown` and BOTH green grades arm exactly as
+# they do today: this change can never make an arm WAIT on evidence it does not have, only
+# refuse one on evidence it does.
+ARM_DECLINE_GATE_RED = "gate-red"
+ARM_DECLINE_MARKER_PREFIX = "<!-- sparq-arm-declined:v1 sha="
+
+
+def _dispatch_claim():
+    """The shared dispatch predicates module (dispatch-claim.py). Loaded lazily so only the
+    paths that need it pay the import — the same idiom as `_park_policy` above, and the same
+    load review-fix.yml's own resolve step performs on this file."""
+    spec = importlib.util.spec_from_file_location(
+        "registry_dispatch_claim_armgate",
+        Path(__file__).resolve().with_name("dispatch-claim.py"))
+    if spec is None or spec.loader is None:
+        raise WorkerPrError("cannot load shared dispatch predicates")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _live_arm_gate(repo, head_sha):
+    """The LIVE tier-appropriate aggregator conclusion at the reviewed head, in
+    `repair_gate_conclusion`'s vocabulary (failure | pending | missing | unknown | one of the
+    two green grades).
+
+    Taken through dispatch-claim's OWN `_live_repair_gate` walk rather than a second spelling of
+    it: that walk requests each aggregator name by EQUALITY (never a prefix — `gate` prefixes
+    `gate, draft-tier`), pages each name to exhaustion, CROSS-CHECKS the collected count against
+    the endpoint's own `total_count`, resolves newest-run-wins across the tiered names so a
+    cancelled twin cannot decide a head whose real run is newer, and yields "unknown" rather
+    than a silent "missing" on any unprovable read. Re-deriving any of that here is how the two
+    readings would drift, and drift on this predicate is what #762 spent ten days on.
+
+    `draft=True` is passed unconditionally and is correct by construction: this is called from
+    `ready_and_arm` BEFORE its `gh pr ready`, so the head is still a draft and both tier names
+    are in scope. Module-level (not inlined) so the self-test can substitute it exactly the way
+    the rest of the ready_and_arm harness substitutes `_gh_json` / `_run_gh`."""
+    return _dispatch_claim()._live_repair_gate(repo, head_sha, True)
+
+
+def arm_gate_decision(repair_gate):
+    """PURE: may the merge latch be placed, given the tier-appropriate aggregator reading at the
+    reviewed head?
+
+    Returns `ARM_DECLINE_GATE_RED` on a CONCLUDED `failure` and "" (proceed) on every other
+    value, INCLUDING every value that means "we do not know yet". The fail direction is the one
+    thing this function exists to pin: an unprovable, missing or still-running aggregator must
+    arm exactly as it does today, because the alternative is the measured 25.3%-pending stall
+    described above. Refusing an arm is never a release on weaker evidence, so the new refusal
+    is safe in the other direction by construction."""
+    return ARM_DECLINE_GATE_RED if repair_gate == "failure" else ""
+
+
+def _record_arm_decline(repo, pr_number, reviewed_sha, grade, bot_login=""):
+    """The durable, SHA-bound receipt for a declined arm — the census row this decline is
+    required to emit, on the PR itself rather than only in a run log that ages out.
+
+    Idempotent on exactly the terms `_apply_trust_surface_audit` uses: only a comment authored
+    by the EXACT App identity and carrying the marker for THIS reviewed sha suppresses a
+    re-post, so a receipt from an earlier head never masks the current one and an absent
+    `bot_login` fails toward a duplicate receipt rather than a missing one. Best-effort by
+    design (`check=False`): a failed receipt must not convert a correct refusal-to-arm into a
+    raised arm step, because the refusal is the safe outcome and the raise would re-open the
+    round the refusal just saved."""
+    marker = f"{ARM_DECLINE_MARKER_PREFIX}{reviewed_sha} -->"
+    existing = _paginated_comments(repo, pr_number)
+    if bot_login and any(
+            marker in str(c.get("body", ""))
+            and str(c.get("user", {}).get("login", "")) == bot_login
+            for c in existing):
+        return
+    body = ("> 🤖 SPARQ agent — the cross-provider review APPROVED this PR, and the arm was "
+            f"DECLINED: the CI aggregator at the reviewed head {reviewed_sha[:12]} has already "
+            f"concluded `{grade}`. An auto-merge latch on a concluded-red head cannot merge, "
+            "and the next dispatch tick would defuse it (disable-auto + redraft) to run a CI "
+            "repair — so the latch is not placed and the PR is handed straight to the CI-repair "
+            "lane as a DRAFT. The approve still stands: once the repair advances the head, the "
+            "re-review re-binds it and the arm runs on a head whose gate is not red.\n\n"
+            + marker)
+    _run_gh(["pr", "comment", str(pr_number), "-R", repo, "--body", body], check=False)
+
+
 def _arm_auto_merge(repo, pr_number, reviewed_sha, attempts=ARM_ATTEMPTS, issue=None):
     """Latch the sha-bound auto-merge, surviving the post-`pr ready` CLEAN-STATUS race
     (P1, runs 29674274380/29674657458: every failed arm's ready_for_review `gate` run
@@ -4495,6 +4609,36 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
         # trust-plane change is durably recorded whether flagged by path or by label. Malformed
         # live label surfaces RAISE (fail closed); the arm never proceeds on an unreadable posture.
         trust_hits = tuple(trust_hits) + (SECURITY_LABEL_AUDIT_HIT,)
+    if arm:
+        # [registry #892] THE ARM'S OWN CI READING — see the ARM_DECLINE_GATE_RED block. Placed
+        # HERE, above every mutation including the trust audit and the `pr ready` below, because
+        # a declined arm must leave the PR EXACTLY as the review found it: an unmodified,
+        # correctly-labelled DRAFT. Undrafting first and redrafting on the refusal would emit the
+        # very ready/draft churn pair this change exists to stop, and would race pr-gate.yml into
+        # starting a `gate` run for a head we already know is red.
+        arm_gate = _live_arm_gate(repo, reviewed_sha)
+        declined = arm_gate_decision(arm_gate)
+        if declined:
+            _record_arm_decline(repo, pr_number, reviewed_sha, arm_gate, bot_login=bot_login)
+            # The PR keeps the `review:needs` it was dispatched under and stays a DRAFT, and
+            # `bind_reviewed_sha` asks review-fix.yml to bind the marker anyway. That pairing is
+            # load-bearing and is the whole routing decision: the review DID complete end to end
+            # on this head, so binding is honest — and it is what puts the PR in the CI-REPAIR
+            # lane instead of the review lane. enumerate_review_items walks
+            # review:needs -> (draft and reviewed_match, so no re-review) -> the drafted
+            # fall-through -> GAP-A `repair == "failure"` -> needs-ci-fix. Leaving the marker
+            # UNBOUND would instead re-emit `needs-review` and spend another cross-provider
+            # review round on a tree nobody has touched. `review:pass` is deliberately NOT
+            # applied: no valid flow leaves a DRAFT labelled review:pass, and the disarm net and
+            # the stranded recovery both key stand-downs off that label.
+            _write_outputs({"armed": False, "head_moved": False, "arm_complete": False,
+                            "arm_declined": declined, "arm_gate": arm_gate,
+                            "bind_reviewed_sha": True})
+            print(f"arm DECLINED ({declined}): the aggregator at the reviewed head "
+                  f"{reviewed_sha[:12]} concluded '{arm_gate}' — no ready, no latch, no "
+                  "review-state mutation; the PR stays a draft and is handed to the CI-repair "
+                  "lane (the approve stands and re-arms once the repair advances the head)")
+            return
     if arm and trust_hits:
         # Durable audit BEFORE the merge latch can fire (sol r2 on #257): auto-merge can
         # complete immediately, and a post-merge crash would leave an armed trust diff with
@@ -4967,6 +5111,36 @@ def provenance_workflow_seam_report():
         # re-derived `.github/workflows` INDEPENDENTLY of the report. An assertion about a scan
         # has to read what the scan says it scanned.
         **dict(zip(("gh_debug_scanned_root", "gh_debug_env_sites"), _workflow_gh_debug_scan())),
+    }
+
+
+def arm_decline_workflow_seam_report():
+    """[registry #892] Structural findings about the LIVE review-fix.yml reviewed-sha BIND step,
+    read off PARSED YAML nodes.
+
+    The declined arm's routing lives HALF in Python and half in this `if:` — ready_and_arm sets
+    `bind_reviewed_sha`, and only this expression turns it into a marker write. A behavioural
+    test of ready_and_arm alone cannot see the expression at all, and on this repo every uncaught
+    mutant of a recent sweep lived at exactly that seam, so the three things a deletion would
+    change are asserted here by name: that the step still exists, that it still invokes
+    `reviewed-sha set`, and that its condition still admits BOTH the armed leg and the
+    declined-arm leg. A substring assertion over the file text could not see `if: false`,
+    `continue-on-error: true`, or a deleted step."""
+    steps = _workflow_yaml("review-fix.yml")["jobs"]["outcome"]["steps"]
+    step = next((s for s in steps
+                 if "reviewed-sha set" in str(s.get("run") or "")), None)
+    condition = str((step or {}).get("if") or "")
+    return {
+        "step_present": step is not None,
+        "step_name": (step or {}).get("name"),
+        "invokes_reviewed_sha_set": bool(
+            re.search(r"worker-pr\.py\s+reviewed-sha\s+set", str((step or {}).get("run") or ""))),
+        "step_continue_on_error": (step or {}).get("continue-on-error"),
+        "admits_armed_leg": "steps.arm.outputs.arm_complete == 'true'" in condition,
+        "admits_declined_leg": "steps.arm.outputs.bind_reviewed_sha == 'true'" in condition,
+        "requires_arm_step_success": "steps.arm.outcome == 'success'" in condition,
+        "still_drops_hold": "decision != 'hold'" in condition,
+        "still_drops_stale": "decision != 'stale'" in condition,
     }
 
 
@@ -9248,7 +9422,8 @@ def _self_test():
     raa_state = {}
     real_raa = {name: globals()[name] for name in (
         "_gh_json", "_run_gh", "_pr_changed_files", "set_review_state",
-        "_paginated_comments", "needs_user", "_write_outputs", "_arm_sleep_backoff")}
+        "_paginated_comments", "needs_user", "_write_outputs", "_arm_sleep_backoff",
+        "_live_arm_gate")}
 
     def raa_gh_json(args, **_kw):
         path = args[1] if len(args) > 1 else ""
@@ -9308,7 +9483,7 @@ def _self_test():
                 issue_labels=(), issue=None, probe_garbage=False, labels_payload=None,
                 benign_diff=False, security_keywords=(), merge_script=None,
                 hold_after_fail=None, draft=True, author="sparq[bot]", head_repo="o/r",
-                state="open", late_after_read=None):
+                state="open", late_after_read=None, arm_gate="pending"):
         raa_calls.clear(); raa_outputs.clear()
         sha = "b" * 40
         raa_state.update(head=(sha if head_ok else "c" * 40), merge_fails=merge_fails,
@@ -9317,7 +9492,7 @@ def _self_test():
                          benign_diff=benign_diff, merge_script=merge_script,
                          hold_after_fail=hold_after_fail, draft=draft, author=author,
                          head_repo=head_repo, state=state, late_after_read=late_after_read,
-                         pr_reads=0)
+                         pr_reads=0, arm_gate=arm_gate)
         globals()["_gh_json"] = raa_gh_json
         globals()["_run_gh"] = raa_run_gh
         globals()["_pr_changed_files"] = lambda repo, pr: ["scripts/worker-pr.py"]
@@ -9325,6 +9500,13 @@ def _self_test():
         globals()["_paginated_comments"] = lambda repo, pr: list(comments)
         globals()["needs_user"] = lambda repo, pr, reason, **kw: raa_calls.append("needs-user")
         globals()["_arm_sleep_backoff"] = lambda attempt: raa_calls.append(f"sleep:{attempt}")
+        # [registry #892] the live aggregator reading, substituted exactly like every other I/O
+        # seam in this harness. The DEFAULT is "pending" — the fail-open grade — so every
+        # pre-existing check in this block exercises the unchanged arm path and a regression that
+        # widened the decline beyond a concluded `failure` turns them red rather than passing
+        # quietly on a default that already declined.
+        globals()["_live_arm_gate"] = (
+            lambda repo, head_sha: raa_state.get("arm_gate", "pending"))
         globals()["_write_outputs"] = raa_outputs.update
         ready_and_arm("o/r", 41, sha, "anthropic", "ab" * 8, "openai", "acctX", True,
                       issue=issue, bot_login="sparq[bot]",
@@ -9645,6 +9827,81 @@ def _self_test():
                       ("raised", any(c.startswith("pr ready") for c in raa_calls)
                        or bool(raa_latches()), "state:pass" in raa_calls),
                       ("raised", False, False))
+        # ---- [registry #892] THE ARM'S OWN CI READING -----------------------------------------
+        # sparq-org/sparq#4643: `gate, draft-tier` CONCLUDED failure at 23:40:26Z and the loop
+        # armed that same head at 23:50:54Z; the next tick defused the arm. The latch can never
+        # merge a concluded-red head, so placing it is a guaranteed round trip.
+        # PURE table first — the decline is reachable from the concluded `failure` grade and
+        # from NOTHING else. Every other grade is a CONTROL: the fail-open direction is the
+        # property, because a decline on `pending`/`missing`/`unknown` would refuse the measured
+        # 25.3% of heads whose aggregator is still in progress at dispatch (#762).
+        check("arm_gate_decision declines ONLY a concluded failure (fail-open controls)",
+              {grade: arm_gate_decision(grade) for grade in (
+                  "failure", "pending", "missing", "unknown",
+                  "green:merge-required", "green:draft-tier", "success", "", None)},
+              {"failure": ARM_DECLINE_GATE_RED, "pending": "", "missing": "", "unknown": "",
+               "green:merge-required": "", "green:draft-tier": "", "success": "", "": "",
+               None: ""})
+        # RED: the #4643 shape. No ready, no latch, no review-state mutation, no issue
+        # completion — and a marker BIND request, which is what routes the PR to the CI-repair
+        # lane instead of back into the review lane.
+        run_raa(benign_diff=True, arm_gate="failure")
+        check("a CONCLUDED-RED aggregator DECLINES the arm: no ready, no latch, no state churn",
+              (any(c.startswith("pr ready") for c in raa_calls),
+               bool(raa_latches()),
+               "state:pass" in raa_calls,
+               raa_outputs.get("armed"),
+               raa_outputs.get("arm_complete"),
+               raa_outputs.get("arm_declined"),
+               raa_outputs.get("arm_gate"),
+               raa_outputs.get("bind_reviewed_sha")),
+              (False, False, False, False, False, ARM_DECLINE_GATE_RED, "failure", True))
+        check("the declined arm leaves a SHA-bound receipt naming the reason on the PR",
+              any(ARM_DECLINE_MARKER_PREFIX + sha in c and c.startswith("pr comment")
+                  for c in raa_calls), True)
+        decline_bot = {"body": f"x {ARM_DECLINE_MARKER_PREFIX}{sha} -->",
+                       "user": {"login": "sparq[bot]"}}
+        run_raa(benign_diff=True, arm_gate="failure", comments=(decline_bot,))
+        check("the decline receipt is idempotent for THIS sha (no duplicate every tick)",
+              any(ARM_DECLINE_MARKER_PREFIX in c and c.startswith("pr comment")
+                  for c in raa_calls), False)
+        run_raa(benign_diff=True, arm_gate="failure",
+                comments=({"body": f"x {ARM_DECLINE_MARKER_PREFIX}{'d' * 40} -->",
+                           "user": {"login": "sparq[bot]"}},))
+        check("a receipt bound to an EARLIER head never suppresses this head's receipt",
+              any(ARM_DECLINE_MARKER_PREFIX + sha in c for c in raa_calls), True)
+        # CONTROL, and the load-bearing half: without it the fix could pass by declining
+        # everything. A head whose aggregator is NOT a concluded failure still gets its arm —
+        # for the green grades AND for every not-yet-known grade.
+        for grade in ("green:merge-required", "green:draft-tier", "pending", "missing",
+                      "unknown"):
+            run_raa(benign_diff=True, arm_gate=grade)
+            check(f"CONTROL: aggregator '{grade}' still ARMS exactly as before",
+                  (any(c.startswith("pr ready") for c in raa_calls),
+                   bool(raa_latches()), raa_outputs.get("armed"),
+                   "state:pass" in raa_calls,
+                   raa_outputs.get("arm_complete"),
+                   raa_outputs.get("arm_declined"),
+                   any(ARM_DECLINE_MARKER_PREFIX in c for c in raa_calls)),
+                  (True, True, True, True, True, None, False))
+        # The decline is ABOVE every mutation, including the trust audit: a declined arm must
+        # leave the PR byte-identical to how the review found it.
+        run_raa(arm_gate="failure")
+        check("a declined arm writes NO trust-surface audit either (no mutation at all)",
+              any("trust-surface" in c for c in raa_calls), False)
+        # THE YAML SEAM. `bind_reviewed_sha` is inert unless review-fix.yml's bind step admits
+        # it, and that expression is not reachable from any behavioural test of this module.
+        check("review-fix.yml's bind step admits BOTH the armed and the declined-arm legs",
+              arm_decline_workflow_seam_report(),
+              {"step_present": True,
+               "step_name": "Bind the reviewed sha (terminal marker for this head)",
+               "invokes_reviewed_sha_set": True,
+               "step_continue_on_error": None,
+               "admits_armed_leg": True,
+               "admits_declined_leg": True,
+               "requires_arm_step_success": True,
+               "still_drops_hold": True,
+               "still_drops_stale": True})
         run_raa(benign_diff=True)
         check("benign-path diff with NO security posture ARMS with NO audit (#153 control)",
               (any(LATCH_MUTATION in c for c in raa_calls),
