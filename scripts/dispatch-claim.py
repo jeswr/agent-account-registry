@@ -10389,6 +10389,53 @@ def _self_test():
           "without a chain_preference declaration; a PLAN-only carve-out (the sparq #4211 defect) "
           "is reported, and a live divergence raises RouteDivergenceError naming both chains")
 
+    # ---- [OPUS-5] adopt-loop L3d: the PLAN PACKAGE seam, which straddles TWO REPOSITORIES -------
+    # `_route_matches` compares the plan row's minted `package` against the reduction of its own
+    # labels. PLAN runs the TARGET repo's `dispatch-plan.py`, so a target still on the pre-area-set
+    # reduction mints `__global__` for its multi-area rows. Rejecting those here would raise
+    # `plan package disagrees with labels` for every one of them on every tick, forever — the #112
+    # shape, one artifact over — so the legacy spelling is accepted, GUARDED BY the labels proving
+    # two or more distinct areas. Every other disagreement still raises.
+    def _pkg_route_item(number, areas, package):
+        labels = sorted([f"area:{a}" for a in areas] + ["role:impl", "priority:P2"])
+        route = _agree._POLICY.resolve("probe/target", labels, _div_policy, _sparq_declared)
+        return {"number": number, "labels": labels, "role": "impl", "priority": 2,
+                "package": package, "model_chain": route["model_chain"],
+                "agent": route["agent"], "escalate": route["escalate"]}
+
+    def _pkg_route_refusal(item):
+        try:
+            _route_matches("probe/target", item, _div_policy, _sparq_declared, _agree._POLICY)
+        except DispatchError as exc:
+            return str(exc)
+        return None
+
+    _two_area = ["gui", "ci"]
+    assert _pkg_route_refusal(_pkg_route_item(3368, _two_area, "ci,gui")) is None, \
+        "the CANONICAL composite key must be accepted"
+    assert _pkg_route_refusal(_pkg_route_item(3369, _two_area, GLOBAL_PACKAGE)) is None, \
+        ("an un-upgraded TARGET planner mints __global__ for a multi-area row; rejecting it here "
+         "defers that row forever (the #112 shape across the PLAN artifact)")
+    for _bad, _why in (
+            ("gui,ci", "a NON-canonical (unsorted) composite is not the reduction of any set"),
+            ("ci", "a single area for a row whose labels declare two"),
+            ("ci,site", "a composite naming an area the row does not carry")):
+        assert "plan package disagrees with labels" in (
+            _pkg_route_refusal(_pkg_route_item(3370, _two_area, _bad)) or ""), (_bad, _why)
+    # CONTROLS on the guard itself. The tolerance is `>=2 DISTINCT areas` and nothing else:
+    assert _pkg_route_refusal(_pkg_route_item(3371, ["gui"], "gui")) is None
+    assert "plan package disagrees with labels" in (
+        _pkg_route_refusal(_pkg_route_item(3372, ["gui"], GLOBAL_PACKAGE)) or ""), \
+        "[CONTROL] a ONE-area row minted __global__ must still be REJECTED"
+    assert _pkg_route_refusal(_pkg_route_item(3373, [], GLOBAL_PACKAGE)) is None, \
+        "[CONTROL] a ZERO-area row reduces to __global__ on BOTH sides and matches directly"
+    assert "plan package disagrees with labels" in (
+        _pkg_route_refusal(_pkg_route_item(3374, [], "ci")) or ""), \
+        "[CONTROL] a ZERO-area row minted as a named area must still be REJECTED"
+    print("  ok   adopt-loop L3d: _route_matches accepts the canonical composite AND the legacy "
+          "`__global__` an un-upgraded target planner mints for a MULTI-area row, and rejects "
+          "every other disagreement — including `__global__` on a one-area or zero-area row")
+
     # ---- THE IMPL LANE. worker.yml runs the SAME mint-vs-adopt equality with its OWN two copies of
     # the reduction, and the review of #702 MEASURED that both could be reverted to the pre-#112
     # rule with the entire 34-script enrolled suite staying green. Both now go through the canonical
