@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4375,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "00a9a80065381bbc055dc78da0d2e9a8967c0ca1",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "SV-ND-2 unconditionally says that a request whose bound index is unreadable or absent MUST be indistinguishable from the same request against a non-existent index. SV-ND-4, the following explanation, and the Unreadable descriptor conformance scenario instead permit and require distinguishable results when the requester has at least one eligible entry: neighbours are returned with the unreadable-descriptor bound index, while an unbound service returns zero solutions. Because SV-ND-2 contains no eligible-entry qualification, a conforming implementation cannot satisfy both normative requirements.",
+    "file": "site/specs/solid-vector-api.typ",
+    "fix_hint": "Qualify SV-ND-2 itself: bound-index unreadability or absence must be indistinguishable from a non-existent index only when the requester has an empty eligible entry set. Keep seed and referenced-graph unreadability/absence indistinguishable unconditionally. Ensure the nearby explanation and conformance scenario use exactly the same boundary.",
+    "severity": "major",
+    "title": "SV-ND-2 still contradicts the bound-index disclosure exception"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 remains materially unchanged on the prior major finding. SV-ND-4 and the Unreadable descriptor conformance scenario expressly permit a requester with at least one eligible entry to distinguish a bound index with an unreadable descriptor from no bound index, and to infer its dimension. However, SV-ND-2 still unconditionally requires a request whose bound index is unreadable or absent to be indistinguishable from the same request against a non-existent index. Explanatory prose cannot narrow that normative MUST. The specification therefore continues to prescribe incompatible behavior, so progress is stagnant and approval remains blocked.",
+  "verdict": "request_changes"
+ }
+}
