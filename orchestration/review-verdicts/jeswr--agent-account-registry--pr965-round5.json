@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 965,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "dc75bafdcd9722c5ec214e79486c1ed78c97a7e4",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The pull request is fetched only once before planning. Immediately before the first possible write, the code calls `_live_hold` for the PR issue and source issue but never re-fetches `repos/{repo}/pulls/{number}` or verifies that the live head SHA and worker head ref still equal `head_sha` and still bind to `issue_number`. Receipts, episode state, verdict selection, and comments therefore remain authorized for the earlier head. A force-push during the API gap can cause mutations for the old head to be applied to a PR now pointing at different code.",
+    "file": "scripts/adjudicate-stuck.py",
+    "fix_hint": "At the mutation boundary, before any comment or label write, re-fetch the pull request and require exact equality of the current head SHA and worker ref/source-issue binding with the values used for adjudication. Stand down without writing on any mismatch or malformed response. Add an end-to-end test that changes the head between planning and the boundary and asserts zero comment and label writes.",
+    "severity": "blocker",
+    "title": "The mutation boundary is still not bound to the current pull request head"
+   },
+   {
+    "body": "`in_flight` is computed from the initial comments and timeline, stored in `probe`, and reused unchanged by boundary `admission`. The boundary's `_live_hold` calls obtain fresh timelines only for ownership; they do not return the current hold application timestamp, and comments/receipts are not refreshed. If the original hold is removed and machine-reapplied after the receipt during the gap, ownership can remain machine-owned while stale `readmission_in_flight=True` bypasses the cap for a new park.",
+    "file": "scripts/adjudicate-stuck.py",
+    "fix_hint": "At the mutation boundary, fetch fresh timeline and bot comments/receipts, recompute the live hold application time, matching adjudication record, receipt stamps, readmission count, and `incomplete_readmission`, and pass only that fresh result to `admission`. Add a non-vacuous boundary test that moves the live hold application from before to after the receipt and asserts `readmissions-spent` with zero writes.",
+    "severity": "major",
+    "title": "The final-slot exception still uses stale hold-ordering evidence"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The same two trust-boundary defects from round 4 remain. The mutation boundary still refreshes only issue label/ownership snapshots and then calls admission with the stale probe assembled earlier. It neither re-fetches the pull request to bind the current head/ref to the adjudicated head/source issue nor recomputes the final-slot in-flight exception from fresh timeline and receipt evidence. Thus writes can still be authorized for a force-pushed-away head, and a newly reapplied hold can still inherit an exception proven for the prior application. The added self-tests exercise pure helpers and simulated replay, but do not test either live boundary race end to end. Progress is stagnant because both prior findings remain at the same severities.",
+  "verdict": "request_changes"
+ }
+}
