@@ -19072,6 +19072,50 @@ def _starvation_row(number, *, packages, parked=False, inactive=True, decision="
             "detail" if parked else "not-parked", inactive, cause)
 
 
+def _branch_is_statically_dead(test, field):
+    """True when `field` ('body'/'orelse') of an `if`/`while` whose test is `test` can NEVER run
+    because the test is a compile-time constant. `if False:` / `if 0:` kill the body; `if True:`
+    kills the `else`. Anything the literal evaluator cannot fold (a name, a call, a comparison) is
+    treated as LIVE — this narrows what counts as proof, it never widens it."""
+    try:
+        value = ast.literal_eval(test)
+    except (ValueError, TypeError, SyntaxError):
+        return False                      # not a constant -> could go either way -> live
+    return not value if field == "body" else bool(value)
+
+
+def _live_nodes(node):
+    """Yield `node` and every descendant that a constant-false guard does not already kill.
+
+    `ast.walk` sees the whole subtree, so it cannot tell a statement that RUNS from one buried
+    under `if False:` — the dead-code mutant that satisfies a structural claim while shipping
+    nothing. A `while`'s `orelse` runs when the loop finishes, so only its `body` is killable."""
+    yield node
+    for field, value in ast.iter_fields(node):
+        if isinstance(node, ast.If) and field in ("body", "orelse") \
+                and _branch_is_statically_dead(node.test, field):
+            continue
+        if isinstance(node, ast.While) and field == "body" \
+                and _branch_is_statically_dead(node.test, field):
+            continue
+        for child in (value if isinstance(value, list) else [value]):
+            if isinstance(child, ast.AST):
+                yield from _live_nodes(child)
+
+
+def _escalation_block(source):
+    """The PRODUCTION escalation loop, lifted verbatim from `source` — header through the last
+    statement of its body. Only used to build the "whole call site under `if False:`" mutant, which
+    is the ONLY one that exercises the live-ancestry decision on the LOOP (as opposed to on the
+    counter inside it)."""
+    head = "        for _stuck, _stuck_cause in starvation_stuck_holders(\n"
+    begin = source.index(head)
+    end = source.index("\n        if starved:\n", begin) + 1
+    block = source[begin:end]
+    assert block.count("defer_reasons[") == 1, block          # the counter must be inside it
+    return block
+
+
 def _escalation_call_site(source):
     """[registry #772 + #677] STRUCTURAL proof that some PRODUCTION function both iterates
     `starvation_stuck_holders(...)` and counts each result into the shared `defer_reasons`
@@ -19084,26 +19128,51 @@ def _escalation_call_site(source):
     [registry #677] The counter subscript is pinned to `STARVATION_STUCK_BUCKETS[...]` rather than
     to one literal reason. A literal here would be satisfied by a call site that files all three
     causes into one bucket — which is precisely the measurement hole the per-cause bucket exists to
-    close, and it would leave every pure-function assertion in this file green."""
-    import ast
+    close, and it would leave every pure-function assertion in this file green.
+
+    [registry #677, round 1] Pinning the DICT was not enough: `STARVATION_STUCK_BUCKETS[<any
+    expression>]` also matched, so the very mutant the paragraph above names — every cause filed
+    under one hard-coded key — kept this green. So the loop's `(number, cause)` target is BOUND
+    (the two-name tuple unpack is REQUIRED; a call site that reshapes it must update this checker
+    rather than silently fall through it), and the counter's inner subscript must be that exact
+    `cause` NAME, un-rebound inside the loop. Reachability is decided on live ancestry
+    (`_live_nodes`), so the docstring's "not a dead branch" claim is now something the code
+    actually enforces. SEVEN mutants in `_starvation_sweep_self_test` — hard-coded key, four
+    dead-branch shapes (`if False:` on the counter and on the WHOLE loop, `while False:`, an
+    `if True:`/`else:` counter), a rebound cause, and a cause never unpacked at all — must each
+    drive this back to None."""
     tree = ast.parse(source)
     for func in ast.walk(tree):
         if not isinstance(func, ast.FunctionDef) or func.name.endswith("_self_test"):
             continue
-        for loop in ast.walk(func):
+        for loop in _live_nodes(func):
             if not isinstance(loop, ast.For):
                 continue
             call = loop.iter
             if not (isinstance(call, ast.Call)
                     and getattr(call.func, "id", None) == "starvation_stuck_holders"):
                 continue
-            for stmt in ast.walk(loop):
+            # The sweep yields `(number, cause)` pairs; bind the cause slot by name so the counter
+            # below has to key on THIS iteration's cause rather than on any constant that happens
+            # to be a valid bucket key.
+            target = loop.target
+            if not (isinstance(target, ast.Tuple) and len(target.elts) == 2
+                    and all(isinstance(elt, ast.Name) for elt in target.elts)):
+                continue
+            cause = target.elts[1].id
+            body = list(_live_nodes(loop))
+            if any(isinstance(node, ast.Name) and node.id == cause
+                   and isinstance(node.ctx, ast.Store) and node is not target.elts[1]
+                   for node in body):
+                continue      # the cause name is reassigned in the loop -> no longer this row's
+            for stmt in body:
                 if (isinstance(stmt, ast.AugAssign) and isinstance(stmt.op, ast.Add)
                         and isinstance(stmt.target, ast.Subscript)
                         and getattr(stmt.target.value, "id", None) == "defer_reasons"
                         and isinstance(stmt.target.slice, ast.Subscript)
                         and getattr(stmt.target.slice.value, "id", None)
-                        == "STARVATION_STUCK_BUCKETS"):
+                        == "STARVATION_STUCK_BUCKETS"
+                        and getattr(stmt.target.slice.slice, "id", None) == cause):
                     return func.name
     return None
 
@@ -20248,13 +20317,66 @@ def _starvation_sweep_self_test():
     # and completely inert. Asserted structurally rather than textually on purpose: a six-character
     # call-site edit can leave every string in place, and a regex anchored `(?m)^\s*...` matches at
     # ANY indentation, so it cannot tell a live statement from one buried in a dead branch.
-    seam = _escalation_call_site(Path(__file__).resolve().read_text(encoding="utf-8"))
+    _seam_src = Path(__file__).resolve().read_text(encoding="utf-8")
+    seam = _escalation_call_site(_seam_src)
     assert seam == "dispatch", (
         "the production tick must iterate starvation_stuck_holders(...) AND count each escalated "
         "holder into defer_reasons[STARVATION_STUCK_BUCKETS[cause]] — without both, a stuck "
         f"__global__ holder is silent again (found {seam!r})")
-    print("  ok   #772 call-site seam (AST): the production tick ITERATES the escalation and "
-          "COUNTS every escalated holder — a deleted call site or a dropped counter reds here")
+    # NON-VACUITY, on the PRODUCTION source. `seam == "dispatch"` alone proves only that SOMETHING
+    # shaped like the counter exists; each mutant below keeps the loop, the call and the histogram
+    # in place and breaks exactly the per-cause guarantee this PR ships, so each must come back
+    # None. Without them the marquee claim ("every cause counted under its OWN bucket") is a
+    # comment. Line-anchored: the fixture goes stale loudly rather than mutating nothing.
+    _count = "            defer_reasons[STARVATION_STUCK_BUCKETS[_stuck_cause]] += 1\n"
+    _head = "        for _stuck, _stuck_cause in starvation_stuck_holders(\n"
+    _block = _escalation_block(_seam_src)
+    for _mutant_why, _edits in (
+        ("all three causes hard-coded into ONE bucket",
+         ((_count,
+           "            defer_reasons[STARVATION_STUCK_BUCKETS[GLOBAL_CAUSE_NO_PROVENANCE]] += 1\n"
+           ),)),
+        ("the counter buried under `if False:`",
+         ((_count, "            if False:\n"
+                   "                defer_reasons[STARVATION_STUCK_BUCKETS[_stuck_cause]] += 1\n"),
+          )),
+        ("the counter buried under `while False:`",
+         ((_count, "            while False:\n"
+                   "                defer_reasons[STARVATION_STUCK_BUCKETS[_stuck_cause]] += 1\n"),
+          )),
+        ("the counter demoted to the `else:` of a constant-true guard",
+         ((_count, "            if True:\n"
+                   "                pass\n"
+                   "            else:\n"
+                   "                defer_reasons[STARVATION_STUCK_BUCKETS[_stuck_cause]] += 1\n"),
+          )),
+        ("the cause rebound to a constant before the count",
+         ((_count, "            _stuck_cause = GLOBAL_CAUSE_NO_PROVENANCE\n"
+                   "            defer_reasons[STARVATION_STUCK_BUCKETS[_stuck_cause]] += 1\n"),
+          )),
+        ("the cause never unpacked from the pair at all",
+         ((_head, "        for _stuck in starvation_stuck_holders(\n"),
+          (_count, "            defer_reasons[STARVATION_STUCK_BUCKETS[_stuck]] += 1\n"))),
+        # ...and the WHOLE call site under a constant-false guard, not just the counter: the loop
+        # scan is a separate ancestry decision from the body scan, and only this mutant reds it.
+        ("the entire escalation loop buried under `if False:`",
+         ((_block, "        if False:\n" + textwrap.indent(_block, "    ")),)),
+    ):
+        _mutant = _seam_src
+        for _anchor, _replacement in _edits:
+            assert _mutant.count(_anchor) == 1, (
+                f"the #677 call-site mutant anchor no longer matches production verbatim "
+                f"({_mutant_why}) — the edit would hit nothing and the mutant would pass vacuously")
+            _mutant = _mutant.replace(_anchor, _replacement)
+        assert _mutant != _seam_src, f"the #677 call-site mutant fixture is stale: {_mutant_why}"
+        ast.parse(_mutant)                # raises: a mutant that cannot even parse is not a kill
+        assert _escalation_call_site(_mutant) is None, (
+            f"the #677 call-site seam accepted a mutant with {_mutant_why} — it proves the counter "
+            "EXISTS, not that it files each holder under the cause the sweep returned")
+    print("  ok   #772/#677 call-site seam (AST): the production tick ITERATES the escalation and "
+          "COUNTS every holder under ITS OWN cause — a deleted call site, a dropped counter, and "
+          "7 per-cause mutants (hard-coded bucket, 4 dead-branch shapes, rebound cause, cause "
+          "never unpacked) each red here")
 
     # ---- [registry #822] THE PARK CALL SITE, on the PARSED tree -------------------------------
     # The pure-function tests prove `starvation_park_targets` returns the whole batch. NONE of them
