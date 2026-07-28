@@ -73,10 +73,28 @@ slot automatically — no receipt-guessing).
 
 ### The `package` partition has ONE canonical derivation (and one pinned copy)
 
-A row's `package` is the single conflict partition its lease reserves, reduced from the source
-issue's `area:*` labels: **exactly one** distinct area reserves that area, **zero or multiple**
-reserve the serializing `__global__` partition (fail-closed — over-serialize a multi-area row rather
-than free a busy sibling crate).
+A row's `package` is the conflict partition its lease reserves, reduced from the source issue's
+`area:*` labels. **A partition key names a SET of areas**, and two rows exclude each other iff their
+sets **intersect** (`lease_schema.packages_conflict`):
+
+| the row's `area:*` labels | the key it reserves | excludes against |
+|---|---|---|
+| exactly one, `area:A` | `A` | anything reserving `A` |
+| two or more, `area:A` + `area:B` | `A,B` (sorted, `,`-joined — canonical) | anything reserving `A` **or** `B` |
+| **none** | `__global__` | **everything** (fail-closed: the footprint is unknown) |
+
+The zero-area row is the only one that is still deliberately over-wide, and that asymmetry is the
+whole safety argument: an unlabelled row's blast radius cannot be named, so narrowing it would make
+it concurrent with all live work at once. Multi-area rows used to reserve `__global__` too — which
+made "touches A and B" mean "touches everything" and self-blocked 13.9% of the ready board — and
+that is what the set-valued key fixes.
+
+`__global__` is the universal set, so `packages_conflict` serializes it in both directions exactly
+as the old string comparison did. Every enforcement site decides with that one predicate —
+`select-and-claim.partition_available` (the CAS claim), `dispatch-claim.filter_busy_area_items`
+(PLAN assemble), `revalidate_items_against_live_pulls` (CLAIM live re-check) and
+`sibling_lease_conflict` (the cross-lane ledger view) — because a widening applied at one site and
+not another plans work the next one refuses, every tick.
 
 That reduction is **`lease_schema.plan_package`**. Precisely:
 
@@ -103,6 +121,14 @@ a value-agreement leg (value agreement is exactly what a private-but-agreeing co
 The fifth row, `dispatch-plan.py`, is the exception and is **agreement-pinned, not shared** — it
 ships where `lease_schema.py` does not exist. A private copy *there* is caught only if it disagrees
 on one of the exercised area shapes, which is weaker than the four callers above.
+
+And it is the one seam that genuinely straddles two repositories: PLAN runs **the target repo's
+own** `dispatch-plan.py`, cloned at run time, so a target still on the pre-set reduction mints
+`__global__` for its multi-area rows. The registry therefore does not trust the minted string —
+`dispatch-claim.item_partition` re-derives every impl row's reservation from that row's own
+(schema-validated) `area:*` labels, and `_route_check` accepts the legacy `__global__` spelling
+**only** where those labels prove two or more distinct areas. A zero-area row reduces to
+`__global__` on both sides, matches the equality directly, and can never be narrowed by that rule.
 The routing tables `review-fix.yml` re-derives inline (`review_chain` / `fix_chain` / `ladders`) are
 pinned to `dispatch-claim.REVIEW_CHAIN` / `FIX_CHAIN` / `worker-pr.ESCALATION_LADDERS` the same way.
 `FIX_CHAIN` is the provider-wide walk, **not** the chain the dispatcher claims from: since #578 the
