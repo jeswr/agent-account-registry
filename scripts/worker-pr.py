@@ -3479,6 +3479,27 @@ def identity_refusal_reason_prose(reason):
     return IDENTITY_REFUSAL_REASONS[reason]
 
 
+def identity_refusal_issue(value, log=print):
+    """PURE. Coerce review-fix.yml's `--issue` into an issue number, or None.
+
+    This is the loop's EXIT, so its inputs must never be able to ABORT it — an aborted exit is
+    #972 returning. `needs.resolve.outputs.issue` crosses a workflow output, and every sibling
+    subcommand declares `--issue type=int`, where an empty or malformed value is an argparse
+    exit 2 BEFORE any park can land. Here it degrades instead: the PR-side park alone already
+    removes the PR from the review frontier (enumerate_review_items excludes
+    HUMAN_HOLD_PR_LABELS), so a missing source issue costs the issue-side label and nothing more."""
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return None
+    try:
+        number = int(text)
+    except ValueError:
+        log(f"::warning::identity-refusal: issue {value!r} is not an issue number; parking the "
+            "PR only (an unparseable issue must never abort the review loop's exit)")
+        return None
+    return number if number > 0 else None
+
+
 def identity_refusal_records(comments, bot_login):
     """PURE. The set of target-identity refusal CODES already receipted on this PR by the bot.
 
@@ -3536,6 +3557,7 @@ def identity_refusal(repo, pr_number, reason, issue=None, bot_login="",
     Idempotent: a re-run whose reason is already receipted writes NOTHING (no second comment, no
     second park, no second ops alert)."""
     prose = identity_refusal_reason_prose(reason)      # closed enum, BEFORE any write
+    issue = identity_refusal_issue(issue)
     try:
         already = identity_refusal_records(_paginated_comments(repo, pr_number), bot_login) \
             if bot_login else set()
@@ -11735,6 +11757,31 @@ def _self_test():
     check("[#972] the CLI's declared choices ARE the closed table (no second hand-written list)",
           all(code in _ir_cli_help.stdout for code in IDENTITY_REFUSAL_REASONS)
           and _ir_cli_help.returncode == 0, True)
+    # (7) THE EXIT MUST SURVIVE ITS OWN INPUTS. review-fix.yml passes
+    #     `--issue ${{ needs.resolve.outputs.issue }}`, and every sibling subcommand declares that
+    #     option `type=int` — where an empty or malformed value is an argparse exit 2 BEFORE any
+    #     park can land, i.e. the #972 loop resumes. Here it degrades to a PR-only park.
+    _ir_logs = []
+    check("[#972] a malformed/empty/absent source issue degrades instead of aborting the exit",
+          [identity_refusal_issue(v, log=_ir_logs.append)
+           for v in ("77", 77, "", "  ", None, "not-a-number", "0", "-3")],
+          [77, 77, None, None, None, None, None, None])
+    check("[#972] ...and an unparseable issue says so loudly",
+          any("is not an issue number" in line for line in _ir_logs), True)
+    _ir_no_issue, _ = _drive_identity_refusal("author-not-app-bot", issue="")
+    check("[#972] the PR-side terminal park still lands with NO usable source issue "
+          "(the frontier exclusion only needs the PR label)",
+          (_ir_no_issue.states, _ir_no_issue.issue_status, len(_ir_no_issue.comments)),
+          (["needs-user"], [], 2))
+    # ...and the CLI seam declares NO `type=int`, so nothing upstream of the coercion can reject
+    # the value first. Asserted through the PRODUCTION parser: an empty --issue must NOT be an
+    # argparse error (exit 2 / "invalid int value") — it reaches the code above instead.
+    _ir_issue_cli = subprocess.run(
+        [sys.executable, "-B", str(Path(__file__).resolve()), "identity-refusal",
+         "--repo", "o/r", "--pr", "41", "--reason", "not-a-declared-code", "--issue", ""],
+        capture_output=True, text=True, check=False)
+    check("[#972] the CLI's --issue is not `type=int` (an empty value is never an argparse error)",
+          "invalid int value" in _ir_issue_cli.stderr, False)
 
     print("worker-pr self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
@@ -11896,7 +11943,12 @@ def main():
     iref = subparsers.add_parser("identity-refusal", parents=[common])
     iref.add_argument("--reason", required=True,
                       choices=tuple(sorted(IDENTITY_REFUSAL_REASONS)))
-    iref.add_argument("--issue", type=int)
+    # DELIBERATELY NOT `type=int`, unlike every sibling subcommand. This is the loop's EXIT: an
+    # empty or malformed `--issue` must never be able to abort it, because an aborted exit is the
+    # #972 defect returning. The PR-side park alone already removes the PR from the review
+    # frontier (enumerate_review_items excludes HUMAN_HOLD_PR_LABELS), so a missing source issue
+    # degrades to "park the PR, skip the issue" with a loud warning rather than an argparse exit 2.
+    iref.add_argument("--issue", default="")
     iref.add_argument("--bot-login", default="")
     iref.add_argument("--head-sha", default="")
 
