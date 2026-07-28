@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 986,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "bea5ecc4c48b33fe1341ac7c41d2caa64a62f01d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly separates candidate admission (`is_staged`) from fence reach (`on_frontier`) and limits the new one-way EC2 hold to the two dispatcher-selected statuses. It remains fail-closed when the label is unavailable, preserves live-claim and non-dispatch status exclusions, and relies on the existing snapshot fingerprint check to avoid racing a concurrent claim. The shared fence helper keeps both paths consistent. The added self-tests are non-vacuous: they cover ready/deferred positives, code-only/in-progress/inventory/already-gated negatives, add-only mutation shape, unavailable-label failure, and readiness-engine exclusion.",
+  "verdict": "approve"
+ }
+}
