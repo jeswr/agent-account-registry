@@ -12,16 +12,6 @@
   },
   {
    "account": "488920c2efe2b3fb",
-   "claim_id": "40a4cf288c48450395dc967fa72623b6",
-   "holder": "sparq-org/sparq#3108@30335178675.1",
-   "package": "sparq-mcp,sparq-py",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785220406,
-   "expires_at": 1785226706
-  },
-  {
-   "account": "488920c2efe2b3fb",
    "claim_id": "25c6ed3c6dd140ff8c153120570e7359",
    "holder": "sparq-org/sparq#3166@30336171179.1",
    "package": "sparq-reason-dl",
