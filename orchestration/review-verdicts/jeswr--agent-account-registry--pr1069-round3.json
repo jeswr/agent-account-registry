@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1069,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6f94eb3f4d42054825a8077eacf8811f33836337",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 remains sound and complete. The liveness-aware groomer renews provably active lease-holding runs before expiry, reclaims dead or ineligible holders, and fail-closes transient or unreadable probes into a short grace hold that is persisted to the ledger and bounded by the absolute renewal ceiling. The workflow grants only the added Actions read scope alongside the existing ledger write scope. The tests exercise the pure planner, real reclaim transaction and PUT payload, probe-result mapping, expiry-based suppression consumers, ceiling behavior, CAS retry wiring, and the permissions block with non-vacuous expectations. No new correctness, security, trust-plane, or test-validity defect is supported by the diff. With zero findings in both rounds 2 and 3, progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
