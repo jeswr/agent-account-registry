@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4604,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9ec0dcb39dad69acd04e38240d7d2e105b3bb706",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The fallback is narrowly triggered only by tableau ResourceBudget exhaustion, reuses the existing guarded RL/EL consistency branches, rejects transitive and out-of-profile augmentations, and fails closed if the rendered structural ontology does not round-trip to the same axiom multiset. The integration tests exercise both definitive RL outcomes on the real entailment path and pin the principal refusal cases (out-of-profile and RL divergence), while focused unit tests cover EL abstention, transitivity refusal, and the round-trip comparison. Branch attribution and preservation of the original ResourceBudget abstention are consistent with the documented semantics. No correctness, soundness, security, or vacuous-test issue requiring changes was found.",
+  "verdict": "approve"
+ }
+}
