@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4671,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "acdc74c4a3bdae47614b87423f141b21005a49f8",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In \u201cThe missing pass,\u201d the record says that a quad emitted by two productions is a linearity violation and can be handled by rejecting it or requiring @prefer. That is distinct from the later fresh-blank single-reference condition: RDF dataset set semantics collapse duplicate emitted quads, so the residual contains no provenance showing which production(s) emitted it. @prefer only orders competing interpretations; it cannot recover a case where forward execution requires both emit sites, nor does selecting one establish that replay yields the same graph and satisfies the surrounding production. This makes the claimed generation-time expressibility verdict unsound for overlapping emit relations.",
+    "file": "research/shuttle-generic-print-mode-2026-07.md",
+    "fix_hint": "Separate fresh-node linearity from overlapping-emission ambiguity. Define the actual admissibility condition for overlaps: for example, reject overlaps unless the alternatives are mutually exclusive or prove via reconstructed bindings plus full forward replay that one preferred derivation reproduces the complete production result. State explicitly that @prefer alone is insufficient when multiple emit sites are jointly required. Add a negative conformance case where two productions emit the same quad (including a case requiring both derivations) and require generation failure or a sound, replay-validated choice.",
+    "severity": "major",
+    "title": "The proposed linearity/ambiguity rule is semantically incorrect"
+   }
+  ],
+  "progress": null,
+  "summary": "The record is thoughtful and appropriately limits its performance and upstream-delivery claims, but its central ambiguity/linearity rule is not sound enough to serve as the implementation plan. It conflates duplicate emit provenance with linear blank-node use and claims that @prefer can resolve cases where two productions emit the same RDF quad. RDF dataset set semantics erase that provenance, and ordering alternatives cannot in general reconstruct two required derivations or prove that choosing one preserves forward replay. The acceptance plan also does not explicitly test this load-bearing case.",
+  "verdict": "request_changes"
+ }
+}
