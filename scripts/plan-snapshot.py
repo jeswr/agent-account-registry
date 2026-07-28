@@ -580,6 +580,60 @@ def _pr_status_snapshot(fetch, claim, repo, pulls, concurrency=SNAPSHOT_CONCURRE
     return status_items, skips
 
 
+def _reason_histogram(reasons):
+    counts = {}
+    for reason in reasons.values():
+        counts[reason] = counts.get(reason, 0) + 1
+    return ", ".join(f"{name}={count}" for name, count in sorted(counts.items())) or "none"
+
+
+def inertness_attestation(claim, pulls, status_items):
+    """PURE per-PR "is this pull request provably inert?" map, for the PLAN-side partition.
+
+    [sparq#4819] THE DEFECT THIS CLOSES. Two partition legs decide `area:` occupancy for the same
+    PR. CLAIM's (`busy_packages_of_pulls`) frees a machine-parked PR's crates when
+    `_pull_inactivity_decision` proves it is a defused draft — MEASURED 142 free events over 57
+    crates in one tick. PLAN's (the target repo's own readiness engine, run in a LATER, hostile
+    step that holds no token and may not see this repository at all) had no way to evaluate that
+    predicate, so it reserved exactly the crates CLAIM was about to free, and it did so BEFORE the
+    frontier was committed. The registry's carve-out was live, loud, and dead.
+
+    The fix is NOT a second predicate. This walks the SAME `_pull_inactivity_decision`, with the
+    SAME detail-beats-listing coherence rule CLAIM applies, and writes only its ANSWER — so the
+    target engine consumes a decision it can never re-derive differently. A second implementation
+    of "would parking this PR really free its crates?" is precisely the mint-vs-adopt drift that
+    produced the defect.
+
+    Returned as `{"items": {"<number>": bool}, "reasons": {"<number>": str}}`; the reasons ride
+    along ONLY for the census line and diagnostics — nothing decides on them. Runs in the
+    authenticated registry-inline snapshot step, which precedes ALL target-code execution
+    (REG-4), so no target can influence the attestation it later consumes.
+
+    FAILS CLOSED IN EVERY DIRECTION. A malformed row, an unparseable number, a latch, a
+    non-draft bit, a head that moved between the listing and the detail read — every one of them
+    yields False, because `_pull_inactivity_decision` is fail-closed and nothing here second-
+    guesses it. A PR absent from the map is likewise not attested, and the consumer treats
+    "absent" as "occupies".
+    """
+    items, reasons = {}, {}
+    for pull in pulls if isinstance(pulls, list) else []:
+        if not isinstance(pull, dict):
+            continue
+        number = pull.get("number")
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            continue
+        record = (status_items or {}).get(str(number), (status_items or {}).get(number))
+        # The DETAIL read is the newer half of the split snapshot and is authoritative when it
+        # exists — same precedence CLAIM uses. `pr_ci_status` normalises the raw record into the
+        # {head_sha, armed, draft} shape the predicate wants; an absent record leaves the
+        # listing's own atomic row to supply the proof (or to refuse to).
+        status = claim.pr_ci_status(record) if record is not None else claim._NO_PR_DETAIL
+        inactive, reason = claim._pull_inactivity_decision(pull, status)
+        items[str(number)] = bool(inactive)
+        reasons[str(number)] = str(reason)
+    return {"items": items, "reasons": reasons}
+
+
 def snapshot_targets(fetch, claim, repos, out_dir, concurrency=SNAPSHOT_CONCURRENCY):
     # Phase 1 — every repo-level listing is independent of every other, so the walks
     # overlap. Each walk is UNCHANGED: the same serial page-walk to a short page, the same
@@ -608,6 +662,12 @@ def snapshot_targets(fetch, claim, repos, out_dir, concurrency=SNAPSHOT_CONCURRE
         Path(out_dir, f"raw-prstatus-{index}.json").write_text(
             json.dumps({"complete": True, "items": status_items, "skips": skips}),
             encoding="utf-8")
+        inert = inertness_attestation(claim, pulls, status_items)
+        Path(out_dir, f"raw-inertness-{index}.json").write_text(
+            json.dumps({"complete": True, **inert}), encoding="utf-8")
+        print(f"SNAPSHOT inertness {repo}: {sum(inert['items'].values())} of "
+              f"{len(inert['items'])} open PR(s) provably inert "
+              f"({_reason_histogram(inert['reasons'])})")
     print(f"SNAPSHOT complete for {len(repos)} target repo(s)")
 
 
@@ -1022,7 +1082,8 @@ def _self_test():
             "repo-level listing walks did not overlap: the barrier timed out after "
             f"{seen['walks']} of {parties} walks started")
         assert seen["walks"] == parties, seen
-        assert written == ["raw-issues-0.json", "raw-issues-1.json", "raw-prstatus-0.json",
+        assert written == ["raw-inertness-0.json", "raw-inertness-1.json",
+                           "raw-issues-0.json", "raw-issues-1.json", "raw-prstatus-0.json",
                            "raw-prstatus-1.json", "raw-pulls-0.json",
                            "raw-pulls-1.json"], written
 
@@ -1258,6 +1319,69 @@ def _self_test():
                     got = "stop"
             assert got == want, (label, got, want)
 
+    def the_inertness_attestation_adopts_the_claim_predicate_and_fails_closed():
+        """[sparq#4819] The PLAN-side attestation must be `_pull_inactivity_decision`'s ANSWER —
+        never an independent re-derivation of it — and every unprovable shape must read False.
+
+        Every row is asserted `is claim._pull_inactivity_decision(...)[0]`, not against a literal:
+        a hand-written expectation would let this suite and the predicate drift apart silently,
+        which is the exact two-legs-disagree defect the attestation exists to end. The literal
+        `want` column is carried alongside so the row still fails if BOTH sides regress together.
+        """
+        def listing(number, *, draft=True, latch=..., sha="a" * 40):
+            row = {"number": number, "state": "open",
+                   "head": {"ref": f"sparq-agent/issue-{number}-1-1", "sha": sha,
+                            "repo": {"full_name": repo}}}
+            if draft is not ...:
+                row["draft"] = draft
+            if latch is not ...:
+                row["auto_merge"] = latch
+            return row
+
+        armed_latch = {"enabled_by": {"login": "u"}, "merge_method": "squash"}
+        cases = [
+            ("draft + explicit-null latch is the atomic single-read proof",
+             listing(1, latch=None), None, True),
+            ("a LATCHED draft is never inert", listing(2, latch=armed_latch), None, False),
+            ("a NON-draft never frees", listing(3, draft=False, latch=None), None, False),
+            ("a pre-#517 row with NO auto_merge key proves nothing (ABSENCE != NULL)",
+             listing(4), None, False),
+            ("a row with no draft bit at all proves nothing", listing(5, draft=..., latch=None),
+             None, False),
+            ("a malformed head sha proves nothing", listing(6, latch=None, sha="zz"), None, False),
+            ("a garbage latch shape proves nothing", listing(7, latch="garbage"), None, False),
+            # DETAIL beats listing, in both directions — the round-4 split-snapshot race.
+            ("a newer detail confirming the defused draft frees", listing(8, latch=None),
+             {"head_sha": "a" * 40, "auto_merge": None, "draft": True, "mergeable": True}, True),
+            ("a newer detail saying the draft went READY holds", listing(9, latch=None),
+             {"head_sha": "a" * 40, "auto_merge": None, "draft": False, "mergeable": True}, False),
+            ("a newer detail carrying a latch holds", listing(10, latch=None),
+             {"head_sha": "a" * 40, "auto_merge": armed_latch, "draft": True}, False),
+            ("a detail whose head MOVED means the listing row is stale", listing(11, latch=None),
+             {"head_sha": "b" * 40, "auto_merge": None, "draft": True}, False),
+            ("an unreadable detail record holds (pr_ci_status -> {})", listing(12, latch=None),
+             {"head_sha": "not-a-sha"}, False),
+        ]
+        for label, row, record, want in cases:
+            items = {str(row["number"]): record} if record is not None else {}
+            got = inertness_attestation(claim, [row], items)
+            status = (claim.pr_ci_status(record) if record is not None
+                      else claim._NO_PR_DETAIL)
+            expected, reason = claim._pull_inactivity_decision(row, status)
+            assert got["items"][str(row["number"])] is expected is want, (label, got, want)
+            assert got["reasons"][str(row["number"])] == reason, (label, got, reason)
+        # Hostile shapes never enter the map at all, and never raise.
+        junk = inertness_attestation(claim, ["x", None, 42, {"number": True},
+                                             {"number": -1}, {"no": "number"}], {})
+        assert junk == {"items": {}, "reasons": {}}, junk
+        assert inertness_attestation(claim, None, None) == {"items": {}, "reasons": {}}
+        # An int-keyed status map (the in-memory shape) resolves the same as the JSON str keys.
+        row13 = listing(13, latch=None)
+        detail = {"head_sha": "a" * 40, "auto_merge": armed_latch, "draft": True}
+        assert inertness_attestation(claim, [row13], {13: detail})["items"]["13"] is False
+        assert inertness_attestation(claim, [row13], {"13": detail})["items"]["13"] is False
+
+    the_inertness_attestation_adopts_the_claim_predicate_and_fails_closed()
     snapshot_parallel_output_is_identical_to_serial()
     per_pr_reads_actually_overlap()
     repo_listings_overlap_across_repos()

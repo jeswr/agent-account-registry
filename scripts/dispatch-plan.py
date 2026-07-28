@@ -924,12 +924,41 @@ def _routing_doc():
     return {}
 '''
 
-    def _run_readiness(rows_by_target, planners):
+    # [sparq#4819] The SAME contract with the machine-park carve-out sparq's engine ships: a
+    # `review:parked` PR releases its declared areas iff the row carries a positively-attested
+    # `inert` bit. Deliberately a separate implementation from sparq's, for the reason the
+    # PR-aware planner above is: this is the CONTRACT dispatch.yml depends on, and the interlock
+    # must be tested against a written statement of it rather than against a copy of one side.
+    _INERT_AWARE_PLANNER = _PR_AWARE_PLANNER.replace(
+        '''        if L & PARKED:
+            continue''',
+        '''        if L & PARKED:
+            continue
+        if ("review:parked" in L and "pull_request" in it
+                and it.get("inert") is True):
+            continue''').replace(
+        "def _routing_doc():",
+        'INERT_FIELD = "inert"\nMACHINE_PARK_PR_LABEL = "review:parked"\n\n\ndef _routing_doc():')
+    # ...and the FORBIDDEN engine: it releases a machine park on the LABEL ALONE. The interlock
+    # must refuse to hand it attestations, or the workflow would be sanctioning exactly the
+    # unconditional release sparq#4819 rules out.
+    _UNCONDITIONAL_PARK_PLANNER = _PR_AWARE_PLANNER.replace(
+        'PARKED = {"needs:user", "review:needs-user", "status:blocked"}',
+        'PARKED = {"needs:user", "review:needs-user", "status:blocked", "review:parked"}').replace(
+        "def _routing_doc():",
+        'INERT_FIELD = "inert"\nMACHINE_PARK_PR_LABEL = "review:parked"\n\n\ndef _routing_doc():')
+
+    def _run_readiness(rows_by_target, planners, attest=True):
         """EXECUTE the real readiness step over a synthetic snapshot; return (plan, printed).
 
         `rows_by_target[i]` is the `/issues?state=open` listing for target i (PR rows included,
         exactly as GitHub returns them). `planners[i]` is either the PR-aware source above or
         None, meaning "use THIS repository's own scripts/ unmodified".
+
+        [sparq#4819] A PR fixture row carrying `"_inert": True` is attested provably-inert in the
+        `raw-inertness-<i>.json` the snapshot step writes. `attest=False` omits that file entirely,
+        which is the PRODUCER-DELETED case: the consumer must fall back to every-PR-reserves and
+        say so, and it is asserted separately below.
         """
         import json as _json
         import shutil
@@ -975,6 +1004,13 @@ def _routing_doc():
                     with open(os.path.join(workdir, f"raw-{kind}-{index}.json"), "w",
                               encoding="utf-8") as handle:
                         _json.dump({"complete": True, "items": items}, handle)
+                if attest:
+                    with open(os.path.join(workdir, f"raw-inertness-{index}.json"), "w",
+                              encoding="utf-8") as handle:
+                        _json.dump({"complete": True,
+                                    "items": {str(r["number"]): bool(r.get("_inert"))
+                                              for r in rows if "pull_request" in r},
+                                    "reasons": {}}, handle)
             with open(os.path.join(workdir, "trusted-bots.json"), "w", encoding="utf-8") as handle:
                 _json.dump({name: [] for name in names}, handle)
             saved = (sys.argv[:], os.environ.get("TARGET_ROOT"), os.environ.get("PATH"))
@@ -1195,6 +1231,76 @@ def _routing_doc():
           _issue(604, _def + ["area:free"])]], [_PR_AWARE_PLANNER])
     chk("[#768] the DEFERRED lane reserves the PR half and the in-flight issue half too",
         _planned(_plan_def), [604])
+    # [sparq#4819] ...and it now SAYS SO. The ready lane has printed its partition attrition every
+    # tick since #708; this lane printed nothing, so "offered 1" was indistinguishable from "had 1
+    # candidate" and from "is broken". Asserted on the executed step's real output, at a fixture
+    # where the three numbers genuinely differ (3 candidates, 1 offered, 2 partition-deferred) —
+    # a fixture where they coincided would pass for a line that printed any one of them thrice.
+    chk("[sparq#4819] the deferred lane names its own partition attrition, always",
+        [line for line in _.split("\n") if line.startswith("deferred census")],
+        ["deferred census o/t0: candidates=3 frontier=1 partition-deferred=2 "
+         "ready-lane-keys-held=0 top-contended: docs=1, usage=1"])
+    _, _def_zero = _run_readiness([[_issue(605, ["area:usage"], pr=True)]], [_PR_AWARE_PLANNER])
+    chk("[sparq#4819] ...printed at ZERO too — an absent bucket must not look like an empty one",
+        "deferred census o/t0: candidates=0 frontier=0 partition-deferred=0" in _def_zero, True)
+
+    # ------------------------------------------------------------------------------------------
+    # [sparq#4819] THE MACHINE-PARK ATTESTATION INTERLOCK.
+    #
+    # CLAIM frees a `review:parked` provably-inert draft's crates and logs it 142 times a tick;
+    # PLAN reserved those same crates and committed the frontier FIRST, because `occupancy_input`
+    # carried no `draft`/`auto_merge` and so could not evaluate the predicate. These run the WHOLE
+    # readiness step, so they cover the CALL SITE (`row[inert_field] = ...`) that a block-scoped
+    # or attribute-level assertion cannot see, in both directions and in the producer-deleted and
+    # planner-does-not-consume degradations.
+    # ------------------------------------------------------------------------------------------
+    _park_rows = [_issue(700, ["area:usage", "review:parked"], pr=True),
+                  _issue(701, _READY + ["area:usage"]),
+                  _issue(702, _READY + ["area:docs"])]
+    _plan_hold, _out_hold = _run_readiness([_park_rows], [_INERT_AWARE_PLANNER])
+    chk("[sparq#4819] an UNATTESTED machine-parked PR keeps its crate (the forbidden fix stays out)",
+        _planned(_plan_hold), [702])
+    _plan_free, _out_free = _run_readiness(
+        [[dict(_park_rows[0], _inert=True)] + _park_rows[1:]], [_INERT_AWARE_PLANNER])
+    chk("[sparq#4819] ...and an ATTESTED one releases it, so the waiting sibling is offered",
+        _planned(_plan_free), [701, 702])
+    # The two degradation warnings must be ABSENT on the healthy path. Deliberately NOT
+    # `"::warning::" not in _out_free`: this fixture planner has no `ready_candidates`, so it
+    # legitimately raises an unrelated warning, and the broad assertion would be satisfied by the
+    # wrong absence — the "right answer, wrong reason" class.
+    chk("[sparq#4819] the release census names the PR and the crate it released, and opens clean",
+        ("parked-release census o/t0: stamped" in _out_free,
+         "1 machine-parked row(s) release their areas: pr#700:usage" in _out_free,
+         "no inertness attestation" in _out_free, "NOT STAMPED" in _out_free),
+        (True, True, False, False))
+    chk("[sparq#4819] ...and the census prints at ZERO releases too",
+        "0 machine-parked row(s) release their areas: none" in _out_hold, True)
+    # PRODUCER DELETED. The consumer must fall back to every-PR-reserves and SAY SO — a silent
+    # fallback is a carve-out that stops firing with no signal, the #753/#762 class.
+    _plan_noattest, _out_noattest = _run_readiness(
+        [[dict(_park_rows[0], _inert=True)] + _park_rows[1:]], [_INERT_AWARE_PLANNER],
+        attest=False)
+    chk("[sparq#4819] with NO attestation file the park holds again, loudly",
+        (_planned(_plan_noattest), "no inertness attestation" in _out_noattest,
+         "::warning::" in _out_noattest),
+        ([702], True, True))
+    # PLANNER DOES NOT CONSUME IT. Today's behaviour exactly, and the field is never stamped.
+    _plan_legacy, _out_legacy = _run_readiness(
+        [[dict(_park_rows[0], _inert=True)] + _park_rows[1:]], [_PR_AWARE_PLANNER])
+    chk("[sparq#4819] a planner with no inertness contract is byte-identical to today",
+        (_planned(_plan_legacy), "NOT STAMPED" in _out_legacy,
+         "declares no inertness contract" in _out_legacy),
+        ([702], True, True))
+    # THE REFUSAL THAT MATTERS. An engine that releases a machine park on the LABEL ALONE is the
+    # fix the issue forbids; the interlock must refuse to feed it, naming that reason. Without
+    # this row the `if held:` branch of `inert_aware` has NO coverage and could be deleted with
+    # every other assertion green.
+    _plan_uncond, _out_uncond = _run_readiness(
+        [_park_rows], [_UNCONDITIONAL_PARK_PLANNER])
+    chk("[sparq#4819] an engine that releases a park with NO attestation is refused, by name",
+        ("RELEASES a machine-parked area with no attestation" in _out_uncond,
+         "NOT STAMPED" in _out_uncond, _planned(_plan_uncond)),
+        (True, True, [701, 702]))
 
     # issue #112: a MULTI-area issue reserves BOTH its areas, NOT the alphabetically-first one —
     # else a busy secondary area (here 'worker') could not exclude it and it would double-dispatch.
