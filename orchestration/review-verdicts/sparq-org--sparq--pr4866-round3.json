@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4866,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c6f46be4de64566b547658d9d7cdbcfb18d3c6f3",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "open_validated calls record_len(dim, degree), whose `8 + dim * 4 + degree * 4` arithmetic is unchecked. Both values are attacker-controlled u32 fields, and wasm32 is explicitly supported, so values such as dim=u32::MAX overflow before the subsequent checked `count.checked_mul(record_len)` guard runs. Depending on build overflow checks this can panic during open or wrap into a bogus record size and invalidate later offset/alignment reasoning. The existing malformed-header test exercises a huge count, but not hostile dim/degree values, so it does not cover this path.",
+    "file": "crates/sparq-vamana/src/graph.rs",
+    "fix_hint": "Make record-length construction checked (checked_mul plus checked_add) and return a descriptive Err from open_validated before any wrapped size is used. Add a focused open_from_bytes malformed-header test with u32::MAX dimension and/or degree; ideally exercise the calculation under a 32-bit target or factor it into a usize-width-independent checked helper whose overflow behavior can be tested.",
+    "severity": "major",
+    "title": "Forged graph dimensions overflow record-size arithmetic on wasm32"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 fixes the prior out-of-range PQ-code finding on the real open path and adds non-vacuous mmap and owned-byte regression coverage. However, malformed graph header dimensions still reach unchecked node-record size arithmetic before the checked count/body calculation. On the explicitly supported wasm32 target, a forged u32 dimension or degree can overflow inside record_len (and later produce wrapped offsets or a panic), contradicting the malformed-input fail-cleanly contract. Because this is a new major finding after round 2, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
