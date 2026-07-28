@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4901,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7c383a9ab3f02599357ecdf5a36580a0aaf73905",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major portability defect. The harness now probes whether a host-network container can reach the already-running server and starts the socat forwarder only on the VM-backed branch; on native Linux it skips the conflicting listener. It also re-probes after starting the detached forwarder and reports its logs on failure. The hermetic configuration check pins this guard and includes mutations demonstrating that C7 fires when the probe or guard is removed. No new correctness, soundness, test-validity, or security issue was found in the supplied diff.",
+  "verdict": "approve"
+ }
+}
