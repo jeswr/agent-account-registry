@@ -740,6 +740,60 @@ the parsed document in memory and required to come back named.
   quarantine path, removing that persistence primitive at its source. Drift ABORTS without
   mutating human-owned issue state; `final_state` returns the issue to the pool.
 
+### Purging raw account identities from published ledger history (issue #536)
+
+Since #212 every lease `account` and every claim commit subject carries the salted 16-hex
+fingerprint, never the catalog handle. That fixed what is WRITTEN; it could not touch what is
+already PUBLISHED. Measured on 2026-07-28 by the tool below, `origin/ledger` still carries
+**1,585** commit subjects of the pre-#212 shape `claim <cid8> <handle> <package>/<role>` and
+**16,951** raw-identity lease rows across **3,040** of its **10,447** distinct `data/leases.json`
+snapshots (20,460 reachable commits).
+
+Clearing that means force-updating a published ref, so it is a **maintainer** action inside a
+maintenance window — the worker container holds no token by design and can neither push nor mutate
+remote history. `scripts/ledger-history-purge.py` is the half that can be automated safely: it
+needs no token, never invokes `gh`, writes at most ONE local ref, and refuses a `refs/remotes/…`
+ref outright, so it cannot be aimed at anything it could publish.
+
+1. **Measure**, read-only, from any clone:
+   `python3 scripts/ledger-history-purge.py scan --ref origin/ledger`.
+   Exit 1 = exposures remain, 0 = the ref is publishable, 2 = it could not be decided (which is
+   also a refusal). The report is counts and object SHAs only — it never prints a handle, so it is
+   safe to paste anywhere the branch itself is visible.
+2. **Quiesce the ledger writers** and let in-flight runs drain. *Re-derive* the writer set at the
+   start of the window rather than trusting a list copied into prose (that duplication is exactly
+   #958): the writers are the scripts whose CAS PUT pins `branch=ledger` — `select-and-claim.py`,
+   `groom.py`, `model-health.py`, `metrics.py`, `worker-pr.py` — plus every workflow that runs one.
+   Step 5's lease is a backstop, not a substitute: a writer that lands mid-window makes the push
+   abort and the window restart.
+3. **Rewrite a LOCAL branch** — never `origin/ledger` directly:
+   ```bash
+   git fetch origin ledger && git branch ledger-purge origin/ledger
+   python3 scripts/ledger-history-purge.py rewrite --ref ledger-purge
+   ```
+   Raw-identity rows are dropped (a snapshot whose rows were all raw becomes the empty snapshot),
+   fingerprinted rows are kept byte-for-byte, and each legacy claim subject loses exactly its
+   handle token. The command re-scans what it produced and refuses if anything survived; git keeps
+   the pre-purge history under `refs/original/` (a second run refuses rather than clobber it).
+4. **Verify independently**, adding the literal check for the handles you know. Keep that file
+   local and off the runner — it names accounts, which is the thing being purged:
+   `python3 scripts/ledger-history-purge.py scan --ref ledger-purge --handles-file ~/handles.txt`.
+5. **Force-update under a lease**, so a writer that slipped past step 2 aborts the push instead of
+   being silently overwritten:
+   ```bash
+   git push --force-with-lease=refs/heads/ledger:$(git rev-parse origin/ledger) \
+     origin ledger-purge:refs/heads/ledger
+   ```
+6. **Re-verify the published ref, then resume the writers**:
+   `git fetch --force origin ledger && python3 scripts/ledger-history-purge.py scan --ref origin/ledger`.
+
+Two things the rewrite does not do. Every commit id from the first purged commit onward changes, so
+any `ledger` checkout must re-fetch — the lease protocol itself is unaffected, since each writer's
+CAS re-reads the tip and a PUT against a stale blob SHA simply loses the race and re-derives. And a
+force-update is not an un-publish: unreachable objects stay addressable by SHA until GitHub's GC,
+and existing clones, forks and caches keep their own copies. The purge bounds future exposure; it
+does not undo past disclosure.
+
 ## Registering a new account (web-login broker)
 
 You don't paste tokens manually. Instead:
