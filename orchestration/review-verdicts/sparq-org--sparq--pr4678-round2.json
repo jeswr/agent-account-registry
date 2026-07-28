@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4678,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "51fea4692098aff7fcb8a5126f2856332825699a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior documentation mismatch: `with_max_depth` now explicitly states that the bound applies only to expandable non-literal terms, and `max_depth_zero_still_projects_a_literal_focus_as_its_value_object` pins that behavior on the real public projection path. The implementation remains cycle-safe under both repeat policies, deterministic through sorted predicates and objects, JSON-escapes control characters correctly, and preserves literal datatype, language, and direction metadata. No correctness, soundness, test-validity, or security issue remains in the supplied diff.",
+  "verdict": "approve"
+ }
+}
