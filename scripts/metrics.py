@@ -715,7 +715,9 @@ def dispatch_panel(records, repo, now, stale_after=DISPATCH_STALE_SECONDS):
         "census_unclassified": int(latest.get("census_unclassified", 0) or 0),
         "attribution": latest.get("attribution", "unavailable"),
         "realisation_rate": round(realised / width, 4) if width > 0 else None,
-        "gate_a": telemetry.gate_a_state(rows, repo),
+        # `now` is LOAD-BEARING: without it the gate cannot tell a healthy window from a
+        # frozen one, and a dead dispatcher publishes `open: true` beside `status: stale`.
+        "gate_a": telemetry.gate_a_state(rows, repo, now=now),
     }
 
 

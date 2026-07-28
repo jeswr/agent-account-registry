@@ -80,6 +80,14 @@ UNATTRIBUTED_AREA = "__unattributed__"
 # Gate A opens at realised >= 80% of frontier width, sustained.
 GATE_A_RATIO = 0.8
 GATE_A_SUSTAIN_TICKS = 12
+# THE WINDOW MUST BE RECENT AND DENSE, not merely long enough. Without these two bounds the gate
+# evaluated the newest 12 INFORMATIVE rows whatever their age: 14 healthy rows 40h old published
+# `open: true, reason: sustained` beside `status: stale` on the same panel, and an un-recorded tick
+# leaves no row at all, so a dispatcher that stops ticking FREEZES its own evidence in the open
+# position. Both bounds are stated as named refusals, never inferred from a balance.
+GATE_A_TICK_S = 600                            # the dispatch cron cadence
+GATE_A_STALE_S = 3 * GATE_A_TICK_S             # the newest informative tick must be this recent
+GATE_A_SPAN_SLACK = 3                          # the window may span at most this x its ideal
 
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
 RUN_ID_RE = re.compile(r"^[0-9]+\.[0-9]+$")
@@ -411,7 +419,7 @@ def render_log_line(record):
     return line
 
 
-def gate_a_state(records, repo, ratio=GATE_A_RATIO, sustain=GATE_A_SUSTAIN_TICKS):
+def gate_a_state(records, repo, ratio=GATE_A_RATIO, sustain=GATE_A_SUSTAIN_TICKS, now=None):
     """Evaluate Gate A from the ring: realised >= `ratio` * frontier_width, sustained.
 
     Ticks with `frontier_width == 0` carry no information about whether the frontier is the limit,
@@ -431,11 +439,20 @@ def gate_a_state(records, repo, ratio=GATE_A_RATIO, sustain=GATE_A_SUSTAIN_TICKS
         return {"open": False, "reason": "insufficient-samples", "threshold": ratio,
                 "sustain_ticks": sustain, "observed_ticks": len(window),
                 "latest_ratio": latest, "min_ratio": min(ratios) if ratios else None}
+    # RECENCY AND DENSITY, before the ratio is even looked at. A window can satisfy the ratio
+    # perfectly and still be evidence about a dispatcher that stopped running hours ago.
+    newest_ts, oldest_ts = int(window[-1].get("ts", 0) or 0), int(window[0].get("ts", 0) or 0)
+    span, age = newest_ts - oldest_ts, (None if now is None else max(0, int(now) - newest_ts))
+    base = {"open": False, "threshold": ratio, "sustain_ticks": sustain,
+            "observed_ticks": len(window), "latest_ratio": latest,
+            "min_ratio": min(ratios), "window_span_seconds": span, "age_seconds": age}
+    if age is not None and age > GATE_A_STALE_S:
+        return {**base, "reason": "stale-window"}
+    if span > sustain * GATE_A_TICK_S * GATE_A_SPAN_SLACK:
+        return {**base, "reason": "sparse-window"}
     worst = min(ratios)
-    return {"open": worst >= ratio,
-            "reason": "sustained" if worst >= ratio else "below-threshold",
-            "threshold": ratio, "sustain_ticks": sustain, "observed_ticks": len(window),
-            "latest_ratio": latest, "min_ratio": worst}
+    return {**base, "open": worst >= ratio,
+            "reason": "sustained" if worst >= ratio else "below-threshold"}
 
 
 def latest_by_repo(records):
@@ -1413,6 +1430,31 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
              for i in range(40)], "sparq-org/sparq")), (False, 0))
     chk("[gate-a] the window is per-target",
         gate_a_state(passing, "other/repo")["observed_ticks"], 0)
+    # RECENCY. `passing` is 12 perfect ticks at ts=0..11; evaluated 40h later it is evidence about
+    # a dispatcher that stopped running, and the un-bounded gate published `open: true,
+    # reason: sustained` beside `status: stale` on the very same panel. A term that says "the last
+    # 12 rows were healthy" cannot report that there have BEEN no rows since — so the refusal is
+    # named, not inferred.
+    chk("[gate-a] a window whose newest tick is STALE cannot open the gate, however perfect it is",
+        (lambda g: (g["open"], g["reason"], g["age_seconds"] > GATE_A_STALE_S))(
+            gate_a_state(passing, "sparq-org/sparq", now=40 * 3600)),
+        (False, "stale-window", True))
+    chk("[gate-a] ...and the SAME rows still open it when they are current",
+        (lambda g: (g["open"], g["reason"]))(
+            gate_a_state(passing, "sparq-org/sparq", now=11 + GATE_A_TICK_S)),
+        (True, "sustained"))
+    # DENSITY. 12 healthy rows spread over days are 12 ticks that mostly did not happen — an
+    # un-recorded tick leaves no row at all, so sparseness is the only trace a dead stretch leaves.
+    sparse = [dict(rec, run_id=f"{i}.1", ts=i * GATE_A_TICK_S * 50, frontier_width=10,
+                   realised_dispatches=9) for i in range(GATE_A_SUSTAIN_TICKS)]
+    chk("[gate-a] a window SPREAD over a long span is refused — missing ticks leave no row, so "
+        "sparseness is the only trace a dead stretch leaves",
+        (lambda g: (g["open"], g["reason"]))(
+            gate_a_state(sparse, "sparq-org/sparq", now=sparse[-1]["ts"])),
+        (False, "sparse-window"))
+    chk("[gate-a] ...and a gate asked WITHOUT a clock still refuses to claim recency it cannot "
+        "check, rather than assuming the window is current",
+        gate_a_state(passing, "sparq-org/sparq")["age_seconds"], None)
     chk("latest_by_repo picks the newest tick per target",
         {k: v["ts"] for k, v in latest_by_repo(
             [dict(rec, ts=5), dict(rec, ts=9), dict(rec, repo="c/d", ts=1)]).items()},
