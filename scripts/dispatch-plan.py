@@ -939,6 +939,13 @@ def _routing_doc():
             continue''').replace(
         "def _routing_doc():",
         'INERT_FIELD = "inert"\nMACHINE_PARK_PR_LABEL = "review:parked"\n\n\ndef _routing_doc():')
+    # ...an engine that DECLARES the contract but never consults the field. Without this the
+    # `if freed != [...]` half of `inert_aware` has no coverage: deleting it would hand
+    # attestations to an engine that ignores them, and PLAN would keep reserving the crates it
+    # believes it released — the defect, restored, with a log line claiming otherwise.
+    _INERT_DECLARING_ONLY_PLANNER = _PR_AWARE_PLANNER.replace(
+        "def _routing_doc():",
+        'INERT_FIELD = "inert"\nMACHINE_PARK_PR_LABEL = "review:parked"\n\n\ndef _routing_doc():')
     # ...and the FORBIDDEN engine: it releases a machine park on the LABEL ALONE. The interlock
     # must refuse to hand it attestations, or the workflow would be sanctioning exactly the
     # unconditional release sparq#4819 rules out.
@@ -956,9 +963,9 @@ def _routing_doc():
         None, meaning "use THIS repository's own scripts/ unmodified".
 
         [sparq#4819] A PR fixture row carrying `"_inert": True` is attested provably-inert in the
-        `raw-inertness-<i>.json` the snapshot step writes. `attest=False` omits that file entirely,
-        which is the PRODUCER-DELETED case: the consumer must fall back to every-PR-reserves and
-        say so, and it is asserted separately below.
+        `raw-inertness-<i>.json` the snapshot step writes. `attest=False` omits that file entirely
+        (the PRODUCER-DELETED case); a DICT is written verbatim as the document, so a malformed or
+        hostile attestation can be handed to the consumer. All three are asserted below.
         """
         import json as _json
         import shutil
@@ -1004,13 +1011,15 @@ def _routing_doc():
                     with open(os.path.join(workdir, f"raw-{kind}-{index}.json"), "w",
                               encoding="utf-8") as handle:
                         _json.dump({"complete": True, "items": items}, handle)
-                if attest:
+                if attest is not False:
+                    document = (attest if isinstance(attest, dict) else
+                                {"complete": True,
+                                 "items": {str(r["number"]): bool(r.get("_inert"))
+                                           for r in rows if "pull_request" in r},
+                                 "reasons": {}})
                     with open(os.path.join(workdir, f"raw-inertness-{index}.json"), "w",
                               encoding="utf-8") as handle:
-                        _json.dump({"complete": True,
-                                    "items": {str(r["number"]): bool(r.get("_inert"))
-                                              for r in rows if "pull_request" in r},
-                                    "reasons": {}}, handle)
+                        _json.dump(document, handle)
             with open(os.path.join(workdir, "trusted-bots.json"), "w", encoding="utf-8") as handle:
                 _json.dump({name: [] for name in names}, handle)
             saved = (sys.argv[:], os.environ.get("TARGET_ROOT"), os.environ.get("PATH"))
@@ -1280,10 +1289,38 @@ def _routing_doc():
     _plan_noattest, _out_noattest = _run_readiness(
         [[dict(_park_rows[0], _inert=True)] + _park_rows[1:]], [_INERT_AWARE_PLANNER],
         attest=False)
+    # The warning is asserted with its `::warning::` PREFIX ATTACHED. A bare
+    # `"::warning::" in out` passes for the wrong reason here — this fixture planner has no
+    # `ready_candidates`, so an unrelated warning is present either way, and downgrading THIS
+    # message to a plain print left the pair green (measured: mutant C7 survived it).
     chk("[sparq#4819] with NO attestation file the park holds again, loudly",
-        (_planned(_plan_noattest), "no inertness attestation" in _out_noattest,
-         "::warning::" in _out_noattest),
-        ([702], True, True))
+        (_planned(_plan_noattest),
+         "::warning::o/t0: no inertness attestation" in _out_noattest),
+        ([702], True))
+    # A truthy-but-not-True value in the map is NOT a proof. The consumer normalises with
+    # `is True`; relaxing it to `bool(...)` would read a producer's string or int as an
+    # attestation (measured: mutant C2 survived a boolean-only fixture).
+    _plan_truthy, _ = _run_readiness(
+        [_park_rows], [_INERT_AWARE_PLANNER],
+        attest={"complete": True, "items": {"700": "yes"}, "reasons": {}})
+    chk("[sparq#4819] a truthy-but-not-True attestation releases nothing",
+        _planned(_plan_truthy), [702])
+    # A document that never says `complete` is an INCOMPLETE read, not an empty one; accepting it
+    # would consume a half-written snapshot as authoritative.
+    _plan_incomplete, _out_incomplete = _run_readiness(
+        [_park_rows], [_INERT_AWARE_PLANNER],
+        attest={"items": {"700": True}})
+    chk("[sparq#4819] an INCOMPLETE attestation document is refused, loudly",
+        (_planned(_plan_incomplete),
+         "::warning::o/t0: inertness attestation is malformed or incomplete" in _out_incomplete),
+        ([702], True))
+    # An engine that declares the contract but never consults it must NOT be fed attestations.
+    _plan_ignoring, _out_ignoring = _run_readiness(
+        [[dict(_park_rows[0], _inert=True)] + _park_rows[1:]], [_INERT_DECLARING_ONLY_PLANNER])
+    chk("[sparq#4819] a planner that declares the field but ignores it is refused, by name",
+        ("planner ignores the inertness attestation" in _out_ignoring,
+         "NOT STAMPED" in _out_ignoring, _planned(_plan_ignoring)),
+        (True, True, [702]))
     # PLANNER DOES NOT CONSUME IT. Today's behaviour exactly, and the field is never stamped.
     _plan_legacy, _out_legacy = _run_readiness(
         [[dict(_park_rows[0], _inert=True)] + _park_rows[1:]], [_PR_AWARE_PLANNER])

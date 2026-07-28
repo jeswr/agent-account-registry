@@ -572,8 +572,13 @@ jobs:
                       return False, "planner does not RESERVE a pull request's declared area"
                   return True, "reserves PR areas and never dispatches a PR row"
 
-              # >>> inertness-attestation — EXECUTED by scripts/dispatch-plan.py --self-test.
-              # [sparq#4819] THE TWO PARTITION LEGS DISAGREED ABOUT THE SAME PR. CLAIM's
+              # [sparq#4819] NO `>>> ... <<<` SENTINELS HERE, ON PURPOSE: nothing extracts this
+              # range on its own, and a marker implying a guard it does not have is the vacuity
+              # class this repository already tracks. What covers this block is stronger — the
+              # WHOLE step heredoc is extracted and EXECUTED by scripts/dispatch-plan.py
+              # --self-test (`_run_readiness`), so the CALL SITE below is under test too, which
+              # is where every uncaught mutant in this repo's history has lived.
+              # THE TWO PARTITION LEGS DISAGREED ABOUT THE SAME PR. CLAIM's
               # `busy_packages_of_pulls` frees a machine-parked (`review:parked`) PR's crates when
               # `_pull_inactivity_decision` proves it a defused draft, and says so every tick
               # (`claim-revalidation free: crate X freed via parked pr#N` — MEASURED 142 events
@@ -653,7 +658,6 @@ jobs:
                       return None, "planner ignores the inertness attestation"
                   return field, (f"releases an attested machine park via `{field}` and holds an "
                                  "unattested one")
-              # <<< inertness-attestation
 
               occupancy_input = []
               pr_aware, pr_aware_why = pr_row_aware(dispatch)
@@ -671,7 +675,11 @@ jobs:
                           "pull_request": {},
                       }
                       if inert_field is not None:
-                          row[inert_field] = inert_map.get(pr_number, False) is True
+                          # `inert_map`'s values were normalised to real booleans with `is True`
+                          # where the document was parsed; a second `is True` here would be a
+                          # redundant guard no mutant can kill, i.e. a guard that looks like
+                          # protection and is not. One normalisation point, tested at that point.
+                          row[inert_field] = inert_map.get(pr_number, False)
                       occupancy_input.append(row)
                   print(f"{repo}: PLAN occupancy carries {len(occupancy_input)} open pull-request "
                         f"row(s) — {pr_aware_why}")
@@ -856,8 +864,9 @@ jobs:
               deferred_ready = dispatch.compute_ready(
                   occupancy_input + in_flight_input + deferred_input,
                   in_progress_packages=taken)
-              # >>> deferred-census — EXECUTED by scripts/dispatch-plan.py --self-test.
-              # [sparq#4819] The READY lane has named its partition attrition every tick since the
+              # [sparq#4819] Same no-sentinel rule as the attestation block above: the whole
+              # heredoc is executed by `_run_readiness`, so this line is asserted on its real
+              # output rather than pattern-matched. The READY lane has named its partition attrition every tick since the
               # `partition census` line above landed; this lane, which runs the SAME
               # one-unit-per-package selection over its own candidate set AND inherits the ready
               # lane's `taken` keys on top, printed NOTHING. So "the retry lane offered 2 rows"
@@ -881,7 +890,6 @@ jobs:
                     f"frontier={len(deferred_ready)} "
                     f"partition-deferred={max(0, len(deferred_input) - len(deferred_ready))} "
                     f"ready-lane-keys-held={len(taken)} top-contended: {_def_top}")
-              # <<< deferred-census
 
               routing_doc = dispatch._routing_doc()
               flagged_rows = [(row, False) for row in dispatch.plan_dispatch(ready, routing_doc)]
