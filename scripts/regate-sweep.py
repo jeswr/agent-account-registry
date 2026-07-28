@@ -1569,6 +1569,15 @@ def _sparse_paths(job, path="registry"):
     return {line.strip() for line in str(spec).splitlines() if line.strip()}
 
 
+def _sparse_paths_or_empty(job, path="registry"):
+    """`_sparse_paths` that REPORTS instead of raising. A raise aborts every seam assertion after
+    it, so one mutant would mask the rest — the shape the mutation run flagged on the cron."""
+    try:
+        return _sparse_paths(job, path)
+    except RegateSweepError:
+        return set()
+
+
 SWEEP_JOB = "sweep"
 SWEEP_STEP_ID = "sweep"
 TOKEN_STEP_ID = "registry-token"
@@ -1586,7 +1595,11 @@ def _test_workflow_seam(chk):
     crons = [entry.get("cron") for entry in (triggers.get("schedule") or [])]
     chk("seam: the sweep is on a schedule (delete the cron and it only ever runs by hand)",
         len(crons), 1)
-    minutes = sorted(int(part) for part in str(crons[0]).split()[0].split(","))
+    # Derived DEFENSIVELY. `crons[0]` on an empty list raises, and a raise here does not just look
+    # untidy: it aborts the ~30 seam assertions below, so the single mutant that deletes the cron
+    # would mask every other seam regression behind it. Measured — the mutation run flagged exactly
+    # this as a kill-by-exception.
+    minutes = sorted(int(part) for part in str(crons[0]).split()[0].split(",")) if crons else []
     chk("seam: the cron fires TICKS_PER_HOUR times an hour — the number the drain arithmetic uses",
         len(minutes), TICKS_PER_HOUR)
     chk("seam: the cron minutes do not collide with the other registry crons (dispatch 3/13/…, "
@@ -1598,7 +1611,7 @@ def _test_workflow_seam(chk):
     # --- the call site ------------------------------------------------------------------------
     sweep_steps = [s for s in steps if s.get("id") == SWEEP_STEP_ID]
     chk("seam: exactly one step with the sweep id", len(sweep_steps), 1)
-    step = sweep_steps[0]
+    step = sweep_steps[0] if sweep_steps else {}
     tails = _invocations(step, "regate-sweep.py")
     chk("seam: the step calls this script twice — once `--self-test`, once live",
         (len(tails), tails[0] if tails else None), (2, ["--self-test"]))
@@ -1640,7 +1653,7 @@ def _test_workflow_seam(chk):
     mints = [s for s in steps if str(s.get("uses", "")).startswith(
         "actions/create-github-app-token@")]
     chk("seam: exactly one App-token mint", len(mints), 1)
-    mint = mints[0]
+    mint = mints[0] if mints else {}
     chk("seam: the mint is scoped to this repository only",
         ((mint.get("with") or {}).get("owner"), (mint.get("with") or {}).get("repositories")),
         ("jeswr", "agent-account-registry"))
@@ -1674,13 +1687,14 @@ def _test_workflow_seam(chk):
     # --- the checkout: the declaration must come from MASTER, never from a PR tree ------------
     checkouts = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout@")]
     chk("seam: exactly one checkout", len(checkouts), 1)
+    first_checkout = checkouts[0] if checkouts else {}
     chk("seam: the checkout pins no `ref`, so the repair declaration is read from the default "
         "branch — a PR must not be able to declare ITSELF attributable",
-        (checkouts[0].get("with") or {}).get("ref"), None)
+        (first_checkout.get("with") or {}).get("ref"), None)
     chk("seam: the checkout does not persist credentials",
-        (checkouts[0].get("with") or {}).get("persist-credentials"), False)
+        (first_checkout.get("with") or {}).get("persist-credentials"), False)
     chk("seam: every file the self-test asserts against is in the job's sparse checkout",
-        sorted(_sparse_paths(job)), sorted(REQUIRED_FILES))
+        sorted(_sparse_paths_or_empty(job)), sorted(REQUIRED_FILES))
     for path in REQUIRED_FILES:
         _require(path)
 
