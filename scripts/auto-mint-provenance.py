@@ -1274,6 +1274,13 @@ def _self_test():                                                       # noqa: 
              "> ## Evidence\n    Closes #4242", True),
             ("nested quote then indented (still a paragraph)",
              "> > inner\n    Closes #4242", False),
+            # NESTING NEEDS ITS OWN ROWS: the paragraph case above reads the same whether one level
+            # of marker is stripped or all of them, so on its own it cannot tell a recursive unwrap
+            # from a single one. These can.
+            ("nested quote holding a HEADING", "> > ## Evidence\n    Closes #4242", True),
+            ("triple-nested quote holding a heading", "> > > ## E\n    Closes #4242", True),
+            ("nested quote holding a fence",
+             "> > ```\n> > x\n> > ```\n    Closes #4242", True),
             ("quoted list item then indented", "> - item\n    Closes #4242", False),
             ("unterminated HTML block then indented", "<div>\n</div>\n    Closes #4242", False),
             ("3-space indent is not code", "## E\n   Closes #4242", False),
@@ -2100,6 +2107,25 @@ def _self_test():                                                       # noqa: 
         written_summary = summary_path.read_text(encoding="utf-8") if summary_path.exists() else ""
     finally:
         summary_path.unlink(missing_ok=True)
+    # ...and the fixtures must not write into the job summary the ENVIRONMENT already set. In
+    # Actions GITHUB_STEP_SUMMARY is always set, so an unpinned fixture appends one `### auto-mint`
+    # block to the REAL summary per call — measured at 5 per green run before this was pinned.
+    leak_path = SCRIPTS_DIR.parent / ".git" / f"auto-mint-leak-probe-{os.getpid()}"
+    leak_path.write_text("", encoding="utf-8")
+    saved_env = os.environ.get("GITHUB_STEP_SUMMARY")
+    os.environ["GITHUB_STEP_SUMMARY"] = str(leak_path)
+    try:
+        main_call(["--registry-repo", "o/r", "--annotate-repo", "o/r"])
+        leaked = leak_path.read_text(encoding="utf-8")
+    finally:
+        if saved_env is None:
+            os.environ.pop("GITHUB_STEP_SUMMARY", None)
+        else:
+            os.environ["GITHUB_STEP_SUMMARY"] = saved_env
+        leak_path.unlink(missing_ok=True)
+    check("...and a fixture run NEVER appends to the job summary the environment already set",
+          leaked, "")
+
     check("main() writes the census into the job summary an operator actually reads",
           ("### auto-mint" in written_summary, "enrolled_pulls=0" in written_summary), (True, True))
 
