@@ -1,4 +1,5 @@
 account-usage.py
+alert_route.py
 backfill-provenance.py
 broker-refresh.py
 chain_preference.py
@@ -37,6 +38,7 @@ reconcile-conflict-park.py
 reconcile-park-misescalation.py
 regate-sweep.py
 resolve-conflicts.py
+retriage-alert.py
 retriage.py
 route-resolve.py
 select-and-claim.py
