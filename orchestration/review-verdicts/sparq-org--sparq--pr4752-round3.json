@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4752,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "111f25ace7b34dd296425d3317f1c32ce895dec1",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains clean. The stateful authorization lane pins a published generation, materializes the corresponding server-store snapshot, and reuses it only when both generation and authorization model match; its install guard prevents an older concurrent build from replacing a newer cached generation. Request parsing fail-closes malformed or ambiguous source selection, and unsupported ODRL/trust combinations are refused rather than silently bypassed. The focused HTTP tests exercise the real server store, cache warming, an actual ACL update through the SPARQL writer, subsequent authorization, ODRL refusal, and trust refusal; the parsing regression uses otherwise-valid datasets and is non-vacuous. No new correctness, soundness, security, or test-validity issue is evident. Because round 2 also had no findings, progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
