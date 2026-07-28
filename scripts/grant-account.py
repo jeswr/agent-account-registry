@@ -2301,6 +2301,61 @@ else:
            for name in ("activate_inline", "activate_merged")},
           {"activate_inline": (False, True), "activate_merged": (False, True)})
 
+    # ------------------------------------------------------------------------------------------
+    # [#955] THE REGISTRATION VALIDATION RESOLVES BY EXACT COUNT — and it is EXECUTED. The step used
+    # to build `{a["handle"]: a for a in read_accounts(...)}` and `.get(handle)`. read_accounts sets
+    # `a["handle"]` from the issue TITLE and does NOT deduplicate, and on a public repo a drive-by
+    # issue titled `acctNN` is selectable (the `account` label comes from the issue template, not
+    # from author permission) — so two records sharing the handle collapsed into the LAST one and
+    # this step could assert `models` against an OUTSIDER's body. The fragment below is the
+    # workflow's own text (its `# >>>` sentinels must survive for workflow_block to extract
+    # anything at all); only `records`/`handle` are supplied, `account` is its only output.
+    # ------------------------------------------------------------------------------------------
+    validate_resolve = compile(workflow_block(workflow, "validate", "resolve-registered-record"),
+                               "<resolve-registered-record>", "exec")
+
+    def run_validate(records):
+        """Execute the REAL validate-step resolution over a synthetic read_accounts catalog.
+
+        -> (the resolved record or None, the refusal message or "")."""
+        namespace = {"records": records, "handle": handle}
+        try:
+            exec(validate_resolve, namespace)  # noqa: S102 — this IS the workflow's own fragment
+        except SystemExit as exc:
+            return None, str(exc)
+        return namespace.get("account"), ""
+
+    broker = {"handle": handle, "provider": "anthropic", "models": ["claude-opus-4-8"]}
+    outsider = {"handle": handle, "provider": "anthropic", "models": ["drive-by"]}
+    unrelated = {"handle": "acct08", "provider": "openai", "models": ["gpt-5"]}
+    check("[#955] EXECUTED validate: exactly one record for the handle resolves to THAT record",
+          run_validate([unrelated, broker]), (broker, ""))
+    # The rows that bite: under the dict comprehension BOTH orders exited 0 — the first silently
+    # validating the outsider's `models`, the second silently validating the broker's and calling a
+    # poisoned catalog clean. Asserting the empty refusal message is absent is what makes a
+    # last-one-wins reintroduction go red rather than merely change which record it picked.
+    duplicate_last, duplicate_message = run_validate([broker, outsider])
+    check("[#955] EXECUTED validate: a duplicate handle refuses, naming the count, never keeping "
+          "the LAST record",
+          (duplicate_last, "found 2" in duplicate_message, duplicate_message == ""),
+          (None, True, False))
+    duplicate_first, first_message = run_validate([outsider, broker])
+    check("[#955] EXECUTED validate: ...and refuses on the other order too (not order-dependent)",
+          (duplicate_first, "found 2" in first_message), (None, True))
+    absent, absent_message = run_validate([unrelated])
+    check("[#955] EXECUTED validate: no record for the handle refuses, naming a count of 0",
+          (absent, "found 0" in absent_message), (None, True))
+    # The single-record models check still bites — the count guard did not absorb it.
+    empty, empty_message = run_validate([{"handle": handle, "provider": "anthropic", "models": []}])
+    check("[#955] EXECUTED validate: the sole record with an EMPTY models line still refuses",
+          (empty, "empty models line" in empty_message, "found 1" in empty_message),
+          (None, True, False))
+    check("[#955] a renamed step, or a deleted sentinel, fails the extraction LOUDLY",
+          (refuses(workflow_block, workflow, "validate", "no-such-marker", needle="found 0/0"),
+           refuses(workflow_block, workflow, "no_such_step", "resolve-registered-record",
+                   needle="found 0")),
+          (True, True))
+
     template = (root / ".github/ISSUE_TEMPLATE/set-up-account.yml").read_text(encoding="utf-8")
     form = strip_yaml_comments(template)
     check("the request form documents the grant label (in the form itself, not a comment)",
