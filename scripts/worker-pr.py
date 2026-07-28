@@ -11782,6 +11782,37 @@ def _self_test():
         capture_output=True, text=True, check=False)
     check("[#972] the CLI's --issue is not `type=int` (an empty value is never an argparse error)",
           "invalid int value" in _ir_issue_cli.stderr, False)
+    # (8) THE FAIL DIRECTION of the idempotence read. An unreadable comment page must never
+    #     SUPPRESS the exit — a duplicate receipt is noise, a missing one is the #972 loop.
+    _ir_blind = _IdentityWrites().install()
+    _ir_blind_raise = globals()["_paginated_comments"]
+    globals()["_paginated_comments"] = _ir_raiser = (
+        lambda repo, pr: (_ for _ in ()).throw(WorkerPrError("comments page is malformed")))
+    try:
+        identity_refusal("o/r", 41, "author-not-app-bot", issue=7, bot_login=_ir_bot)
+    finally:
+        globals()["_paginated_comments"] = _ir_blind_raise
+        _ir_blind.restore()
+    check("[#972] an UNREADABLE comment page still records the refusal (fail toward writing)",
+          (len(_ir_blind.comments), _ir_blind.states), (2, ["needs-user"]))
+    # (9) THE CALL SITE. Everything above drives `identity_refusal` directly; this drives the
+    #     PRODUCTION `main()` dispatcher with the workflow's own argv shape, so a subcommand
+    #     wired to the wrong function — or not wired at all — reds here. Writes are stubbed, so
+    #     no GitHub call is made.
+    _ir_main = _IdentityWrites().install()
+    _ir_saved_argv, _ir_saved_route = sys.argv, globals()["_alert_route"]
+    globals()["_alert_route"] = lambda: (None, None)
+    sys.argv = ["worker-pr.py", "identity-refusal", "--repo", "o/r", "--pr", "41",
+                "--reason", "author-not-app-bot", "--issue", "7",
+                "--bot-login", _ir_bot, "--head-sha", "d" * 40]
+    try:
+        _ir_main_rc = main()
+    finally:
+        sys.argv, globals()["_alert_route"] = _ir_saved_argv, _ir_saved_route
+        _ir_main.restore()
+    check("[#972] the `identity-refusal` subcommand is WIRED in main() and reaches the writer",
+          (_ir_main_rc, len(_ir_main.comments), _ir_main.states, _ir_main.issue_status),
+          (0, 2, ["needs-user"], [(7, "needs-user")]))
 
     print("worker-pr self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
