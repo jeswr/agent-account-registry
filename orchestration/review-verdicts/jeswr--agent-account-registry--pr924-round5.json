@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 924,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d745d5cbd53f59a8f92762704089734e255701b5",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_workflow_run_shell` iterates over `body.splitlines()` and calls `pipefail_delta` on segments from each physical line. For a body containing `set +o pipefail`, then `set -o \\` on one line and `pipefail` on the next, Bash re-enables pipefail, but neither segment matches a complete option transition. The scanner consequently leaves `pipefail` false and suppresses a subsequent `producer | head -1` pipeline. The new fixture asserts same-line separators and scoped constructs, but does not exercise this multiline logical-command bypass, so its exact count remains green despite the false-negative path.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Track pipefail option transitions over shell logical commands, including backslash continuations, before deciding whether following commands are emitted. Add a positive-control fixture that disables pipefail, re-enables it with `set -o \\` plus `pipefail` on the next physical line, then contains a vulnerable pipeline, and require that pipeline to be counted.",
+    "severity": "major",
+    "title": "Backslash-continued pipefail re-enable still bypasses the workflow guard"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-4 major finding remains unresolved. `_workflow_run_shell` still processes each physical line independently, and `pipefail_delta` only recognizes a complete `set ... pipefail` within one segment. Bash logical commands may span backslash continuations, so `set +o pipefail`, then `set -o \\` followed by `pipefail`, re-enables pipefail at runtime while the scanner retains its disabled state. A later vulnerable pipeline is therefore blanked and the real-workflow guard can report a false-clean zero. The expanded control fixture still has no backslash-continuation positive control.",
+  "verdict": "request_changes"
+ }
+}
