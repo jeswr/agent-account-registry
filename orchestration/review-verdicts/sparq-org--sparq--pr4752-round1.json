@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4752,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "252e69584b64101ea806fbef1bceb51bac789fa9",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "parse_request uses obj.get(\"source\").and_then(|s| s.as_str()), so a present malformed value such as {\"source\":null,\"dataset\":\"...\"} or {\"source\":false,\"dataset\":\"...\"} becomes None and defaults to AuthzSource::Body. This selector chooses whether authorization trusts the server's loaded store or a caller-supplied dataset, so malformed input must not silently cross into the body lane. The stated fail-closed contract and unknown-source rejection currently cover only unknown strings, leaving this type-confusion path untested.",
+    "file": "crates/sparq-server/src/solid_authz.rs",
+    "fix_hint": "Distinguish an absent key from a present value: match obj.get(\"source\") directly, default only on None, accept only Value::String containing body/server, and return 400 for every other JSON type. Add a wire-level or parse_request test for at least source:null (with an otherwise valid dataset) asserting BAD_REQUEST.",
+    "severity": "major",
+    "title": "Non-string source values silently select the body authorization lane"
+   }
+  ],
+  "progress": null,
+  "summary": "The generation-keyed stateful authorization view and its ACL-write integration test are coherent, but the new source selector is not fully fail-closed. A present JSON value of the wrong type is collapsed into the historical absent/default case, which can select the caller-supplied body dataset across a trust-boundary mistake. Reject every present value other than a string equal to body or server.",
+  "verdict": "request_changes"
+ }
+}
