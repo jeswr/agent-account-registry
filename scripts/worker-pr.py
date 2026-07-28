@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 
 
 _retry_spec = importlib.util.spec_from_file_location(
@@ -9889,6 +9890,25 @@ def _self_test():
         run_raa(arm_gate="failure")
         check("a declined arm writes NO trust-surface audit either (no mutation at all)",
               any("trust-surface" in c for c in raa_calls), False)
+        # The TIER ARGUMENT of the live read, asserted directly — the harness above substitutes
+        # `_live_arm_gate` wholesale, so nothing there can see which names it requests. It has to
+        # be `draft=True`: a sparq DRAFT head publishes `gate, draft-tier` and NOTHING named
+        # plain `gate`, so `repair_gate_checks_for(False)` would read "missing" on every draft,
+        # `arm_gate_decision` would fail open on all of them, and this whole change would be
+        # silently inert while every test above still passed (the #762 shape exactly). Also pins
+        # that the read goes through dispatch-claim's own walk rather than a second spelling.
+        real_dc = globals()["_dispatch_claim"]
+        dc_calls = []
+        try:
+            globals()["_dispatch_claim"] = lambda: types.SimpleNamespace(
+                _live_repair_gate=lambda repo, head_sha, draft: (
+                    dc_calls.append((repo, head_sha, draft)) or "failure"))
+            # the REAL function, not the harness stub globals() currently holds
+            gate_seen = real_raa["_live_arm_gate"]("o/r", sha)
+        finally:
+            globals()["_dispatch_claim"] = real_dc
+        check("the live arm gate reads BOTH tiers (draft=True) via dispatch-claim's own walk",
+              (dc_calls, gate_seen), ([("o/r", sha, True)], "failure"))
         # THE YAML SEAM. `bind_reviewed_sha` is inert unless review-fix.yml's bind step admits
         # it, and that expression is not reachable from any behavioural test of this module.
         check("review-fix.yml's bind step admits BOTH the armed and the declined-arm legs",
