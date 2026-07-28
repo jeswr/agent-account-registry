@@ -449,6 +449,10 @@ BUCKETS = (
     "gate-not-red",
     "failure-postdates-repair",
     "already-contains-fix",
+    # A read this tick could not complete (the containment compare, or the marker listing). NOT the
+    # same state as "the log said nothing usable", and naming them alike would let a listing outage
+    # masquerade in the census as a population that was examined and found unattributable.
+    "read-failed",
     "log-unavailable",
     "unreconciled-log",
     "wrong-harness",
@@ -750,7 +754,7 @@ class Sweeper:
             return bucket, empty, gate
         contains = head_contains(self.repo, merge_sha, head, self.runner)
         if contains is None:
-            return "log-unavailable", empty, gate
+            return "read-failed", empty, gate
         if contains:
             return "already-contains-fix", empty, gate
         job_id = gate_run_id(gate)
@@ -760,7 +764,7 @@ class Sweeper:
             return bucket, ledger, gate
         swept = already_swept(self.repo, pr["number"], repair["repair_pr"], self.runner)
         if swept is None:
-            return "log-unavailable", ledger, gate
+            return "read-failed", ledger, gate
         return ("already-swept" if swept else "attributable"), ledger, gate
 
     def _act(self, pr, repair, merged_at, ledger, gate):
@@ -940,12 +944,22 @@ def _test_failure_ledger(chk):
                            "RegateSweepError: input missing",
                            "##[error]Process completed with exit code 1.")).reason,
         "unreconciled-log")
-    chk("ledger: two failing roll-ups are refused (the suite runs under set -e, so this is a log "
-        "this harness cannot account for)",
+    # TWO roll-ups, deliberately shaped so that NEITHER the count clause nor the header clause can
+    # catch it: same harness, and a count that agrees with the single extracted failure. An inner
+    # self-test invoked as a subprocess prints exactly this. Without the exactly-one clause the log
+    # reconciles and its (ambiguous) accounting would be believed. The earlier two-harness spelling
+    # of this test was killed by the OTHER two clauses, so it credited a kill it could not produce.
+    chk("ledger: TWO failing roll-ups are refused even when the first one's own accounting is "
+        "self-consistent — the log names two accountings and this harness reads neither",
+        failure_ledger(_log("== self-test worker-live.sh ==", "  FAIL x: 1 (want 0)",
+                            "worker-live self-test FAILED (1 failure(s))",
+                            "worker-live self-test FAILED (1 failure(s))")).reason,
+        "unreconciled-log")
+    chk("ledger: two failing roll-ups from DIFFERENT harnesses are refused too",
         failure_ledger(_log("== self-test a.py ==", "  FAIL x: 1 (want 0)",
-                           "a self-test FAILED (1 failure(s))",
-                           "== self-test b.py ==", "  FAIL y: 1 (want 0)",
-                           "b self-test FAILED (1 failure(s))")).reason,
+                            "a self-test FAILED (1 failure(s))",
+                            "== self-test b.py ==", "  FAIL y: 1 (want 0)",
+                            "b self-test FAILED (1 failure(s))")).reason,
         "unreconciled-log")
     chk("ledger: a roll-up that does NOT match the last `== self-test X ==` header is refused "
         "(the accounting must belong to the harness that actually stopped the loop)",
@@ -1122,7 +1136,7 @@ class FakeGh:
 
     def __init__(self, repo, pulls, *, gate_by_head=None, logs=None, contains=None,
                  comments=None, default_branch=DEFAULT_BRANCH, repair_detail=None,
-                 refuse_update=(), ref_moves=True):
+                 refuse_update=(), ref_moves=True, refuse_comment_reads=False):
         self.repo = repo
         self.pulls = pulls
         self.gate_by_head = gate_by_head or {}
@@ -1133,6 +1147,7 @@ class FakeGh:
         self.repair_detail = repair_detail
         self.refuse_update = set(refuse_update)
         self.ref_moves = ref_moves
+        self.refuse_comment_reads = refuse_comment_reads
         self.calls = []
 
     def __call__(self, args):
@@ -1157,10 +1172,15 @@ class FakeGh:
             return 0, json.dumps({"check_runs": self.gate_by_head.get(head, [])})
         if tail.startswith("/compare/"):
             head = tail.split("...")[-1]
-            return 0, json.dumps({"status": "ahead" if self.contains.get(head) else "diverged"})
+            state = self.contains.get(head, False)
+            if state is None:
+                return 1, ""      # the compare could not be read at all
+            return 0, json.dumps({"status": "ahead" if state else "diverged"})
         if "/actions/jobs/" in tail:
             return 0, self.logs.get(int(tail.split("/")[3]), "")
         if "/comments" in tail:
+            if self.refuse_comment_reads:
+                return 1, ""
             number = int(tail.split("/")[2])
             return 0, json.dumps([{"body": b} for b in self.comments.get(number, [])])
         if tail.startswith("/git/ref/heads/"):
@@ -1188,7 +1208,7 @@ NOW = parse_rfc3339("2026-07-28T02:30:00Z")
 
 
 def _fixture(*, labels=(), comments=None, refuse_update=(), cap=MAX_MOVES_PER_TICK, apply=True,
-             ref_moves=True):
+             ref_moves=True, refuse_comment_reads=False):
     """Tonight's board, reduced to its two load-bearing members: #903 (attributable) and #92 (red
     on its own merits, identical in every other respect)."""
     pulls = [_pr(903, head="a" * 40, ref="fix/903", labels=labels),
@@ -1198,7 +1218,8 @@ def _fixture(*, labels=(), comments=None, refuse_update=(), cap=MAX_MOVES_PER_TI
         gate_by_head={"a" * 40: [_gate()], "b" * 40: [_gate()]},
         logs={90164408722: _worker_live_log(f"{SIG}: 1 (want 0)")},
         contains={}, comments=comments or {}, repair_detail=REPAIR_DETAIL,
-        refuse_update=refuse_update, ref_moves=ref_moves)
+        refuse_update=refuse_update, ref_moves=ref_moves,
+        refuse_comment_reads=refuse_comment_reads)
     # #92's gate points at a different job whose log carries its OWN failure.
     gh.gate_by_head["b" * 40] = [{**_gate(),
                                  "details_url": ".../actions/runs/1/job/555"}]
@@ -1222,6 +1243,10 @@ def _test_live_sweep(chk):
          if any(re.search(r"/actions/(runs|jobs)/\d+/rerun", a) for a in c)], [])
     chk("live: the CONTROL — a PR red on its own merits — is NOT touched", 92 in gh.updated(),
         False)
+    chk("live: the move is CONDITIONAL on the head it classified — an author push landing between "
+        "the read and the write rejects the update instead of discarding their commit",
+        [a for c in gh.calls for a in c if a.startswith("expected_head_sha=")],
+        ["expected_head_sha=" + "a" * 40])
     chk("live: the control's refusal is named in the census",
         "own-merits:1" in sweeper.rows[0], True)
     chk("live: the census names the class and the move", "class=1 moved=1" in sweeper.rows[0], True)
@@ -1242,6 +1267,20 @@ def _test_live_sweep(chk):
     sweeper4.run()
     chk("idempotence: once the head contains the fix the PR leaves the class on its own",
         (gh4.updated(), "already-contains-fix:1" in sweeper4.rows[0]), ([], True))
+
+    # A failed READ is its own state. Collapsing it into an evidence bucket would let a listing
+    # outage read, in the census, as a population that WAS examined and found unattributable.
+    gh4b, sweeper4b = _fixture()
+    gh4b.contains["a" * 40] = None
+    sweeper4b.run()
+    chk("read-failure: an unreadable containment compare is censused as read-failed, never as an "
+        "examined-and-refused PR", (gh4b.updated(), "read-failed:1" in sweeper4b.rows[0]),
+        ([], True))
+    gh4c, sweeper4c = _fixture(refuse_comment_reads=True)
+    sweeper4c.run()
+    chk("read-failure: an unreadable MARKER listing refuses the move — reading it as 'not swept' "
+        "would move a head this tick cannot prove it has not already moved",
+        (gh4c.updated(), "read-failed:1" in sweeper4c.rows[0]), ([], True))
 
     # THE CAP, on the live path.
     many = [_pr(n, head=f"{n:040x}", ref=f"fix/{n}") for n in (903, 923, 895, 893, 886, 856)]
