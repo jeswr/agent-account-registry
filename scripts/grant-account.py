@@ -1928,10 +1928,7 @@ def flag(name):
     return argv[argv.index(name) + 1] if name in argv else ""
 
 
-if argv[:2] == ["issue", "list"]:
-    for number in state["issue_numbers"]:
-        print(number)
-elif argv[:2] == ["issue", "view"]:
+if argv[:2] == ["issue", "view"]:
     number = argv[2]
     fields = flag("--json")
     if number not in state["labels"]:
@@ -1956,8 +1953,24 @@ elif argv[:2] == ["issue", "edit"]:
 elif argv[:2] in (["issue", "comment"], ["issue", "close"]):
     pass
 elif argv[:1] == ["api"]:
-    url = argv[1]
-    if "/commits/" in url:
+    # The URL is the first non-flag argument: `--paginate` may precede it (#896).
+    url = next((argument for argument in argv[1:] if not argument.startswith("-")), "")
+    if "/issues?" in url:
+        # The AUTHORITATIVE issues endpoint (#896): the union of issues AND pull requests,
+        # state-filtered by the query and served one JSON array per PAGE. Page size is 2 here,
+        # standing in for GitHub's real per-page cap, and only `--paginate` walks past the first
+        # page — so a read that drops `--paginate`, or asks for `state=open`, or forgets that PRs
+        # share this endpoint, resolves a DIFFERENT set and the scenarios below catch it.
+        if "issues" in state.get("fail", []):
+            die("issues listing rejected")
+        found = re.search(r"[?&]state=([a-z]+)", url)
+        wanted = found.group(1) if found else "open"   # the API's own default
+        records = [record for record in state["issues"]
+                   if wanted == "all" or record.get("state", "open") == wanted]
+        pages = [records[index:index + 2] for index in range(0, len(records), 2)] or [[]]
+        for page in (pages if "--paginate" in argv else pages[:1]):
+            print(json.dumps(page))
+    elif "/commits/" in url:
         if "commits" in state.get("fail", []):
             die("commits read rejected")
         print(state["parent_sha"])
@@ -2021,6 +2034,11 @@ else:
                                    base_sha: FIXTURE},
                      "pr_files": pr_files()}
             state.update(scenario)
+            # #896: the account issue is resolved through the issues API, so the fake serves issue
+            # RECORDS. `issue_numbers` stays the simple knob (each number is a record titled with
+            # the handle, open); a scenario that cares about titles, PRs or state passes `issues`.
+            state.setdefault("issues", [{"number": int(number), "title": handle, "state": "open"}
+                                        for number in state["issue_numbers"]])
             state_file, log_file = work / "state.json", work / "calls.jsonl"
             state_file.write_text(json.dumps(state), encoding="utf-8")
             log_file.write_text("", encoding="utf-8")
@@ -2139,6 +2157,120 @@ else:
           run_activate(head_ref="account-pool/not-a-handle!")[:2] + (
               [call for call in run_activate(head_ref="account-pool/x")[2]], ),
           (1, ["status:pending"], []))
+
+    # ------------------------------------------------------------------------------------------
+    # [#896] THE ACCOUNT ISSUE IS RESOLVED THROUGH AUTHORITATIVE STATE, NOT THE SEARCH INDEX.
+    # Both activation paths used to resolve the record with `gh issue list --search "<handle>
+    # in:title"` — GitHub's eventually-consistent index, read without `--limit` so also capped at
+    # 30 results (#238). The rows below are the two directions that carrier gets wrong, driven
+    # through the privileged step: a record the index has not caught up with reads as `found 0`
+    # (a fail-closed refusal of a CORRECT activation), and — the direction that fails OPEN — a
+    # DUPLICATE pair with only one copy indexed reads as `found 1` and activates an arbitrary
+    # record. The fake serves the issues endpoint the way GitHub does: pull requests included,
+    # `state=` honoured, one array per page and no page past the first without `--paginate`.
+    # ------------------------------------------------------------------------------------------
+    account_issue = {"number": 5, "title": handle, "state": "open"}
+    check("[#896] EXECUTED activate: a PULL REQUEST titled with the handle is not the account",
+          activated_view(issues=[{"number": 77, "title": handle, "state": "open",
+                                  "pull_request": {"url": "https://api.github.com/pulls/77"}},
+                                 account_issue]),
+          (0, ["status:available"], True, True))
+    check("[#896] EXECUTED activate: a CLOSED duplicate is still an ambiguity (state=all)",
+          activated_view(issues=[account_issue,
+                                 {"number": 6, "title": handle, "state": "closed"}]),
+          (1, ["status:pending"], False, False))
+    check("[#896] EXECUTED activate: the account is found PAST the first page (never capped)",
+          activated_view(issues=[{"number": number, "title": f"acct{number:02d}", "state": "open"}
+                                 for number in (1, 2, 3, 4)] + [account_issue]),
+          (0, ["status:available"], True, True))
+    check("[#896] EXECUTED activate: near-miss titles are not the account (exact match)",
+          activated_view(issues=[{"number": 71, "title": handle + "0", "state": "open"},
+                                 {"number": 72, "title": f"set up {handle}", "state": "closed"},
+                                 account_issue]),
+          (0, ["status:available"], True, True))
+    # An enumeration that FAILS must be reported as an unreadable listing, not silently become
+    # "found 0": both refuse today, but a swallowed error misdiagnoses a transient API failure as
+    # a missing record, and it is the zero-match branch that any future relaxation would touch.
+    code, final, calls, output = run_activate(fail=["issues"])
+    check("[#896] EXECUTED activate: an unreadable issues listing refuses AS a failed enumeration",
+          (code, final, any(call[:2] == ["issue", "edit"] for call in calls),
+           "could not enumerate the account issues" in output),
+          (1, ["status:pending"], False, True))
+
+    # ------------------------------------------------------------------------------------------
+    # [#896] ...AND SO DOES THE INLINE ACTIVATION. `activate_inline` performs a state transition
+    # identical in consequence to the job above (status:pending -> status:available on a credential
+    # the allocator then hands out), so its resolution is EXECUTED against the same fake GitHub
+    # rather than asserted by substring. Only the step's own env transport is supplied ($HANDLE /
+    # $REPO); the endpoint, the pagination, the state filter, the pull-request filter, the exact
+    # title comparison and the exactly-one requirement all come from the workflow text — and the
+    # fragment's `# >>>` sentinels must survive for workflow_block to extract anything at all.
+    # ------------------------------------------------------------------------------------------
+    inline_resolve = workflow_block(workflow, "activate_inline", "resolve-account-issue")
+
+    def run_inline(issues, fail=()):
+        """Execute the REAL activate_inline resolution fragment.
+
+        -> (exit code, resolved issue number, combined output)."""
+        with tempfile.TemporaryDirectory() as directory:
+            work = pathlib.Path(directory)
+            (work / "bin").mkdir()
+            (work / "bin" / "gh").write_text(fake_gh, encoding="utf-8")
+            (work / "bin" / "gh").chmod(0o755)
+            state_file, log_file = work / "state.json", work / "calls.jsonl"
+            state_file.write_text(json.dumps({"issues": issues, "fail": list(fail)}),
+                                  encoding="utf-8")
+            log_file.write_text("", encoding="utf-8")
+            script = ("set -euo pipefail\n" + inline_resolve
+                      + '\nprintf "resolved=%s\\n" "$num"\n')
+            done = subprocess.run(
+                ["bash", "-c", script], cwd=str(work), capture_output=True, text=True,
+                timeout=300, check=False,
+                env={**os.environ, "PATH": f"{work / 'bin'}:{os.environ['PATH']}",
+                     "REPO": "o/registry", "HANDLE": handle, "GH_TOKEN": "t",
+                     "FAKE_GH_STATE": str(state_file), "FAKE_GH_LOG": str(log_file)})
+            resolved = next((line.split("=", 1)[1] for line in done.stdout.split("\n")
+                             if line.startswith("resolved=")), None)
+            return done.returncode, resolved, done.stdout + done.stderr
+
+    def inline_view(issues, fail=()):
+        """(exit code, resolved issue number) — the outcome, without the diagnostics."""
+        return run_inline(issues, fail)[:2]
+
+    check("[#896] EXECUTED inline activation: one authoritative record resolves to that issue",
+          inline_view([account_issue]), (0, "5"))
+    check("[#896] EXECUTED inline activation: a PULL REQUEST titled with the handle is ignored",
+          inline_view([{"number": 77, "title": handle, "state": "open",
+                        "pull_request": {"url": "https://api.github.com/pulls/77"}},
+                       account_issue]),
+          (0, "5"))
+    check("[#896] EXECUTED inline activation: a CLOSED duplicate refuses (state=all)",
+          inline_view([account_issue, {"number": 6, "title": handle, "state": "closed"}]),
+          (1, None))
+    check("[#896] EXECUTED inline activation: the account is found PAST the first page",
+          inline_view([{"number": number, "title": f"acct{number:02d}", "state": "open"}
+                       for number in (1, 2, 3, 4)] + [account_issue]),
+          (0, "5"))
+    check("[#896] EXECUTED inline activation: near-miss titles are not the account",
+          inline_view([{"number": 71, "title": handle + "0", "state": "open"}, account_issue]),
+          (0, "5"))
+    check("[#896] EXECUTED inline activation: no record at all refuses",
+          inline_view([]), (1, None))
+    # As on the merged path: a listing that FAILED must be refused AS a failed enumeration. Both
+    # branches exit 1, so the outcome alone cannot tell them apart — a `|| true` on the read would
+    # report a transient API failure as "found 0", indistinguishable from a genuinely absent record.
+    code, resolved, output = run_inline([account_issue], fail=["issues"])
+    check("[#896] EXECUTED inline activation: an unreadable listing refuses AS a failed enumeration",
+          (code, resolved, "could not enumerate the account issues" in output,
+           "found 0" in output),
+          (1, None, True, False))
+    # Neither path may carry the index-backed carrier back in (the executed rows above are the
+    # proof of behaviour; this is the textual guard against a second, un-executed reintroduction).
+    check("[#896] neither activation path resolves the account issue through the search index",
+          {name: ("in:title" in strip_yaml_comments(workflow_step_script(workflow, name)),
+                  "--paginate" in strip_yaml_comments(workflow_step_script(workflow, name)))
+           for name in ("activate_inline", "activate_merged")},
+          {"activate_inline": (False, True), "activate_merged": (False, True)})
 
     template = (root / ".github/ISSUE_TEMPLATE/set-up-account.yml").read_text(encoding="utf-8")
     form = strip_yaml_comments(template)
