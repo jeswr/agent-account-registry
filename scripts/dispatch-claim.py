@@ -1810,13 +1810,23 @@ def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_stat
 #       and this derivation was WRONG on its face in round 1: the sticky-unpark veto's timeline
 #       read was written as "(1)", which is a count of `gh api --paginate` INVOCATIONS, not of
 #       HTTP requests. At `per_page=100` that read costs ceil(events/100) requests.
-#       RE-MEASURED via `Link: rel="last"` on the live target (sparq-org/sparq, 2026-07-27): the
-#       four holders of the measured board (#4360/#4509/#4528/#4571) carry 18 / 12 / 7 / 9
-#       timeline events, and the three OLDEST open PRs (#1487/#1509/#1607) — the worst case the
-#       fleet actually holds — carry 19 / 33 / 24. ONE page each, so the itemised 1 is right
-#       today, AND the bound is not tight on it: at a cap of 12 the spare affords FOUR pages per
-#       holder (12 * (4 + 4) = 96 <= 102) before it binds. The self-test asserts that headroom
-#       rather than assuming it.
+#       RE-MEASURED on the live target (sparq-org/sparq), as `len(timeline?per_page=100)`. THE
+#       POPULATION IS THE FOUR PRs THE SWEEP ACTUALLY PARKED, and it identifies itself: their
+#       `review:parked` labels landed 20:15:53Z, 20:28:37Z, 20:41:20Z and 20:50:16Z — FOUR
+#       CONSECUTIVE TICKS, ONE PARK EACH, which is this defect visible in the label timeline.
+#           #4599 = 8, #4601 = 5, #4604 = 7, #4607 = 4 events
+#       and the three OLDEST open PRs (#1487/#1509/#1607) — the widest timelines the fleet
+#       actually holds — carry 19 / 32 / 25. ONE page each, so the itemised 1 is right.
+#       (An EARLIER round of this comment named #4360/#4509/#4528/#4571 as the board. That was
+#       wrong and is corrected rather than quietly dropped: #4571 is an ISSUE, #4360 is a CLOSED
+#       PR, and #4509/#4528 carry `needs:user` — a human-owned hold that
+#       park_starved_partition_holder REFUSES. They are the UNPROVENANCED population this file
+#       names elsewhere, which is a different set from the PARKED board.)
+#       These counts DRIFT — they moved within hours of being taken, and two read methods
+#       disagreed by one — so the exact numbers are not what the bound rests on. What it rests on
+#       is the margin to the 100/page boundary: at a cap of 12 the spare affords FOUR pages per
+#       holder (12 * (4 + 4) = 96 <= 102) before the budget binds, i.e. ~400 timeline events on
+#       every holder at once.
 #   spare requests per tick     ~= 102
 #       the floor sizes a clean tick at MEASURED_REQUESTS_PER_TICK=613 and 6 ticks/h = 3,678/h,
 #       against OBSERVED_SAFE_REQUESTS_PER_HOUR = 7*613 = 4,291/h that ran clean for thirteen
@@ -16037,7 +16047,8 @@ def _starvation_park_batch_seam_self_test():
     green if the production tick acts on only the first target — which IS the defect. This runs
     the real statements and counts the real writes.
     """
-    board = [4360, 4509, 4528, 4571][:MEASURED_STARVED_HOLDER_BOARD]
+    # the real PR numbers of the board the sweep parked one-per-tick on the measured window
+    board = [4599, 4601, 4604, 4607][:MEASURED_STARVED_HOLDER_BOARD]
     parked, counted = _run_starvation_park_batch(list(reversed(board)))
     assert parked == board, (
         f"ONE tick must park ALL {len(board)} inert `{GLOBAL_PACKAGE}` holders — the reservation "
@@ -16149,7 +16160,9 @@ def _starvation_sweep_self_test():
           "ascending and order-independently — parking one of three frees nothing")
 
     # The measured board itself, at its real PR numbers: one tick, one floor interval, drained.
-    board_numbers = [4360, 4509, 4528, 4571][:MEASURED_STARVED_HOLDER_BOARD]
+    # These are the four PRs the sweep ACTUALLY parked, one per tick, on the window this change is
+    # justified by — `review:parked` applied at 20:15:53Z / 20:28:37Z / 20:41:20Z / 20:50:16Z.
+    board_numbers = [4599, 4601, 4604, 4607][:MEASURED_STARVED_HOLDER_BOARD]
     board = [_starvation_row(n, packages={GLOBAL_PACKAGE}) for n in reversed(board_numbers)]
     assert starvation_park_targets([], 30, board) == board_numbers, board_numbers
     _floor = _load_module("registry_tick_floor_pin",
@@ -16220,11 +16233,16 @@ def _starvation_sweep_self_test():
         ("the park receipt comment", 1),
         ("the machine-park label write", 1),
     ), ("the per-park cost is an ITEMISED MEASUREMENT of the requests park_starved_partition_"
-        "holder issues — the veto's `--paginate` timeline read (MEASURED one page: 18/12/7/9 "
-        "events on the four holders of the measured board, 19/33/24 on the three OLDEST open PRs, "
-        "read from `Link: rel=\"last\"` on sparq-org/sparq 2026-07-27), up to 2 collaborator-"
-        "permission probes behind it, the receipt comment and the label write. Change a line item "
-        "only with a new measurement of that call path, and re-derive "
+        "holder issues. THE POPULATION TO RE-MEASURE IS THE PRs THE SWEEP ACTUALLY PARKED — on "
+        "sparq-org/sparq that is #4599/#4601/#4604/#4607, identifiable without trusting this "
+        "sentence because their `review:parked` labels landed 20:15:53Z/20:28:37Z/20:41:20Z/"
+        "20:50:16Z, one per tick, which is the defect itself. It is NOT the unprovenanced "
+        "population (#4360/#4509/#4528) this file names elsewhere: those are a different set, one "
+        "is closed and two carry a `needs:user` hold this writer refuses. Their `--paginate` "
+        "timeline reads measured 8/5/7/4 events, and the three OLDEST open PRs 19/32/25 — one "
+        "page each, and the counts DRIFT, so re-measure rather than trust them. Then up to 2 "
+        "collaborator-permission probes, the receipt comment and the label write. Change a line "
+        "item only with a new measurement of that call path, and re-derive "
         "STARVATION_PARKS_PER_TICK_MAX when you do")
     assert STARVATION_PARK_REQUESTS_EACH == 5, (
         "STARVATION_PARK_REQUESTS_EACH is a MEASUREMENT, and it is read only on the LEFT of "
@@ -16244,18 +16262,21 @@ def _starvation_sweep_self_test():
         "drain time in this block and the bound they justify must be re-derived")
 
     # ...and the itemised timeline read is the one line item that is not a constant of the API: a
-    # holder with >100 timeline events costs a page more. The bound must not be tight on it.
+    # holder with >100 timeline events costs a page more, so the margin to that boundary is worth
+    # having in the run log. It is COMPUTED AND REPORTED, NOT ASSERTED, and deliberately so:
+    # `_pages_afforded >= 1` is algebraically the same statement as `_batch_cost <= _spare_per_tick`
+    # above, so it could never fire on its own. An assertion that cannot fail is the vacuity this
+    # very block exists to eliminate, and writing one here would have been the same mistake in a
+    # new costume. Strengthening it to `>= 2` WOULD bite — but it would narrow the bound's honest
+    # interval from [4, 20] to [4, 16] as a side effect of a comment, which is a different change.
     _pages_afforded = (int(_spare_per_tick) // STARVATION_PARKS_PER_TICK_MAX
                        - (STARVATION_PARK_REQUESTS_EACH - 1))
-    assert _pages_afforded >= 1, (
-        f"a full batch affords {_pages_afforded} timeline page(s) per holder — at least the one "
-        "MEASURED page must fit, or a single long-lived holder breaks the budget the bound is "
-        "derived from")
     print(f"  ok   #871 measured inputs PINNED BY EQUALITY: park cost "
           f"{STARVATION_PARK_REQUESTS_EACH} (itemised), floor {_floor.MIN_TICK_INTERVAL_SECONDS}s, "
           f"tick {_floor.MEASURED_REQUESTS_PER_TICK} req, safe "
           f"{_floor.OBSERVED_SAFE_REQUESTS_PER_HOUR}/h — and the batch affords "
-          f"{_pages_afforded} timeline page(s) per holder against a MEASURED 1")
+          f"{_pages_afforded} timeline page(s) per holder (reported, not asserted: it restates "
+          f"the batch-cost bound) against a MEASURED 1")
 
     # ...and a board WIDER than the bound is paced, ascending, loudly — never silently truncated.
     paced_logs = []
