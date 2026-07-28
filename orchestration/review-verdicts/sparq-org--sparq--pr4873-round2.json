@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4873,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a64d97b412d2ce9e884778eba1e9294e62481652",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and complete as scoped. The update differential keeps sparq-vs-sparq comparisons strict, switches to constrained RDFC-1.0 canonicalization only when blank nodes require isomorphism, and preserves duplicate sensitivity with the raw-count guard. Oxigraph's xsd:integer lexical collapse is adjudicated narrowly through an independent structural normalization, while unrelated differences remain failures. LOAD substitution is explicitly limited to generated ground N-Triples and is backed by tests for both the engine capability mismatch and semantic equivalence. The tests exercise positive and negative comparator behavior, constrained triple-term handling, exact lexical-term deletion, generator coverage, and injected-divergence detection; none is vacuous. No reviewer-directed instruction was found in the diff. With no prior findings and no new issues, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
