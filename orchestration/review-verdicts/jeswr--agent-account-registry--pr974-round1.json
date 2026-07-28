@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 974,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2abc4691311a86ad203cd5dd961bb40fbca95cc8",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The validation now resolves the newly registered handle by exact-match cardinality and fails closed on both zero and multiple parsed catalog records, eliminating the prior last-record-wins ambiguity while preserving the nonempty-model guard. The added self-tests execute the workflow's extracted production fragment, cover both duplicate orderings, zero matches, the valid singleton, and an empty-model singleton, and explicitly verify sentinel/step extraction failure; these assertions are non-vacuous and would fail under the prior dict-comprehension behavior. No trust check, permission boundary, token handling, or workflow action pinning is weakened by this scoped change.",
+  "verdict": "approve"
+ }
+}
