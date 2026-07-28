@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 900,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "674695d300920489ccfacb467b3be1bd1d3659f2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The self-test described as proving every row declares label|kind|probe|pattern only rejects NF<4. A row such as `|command|tool|pattern` or `label|command|tool|` has four fields and passes that assertion; an empty label is then silently skipped by `_selftest_env_blocked`. The current two rows are valid and are additionally covered by dependency-specific assertions, so this does not undermine the present change, but a later added requirement could be accidentally omitted fail-open if its label is empty.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Validate every parsed row's label, kind, probe, and pattern as non-empty (and preferably reject unsupported kinds) rather than checking only NF<4; add a fixture showing that an empty-label requirement is rejected rather than skipped.",
+    "severity": "minor",
+    "title": "Requirement-row validation permits an empty label or pattern"
+   }
+  ],
+  "progress": null,
+  "summary": "The dependency preflight is fail-closed, runs before changed-path classification, and refuses the registry gate whenever either declared runtime dependency is absent. The implementation correctly separates the refusal decision from best-effort consumer reporting, safely treats unknown probe kinds as absent, and tests present/absent behavior, real probes, real-tree consumer matching, and gate wiring. I found no blocker or major issue. One minor extensibility gap remains in the requirement-table shape assertion.",
+  "verdict": "approve"
+ }
+}
