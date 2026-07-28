@@ -43,6 +43,29 @@ charges it to the MACHINE ladder — a PR that fails its adjudicated round lands
 terminal (retire, hand the issue back for decomposition), never back in the maintainer's inbox.
 
 DRY-RUN IS THE DEFAULT. `--apply` is required to write anything.
+
+THE WRITE PATH IS A TRANSACTION, AND IT COMMITS LAST. Nothing here is atomic with anything else,
+so the write path is built so that every state it can die in is either COMPLETE or still VISIBLE
+to the next sweep:
+
+  * MUTATION BOUNDARY. Every decision above is re-derived from a label + timeline read taken
+    immediately before the FIRST write, through the SAME pure `admission`. A hold whose live
+    application is no longer provably machine-owned stands the whole transaction down, mutating
+    nothing — a stale ownership proof never authorises a delete.
+  * COMMIT LAST. `readmission_writes` orders the transaction receipt -> `review:needs` ->
+    the issue's `needs:user` -> and only THEN the PR's `review:needs-user`. That last delete is
+    the label this sweep's own listing filters on, so a failure at any earlier point leaves the PR
+    still listed and `readmission_writes` re-plans exactly the missing writes from LIVE state on
+    the next sweep. The receipt suppresses only the COMMENT, never the label writes, so an
+    incomplete transaction can never be mistaken for a finished one and reconciliation never
+    spends a second automatic re-admission.
+  * DETECT AND REPAIR THE UN-CLOSEABLE WINDOW. A label carries no per-application identity, so a
+    human application landing between the ownership re-check and the DELETE would be erased with
+    no trace in the live label set. The TIMELINE keeps it (an `unlabeled` never erases a
+    `labeled`), so `clear_hold_with_repair` re-reads ownership AFTER the delete and PUTS THE HOLD
+    BACK when it can no longer prove the application it deleted was the machine's. The restoration
+    posts a `hold-restored` receipt, and that marker — not the timeline, which now shows the bot
+    as the latest applier — is what makes the restored human gesture STICKY forever.
 """
 import argparse
 import importlib.util
@@ -92,6 +115,11 @@ ADJUDICATION_REASONS = {
     "human-applied": (GENUINELY_HUMAN,
                       "a PROVEN human applied the hold — a human decision is not the machine's "
                       "to undo (and an unreadable timeline counts as human)"),
+    "hold-restored": (GENUINELY_HUMAN,
+                      "a human applied a hold on this PR or its source issue inside the window "
+                      "between a re-admission's ownership proof and its DELETE; the sweep put "
+                      "that hold back, and a restored human gesture is sticky at every later "
+                      "position in the history"),
     "question-cause": (GENUINELY_HUMAN,
                        "the park records a QUESTION-class cause, which by taxonomy has no "
                        "machine exit"),
@@ -143,7 +171,7 @@ def _quiet(*_args, **_kwargs):
 
 
 def admission(*, pr_labels, issue_labels, park_records, park_marker_present, bot_bodies,
-              hold_applied_by_human, issue_hold_machine_owned, rounds_recorded,
+              hold_applied_by_human, hold_restored, issue_hold_machine_owned, rounds_recorded,
               readmissions_spent, trust_surface, blocking_findings):
     """PURE. (disposition, reason, detail) — may this PR re-enter the review loop?
 
@@ -166,7 +194,14 @@ def admission(*, pr_labels, issue_labels, park_records, park_marker_present, bot
     `blocking_findings` is the count of blocker/critical/major findings in the LATEST recorded
     verdict, or None when that record is unreadable. It gates ONLY the trust-surface guardrail: a
     non-trust PR with real findings is precisely the "real but fixable" case that belongs back in
-    the loop."""
+    the loop.
+
+    `hold_restored` is whether a previous sweep ever RESTORED a hold on this PR after detecting a
+    human application inside the un-closeable write window (`clear_hold_with_repair`). It refuses
+    unconditionally and order-independently, exactly like the deny signal, because the restoration
+    itself destroys the evidence every other probe reads: the label was re-applied BY THE BOT, so
+    `hold_applied_by_human` is False and the timeline names a machine. The receipt is the only
+    surviving record that a human ever made the gesture, so it — and not the timeline — decides."""
     def out(reason, extra=""):
         disposition, sentence = ADJUDICATION_REASONS[reason]
         return (disposition, reason, f"{sentence}{extra}")
@@ -180,6 +215,10 @@ def admission(*, pr_labels, issue_labels, park_records, park_marker_present, bot
         for pattern, denied in park_policy.LEGACY_PARK_DENY_PROSE:
             if pattern.search(str(body)):
                 return out("deny-prose", f" (signal: {denied})")
+    # ...and the RESTORED-HOLD signal beside it, for the same order-independent reason: it is the
+    # only evidence that survives a restoration, and it must outrank every later machine event.
+    if hold_restored:
+        return out("hold-restored")
     if hold_applied_by_human:
         return out("human-applied")
     records = [record for record in (park_records or []) if isinstance(record, dict)]
@@ -293,6 +332,77 @@ def already_recorded(comments, bot_login, disposition, head):
                for record in adjudication_records(comments, bot_login))
 
 
+# The writes ONE return-to-loop transaction is made of, in the ONLY order that makes a partial
+# failure recoverable. See `readmission_writes` for why the order is load-bearing.
+READMISSION_WRITES = ("comment", "add-reentry", "clear-issue-hold", "delete-hold")
+
+
+def readmission_writes(*, pr_labels, issue_labels, recorded, issue_hold_machine_owned):
+    """PURE. The writes the return-to-loop transaction for this head STILL OWES, given the LIVE
+    label state, in COMMIT-LAST order. Called only once `admission` has returned return-to-loop
+    against that same live state, so every write below is already authorised.
+
+    INTENT IS NOT COMPLETION. The receipt is posted FIRST — deliberately, so a crash leaves an
+    explained, window-bearing PR rather than a silently relabelled one — which means the receipt
+    exists in states where NONE of the label writes landed. Reading it as "this head is done" is
+    what made a partial failure PERMANENT: the next sweep saw the marker, no-oped, and the PR
+    stayed parked forever having spent an automatic re-admission it never received. So the receipt
+    suppresses ONLY the comment; every label write is planned from live state and therefore
+    reconciles itself, and because reconciliation posts no second receipt it cannot spend a second
+    re-admission against the cap.
+
+    THE ORDER IS THE INVARIANT, not a style choice. `delete-hold` removes the very label this
+    sweep's listing query filters on, so it is the COMMIT: after it the PR is invisible to the
+    next sweep and must therefore already be complete, and before it the PR is still listed and
+    still reconcilable. Every other write is placed ahead of it:
+      - `add-reentry` is monotone and cannot re-admit anything early — the review lane excludes a
+        PR carrying the human hold outright, so `review:needs` sits inert until the commit.
+      - `clear-issue-hold` likewise: dispatch dedupes issue re-dispatch behind the open worker PR
+        (dispatch-claim._linked_open_pr_issues), so an issue unheld while its PR is still parked
+        cannot relaunch a second worker.
+    Move `delete-hold` earlier and a failure after it strands the PR outside every future sweep's
+    listing — the exact terminal-park-forever outcome this ordering exists to make impossible."""
+    live = {label for label in (pr_labels or []) if isinstance(label, str)}
+    issue_live = {label for label in (issue_labels or []) if isinstance(label, str)}
+    writes = []
+    if not recorded:
+        writes.append("comment")
+    if REENTRY_LABEL not in live:
+        writes.append("add-reentry")
+    if park_policy.HUMAN_PARK_LABEL in issue_live and issue_hold_machine_owned:
+        writes.append("clear-issue-hold")
+    writes.append("delete-hold")
+    return tuple(writes)
+
+
+def clear_hold_with_repair(*, machine_owned_now, delete, restore):
+    """Delete a human-owned hold a prior proof said the machine applied — and make a human
+    application that lands in the race window DETECTABLE and RECOVERABLE.
+
+    GitHub has no compare-and-swap on labels, and a label carries no per-application identity: a
+    maintainer re-asserting the hold between an ownership proof and the DELETE is erased with no
+    trace whatsoever in the live label set. The TIMELINE does keep it — an `unlabeled` event never
+    erases a `labeled` one — so the race is detectable AFTER the write, and that is what makes it
+    repairable. The protocol is therefore check -> delete -> re-check -> restore:
+
+      - "stood-down": the re-check taken immediately before the delete already shows a human
+        application. NOTHING is written; the hold stays and the caller abandons the transaction.
+      - "cleared": the re-check taken AFTER the delete still proves machine ownership, so the
+        application actually deleted was the machine's own.
+      - "restored": it does not — a human application landed inside the un-closeable window (or
+        the probe is unreadable, which fails the same way, because an unprovable answer must never
+        authorise destroying a human gesture). The hold is PUT BACK and the caller must post the
+        sticky `hold-restored` receipt: the restore re-applies the label AS THE BOT, so nothing in
+        the timeline would stop the next sweep from deleting it all over again."""
+    if not machine_owned_now():
+        return "stood-down"
+    delete()
+    if machine_owned_now():
+        return "cleared"
+    restore()
+    return "restored"
+
+
 def blocking_finding_count(record):
     """Blocker/critical/major findings in a recorded review verdict, or None when the record is
     not readable as one. None means UNKNOWN and every consumer must treat it as blocking — a
@@ -391,6 +501,27 @@ def readmission_body(receipt, reason, detail, head, episode):
         f"{adjudication_marker(RETURN_TO_LOOP, reason, head, episode)}")
 
 
+def restored_hold_body(surface, head, episode):
+    """The comment a RESTORED hold posts, and the only durable record that the human gesture it
+    restored ever happened. `clear_hold_with_repair` puts the label back AS THE BOT, so from here
+    on the timeline names a machine as the latest applier and every ownership probe would agree
+    the hold is drainable — this marker is what makes the restored gesture STICKY instead."""
+    return (
+        "> 🤖 SPARQ agent — **stuck-escalation adjudication: a human hold was restored** "
+        "(registry #446)\n\n"
+        f"While this re-admission was mid-write, a human applied {surface}. A GitHub label "
+        "carries no per-application identity, so the sweep's own DELETE removed that gesture — "
+        "but the "
+        "timeline still recorded it, the sweep re-read it immediately after the write, and **the "
+        "hold has been put back exactly as it was**.\n\n"
+        "The re-admission receipt above is therefore RETRACTED as an outcome: the transaction was "
+        "abandoned where it stood and this pull request stays with its human. It did spend one "
+        "automatic re-admission, which no longer changes anything — this marker makes every "
+        "future sweep read this PR as a human question, whatever the label timeline says next."
+        "\n\n"
+        f"{adjudication_marker(GENUINELY_HUMAN, 'hold-restored', head, episode)}")
+
+
 def _gh(args, token=None, check=True):
     env = dict(os.environ)
     if token:
@@ -421,6 +552,31 @@ def _paginated(repo, number, kind, token=None):
 def _label_names(container):
     return [label.get("name") for label in (container.get("labels") or [])
             if isinstance(label, dict) and isinstance(label.get("name"), str)]
+
+
+def _hold_machine_owned_now(repo, number, label, is_human, token):
+    """Whether the LIVE newest application of `label` on `repo#number` is provably the machine's,
+    from a timeline read taken RIGHT NOW. FAIL-CLOSED in the only direction that matters: an
+    unreadable answer is a NEGATIVE answer, so it can never authorise a delete and always triggers
+    a restore."""
+    try:
+        timeline = _paginated(repo, number, "timeline", token=token)
+        return park_policy.label_application_machine_owned(
+            repo, number, label, lambda _repo, _num: timeline, is_human=is_human, log=_quiet)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  {repo}#{number}: live hold-ownership probe failed ({exc}) — treated as human")
+        return False
+
+
+def _live_hold(repo, number, label, is_human, token):
+    """The MUTATION-BOUNDARY snapshot of `repo#number`: (live label names, hold machine-owned).
+    Ownership is True when the label is not live at all — there is nothing to own — and otherwise
+    the fail-closed live probe."""
+    issue = _gh_json(["api", f"repos/{repo}/issues/{number}"], token=token)
+    labels = _label_names(issue if isinstance(issue, dict) else {})
+    if label not in set(labels):
+        return labels, True
+    return labels, _hold_machine_owned_now(repo, number, label, is_human, token)
 
 
 def _sweep(args, worker_pr, policy_resolve):
@@ -493,20 +649,27 @@ def _sweep(args, worker_pr, policy_resolve):
             blocking = blocking_finding_count(verdict_record)
             readmissions_spent = worker_pr.auto_readmission_marker_count(comments, args.bot_login)
 
-            disposition, reason, detail = admission(
-                pr_labels=pr_labels,
-                issue_labels=issue_labels,
+            # Everything `admission` reads that is NOT label/ownership state: it is re-run
+            # verbatim at the mutation boundary below over freshly-read labels and ownership, so
+            # these must be computed once and shared rather than re-derived and allowed to drift.
+            probe = dict(
                 park_records=park_policy.park_reason_records(comments, args.bot_login,
                                                              log=_quiet),
                 park_marker_present=any(park_policy.PARK_REASON_MARKER in body
                                         for body in bot_bodies),
                 bot_bodies=bot_bodies,
-                hold_applied_by_human=applied_by_human,
-                issue_hold_machine_owned=issue_hold_machine_owned,
+                hold_restored=any(record["reason"] == "hold-restored"
+                                  for record in adjudication_records(comments, args.bot_login)),
                 rounds_recorded=worker_pr.count_rounds(comments, args.bot_login),
                 readmissions_spent=readmissions_spent,
                 trust_surface=trust_surface,
                 blocking_findings=blocking)
+            disposition, reason, detail = admission(
+                pr_labels=pr_labels,
+                issue_labels=issue_labels,
+                hold_applied_by_human=applied_by_human,
+                issue_hold_machine_owned=issue_hold_machine_owned,
+                **probe)
             episode = readmissions_spent + 1
             verdict_note = (f"round {round_n} verdict: "
                             f"{'unreadable' if blocking is None else f'{blocking} blocking'}"
@@ -532,7 +695,12 @@ def _sweep(args, worker_pr, policy_resolve):
                 print(f"  #{number}: SKIP — the hold was cleared while this sweep was running")
                 skipped.append((number, "hold cleared mid-sweep"))
                 continue
-            if already_recorded(comments, args.bot_login, disposition, head_sha):
+            # A RETURN_TO_LOOP receipt records INTENT, never completion, so it suppresses only the
+            # comment (see readmission_writes). A GENUINELY_HUMAN receipt IS the whole transaction,
+            # so it still short-circuits the PR entirely.
+            recorded_loop = already_recorded(comments, args.bot_login, RETURN_TO_LOOP, head_sha)
+            recorded_human = already_recorded(comments, args.bot_login, GENUINELY_HUMAN, head_sha)
+            if disposition == GENUINELY_HUMAN and recorded_human:
                 print(f"  #{number}: already recorded for head {head_sha[:12]} — no-op")
                 continue
             if not args.apply:
@@ -550,28 +718,86 @@ def _sweep(args, worker_pr, policy_resolve):
                 explained.append((number, reason))
                 continue
 
-            # RECEIPT FIRST. The comment carries the budget window (the auto-readmission receipt)
-            # AND the decision, so a crash before the label writes leaves a PR that is explained
-            # and window-bearing rather than one that was quietly moved.
-            receipt = worker_pr.auto_readmission_receipt(
-                f"{worker_pr.AUTO_READMIT_ADJUDICATION_PREFIX}{head_sha[:12]}/{episode}", now)
-            _gh(["api", "-X", "POST", f"repos/{args.repo}/issues/{number}/comments",
-                 "-f", f"body={readmission_body(receipt, reason, detail, head_sha, episode)}"],
-                token=args.token)
-            _gh(["api", "-X", "DELETE", f"repos/{args.repo}/issues/{number}/labels/"
-                 + urllib.parse.quote(park_policy.HUMAN_PR_PARK_LABEL, safe="")],
-                token=args.token)
-            _gh(["api", "-X", "POST", f"repos/{args.repo}/issues/{number}/labels",
-                 "-f", f"labels[]={REENTRY_LABEL}"], token=args.token)
-            # The ISSUE half. `admission` already refused unless this is provably machine-applied,
-            # so reaching here means the clear is authorised; without it the review lane would
-            # still exclude the PR and the re-admission would be a no-op relabel.
-            if issue_number and park_policy.HUMAN_PARK_LABEL in set(issue_labels):
-                _gh(["api", "-X", "DELETE",
-                     f"repos/{args.repo}/issues/{issue_number}/labels/"
-                     + urllib.parse.quote(park_policy.HUMAN_PARK_LABEL, safe="")],
-                    token=args.token)
-            readmitted.append((number, reason))
+            # ---- THE MUTATION BOUNDARY -----------------------------------------------------
+            # Everything above was decided from reads taken several API round trips ago, and a
+            # maintainer can apply either hold inside that gap. Re-read the AUTHORITATIVE label
+            # and timeline state NOW and re-run the SAME pure adjudicator over it, so no delete is
+            # ever planned against a stale ownership proof. This runs before the FIRST write, so a
+            # stand-down here mutates nothing at all.
+            live_labels, hold_owned = _live_hold(
+                args.repo, number, park_policy.HUMAN_PR_PARK_LABEL, is_human, args.token)
+            live_issue_labels, live_issue_owned = _live_hold(
+                args.repo, issue_number, park_policy.HUMAN_PARK_LABEL, is_human, args.token)
+            live_disposition, live_reason, live_detail = admission(
+                pr_labels=live_labels, issue_labels=live_issue_labels,
+                hold_applied_by_human=not hold_owned,
+                issue_hold_machine_owned=live_issue_owned, **probe)
+            if live_disposition != RETURN_TO_LOOP:
+                print(f"  #{number}: STOOD DOWN at the mutation boundary — the live state now "
+                      f"reads [{live_reason}]; nothing was written")
+                if live_reason != "not-parked" and not recorded_human:
+                    _gh(["api", "-X", "POST", f"repos/{args.repo}/issues/{number}/comments",
+                         "-f", "body=" + human_park_body(live_reason, live_detail,
+                                                         head_sha, episode)],
+                        token=args.token)
+                    explained.append((number, live_reason))
+                else:
+                    skipped.append((number, f"boundary/{live_reason}"))
+                continue
+            writes = readmission_writes(pr_labels=live_labels, issue_labels=live_issue_labels,
+                                        recorded=recorded_loop,
+                                        issue_hold_machine_owned=live_issue_owned)
+            if recorded_loop:
+                print(f"  #{number}: RECONCILING an incomplete re-admission for head "
+                      f"{head_sha[:12]} — owed writes {'/'.join(writes)} (no second receipt, so "
+                      "no second automatic re-admission is spent)")
+            stood_down = None
+            for write in writes:
+                if write == "comment":
+                    # RECEIPT FIRST. The comment carries the budget window (the auto-readmission
+                    # receipt) AND the decision, so a crash before the label writes leaves a PR
+                    # that is explained and window-bearing rather than one quietly moved.
+                    receipt = worker_pr.auto_readmission_receipt(
+                        f"{worker_pr.AUTO_READMIT_ADJUDICATION_PREFIX}{head_sha[:12]}/{episode}",
+                        now)
+                    _gh(["api", "-X", "POST", f"repos/{args.repo}/issues/{number}/comments",
+                         "-f", "body=" + readmission_body(receipt, live_reason, live_detail,
+                                                          head_sha, episode)],
+                        token=args.token)
+                elif write == "add-reentry":
+                    _gh(["api", "-X", "POST", f"repos/{args.repo}/issues/{number}/labels",
+                         "-f", f"labels[]={REENTRY_LABEL}"], token=args.token)
+                else:
+                    # The two hold DELETEs, each through the detect-and-repair protocol. The issue
+                    # half comes first and the PR's own hold LAST — that delete is the commit.
+                    target, label, surface = (
+                        (issue_number, park_policy.HUMAN_PARK_LABEL,
+                         "the source issue's `needs:user`")
+                        if write == "clear-issue-hold" else
+                        (number, park_policy.HUMAN_PR_PARK_LABEL,
+                         "this pull request's `review:needs-user`"))
+                    outcome = clear_hold_with_repair(
+                        machine_owned_now=(lambda t=target, la=label: _hold_machine_owned_now(
+                            args.repo, t, la, is_human, args.token)),
+                        delete=(lambda t=target, la=label: _gh(
+                            ["api", "-X", "DELETE", f"repos/{args.repo}/issues/{t}/labels/"
+                             + urllib.parse.quote(la, safe="")], token=args.token)),
+                        restore=(lambda t=target, la=label: _gh(
+                            ["api", "-X", "POST", f"repos/{args.repo}/issues/{t}/labels",
+                             "-f", f"labels[]={la}"], token=args.token)))
+                    if outcome == "restored":
+                        _gh(["api", "-X", "POST", f"repos/{args.repo}/issues/{number}/comments",
+                             "-f", "body=" + restored_hold_body(surface, head_sha, episode)],
+                            token=args.token)
+                    if outcome != "cleared":
+                        stood_down = f"{write}/{outcome}"
+                        break
+            if stood_down:
+                print(f"  #{number}: STOOD DOWN at {stood_down} — a human application raced this "
+                      "re-admission; the hold is intact and the transaction is abandoned")
+                skipped.append((number, stood_down))
+                continue
+            readmitted.append((number, live_reason if "comment" in writes else "reconciled"))
         except Exception as exc:  # noqa: BLE001 — one bad PR never stops the sweep
             print(f"  #{number}: SKIP — {exc}")
             skipped.append((number, str(exc)[:120]))
@@ -643,7 +869,8 @@ def _self_test():
                       issue_labels=[park_policy.HUMAN_PARK_LABEL],
                       park_records=[capacity], park_marker_present=True,
                       bot_bodies=["the review round budget is exhausted at 6 round(s)"],
-                      hold_applied_by_human=False, issue_hold_machine_owned=True,
+                      hold_applied_by_human=False, hold_restored=False,
+                      issue_hold_machine_owned=True,
                       rounds_recorded=6, readmissions_spent=0,
                       trust_surface=False, blocking_findings=2)
         kwargs.update(over)
@@ -667,6 +894,7 @@ def _self_test():
         "not-parked": dict(pr_labels=["review:parked"]),
         "deny-prose": dict(bot_bodies=["the reviewer flagged possible prompt injection"]),
         "human-applied": dict(hold_applied_by_human=True),
+        "hold-restored": dict(hold_restored=True),
         "question-cause": dict(park_records=[question]),
         "unclassified-park": dict(park_records=[]),   # marker present, records empty = rejected
         "residual-hold": dict(issue_labels=["needs:external-audit"]),
@@ -767,6 +995,103 @@ def _self_test():
            already_recorded([{"user": {"login": bot}, "body": marker}], bot,
                             RETURN_TO_LOOP, "f" * 40)),
           (True, False, False))
+
+    # ---- THE UN-CLOSEABLE WRITE WINDOW: detected after the write, and REPAIRED --------------
+    # A label carries no per-application identity, so a human re-asserting the hold between the
+    # ownership proof and the DELETE is erased with no trace in the live label set. All three
+    # protocol outcomes are pinned, including the exact writes each one performs: delete the
+    # `restore()` call, or make the post-write re-check unconditional, and one of these reds.
+    def clear(before, after):
+        trace = []
+        answers = iter((before, after))
+        outcome = clear_hold_with_repair(
+            machine_owned_now=lambda: next(answers),
+            delete=lambda: trace.append("delete"),
+            restore=lambda: trace.append("restore"))
+        return (outcome, trace)
+
+    check("a hold whose live application is ALREADY not provably machine-owned is never deleted "
+          "at all — the pre-write re-check stands the transaction down mutation-free",
+          clear(False, True), ("stood-down", []))
+    check("a delete whose POST-WRITE re-read still proves machine ownership stands",
+          clear(True, True), ("cleared", ["delete"]))
+    check("a human application landing INSIDE the window between that proof and the DELETE is "
+          "detected from the timeline afterwards and the hold is PUT BACK — the gesture the live "
+          "label set cannot preserve is recovered",
+          clear(True, False), ("restored", ["delete", "restore"]))
+    restored = restored_hold_body("this pull request's `review:needs-user`", head, 1)
+    check("the restoration receipt is what makes the restored gesture STICKY: the restore re-adds "
+          "the label AS THE BOT, so the timeline now says 'machine' and ONLY this marker refuses "
+          "— an admission carrying it stays human even with every other probe saying drain it",
+          (parse_adjudication(restored)["reason"],
+           [record["reason"] for record in adjudication_records(
+               [{"user": {"login": bot}, "body": restored}], bot)],
+           verdict(hold_restored=True, hold_applied_by_human=False)[:2]),
+          ("hold-restored", ["hold-restored"], (GENUINELY_HUMAN, "hold-restored")))
+    check("the restoration receipt retracts the re-admission it undoes, and claims nothing else",
+          ("the hold has been put back exactly as it was" in restored,
+           "RETRACTED as an outcome" in restored,
+           restored.startswith("> 🤖 SPARQ agent")), (True, True, True))
+
+    # ---- INTENT IS NOT COMPLETION: the transaction reconciles, and COMMITS LAST --------------
+    held_pr = [park_policy.HUMAN_PR_PARK_LABEL]
+    held_issue = [park_policy.HUMAN_PARK_LABEL]
+
+    def plan(pr, issue, recorded=False, issue_owned=True):
+        return readmission_writes(pr_labels=pr, issue_labels=issue, recorded=recorded,
+                                  issue_hold_machine_owned=issue_owned)
+
+    check("the full transaction, in COMMIT-LAST order",
+          plan(held_pr, held_issue),
+          ("comment", "add-reentry", "clear-issue-hold", "delete-hold"))
+    check("the receipt suppresses ONLY the comment — every label write is still owed, which is "
+          "the whole of the finding: a receipt-first partial failure used to read as 'done'",
+          plan(held_pr, held_issue, recorded=True),
+          ("add-reentry", "clear-issue-hold", "delete-hold"))
+    check("writes already landed are not re-issued, and an issue hold that is NOT provably "
+          "machine-owned is never planned at all",
+          (plan(held_pr + [REENTRY_LABEL], held_issue, recorded=True),
+           plan(held_pr, held_issue, recorded=True, issue_owned=False),
+           plan(held_pr, [], recorded=True)),
+          (("clear-issue-hold", "delete-hold"), ("add-reentry", "delete-hold"),
+           ("add-reentry", "delete-hold")))
+    check("`delete-hold` is LAST in every plan — it removes the label the sweep's own listing "
+          "filters on, so it is the COMMIT and nothing may follow it",
+          sorted({writes[-1] for writes in (
+              plan(held_pr, held_issue), plan(held_pr, held_issue, recorded=True),
+              plan(held_pr + [REENTRY_LABEL], [], recorded=True))}),
+          ["delete-hold"])
+    check("every planned write is a member of the closed write set",
+          sorted(set(plan(held_pr, held_issue)) - set(READMISSION_WRITES)), [])
+
+    def replay(fail_after):
+        """Sweep the PR until its transaction completes, with the API call for write index
+        `fail_after` raising on the FIRST sweep. The `while` condition IS the sweep's listing
+        query — a PR is re-swept if and ONLY if it still carries the human hold — so a plan that
+        commits before it is complete simply falls out of the loop half-finished."""
+        pr, issue = set(held_pr), set(held_issue)
+        recorded, receipts, sweeps = False, 0, 0
+        while park_policy.HUMAN_PR_PARK_LABEL in pr and sweeps < 6:
+            sweeps += 1
+            for index, write in enumerate(plan(sorted(pr), sorted(issue), recorded=recorded)):
+                if sweeps == 1 and index == fail_after:
+                    break               # the API call raised; the sweep's handler skips the PR
+                if write == "comment":
+                    recorded, receipts = True, receipts + 1
+                elif write == "add-reentry":
+                    pr.add(REENTRY_LABEL)
+                elif write == "clear-issue-hold":
+                    issue.discard(park_policy.HUMAN_PARK_LABEL)
+                elif write == "delete-hold":
+                    pr.discard(park_policy.HUMAN_PR_PARK_LABEL)
+        return (sorted(pr), sorted(issue), receipts, sweeps)
+
+    check("a failure after ANY write is RECONCILED to the same complete state by the next sweep, "
+          "and the receipt is posted EXACTLY ONCE however many sweeps it takes — so reconciling "
+          "can never spend a second automatic re-admission against the cap",
+          [replay(fail_after) for fail_after in range(len(READMISSION_WRITES) + 1)],
+          [([REENTRY_LABEL], [], 1, 2)] * len(READMISSION_WRITES)
+          + [([REENTRY_LABEL], [], 1, 1)])
 
     # ---- the recorded-verdict reader: UNKNOWN is never zero ---------------------------------
     check("blocking findings are counted by severity, and an unreadable record is None (never 0)",
