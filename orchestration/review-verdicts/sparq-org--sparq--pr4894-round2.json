@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4894,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "112f0bacebc8f1ca9683a7ff6a898d05345b48a8",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and complete. Rule C2 is conservative: it applies only to bound-predicate patterns sharing the same subject variable, requires the same source to be a candidate for both, verifies per-predicate characteristic-set accounting with checked addition, rejects duplicate normalized set keys, and retains assignments on incomplete or unalignable evidence. Descriptor identity and pattern-permutation checks prevent summaries from being applied to the wrong source or BGP pattern. Candidate collapse is conservative, and combination_is_dead preserves cross-source assignments. The tests are non-vacuous and exercise the live pruning path plus truncation, unknown accounting, duplicate keys, overflow, malformed selections, source mismatch, non-subject joins, unbound predicates, and cross-source survival. Documentation keeps the feature opt-in and explicitly avoids cryptographic privacy or soundness claims. No hostile reviewer-directed instruction was found in the diff. With no prior-round findings and no current findings, progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
