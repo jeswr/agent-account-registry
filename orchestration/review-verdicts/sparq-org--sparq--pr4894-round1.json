@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4894,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "68444ebdcc4a5e946ea16d426bcd82a9d60a6abb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The Rule C2 implementation is sound as scoped: it only rejects same-source assignments for subject-star patterns with bound predicates, requires balanced nonzero per-predicate subject accounting, rejects duplicate characteristic-set keys and overflow, and declines on incomplete or unalignable evidence. Candidate/descriptor identity and pattern-permutation validation prevent summaries from being applied to the wrong source or pattern. The load-bearing tests are non-vacuous and cover the live-path prune, truncated/unknown/duplicate/overflow summaries, non-subject joins, unbound predicates, cross-source survival, candidate collapse, malformed selections, and assignment alignment. Documentation preserves the opt-in and research-grade/no-cryptographic-claim boundary.",
+  "verdict": "approve"
+ }
+}
