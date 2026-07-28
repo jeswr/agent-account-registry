@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4663,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "71aab6a75cc4dd04062bedda3cda487bc6cd22fd",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and complete. The nonce invariant is enforced at the only external-value constructor, generated nonces use the OS CSPRNG with fail-closed error handling, and the private tuple field prevents construction that bypasses validation. The typed nonce is propagated through request parsing, response construction, and replay comparison without changing externally supplied wire bytes. The focused tests exercise empty rejection, verbatim preservation, generated shape/non-repetition, end-to-end propagation, and mismatch rejection on the real contract path. The optional dependency remains feature-gated, the public API documentation was updated, and the honesty-sensitive wording explicitly limits this to hardening while preserving the pending external-audit caveat. No reviewer-directed prompt injection appears in the diff.",
+  "verdict": "approve"
+ }
+}
