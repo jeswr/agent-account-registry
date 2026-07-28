@@ -554,13 +554,50 @@ def repair_census_line(repair, reason):
 # =============================================================================================
 # live path
 # =============================================================================================
+# ⚠️ THE RUNNER IS THE ONLY THING BETWEEN THIS SCRIPT AND LIVE PULL REQUESTS, AND THE IN-PROCESS
+# DOUBLE CANNOT SEE PAST IT. `_gh(args)` with no runner shells out to the REAL `gh`; the request
+# never reaches the double at all, so every "no path arms" assertion in this file is silent about
+# it. MEASURED: injecting `_gh(["pr","merge",str(number),"-R",self.repo])` — the same idiom minus
+# `self.runner` — at the real call site in `_act` issued 17 real `gh pr merge` invocations against
+# PRs #903/#895/#893/#886/#856 while this suite reported 202/202 PASSED. The self-test's fixtures
+# name those real open registry PR numbers on purpose (they are #927's board, kept so the replay is
+# the incident), and the sweep job's self-test step carries a token with `pull-requests: write`.
+#
+# So the sentinel sits OUTSIDE the runner seam: while `--self-test` runs, the runner-less branch is
+# REFUSED instead of executed. A write that forgets its runner then reds by name — through
+# `_run_total`/`_main_total` — instead of shelling out at live PR numbers. Asserted in BOTH
+# directions in `_test_live_gh_sentinel`: armed, the call raises and reaches no process; disarmed,
+# that identical call is what invokes `gh`, so this guards a live path and not a dead branch.
+LIVE_GH_UNDER_SELF_TEST = (
+    "regate-sweep: a runner-less `gh` request was issued while --self-test is running")
+_LIVE_GH_FORBIDDEN = False
+
+
+def forbid_live_gh(active=True):
+    """Arm (or disarm) the runner-less-`gh` sentinel. -> the PREVIOUS state, so it can be restored.
+
+    Not a constant, because `_test_live_gh_sentinel` has to disarm it to prove the branch it guards
+    is real; a guard whose OFF state is never exercised is indistinguishable from dead code."""
+    global _LIVE_GH_FORBIDDEN
+    previous = _LIVE_GH_FORBIDDEN
+    _LIVE_GH_FORBIDDEN = bool(active)
+    return previous
+
+
 def _gh(args, runner=None):
-    """Run `gh <args>` -> (rc, stdout). Never raises.
+    """Run `gh <args>` -> (rc, stdout).
+
+    Raises only for the self-test sentinel above — a runner-less request under `--self-test` is a
+    test that has lost its double, and refusing it loudly is the whole point. On the live path it
+    never raises.
 
     Sanitized: only the subcommand words and the return code are ever printed. `GH_DEBUG=api`
     echoes request bodies into stderr, so stderr is never surfaced."""
     if runner is not None:
         return runner(args)
+    if _LIVE_GH_FORBIDDEN:
+        raise RegateSweepError(
+            f"{LIVE_GH_UNDER_SELF_TEST}: gh {' '.join(str(a) for a in args)}")
     result = subprocess.run(["gh"] + list(args), capture_output=True, text=True, check=False)
     return result.returncode, result.stdout or ""
 
@@ -706,6 +743,27 @@ LATCHED_ARM_NOTE = (
     "only the fresh gate speaks for the new one**. If that is not enough for this PR, disarm it: "
     "the sweeper deliberately does not, because nothing would re-arm a PR whose owner's arm it "
     "stripped. Counted as `latched-arm` in this tick's census.")
+
+
+# ⚠️ THE SAME WITHDRAWAL APPLIES TO THE ANNOTATION, and for two rounds it did not. The clause
+# "the diff is unchanged" — measured false above and struck from the note — kept shipping to the
+# operator from an inline f-string in `_act`, three lines above the note that withdraws it, because
+# the guard scanned `LATCHED_ARM_NOTE` and nothing else. A guard that names ONE artifact defends
+# that artifact, not the CLAIM. So the annotation is a named constant too, and the guard now scans
+# the REAL captured output of a latched-arm tick plus the body it posts, which covers text nobody
+# remembered to enrol.
+LATCHED_ARM_WARNING = (
+    "::warning::regate-sweep: #{number} had auto-merge ALREADY latched — removing `{label}` "
+    "de-authorises a FUTURE arm decision but does not retract this one, so it will merge on the "
+    "fresh gate. Deliberate, and it rests on one claim: the green it merges on is fresh — computed "
+    "against a base that contains the repair. It is NOT a claim about what the move did to the "
+    "approved diff; see the note posted on the PR. Censused as latched-arm.")
+
+# The clauses measured FALSE and withdrawn. Scanned over everything a tick publishes, not over one
+# constant — see `_test_live_sweep`. Adding a phrase here is cheap; the point is that the SURFACE
+# the guard scans is derived from a real run, so it does not need to be complete to be sound.
+WITHDRAWN_DIFF_CLAIMS = ("byte-identical", "diff is unchanged", "no author commits",
+                         "identical diff", "the approved diff is unchanged")
 
 
 def sweep_comment(repair, repair_pr_merged_at, gate_completed_at, old_sha, fails,
@@ -910,10 +968,7 @@ class Sweeper:
                   "latched-arm-unknown rather than counted as unarmed")
         if latched:
             self.latched_arms += 1
-            print(f"::warning::regate-sweep: #{number} had auto-merge ALREADY latched — removing "
-                  "`review:pass` de-authorises a future arm but does not retract this one, so it "
-                  "will merge on the fresh gate. Deliberate (the green is fresh, the diff is "
-                  "unchanged); recorded on the PR and censused as latched-arm.")
+            print(LATCHED_ARM_WARNING.format(number=number, label=REVIEW_PASS_LABEL))
         post_comment(self.repo, number,
                      sweep_comment(repair["repair_pr"], merged_at,
                                    (gate or {}).get("completed_at") or "an unrecorded time",
@@ -1013,6 +1068,11 @@ def main(argv=None, runner=None):
 # =============================================================================================
 def _self_test():
     ok = True
+    # ⚠️ ARMED FOR THE WHOLE SUITE. Every request must go through an injected runner; a runner-less
+    # `_gh` here is a test that lost its double, and the fixtures name REAL open PR numbers. See
+    # `LIVE_GH_UNDER_SELF_TEST`. Restored on the way out so `main()` is not left poisoned for a
+    # caller that imports this module.
+    previously_forbidden = forbid_live_gh(True)
 
     def chk(name, got, want):
         nonlocal ok
@@ -1020,6 +1080,17 @@ def _self_test():
         ok = ok and good
         print(f"  {'ok  ' if good else 'FAIL'} {name}: {got!r} (want {want!r})")
 
+    try:
+        _run_suite(chk)
+    finally:
+        forbid_live_gh(previously_forbidden)
+
+    print("regate-sweep self-test", "PASSED" if ok else "FAILED")
+    return 0 if ok else 1
+
+
+def _run_suite(chk):
+    _test_live_gh_sentinel(chk)
     _test_drain_arithmetic(chk)
     _test_failure_ledger(chk)
     _test_signature_matching(chk)
@@ -1033,8 +1104,58 @@ def _self_test():
     _test_census(chk)
     _test_workflow_seam(chk)
 
-    print("regate-sweep self-test", "PASSED" if ok else "FAILED")
-    return 0 if ok else 1
+
+def _test_live_gh_sentinel(chk):
+    """The runner-less `gh` escape hatch, asserted in BOTH directions.
+
+    ⚠️ `subprocess.run` is patched for the WHOLE of this function, including the armed direction.
+    Deleting the sentinel from `_gh` must red — it must NOT execute `gh pr merge 903` against a live
+    PR from inside the very test that certifies it cannot happen. The armed check therefore asserts
+    the recorder saw NOTHING as well as that the call raised: 'it raised' alone would also be
+    satisfied by a crash on the way to the same live write."""
+    import subprocess as sp
+
+    seen = []
+
+    class _Completed:
+        returncode = 7
+        stdout = "recorded"
+        stderr = ""
+
+    def recorder(cmd, **_kwargs):
+        seen.append(list(cmd))
+        return _Completed()
+
+    real_run = sp.run
+    was_forbidden = _LIVE_GH_FORBIDDEN
+    sp.run = recorder
+    try:
+        # ⚠️ `was_forbidden`, NOT the live global, and read BEFORE this function arms anything.
+        # Asserting the flag after a local `forbid_live_gh(True)` would be true of a suite whose
+        # entry point never armed it — the control would then certify only itself.
+        chk("self-test sentinel: `_self_test` ARMED it for the whole suite — the fixtures name "
+            "REAL open registry PRs and the sweep job's self-test step holds a `pull-requests: "
+            "write` token", was_forbidden, True)
+        forbid_live_gh(True)
+        escaped = _raises(lambda: _gh(["pr", "merge", "903", "-R",
+                                       "jeswr/agent-account-registry"]))
+        chk("self-test sentinel: a request that FORGETS its runner raises by name and reaches no "
+            "process at all — measured, this exact idiom issued 17 live `gh pr merge` calls "
+            "against #903/#895/#893/#886/#856 on a 202/202 green suite",
+            (type(escaped).__name__, LIVE_GH_UNDER_SELF_TEST in str(escaped), seen),
+            ("RegateSweepError", True, []))
+        forbid_live_gh(False)
+        chk("self-test sentinel: DISARMED, that identical call is what invokes the real `gh`, and "
+            "its rc/stdout are passed through — so the sentinel guards a LIVE branch, not a dead "
+            "one, and this is the only assertion that executes it",
+            (_gh(["pr", "merge", "903"]), seen), ((7, "recorded"), [["gh", "pr", "merge", "903"]]))
+        chk("self-test sentinel: an injected runner is honoured in BOTH states, so arming it "
+            "cannot quietly break the suite's own request path",
+            (_gh(["api", "/x"], runner=lambda a: (0, "via-runner")), seen[-1:]),
+            ((0, "via-runner"), [["gh", "pr", "merge", "903"]]))
+    finally:
+        sp.run = real_run
+        forbid_live_gh(was_forbidden)
 
 
 def _test_drain_arithmetic(chk):
@@ -1355,12 +1476,29 @@ def _raises(fn):
     return None
 
 
-# ⚠️ TWO DISTINCT REFUSALS, NAMED SEPARATELY. They both reject `["pr","merge",…]`, so a test that
-# only asserts "it raises" is satisfied by EITHER — deleting one alone then survives, which is the
-# mutually-masking-duplicate-guard shape. The assertions below key on these strings, so each guard
-# has an observer that the other cannot satisfy.
+def _totalled(fn):
+    """`fn()`, or its exception rendered as a value. For asserting a REPORTING helper is TOTAL.
+
+    A helper that raises aborts every assertion after it, so the mutant that makes it partial dies
+    by traceback with no named red and masks the rest of the section — two probes truncated at
+    68/202 exactly that way. Rendering the exception turns that into a named red with the failure
+    as its `got`."""
+    try:
+        return fn()
+    except Exception as exc:  # noqa: BLE001
+        return f"{type(exc).__name__}: {exc}"[:120]
+
+
+# ⚠️ FOUR DISTINCT REFUSALS, NAMED SEPARATELY. Several of them reject the same argv — `pr merge`
+# trips the first, and a bare "it raises" assertion is satisfied by ANY of them — so deleting one
+# alone survives, which is the mutually-masking-duplicate-guard shape. The assertions below key on
+# these strings, and a check asserts all four are pairwise DISTINCT: aliasing two of them
+# (`_DOUBLE_NO_PATH = _DOUBLE_NOT_API`) restores the masking without changing behaviour, and that
+# mutant used to survive because the distinct-message fix had no test of its own.
 _DOUBLE_NOT_API = "unexpected FakeGh request: this double serves `gh api` only"
 _DOUBLE_NO_PATH = "unexpected FakeGh request: no repository path"
+_DOUBLE_UNSERVED_WRITE = "unexpected FakeGh WRITE: this double serves three writes only"
+_DOUBLE_UNSERVED_READ = "unexpected FakeGh read: no route for this path"
 
 
 class FakeGh:
@@ -1404,11 +1542,8 @@ class FakeGh:
         if path is None:
             raise AssertionError(f"{_DOUBLE_NO_PATH}: {self.repo} not in {list(args)!r}")
         tail = path[len(prefix):]
-        if method == "PUT" and tail.endswith("/update-branch"):
-            number = int(tail.split("/")[2])
-            return (1, "") if number in self.refuse_update else (0, "{}")
-        if method in ("POST", "DELETE"):
-            return 0, "{}"
+        if method not in ("GET", "HEAD"):
+            return self._write(method, tail, args)
         if tail == "":
             return 0, json.dumps({"default_branch": self.default_branch})
         if tail.startswith("/pulls?state=open"):
@@ -1441,12 +1576,50 @@ class FakeGh:
                 if pull["head"]["ref"] == branch:
                     return 0, json.dumps({"object": {"sha": moved or pull["head"]["sha"]}})
             return 1, ""
-        raise AssertionError(f"unexpected FakeGh request: {method} {tail}")
+        raise AssertionError(f"{_DOUBLE_UNSERVED_READ}: {method} {tail}")
+
+    # ⚠️ FAIL CLOSED ON WRITES — this is the guarantee; the argv-spelling enumeration below is only
+    # an optimisation on top of it. The double used to answer EVERY `--method POST|DELETE` under
+    # `/repos/<repo>` with `(0,"{}")` before looking at the path, so for those two methods the
+    # spelling list was the only defence and it had holes. MEASURED at the real call site in `_act`,
+    # both survived 202/202 rc 0: `POST /issues/903/labels --input f.json` (adds `review:pass` — the
+    # one label that authorises arming, and the label this sweeper REMOVES for exactly that reason,
+    # invisible to the spelling list because the label name is in the file, not the argv) and
+    # `POST /pulls/903/reviews -f event=APPROVE` (the REST twin of `gh pr review --approve`).
+    #
+    # These three (method, tail) pairs are every write the sweeper issues: `move_branch`,
+    # `post_comment`, `drop_review_pass`. Everything else raises, so a NEW arming spelling nobody
+    # enumerated is refused by construction rather than by having been thought of.
+    SERVED_WRITES = (
+        ("PUT", re.compile(r"/pulls/\d+/update-branch")),
+        ("POST", re.compile(r"/issues/\d+/comments")),
+        ("DELETE", re.compile(r"/issues/\d+/labels/" + re.escape(REVIEW_PASS_LABEL))),
+    )
+
+    def _write(self, method, tail, args):
+        if not any(m == method and pattern.fullmatch(tail) for m, pattern in self.SERVED_WRITES):
+            raise AssertionError(f"{_DOUBLE_UNSERVED_WRITE}: {method} {tail} in {list(args)!r}")
+        if method == "PUT":
+            number = int(tail.split("/")[2])
+            return (1, "") if number in self.refuse_update else (0, "{}")
+        return 0, "{}"
 
     def updated(self):
-        return sorted(int(re.search(r"/pulls/(\d+)/update-branch", " ".join(c)).group(1))
-                      for c in self.calls
-                      if "--method" in c and c[c.index("--method") + 1] == "PUT")
+        """The PRs this double was asked to `update-branch`. TOTAL.
+
+        ⚠️ `re.search(...).group(1)` on any PUT that is not an update-branch raises AttributeError,
+        and a raise inside a REPORTING helper aborts every assertion after it: two probes truncated
+        at 68/202 with a traceback and no named red, which masks everything below. Every helper in
+        this double reports instead of raising — a stray PUT is refused by `_write`, and its
+        refusal is the finding, not this function's stack trace."""
+        numbers = []
+        for call in self.calls:
+            if "--method" not in call or call[call.index("--method") + 1] != "PUT":
+                continue
+            match = re.search(r"/pulls/(\d+)/update-branch", " ".join(str(a) for a in call))
+            if match is not None:
+                numbers.append(int(match.group(1)))
+        return sorted(numbers)
 
     def posted_bodies(self):
         """Every comment body this double was asked to POST."""
@@ -1488,13 +1661,58 @@ ARMING_SPELLINGS = (
     ("rest:merge", lambda a: any(re.search(r"/pulls/\d+/merge\b", x) for x in a)),
     ("rest:auto_merge", lambda a: any("/auto_merge" in x for x in a)),
     ("rest:rerun", lambda a: any(re.search(r"/(runs|jobs)/\d+/rerun", x) for x in a)),
-    ("rest:add review:pass", lambda a: any(x.endswith("/labels") for x in a)
-     and REVIEW_PASS_LABEL in " ".join(a)),
+    # ⚠️ NOT `and REVIEW_PASS_LABEL in " ".join(a)`. That conjunct made the predicate blind to
+    # `--method POST …/issues/903/labels --input f.json`, where the label name is in the FILE and
+    # never appears in the argv — measured surviving at the real call site. The sweeper POSTs to
+    # `/labels` never, so any such write is arming-class regardless of which label it names.
+    ("rest:add labels", lambda a: any(x.endswith("/labels") for x in a)),
+    # The REST twin of `gh pr review --approve`; `review:pass` is not the only way to authorise.
+    ("rest:approve", lambda a: any(re.search(r"/pulls/\d+/reviews\b", x) for x in a)),
     # GraphQL mutations.
     ("graphql:enablePullRequestAutoMerge",
      lambda a: any("enablePullRequestAutoMerge" in x for x in a)),
     ("graphql:mergePullRequest", lambda a: any("mergePullRequest" in x for x in a)),
     ("graphql:addLabelsToLabelable", lambda a: any("addLabelsToLabelable" in x for x in a)),
+)
+
+
+# ⚠️ ONE POSITIVE DETECTION PROBE PER SPELLING, and a check that this table's labels are EXACTLY
+# the enumerated ones. Without it the list implies coverage it does not have: MEASURED, replacing
+# each predicate with `lambda a: False` one at a time, 8 of 14 could be made constantly false and
+# the suite stayed 202/202 — `cli:pr ready`, `cli:issue edit --add-label`, `cli:pr review
+# --approve`, `cli:workflow run`, `rest:rerun`, `rest:add …`, `graphql:mergePullRequest` and
+# `graphql:addLabelsToLabelable` were decoration. Order matters: `arming_calls` stops at the first
+# match, so each probe must be matched by ITS OWN predicate and by no earlier one.
+ARMING_PROBES = (
+    ("cli:pr merge", ("pr", "merge", "903", "-R", "o/r")),
+    ("cli:pr ready", ("pr", "ready", "903")),
+    ("cli:pr edit --add-label", ("pr", "edit", "903", "--add-label", REVIEW_PASS_LABEL)),
+    ("cli:issue edit --add-label", ("issue", "edit", "903", "--add-label", REVIEW_PASS_LABEL)),
+    ("cli:pr review --approve", ("pr", "review", "903", "--approve")),
+    ("cli:run rerun", ("run", "rerun", "123", "--failed")),
+    ("cli:workflow run", ("workflow", "run", "regate-sweep.yml")),
+    ("rest:merge", ("api", "--method", "PUT", "/repos/o/r/pulls/903/merge")),
+    ("rest:auto_merge", ("api", "--method", "PUT", "/repos/o/r/pulls/903/auto_merge")),
+    ("rest:rerun", ("api", "--method", "POST", "/repos/o/r/actions/runs/5/rerun")),
+    ("rest:add labels", ("api", "--method", "POST", "/repos/o/r/issues/903/labels",
+                         "--input", "f.json")),
+    ("rest:approve", ("api", "--method", "POST", "/repos/o/r/pulls/903/reviews",
+                      "-f", "event=APPROVE")),
+    ("graphql:enablePullRequestAutoMerge",
+     ("api", "graphql", "-f", "query=mutation{enablePullRequestAutoMerge(input:$i){clientMutationId}}")),
+    ("graphql:mergePullRequest",
+     ("api", "graphql", "-f", "query=mutation{mergePullRequest(input:$i){clientMutationId}}")),
+    ("graphql:addLabelsToLabelable",
+     ("api", "graphql", "-f", "query=mutation{addLabelsToLabelable(input:$i){clientMutationId}}")),
+)
+
+# The three writes the sweeper really issues. None may be flagged, or the "no arming call" checks
+# would be true of a run that never wrote anything — and none may be REFUSED by the double, or the
+# fail-closed allow-list and this enumeration have drifted apart.
+SWEEPER_WRITES = (
+    ("api", "--method", "PUT", "/repos/o/r/pulls/903/update-branch", "-f", "expected_head_sha=a"),
+    ("api", "--method", "POST", "/repos/o/r/issues/903/comments", "-f", "body=x"),
+    ("api", "--method", "DELETE", f"/repos/o/r/issues/903/labels/{REVIEW_PASS_LABEL}"),
 )
 
 
@@ -1546,12 +1764,34 @@ def _row(sweeper, index=0):
 
 def _run_total(chk, label, sweeper):
     """Run one tick, turning an ESCAPING exception into a NAMED red rather than an abort."""
+    return _run_capturing(chk, label, sweeper)[0]
+
+
+def _run_capturing(chk, label, sweeper):
+    """Run one tick with its OPERATOR-FACING OUTPUT captured. -> (result, printed text).
+
+    ⚠️ The `::warning::` and `::error::` annotations are published to a human exactly as surely as
+    the text posted onto the PR, and a guard that scans only the note CONSTANT is blind to them —
+    which is how the withdrawn "the diff is unchanged" clause kept shipping for two rounds from an
+    inline f-string three lines above the note that withdraws it. Returning the real text lets the
+    guard scan what the run ACTUALLY printed rather than a hand-enrolled list of artifacts.
+
+    The captured text is re-emitted, so the job log is unchanged and an annotation is never
+    swallowed by the act of checking it."""
+    import contextlib
+    import io
+    buffer = io.StringIO()
+    result = None
     try:
-        return sweeper.run()
+        with contextlib.redirect_stdout(buffer):
+            result = sweeper.run()
     except BaseException as exc:                                          # noqa: BLE001
+        print(buffer.getvalue(), end="")
         chk(f"tick[{label}] completed without raising",
             f"{type(exc).__name__}: {exc}"[:140], "no exception")
-        return None
+        return None, buffer.getvalue()
+    print(buffer.getvalue(), end="")
+    return result, buffer.getvalue()
 
 
 def _test_live_sweep(chk):
@@ -1667,25 +1907,67 @@ def _test_live_sweep(chk):
     chk("double: still serves the `gh api` calls the sweeper really makes",
         isinstance(_raises(lambda: probe(("api", "/repos/jeswr/agent-account-registry"))), Exception),
         False)
+    chk("double: an `api` path it has no route for is refused for THAT reason — the third refusal "
+        "had no observer, so nothing would have noticed it being deleted",
+        _DOUBLE_UNSERVED_READ in str(_raises(
+            lambda: probe(("api", "/repos/jeswr/agent-account-registry/collaborators")))), True)
+    chk("double: the four refusal messages are PAIRWISE DISTINCT — aliasing two of them restores "
+        "the mutual masking the separate naming exists to prevent, and that mutant survived",
+        len({_DOUBLE_NOT_API, _DOUBLE_NO_PATH, _DOUBLE_UNSERVED_WRITE, _DOUBLE_UNSERVED_READ}), 4)
+
+    # ⚠️ FAIL CLOSED ON WRITES. Before this, EVERY `--method POST|DELETE` under `/repos/<repo>` was
+    # answered `(0,"{}")` before the path was looked at, so the spelling enumeration was the only
+    # defence on the write path — and the first two rows below were MEASURED surviving 202/202 rc 0
+    # when injected at the real call site in `_act`.
+    writes = FakeGh("jeswr/agent-account-registry", [])
+    repo_prefix = "/repos/jeswr/agent-account-registry"
+    for label, argv in (
+            ("POST …/issues/903/labels --input f.json (adds `review:pass` from a FILE, so the "
+             "label name is nowhere in the argv)",
+             ("api", "--method", "POST", f"{repo_prefix}/issues/903/labels", "--input", "f.json")),
+            ("POST …/pulls/903/reviews -f event=APPROVE (the REST twin of `pr review --approve`)",
+             ("api", "--method", "POST", f"{repo_prefix}/pulls/903/reviews", "-f",
+              "event=APPROVE")),
+            ("PUT …/pulls/903/merge",
+             ("api", "--method", "PUT", f"{repo_prefix}/pulls/903/merge")),
+            ("PUT …/pulls/903/auto_merge",
+             ("api", "--method", "PUT", f"{repo_prefix}/pulls/903/auto_merge")),
+            ("DELETE of a label that is NOT review:pass",
+             ("api", "--method", "DELETE", f"{repo_prefix}/issues/903/labels/needs-user")),
+            ("PATCH of the PR itself",
+             ("api", "--method", "PATCH", f"{repo_prefix}/pulls/903")),
+            ("a spelling nobody enumerated",
+             ("api", "--method", "POST", f"{repo_prefix}/issues/903/assignees"))):
+        chk(f"double: FAILS CLOSED on the unserved write `{label[:52]}`",
+            _DOUBLE_UNSERVED_WRITE in str(_raises(lambda a=argv: writes(a))), True)
+    for argv in SWEEPER_WRITES:
+        served = tuple(a.replace("/repos/o/r", repo_prefix) for a in argv)
+        chk(f"double: still SERVES the write the sweeper really issues — "
+            f"`{argv[2]} {argv[3].split('/repos/o/r')[-1]}`",
+            _raises(lambda a=served: writes(a)), None)
+    chk("double: and a stray PUT is REFUSED rather than crashing the reporting helper — "
+        "`updated()` is TOTAL over the refused calls it still recorded, so a partial helper cannot "
+        "truncate the run and mask every assertion below it",
+        _totalled(writes.updated), [903])
 
     # AND the control must be able to SEE those spellings. Without this the "no arming call" checks
     # could pass by matching nothing at all — the vacuity that hid the CLI form in the first place.
-    for label, argv in (("cli:pr merge", ("pr", "merge", "7")),
-                        ("cli:pr merge", ("pr", "merge", "903", "--auto", "--squash")),
-                        ("cli:pr edit --add-label", ("pr", "edit", "9", "--add-label",
-                                                     REVIEW_PASS_LABEL)),
-                        ("cli:run rerun", ("run", "rerun", "1", "--failed")),
-                        ("rest:auto_merge", ("api", "--method", "PUT",
-                                             "/repos/o/r/pulls/9/auto_merge")),
-                        ("rest:merge", ("api", "--method", "PUT", "/repos/o/r/pulls/9/merge")),
-                        ("graphql:enablePullRequestAutoMerge",
-                         ("api", "graphql", "-f", "query=mutation{enablePullRequestAutoMerge}"))):
+    chk("never-arm control: EVERY enumerated spelling has a positive detection probe — an "
+        "un-probed predicate can be replaced by `lambda a: False` and nothing notices, which was "
+        "true of 8 of the 14",
+        sorted({label for label, _ in ARMING_PROBES}),
+        sorted({label for label, _ in ARMING_SPELLINGS}))
+    for label, argv in ARMING_PROBES:
         chk(f"never-arm control: `{' '.join(argv)[:44]}` is DETECTED as {label}",
             [name for name, _ in arming_calls([argv])], [label])
     chk("never-arm control: an ordinary read is NOT flagged (so the control is not simply true "
         "of everything)",
         arming_calls([("api", "/repos/o/r/pulls?state=open"),
-                      ("api", "--method", "POST", "/repos/o/r/issues/1/comments")]), [])
+                      ("api", "/repos/o/r/commits/abc/check-runs")]), [])
+    chk("never-arm control: and none of the three writes the sweeper DOES issue is flagged — a "
+        "control that fires on `update-branch`, the marker comment or the `review:pass` removal "
+        "would make `arming_calls(...) == []` mean 'this tick wrote nothing'",
+        arming_calls(SWEEPER_WRITES), [])
 
     # NEVER ARM.
     gh6, sweeper6 = _fixture(labels=[REVIEW_PASS_LABEL])
@@ -1706,7 +1988,7 @@ def _test_live_sweep(chk):
     # That case is accepted (the green it merges on is fresh) but it must be VISIBLE.
     gh7b, sweeper7b = _fixture(labels=[REVIEW_PASS_LABEL],
                                auto_merge={"enabled_by": {"login": "someone"}})
-    _run_total(chk, 'sweeper7b', sweeper7b)
+    _, printed7b = _run_capturing(chk, 'sweeper7b', sweeper7b)
     chk("latched-arm: an ALREADY-armed PR is moved, counted and named — the head move does not "
         "retract auto-merge, so the census must not report this merge as unattended",
         ("latched-arm=1" in _row(sweeper7b), gh7b.updated()), (True, [903]))
@@ -1733,8 +2015,27 @@ def _test_live_sweep(chk):
     chk("latched-arm: the published note does NOT claim the approved diff is unchanged — measured "
         "false (same-file non-overlapping merges shift hunk headers and blob ids), and this text "
         "is posted onto other people's PRs",
-        [phrase for phrase in ("byte-identical", "diff is unchanged", "no author commits",
-                               "identical diff") if phrase in LATCHED_ARM_NOTE], [])
+        [phrase for phrase in WITHDRAWN_DIFF_CLAIMS if phrase in LATCHED_ARM_NOTE], [])
+    # ⚠️ AND THE SAME OVER EVERYTHING THE TICK ACTUALLY PUBLISHED. Scanning the note constant alone
+    # is what let the withdrawn clause keep shipping from the `::warning::` three lines above it.
+    # This input is the REAL captured stdout of the latched-arm tick plus the body it really
+    # posted — so a justification added in a new annotation, or in the comment, is covered without
+    # anyone remembering to enrol it.
+    published7b = printed7b + "\n" + "\n".join(gh7b.posted_bodies())
+    chk("latched-arm: the scanned surface really CONTAINS the tick's annotation channel — an "
+        "inert capture would leave the guard below scanning only the posted body, which is the "
+        "one artifact it was already scanning",
+        LATCHED_ARM_WARNING.format(number=903, label=REVIEW_PASS_LABEL) in printed7b, True)
+    chk("latched-arm: NO justification this tick published to a human — captured annotations AND "
+        "the posted body, not one hand-named constant — claims the approved diff survived the move",
+        (sorted(p for p in WITHDRAWN_DIFF_CLAIMS if p in published7b),
+         "latched-arm" in published7b), ([], True))
+    chk("latched-arm: and what it publishes INSTEAD is the freshness claim named with the base it "
+        "rests on — gutting that clause to a vacuous one leaves the guard above satisfied",
+        ("computed against a base that contains the repair" in published7b,
+         "computed against a base that contains the repair" in LATCHED_ARM_NOTE,
+         "computed against a base that contains the repair" in LATCHED_ARM_WARNING),
+        (True, True, True))
     chk("latched-arm: the note states the one claim it DOES rest on (the green is fresh)",
         "green it merges on is fresh" in LATCHED_ARM_NOTE.lower(), True)
     chk("latched-arm: and it tells the reader what to do if that is not enough for their PR",
