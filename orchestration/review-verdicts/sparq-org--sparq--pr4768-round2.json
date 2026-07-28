@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4768,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "fbcb48c6c372a7b211f87f160b4e4f76771f7478",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The prior major finding is unchanged. Immediately after the revised ignore-list paragraph, `The advisories-gate gap (GX-1 \u2014 know this)` still states that `cargo deny check advisories` is `continue-on-error (non-gating)`. That directly contradicts `.github/workflows/supply-chain.yml`, AGENTS.md, and the compliance evidence changed here, which all describe the check as fail-closed and gating after the CVSS-v4 blocker was resolved. This is operational guidance for agents, so the stale section can still cause incorrect security and audit conclusions.",
+    "file": ".claude/skills/rust-supply-chain-attestation/SKILL.md",
+    "fix_hint": "Replace or remove the obsolete GX-1 gap section in this PR. State that the CVSS-v4 parsing blocker tracked by sq-q8de is resolved, the PR-time `cargo deny check advisories` step is gating with no `continue-on-error`, and the daily dependency monitor is defense in depth.",
+    "severity": "major",
+    "title": "Supply-chain skill still says the advisory check is non-gating"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 is improving: the prior minor wording inconsistency in compliance/sbom/evidence.md was fixed, but the prior major contradiction remains. The updated supply-chain skill still immediately follows its revised ignore-list guidance with an obsolete GX-1 section claiming the advisory check is continue-on-error and non-gating, while the workflow and other documentation in this same diff say it is fail-closed and gating. Because this is operational agent guidance, the contradiction remains release-blocking.",
+  "verdict": "request_changes"
+ }
+}
