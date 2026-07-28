@@ -645,7 +645,10 @@ def publish(census, considered, errors, apply, summary_path):
     return 1 if (errors or unclassified) else 0
 
 
-def main(argv=None):
+def build_parser():
+    """The CLI, extracted so `--self-test` can read the DEFAULTS it ships with. The two caps are
+    the headline claim of this program, and a cap whose only assertion derives from the constant
+    under test cannot disagree with it — so the test reads these and compares them to literals."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--repos", default="", help="comma-separated owner/name targets")
@@ -659,6 +662,11 @@ def main(argv=None):
     parser.add_argument("--reconcile-max", type=int, default=RECONCILE_MAX,
                         help="lifetime cap on automatic releases for ONE pull request")
     parser.add_argument("--summary-path", default=os.environ.get("GITHUB_STEP_SUMMARY"))
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
     args = parser.parse_args(argv)
     if args.self_test:
         return _self_test()
@@ -716,11 +724,42 @@ def _self_test():
     check("conflict-resolved is a recovery on its OWN, even with the head unmoved",
           v(live_head=head_a, live_mergeable=True)[:2],
           ("conflict-resolved", "cleared-conflict-resolved"))
-    # THE ANTI-TIMER CONTROL, executable: `verdict` takes no clock argument at all, so the same
-    # park evaluated at any wall time is the same answer. Asserted on the SIGNATURE, so adding a
-    # timed branch would have to add a parameter and red this row.
+    # THE ANTI-TIMER CONTROL. The first version asserted only that `verdict`'s SIGNATURE had no
+    # time-shaped parameter — a PRESENCE test, which a behaviour-neutral
+    # `and __import__("time").time() > 0` inside the function satisfied and SURVIVED. The property
+    # that actually matters is that this module cannot READ THE CURRENT TIME AT ALL, so it is
+    # asserted structurally over the whole module: no time module is imported by any spelling
+    # (including `__import__` / `import_module`), and no current-time attribute is ever reached.
+    #
+    # Parsing and ORDERING timestamps is deliberately still allowed — `machine_applied` compares
+    # `labeled` instants to find the newest, which is a comparison between two recorded events and
+    # never a comparison against now.
+    import ast as clock_ast
     import inspect
-    check("no branch of the verdict can consult a clock (the signature admits no time input)",
+
+    TIME_MODULES = {"time", "datetime", "calendar", "zoneinfo", "dateutil", "sched", "timeit"}
+    NOW_ATTRS = {"time", "time_ns", "monotonic", "monotonic_ns", "perf_counter", "perf_counter_ns",
+                 "process_time", "thread_time", "clock", "clock_gettime", "times", "now",
+                 "utcnow", "today", "fromtimestamp"}
+    module_source = Path(__file__).resolve().read_text(encoding="utf-8")
+    module_ast = clock_ast.parse(module_source)
+    imported, dynamic, reached = set(), [], set()
+    for node in clock_ast.walk(module_ast):
+        if isinstance(node, clock_ast.Import):
+            imported |= {alias.name.split(".")[0] for alias in node.names}
+        elif isinstance(node, clock_ast.ImportFrom):
+            imported.add(str(node.module or "").split(".")[0])
+        elif isinstance(node, clock_ast.Call):
+            name = getattr(node.func, "id", "") or getattr(node.func, "attr", "")
+            if name in {"__import__", "import_module"}:
+                dynamic.append(name)
+        elif isinstance(node, clock_ast.Attribute) and node.attr in NOW_ATTRS:
+            reached.add(node.attr)
+    check("this module cannot read the current time BY ANY SPELLING — no time module is imported, "
+          "no dynamic import exists, and no current-time attribute is reached anywhere",
+          (sorted(imported & TIME_MODULES), dynamic, sorted(reached)), ([], [], []))
+    check("...and `verdict` additionally takes no time-shaped parameter, so a timed branch cannot "
+          "be wired in from a caller either",
           sorted(name for name in inspect.signature(verdict).parameters
                  if any(token in name for token in ("time", "now", "clock", "hour", "age",
                                                     "grace", "elapsed"))),
@@ -792,8 +831,18 @@ def _self_test():
     check("...but a NEW head is a NEW recovery",
           v(live_head="d" * 40, receipts=spent, receipt_count=1)[:2],
           ("head-moved", "cleared-head-moved"))
-    check("the lifetime cap stops the loop outright",
-          v(receipt_count=RECONCILE_MAX)[:2], (None, "cap-reached"))
+    # PINNED TO LITERALS, not to the constant under test. The first version of this row read
+    # `v(receipt_count=RECONCILE_MAX)`, whose input derives from the very constant it is meant to
+    # guard — so `RECONCILE_MAX = 1000000` passed it. A cap must be asserted against a number the
+    # code cannot supply.
+    check("the lifetime cap is the LITERAL 2: one release is still allowed, a second is refused",
+          (RECONCILE_MAX, v(receipt_count=0)[1], v(receipt_count=1)[1], v(receipt_count=2)[1],
+           v(receipt_count=3)[1]),
+          (2, "cleared-head-moved", "cleared-head-moved", "cap-reached", "cap-reached"))
+    cli = build_parser().parse_args(["--repos", "o/r", "--bot-login", "b"])
+    check("the shipped CLI DEFAULTS are the literals 5 (per run) and 2 (per PR), so neither cap "
+          "can be widened by changing a constant alone",
+          (cli.max_clears, cli.reconcile_max), (5, 2))
     check("a MALFORMED receipt still counts toward the cap: a corrupt receipt can never buy an "
           "extra release",
           clear_receipts(
@@ -877,13 +926,22 @@ def _self_test():
           "Lane-INVISIBLE" in render_summary(counts, cleared, terminal, reachable, unclassified,
                                              lane_split, 5),
           True)
-    # INERT AS A DECISION, asserted on the signature: a lane input would have to be added to
-    # `verdict` before it could gate anything, and that would red this row.
-    check("lane admissibility can never change a verdict (the signature admits no lane input)",
-          sorted(name for name in inspect.signature(verdict).parameters
-                 if any(token in name for token in ("lane", "branch", "head_ref", "author",
-                                                    "draft", "enrol", "enroll"))),
-          [])
+    # PRECISELY WHAT THIS PROVES, and no more. The lane BOOLEAN never reaches `verdict` — asserted
+    # on the signature below. But lane SHAPE is not inert: a lane head ref makes the source issue
+    # derivable, and those issue labels DO feed the residual-hold rule (L532-534, and the lane row
+    # in block (h2) demonstrates exactly that). The first version of this row was titled "lane
+    # admissibility can never change a verdict", which its own sibling row disproves. The direction
+    # is one-way — deriving the issue can only ever add a refusal, never authorise a release — and
+    # that is the property worth naming.
+    check("the lane BOOLEAN is not a verdict input (no lane parameter exists); lane SHAPE reaches "
+          "the verdict only through issue_labels, which can only ever ADD a refusal",
+          (sorted(name for name in inspect.signature(verdict).parameters
+                  if any(token in name for token in ("lane", "branch", "head_ref", "author",
+                                                     "draft", "enrol", "enroll"))),
+           # A lane head with a clean source issue releases exactly as a non-lane head does, so the
+           # derivation adds refusals and nothing else.
+           v(issue_labels=[])[1], v(issue_labels=["needs:ec2"])[1]),
+          ([], "cleared-head-moved", "residual-hold"))
     check("the head-ref axis matches the lane's own shape and nothing else",
           [bool(LANE_HEAD_RE.match(ref)) for ref in
            ("sparq-agent/issue-394-30316285331-1", "feat/self-declared-dual-review",
@@ -1111,13 +1169,34 @@ def _self_test():
     call_body = "\n".join(line for line in str(call_steps[0].get("run", "")).splitlines()
                           if not line.strip().startswith("#")) if call_steps else ""
     call_run = " ".join(call_body.replace("\\\n", " ").split())
-    check("the workflow call site wires this program, its self-test, and BOTH caps",
+    # EXACT TOKENS, NOT SUBSTRING CONTAINMENT. `"--apply" in call_run` is satisfied by
+    # `--apply-DROPPED`, and `"--reconcile-max" in call_run` by `--reconcile-max-DROPPED`; both
+    # mutants survived the first version of this row. Tokenising and using list membership makes
+    # the match exact, and reading the VALUE that follows each flag pins the number as well as the
+    # name.
+    tokens = call_run.split()
+
+    def has_sequence(want):
+        parts = want.split()
+        return any(tokens[i:i + len(parts)] == parts
+                   for i in range(len(tokens) - len(parts) + 1))
+
+    def flag_value(flag):
+        index = tokens.index(flag) if flag in tokens else -1
+        return tokens[index + 1] if 0 <= index < len(tokens) - 1 else None
+
+    check("the workflow call site invokes this program by EXACT token sequence — self-test first, "
+          "then the applying run",
           (len(call_steps),
-           [flag for flag in ("python3 scripts/reconcile-conflict-park.py --self-test",
-                              "python3 scripts/reconcile-conflict-park.py --apply",
-                              "--max-clears", "--reconcile-max", "--repos", "--bot-login")
-            if flag not in call_run]),
-          (1, []))
+           has_sequence("python3 scripts/reconcile-conflict-park.py --self-test"),
+           has_sequence("python3 scripts/reconcile-conflict-park.py --apply"),
+           "--apply" in tokens, "--repos" in tokens, "--bot-login" in tokens),
+          (1, True, True, True, True, True))
+    check("the workflow passes the SAME cap literals the CLI defaults to, so a widening in either "
+          "place disagrees with the other",
+          (flag_value("--max-clears"), flag_value("--reconcile-max"),
+           str(cli.max_clears), str(cli.reconcile_max)),
+          ("5", "2", "5", "2"))
     check("the reconcile step can neither continue-on-error nor swallow its exit code",
           (call_steps[0].get("continue-on-error") if call_steps else "no step",
            "|| true" in call_run, "set +e" in call_run, "set -euo pipefail" in call_run),
