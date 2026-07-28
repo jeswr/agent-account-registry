@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 924,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d745d5cbd53f59a8f92762704089734e255701b5",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The extractor calls `pipefail_delta` on each physical line/segment and never assembles backslash-continued shell commands. After `set +o pipefail`, a valid shell sequence such as `set -o \\\\` followed by `pipefail`, then `producer | head -1`, re-enables pipefail in bash, but neither physical line matches a complete enable. The scanner therefore keeps `pipefail = False`, comments out the vulnerable pipeline, and can return a false-clean zero. The new fixture covers same-line separators but not continued option commands, so its exact-count assertion does not detect this bypass.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Track pipefail transitions over shell logical commands, including backslash continuations, before deciding whether later commands are emitted. Add a positive control that disables pipefail, re-enables it with `set -o \\\\` plus `pipefail` on the next physical line, then runs `producer | head -1`, and require that shape to be counted.",
+    "severity": "major",
+    "title": "Backslash-continued pipefail re-enable bypasses the workflow guard"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-2 same-line re-enable defect is covered, but the workflow guard still has a fail-open state-tracking gap: it processes physical lines independently even though shell option commands may use backslash continuations. A continued `set -o pipefail` is executed by bash but is invisible to `pipefail_delta`, so a subsequently vulnerable pipeline can remain blanked and the real-workflow assertion can incorrectly report zero. The positive fixture has no multiline enable control. This is a new major bypass, so progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
