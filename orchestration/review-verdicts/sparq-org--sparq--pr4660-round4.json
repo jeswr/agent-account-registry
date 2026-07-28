@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4660,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "39736c285863a94bfdbda5d2f9d7f2064fdc4205",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The diff adds both Store.validateStore and store_validateStore to the generated declaration file, but adds no corresponding Rust/wasm implementation or generated JavaScript glue. No validateStore or validate_store implementation exists elsewhere in the checkout. TypeScript callers will compile successfully and then encounter a missing method/export at runtime. This is the same unsupported API class that was absent in round 3.",
+    "file": "packages/sparq-client/src/generated/sparq_wasm.d.ts",
+    "fix_hint": "Remove the validateStore documentation, method declaration, cross-link, and InitOutput export from this PR. If the API is intended, implement it in the wasm source with focused stateful/default-graph equivalence tests, update the public JS/WASM skill as required, and regenerate all wasm-bindgen artifacts rather than editing only the .d.ts file.",
+    "severity": "major",
+    "title": "Generated typings declare validateStore without a runtime implementation"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 4 regresses from round 3's clean approval: the unsupported Store.validateStore declaration has returned in the generated wasm typings, but this diff contains no corresponding wasm implementation or generated JavaScript binding. Repository context also contains no validateStore/validate_store implementation outside this declaration file. Consumers can therefore compile against an API that is absent at runtime, and the claimed low-level wasm export is likewise unsupported. The file-picker refactor and its focused tests remain coherent, but the false generated API surface is a major blocking issue.",
+  "verdict": "request_changes"
+ }
+}
