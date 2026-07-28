@@ -239,6 +239,21 @@ def classify(pr, now, *, grace_seconds, required_check,
     if markers >= max_actions_per_head:
         return "skip", "action-budget-exhausted"
 
+    # (10a) NO MERGE QUEUE ON THE BASE REF -> DETECT, BUT DO NOT ACT.
+    # The remedy is disarm-then-relatch, and GitHub REFUSES `enablePullRequestAutoMerge`
+    # outright while a PR reads clean status ("Pull request is in clean status") -- which
+    # every PR reaching this line does, because (4) above requires CLEAN. On a queue-enabled
+    # base the latch is still meaningful (the PR is not immediately mergeable; it must
+    # traverse the queue) and GitHub accepts it. On a base with NO queue the relatch cannot
+    # succeed, so acting would disarm a PR and then fail to re-arm it -- converting a dead
+    # latch into an UNARMED PR, which is strictly worse than what we found.
+    # This is the guard that also makes `is_in_merge_queue` non-vacuous: without it that
+    # field is False by construction wherever there is no queue.
+    # The population is still CENSUSED so the gap is visible rather than silently dropped;
+    # a base without a queue needs a different remedy, which this tool does not have.
+    if not pr.get("is_merge_queue_enabled"):
+        return "skip", "no-merge-queue-on-base:cannot-relatch"
+
     if pr.get("auto_merge_enabled_at") is not None:
         return "rescue", "dead-latch"
     # Unarmed, but we hold a marker for THIS head: our own disarm landed and the re-arm did not.
@@ -315,6 +330,14 @@ def marker_body(head_sha, action, grace_seconds, age_seconds, run_url):
 # GitHub IO. Reads go through the shared retry policy; MUTATIONS never do (gh_retry's hard scope
 # rule -- a retried write is a repeated write).
 # ---------------------------------------------------------------------------------------------
+# The ONLY remediation verb this tool may use. See Watchdog.rearm for why `gh pr merge --auto`
+# is not an option here, and `worker-pr.py` ARM_AUTO_MERGE_MUTATION for the estate-wide rule.
+# `%s` is the merge method, restricted by the caller to the three GitHub accepts.
+REARM_MUTATION = (
+    "mutation($pr:ID!,$oid:GitObjectID!){"
+    "enablePullRequestAutoMerge(input:{pullRequestId:$pr,expectedHeadOid:$oid,"
+    "mergeMethod:%s}){clientMutationId}}")
+
 OPEN_PR_QUERY = """
 query($owner: String!, $name: String!, $cursor: String) {
   repository(owner: $owner, name: $name) {
@@ -322,7 +345,8 @@ query($owner: String!, $name: String!, $cursor: String) {
                  orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
       nodes {
-        number url isDraft isInMergeQueue mergeable mergeStateStatus headRefOid
+        id number url isDraft isInMergeQueue isMergeQueueEnabled mergeable mergeStateStatus
+        headRefOid
         autoMergeRequest { enabledAt mergeMethod }
         labels(first: 60) { nodes { name } }
       }
@@ -417,7 +441,11 @@ class Watchdog:
                     "url": node["url"],
                     "head_sha": node["headRefOid"],
                     "is_draft": bool(node["isDraft"]),
+                    "node_id": node["id"],
                     "is_in_merge_queue": bool(node["isInMergeQueue"]),
+                    # The BASE ref's queue, not this PR's membership of it. Load-bearing:
+                    # see the no-merge-queue guard in classify().
+                    "is_merge_queue_enabled": bool(node["isMergeQueueEnabled"]),
                     "mergeable": node["mergeable"],
                     "merge_state_status": node["mergeStateStatus"],
                     "auto_merge_enabled_at": parse_iso(auto.get("enabledAt")),
@@ -495,13 +523,37 @@ class Watchdog:
                                % (pr["repo"], pr["number"], code))
 
     def rearm(self, pr, token):
-        # Restore the latch's OWN merge method. The queue overrides it anyway ("The merge strategy
-        # for main is set by the merge queue"), so this is about changing nothing we were not
-        # asked to change, not about the method mattering.
-        flag = {"SQUASH": "--squash", "REBASE": "--rebase", "MERGE": "--merge"}.get(
-            (pr.get("auto_merge_method") or "SQUASH").upper(), "--squash")
-        code, _ = self.gh_write(["gh", "pr", "merge", str(pr["number"]), "--repo", pr["repo"],
-                                 "--auto", flag], token)
+        """Re-latch via the RAW enablePullRequestAutoMerge MUTATION -- never `gh pr merge --auto`.
+
+        THIS VERB CHOICE IS THE SAFETY PROPERTY, not a style preference. `gh pr merge --auto`
+        does NOT reliably latch: in gh v2.94.0 `merge.go:530` computes
+        `autoMerge = AutoMergeEnable && !isImmediatelyMergeable(mergeStateStatus)`, and
+        `isImmediatelyMergeable("CLEAN")` is TRUE (`merge.go:763-769`), so `--auto` on a CLEAN
+        PR yields `autoMerge=false`. `payload.auto` is forced back to true ONLY when the base
+        ref has a merge queue (`merge.go:302` via `shouldAddToMergeQueue`, `:488`), and
+        `http.go:88` then branches: `payload.auto` true -> `enablePullRequestAutoMerge`,
+        false -> `MergePullRequest` -- an IMMEDIATE, IRREVERSIBLE MERGE.
+        classify() requires CLEAN, so on any base without a merge queue every "re-arm" this
+        tool issued would have been an unreviewed merge, while the marker comment it posts
+        says it re-armed. That is the defect this function exists to not have.
+
+        This is also the estate's standing rule, not a local judgement: `gh pr merge --auto`
+        is banned repo-wide (`pr-gate.yml`, `worker-pr.py`) for exactly this reason, and the
+        sanctioned primitive is this mutation -- see worker-pr.py's ARM_AUTO_MERGE_MUTATION.
+
+        The mutation can ONLY ever latch. It cannot merge, at any gh version, on any repo
+        shape, with any flag -- the safety no longer depends on a precondition steering an
+        internal branch of a third-party CLI whose semantics have already changed once.
+        `expectedHeadOid` carries the head CAS that `--match-head-commit` used to.
+        """
+        method = (pr.get("auto_merge_method") or "SQUASH").upper()
+        if method not in ("SQUASH", "REBASE", "MERGE"):
+            method = "SQUASH"
+        code, _ = self.gh_write(
+            ["gh", "api", "graphql",
+             "-f", "query=" + REARM_MUTATION % method,
+             "-F", "pr=%s" % pr["node_id"],
+             "-F", "oid=%s" % pr["head_sha"]], token)
         if code != 0:
             raise RuntimeError("re-arm failed for %s#%d (rc=%d)"
                                % (pr["repo"], pr["number"], code))
@@ -662,6 +714,10 @@ def _dead_latch(**over):
         "repo": "sparq-org/latch-watchdog-fixture-repo", "number": 999000617, "url": "u",
         "head_sha": "cd0ca3f1786b95ef731245c6443123238068c6a3",
         "is_draft": False, "is_in_merge_queue": False,
+        # A queue-enabled base: the ONLY shape this tool may act on, because the relatch
+        # mutation is refused on a clean-status PR whose base has no queue. See classify (10a).
+        "is_merge_queue_enabled": True,
+        "node_id": "PR_kwFAKEFIXTUREnodeid",
         "mergeable": "MERGEABLE", "merge_state_status": "CLEAN",
         "auto_merge_enabled_at": 1000.0, "auto_merge_method": "MERGE",
         "labels": ["review:pass", "area:ci"],
@@ -711,6 +767,24 @@ class _FakeGh:
             if any(key in part for part in args):
                 return code, ""
         return 0, ""
+
+
+def _fetch_one_pr(is_queue):
+    """Drive the REAL open-PR fetch against a stubbed read, so the parse is exercised end to
+    end rather than hand-built. Used to pin that isMergeQueueEnabled is actually consumed."""
+    payload = json.dumps({"data": {"repository": {"pullRequests": {
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": [{"id": "PR_kwFPARSE", "number": 1, "url": "u", "isDraft": False,
+                   "isInMergeQueue": False, "isMergeQueueEnabled": is_queue,
+                   "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "headRefOid": "a",
+                   "autoMergeRequest": None, "labels": {"nodes": []}}]}}}})
+    fake = _FakeGh(reads={"query=": payload})
+    dog = Watchdog(apply_changes=False, grace_seconds=DEFAULT_GRACE_SECONDS,
+                   required_check="gate", deny_labels=DEFAULT_DENY_LABELS,
+                   require_label="review:pass", max_actions_per_head=2, max_actions_per_run=5,
+                   marker_actor="b[bot]", clock=lambda: 0.0,
+                   gh_read=fake.read, gh_write=fake.write)
+    return dog.list_open_prs("o/r", "t")[0]
 
 
 def _self_test():
@@ -825,6 +899,33 @@ def _self_test():
     chk("unarmed with NO marker is not our business (arming unarmed PRs is registry #447)",
         _verdict(_dead_latch(auto_merge_enabled_at=None, markers_for_head=0), 1e9),
         ("skip", "not-armed"))
+    # -- NO MERGE QUEUE ON THE BASE: detect, census, never act. --------------------------------
+    # The relatch mutation is REFUSED by GitHub while a PR reads clean status, and classify
+    # requires CLEAN -- so on a base without a queue the remedy cannot succeed. Acting would
+    # disarm and then fail to re-arm, leaving the PR UNARMED: strictly worse than found.
+    # This is also what makes `is_in_merge_queue` non-vacuous; without it that field is False
+    # by construction exactly where there is no queue.
+    chk("a dead latch on a base with NO merge queue is censused, never actioned",
+        _verdict(_dead_latch(is_merge_queue_enabled=False), 1e9),
+        ("skip", "no-merge-queue-on-base:cannot-relatch"))
+    chk("the orphan path is refused on a no-queue base too",
+        _verdict(_dead_latch(is_merge_queue_enabled=False, auto_merge_enabled_at=None,
+                             markers_for_head=1), 1e9),
+        ("skip", "no-merge-queue-on-base:cannot-relatch"))
+    # ANTI-VACUITY: the SAME fixture on a queue-enabled base must still be actioned, or the
+    # guard is just the watchdog switched off.
+    chk("the identical dead latch IS actioned when the base has a queue",
+        _verdict(_dead_latch(is_merge_queue_enabled=True), 1e9), ("rescue", "dead-latch"))
+    # The guard sits AFTER the grace and budget checks, so it cannot mask them.
+    chk("a no-queue base still reports within-grace first (guard ordering)",
+        _verdict(_dead_latch(is_merge_queue_enabled=False), 1000.0), ("skip", "within-grace"))
+
+    # The parse must READ the field: replacing it with a constant `True` re-opens the whole
+    # defect while every classify test above still passes, because they set the field directly.
+    chk("PARSE: is_merge_queue_enabled is read from the GraphQL payload, not assumed",
+        [_fetch_one_pr(is_queue=False)["is_merge_queue_enabled"],
+         _fetch_one_pr(is_queue=True)["is_merge_queue_enabled"]], [False, True])
+
     chk("an orphan that reached the queue on its own is left alone",
         _verdict(_dead_latch(auto_merge_enabled_at=None, markers_for_head=1,
                              is_in_merge_queue=True), 1e9), ("skip", "in-merge-queue"))
@@ -847,7 +948,8 @@ def _self_test():
          "completed_at": "2026-07-27T21:25:43Z"}]})
     prs_json = json.dumps({"data": {"repository": {"pullRequests": {
         "pageInfo": {"hasNextPage": False, "endCursor": None},
-        "nodes": [{"number": 999000617, "url": "u", "isDraft": False, "isInMergeQueue": False,
+        "nodes": [{"id": "PR_kwFLIVEFLOWnodeid", "number": 999000617, "url": "u",
+                   "isDraft": False, "isInMergeQueue": False, "isMergeQueueEnabled": True,
                    "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
                    "headRefOid": "cd0ca3f", "autoMergeRequest": {"enabledAt":
                        "2026-07-27T21:20:19Z", "mergeMethod": "MERGE"},
@@ -859,21 +961,49 @@ def _self_test():
                    marker_actor="sparq-bot[bot]", clock=lambda: parse_iso(
                        "2026-07-28T08:46:00Z"), gh_read=fake.read, gh_write=fake.write)
     rc = dog.run(["sparq-org/latch-watchdog-fixture-repo"], {"sparq-org": "t"}, 0)
-    chk("flow: a live dead latch produces marker -> disable-auto -> re-arm, in that order",
-        [(w[1], w[2], sorted(set(w) & {"--body", "--disable-auto", "--auto"}))
-         for w in fake.write_log],
-        [("pr", "comment", ["--body"]), ("pr", "merge", ["--disable-auto"]),
-         ("pr", "merge", ["--auto"])])
-    chk("flow: the re-arm restores the latch's OWN merge method",
-        fake.write_log[-1][-1], "--merge")
+    # CHANGED DELIBERATELY, and the change IS the fix. The previous form of this check pinned
+    # `("pr", "merge", ["--auto"])` as the re-arm -- i.e. it asserted the hazardous verb was
+    # present. `gh pr merge --auto` on a CLEAN PR resolves to an IMMEDIATE MERGE unless the base
+    # has a merge queue (gh v2.94.0 merge.go:530/:763/:302, http.go:88), and classify() requires
+    # CLEAN. So the old check was pinning an unreviewed-merge path in place. The re-arm is now
+    # the raw enablePullRequestAutoMerge mutation, which can only ever latch.
+    chk("flow: a live dead latch produces marker -> disable-auto -> relatch, in that order",
+        [(w[1], w[2]) for w in fake.write_log],
+        [("pr", "comment"), ("pr", "merge"), ("api", "graphql")])
+    # DEFENSIVE INDEXING, deliberately. These assertions previously indexed `write_log[-1]`
+    # directly; a mutant that produced NO writes raised IndexError and aborted the whole
+    # self-test before any named row printed. A crash is not a kill -- it reads identically
+    # whether the guarantee broke or the fixture broke -- so every access below degrades to a
+    # value that FAILS BY NAME instead of exploding.
+    last = fake.write_log[-1] if fake.write_log else []
+    relatch_q = next((a for a in last if a.startswith("query=")), "")
+    chk("flow: the relatch is the raw auto-merge MUTATION, never a merge verb",
+        relatch_q.startswith(
+            "query=mutation($pr:ID!,$oid:GitObjectID!){enablePullRequestAutoMerge("), True)
+    chk("flow: the relatch carries the head CAS in expectedHeadOid",
+        "oid=cd0ca3f" in last, True)
+    chk("flow: the relatch binds the PR by node id, not by number",
+        "pr=PR_kwFLIVEFLOWnodeid" in last, True)
+    chk("flow: the relatch restores the latch's OWN merge method",
+        "mergeMethod:MERGE" in "".join(last), True)
+    # ANTI-VACUITY for the whole block: no merge verb may appear in ANY mutation issued.
+    chk("flow: NO `gh pr merge --auto` is issued anywhere in the rescue",
+        [w for w in fake.write_log if "--auto" in w], [])
     chk("flow: the marker carries the head sha so the budget is per-head",
         "head=cd0ca3f" in fake.write_log[0][-1], True)
     # NOT a substring search over the argv -- the marker BODY legitimately contains the word
     # "dequeued" in its own explanation, and grepping for it matched this tool's own prose.
-    chk("flow: every mutation issued is a pr comment or a pr merge -- no raw API call, so the "
-        "verdict-stripping dequeue mutation is unreachable at runtime",
+    # The remedy now DOES make a raw API call (the relatch mutation), so this check can no
+    # longer be "no raw API call at all". It is instead an ALLOW-LIST of the exact three
+    # mutations, which is strictly tighter: the verdict-stripping dequeue mutation is still
+    # unreachable, and so is every other graphql document except the one named relatch.
+    chk("flow: every mutation issued is one of exactly three allowed forms",
         sorted({tuple(w[:3]) for w in fake.write_log}),
-        [("gh", "pr", "comment"), ("gh", "pr", "merge")])
+        [("gh", "api", "graphql"), ("gh", "pr", "comment"), ("gh", "pr", "merge")])
+    chk("flow: the ONLY graphql document issued is the relatch mutation",
+        sorted({q[len("query="):][:40] for w in fake.write_log for q in w
+                if isinstance(q, str) and q.startswith("query=")}),
+        ["mutation($pr:ID!,$oid:GitObjectID!){enab"])
     chk("flow: rc is 0 and the census counts one rescue",
         (rc, dog.census[0]["rescued"], dog.census[0]["considered"]), (0, 1, 1))
 
@@ -936,7 +1066,8 @@ def _self_test():
     # makes `self.disarm(...)` unconditional survives the whole suite.
     orphan_prs = json.dumps({"data": {"repository": {"pullRequests": {
         "pageInfo": {"hasNextPage": False, "endCursor": None},
-        "nodes": [{"number": 999000617, "url": "u", "isDraft": False, "isInMergeQueue": False,
+        "nodes": [{"id": "PR_kwFORPHANnodeid", "number": 999000617, "url": "u",
+                   "isDraft": False, "isInMergeQueue": False, "isMergeQueueEnabled": True,
                    "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
                    "headRefOid": "cd0ca3f", "autoMergeRequest": None,
                    "labels": {"nodes": [{"name": "review:pass"}]}}]}}}})
@@ -953,7 +1084,7 @@ def _self_test():
     dog5.run(["sparq-org/latch-watchdog-fixture-repo"], {"sparq-org": "t"}, 0)
     chk("flow ORPHAN: an already-unarmed PR is re-armed with NO disable-auto call",
         [(w[2], sorted(set(w) & {"--disable-auto", "--auto"})) for w in fake5.write_log],
-        [("comment", []), ("merge", ["--auto"])])
+        [("comment", []), ("graphql", [])])
     chk("flow ORPHAN: the census books it as a re-arm, not a rescue",
         (dog5.census[0]["rearmed"], dog5.census[0]["rescued"]), (1, 0))
 
@@ -1031,12 +1162,14 @@ def _self_test():
 
     page1 = json.dumps({"data": {"repository": {"pullRequests": {
         "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
-        "nodes": [{"number": 999000001, "url": "u", "isDraft": True, "isInMergeQueue": False,
+        "nodes": [{"id": "PR_kwFPAGEA", "number": 999000001, "url": "u", "isDraft": True,
+                   "isInMergeQueue": False, "isMergeQueueEnabled": True,
                    "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "headRefOid": "a",
                    "autoMergeRequest": None, "labels": {"nodes": []}}]}}}})
     page2 = json.dumps({"data": {"repository": {"pullRequests": {
         "pageInfo": {"hasNextPage": False, "endCursor": None},
-        "nodes": [{"number": 999000002, "url": "u", "isDraft": True, "isInMergeQueue": False,
+        "nodes": [{"id": "PR_kwFPAGEB", "number": 999000002, "url": "u", "isDraft": True,
+                   "isInMergeQueue": False, "isMergeQueueEnabled": True,
                    "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "headRefOid": "b",
                    "autoMergeRequest": None, "labels": {"nodes": []}}]}}}})
     # Fully scripted downstream reads on purpose: this fixture is about PAGINATION, so it must
@@ -1069,8 +1202,11 @@ def _self_test():
 
     for label, rc_map, want_writes in (
             ("a failed marker post aborts before any merge mutation", {"comment": 5}, 1),
+            # Keyed on the MUTATION NAME now, not `--auto`: the relatch is a raw graphql
+            # document, and a fixture still keyed on the old flag would never fire -- it would
+            # pass by never exercising the failure path at all.
             ("a failed re-arm reds the run after the marker is already durable",
-             {"--auto": 6}, 3)):
+             {"enablePullRequestAutoMerge": 6}, 3)):
         faken = _FakeGh(reads={"query=": prs_json, "check-runs": gate_json, "comments": "[]"},
                         write_rc=rc_map)
         dogn = _dog(faken)
@@ -1150,6 +1286,33 @@ def _self_test():
              "set +e" in run, "set -euo pipefail" in run), (None, False, False, True))
         chk("YAML: the grace period passed by the workflow is the MEASURED one",
             "--grace-seconds %d" % DEFAULT_GRACE_SECONDS in run, True)
+        # THE VALUES, not just the flag names. The block above asserts each flag is PRESENT,
+        # which a mutant that changes its VALUE survives untouched -- and these two values are
+        # the blast radius itself. Measured: `--max-actions-per-run 5 -> 500` and
+        # `--marker-actor "${APP_SLUG}[bot]" -> "${APP_SLUG}"` both survived the battery, the
+        # second of which makes the per-head marker budget match nothing, so `eligible_at`
+        # never re-anchors and the rescue loop is unbounded per tick.
+        # TOKEN equality, never substring: "--max-actions-per-run 5" is a SUBSTRING of
+        # "--max-actions-per-run 500", so the containment form passed on a 100x blast radius.
+        # That mutant SURVIVED the containment version of this very check.
+        run_tokens = run.split()
+
+        def _flag_value(flag):
+            return run_tokens[run_tokens.index(flag) + 1] if flag in run_tokens else None
+
+        chk("YAML: the per-run blast radius is EXACTLY the bounded value",
+            _flag_value("--max-actions-per-run"), "5")
+        chk("YAML: the marker actor is the BOT identity, so markers this tool wrote are the "
+            "ones its own budget counts",
+            "--marker-actor \"${APP_SLUG}[bot]\"" in run
+            or "--marker-actor '${APP_SLUG}[bot]'" in run
+            or "--marker-actor ${APP_SLUG}[bot]" in run, True)
+        chk("YAML: the per-head budget value is EXACTLY pinned too",
+            _flag_value("--max-actions-per-head"), "2")
+        chk("YAML: the grace period value is EXACTLY the measured one",
+            _flag_value("--grace-seconds"), str(DEFAULT_GRACE_SECONDS))
+        chk("YAML: the marker actor value carries the [bot] suffix EXACTLY",
+            (_flag_value("--marker-actor") or "").strip("\"'"), "${APP_SLUG}[bot]")
         chk("YAML: the job never grants write permissions to the ambient token",
             doc["jobs"]["watch"].get("permissions"), {"contents": "read"})
         chk("YAML: the secret-consuming job is bound to the protected environment",
@@ -1188,10 +1351,27 @@ def _self_test():
         write_argvs.append(tuple(
             el.value for el in node.args[0].elts
             if isinstance(el, ast.Constant) and isinstance(el.value, str)))
-    chk("every mutation this module can issue is `gh pr comment` or `gh pr merge` -- there is no "
-        "raw-API call site, so dequeuePullRequest is unreachable by construction",
+    # The relatch is now a RAW MUTATION, so "there is no raw-API call site" is no longer the
+    # right invariant -- and stating it that way would now be FALSE. The tighter replacement is
+    # an exact ALLOW-LIST of the three call sites, plus a scan of every graphql document this
+    # module can issue. dequeuePullRequest stays unreachable by construction, and so does every
+    # other mutation except the named relatch.
+    chk("every mutation this module can issue is one of exactly three allowed call sites",
         sorted({argv[:3] for argv in write_argvs}),
-        [("gh", "pr", "comment"), ("gh", "pr", "merge")])
+        [("gh", "api", "graphql"), ("gh", "pr", "comment"), ("gh", "pr", "merge")])
+    graphql_docs = sorted({s for argv in write_argvs for s in argv if "mutation(" in s})
+    chk("the ONLY graphql mutation in the source is enablePullRequestAutoMerge",
+        [d for d in graphql_docs if "enablePullRequestAutoMerge" not in d], [])
+    chk("no graphql document mentions dequeue or a merge mutation",
+        [d for d in graphql_docs
+         if "dequeue" in d.lower() or "mergePullRequest" in d], [])
+    # THE BANNED VERB, asserted structurally at the argv level. `gh pr merge --auto` resolves to
+    # an immediate merge on a CLEAN PR whose base has no queue; it is banned estate-wide.
+    chk("NO call site can issue `gh pr merge --auto` (the banned direct-merge verb)",
+        [argv for argv in write_argvs
+         if argv[:3] == ("gh", "pr", "merge") and "--auto" in argv], [])
+    chk("NO call site can pass --admin (which would bypass the queue entirely)",
+        [argv for argv in write_argvs if "--admin" in argv], [])
     chk("no mutation call site carries a label flag, so no human-terminal label can be written",
         sorted({flag for argv in write_argvs for flag in argv
                 if flag in ("--add-label", "--remove-label", "--edit", "--label")}), [])
