@@ -2183,9 +2183,21 @@ def _review_fix_standdown_labels(source=None):
     workflow uses (`"x" in labels` and `{...} & set(labels)`). A comment or a dead string
     mentioning a park label therefore proves nothing here — only an executed guard does.
 
-    Every failure direction shrinks the result: an unparsable body is skipped, a guard that stopped
-    raising is not collected, a dropped guard simply is not there. The caller asserts EQUALITY
-    against the constants above, so all three land as a RED rather than a quiet pass."""
+    PROVENANCE-BOUND (review round 2): matching a comparator merely SPELLED `labels` said nothing
+    about what that name held when the guard ran, so `labels = []` slipped in above the guards left
+    all three literals reported while all three guards were inert — the fail-open this pin exists
+    to catch, wearing the pin's own green. So the scan is anchored: it STARTS at the statement that
+    derives `labels` from the PR payload (a top-level `labels = ...` whose value reads `pull`'s
+    `"labels"`), walks only the top-level statements after it, and STOPS dead at the first
+    non-guard statement that so much as names `labels`. Anything that could rebind, empty, alias or
+    shadow the value between the derivation and a guard therefore ends the collection instead of
+    being stepped over, and a derivation that no longer reads the PR yields nothing at all.
+
+    Every failure direction shrinks the result: an unparsable body is skipped, a body with no
+    PR-derived `labels` contributes nothing, a guard that stopped raising is not collected, a guard
+    behind an intervening write to `labels` is cut off, a dropped guard simply is not there. The
+    caller asserts EQUALITY against the constants above, so all of them land as a RED rather than a
+    quiet pass."""
     import ast  # self-test-only, same lazy-import idiom as _review_fix_source
     import textwrap
 
@@ -2216,28 +2228,56 @@ def _review_fix_standdown_labels(source=None):
                         if isinstance(element, ast.Constant) and isinstance(element.value, str)}
         return out
 
+    def standdown(node):
+        """The park literals `node` refuses to run on, if it is an executed stand-down at all.
+
+        REACHABILITY, not mere presence (review round 1). `ast.walk` accepted an `if` ANYWHERE in
+        the tree, so burying the live guard under dead control flow — `if False:`, a never-called
+        `def`, a SystemExit-swallowing `try` — left the answer UNCHANGED while the workflow ran
+        models on parked PRs: exactly the conditionally-inert fail-open this pin exists to catch.
+        These heredoc bodies are straight-line scripts, so the admission path IS the module body:
+        only a guard that is a STATEMENT OF IT, raising at ITS OWN top level, counts."""
+        if not isinstance(node, ast.If):
+            return set()
+        if not any(isinstance(inner, ast.Raise) and isinstance(inner.exc, ast.Call)
+                   and isinstance(inner.exc.func, ast.Name)
+                   and inner.exc.func.id == "SystemExit"
+                   for inner in node.body):
+            return set()
+        return guarded(node.test)
+
+    def derives_labels(node):
+        """`node` is the top-level statement that binds `labels` FROM THE PR PAYLOAD."""
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "labels"):
+            return False
+        read = list(ast.walk(node.value))
+        return (any(isinstance(sub, ast.Name) and sub.id == "pull" for sub in read)
+                and any(isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+                        and sub.value == "labels" for sub in read))
+
+    def touches_labels(node):
+        """`node` so much as names `labels` — rebind, `del`, in-place mutation, or aliasing."""
+        return any(isinstance(sub, ast.Name) and sub.id == "labels" for sub in ast.walk(node))
+
     found = set()
     for body in bodies:
         try:
             tree = ast.parse(textwrap.dedent(body))
         except SyntaxError:
             continue
-        # REACHABILITY, not mere presence (review round 1). `ast.walk` accepted an `if` ANYWHERE
-        # in the tree, so burying the live guard under dead control flow — `if False:`, a
-        # never-called `def`, a SystemExit-swallowing `try` — left this set UNCHANGED while the
-        # workflow ran models on parked PRs: exactly the conditionally-inert fail-open this pin
-        # exists to catch. These heredoc bodies are straight-line scripts, so the admission path
-        # IS the module body: only a guard that is a STATEMENT OF IT counts. Any nesting drops
-        # the guard, which shrinks the set, which reds the caller's equality assertion.
-        for node in tree.body:
-            if not isinstance(node, ast.If):
-                continue
-            if not any(isinstance(inner, ast.Raise) and isinstance(inner.exc, ast.Call)
-                       and isinstance(inner.exc.func, ast.Name)
-                       and inner.exc.func.id == "SystemExit"
-                       for inner in node.body):
-                continue
-            found |= guarded(node.test)
+        start = next((i for i, node in enumerate(tree.body) if derives_labels(node)), None)
+        if start is None:
+            continue  # nothing here binds the PR's labels, so nothing here can guard on them
+        # From the derivation forward, and no further than the first statement that could have
+        # replaced what the guards read (review round 2). A guard is only evidence while the name
+        # it tests still holds the value the PR payload put there.
+        for node in tree.body[start + 1:]:
+            hit = standdown(node)
+            if hit:
+                found |= hit
+            elif touches_labels(node):
+                break
     return sorted(found)
 
 
@@ -4190,6 +4230,88 @@ def _self_test():
           "it died of unreachability rather than of a syntax error the pin merely stepped over",
           (_unparsable != _rf_src, attempt(lambda: _review_fix_standdown_labels(_unparsable))),
           (True, []))
+    # KNOWN POSITIVES 5-6 are the review-round-2 escape, and they are NOT a nesting mutant: every
+    # guard stays exactly where it is, top-level and raising, and the workflow still parses and
+    # still runs — only the VALUE they test has been swapped out from under them by one valid
+    # statement. That is the cheapest possible fail-open (one line, no restructuring) and the
+    # presence-of-a-name pin reported all three park labels straight through it.
+    _rebound_all = _rf_src.replace(
+        'if {"review:needs-user", "needs:user"} & set(labels):\n',
+        'labels = []\n          if {"review:needs-user", "needs:user"} & set(labels):\n')
+    check("KNOWN POSITIVE 5 — REBINDING `labels` above the guards reds: the guards are intact, "
+          "top-level and raising, so only provenance (each one still reads what the PR payload "
+          "put in `labels`) distinguishes this inert workflow from the live one",
+          (_rebound_all != _rf_src, attempt(lambda: _review_fix_standdown_labels(_rebound_all))),
+          (True, []))
+    # ...and KP5's [] means "cut off at the rebind" only because the mutant is VALID, non-crashing
+    # python rather than a KP4-style syntax error. This row is that discriminator: the SAME
+    # inserted statement, moved one guard later, leaves the guard above it collected — a body that
+    # failed to parse could not have reported anything at all.
+    _rebound_mid = _rf_src.replace(
+        'if "review:parked" in labels:\n',
+        'labels = []\n          if "review:parked" in labels:\n')
+    check("KNOWN POSITIVE 6 — the same rebind moved BELOW the first guard keeps that guard and "
+          "loses only the ones after it, which is what proves KP5's mutant parsed and ran: the "
+          "pin cuts the scan at the write, it does not discard the body",
+          (_rebound_mid != _rf_src, attempt(lambda: _review_fix_standdown_labels(_rebound_mid))),
+          (True, sorted({HUMAN_PR_PARK_LABEL, HUMAN_PARK_LABEL})))
+    # KNOWN POSITIVES 7-8 are the OTHER half of provenance, and the author's own mutation sweep is
+    # what found them uncovered (three survivors: the anchor's payload, key and target-name
+    # requirements were each individually deletable with the suite green). KP5/KP6 pin that nothing
+    # overwrites `labels` between the derivation and the guards; these pin that the thing the scan
+    # anchors on is THE PR'S OWN LABELS, BOUND TO THE NAME THE GUARDS READ. Every mutant below is
+    # valid, non-crashing python — `head` is a real already-bound dict, `assignees` a real PR field
+    # — and each leaves three live top-level guards standing down on the wrong thing, or on nothing.
+    _offobject = _rf_src.replace('for label in (pull.get("labels") or [])',
+                                 'for label in (head.get("labels") or [])')
+    _offkey = _rf_src.replace('for label in (pull.get("labels") or [])',
+                              'for label in (pull.get("assignees") or [])')
+    # ...and the LAST element of each row is its own discriminator, in place of a second row:
+    # undoing the substitution on the MUTATED text restores the full answer, so the []s are the
+    # provenance loss and not a mutant that merely stopped parsing (KP4's failure mode).
+    check("KNOWN POSITIVE 7 — a derivation repointed off the PR OBJECT, or off the PR's `labels` "
+          "KEY, yields nothing at all, and reading the PR's labels back restores all three: what "
+          "the guards test has to be the labels the pull request actually carries",
+          (_offobject != _rf_src, attempt(lambda: _review_fix_standdown_labels(_offobject)),
+           _offkey != _rf_src, attempt(lambda: _review_fix_standdown_labels(_offkey)),
+           attempt(lambda: _review_fix_standdown_labels(_offobject.replace(
+               'for label in (head.get("labels") or [])',
+               'for label in (pull.get("labels") or [])')))),
+          (True, [], True, [], _standdown))
+    # KP8 is the anchor's own fail-open: the PR-derived value is still computed, just BOUND
+    # SOMEWHERE ELSE, while the name the guards read is left empty. An anchor that matched any
+    # PR-derived assignment would latch onto the decoy and report all three park labels for a
+    # workflow whose guards test `[]`.
+    _decoy = _rf_src.replace('\n          labels = sorted({\n',
+                             '\n          labels = []\n          decoy = sorted({\n')
+    check("KNOWN POSITIVE 8 — a PR-derived binding under ANOTHER NAME is not an anchor: the scan "
+          "starts only where the PR's labels reach `labels` itself, so a decoy cannot lend its "
+          "provenance to guards reading an empty list (binding it back to `labels` restores all "
+          "three, which is what proves the mutant parsed and kept its guards)",
+          (_decoy != _rf_src, attempt(lambda: _review_fix_standdown_labels(_decoy)),
+           attempt(lambda: _review_fix_standdown_labels(
+               _decoy.replace("decoy = sorted({", "labels = sorted({")))),
+          (True, [], _standdown))
+    # KNOWN POSITIVE 9 closes the last surviving mutant of the author's sweep, and it is one this
+    # module's own workflow comment already PROMISES is caught: relaxing the reachability test from
+    # the guard's OWN body to `ast.walk` left the suite green. A SystemExit the guard raises and
+    # then SWALLOWS is the purest conditionally-inert trust check there is — right test, right
+    # labels, right top-level position, no effect — so the raise has to be a statement of the
+    # guard's own body, and a mutant that buries it inside a `try` must red. Two sibling guards
+    # survive in the expectation, which is what proves this mutant parsed and ran.
+    _swallowed = _rf_src.replace(
+        '              raise SystemExit("pull request is capacity-parked (review:parked); "\n'
+        '                               "a human readmission gesture re-admits it via the '
+        'dispatcher")\n',
+        '              try:\n'
+        '                  raise SystemExit("pull request is capacity-parked (review:parked)")\n'
+        '              except SystemExit:\n'
+        '                  pass\n')
+    check("KNOWN POSITIVE 9 — a stand-down that RAISES AND SWALLOWS its own SystemExit reds: the "
+          "guard is intact, top-level and testing the right PR labels, and it still stops nothing, "
+          "so the pin counts only a raise the guard itself performs",
+          (_swallowed != _rf_src, attempt(lambda: _review_fix_standdown_labels(_swallowed))),
+          (True, sorted({HUMAN_PR_PARK_LABEL, HUMAN_PARK_LABEL})))
 
     print("park-policy self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

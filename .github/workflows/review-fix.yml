@@ -292,9 +292,14 @@ jobs:
           # park_policy.py --self-test; so does BURYING one under dead control flow, because the
           # pin reads only TOP-LEVEL statements of this step — nesting a guard inside `if False:`,
           # a never-called def, or a SystemExit-swallowing try leaves it textually intact while
-          # this step admits parked PRs, and the pin reports what EXECUTES. Keep the guards in a
-          # shape it can read: a top-level `if`, testing a literal or a literal set against
-          # `labels`, raising SystemExit.
+          # this step admits parked PRs, and the pin reports what EXECUTES. Nor does leaving the
+          # guards alone and swapping the VALUE out from under them help: the pin starts at the
+          # `labels = sorted(...)` derivation ABOVE and stops at the first statement after it that
+          # so much as names `labels`, so one inert `labels = []` cuts the guards off rather than
+          # sneaking past them. Keep the guards in a shape it can read: top-level `if`s, testing a
+          # literal or a literal set against `labels`, raising SystemExit, in the run directly
+          # below the derivation — anything inserted between that touches `labels` ends the scan
+          # there and reds the pin, so re-derive at the point of use instead of rebinding here.
           #
           # review:needs-user (loop escalation) and needs:user (groom's parked-PR "Human
           # attention required" marker) are BOTH human-owned terminal for every mode/flavour.
