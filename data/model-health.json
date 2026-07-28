@@ -2076,6 +2076,14 @@
    "model_alias": "opus5",
    "exit_class": "success",
    "run_id": "30330728747.1"
+  },
+  {
+   "ts": 1785215757,
+   "provider": "anthropic",
+   "account": "488920c2efe2b3fb",
+   "model_alias": "opus5",
+   "exit_class": "unknown",
+   "run_id": "30329603219.1"
   }
  ]
 }
