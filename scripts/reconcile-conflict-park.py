@@ -105,6 +105,20 @@ def _load(modname, filename):
 _resolver = _load("registry_resolve_conflicts", "resolve-conflicts.py")
 ATTEMPT_RE = _resolver.ATTEMPT_RE
 ESCALATION_MARKER = _resolver.ESCALATION_MARKER
+# [#941 INTERACTION — the merge-composition hazard, closed by IMPORTING the other program's own
+# predicate rather than restating it.] #941's `_escalate_stuck` writes the HUMAN terminal once a
+# grace-window park goes past `STUCK_UNPARK_MAX` (`stuck_park_label`), and that over-cap write
+# ALSO emits `ESCALATION_MARKER` beside its receipt — so a PR #941 handed to a human PRECISELY FOR
+# EXHAUSTING ITS AUTOMATIC BUDGET is byte-indistinguishable, on the two facts this program
+# originally read, from a pre-#941 timeout park. It is single-attempt too, because the grace-window
+# branch only fires when `head_sha in heads and len(heads) == 1`. Left alone, this program would
+# grant it `RECONCILE_MAX` more releases: an EFFECTIVE CAP OF FOUR, assembled from two mechanisms
+# each correct alone. Each of the three names below is asserted against the owning module in
+# `_self_test`, so a rename or a semantic change there fails LOUDLY here rather than silently
+# re-opening the compose hole.
+STUCK_PARK_MARKER = _resolver.STUCK_PARK_MARKER
+STUCK_UNPARK_MAX = _resolver.STUCK_UNPARK_MAX
+stuck_receipts = _resolver.stuck_receipts
 
 RECONCILE_MARKER = "<!-- sparq-conflict-park-reconciled:v1"
 RECEIPT_RE = re.compile(
@@ -146,6 +160,7 @@ ADMIT_CODES = {
 }
 REFUSAL_HUMAN_TERMINAL = (
     "human-applied",        # a PROVEN human applied `needs:user` at some point in this history
+    "budget-exhausted",     # #941 wrote this terminal for exhausting ITS automatic budget
     "human-review-hold",    # a live review decision (review:changes / review:needs-user)
     "residual-hold",        # a needs:* hold would survive the clear on the PR or its issue
     "deny-prose",           # an injection / human-arm signal is recorded by the bot
@@ -315,8 +330,8 @@ def machine_applied(timeline, label):
 
 
 def verdict(*, pr_labels, issue_labels, live_head, live_mergeable, heads, escalated,
-            hold_applied_by_human, bot_bodies, receipts, receipt_count,
-            reconcile_max=RECONCILE_MAX):
+            hold_applied_by_human, bot_bodies, receipts, receipt_count, stuck_park_gen=None,
+            reconcile_max=RECONCILE_MAX, stuck_unpark_max=STUCK_UNPARK_MAX):
     """PURE. (cause, code, detail). `cause is None` means REFUSED and the park stands exactly as
     it is — every ambiguity lands there.
 
@@ -340,6 +355,16 @@ def verdict(*, pr_labels, issue_labels, live_head, live_mergeable, heads, escala
         return (None, "human-applied",
                 "a PROVEN HUMAN applied the hold (or its ownership could not be proven "
                 "machine-made) — a human decision is not the machine's to undo")
+    # [#941 INTERACTION] Positive proof, from #941's OWN durable receipt, that this terminal was
+    # written for exhausting THAT program's automatic re-admission budget. Releasing it would hand
+    # a further `reconcile_max` grants to a PR whose whole reason for being here is that its grants
+    # ran out — the two caps would COMPOSE into one of four. A flap is a genuine question.
+    if stuck_park_gen is not None and stuck_park_gen > stuck_unpark_max:
+        return (None, "budget-exhausted",
+                f"#941's grace-window park reached generation {stuck_park_gen}, past its "
+                f"STUCK_UNPARK_MAX of {stuck_unpark_max}: this terminal IS the exhaustion of the "
+                "conflict lane's own automatic budget, and a second mechanism must not re-grant "
+                "what the first deliberately stopped granting")
     live_review = sorted(labels & set(REVIEW_DECISION_HOLDS))
     if live_review:
         return (None, "human-review-hold",
@@ -548,6 +573,11 @@ def reconcile_repo(client, repo, bot_login, maintainer, apply, max_clears, recon
                 and machine_applied(timeline, park_policy.HUMAN_PARK_LABEL)
             ) or human_ever_applied(timeline, park_policy.HUMAN_PARK_LABEL, _is_human)
             receipts, receipt_count = clear_receipts(comments, bot_login)
+            # [#941 INTERACTION] The generation of the NEWEST grace-window park #941 recorded, read
+            # through ITS OWN trust-filtered reader so the two programs cannot disagree about what
+            # counts as a receipt. None when #941 never parked this PR (the pre-#941 population).
+            stuck_parks = stuck_receipts(comments, bot_login, STUCK_PARK_MARKER)
+            stuck_park_gen = stuck_parks[-1]["gen"] if stuck_parks else None
             cause, code, detail = verdict(
                 pr_labels=[label.get("name") for label in (row.get("labels") or [])
                            if isinstance(label, dict)],
@@ -558,7 +588,7 @@ def reconcile_repo(client, repo, bot_login, maintainer, apply, max_clears, recon
                 escalated=escalation_recorded(bot_bodies),
                 hold_applied_by_human=applied_by_human,
                 bot_bodies=bot_bodies, receipts=receipts, receipt_count=receipt_count,
-                reconcile_max=reconcile_max)
+                stuck_park_gen=stuck_park_gen, reconcile_max=reconcile_max)
         except Exception as exc:      # noqa: BLE001 — one bad PR never stops the sweep
             census_record(census, repo, number, "read-failed", str(exc)[:160], lane_visible)
             print(f"  {repo}#{number}: READ-FAILED — {str(exc)[:160]}")
@@ -706,6 +736,25 @@ def _self_test():
           ["no-live-park", "no-live-park", "no-live-park", "cleared-head-moved"])
     check("[GENUINE] a PROVEN-HUMAN-applied park is NEVER cleared, even with the cause recovered",
           v(hold_applied_by_human=True)[:2], (None, "human-applied"))
+    # --- (c2) [#941 INTERACTION] the merge-composition hazard ---------------------------------
+    check("[#941] the imported exhaustion predicate is the OWNING module's, so a rename or a "
+          "semantic change there fails here rather than silently re-opening the compose hole",
+          (STUCK_PARK_MARKER is _resolver.STUCK_PARK_MARKER,
+           STUCK_UNPARK_MAX is _resolver.STUCK_UNPARK_MAX,
+           stuck_receipts is _resolver.stuck_receipts,
+           STUCK_UNPARK_MAX, _resolver.stuck_park_label(STUCK_UNPARK_MAX + 1),
+           _resolver.stuck_park_label(STUCK_UNPARK_MAX)),
+          (True, True, True, 2, park_policy.HUMAN_PARK_LABEL,
+           park_policy.MACHINE_PARK_PR_LABEL))
+    check("[#941][GENUINE] a park #941 wrote for EXHAUSTING ITS OWN BUDGET is never released — "
+          "otherwise the two caps compose into an effective cap of four",
+          [v(stuck_park_gen=gen)[1] for gen in (None, 1, 2, 3, 4)],
+          ["cleared-head-moved", "cleared-head-moved", "cleared-head-moved",
+           "budget-exhausted", "budget-exhausted"])
+    check("[#941] the exhaustion refusal outranks a FULLY RECOVERED cause, and is HUMAN-terminal",
+          (v(stuck_park_gen=3, live_mergeable=True)[1],
+           refusal_exit_class("budget-exhausted")),
+          ("budget-exhausted", "human-terminal"))
     check("[GENUINE] a live `review:changes` review decision blocks the release (#781's shape)",
           v(pr_labels=[park_policy.HUMAN_PARK_LABEL, "review:changes"])[:2],
           (None, "human-review-hold"))
@@ -957,6 +1006,27 @@ def _self_test():
     check("[CALL SITE][GENUINE] an UNIDENTIFIABLE applier is not a machine: `not proven human` "
           "alone must not authorise the delete (the positive-machine-proof conjunct)",
           unknown_actor.labels_removed, [])
+    # [#941 INTERACTION] The call-site fixture is built by #941's OWN `stuck_receipt`, so it is the
+    # real wire bytes rather than my restatement of them. Over-cap generation => refused.
+    over_cap = FakeGh({22: fake_row(22)})
+    over_cap.pulls_by_number[22]["comments"].append(
+        {"user": {"login": "bot"},
+         "body": "> 🤖 SPARQ agent\n" + _resolver.stuck_receipt(
+             STUCK_PARK_MARKER, head_a, STUCK_UNPARK_MAX + 1)})
+    rows_cap = []
+    reconcile_repo(over_cap, "o/r", "bot", "jeswr", True, 5, RECONCILE_MAX, rows_cap)
+    check("[CALL SITE][#941] an over-cap grace-window park, in #941's real receipt bytes, is "
+          "refused at the call site — the effective-cap-of-four hazard",
+          (over_cap.labels_removed, [(row["number"], row["code"]) for row in rows_cap]),
+          ([], [(22, "budget-exhausted")]))
+    under_cap = FakeGh({23: fake_row(23)})
+    under_cap.pulls_by_number[23]["comments"].append(
+        {"user": {"login": "bot"},
+         "body": _resolver.stuck_receipt(STUCK_PARK_MARKER, head_a, STUCK_UNPARK_MAX)})
+    reconcile_repo(under_cap, "o/r", "bot", "jeswr", True, 5, RECONCILE_MAX, [])
+    check("[CALL SITE][#941] an UNDER-cap grace-window receipt does not block the release — the "
+          "refusal is the exhaustion, not the mere presence of #941",
+          under_cap.labels_removed, [(23, "needs:user")])
     human_then_bot = FakeGh({21: fake_row(21, timeline=[
         event("labeled", "needs:user", "2026-07-27T10:00:00Z", "jeswr"),
         event("labeled", "needs:user", "2026-07-28T01:00:00Z", "sparq-orchestrator[bot]")])})
