@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "488920c2efe2b3fb",
-   "claim_id": "f1c750024f3a422e9e21b10a021554a6",
-   "holder": "sparq-org/sparq#2660@30320919760.1",
-   "package": "wrapper",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785202826,
-   "expires_at": 1785209126
-  },
-  {
-   "account": "488920c2efe2b3fb",
    "claim_id": "aee1454296e9499d82656121e37105b1",
    "holder": "sparq-org/sparq#2781@30321485902.1",
    "package": "sparq-bench",
