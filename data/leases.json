@@ -41,16 +41,6 @@
    "expires_at": 1785242636
   },
   {
-   "account": "dc2d751954080e13",
-   "claim_id": "87b9b21e8f3d4b70ad8b4ac9145f6d57",
-   "holder": "review:sparq-org/sparq#4788@dispatch-30352496302.1",
-   "package": "sparq-gpu",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785236352,
-   "expires_at": 1785240552
-  },
-  {
    "account": "efb4eb2781de6958",
    "claim_id": "a04d564cb3b84dc1b0beb097fbc1fec2",
    "holder": "jeswr/agent-account-registry#983@30352977351.1",
