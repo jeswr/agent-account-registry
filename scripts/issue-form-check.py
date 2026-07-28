@@ -35,11 +35,17 @@ non-empty `options` for `dropdown` (distinct, non-empty strings) and for `checkb
 each carrying a non-empty `label`). A form whose every element is `markdown` collects nothing and
 is rejected by GitHub, so it is rejected here.
 
-`id` IS OPTIONAL IN GITHUB'S SCHEMA — deliberately not required here. Requiring it would refuse
-forms GitHub accepts, which is a different bug, not a stricter gate. What IS documented is its
-SYNTAX (alphanumerics plus `-` and `_`) and its UNIQUENESS within a form, and both are enforced.
-The markdown-specific exception: a `markdown` element is decoration, not a field, so it carries no
-field id and takes part in neither rule.
+`id` IS OPTIONAL IN GITHUB'S SCHEMA — deliberately not required here (raised again as PR #893
+review r2, and declined again on the same grounds). GitHub's form-schema reference lists `id` as
+OPTIONAL for `input`, `textarea`, `dropdown` and `checkboxes` alike — per element only `type` and
+`attributes` are Required — because an `id` exists to be REFERENCED (template default values), not
+to make a field valid. What the schema does mandate about `id` is its SYNTAX (alphanumerics plus
+`-` and `_`) and its UNIQUENESS within a form, and both of those ARE enforced below. See
+docs.github.com, "Syntax for GitHub's form schema". So requiring an `id` would refuse forms GitHub
+renders fine — a stricter gate is not automatically a sounder one, and refusing valid input is
+itself the bug. The self-test row asserting that a labelled field WITHOUT an id is accepted is what
+holds that line; it is a rule, not an oversight. The markdown-specific exception: a `markdown`
+element is decoration, not a field, so it carries no field id and takes part in neither rule.
 
 USAGE
   python3 scripts/issue-form-check.py <template-directory>
@@ -210,8 +216,13 @@ def _self_test():
         {"type": "dropdown", "id": "c", "attributes": {"label": "C", "options": ["x", "y"]}},
         {"type": "checkboxes", "id": "d",
          "attributes": {"label": "D", "options": [{"label": "yes", "required": True}]}})), [])
-    check("`id` is OPTIONAL — a labelled field without one is accepted (GitHub's schema)",
-          rejects(body({"type": "input", "attributes": {"label": "A"}})), False)
+    # NOT an oversight — the rule itself. GitHub's schema marks `id` Optional on every fillable
+    # type (only `type`+`attributes` are Required), so refusing these would refuse valid forms.
+    for kind in FILLABLE:
+        extra = {"options": ["x"]} if kind == "dropdown" else (
+            {"options": [{"label": "x"}]} if kind == "checkboxes" else {})
+        check(f"`id` is OPTIONAL — a labelled `{kind}` without one is accepted (GitHub's schema)",
+              rejects(body({"type": kind, "attributes": dict(extra, label="A")})), False)
 
     # ---- TOP LEVEL.
     check("a non-mapping document is refused", rejects(["not", "a", "form"]), True)
