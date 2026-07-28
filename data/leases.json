@@ -42,16 +42,6 @@
   },
   {
    "account": "efb4eb2781de6958",
-   "claim_id": "24daa2e2dbe245139fb14b6d9250471a",
-   "holder": "jeswr/agent-account-registry#251@30361007291.1",
-   "package": "dashboard",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785243282,
-   "expires_at": 1785245982
-  },
-  {
-   "account": "efb4eb2781de6958",
    "claim_id": "0fdff46db157471e994494dbcf854f4b",
    "holder": "fix:sparq-org/sparq#4375@dispatch-30362853794.1",
    "package": "site-specs",
