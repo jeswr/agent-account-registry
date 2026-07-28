@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4644,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bed7c40a8a493d1ed4689ce1282c3ff9e3807ec0",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The normal release-producing workflow now invokes the reusable verifier in an unconditional `verify-provenance` job that depends on both `setup` and `release`, passes the resolved release tag, and does not swallow failures. The standalone `release: published` trigger is accurately retained only as an out-of-band safety net. The structural self-test identifies the actual Release-producing job, requires the reusable-workflow caller to depend on it, and rejects conditional, error-swallowing, or tag-less wiring, so it is no longer a vacuous trigger-text assertion. The verification script itself is fail-closed for missing/empty bundles, checksum failures, uncovered assets, empty coverage, and one-sided bundle coverage; its hermetic tests exercise those invariants. Documentation consistently keeps the control at AR until a real release run supplies evidence and does not overclaim Build L3. No actionable correctness, soundness, test-validity, or security issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
