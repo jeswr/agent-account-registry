@@ -302,8 +302,16 @@ _sigpipe_shape_hits() {
 # to tolerate 401s) is out of the class, not an exception carved into the guard. Two directions are
 # deliberate: state starts ON — `shell: bash` runs `-o pipefail`, so a body that never states one
 # way or the other is assumed vulnerable and counted (fail closed) — and the state is tracked PER
-# LINE, so a body that disables pipefail for a few lines still has the rest of it scanned. Blanked
-# lines become `#`, which is exactly what the awk scanner already skips. Each body is additionally
+# COMMAND, so a body that disables pipefail for a few commands still has the rest of it scanned.
+# Command granularity, not line granularity, because a re-enable takes effect for the REST OF ITS
+# OWN LINE: under a per-line machine `set -o pipefail && producer | head -1` blanked the whole line
+# — including a pipeline the shell really did run with pipefail on — and reported no hit, which is
+# fail-OPEN (review r2 of #924). So each line is split on the command separators `;`/`&&`/`||`/`&`
+# (never on `|`: a pipeline is ONE command and the shape scanner needs it intact) and each segment
+# is emitted, or blanked, under the state in force where the shell would reach it. Separators are
+# kept verbatim even around a blanked segment, so a trailing `&&` still continues the logical line,
+# and a line with no segment left standing collapses to a bare `#` — which is exactly what the awk
+# scanner already skips, as it did for every blanked line before. Each body is additionally
 # separated by one more `#` so that a body ending mid-continuation (a heredoc line ending in `|`,
 # say) cannot splice onto the next body and score a shape present in neither — defence in depth,
 # and the only property here the control fixture's count does NOT pin, because a well-formed body
@@ -317,7 +325,9 @@ _sigpipe_shape_hits() {
 # is provably in the body's own outermost execution scope: never inside a heredoc, and never after
 # the body has entered any nested construct (`(`/`{`/`$(…)`/if/while/for/case/function — detected
 # over-eagerly on purpose, since the cost of a missed exemption is a spurious hit someone must look
-# at, and the cost of a missed nesting is a real shape silently dropped). An ENABLE is honoured
+# at, and the cost of a missed nesting is a real shape silently dropped) — and, for the same reason,
+# only as the FIRST command of its line, the one position where the `set` cannot be quoted TEXT that
+# a separator splitter innocent of quoting mistook for a command. An ENABLE is honoured
 # WHEREVER it appears: turning the scanner back on can only ever add hits. The consequence for
 # authors is a rule, not a trap — put `set +o pipefail` at the top of the `run:` body, exactly where
 # fingerprint-accounts.yml already has it, and the region is exempt as before.
@@ -356,6 +366,10 @@ NESTED = re.compile(
     r"(?:if|elif|else|then|fi|while|until|for|do|done|case|esac|select|function)"
     r"(?=\s|;|$)"
 )
+# The separators between the COMMANDS of one line. `|` is deliberately absent: a pipeline is a
+# single command and is the very shape the scanner downstream has to see whole. The capture group
+# makes re.split keep the separators, so rejoining the segments reproduces the line byte for byte.
+SEPARATOR = re.compile(r"(&&|\|\||;|&)")
 
 
 def pipefail_delta(line):
@@ -405,12 +419,21 @@ for path in sys.argv[1:]:
                     pending.pop(0)
             else:
                 pending.extend(heredoc_delimiters(line))
-            delta = pipefail_delta(line)
-            out.append(line if pipefail else "#")
-            if delta is True:
-                pipefail = True                                  # re-enable: honoured anywhere
-            elif delta is False and outer and not in_heredoc:
-                pipefail = False                                 # disable: only when provable
+            segments = SEPARATOR.split(line)
+            emitted = []
+            standing = False   # some command of this line survived the blanking
+            for index, segment in enumerate(segments):
+                if index % 2:                                    # a separator, kept either way so
+                    emitted.append(segment)                      # a trailing `&&` still continues
+                    continue
+                emitted.append(segment if pipefail else "")
+                standing = standing or pipefail
+                delta = pipefail_delta(segment)
+                if delta is True:
+                    pipefail = True                              # re-enable: honoured anywhere
+                elif delta is False and index == 0 and outer and not in_heredoc:
+                    pipefail = False                             # disable: only when provable
+            out.append("".join(emitted) if standing else "#")
             if in_heredoc or NESTED.search(line):
                 outer = False
 print("\n".join(out))
@@ -4616,15 +4639,20 @@ PY
   # which is where enrolment decides what gets a credential. Extraction is PyYAML, so the count below
   # is over SHELL, not over YAML that happens to look like shell. The control comes first and its
   # number pins the whole chain at once — mutation-checked, each of these lands somewhere other than
-  # 9: losing the `run:` walk gives 0, dropping the pipefail state machine 11, making the exemption a
-  # whole-body skip 3, defaulting pipefail to OFF (the fail-OPEN direction) 8, and honouring a
+  # 12: losing the `run:` walk gives 0, dropping the pipefail state machine 16, making the exemption
+  # a whole-body skip 3, defaulting pipefail to OFF (the fail-OPEN direction) 11, and honouring a
   # `set +o pipefail` in ANY scope — the flat state machine review r1 of #924 found bypassable, where
   # a disable buried in a heredoc / an uncalled function / a `false` branch / a subshell blanks the
-  # rest of the body — gives 4, one lost hit per bypass construct. Each HALF of the scope rule is
-  # pinned on its own too: keeping the nesting latch but dropping the heredoc check gives 7, the
-  # reverse gives 6, and narrowing the heredoc delimiter regex to quoted words only gives 8. Those
+  # rest of the body — gives 6, one lost hit per bypass construct. Each HALF of the scope rule is
+  # pinned on its own too: keeping the nesting latch but dropping the heredoc check gives 10, the
+  # reverse gives 9, and narrowing the heredoc delimiter regex to quoted words only gives 11. Those
   # five bypass steps are the only rows that separate a scope-aware exemption from a scanner that
   # any nested `set` line can switch off, which is why they are carried as data rather than trusted.
+  # The last three steps pin the COMMAND-granularity state machine, which is what stops a re-enable
+  # from hiding the very pipeline it re-enables for: tracking the state per LINE instead — the r2
+  # reading, where `set -o pipefail && producer | head -1` blanks its own line — gives 10, and
+  # honouring a disable at any command of its line rather than only the first, which lets a `set +o
+  # pipefail` QUOTED inside a string blank the rest of the body, gives 11. Both are fail-OPEN.
   # Each row captures the extractor's own failure into a SENTINEL rather than letting `set -e` abort
   # here: an absent PyYAML (the unprivileged model container has no pip — #824) must turn these two
   # rows red, not silently take every later row of the suite down with it. Red is the fail-closed
@@ -4633,7 +4661,7 @@ PY
   if _workflow_run_shell "$SCRIPT_DIR/fixtures/sigpipe-workflow-889.yml" > "$tmp/wf-control.txt" 2>/dev/null
   then wf_control=$(_sigpipe_shape_hits "$tmp/wf-control.txt"); else wf_control=extractor-unavailable; fi
   chk "the workflow \`run:\` extractor finds the shapes in pipefail-ON shell and exempts only the rest (control)" \
-    "$wf_control" "9"
+    "$wf_control" "12"
   # ...and an unparseable workflow REFUSES rather than contributing a comfortable zero: a file the
   # scanner cannot read is unverified, which is exactly the state this guard exists to reject.
   # An unterminated flow mapping — invalid at EOF under any conforming YAML parser, so this row

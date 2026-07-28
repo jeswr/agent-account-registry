@@ -3,10 +3,11 @@
 # it AND the "zero hits across .github/workflows/*.yml" assertion needs no exemption for its own
 # evidence — the same rule sigpipe-shapes-879.txt / sigpipe-repro-879.bash follow for scripts/*.sh.
 #
-# It carries NINE countable `producer | early-exiting consumer` shapes in pipefail-ON shell — four
-# in plainly-scoped bodies and five behind a `set +o pipefail` that does not actually apply to them
-# — and TWO that must NOT be counted because pipefail really is off where they sit. worker-live.sh
-# asserts the exact total, which pins BOTH directions at once: an extractor that returned nothing
+# It carries TWELVE countable `producer | early-exiting consumer` shapes in pipefail-ON shell — four
+# in plainly-scoped bodies, five behind a `set +o pipefail` that does not actually apply to them,
+# two re-enabled on the SAME line as the shape, and one behind a `set +o pipefail` that is merely
+# quoted TEXT — and FOUR that must NOT be counted because pipefail really is off where they sit.
+# worker-live.sh asserts the exact total, which pins BOTH directions at once: one that returned none
 # (or that lost the `run:` walk entirely) undercounts, and one that dropped the pipefail state
 # machine overcounts.
 name: sigpipe shape control (not a real workflow)
@@ -99,4 +100,34 @@ jobs:
           (
             set +o pipefail
           )
+          counted=$(printf 'a\nb\n' | head -1)
+
+      # --- SAME-LINE RE-ENABLE CONTROLS (review r2 of #924). `set -o pipefail` takes effect for the
+      # REST OF ITS OWN LINE, so the pipeline after the separator runs WITH pipefail and is in the
+      # 141 class. A per-LINE state machine blanked the whole line under the pre-re-enable state and
+      # scored 0 for both steps below — fail-OPEN, and invisible to the step above because that one
+      # puts its vulnerable pipeline on the NEXT line. Each step below must be counted (2 total):
+      # the `tolerated=` line is genuinely exempt, the same-line one is not. Both normal separators
+      # are covered, since a splitter could plausibly know one and not the other. ---
+      - name: re-enabled by `&&` on the same line as the vulnerable pipeline
+        run: |
+          set +o pipefail
+          tolerated=$(printf 'a\nb\n' | head -1)
+          set -o pipefail && counted=$(printf 'a\nb\n' | head -1)
+
+      - name: re-enabled by `;` on the same line as the vulnerable pipeline
+        run: |
+          set +o pipefail
+          tolerated=$(printf 'a\nb\n' | head -1)
+          set -o pipefail; counted=$(printf 'a\nb\n' | head -1)
+
+      # ...and splitting a line into commands must not hand the DISABLE direction a new bypass: the
+      # splitter knows nothing of quoting, so a `set +o pipefail` sitting inside a string is TEXT,
+      # and honouring it would blank the rest of the body — the same fail-OPEN the scope rules above
+      # exist to stop. Anchoring a disable to the FIRST command of its line is what keeps that out,
+      # and the pipeline below must be counted (1).
+      - name: quoted disable mid-line is text, not a state change
+        run: |
+          set -euo pipefail
+          echo 'a; set +o pipefail b'
           counted=$(printf 'a\nb\n' | head -1)
