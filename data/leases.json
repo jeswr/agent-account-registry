@@ -72,16 +72,6 @@
   },
   {
    "account": "51bde6688e140866",
-   "claim_id": "661dab794fbf447eaa57411101819eb1",
-   "holder": "fix:sparq-org/sparq#4876@dispatch-30394792104.1",
-   "package": "sparq-lws-core",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785269458,
-   "expires_at": 1785275758
-  },
-  {
-   "account": "51bde6688e140866",
    "claim_id": "914eeb3ef6bf4b3e981eb5fb7ef4690d",
    "holder": "jeswr/agent-account-registry#957@30395250728.1",
    "package": "dashboard",
