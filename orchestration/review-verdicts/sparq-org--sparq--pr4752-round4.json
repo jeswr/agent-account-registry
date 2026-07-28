@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4752,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "111f25ace7b34dd296425d3317f1c32ce895dec1",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains clean. The generation-keyed stateful authorization cache binds both the materialized PodStore and requested authorization model to the pinned server generation, rejects stale-cache installation after concurrent builds, and rebuilds after every published write generation. Source parsing remains fail-closed for malformed, unknown, or ambiguous selectors. Unsupported trust composition is rejected, and ODRL presence is conservatively detected before cache reuse so policy-bearing server stores cannot bypass enforcement. The focused tests are non-vacuous: they exercise the real HTTP/server-store path, warm the cache, commit an ACL update through the SPARQL writer, observe the new authorization decision, verify access-controlled querying and WAC advertisement, and cover ODRL and trust refusals. No new correctness, soundness, security, or test-validity issue is evident. Because round 3 also had no findings, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
