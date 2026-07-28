@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4814,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ea7da9797996b6b64e0a06e82a25f74e9ef0e961",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major finding is resolved. The workflow now extracts the complete published feature list directly from js/package.json's build:wasm script and uses it for both wasm32 cargo build and clippy, so the actual shipped feature combination is checked on Rust-only pull requests. The extractor fails closed if the expected feature argument is absent, and the current script format yields the intended comma-separated feature set. The nightly comment is consistent with that source. No correctness, security, or test-validity issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
