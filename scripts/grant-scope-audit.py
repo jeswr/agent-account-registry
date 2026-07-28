@@ -38,9 +38,14 @@
 #      is therefore never inferred: it must be ASSERTED by a durable expected-record manifest
 #      (`--expected-records`, {target: {window, records: [PR numbers]}}) that the maintainer
 #      derives from the authoritative enumeration of that target's worker PRs in an observation
-#      window, and VERIFIED here — every expected record must actually be present. Without a
-#      verified manifest a row is `partial-evidence`: observed handles are reported (positive
-#      evidence of USE is sound on any corpus) and the candidate list stays EMPTY.
+#      window, and VERIFIED here — every expected record must actually be present. Verification is
+#      by FILENAME, so a filename must be worth trusting: each record's name is parsed exactly and
+#      must agree with the `pr_number` INSIDE it, or the audit refuses. Otherwise a record parked
+#      under another PR's name would witness a record that is really missing, and an incomplete
+#      corpus would be declared complete — the false revocation this whole module exists to
+#      prevent. Without a verified manifest a row is `partial-evidence`: observed handles are
+#      reported (positive evidence of USE is sound on any corpus) and the candidate list stays
+#      EMPTY.
 #   3. Without a salt the fingerprints cannot be mapped back to handles, so NO target ever yields
 #      a candidate — the pool is "unknown", not "unused". Mapping is opt-in (`--salt-env`).
 #   4. A fingerprint that no granted handle explains (a RETIRED account like acct03/acct06, or an
@@ -68,6 +73,7 @@ _FINGERPRINT_ALPHABET = frozenset("0123456789abcdef")
 # One record per worker PR; worker-pr.provenance_path builds exactly this name.
 RECORD_SUFFIX = ".json"
 RECORD_INFIX = "--pr"
+_DIGITS = frozenset("0123456789")
 DEFAULT_POLICY = "policy/repos.toml"
 DEFAULT_PROVENANCE_DIR = "orchestration/provenance"
 # The env var holding the salt, when the operator opts in to mapping. Never read unless asked for,
@@ -162,10 +168,43 @@ def record_target(filename, targets):
     return matched[0] if matched else None
 
 
-def record_fingerprint(text, filename):
-    """`impl_account_h` from one record's TEXT. Any unreadable record refuses the whole audit: a
-    record we cannot parse is a PR whose account we do not know, and skipping it would quietly
-    shrink the evidence for exactly the rows the audit is about to propose narrowing."""
+def record_number(filename, target):
+    """The PR number named by a record filename attributed to `target`.
+
+    EXACT, never a loose prefix read: the name must be precisely what worker-pr.provenance_path
+    builds for some positive PR number (`<owner>--<name>--pr<N>.json`, no zero padding), because
+    this number is what binds a record's NAME to its CONTENT in `record_fingerprint` below.
+
+    A file this module has attributed to a target but cannot number REFUSES the whole audit rather
+    than being demoted to `foreign` and ignored: dropping it would remove positive evidence of USE
+    from that row, and a handle whose only record was dropped becomes a revocation candidate —
+    absence manufactured by a parse we gave up on, in the one direction that must never fail
+    open."""
+    prefix = record_prefix(target)
+    number = (filename[len(prefix):-len(RECORD_SUFFIX)]
+              if filename.startswith(prefix) and filename.endswith(RECORD_SUFFIX) else "")
+    if not number or set(number) - _DIGITS or number.startswith("0"):
+        raise AuditError(
+            f"provenance record {filename!r} is attributed to target {target!r} but is not named "
+            f"{prefix}<PR number>{RECORD_SUFFIX} — refusing to audit a corpus holding a record "
+            "whose name this module cannot read exactly (fail closed)")
+    return int(number)
+
+
+def record_fingerprint(text, filename, number):
+    """`impl_account_h` from one record's TEXT, bound to the PR its FILENAME names. Any unreadable
+    record refuses the whole audit: a record we cannot parse is a PR whose account we do not know,
+    and skipping it would quietly shrink the evidence for exactly the rows the audit is about to
+    propose narrowing.
+
+    The document's own `pr_number` must EQUAL `number`, the PR the filename claims. Completeness
+    downstream is verified against the set of observed FILENAMES, so a filename witnesses that a
+    PR's record is present only if the document under it really is that PR's record: a record
+    copied or renamed onto another PR's name would otherwise satisfy the manifest entry for a
+    record that is genuinely ABSENT, marking an incomplete corpus `scoped` and turning the missing
+    evidence into revocation candidates. One writer produces both halves (provenance_record puts
+    `pr_number` in the document and the same number in provenance_path), so a disagreement is
+    corruption, not a variant shape — it refuses."""
     try:
         document = json.loads(text)
     except (ValueError, TypeError) as exc:
@@ -178,6 +217,16 @@ def record_fingerprint(text, filename):
             f"provenance record {filename!r} carries impl_account_h={value!r}, which is not a "
             f"{FINGERPRINT_LENGTH}-hex account fingerprint — refusing to audit a corpus with an "
             "unreadable record (fail closed)")
+    recorded = document.get("pr_number")
+    if isinstance(recorded, bool) or not isinstance(recorded, int) or recorded <= 0:
+        raise AuditError(
+            f"provenance record {filename!r} carries pr_number={recorded!r}, which is not a "
+            "positive PR number — refusing a record whose filename cannot be bound to its content")
+    if recorded != number:
+        raise AuditError(
+            f"provenance record {filename!r} is the record of PR #{recorded}: its name and its "
+            f"content name different PRs, so this file cannot witness that PR #{number}'s record "
+            "is present — refusing (fail closed)")
     return value
 
 
@@ -242,7 +291,10 @@ def collect_evidence(corpus, targets):
 
     The filenames are what a completeness manifest is verified against, so they are collected on
     the same pass that reads the evidence — the audit must never check completeness against a
-    different view of the corpus than the one it draws its conclusions from.
+    different view of the corpus than the one it draws its conclusions from. A filename reaches
+    `observed` only out of a corpus in which EVERY record's name and content name the same PR —
+    one disagreement refuses this whole pass, so no report is ever built on a name that does not
+    hold the record it claims.
 
     `corpus` is an iterable of (filename, text) so the reader stays pure and the caller owns I/O."""
     evidence = {target: collections.Counter() for target in targets}
@@ -253,7 +305,8 @@ def collect_evidence(corpus, targets):
         if target is None:
             foreign += 1
             continue
-        evidence[target][record_fingerprint(text, filename)] += 1
+        number = record_number(filename, target)
+        evidence[target][record_fingerprint(text, filename, number)] += 1
         observed[target].add(filename)
     return evidence, observed, foreign
 
@@ -428,10 +481,14 @@ def _policy(rows):
     return text
 
 
-def _record(handle):
-    return json.dumps({"pr_number": 1, "head_sha_at_open": "a" * 40, "impl_provider": "anthropic",
-                       "impl_alias": "opus5", "impl_account_h": _H[handle], "issue": 1,
-                       "recorded_at_run": "1.1"})
+def _record(handle, number):
+    """One provenance record, shaped like worker-pr.provenance_record's document. `number` is
+    REQUIRED and has no default: every fixture must state which PR it is the record of, so a
+    fixture whose filename and content disagree cannot be written by accident — that mismatch is
+    the fail-open this module now refuses, and it must only ever appear where a check means it."""
+    return json.dumps({"pr_number": number, "head_sha_at_open": "a" * 40,
+                       "impl_provider": "anthropic", "impl_alias": "opus5",
+                       "impl_account_h": _H[handle], "issue": 1, "recorded_at_run": "1.1"})
 
 
 def _manifest(rows, window="2026-07-01..2026-07-28"):
@@ -540,26 +597,71 @@ def _self_test():
     refuses("a target that is not <owner>/<repo> has no record prefix and refuses",
             lambda: record_prefix("not-a-target"))
     check("a well-formed record yields its fingerprint",
-          record_fingerprint(_record("acct01"), "o--a--pr1.json"), _H["acct01"])
+          record_fingerprint(_record("acct01", 1), "o--a--pr1.json", 1), _H["acct01"])
     refuses("a record with a non-fingerprint impl_account_h refuses the audit",
-            lambda: record_fingerprint('{"impl_account_h": "zz"}', "o--a--pr1.json"))
+            lambda: record_fingerprint('{"impl_account_h": "zz"}', "o--a--pr1.json", 1))
     refuses("a record with NO impl_account_h refuses the audit",
-            lambda: record_fingerprint('{"pr_number": 1}', "o--a--pr1.json"))
+            lambda: record_fingerprint('{"pr_number": 1}', "o--a--pr1.json", 1))
     refuses("an unparseable record refuses the audit (never skipped)",
-            lambda: record_fingerprint("{not json", "o--a--pr1.json"))
+            lambda: record_fingerprint("{not json", "o--a--pr1.json", 1))
     refuses("a record that parses but is not a JSON object refuses the audit",
-            lambda: record_fingerprint("[]", "o--a--pr1.json"))
+            lambda: record_fingerprint("[]", "o--a--pr1.json", 1))
+
+    # -- FILENAME <-> CONTENT. Completeness is verified against filenames, so a filename that does
+    # not hold the record it names would witness a record that is absent. The number is read
+    # EXACTLY from the name, and the document must agree with it.
+    check("a canonical record filename yields the PR number it names",
+          record_number("o--a--pr7.json", "o/a"), 7)
+    check("...for a repository name containing `--` too",
+          record_number("o--a--b--pr7.json", "o/a--b"), 7)
+    refuses("a record name whose PR number is not digits refuses (never silently ignored)",
+            lambda: record_number("o--a--prX.json", "o/a"))
+    refuses("...nor is a zero-padded number, which is not the name the writer builds",
+            lambda: record_number("o--a--pr07.json", "o/a"))
+    refuses("...nor a name carrying no number at all", lambda: record_number("o--a--pr.json", "o/a"))
+    refuses("a name that is not this target's record at all refuses",
+            lambda: record_number("x--y--pr7.json", "o/a"))
+    refuses("a record whose document names a DIFFERENT PR than its filename refuses",
+            lambda: record_fingerprint(_record("acct01", 1), "o--a--pr2.json", 2))
+    refuses("a record with NO pr_number refuses (its name would witness nothing)",
+            lambda: record_fingerprint(json.dumps({"impl_account_h": _H["acct01"]}),
+                                       "o--a--pr1.json", 1))
+    # Each shape below would COMPARE EQUAL to the filename's number (`True == 1`, `1.0 == 1`), so
+    # the equality check alone accepts them: only the shape guard refuses, and these are what make
+    # it independently killable rather than a second copy of the check above.
+    refuses("a record whose pr_number is a string refuses",
+            lambda: record_fingerprint(json.dumps({"impl_account_h": _H["acct01"],
+                                                   "pr_number": "1"}), "o--a--pr1.json", 1))
+    refuses("a record whose pr_number is a bool refuses (JSON true equals 1 in Python)",
+            lambda: record_fingerprint(json.dumps({"impl_account_h": _H["acct01"],
+                                                   "pr_number": True}), "o--a--pr1.json", 1))
+    refuses("a record whose pr_number is a float refuses (1.0 equals 1 too)",
+            lambda: record_fingerprint(json.dumps({"impl_account_h": _H["acct01"],
+                                                   "pr_number": 1.0}), "o--a--pr1.json", 1))
+    refuses("a record whose pr_number is not positive refuses even when the caller agrees with it",
+            lambda: record_fingerprint(json.dumps({"impl_account_h": _H["acct01"],
+                                                   "pr_number": -5}), "o--a--pr5.json", -5))
     refuses("a sibling that cannot be loaded refuses rather than auditing without it",
             lambda: _load_sibling("no-such-sibling.txt", "registry_no_such_sibling"))
 
     # -- THE CORE #608 QUESTION: usage is attributed PER TARGET, and does not leak across rows.
-    corpus = [("o--a--pr1.json", _record("acct01")), ("o--a--pr2.json", _record("acct02")),
-              ("o--b--pr3.json", _record("acct03")), ("x--y--pr4.json", _record("acct01"))]
+    # Every fixture below names, in its filename AND in its document, the SAME PR — the corpus a
+    # correct writer produces. It is the positive control for the binding checks that follow.
+    corpus = [("o--a--pr1.json", _record("acct01", 1)), ("o--a--pr2.json", _record("acct02", 2)),
+              ("o--b--pr3.json", _record("acct03", 3)), ("x--y--pr4.json", _record("acct01", 4))]
     evidence, observed, foreign = collect_evidence(corpus, ["o/a", "o/b"])
     check("records belonging to no audited target are counted, not attributed", foreign, 1)
     check("each audited target's own record filenames are collected for the completeness check",
           (sorted(observed["o/a"]), sorted(observed["o/b"])),
           (["o--a--pr1.json", "o--a--pr2.json"], ["o--b--pr3.json"]))
+    # The binding AT THE SEAM THAT USES IT. `o--a--pr2.json` holding PR 1's record would otherwise
+    # be observed as PR 2's record and satisfy the manifest entry for a record that is genuinely
+    # missing — declaring an incomplete corpus complete and turning the absence into candidates.
+    refuses("a corpus record whose document names another PR refuses the whole audit",
+            lambda: collect_evidence([("o--a--pr1.json", _record("acct01", 1)),
+                                      ("o--a--pr2.json", _record("acct02", 1))], ["o/a", "o/b"]))
+    refuses("...and a corpus record with an unreadable PR number is refused, never made foreign",
+            lambda: collect_evidence([("o--a--pr0x2.json", _record("acct01", 2))], ["o/a", "o/b"]))
     # The manifest states the corpus is EXACTLY these PRs for these windows, so — and only so —
     # absence becomes disuse. Every candidate-producing check below runs under this claim.
     complete = expected_records(_manifest({"o/a": [1, 2], "o/b": [3]}), ["o/a", "o/b"])
@@ -722,6 +824,23 @@ def _self_test():
         after = {path.name: path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()}
         check("the audit is READ-ONLY (policy + corpus byte-identical after a full run)",
               after, before)
+
+        # END TO END through read_corpus: PR 5's record parked under PR 6's name. The manifest does
+        # not even expect pr6 — an EXTRA record is allowed — but a file whose name does not hold
+        # the record it claims makes every filename in this corpus untrustworthy as a completeness
+        # witness, so the whole run refuses rather than reporting from it.
+        misnamed = prov / "o--a--pr6.json"
+        misnamed.write_text(_record("acct01", 5), encoding="utf-8")
+        refuses("end to end, a corpus file whose name and content name different PRs refuses",
+                lambda: run(str(policy_path), str(prov), salt=SALT,
+                            expected_path=str(manifest_path)))
+        misnamed.unlink()
+        check("...and the SAME run without that one file scopes normally (the refusal is not "
+              "vacuous)",
+              run(str(policy_path), str(prov), salt=SALT,
+                  expected_path=str(manifest_path))["targets"]["o/a"]["revocation_candidates"],
+              ["acct03"])
+
         refuses("a missing provenance directory refuses",
                 lambda: run(str(policy_path), str(root / "nope"), salt=SALT))
         refuses("an unreadable policy refuses (rather than a traceback)",

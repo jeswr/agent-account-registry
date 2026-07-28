@@ -76,6 +76,11 @@ The dangerous failure mode is proposing a revocation that is really just missing
   observation `window` and the PR numbers that corpus must contain, derived from the `ledger`
   branch / PR list) and **verified** here: if any expected record is absent, the row stays
   `partial-evidence`. This is what keeps caveat 3 above from becoming a false revocation.
+- Verification is **by filename**, so each filename must be worth trusting: a record's name is
+  parsed exactly (`<owner>--<name>--pr<N>.json`) and must agree with the `pr_number` **inside** the
+  document, or the audit refuses. Otherwise a record parked under another PR's name would witness a
+  record that is really missing, and an incomplete corpus would verify as complete — the false
+  revocation this whole tool exists to prevent, re-entering through the completeness check itself.
 - **Mapping is opt-in** (`--salt-env`). Unmapped, *no* target ever yields a candidate, because
   every granted handle is unknown rather than unused. This is the default, so the tool is
   advisory-safe to run anywhere.
