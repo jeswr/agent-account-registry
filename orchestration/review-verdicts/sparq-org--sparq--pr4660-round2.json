@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4660,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d56f1620a345dca8e092874e562c3e60ab9d3189",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The diff adds Store.validateStore and store_validateStore only to sparq_wasm.d.ts. No corresponding generated JS glue, wasm artifact/source change, or focused runtime test appears in the diff, and the checkout contains no non-declaration validateStore implementation. TypeScript consumers can therefore compile calls to store.validateStore(...), but the shipped Store object will not implement that method. The unrelated API addition also makes this picker-focused PR incomplete as published.",
+    "file": "packages/sparq-client/src/generated/sparq_wasm.d.ts",
+    "fix_hint": "Remove the validateStore-related generated declaration changes from this PR. If the API is intentional, regenerate and commit the complete wasm-bindgen output from the matching Rust implementation and add a focused runtime test that instantiates Store and calls validateStore; ship that as a separately scoped public-API change with the required surface documentation.",
+    "severity": "major",
+    "title": "Generated declaration exposes a runtime method that this PR does not provide"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The file-picker change remains coherent and its focused tests still cover the raw-File, cancellation, fallback, option-forwarding, and partial-failure contracts approved in round 1. However, round 2 introduces an unrelated generated declaration for Store.validateStore without the corresponding generated JavaScript/wasm implementation anywhere in this change. That makes the published TypeScript surface claim a callable method that will be absent at runtime. This is a new major finding, so progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
