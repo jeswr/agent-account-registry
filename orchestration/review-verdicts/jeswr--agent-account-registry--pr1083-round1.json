@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1083,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e8fbf35fe6d4979905782eb382aab85b20a93964",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly makes the cross-repository keepalive body extractable and extends the existing hermetic harness to execute that exact workflow script. The new assertions are outcome-based and non-vacuous: they independently pin the watched workflow set, stale dispatch behavior, both live statuses, unreadable-live-check behavior, fresh-run behavior, and the complete repository/workflow/ref dispatch argv by equality. The shared spec parser refuses missing, empty, or malformed lists, and the generalized runner preserves the existing registry-leg coverage while recording complete dispatch calls. I found no correctness, soundness, security, or test-validity defect in the diff.",
+  "verdict": "approve"
+ }
+}
