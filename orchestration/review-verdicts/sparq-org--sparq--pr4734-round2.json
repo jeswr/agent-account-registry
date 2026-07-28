@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4734,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f9ea1a3cc07d44ef2662d379f905c9b85d0cfb0b",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Both graph implementations call prof_round!(added.len()) on insert and prof_round!(removed.len()) on delete. But Progress::derived_count is documented as facts newly committed to the closure, and total_derived as their running total. An insert can commit multiple visible consequences while ticking only one asserted triple; a delete commits nothing and instead removes facts, yet increments total_derived positively. The end-to-end test performs an insert followed by its deletion but checks only that two ticks occurred, so it does not expose that the report ends with total_derived == 2 despite the net mutation being undone.",
+    "file": "crates/sparq-reason/src/incremental.rs",
+    "fix_hint": "Define explicit, consistent incremental semantics distinct from batch net-new accounting. Either report actual visible closure additions/removals with a signed or operation-aware progress shape, or document and name these values as processed base mutations rather than derived/committed facts. Update Report::total_derived and Progress docs accordingly, and strengthen the insert/delete test to assert each tick's counts and the final report total for a case where one asserted triple creates multiple consequences and is then deleted.",
+    "severity": "major",
+    "title": "Incremental ticks count input mutations as newly derived closure facts"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The two round-1 findings are addressed: OWL equality expansion is reconciled to the returned net-new count with a real sameAs fixture, and direct incremental rebuilds are now accurately documented and tested as emitting no rounds. However, the newly added incremental progress ticks do not satisfy the public Progress semantics: inserts report asserted-input cardinality rather than closure facts committed, while deletes report removals as positive newly committed/derived facts. A profiler spanning insert and delete therefore accumulates a positive total even when the mutation is undone. This makes the shared Report/Progress accounting misleading on a public path. Because this is a new major finding relative to the recorded round-1 findings, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
