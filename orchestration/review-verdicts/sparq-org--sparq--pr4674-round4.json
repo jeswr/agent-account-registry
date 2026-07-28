@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4674,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bff9615d8ee75b9e505c515d90bb3c1c6e1eb3bf",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`char_sets_complete_for` sorts each key but does not reject or deduplicate repeated predicates within a `CharSet`. Thus `{p}` and `{p,p}` compare as distinct keys although they denote the same exact predicate set, and `char_set_has` counts each entry once. Supplying `{p}` plus `{p,p}`, and `{q}` plus `{q,q}`, with balanced `distinct_subjects` totals and no served `{p,q}` cohort can make both completeness checks pass. Rule C2 may then report the same-source pairing dead and prune a combination that can actually contribute. The new negative test exercises duplicate identical keys only, so it does not catch this case.",
+    "file": "crates/sparq-fedplan-mpc/src/combination.rs",
+    "fix_hint": "Canonicalize every characteristic-set key as a mathematical set before the repeated-key check, or fail closed when any key contains a duplicate predicate. Add the prior-round non-vacuous negative test using `{p}`, `{p,p}`, `{q}`, and `{q,q}` with balanced totals and no served co-occurrence key; assert that no dead pairing or prune is emitted.",
+    "severity": "major",
+    "title": "Duplicate predicates within a characteristic-set key still bypass the partition guard"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-three major recall-safety finding remains. The new repeated-key guard rejects two characteristic-set entries only when their sorted predicate vectors are exactly equal, but it neither rejects nor canonicalizes duplicate predicates within one key. Consequently `{p}` and `{p,p}` remain distinct keys even though characteristic sets represent mathematical predicate sets. Balanced malformed singleton/multiset entries can still satisfy both per-predicate accounting equalities while omitting the real co-occurrence cohort, causing Rule C2 to emit a dead pairing and potentially suppress a live combination. The added `duplicate_char_sets_decline_the_prune` test covers repeated identical entries, not this prior-round counterexample. Progress is therefore stagnant.",
+  "verdict": "request_changes"
+ }
+}
