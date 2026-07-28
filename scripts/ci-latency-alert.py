@@ -1105,6 +1105,49 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
         chk("a failed attempt lookup lands in the unresolved census state",
             find_queue_overruns(degraded, NOW)[1]
             .get("queued-rerun-attempt-unresolved") == 1)
+
+        # AND THE CALL SITE OF THE CALL SITE. Every assertion above invokes
+        # `resolve_attempt_created` DIRECTLY, so deleting the ONE line in
+        # `fetch_live_runs` that invokes it in production SURVIVED all of them
+        # (MEASURED — this exact mutant survived the battery before this block existed).
+        # A helper that is only ever called by its own tests is not wired to anything.
+        def _live_api(repo, path):
+            if "status=queued" in path:
+                return {"workflow_runs": [
+                    _run_obj(status="queued", age_min=1, attempt=2,
+                             created_age_min=99, now=NOW)]}
+            if "status=in_progress" in path:
+                return {"workflow_runs": []}
+            if "/attempts/2" in path:
+                return {"created_at": "2026-07-28T11:59:00Z"}
+            raise AssertionError(f"unexpected request {path}")
+
+        globals()["_api"] = _live_api
+        wired = fetch_live_runs("o/r")
+        chk("fetch_live_runs ENRICHES what it returns (the production call site)",
+            len(wired) == 1
+            and wired[0].get(ATTEMPT_CREATED_KEY) == "2026-07-28T11:59:00Z")
+        chk("the enrichment reaches M2 through the real fetch path",
+            not find_queue_overruns(wired, NOW)[0])
+    finally:
+        globals()["_api"] = _real_api
+
+    # `fetch_lanes` must carry the birth date the NEW-LANE WINDOW reads, or that guard
+    # can never fire in production. Deleting it SURVIVED the battery before this check.
+    _real_api = globals()["_api"]
+    try:
+        def _lanes_api(repo, path):
+            if path.startswith("actions/workflows?"):
+                return {"workflows": [{"path": GROOM_WORKFLOW, "state": "active",
+                                       "created_at": "2026-07-01T00:00:00Z"}]}
+            return {"workflow_runs": []}
+
+        globals()["_api"] = _lanes_api
+        root = Path(__file__).resolve().parents[1]
+        fetched = {lane["workflow"]: lane
+                   for lane in fetch_lanes("o/r", root, CRON_WINDOW_HOURS, NOW)}
+        chk("fetch_lanes carries each lane's created_at off the workflow listing",
+            fetched.get(GROOM_WORKFLOW, {}).get("created_at") == "2026-07-01T00:00:00Z")
     finally:
         globals()["_api"] = _real_api
 
