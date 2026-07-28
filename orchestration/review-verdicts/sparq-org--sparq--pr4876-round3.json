@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4876,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1545442e810a0009a1ea1283c2230a622f1a0da0",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 3 says there are 16 M2-next marker sites, 10 were corrected, and 6 remain untouched. At the PR head, a literal search under crates/sparq-lws-core/src finds 8 sites: store/reconcile.rs (1), store/blob.rs (1), notifications/ws.rs (3), notifications/mod.rs (1), lib.rs (1), and ldp/content.rs (1). The diff removes four literal marker sites (ldp/mod.rs, ldp/handler.rs, and store/mod.rs twice) and retains the four notification markers while revising their wording, so the claimed 16/10/6 accounting cannot describe either the before or after state. The same section calls the notification corrections five sites in prose but notifications/* \u00d73 in its table. This is load-bearing evidence for the claimed exhaustive sweep, not a cosmetic count.",
+    "file": "research/lws-branch-port-triage.md",
+    "fix_hint": "Re-run the inventory against both the base and PR head, define whether a site means a literal marker occurrence or a conceptual deferred item, and update all totals and the table consistently. If non-literal stale references are included, list them separately rather than counting them as M2-next marker sites. Ensure the remaining-site list accounts for every literal occurrence at the PR head.",
+    "severity": "major",
+    "title": "M2-next sweep counts do not match the PR head"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The prior round's security-boundary defect is fixed: ldp/mod.rs now accurately distinguishes mutation authorization-before-probe from GET/HEAD's principal-independent read_plan probe followed by consume-only-after-Allow. However, the new triage record's load-bearing M2-next inventory is arithmetically and factually inconsistent with the changed tree. It claims 16 marker sites, 10 corrections, and 6 untouched sites, while the PR head contains 8 literal M2-next sites; the diff removes four literal sites and rewrites four notification sites without removing their markers. The record also alternately describes the notification set as five sites and as three. Because the document's stated purpose is an exhaustive, verified marker sweep, this undermines completeness and needs correction. This is a new major finding, so progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
