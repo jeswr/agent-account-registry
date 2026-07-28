@@ -15,6 +15,7 @@ gh_retry.py
 grant-account.py
 groom-alert.py
 groom.py
+issue-form-check.py
 lease_schema.py
 ledger-invariant.py
 ledger_retry.py
