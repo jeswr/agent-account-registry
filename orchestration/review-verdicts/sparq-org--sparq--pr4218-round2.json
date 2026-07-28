@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4218,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c104add4d1fa15039504aceecf6b164d43a28ff6",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "reified_provenance mints the anchor from (subject, predicate, object, rule) but attribution_triples also attaches bridgedFromPolicy. Rule identifiers are not guaranteed globally unique: anonymous rules are represented by blank-node-label strings and programmatic ids are explicitly supported. If two policies with different IRIs emit the same grant and reuse the same rule id/blank-node label, both materializations mint the same anchor; deduplication then leaves that anchor linked to both policies. Audit queries can no longer determine which rule-policy pair produced the grant, contradicting the originating-policy and separate-attribution claims. The existing two_rules_stay_separately_attributable test uses different triples and different rule IRIs, so it does not exercise this collision.",
+    "file": "crates/sparq-solid/src/odrl_bridge.rs",
+    "fix_hint": "Include a collision-safe policy identity in the plain-grant anchor key, with an explicit representation for policies without an IRI, or otherwise mint a source-instance identity that preserves rule-policy pairs. Add a real-path regression test that materializes the same auth triple from two distinct policies whose rules share the same blank-node/programmatic id, then verifies distinct anchors and unambiguous rule-to-policy attribution across rematerialization/refresh. Review the analogous conditional-grant shape-key collapse and either preserve rule-policy pairing there too or document/test the intended many-source model.",
+    "severity": "major",
+    "title": "Reification anchors collide across policies"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 introduces a provenance-identity collision not covered by the tests. Plain-grant reification anchors are keyed only by the emitted triple and rule identifier, while each anchor also carries a policy identifier. Two policies can therefore produce the same auth triple with the same non-global rule id (especially repeated blank-node labels or programmatic ids), causing their provenance to collapse onto one RDF statement and making rule-to-policy attribution ambiguous. The implementation and documentation claim originating-policy attribution and separate attribution, so this must be fixed or explicitly modeled before approval. Because round 1 had no findings, this is regressing.",
+  "verdict": "request_changes"
+ }
+}
