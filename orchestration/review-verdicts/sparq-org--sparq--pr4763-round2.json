@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4763,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "364ae3f8a833690443bdf9f4770ad0a63b91097d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`order_numeric_string` uses exact datatype-free decimal representations, but SPARQL compares mixed numeric operands after promotion. For example, the integer 2^70+1 and the double representing 2^70 compare as equal after the integer is promoted to f64, so their relative ORDER BY order is unspecified. The implementation deliberately gives them different keys, causing `order_by_equal` to split a legal tie run and potentially reject a conforming permutation. Calling this direction safe is incorrect for a differential oracle: although it cannot hide an ordering bug, it can produce false failures. The test in `term.rs` confirms rather than prevents the defect.",
+    "file": "crates/sparq-difftest/src/numeric.rs",
+    "fix_hint": "Do not claim or use exact-key run partitioning as a complete SPARQL ORDER BY oracle for heterogeneous numerics. Implement comparison of the two sequences using the actual SPARQL pairwise numeric ordering/promotion semantics, including the non-transitive mixed-numeric tie relation, or fail closed with a counted skip whenever a sort column contains numeric classes for which exact-key equivalence cannot model promotion ties. Add a test that permutes 2^70+1 integer and the 2^70 double within the same ORDER BY tie and requires acceptance, with a nearby pair that is strictly ordered and must still be rejected when swapped.",
+    "severity": "major",
+    "title": "ORDER BY key still splits ties created by lossy numeric promotion"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-two change fixes the common cross-datatype tie case (for example xsd:integer 1 versus xsd:decimal 1.0) and adds a focused mutation test, but it deliberately leaves the same correctness defect for lossy numeric promotion. SPARQL numeric ordering promotes an integer/decimal to double when compared with a double; distinct exact values can therefore be tied after promotion. `order_numeric_string` instead keys exact arbitrary-precision values and the exact represented f64 value, splitting such a legal tie into separate runs. The added test explicitly asserts this split for 2^70+1 versus the double 2^70. Consequently two conforming engines that permute those tied rows can still be reported as a differential failure. Because the prior major false-positive class remains for a narrower numeric subset, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
