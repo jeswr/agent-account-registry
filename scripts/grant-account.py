@@ -2140,6 +2140,126 @@ else:
               [call for call in run_activate(head_ref="account-pool/x")[2]], ),
           (1, ["status:pending"], []))
 
+    # ------------------------------------------------------------------------------------------
+    # [#394] REGISTRATION IS CREATE-ONCE — EXECUTED. Round 2 of #383 made both activation paths
+    # refuse unless EXACTLY ONE exact-title account issue exists, so a duplicate `acctNN` record
+    # WEDGES the account permanently: no automated path can tell two records apart, and the slot's
+    # claim ref is never released. That defence sits downstream of the defect — the register step
+    # created the record without proving the title was free, and GitHub permits duplicate titles.
+    # The new proof is therefore RUN, not asserted in prose: the REAL fragment, against a fake `gh`
+    # that serves an issue listing and RECORDS every call, with the fragment's exit code and the
+    # `gh issue create` it did (or did not) reach as the observations. A deleted guard, a listing
+    # narrowed to open issues, a swallowed listing failure, and a comparison against the wrong
+    # title all flip a row below red. The fake refuses any unexpected invocation, so a mutation that
+    # reads some other endpoint fails closed instead of passing quietly.
+    #
+    # What the fake MODELS rather than executes: `--jq` projects each issue to `<number> <title>`
+    # and drops pull requests, so the fake serves lines already in that shape. The EXACT-title
+    # decision — the part that can fail OPEN — is the fragment's own, and rows 5/6 below drive it.
+    # ------------------------------------------------------------------------------------------
+    register_fragment = workflow_block(workflow, "register", "register-uniqueness")
+    register_gh = r'''#!/usr/bin/env python3
+import json, os, sys
+argv = sys.argv[1:]
+with open(os.environ["FAKE_GH_LOG"], "a", encoding="utf-8") as log:
+    log.write(json.dumps(argv) + "\n")
+with open(os.environ["FAKE_GH_STATE"], encoding="utf-8") as fh:
+    state = json.load(fh)
+if argv[:1] == ["api"]:
+    # The listing must be the FULLY PAGINATED, ALL-STATE issues read: a closed duplicate wedges
+    # activation exactly like an open one, and an unpaginated read proves nothing past page 1.
+    endpoints = [word for word in argv[1:] if word.startswith("repos/")]
+    if (len(endpoints) != 1 or not endpoints[0].endswith("/issues?state=all&per_page=100")
+            or "--paginate" not in argv):
+        sys.stderr.write("fake-gh: unexpected listing " + " ".join(argv) + "\n"); sys.exit(4)
+    if state.get("listing_fails"):
+        sys.stderr.write("fake-gh: issue listing rejected\n"); sys.exit(1)
+    for number, title in state["issues"]:
+        print(str(number) + " " + title)
+elif argv[:2] == ["label", "create"]:
+    sys.exit(1)                      # the normal case: the label already exists
+elif argv[:2] == ["issue", "create"]:
+    pass
+else:
+    sys.stderr.write("fake-gh: unexpected invocation " + " ".join(argv) + "\n"); sys.exit(4)
+'''
+
+    def run_register(issues, script=None, handle="acct07", **scenario):
+        """Execute the REAL register-uniqueness fragment against a fake GitHub whose issue listing
+        is `issues` (a list of [number, title] pairs). Returns (exit code, the gh calls)."""
+        with tempfile.TemporaryDirectory() as directory:
+            work = pathlib.Path(directory)
+            (work / "bin").mkdir()
+            (work / "bin" / "gh").write_text(register_gh, encoding="utf-8")
+            (work / "bin" / "gh").chmod(0o755)
+            state = {"issues": issues}
+            state.update(scenario)
+            state_file, log_file = work / "state.json", work / "calls.jsonl"
+            state_file.write_text(json.dumps(state), encoding="utf-8")
+            log_file.write_text("", encoding="utf-8")
+            body = "set -euo pipefail\n" + render_gha_expressions(
+                register_fragment if script is None else script, [])
+            done = subprocess.run(
+                ["bash", "-c", body], cwd=str(work), capture_output=True, text=True,
+                timeout=300, check=False,
+                env={**os.environ, "PATH": f"{work / 'bin'}:{os.environ['PATH']}",
+                     "HANDLE": handle, "PROVIDER": "openai",
+                     "body": "provider: openai\nmodels: [sol, luna, terra]\n",
+                     "FAKE_GH_STATE": str(state_file), "FAKE_GH_LOG": str(log_file)})
+            calls = [json.loads(line) for line in
+                     log_file.read_text(encoding="utf-8").split("\n") if line.strip()]
+            return done.returncode, calls
+
+    def register_view(issues, **scenario):
+        """(exit code, [(title, labels)] of every account issue the fragment actually created)."""
+        code, calls = run_register(issues, **scenario)
+        return code, [(call[call.index("--title") + 1],
+                       [call[index + 1] for index, word in enumerate(call) if word == "--label"])
+                      for call in calls if call[:2] == ["issue", "create"]]
+
+    minted_record = ("acct07", ["account", "provider:openai", "status:pending"])
+    check("[#394] EXECUTED register: a FREE title is registered — status:pending, never available",
+          register_view([[9, "acct08"], [10, "some unrelated issue"]]), (0, [minted_record]))
+    check("[#394] EXECUTED register: an existing issue with that exact title creates NOTHING",
+          register_view([[5, "acct07"]]), (1, []))
+    check("[#394] EXECUTED register: ...and two of them refuse too (the wedged state)",
+          register_view([[5, "acct07"], [6, "acct07"]]), (1, []))
+    check("[#394] EXECUTED register: an unreadable issue listing refuses (freeness unprovable)",
+          register_view([[9, "acct08"]], listing_fails=True), (1, []))
+    # Both directions of the EXACT comparison, in one fixture: near-miss titles must NOT block the
+    # registration (a substring/prefix test would false-refuse every enrollment past acct07)...
+    check("[#394] EXECUTED register: near-miss titles are not this handle",
+          register_view([[5, "acct7"], [6, "acct070"], [7, "Acct07"], [8, "acct07 spare"]]),
+          (0, [minted_record]))
+    # ...and the same fixture with the exact title added back must refuse, so a comparison against
+    # the wrong variable (which matches nothing at all) cannot pass the two rows above.
+    check("[#394] EXECUTED register: the exact title among near-misses still refuses",
+          register_view([[5, "acct7"], [6, "acct070"], [7, "acct07"], [8, "acct07 spare"]]),
+          (1, []))
+    # NON-VACUITY: the pre-#394 form — create with no proof — MUST create the duplicate against the
+    # very fixture the real fragment refuses. Without this row a harness that never reached
+    # `gh issue create` at all would leave every refusal row above green while proving nothing.
+    legacy_register = ('gh issue create -R "${{ github.repository }}" --title "$HANDLE" '
+                       '--label account --label "provider:$PROVIDER" --label status:pending '
+                       '--body "$body"\n')
+    check("[#394] NON-VACUOUS: the pre-#394 form DOES create a duplicate on that same fixture",
+          register_view([[5, "acct07"]], script=legacy_register), (0, [minted_record]))
+    # The guard must sit BEFORE the create in the step the runner executes (the fragment is a
+    # region of it), and the handle it proves free must be the CLAIMED slot from the store step —
+    # not `meta`'s pre-login hint, which is the stale snapshot #186 removed.
+    check("[#394] the register step proves the title free BEFORE it creates, on the CLAIMED slot",
+          (0 <= register.find("issues?state=all&per_page=100") < register.find("gh issue create"),
+           register_env.get("HANDLE")),
+          (True, "${{ steps.store.outputs.handle }}"))
+    # ...and the always() alarm OWNS the recovery for that refusal (the issue asked for it
+    # explicitly): a human must not answer a duplicate-title refusal by hand-creating the second
+    # record. Comment-stripped, so the guidance has to be in the comment the alarm POSTS.
+    alarm = workflow_step(workflow, "alarm")
+    check("[#394] the always() alarm's recovery guidance covers the duplicate-title refusal",
+          ("#394" in alarm, "do **not** hand-create a second" in alarm,
+           "allocates a FRESH slot" in alarm),
+          (True, True, True))
+
     template = (root / ".github/ISSUE_TEMPLATE/set-up-account.yml").read_text(encoding="utf-8")
     form = strip_yaml_comments(template)
     check("the request form documents the grant label (in the form itself, not a comment)",
