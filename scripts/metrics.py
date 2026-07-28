@@ -692,9 +692,17 @@ def dispatch_panel(records, repo, now, stale_after=DISPATCH_STALE_SECONDS):
         # which is the one number that must never be fabricated here: `assembler_deferrals=0` on
         # the feed reads as "the assemble leg is healthy", and the assemble leg is exactly where
         # the frontier was measured to die. `assemble_leg` states which of the two it is.
-        "assemble_leg": (latest.get("assemble_leg")
+        # THREE-WAY, and the third state is the honest one. A record written BEFORE
+        # `assemble_leg` existed carries a leg value that may be a real 0 or the coerced 0 this
+        # change removed, and nothing in it can tell them apart — so it is `unknown`, never
+        # promoted to `reported`. Guessing `reported` there would reintroduce, at the legacy
+        # boundary, exactly the fabricated healthy leg the rest of this change deletes. No such
+        # record exists today (this ring ships with this PR); the branch is written correctly
+        # anyway, because "unreached" is not "safe".
+        "assemble_leg": (latest["assemble_leg"]
                          if latest.get("assemble_leg") in {"reported", "missing"}
-                         else ("reported" if isinstance(latest.get("assembler_deferrals"), int)
+                         else ("unknown" if isinstance(latest.get("assembler_deferrals"), int)
+                               and not isinstance(latest.get("assembler_deferrals"), bool)
                                else "missing")),
         "assembler_deferrals": (latest["assembler_deferrals"]
                                 if isinstance(latest.get("assembler_deferrals"), int)
@@ -1381,6 +1389,7 @@ def _test_dispatch_panel(chk):
     # argues for widening crate parallelism (the under-serialisation direction).
     chained = dispatch_panel(
         [rec(now, 32, 0, assembler_deferrals=30, assembler_by_area={"__global__": 30},
+             assemble_leg="reported",
              chain={"frontier_and_retry_rows": 32, "route_rejections": 2,
                     "assembler_deferrals": 30, "claim_deferrals": 0, "realised_dispatches": 0,
                     "unrealised_planned_rows": 0, "unaccounted": 0})],
@@ -1403,6 +1412,14 @@ def _test_dispatch_panel(chk):
             dispatch_panel([rec(now, 32, 0, assembler_deferrals=0,
                                 assemble_leg="reported")], "sparq-org/sparq", now)),
         (0, "reported"))
+    # THE LEGACY BOUNDARY. A record written before `assemble_leg` existed carries a leg value that
+    # may be a real 0 or the coerced 0 this change removes, and nothing in it distinguishes them.
+    # Promoting that to `reported` would rebuild the fabricated healthy leg one layer out, at
+    # precisely the seam where nobody looks. It is `unknown`.
+    chk("[gate-a feed] a pre-`assemble_leg` record is UNKNOWN, never promoted to `reported`",
+        (lambda p: (p["assembler_deferrals"], p["assemble_leg"]))(
+            dispatch_panel([rec(now, 32, 0, assembler_deferrals=0)], "sparq-org/sparq", now)),
+        (0, "unknown"))
     chk("[gate-a feed] a target that has never reported says so",
         dispatch_panel(fresh, "other/repo", now), {"status": "no-record"})
     # "could not read the ring" and "the dispatcher never reported" are DIFFERENT failures.

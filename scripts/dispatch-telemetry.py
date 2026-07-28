@@ -548,13 +548,18 @@ class GitHubAPI:
         except HTTPError as exc:
             if allow_404 and exc.code == 404:
                 return None
+            # THE FULL ERROR TEXT, not `f"HTTP {exc.code}"`. `is_cas_conflict` recognises GitHub's
+            # sha-less CREATE race by a signature that lives in the response BODY, so passing only
+            # the status made that whole branch UNREACHABLE — a control that could never fire,
+            # dressed as one that could. With the body included, the one retryable 422 is caught
+            # and every other 422 still fails closed.
+            detail = _http_error_text(exc)
             if retry_conflict and ledger_retry.is_cas_conflict(
-                    f"HTTP {exc.code}", create=body is not None and "sha" not in (body or {})):
+                    detail, create=body is not None and "sha" not in (body or {})):
                 raise TelemetryConflict("dispatch-telemetry ledger CAS conflict") from exc
             # registry #594, adopted here: 401/404/422 and permission/credential 403s stay FATAL;
             # a secondary-rate-limit or availability rejection is RETRYABLE and is handed to the
             # CAS loop, which already owns this writer's whole request budget.
-            detail = _http_error_text(exc)
             if ledger_retry.is_transient(detail):
                 raise TelemetryRetryable(
                     f"GitHub API {method} was throttled or unavailable (HTTP {exc.code})",
@@ -1172,30 +1177,65 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
     _saved_urlopen = _urlrequest.urlopen
     try:
         _api = GitHubAPI("self-test-token")
-        transport = []
-        for label, error in (
-                ("throttle-403", _urlerror.HTTPError(
-                    "https://api.github.com/x", 403, "Forbidden", {"Retry-After": "20"},
-                    _io.BytesIO(b"You have exceeded a secondary rate limit"))),
-                ("credential-403", _urlerror.HTTPError(
-                    "https://api.github.com/x", 403, "Forbidden", {},
-                    _io.BytesIO(b"Resource not accessible by integration"))),
-                ("validation-422", _urlerror.HTTPError(
-                    "https://api.github.com/x", 422, "Unprocessable Entity", {},
-                    _io.BytesIO(b"Validation Failed"))),
-                ("network", _urlerror.URLError("connection refused"))):
+        transport, waits = [], {}
+
+        def _drive(label, error, body=None, retry_conflict=True):
             _urlrequest.urlopen = _always_raises(error)
             try:
-                _api.request("PUT", "/repos/o/r/contents/x", {"content": "x"})
+                _api.request("PUT", "/repos/o/r/contents/x",
+                             {"content": "x"} if body is None else body,
+                             retry_conflict=retry_conflict)
                 transport.append((label, "returned"))
-            except TelemetryRetryable:
+            except TelemetryConflict:
+                transport.append((label, "cas-conflict"))
+            except TelemetryRetryable as exc:
+                waits[label] = exc.retry_after
                 transport.append((label, "retryable"))
             except TelemetryError:
                 transport.append((label, "fatal"))
+
+        _drive("throttle-403", _urlerror.HTTPError(
+            "https://api.github.com/x", 403, "Forbidden", {"Retry-After": "20"},
+            _io.BytesIO(b"You have exceeded a secondary rate limit")))
+        _drive("credential-403", _urlerror.HTTPError(
+            "https://api.github.com/x", 403, "Forbidden", {},
+            _io.BytesIO(b"Resource not accessible by integration")))
+        _drive("validation-422", _urlerror.HTTPError(
+            "https://api.github.com/x", 422, "Unprocessable Entity", {},
+            _io.BytesIO(b"Validation Failed")))
+        _drive("network", _urlerror.URLError("connection refused"))
         chk("[#594] GitHubAPI.request ITSELF classifies — a throttled PUT becomes retryable while "
             "a credential 403 and a validation 422 stay fatal",
             transport, [("throttle-403", "retryable"), ("credential-403", "fatal"),
                         ("validation-422", "fatal"), ("network", "retryable")])
+        # THE SERVER'S REQUESTED WAIT, carried end-to-end. `retry_after_seconds` being correct is
+        # not the property — the property is that `request` PUTS it on the exception the CAS loop
+        # sleeps on. Dropping the argument leaves the classifier tests green and silently reverts
+        # every throttled retry to the generic schedule.
+        chk("[#594] ...and the server's Retry-After reaches the exception the CAS loop sleeps on",
+            (waits.get("throttle-403"), waits.get("network")), (20, None))
+        # THE ONE RETRYABLE 422. GitHub's sha-less CREATE race is identified by a signature in the
+        # response BODY, so passing only `f"HTTP {code}"` to `is_cas_conflict` made this branch
+        # UNREACHABLE — a control that could never fire. It fires now, and only for a genuine
+        # create (no `sha` in the request body): the same 422 on an UPDATE stays fatal.
+        def _create_race():
+            # A FRESH exception per call: `_http_error_text` READS the body, and a urllib
+            # HTTPError's body is a stream that is consumed once. Reusing one object would make
+            # the second and third probes below pass for the wrong reason (an empty body is not
+            # a create race) — which is how this row first went green against a broken fixture.
+            return _urlerror.HTTPError(
+                "https://api.github.com/x", 422, "Unprocessable Entity", {},
+                _io.BytesIO(b'Invalid request. "sha" wasn\'t supplied.'))
+
+        transport.clear()
+        _drive("create-race", _create_race(), body={"content": "x"})
+        _drive("update-422", _create_race(), body={"content": "x", "sha": "deadbeef"})
+        _drive("create-race-unasked", _create_race(), body={"content": "x"},
+               retry_conflict=False)
+        chk("[#594] the sha-less CREATE race is the ONE retryable 422, and only on a create the "
+            "caller asked to retry",
+            transport, [("create-race", "cas-conflict"), ("update-422", "fatal"),
+                        ("create-race-unasked", "fatal")])
     finally:
         _urlrequest.urlopen = _saved_urlopen
 
