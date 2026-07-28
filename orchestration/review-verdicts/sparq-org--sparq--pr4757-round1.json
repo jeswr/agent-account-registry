@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4757,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "014460d80588dfc35d43e0df0f4e2e20dfa99b6e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`run_nl_query` returns every parsed, non-SERVICE query, but the real `Nlq::ask` loop also calls `constrain::unknown_terms` when `config.check_dictionary` is enabled (true in the default configuration) and repairs queries containing predicate/class IRIs absent from the graph. The new API and docs repeatedly promise the same grounded generation and validation as `ask`, so a model-hallucinated IRI is accepted here even though `ask` rejects/repairs it. The note that validation is syntactic does not resolve the contradiction: dictionary validation is part of the advertised shared loop, and the implementation already has the graph and configuration needed to apply it.",
+    "file": "crates/sparq-mcp/src/nlq.rs",
+    "fix_hint": "After parsing and the forbidden-construct check, apply the same `config.check_dictionary` / `sparq_nlq::constrain::unknown_terms(graph, &parsed)` branch as `Nlq::ask`, feed `dictionary_repair_message` into the repair prompt, and add a test showing an unknown predicate/class IRI is repaired or rejected rather than returned. Alternatively, explicitly narrow every public claim from 'same validation as ask' to parse-plus-forbidden-construct validation, but that would be a deliberate behavioral/spec change rather than the currently claimed parity.",
+    "severity": "major",
+    "title": "Translate-only path omits ask's dictionary validation"
+   }
+  ],
+  "progress": null,
+  "summary": "The translate-only path is generally well scoped and the non-execution/SERVICE tests exercise meaningful behavior, but it does not perform the same validation as `ask` despite repeatedly claiming that it does. In particular, `Nlq::ask` applies the configured live-dictionary constraint and repairs hallucinated predicate/class IRIs, while `run_nl_query` returns immediately after parsing and the forbidden-construct check. This makes the public description and grounding guarantee materially inaccurate and leaves the new path without a test for the omitted validation.",
+  "verdict": "request_changes"
+ }
+}
