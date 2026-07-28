@@ -1697,6 +1697,14 @@
    "wall_seconds": 39,
    "issue": 2958,
    "why_no_diff": "already_done"
+  },
+  {
+   "ts": 1785280799,
+   "provider": "fleet",
+   "account": "5f5b2dc3fb8e231b",
+   "model_alias": "",
+   "exit_class": "zero-dispatch",
+   "run_id": "30406715612.1"
   }
  ]
 }
