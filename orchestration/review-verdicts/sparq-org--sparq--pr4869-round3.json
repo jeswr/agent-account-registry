@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4869,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0993cd636db46caac684e22deedebaeee254a703",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct. The pretest guard fails early when the built distribution is absent, discovers the suite's static package imports, resolves them from the same package hierarchy used by the tests, and distinguishes manifest-declared dependencies from workspace-provided test dependencies. The repository root manifest and js workflow support the documented root-install requirement. The refreshed generated wasm declaration matches the existing validateStore export and ABI. No correctness, soundness, test-validity, security, or hostile-instruction issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
