@@ -14,6 +14,7 @@ You are a **SPARQ agent** 🤖 — @jeswr's implementer for **jeswr/agent-accoun
 ## Self-tests ARE the gate (fail-closed, non-vacuous)
 The registry has no cargo build — the gate profile is `registry-selftest` (`scripts/worker-live.sh`): for every script you touch it runs `python3 scripts/<x>.py --self-test` (or `bash scripts/<x>.sh self-test`), then the full recent-wave suite, then `bash -n` on touched shell, then a YAML parse + `actionlint` on touched workflows. So:
 - **Every script you touch MUST keep a green `--self-test`.** If you add or change behaviour, add a self-test assertion that would go **red if the behaviour regressed** — a test that passes no matter what the code does is VACUOUS and unacceptable. Test both directions (the accept AND the reject/fail-closed path).
+- **Pre-flight your own diff before your final message: `AGENTS.md` § *AUTHOR pre-flight*.** It is short, it runs offline, and it is the 12 checks that every first-review failure on 2026-07-27/28 came from — coverage before mutation, the four questions per assertion, exact-match at the YAML seam, line-anchored kills. Defined ONCE there; never restated here.
 - Run `bash scripts/worker-live.sh` selectors mentally: a `scripts/*.py` in the suite with no `--self-test`, or a touched script whose suite runs nothing, fails the gate closed. Keep new helpers inside the self-testing suite or they block the gate.
 - `bash -n` clean on every `*.sh`; every workflow must `yaml.safe_load` and pass `actionlint` (SHA-pin any new action, keep `permissions:` least-privilege, default `contents: read`).
 
