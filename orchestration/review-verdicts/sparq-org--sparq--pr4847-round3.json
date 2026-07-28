@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4847,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bc24dbaab4865d89a21ea87de1a98a36c4c58a71",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding. The scanner now spans PN_PREFIX internal dots, requires a non-dot final prefix character before treating the run as a prefixed name, and skips the complete local part. The focused unit cases cover dotted prefix and non-prefix boundaries, while the integration regression uses a valid declared `filtr.x:` prefix plus an unrelated unclosed WHERE block, proving the real CanaryFailed path produces no false suggestion. The implementation remains diagnostic-only: suggestions are computed after both query and update parsing fail and never modify the returned SPARQL. No correctness, soundness, test-validity, or security defect remains in the diff-scoped change.",
+  "verdict": "approve"
+ }
+}
