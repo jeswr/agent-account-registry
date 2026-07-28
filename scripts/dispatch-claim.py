@@ -1835,7 +1835,19 @@ def partition_defer_attribution(package, busy, occupancy):
     # sail past an occupant holding `a`. The reported held area is the LOWEST-SORTED contended
     # atom, keeping the attribution a deterministic function of the board (same rule as the
     # lowest-PR tie-break) and keeping the enum invariant `held_area in busy` true.
-    contended = sorted((package_areas(package) or frozenset()) & set(busy))
+    #
+    # [#938 review N3] An UNREADABLE key reaches here only if it is not literally `__global__`
+    # (that branch is two lines up), and it must not be intersected as if it named nothing:
+    # `package_areas(...) or frozenset()` would reintroduce the empty set the whole `None`-means-
+    # universal contract exists to avoid, and the row would be KEPT — the single site where an
+    # unreadable key read as "reserves nothing" instead of "reserves everything". It takes the
+    # cross-cutting branch above instead, which is what the key actually means.
+    own = package_areas(package)
+    if own is None:
+        holder, state, packages = holder_of(lambda _packages: True)
+        held = sorted(set(packages) & set(busy)) or sorted(busy)
+        return ("cross-cutting-item", held[0], holder, state)
+    contended = sorted(own & set(busy))
     if contended:
         held_area = contended[0]
         holder, state, _packages = holder_of(lambda packages: held_area in packages)
@@ -16163,6 +16175,18 @@ agent = "impl"
     # always meant to describe.
     assert partition_defer_attribution(GLOBAL_PACKAGE, {"crate-a"}, _ab_occ)[0] == \
         "cross-cutting-item"
+    # [#938 review N3] An UNREADABLE key must take that branch too. `package_areas(...) or
+    # frozenset()` reintroduced the empty set here — the one site where a key nobody can read
+    # intersected NOTHING and the row was KEPT, contradicting the `None`-means-universal contract
+    # `package_areas` is built around. Every unreadable spelling is checked, and the reported held
+    # area is still an area an occupant genuinely holds.
+    for _unreadable in ("crate-a,", ",crate-a", "crate-a,,crate-b", "__global__,crate-a", "", None):
+        _attr_bad = partition_defer_attribution(_unreadable, {"crate-a"}, _ab_occ)
+        assert _attr_bad is not None and _attr_bad[0] == "cross-cutting-item", \
+            (_unreadable, _attr_bad)
+        assert _attr_bad[1] in {"crate-a"}, (_unreadable, _attr_bad)
+    # ...and an unreadable key against an EMPTY board is still not deferred (nobody holds anything).
+    assert partition_defer_attribution("crate-a,", set(), []) is None
     print("  ok   [OPUS-5 partition] the busy union is intersected, not membership-tested, and the "
           "reported held area is a deterministic atom that is genuinely reserved")
 
