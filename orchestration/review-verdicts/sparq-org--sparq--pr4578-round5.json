@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4578,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e8fcd4c0ae7fbd010fcf731bae6f14053517b0c4",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The Reference conversion still calls into_iri(raw), and the generated reference type still stores only a String documented as an IRI. SHACL sh:class applies to value nodes, including blank nodes: a blank node with rdf:type C (directly or through rdfs:subClassOf*) can conform. This loader rejects that valid value with TermType before ValueSource::is_instance_of can evaluate membership. The real-path harness still exercises classified and unclassified named nodes only, so it does not catch the narrowing. This is the same major correctness gap reported in round 4.",
+    "file": "crates/sparq-wrapper-shacl/src/emit.rs",
+    "fix_hint": "Represent a class reference as a node identity that preserves NamedNode versus BlankNode, accept both node kinds in the sh:class conversion while rejecting literals, and change is_instance_of and ClassMembership reporting accordingly. Add compiled-harness cases proving that a classified blank node loads and an unclassified blank node is rejected.",
+    "severity": "major",
+    "title": "sh:class still rejects blank-node value nodes"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 leaves the prior major correctness issue unchanged. The emitted sh:class conversion still calls into_iri(raw), and the generated reference newtype still represents only an IRI String. SHACL sh:class applies to value nodes, including blank nodes, so a blank node with rdf:type C (directly or through rdfs:subClassOf*) must be eligible to conform. The loader rejects it with TermType before ValueSource::is_instance_of can decide membership. The compiled harness still covers classified and unclassified named nodes only and has no blank-node sh:class cases. This is materially the same major finding at the same severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
