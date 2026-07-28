@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 895,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f326324441ee9466e6a1068fba92b31adea0ec7c",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "After `after=$(exact_title_issues)` returns only `$number`, nothing prevents a public-repo writer from creating another exact-title issue before the step exits successfully. That run's record is then treated as registered, but two exact-title issues exist and both activation paths fail closed forever. A strongly-consistent API only reports writes completed before the read; it does not serialize a write that occurs after the read. Retraction therefore resolves one ordering of the race but does not establish the stated create-once invariant against the explicitly in-scope outside writer.",
+    "file": ".github/workflows/set-up-account.yml",
+    "fix_hint": "Do not claim title uniqueness as a durable create-once primitive without serialization shared by all title writers. Redesign trust identity around an atomically claimed key or the created issue number, and ensure arbitrary later same-title issues cannot become competing trusted records; alternatively require a trusted label/capability unavailable to public issue authors and make activation select the uniquely bound trusted record rather than title alone.",
+    "severity": "blocker",
+    "title": "Post-create uniqueness read leaves a final check-to-success race"
+   },
+   {
+    "body": "The fake inserts `outsider` inside `issue create`, so the second listing necessarily observes it and exercises only the ordering the new retraction handles. No executed scenario inserts a same-title issue after the second `api` response but before the fragment exits. Consequently the suite stays green even though that remaining interleaving produces a successful registration followed by the same ambiguous two-title state. The missing assertion is that an outsider arriving after the post-create listing cannot leave the run successful with two activation-visible exact-title records.",
+    "file": "scripts/grant-account.py",
+    "fix_hint": "Add an executed adversarial scenario that injects the outsider immediately after the second listing is served and assert the protocol cannot both return success and leave two records eligible for activation. This will require a redesigned identity or synchronization protocol; adding another finite uniqueness read merely moves the same race.",
+    "severity": "major",
+    "title": "Self-test omits an outsider write after the post-create proof"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The new compensating protocol closes the specific interleaving tested in round 1 only when the outsider's duplicate is visible by the post-create read. It still does not establish create-once semantics: an outside writer can create the same title immediately after that read returns the workflow's sole issue and before registration succeeds. The workflow then exits successfully while two exact-title records exist, leaving activation wedged. Strong consistency makes completed writes visible; it cannot exclude a future concurrent write. The self-test moves the modeled outsider into the pre-create/create boundary but never models the remaining post-proof/success boundary, so it cannot validate the claimed invariant. These are materially the same blocker and test-validity finding as round 1.",
+  "verdict": "request_changes"
+ }
+}
