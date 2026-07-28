@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4922,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c9c35dc322ba503f6a44a2f8489869281a750c67",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new MCP resources and prompts surfaces are coherently wired through the real JSON-RPC dispatch. Resource reads select the default or exact named graph, preserve reserved-URI behavior, distinguish not-found from materialization failure, and use the existing budgeted CONSTRUCT path. Prompt IRI interpolation is guarded by oxrdf NamedNode validation, with hostile and missing arguments rejected before rendering. The end-to-end tests exercise capability advertisement, graph isolation, protocol error codes, real prompt rendering/refusal, and read-only behavior; the public-surface documentation and feature/dependency declarations are updated consistently. No correctness, soundness, security, or vacuous-test issue was found in the diff.",
+  "verdict": "approve"
+ }
+}
