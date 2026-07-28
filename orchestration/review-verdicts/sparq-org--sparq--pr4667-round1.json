@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4667,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "77d1d0909a99405cecd376bb0581ef3d114c2b0b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change consistently establishes a deliberate review policy for the tag-pinned SLSA builder: routine Dependabot version updates are narrowly ignored, a least-privilege scheduled workflow derives the authoritative pin from the provenance call sites and maintains one review issue, and the compliance record explains the trust rationale and review procedure. The structural checks cover lane agreement, required call-site count, the scoped Dependabot ignore, policy/workflow presence, schedule, upstream target, and issue-write permission. The added mutation tests exercise each claimed degradation and are non-vacuous. No correctness, security, or test-validity defect requiring changes was found.",
+  "verdict": "approve"
+ }
+}
