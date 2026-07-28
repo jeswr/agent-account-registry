@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4734,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "314ea4c76b9737d28f053fabcbbd6e33f51e2b05",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "prof_round(new_delta.len()) counts only canonical facts committed during fixpoint rounds. owl_rl_closure later expands owl:sameAs equivalence classes and computes its returned `added` from the expanded closure, but no round/accounting adjustment includes those additional expanded triples. Therefore Report::total_derived is not generally the documented net-new-fact count and need not equal materialize()'s return value. The headline equality test uses only a transitive-property chain and cannot expose this.",
+    "file": "crates/sparq-reason/src/owl.rs",
+    "fix_hint": "Define and implement one consistent meaning for total_derived. If it must equal the materializer's returned count as documented, account for sameAs expansion/finalization without producing misleading progress ticks, and add an end-to-end OWL fixture with a nontrivial sameAs class asserting report.total_derived() == returned added and callback totals are consistent.",
+    "severity": "major",
+    "title": "OWL total_derived omits facts created by sameAs expansion"
+   },
+   {
+    "body": "Both incremental rematerialize implementations only call prof_mark/prof_phase; they never call prof_round and do not delegate through an instrumented batch materializer. Thus a TBox mutation that falls back to rematerialization produces INCREMENTAL_REBUILD timing but zero progress notifications/rounds. This contradicts profile.rs and SKILL.md, which say such a mutation ticks the rounds of the batch run it delegates to. The rebuild test checks only the phase name and is vacuous with respect to the progress promise.",
+    "file": "crates/sparq-reason/src/incremental.rs",
+    "fix_hint": "Either instrument rebuild work with truthful round/committed counts (and test callback notifications plus report totals for both MaterializedGraph and MaterializedOwlGraph fallback paths), or revise the public docs to state rebuilds emit no progress ticks. Do not claim delegation to a batch run when these functions implement rebuilding directly.",
+    "severity": "major",
+    "title": "Rebuild fallbacks do not emit the documented progress rounds"
+   }
+  ],
+  "progress": null,
+  "summary": "The profiler API and tests are substantial, but two advertised accounting guarantees do not hold on important real paths. OWL sameAs expansion can make Report::total_derived differ from the materializer's returned new-fact count, and incremental rebuild fallbacks record no progress round despite documentation saying they tick delegated batch rounds. The current tests avoid both discrepancies, so they do not validate the public contract completely.",
+  "verdict": "request_changes"
+ }
+}
