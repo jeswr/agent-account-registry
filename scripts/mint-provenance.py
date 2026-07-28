@@ -45,6 +45,7 @@ and this script never prints the login it hashed alongside the hash.
 """
 
 import argparse
+from collections import Counter
 import copy
 import json
 import os
@@ -52,6 +53,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 from typing import NamedTuple
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -97,6 +99,30 @@ SAFE_AREA = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 
 REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
+
+# The word boundaries a `#<n>` reference is read under, as TWO shared constants: `references_issue`
+# tests ONE number against the PR text, and the census DISCOVERS every number in it. Deriving both
+# from the same pair is what stops the census from proposing a candidate the binding test then
+# refuses for a boundary reason alone (`#412` offering `41`, `x#41` offering `41`).
+ISSUE_REF_LEFT = r"(?<![0-9A-Za-z_])"
+ISSUE_REF_RIGHT = r"(?![0-9])"
+ISSUE_REF_RE = re.compile(rf"{ISSUE_REF_LEFT}#([0-9]+){ISSUE_REF_RIGHT}")
+
+# ---- census verdicts (one per PR, disjoint, and every open PR gets exactly one) ----------------
+# A census that only listed the mintable PRs would be indistinguishable from a census that had
+# stopped counting, so every open PR is classified and the summary names every bucket it saw.
+CENSUS_MINTABLE = "MINTABLE"            # mintable AND the review lane would enumerate it
+CENSUS_DEAD = "MINTABLE-BUT-DEAD"       # mintable, but the lane discards it — a mint delivers NOTHING
+CENSUS_NO_ISSUE = "NO-BINDABLE-ISSUE"   # no `#<n>` it names survives issue_mint_refusal
+CENSUS_OTHER_LANE = "NOT-THIS-LANE"     # refused on the PR's own shape (worker namespace, draft, …)
+CENSUS_RECORDED = "ALREADY-RECORDED"    # a provenance record for this PR already exists
+CENSUS_VERDICTS = (CENSUS_MINTABLE, CENSUS_DEAD, CENSUS_NO_ISSUE, CENSUS_RECORDED,
+                   CENSUS_OTHER_LANE)
+
+# The implementing alias both the CLI default and the census decide with. ONE literal: a census
+# that judged a different alias from the one a mint would record would report a population the
+# operator cannot act on.
+DEFAULT_IMPL_ALIAS = "opus5"
 
 
 class MintDecision(NamedTuple):
@@ -253,8 +279,23 @@ def references_issue(pull, issue_number):
     `#412` or `x#41`."""
     if not isinstance(pull, dict) or not isinstance(issue_number, int):
         return False
-    text = f"{pull.get('title') or ''}\n{pull.get('body') or ''}"
-    return bool(re.search(rf"(?<![0-9A-Za-z_])#{issue_number}(?![0-9])", text))
+    return bool(re.search(rf"{ISSUE_REF_LEFT}#{issue_number}{ISSUE_REF_RIGHT}",
+                          pull_reference_text(pull)))
+
+
+def pull_reference_text(pull):
+    """The PR-authored text a `#<n>` reference may be read from — title and body, nothing else."""
+    if not isinstance(pull, dict):
+        return ""
+    return f"{pull.get('title') or ''}\n{pull.get('body') or ''}"
+
+
+def referenced_issue_numbers(pull):
+    """Every `#<n>` the PR's own title/body names, ascending — the census's CANDIDATE list.
+
+    Discovery only. Each candidate is then put through the production `mint_decision`, which
+    re-reads the live issue and applies `issue_mint_refusal`; this function decides nothing."""
+    return sorted({int(match) for match in ISSUE_REF_RE.findall(pull_reference_text(pull))})
 
 
 def issue_mint_refusal(issue_number, issue, pull, plan_package, global_package,
@@ -455,8 +496,90 @@ def admissible_by_the_review_lane(document, pr_number, admission_error):
 
     A LAST-MILE assertion against the consumer's definition, not this script's. Writing a record
     the lane then refuses is the exact silent-stall shape #657 is about, and it is cheap to prove
-    the negative before the PUT rather than discover it a tick later."""
+    the negative before the PUT rather than discover it a tick later.
+
+    NOT SUFFICIENT ON ITS OWN, and that is why `delivery_refusal` exists: this asks whether the
+    RECORD is admissible. It asks nothing about the PR, and the PR is where every terminal
+    exclusion lives."""
     return admission_error(document, pr_number, admit_orchestrator=True)
+
+
+def issue_label_names(issue):
+    """The `labels` of a live issue payload as a sorted list of names — the shape the review
+    enumerator's `issue_labels` map holds. Malformed entries are dropped, never raised on."""
+    if not isinstance(issue, dict):
+        return []
+    return sorted({label.get("name") for label in (issue.get("labels") or [])
+                   if isinstance(label, dict) and isinstance(label.get("name"), str)})
+
+
+def delivery_refusal(repo, document, pull, source_labels, enrolled_authors, *,
+                     enumerate_review_items, now, hold_labels=(), park_label=None):
+    """Why the record about to be written would NOT put this PR into the review lane, or None.
+
+    THE MISSING LAST MILE. `admissible_by_the_review_lane` proves the RECORD is admissible and
+    stops there — so this script could write a record the enumerator discards at its very next
+    predicate, and the only symptom would be the absence of a review. Measured on the enrolled
+    repo, 2026-07-28: of 36 open PRs exactly THREE passed every gate in this file, and ALL THREE
+    carried `needs:user`, which `enumerate_review_items` treats as terminal. Every mint available
+    on that population would have delivered nothing.
+
+    THE DECISION IS THE CONSUMER'S OWN. This drives the PRODUCTION `enumerate_review_items` over
+    the live PR payload and the exact document about to be written, and refuses unless it emits a
+    review item for that PR. Nothing here re-implements an admission predicate: a widened or
+    narrowed enumerator changes this answer by construction, which is the rule §9.1 of the
+    admission design record established for every other consumer.
+
+    PERMISSIVE IN EXACTLY ONE DIRECTION, deliberately. No lease store and no CI snapshot are
+    passed, so a transient per-PR review lease, a conflicting base or a red gate can never make
+    this refuse — the only refusals it can produce are terminal on the PR's own live state. A
+    false "it would be enumerated" therefore degrades to today's behaviour (the record waits for
+    the lease to clear); a false refusal would be a new way to make minting impossible, and there
+    is no input here that can produce one.
+
+    `hold_labels` / `park_label` are the consumer's own constants and feed the ADVISORY hint only.
+    The refusal fires on the enumerator's answer alone — see `_delivery_hint`."""
+    pr_number = document.get("pr_number") if isinstance(document, dict) else None
+    exclusions = Counter()
+    try:
+        items = enumerate_review_items(
+            repo, [pull], {pr_number: document}, [],
+            {document.get("issue"): list(source_labels)}, now,
+            enrolled_authors=enrolled_authors, exclusions=exclusions)
+    except Exception as exc:                            # noqa: BLE001 — any refusal is a refusal
+        return (f"the review lane's own enumerator could not classify this PR ({exc}); a record "
+                "written now would be acted on by nothing")
+    if any(isinstance(item, dict) and item.get("pr_number") == pr_number for item in items):
+        return None
+    named = sorted(exclusions)
+    reason = named[0] if named else _delivery_hint(pull, source_labels, hold_labels, park_label)
+    return f"the review lane does not enumerate it: {reason}"
+
+
+def _delivery_hint(pull, source_labels, hold_labels, park_label):
+    """A best-effort, ADVISORY explanation of a non-enumeration, for the operator's next action.
+
+    NEVER a decision. `enumerate_review_items` records an exclusion reason only for PRs carrying
+    an explicit review-loop signal, and the enrollable population carries none — so on exactly
+    the PRs this feature exists for, the enumerator's own telemetry is silent. This reads the
+    consumer's own exported CONSTANTS (never a copy of its predicates) to name the likely cause;
+    if it names the wrong one the refusal is still correct, because the refusal came from the
+    enumerator."""
+    labels = {label.get("name") if isinstance(label, dict) else label
+              for label in (pull.get("labels") or []) if isinstance(pull, dict)}
+    held = sorted(label for label in labels if isinstance(label, str) and label in set(hold_labels))
+    if held:
+        return (f"the PR carries the human-owned hold {held[0]!r} — that is terminal for every "
+                "autonomous state, so clear it (a human gesture) before minting")
+    if park_label is not None and park_label in labels:
+        return (f"the PR carries the machine park {park_label!r}; it is re-admitted by the "
+                "pipeline's own readmission path, not by a record")
+    parked = sorted(label for label in source_labels
+                    if isinstance(label, str) and label == "status:parked")
+    if parked:
+        return "the source issue is machine-parked (status:parked)"
+    return ("no exclusion was reported — re-run the census (`--census`) to see the PR's live "
+            "labels and state as the enumerator reads them")
 
 
 # ---- I/O ---------------------------------------------------------------------------------------
@@ -522,9 +645,14 @@ def mint(repo, pr_number, issue_number, impl_alias, registry_repo, routing, enro
                   "is recorded — re-run once the registry probe succeeds")
         log(f"REFUSE {repo}#{pr_number}: {reason}")
         return MintDecision(ACTION_REFUSE, reason, None)
+    # Read each payload ONCE and keep it: the delivery check below is driven by the same live PR
+    # and the same live issue the decision was made from, so it cannot disagree with the decision
+    # about what it is looking at.
+    pull_payload = read_pull()
+    issue_payload = read_issue()
     decision = mint_decision(
         repo, pr_number, issue_number, impl_alias, enrolled_authors, routing, stamp,
-        env.get("PROVENANCE_SALT", ""), read_pull(), read_issue(), existing_body,
+        env.get("PROVENANCE_SALT", ""), pull_payload, issue_payload, existing_body,
         allow_global_partition=allow_global_partition,
         attestation_class=dispatch_claim.provenance_attestation_class,
         orchestrator_class=dispatch_claim.ORCHESTRATOR_CLASS,
@@ -546,6 +674,19 @@ def mint(repo, pr_number, issue_number, impl_alias, registry_repo, routing, enro
                   f"({lane_error}); refusing to write a record that stalls")
         log(f"REFUSE {repo}#{pr_number}: {reason}")
         return MintDecision(ACTION_REFUSE, reason, None)
+    # ...and the SECOND last mile: an admissible record on a PR the lane will not enumerate is a
+    # write that delivers no review. Refused on the DRY RUN too, so the operator learns it from the
+    # cheap gesture rather than from a record that then sits inert on the ledger forever.
+    delivery_error = delivery_refusal(
+        repo, decision.document, pull_payload, issue_label_names(issue_payload), enrolled_authors,
+        enumerate_review_items=dispatch_claim.enumerate_review_items, now=time.time(),
+        hold_labels=dispatch_claim.HUMAN_HOLD_PR_LABELS,
+        park_label=dispatch_claim.MACHINE_PARK_PR_LABEL)
+    if delivery_error:
+        reason = (f"the record this run would write would deliver NO review ({delivery_error}); "
+                  "refusing to write a record nothing acts on")
+        log(f"REFUSE {repo}#{pr_number}: {reason}")
+        return MintDecision(ACTION_REFUSE, reason, None)
     document = decision.document
     if not apply_changes:
         log(f"DRY-RUN {repo}#{pr_number}: would mint {record_path} — "
@@ -561,6 +702,180 @@ def mint(repo, pr_number, issue_number, impl_alias, registry_repo, routing, enro
     log(f"minted {record_path} for {repo}#{pr_number} ({document['recorded_at_run']}) — "
         "review-only: the arm refuses this class, a human arms it")
     return decision
+
+
+# ---- the census: WHICH PRs this writer can serve, answered by the production decision -----------
+# WHY THIS EXISTS. Between #876 landing the writer and 2026-07-28 the mint workflow was dispatched
+# ZERO times, and there were ZERO `orchestrator`-attested records among the 463 on `ledger`. The
+# writer was not broken — the first dispatch of it succeeded — but nothing in the pipeline COUNTED
+# this class, so the only way to learn which PR the gesture could serve was to dispatch a run per
+# (PR, candidate issue) guess and read a refusal. On the live population that is ~130 dispatches to
+# discover 3 candidates, all 3 of them dead. A discovery gesture nobody can afford is a gesture
+# nobody performs; this makes the answer one read-only run.
+def census_verdict(repo, pull, open_issues, enrolled_authors, routing, stamp, salt, *,
+                   recorded=(), impl_alias=DEFAULT_IMPL_ALIAS, allow_global_partition=False,
+                   attestation_class, orchestrator_class, plan_package, global_package,
+                   account_hash, json_type_exact, enumerate_review_items, now, hold_labels=(),
+                   park_label=None):
+    """ONE disjoint census verdict for ONE open PR: `(verdict, detail)`.
+
+    Every branch is decided by the PRODUCTION functions this file already ships — `pr_mint_refusal`
+    for the shape, `mint_decision` for the binding, `delivery_refusal` for whether the lane would
+    act. The census therefore cannot drift from what a real `--apply` would do: to change the
+    census you have to change the mint."""
+    number = pull.get("number") if isinstance(pull, dict) else None
+    shape_error = pr_mint_refusal(repo, pull, enrolled_authors)
+    if shape_error:
+        return CENSUS_OTHER_LANE, shape_error
+    if number in set(recorded):
+        return CENSUS_RECORDED, "a provenance record already exists for this PR"
+    refusals = []
+    dead = None
+    for candidate in referenced_issue_numbers(pull):
+        issue = open_issues.get(candidate)
+        if issue is None:
+            refusals.append(f"#{candidate}: not an OPEN issue in this repo")
+            continue
+        decision = mint_decision(
+            repo, number, candidate, impl_alias, enrolled_authors, routing, stamp,
+            salt, pull, issue, None, allow_global_partition=allow_global_partition,
+            attestation_class=attestation_class, orchestrator_class=orchestrator_class,
+            plan_package=plan_package, global_package=global_package, account_hash=account_hash,
+            json_type_exact=json_type_exact)
+        if decision.action != ACTION_MINT:
+            refusals.append(f"#{candidate}: {decision.reason}")
+            continue
+        delivery = delivery_refusal(
+            repo, decision.document, pull, issue_label_names(issue), enrolled_authors,
+            enumerate_review_items=enumerate_review_items, now=now, hold_labels=hold_labels,
+            park_label=park_label)
+        if delivery:
+            # Keep looking: a SECOND candidate issue can be live where the first is not, and
+            # returning the first dead binding would under-report the population.
+            dead = dead or (CENSUS_DEAD, f"issue #{candidate} binds, but {delivery}")
+            continue
+        return CENSUS_MINTABLE, f"mint with --issue {candidate}"
+    if dead:
+        return dead
+    return CENSUS_NO_ISSUE, summarise_refusals(refusals)
+
+
+# A PR body on this repo routinely names 60+ issues (cross-references to the target repo's numbering
+# among them), and printing every refusal made the census unreadable — a report nobody reads is the
+# same as no report. The CLOSED/absent candidates are the least informative line by far, so the
+# summary prefers the refusals that name a fixable condition and states how many it dropped.
+CENSUS_REFUSALS_SHOWN = 3
+_UNINFORMATIVE_REFUSAL = "not an OPEN issue in this repo"
+
+
+def summarise_refusals(refusals, shown=CENSUS_REFUSALS_SHOWN):
+    """A bounded, INFORMATIVE-FIRST rendering of why no candidate issue bound.
+
+    Never silently truncates: the count of everything not shown is always printed, so a summary can
+    never read as a complete list."""
+    if not refusals:
+        return "the PR's title and body name no #<n> at all"
+    informative = [line for line in refusals if _UNINFORMATIVE_REFUSAL not in line]
+    ordered = informative + [line for line in refusals if line not in informative]
+    head = "; ".join(ordered[:shown])
+    hidden = len(ordered) - len(ordered[:shown])
+    closed = sum(1 for line in refusals if _UNINFORMATIVE_REFUSAL in line)
+    tail = f" (+{hidden} more candidate(s), {closed} of them closed/absent)" if hidden else ""
+    return head + tail
+
+
+def census(repo, registry_repo, routing, enrolled_authors, *, impl_alias=DEFAULT_IMPL_ALIAS,
+           env=None, read_pulls=None, read_issues=None, read_recorded=None, modules=None,
+           log=print):
+    """Classify every open PR in `repo` and print one row each plus a fully-seeded summary.
+
+    READ-ONLY BY CONSTRUCTION: there is no writer here and no `--apply` reaches it. It also needs
+    no secret — the account hash is the only field the salt touches and the census never prints a
+    hash, so it decides with a PER-RUN EPHEMERAL salt. A census run therefore cannot disclose
+    PROVENANCE_SALT even by accident, and its verdicts are provably independent of it.
+
+    Every reader is injectable so `--self-test` drives this orchestration and not just its parts.
+    A reader that FAILS raises (MintError from `_gh_json`) — an unreadable population must never
+    be reported as an empty one."""
+    env = os.environ if env is None else env
+    worker_pr, dispatch_claim, lease_schema = modules or (
+        _load_worker_pr(), _load_dispatch_claim(), _load_lease_schema())
+    read_pulls = read_pulls or (lambda: _gh_json(
+        ["api", "--paginate", f"repos/{repo}/pulls?state=open&per_page=100"]))
+    read_issues = read_issues or (lambda: _gh_json(
+        ["api", "--paginate", f"repos/{repo}/issues?state=open&per_page=100"]))
+    if read_recorded is None:
+        def read_recorded():
+            return recorded_pr_numbers(repo, registry_repo, worker_pr)
+
+    pulls = read_pulls() or []
+    rows = read_issues() or []
+    # PLAN's own issue-label map covers ISSUES, not pull-request rows (registry #112) — the same
+    # exclusion `issue_mint_refusal` refuses a PR-as-source-issue for. Applied here so a candidate
+    # that is really a PR is reported as "not an OPEN issue" by the same reasoning.
+    open_issues = {row.get("number"): row for row in rows
+                   if isinstance(row, dict) and "pull_request" not in row}
+    recorded = read_recorded()
+    stamp = mint_stamp(env.get("GITHUB_RUN_ID"), env.get("GITHUB_RUN_ATTEMPT"),
+                       dispatch_claim.ORCHESTRATOR_CLASS)
+    # The census reports what a mint WOULD decide, so it must be told when the stamp itself is
+    # unavailable rather than reporting every PR as unmintable for a reason the operator cannot see.
+    if stamp is None:
+        raise MintError("no runner run identity (GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT): the census "
+                        "reports what a mint would decide, and a mint cannot be decided without "
+                        "the stamp this run would write")
+    salt = os.urandom(16).hex()
+    tally = Counter({verdict: 0 for verdict in CENSUS_VERDICTS})
+    out = []
+    for pull in sorted((p for p in pulls if isinstance(p, dict)),
+                       key=lambda p: p.get("number") if isinstance(p.get("number"), int) else 0):
+        verdict, detail = census_verdict(
+            repo, pull, open_issues, enrolled_authors, routing, stamp, salt, recorded=recorded,
+            impl_alias=impl_alias,
+            attestation_class=dispatch_claim.provenance_attestation_class,
+            orchestrator_class=dispatch_claim.ORCHESTRATOR_CLASS,
+            plan_package=lease_schema.plan_package, global_package=lease_schema.GLOBAL_PACKAGE,
+            account_hash=worker_pr.account_hash, json_type_exact=worker_pr._json_type_exact,
+            enumerate_review_items=dispatch_claim.enumerate_review_items, now=time.time(),
+            hold_labels=dispatch_claim.HUMAN_HOLD_PR_LABELS,
+            park_label=dispatch_claim.MACHINE_PARK_PR_LABEL)
+        tally[verdict] += 1
+        out.append((pull.get("number"), verdict, detail))
+        log(f"census {repo}#{pull.get('number')}: {verdict} — {detail}")
+    # EVERY bucket, including the zeros: "nothing is mintable" and "this stopped being counted"
+    # must not print the same way (the population-census rule this repo already applies at PLAN).
+    log("census summary: " + ", ".join(f"{verdict}={tally[verdict]}" for verdict in CENSUS_VERDICTS)
+        + f", open_prs={len(out)}")
+    return out
+
+
+def recorded_pr_numbers(repo, registry_repo, worker_pr, read_listing=None):
+    """The PR numbers that ALREADY hold a provenance record, from ONE ledger directory listing.
+
+    Both the directory and the per-repo filename prefix are derived from the PRODUCTION path
+    builder (`worker_pr.provenance_path`), never spelled out here — so a record for a DIFFERENT
+    target repo in the same directory can never be counted as one of this repo's PRs, and a
+    renamed layout reds this rather than silently matching nothing.
+
+    RAISES on an unreadable listing rather than returning an empty set: "no record exists" and
+    "I could not tell" must never be the same answer, which is the fail-open shape backfill's
+    sol #217 review found on this exact read."""
+    template = worker_pr.provenance_path(repo, "")           # ".../<owner>--<name>--pr.json"
+    directory, _, filename = template.rpartition("/")
+    stem = filename[:-len(".json")] if filename.endswith(".json") else filename
+    numbered = re.compile(rf"{re.escape(stem)}([1-9][0-9]*)\.json")
+    read_listing = read_listing or (lambda: _gh_json(
+        ["api", f"repos/{registry_repo}/contents/{directory}?ref={worker_pr.LEDGER_REF}"]))
+    listing = read_listing()
+    if not isinstance(listing, list):
+        raise MintError("the ledger provenance listing was not a directory listing")
+    numbers = set()
+    for entry in listing:
+        name = entry.get("name") if isinstance(entry, dict) else None
+        match = numbered.fullmatch(name or "")
+        if match:
+            numbers.add(int(match.group(1)))
+    return numbers
 
 
 # ---- workflow seam (PyYAML-parsed; a `run:` predicate is not a testable predicate) -------------
@@ -598,6 +913,14 @@ def mint_workflow_seam_report(workflow=None):
     guard = str(job.get("if") or "")
     self_at = run.find("mint-provenance.py --self-test")
     invoke_at = run.find('mint-provenance.py "${args[@]}"')
+    census_at = run.find("mint-provenance.py --census")
+    # Every OTHER invocation of the script in this step, so "the self-test runs first" is a fact
+    # about the whole step and not about the one invocation that happened to be checked when the
+    # step had one. A new mode added below without a self-test in front of it reds this.
+    other_invocations = [match.start() for match in
+                         re.finditer(r"python3 scripts/mint-provenance\.py(?! --self-test)", run)]
+    guards_at = [match.start() for match in
+                 re.finditer(r'\[\[\s*"\$(?:PR|ISSUE)_NUMBER"\s*=~', run)]
     step_env = {key: str(value) for key, value in ((step or {}).get("env") or {}).items()}
     return {
         # The salt is a secret: a modified branch copy of this workflow must never see it.
@@ -610,6 +933,26 @@ def mint_workflow_seam_report(workflow=None):
         "step_unconditional": step is not None and "if" not in step,
         "errexit": "set -euo pipefail" in run,
         "self_test_before_mint": 0 <= self_at < invoke_at,
+        "self_test_before_every_invocation": bool(other_invocations) and 0 <= self_at < min(
+            other_invocations),
+        # ---- THE MODE SEAM (#681's lesson, applied to this file) --------------------------------
+        # #681's YAML battery PINNED mode="review" in its harness, which left its own dispatch-input
+        # validation load-bearing and untested. So every clause of the mode branch here is a NAMED
+        # finding with its own mutant: the allowlist, the census-is-read-only refusal, the `exec`
+        # that stops census from reaching the write levers, and the two input guards the census
+        # branch legitimately skips — which must therefore still stand between it and the mint.
+        "mode_is_allowlisted": bool(re.search(r'case\s+"\$MODE"\s+in', run))
+                               and bool(re.search(r"census\|mint\s*\)", run))
+                               and bool(re.search(r"\*\)[^\n]*exit 1", run)),
+        "mode_default": inputs.get("mode", {}).get("default"),
+        "mode_options": sorted(inputs.get("mode", {}).get("options") or []),
+        "census_refuses_apply": bool(re.search(
+            r'if\s*\[\[\s*"\$APPLY"\s*==\s*"true"\s*\]\]\s*;\s*then[^\n]*exit 1', run)),
+        # A `call` would return and fall through to the `args+=(--apply)` lines; `exec` cannot.
+        "census_invocation_execs": bool(re.search(
+            r"^\s*exec python3 scripts/mint-provenance\.py --census\b", run, re.M)),
+        "census_before_input_guards": 0 <= census_at < min(guards_at, default=-1),
+        "input_guards_before_mint": len(guards_at) == 2 and max(guards_at) < invoke_at,
         # Both write levers are conditional on their OWN input, and both default to the no-op.
         "apply_is_conditional": bool(
             re.search(r'\[\[\s*"\$APPLY"\s*==\s*"true"\s*\]\].*args\+=\(--apply\)', run)),
@@ -941,6 +1284,191 @@ def _self_test():                                                       # noqa: 
                                         dispatch_claim.provenance_admission_error) is not None,
           True)
 
+    # ---- THE DELIVERY GATE: a mint that delivers no review is a defect, not a success ----------
+    # THE MEASURED DEFECT (live enrolled repo, 2026-07-28): of 36 open PRs exactly THREE passed
+    # every gate in this file, and ALL THREE carried `needs:user`. `admissible_by_the_review_lane`
+    # said yes to all three, because it asks about the RECORD. The enumerator discards all three.
+    def delivers(**over):
+        payload = pull(**over.pop("pull_over", {}))
+        return delivery_refusal(
+            repo, over.pop("document", minted.document), payload,
+            over.pop("source_labels", ["area:ci"]), over.pop("enrolled", enrolled),
+            enumerate_review_items=over.pop(
+                "enumerator", dispatch_claim.enumerate_review_items),
+            now=1_800_000_000, hold_labels=dispatch_claim.HUMAN_HOLD_PR_LABELS,
+            park_label=dispatch_claim.MACHINE_PARK_PR_LABEL, **over)
+
+    # The POSITIVE leg first: without it every refusal below could be "this always refuses".
+    check("an enrolled, unheld orchestrator PR IS delivered into the review lane", delivers(), None)
+    for hold in sorted(dispatch_claim.HUMAN_HOLD_PR_LABELS):
+        rejects(f"a PR carrying {hold!r} is REFUSED — the mint would deliver nothing",
+                "does not enumerate it",
+                lambda h=hold: delivers(pull_over={"labels": [{"name": h}]}))
+    rejects("...and the hint names the label the operator has to clear", "human-owned hold",
+            lambda: delivers(pull_over={"labels": [{"name": "needs:user"}]}))
+    rejects("a machine-parked PR is refused too", "does not enumerate it",
+            lambda: delivers(pull_over={
+                "labels": [{"name": dispatch_claim.MACHINE_PARK_PR_LABEL}]}))
+    # The HINT is asserted where it lives, so its coverage is not hostage to which channel happened
+    # to supply the reason (the enumerator records one only for signalled PRs — and the enrollable
+    # population is exactly the unsignalled one, which is why the hint exists at all).
+    for labels, needle in ((["needs:user"], "human-owned hold"),
+                           ([dispatch_claim.MACHINE_PARK_PR_LABEL], "machine park")):
+        got = _delivery_hint(pull(labels=[{"name": name} for name in labels]), [],
+                             dispatch_claim.HUMAN_HOLD_PR_LABELS,
+                             dispatch_claim.MACHINE_PARK_PR_LABEL)
+        check(f"the hint names {labels[0]!r} as the thing to clear", needle in got, True)
+    check("the hint names a parked SOURCE ISSUE too",
+          "machine-parked" in _delivery_hint(pull(), ["status:parked"],
+                                            dispatch_claim.HUMAN_HOLD_PR_LABELS,
+                                            dispatch_claim.MACHINE_PARK_PR_LABEL), True)
+    check("...and says so honestly when it cannot tell, pointing at the census",
+          "--census" in _delivery_hint(pull(), [], dispatch_claim.HUMAN_HOLD_PR_LABELS,
+                                       dispatch_claim.MACHINE_PARK_PR_LABEL), True)
+    rejects("a needs:* hold on the SOURCE ISSUE is refused (the enumerator's own predicate)",
+            "does not enumerate it",
+            lambda: delivers(source_labels=["area:ci", "needs:user"]))
+    rejects("an UN-ENROLLED author is refused here too — the waiver is what makes it enumerable",
+            "does not enumerate it", lambda: delivers(enrolled=()))
+    # FAIL-CLOSED on the consumer itself: an enumerator that raises is not an admission.
+    def _exploding_enumerator(*_a, **_k):
+        raise RuntimeError("PLAN walk aborted")
+
+    rejects("an enumerator that RAISES is a refusal, never a pass", "could not classify",
+            lambda: delivers(enumerator=_exploding_enumerator))
+    # ...and the decision is the ENUMERATOR's, not the hint's: an enumerator that admits everything
+    # makes this pass even for a PR the hint would happily explain away, which is what pins the hint
+    # as advisory. (Both directions matter — the check above pins the other one.)
+    check("the verdict follows the enumerator, not the hint",
+          delivers(pull_over={"labels": [{"name": "needs:user"}]},
+                   enumerator=lambda *_a, **_k: [{"pr_number": 41}]), None)
+    # AND IT IS WIRED. mint() must refuse a held PR end to end — a delivery predicate nothing calls
+    # is the vacuity shape this repo keeps measuring.
+    decision, written = run_mint(apply_changes=True,
+                                 pull_over={"labels": [{"name": "needs:user"}]})
+    check("mint() REFUSES a human-held PR and writes nothing", (decision.action, written),
+          (ACTION_REFUSE, []))
+    check("...naming the delivery, not the record", "deliver NO review" in decision.reason, True)
+    check("...and the record itself was admissible, which is why the record check missed it",
+          admissible_by_the_review_lane(minted.document, 41,
+                                        dispatch_claim.provenance_admission_error), None)
+    decision, written = run_mint(issue_over={"labels": [{"name": "area:ci"},
+                                                        {"name": "status:parked"}]})
+    check("a machine-parked SOURCE ISSUE is refused before the record check even needs to run",
+          decision.action, ACTION_REFUSE)
+
+    # ---- THE CENSUS: one disjoint verdict per open PR, decided by the production functions -----
+    census_pulls = [
+        pull(number=41, title="fix: a (#7)", body="closes #7"),                    # mintable
+        pull(number=42, title="fix: b (#7)", body="closes #7",
+             labels=[{"name": "needs:user"}]),                                    # dead
+        pull(number=43, title="fix: c (#999)", body="closes #999"),                # no open issue
+        pull(number=44, title="fix: d", body="no reference at all"),               # names nothing
+        pull(number=45, title="fix: e (#7)", body="closes #7",
+             head={"ref": "sparq-agent/issue-7-1-1"}),                             # other lane
+        pull(number=46, title="fix: f (#7)", body="closes #7"),                    # already recorded
+    ]
+
+    census_issues = [issue(), {"number": 8, "state": "open", "pull_request": {"url": "x"},
+                               "labels": []}]
+
+    def run_census(*, env=None, pulls=None, issues=None, recorded=frozenset({46}),
+                   authors=None):
+        rows = []
+        result = census(
+            repo, "reg/istry", routing, enrolled if authors is None else authors,
+            env=good_env if env is None else env,
+            read_pulls=lambda: census_pulls if pulls is None else pulls,
+            read_issues=lambda: census_issues if issues is None else issues,
+            read_recorded=lambda: recorded, modules=modules, log=rows.append)
+        return result, rows
+
+    verdicts, lines = run_census()
+    check("every open PR gets exactly ONE verdict, and they are the expected disjoint set",
+          [(number, verdict) for number, verdict, _ in verdicts],
+          [(41, CENSUS_MINTABLE), (42, CENSUS_DEAD), (43, CENSUS_NO_ISSUE),
+           (44, CENSUS_NO_ISSUE), (45, CENSUS_OTHER_LANE), (46, CENSUS_RECORDED)])
+    check("...and the MINTABLE row tells the operator the exact issue to pass",
+          [detail for number, _, detail in verdicts if number == 41], ["mint with --issue 7"])
+    check("...and the DEAD row says the mint would deliver nothing",
+          all(marker in next(d for n, _, d in verdicts if n == 42)
+              for marker in ("binds", "does not enumerate")), True)
+    summary = next(line for line in lines if line.startswith("census summary:"))
+    check("the summary seeds EVERY bucket at zero, so 'none' and 'not counted' differ",
+          all(f"{verdict}=" in summary for verdict in CENSUS_VERDICTS), True)
+    check("...and counts the whole population it walked", "open_prs=6" in summary, True)
+    # The refusal summary is BOUNDED but never silently truncated, and it puts the FIXABLE reason
+    # first — the closed/absent lines are the ones a PR body full of cross-references generates.
+    _many = ([f"#{n}: not an OPEN issue in this repo" for n in range(20)]
+             + ["#99: source issue #99 reduces to the serializing __global__ partition"])
+    _rendered = summarise_refusals(_many)
+    check("the refusal summary leads with the FIXABLE reason, not the closed ones",
+          _rendered.startswith("#99: source issue #99 reduces"), True)
+    check("...names how many candidates it did not show", "(+18 more candidate(s), 20 of them "
+          "closed/absent)" in _rendered, True)
+    check("...and is bounded", _rendered.count("; ") < len(_many), True)
+    check("no candidates at all says so", summarise_refusals([]),
+          "the PR's title and body name no #<n> at all")
+    # A candidate that is really a PULL REQUEST is not an open issue for this purpose (#112).
+    check("a `#<n>` that resolves to a PULL REQUEST is not offered as a candidate",
+          census_verdict(repo, pull(number=47, title="fix: g (#8)", body="closes #8"),
+                         {8: {"number": 8, "state": "open", "pull_request": {"url": "x"},
+                              "labels": []}},
+                         enrolled, routing, "orchestrator:9.1", "s",
+                         attestation_class=attestation_class,
+                         orchestrator_class=orchestrator_class,
+                         plan_package=lease_schema.plan_package,
+                         global_package=lease_schema.GLOBAL_PACKAGE,
+                         account_hash=worker_pr.account_hash,
+                         json_type_exact=worker_pr._json_type_exact,
+                         enumerate_review_items=dispatch_claim.enumerate_review_items,
+                         now=1_800_000_000)[0],
+          CENSUS_NO_ISSUE)
+    # The census must never print a hash — it is the ONE surface that walks the whole population,
+    # and the record's privacy decision (22a) is that a login's hash is only ever written, never
+    # reported alongside anything that identifies it.
+    check("no census line prints an account hash",
+          any(minted.document["impl_account_h"] in line for line in lines), False)
+    # ...and it needs no secret to decide: the ephemeral salt is why that is a PROPERTY.
+    _, lines_nosalt = run_census(env=_Env({"GITHUB_RUN_ID": "555", "GITHUB_RUN_ATTEMPT": "1"}))
+    check("the census decides identically with NO PROVENANCE_SALT in the environment",
+          [line for line in lines_nosalt if line.startswith("census ")],
+          [line for line in lines if line.startswith("census ")])
+    # A missing run identity is the one thing the census cannot report around: it decides what a
+    # MINT would decide, and a mint has no stamp without it. Loud, never a page of false refusals.
+    try:
+        run_census(env=_Env({"PROVENANCE_SALT": "s"}))
+    except MintError as exc:
+        check("a census with no runner run identity RAISES rather than refusing every PR",
+              "stamp" in str(exc), True)
+    else:
+        check("a census with no runner run identity RAISES rather than refusing every PR",
+              "no raise", "MintError")
+    # DISCOVERY may never propose a candidate the BINDING test would refuse for a boundary reason:
+    # both read `#<n>` through the same two shared constants.
+    _boundary = pull(title="see #412 and x#41 and (#41).", body="also #7")
+    check("discovery and the binding test agree on every boundary",
+          [n for n in referenced_issue_numbers(_boundary) if not references_issue(_boundary, n)],
+          [])
+    check("...and discovery finds exactly the word-bounded references",
+          referenced_issue_numbers(_boundary), [7, 41, 412])
+    # The recorded-PR reader is derived from the PRODUCTION path builder, so a record for ANOTHER
+    # target repo sharing the directory can never be counted as one of this repo's PRs.
+    _listing = [{"name": worker_pr.provenance_path(repo, 685).rpartition("/")[2]},
+                {"name": worker_pr.provenance_path("other/repo", 999).rpartition("/")[2]},
+                {"name": "README.md"}, {"name": None}]
+    check("the recorded-PR reader counts THIS repo's records only",
+          recorded_pr_numbers(repo, "reg/istry", worker_pr, read_listing=lambda: _listing), {685})
+    try:
+        recorded_pr_numbers(repo, "reg/istry", worker_pr,
+                            read_listing=lambda: {"message": "Not Found"})
+    except MintError as exc:
+        check("...and an unreadable listing RAISES rather than reading as 'nothing recorded'",
+              "directory listing" in str(exc), True)
+    else:
+        check("...and an unreadable listing RAISES rather than reading as 'nothing recorded'",
+              "no raise", "MintError")
+
     # ---- the enrolment ordering constraint ----------------------------------------------------
     # [#657 enable] This assertion used to read "the shipped policy enrols NOBODY" — the correct
     # statement while the minting path shipped ahead of the enable. The enable has now landed, and
@@ -985,6 +1513,19 @@ def _self_test():                                                       # noqa: 
     check("the mint step is unconditional", seam["step_unconditional"], True)
     check("the mint step is errexit", seam["errexit"], True)
     check("the self-test runs BEFORE the mint", seam["self_test_before_mint"], True)
+    check("...and before EVERY invocation, not just the mint one",
+          seam["self_test_before_every_invocation"], True)
+    check("mode is an allowlist, and an unrecognised mode exits non-zero",
+          seam["mode_is_allowlisted"], True)
+    check("...over exactly the two modes", seam["mode_options"], ["census", "mint"])
+    check("...defaulting to the READ-ONLY one", seam["mode_default"], "census")
+    check("census refuses apply=true rather than ignoring it", seam["census_refuses_apply"], True)
+    check("the census invocation EXECs, so it can never reach the --apply assembly",
+          seam["census_invocation_execs"], True)
+    check("the census branch is taken BEFORE the pr/issue guards it legitimately skips",
+          seam["census_before_input_guards"], True)
+    check("...and both guards still stand between that branch and the mint",
+          seam["input_guards_before_mint"], True)
     check("--apply is conditional on its own input", seam["apply_is_conditional"], True)
     check("dispatch defaults to a dry run", seam["dispatch_default_is_dry_run"], False)
     check("--allow-global-partition is conditional on its own input",
@@ -1000,6 +1541,7 @@ def _self_test():                                                       # noqa: 
           seam["step_env_bindings"], {
               "GH_TOKEN": "${{ github.token }}",
               "PROVENANCE_SALT": "${{ secrets.PROVENANCE_SALT }}",
+              "MODE": "${{ inputs.mode }}",
               "TARGET_REPO": "${{ inputs.target_repo }}",
               "PR_NUMBER": "${{ inputs.pr_number }}",
               "ISSUE_NUMBER": "${{ inputs.issue_number }}",
@@ -1035,6 +1577,44 @@ def _self_test():                                                       # noqa: 
     def wf_inputs(doc):
         return (doc.get("on") if "on" in doc else doc.get(True))["workflow_dispatch"]["inputs"]
 
+    def replace_in_run(doc, old, new):
+        """DISABLE-rather-than-delete: leave the line in place and make it inert. `if False`'s
+        shell equivalents (a never-failing test, a `*)` that stops exiting) survive both a grep
+        AND a comment-stripper, so they are the mutants a comment-only battery cannot see."""
+        step = mint_step(doc)
+        text = str(step["run"])
+        assert text.count(old) == 1, f"seam mutant fragment not unique: {old!r}"
+        step["run"] = text.replace(old, new)
+
+    def prepend_to_run(doc, text):
+        step = mint_step(doc)
+        body = str(step["run"])
+        head, _, tail = body.partition("set -euo pipefail\n")
+        assert tail, "seam mutant anchor `set -euo pipefail` not found"
+        step["run"] = head + "set -euo pipefail\n" + text + tail
+
+    def move_guards_after_mint(doc):
+        """Reordering is not a deletion, and no fragment check can see it: both guards stay in the
+        script, spelled exactly as they are, but now run AFTER the mint they were guarding."""
+        step = mint_step(doc)
+        lines = str(step["run"]).splitlines(keepends=True)
+        guards = [line for line in lines if re.search(r'\[\[ "\$(?:PR|ISSUE)_NUMBER" =~', line)]
+        assert len(guards) == 2, guards
+        rest = [line for line in lines if line not in guards]
+        step["run"] = "".join(rest + guards)
+
+    def swap_census_below_guards(doc):
+        """The census branch (which legitimately skips the two guards) moved BELOW them, so a
+        census run would be refused by a guard that does not apply to it."""
+        step = mint_step(doc)
+        body = str(step["run"])
+        start = body.index('if [[ "$MODE" == "census" ]]; then')
+        end = body.index("\n", body.index("--routing-file \"$ROUTING_FILE\"", start))
+        end = body.index("\n", body.index("fi", end)) + 1
+        branch, rest = body[start:end], body[:start] + body[end:]
+        anchor = rest.index("args=(--target-repo")
+        step["run"] = rest[:anchor] + branch + rest[anchor:]
+
     for name, edit, key, want in (
             ("the job is neutered with if: false",
              lambda d: d["jobs"]["mint"].update(**{"if": "false"}), "job_ref_guarded", False),
@@ -1065,7 +1645,40 @@ def _self_test():                                                       # noqa: 
              lambda d: comment_out_line(d, "args+=(--allow-global-partition)"),
              "global_is_conditional", False),
             ("set -euo pipefail survives only as a comment",
-             lambda d: comment_out_line(d, "set -euo pipefail"), "errexit", False)):
+             lambda d: comment_out_line(d, "set -euo pipefail"), "errexit", False),
+            # ---- THE MODE SEAM: one mutant per clause, each reding a NAMED finding -------------
+            # DELETE and DISABLE are different mutants and are both taken: the `case` allowlist is
+            # commented out (deleted) AND widened to a never-refusing catch-all (inert).
+            ("the mode allowlist survives only as a comment",
+             lambda d: comment_out_line(d, 'case "$MODE" in'), "mode_is_allowlisted", False),
+            ("the mode allowlist's refusal branch is made INERT (`*)` stops exiting)",
+             lambda d: replace_in_run(d, "*) echo '::error::mode must be exactly census or mint'; "
+                                      "exit 1 ;;", "*) ;;"), "mode_is_allowlisted", False),
+            ("the census read-only refusal survives only as a comment",
+             lambda d: comment_out_line(d, 'if [[ "$APPLY" == "true" ]]; then echo '
+                                        "'::error::census is read-only"),
+             "census_refuses_apply", False),
+            ("the census invocation loses its `exec` (it would fall through to --apply)",
+             lambda d: replace_in_run(d, "exec python3 scripts/mint-provenance.py --census",
+                                      "python3 scripts/mint-provenance.py --census"),
+             "census_invocation_execs", False),
+            ("the pr_number guard survives only as a comment",
+             lambda d: comment_out_line(d, '[[ "$PR_NUMBER" =~'), "input_guards_before_mint",
+             False),
+            ("the issue_number guard survives only as a comment",
+             lambda d: comment_out_line(d, '[[ "$ISSUE_NUMBER" =~'), "input_guards_before_mint",
+             False),
+            ("the pr_number guard is made INERT (a never-failing pattern)",
+             lambda d: replace_in_run(d, '[[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]',
+                                      '[[ "$PR_NUMBER" == "$PR_NUMBER" ]]'),
+             "input_guards_before_mint", False),
+            ("the input guards are moved BELOW the mint invocation",
+             lambda d: move_guards_after_mint(d), "input_guards_before_mint", False),
+            ("the census branch is moved BELOW the guards it skips",
+             lambda d: swap_census_below_guards(d), "census_before_input_guards", False),
+            ("a second invocation appears with no self-test in front of it",
+             lambda d: prepend_to_run(d, "python3 scripts/mint-provenance.py --census\n"),
+             "self_test_before_every_invocation", False)):
         check(f"YAML-seam mutant reds: {name}", mutated(edit)[key], want)
     # The wrong-input seam needs a value comparison rather than a boolean.
     check("YAML-seam mutant reds: APPLY is bound to the WRONG input",
@@ -1094,32 +1707,53 @@ def main():
     parser.add_argument("--registry-repo", help="owner/name of THIS registry repository")
     parser.add_argument("--pr", type=int, help="the orchestrator PR to mint a record for")
     parser.add_argument("--issue", type=int, help="the open source issue the PR names")
-    parser.add_argument("--impl-alias", default="opus5",
+    parser.add_argument("--impl-alias", default=DEFAULT_IMPL_ALIAS,
                         help="the implementing model alias; must resolve to "
                              f"{ORCHESTRATOR_IMPL_PROVIDER} in the target routing catalog")
     parser.add_argument("--routing-file", help="path to the target's routing.toml")
     parser.add_argument("--apply", action="store_true", help="write the record (default: dry run)")
+    parser.add_argument("--census", action="store_true",
+                        help="READ-ONLY: classify every open PR in the target — which ones this "
+                             "writer can serve, and which would deliver no review. Writes "
+                             "nothing, and is incompatible with --apply")
     parser.add_argument("--allow-global-partition", action="store_true",
                         help="accept a source issue that reduces to the serializing "
                              "__global__ partition")
     args = parser.parse_args()
     if args.self_test:
         return _self_test()
-    missing = [name for name in ("target_repo", "registry_repo", "pr", "issue", "routing_file")
-               if not getattr(args, name)]
-    if missing:
-        parser.error("missing required argument(s): "
-                     + ", ".join("--" + name.replace("_", "-") for name in missing))
     import tomllib
 
-    with open(args.routing_file, "rb") as handle:
-        routing = tomllib.load(handle)
-    policy_resolve = _load_policy_resolve()
-    with open(SCRIPTS_DIR.parent / "policy" / "repos.toml", "rb") as handle:
-        policy_doc = tomllib.load(handle)
-    # The MASTER-protected half. `review_enrolment_authors` validates the whole policy row, so a
-    # malformed or non-canonical list raises here rather than silently resolving to "nobody".
-    enrolled_authors = policy_resolve.review_enrolment_authors(args.target_repo, policy_doc)
+    def _require(*names):
+        missing = [name for name in names if not getattr(args, name)]
+        if missing:
+            parser.error("missing required argument(s): "
+                         + ", ".join("--" + name.replace("_", "-") for name in missing))
+
+    def _resolve_policy():
+        with open(args.routing_file, "rb") as handle:
+            routing = tomllib.load(handle)
+        policy_resolve = _load_policy_resolve()
+        with open(SCRIPTS_DIR.parent / "policy" / "repos.toml", "rb") as handle:
+            policy_doc = tomllib.load(handle)
+        # The MASTER-protected half. `review_enrolment_authors` validates the whole policy row, so
+        # a malformed or non-canonical list raises here rather than silently resolving to "nobody".
+        return routing, policy_resolve.review_enrolment_authors(args.target_repo, policy_doc)
+
+    if args.census:
+        # READ-ONLY, refused rather than silently ignored: an operator who asked for both meant one
+        # of them, and guessing which is how a "just show me" gesture writes to the ledger.
+        if args.apply:
+            parser.error("--census never writes: it is incompatible with --apply")
+        _require("target_repo", "registry_repo", "routing_file")
+        routing, enrolled_authors = _resolve_policy()
+        census(args.target_repo, args.registry_repo, routing, enrolled_authors,
+               impl_alias=args.impl_alias)
+        # A census that finds nothing mintable is a REPORT, not a failure — the summary line is the
+        # finding. Only an unreadable population fails, and that raises MintError above.
+        return 0
+    _require("target_repo", "registry_repo", "pr", "issue", "routing_file")
+    routing, enrolled_authors = _resolve_policy()
     decision = mint(args.target_repo, args.pr, args.issue, args.impl_alias, args.registry_repo,
                     routing, enrolled_authors, apply_changes=args.apply,
                     allow_global_partition=args.allow_global_partition)

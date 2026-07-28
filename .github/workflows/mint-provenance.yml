@@ -19,27 +19,46 @@
 #
 # DRY RUN unless apply=true. Every refusal leaves the PR with no record, i.e. exactly as invisible
 # to the review lane as it is today — never a per-tick refusal loop.
+#
+# TWO MODES, and `census` is the DEFAULT because it is the read-only one. Between #876 landing this
+# writer and 2026-07-28 it was dispatched ZERO times and there were ZERO orchestrator-attested
+# records on `ledger`: the writer was fine (its first dispatch succeeded) but nothing COUNTED the
+# class, so the only way to learn which PR the gesture could serve was one dispatch per (PR,
+# candidate issue) guess. `mode=census` answers that in one read-only run, over the live population,
+# using the same production decision `mode=mint` uses.
 name: mint-provenance
-run-name: mint-provenance ${{ inputs.target_repo }}#${{ inputs.pr_number }} apply=${{ inputs.apply }}
+run-name: >-
+  mint-provenance ${{ inputs.mode }} ${{ inputs.target_repo }}#${{ inputs.pr_number }}
+  apply=${{ inputs.apply }}
 
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: >-
+          census = READ-ONLY: classify every open PR (which can be minted for, and which would
+          deliver no review). mint = write one record for pr_number/issue_number.
+        required: true
+        default: census
+        type: choice
+        options: [census, mint]
       target_repo:
         description: Target owner/repository (must be enabled in policy/repos.toml)
         required: true
-        default: sparq-org/sparq
+        # The ENROLLED repo, not the denser one: `review_enrolment_authors` is master-protected and
+        # names only this repo today, so a default dispatch at any other target can only refuse.
+        default: jeswr/agent-account-registry
         type: string
       pr_number:
-        description: The orchestrator-authored pull request to mint a record for
-        required: true
+        description: The orchestrator-authored pull request to mint a record for (mode=mint only)
+        required: false
         type: string
       issue_number:
         description: >-
-          The OPEN source issue the PR names. It decides the lease partition the review reserves
-          and the human-hold surface that can park it, so it must be a real open issue (not a PR)
-          that the pull request references.
-        required: true
+          The OPEN source issue the PR names (mode=mint only). It decides the lease partition the
+          review reserves and the human-hold surface that can park it, so it must be a real open
+          issue (not a PR) that the pull request references.
+        required: false
         type: string
       impl_alias:
         description: >-
@@ -126,11 +145,14 @@ jobs:
               out.write(f"routing_file=target-routing/{routing}\n")
           PY
 
-      - name: Mint (self-test first; dry run unless apply=true)
+      - name: Census or mint (self-test first; dry run unless apply=true)
         env:
           GH_TOKEN: ${{ github.token }}
           # Raw logins never appear beside their hash — the script prints only the salted hash.
+          # The CENSUS never prints a hash at all and decides with a per-run ephemeral salt, so a
+          # census run cannot disclose this value even by accident.
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+          MODE: ${{ inputs.mode }}
           TARGET_REPO: ${{ inputs.target_repo }}
           PR_NUMBER: ${{ inputs.pr_number }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
@@ -140,9 +162,24 @@ jobs:
           ROUTING_FILE: ${{ steps.policy.outputs.routing_file }}
         run: |
           set -euo pipefail
+          # A `choice` input is enforced by the API, but this workflow is also the thing a
+          # repository_dispatch/reusable caller could grow later — an unrecognised mode must never
+          # fall through to the write path, so the modes are an allowlist here too.
+          case "$MODE" in
+            census|mint) ;;
+            *) echo '::error::mode must be exactly census or mint'; exit 1 ;;
+          esac
+          python3 scripts/mint-provenance.py --self-test
+          if [[ "$MODE" == "census" ]]; then
+            if [[ "$APPLY" == "true" ]]; then echo '::error::census is read-only: set apply=false'; exit 1; fi
+            # `exec` and not a call: the census path REPLACES this shell, so no later line of this
+            # script — including the two that assemble `--apply` — can be reached from census mode.
+            exec python3 scripts/mint-provenance.py --census --target-repo "$TARGET_REPO" \
+                 --registry-repo "$GITHUB_REPOSITORY" --impl-alias "$IMPL_ALIAS" \
+                 --routing-file "$ROUTING_FILE"
+          fi
           [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo '::error::pr_number must be a positive integer'; exit 1; }
           [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo '::error::issue_number must be a positive integer'; exit 1; }
-          python3 scripts/mint-provenance.py --self-test
           args=(--target-repo "$TARGET_REPO" --registry-repo "$GITHUB_REPOSITORY" \
                 --pr "$PR_NUMBER" --issue "$ISSUE_NUMBER" --impl-alias "$IMPL_ALIAS" \
                 --routing-file "$ROUTING_FILE")
