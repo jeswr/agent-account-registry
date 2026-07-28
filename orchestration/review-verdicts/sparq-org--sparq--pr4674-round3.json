@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4674,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "17cfb3e23403a15d3ec2397511a09dc158d213ec",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`char_sets_complete_for` sorts each key but does not reject or deduplicate repeated predicates within one `CharSet`. The public `SourceDescriptorBuilder::char_set` also sorts without deduplicating. Thus `{p}` and malformed `{p,p}` are considered distinct keys even though both represent the same predicate set; their subject counts are both added once by `char_set_has`. Supplying `{p}` plus `{p,p}`, and likewise `{q}` plus `{q,q}`, can balance both `distinct_subjects` totals while omitting the real `{p,q}` cohort. The guard then reports both summaries complete and Rule C2 emits a dead pairing, potentially pruning a live combination. This is the same recall-safety invariant as the prior duplicate-key issue, but the current normalization does not cover this publicly constructible encoding.",
+    "file": "crates/sparq-fedplan-mpc/src/combination.rs",
+    "fix_hint": "Before using characteristic sets as partition evidence, reject any key containing a duplicate predicate (or canonicalize each key as a mathematical set and then perform the existing duplicate-key rejection). Add a non-vacuous negative test using `{p}`, `{p,p}`, `{q}`, and `{q,q}` with balanced predicate totals and no served co-occurrence key; assert that no dead pairing is emitted.",
+    "severity": "major",
+    "title": "Duplicate predicates within a characteristic-set key bypass the partition guard"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Both round-two findings are substantially addressed: pattern ids are now required to form a permutation, and repeated exact characteristic-set keys make the completeness guard decline. However, the public builder still accepts a characteristic-set key containing the same predicate more than once, and the new guard treats that malformed multiset as distinct from the corresponding proper set. This permits the same double-counting counterexample through a slightly different representation and can make Rule C2 suppress a live combination. Because this is a newly identified major variant after a clean prior issue list was not achieved, progress is regressing under the mandated scale.",
+  "verdict": "request_changes"
+ }
+}
