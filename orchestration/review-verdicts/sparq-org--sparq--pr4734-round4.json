@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4734,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6dad83ee3ad4ee7d93b2756e78c0e6af72a39edf",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Report::total_derived is documented to receive no contribution from incremental maintenance, but MaterializedOwlGraph::rematerialize delegates to materialize_owl_rl while the same thread-local profiler is active. Its round() calls and final reconcile_total() therefore add the full fallback rebuild's derived count to the enclosing incremental report. That count can include consequences already visible before the triggering mutation and is not the mutation's net closure change. Direct counting-mode maintenance reports zero, so accounting remains path-dependent. The fallback integration test still does not assert report.total_derived().",
+    "file": "crates/sparq-reason/src/profile.rs",
+    "fix_hint": "Isolate or suppress total_derived accounting for the delegated batch materialization when it runs as an incremental fallback, while preserving the intended INCREMENTAL_REBUILD timing and explicitly chosen progress-tick behavior. Strengthen an_owl_fallback_rebuild_ticks_the_batch_run_it_delegates_to with pre-existing derived facts and assert report.total_derived() == 0. Alternatively, revise the public contract and expose rebuild accounting in a distinct operation-aware field so rebuilt facts cannot be mistaken for incremental net-new consequences.",
+    "severity": "major",
+    "title": "Fallback rebuilds still count the rebuilt closure as incremental derived facts"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3's major accounting defect remains. MaterializedOwlGraph's Fallback rematerialization still invokes materialize_owl_rl under the active profiler. That delegated batch run calls round() and reconcile_total(), so Report::total_derived receives the rebuilt closure's net-new count even though the public contract says incremental maintenance contributes nothing. The updated fallback test still checks only ticks, rounds, and rule groups; it never asserts total_derived() == 0 with pre-existing derived facts. Because the same logical mutation reports zero in direct maintenance but a rebuilt-closure count in fallback mode, accounting remains path-dependent. Progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
