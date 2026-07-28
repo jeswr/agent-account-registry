@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4218,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7b5a0dadcc5746bbc7eeaff2ab35c7d28ecd063c",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`refresh_prohibition` still builds ambiguous-deny provenance with `naming_prohibition_ids`, and that helper still filters only through `rule_action_target_match`. That predicate intentionally checks action and target only; it does not apply the assignee match or constraint classification used by `prohibition_status`. Consequently, if one rule is genuinely ambiguous while another action/target-identical rule is assignee-mismatched or definitely false under supplied evidence, the retained deny is annotated with both IDs even though the latter cannot be carving out this request. This makes the rule-level audit result incorrect, and none of the added tests exercises this mixed-classification refresh case.",
+    "file": "crates/sparq-solid/src/odrl_bridge.rs",
+    "fix_hint": "Expose or reuse the evaluator's per-rule three-valued prohibition classification so ambiguous refresh provenance includes only rules classified `Ambiguous` for this request, including assignee and full constraint evaluation. Add a refresh regression test with one ambiguous prohibition and one action/target-identical but definitely-false or assignee-mismatched prohibition, then assert that only the ambiguous rule ID is present.",
+    "severity": "major",
+    "title": "Ambiguous refresh still attributes definitely inapplicable prohibitions"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4's major correctness finding remains unchanged. The ambiguous-refresh path still obtains provenance from `naming_prohibition_ids`, which selects all action/target-compatible prohibitions even though the policy evaluator's classification also considers assignee and each constraint's three-valued result. Thus a retained fail-closed deny can still be annotated with a definitely inapplicable rule. The added provenance tests do not cover an ambiguous prohibition alongside an assignee-mismatched or definitely-false sibling. Progress is stagnant because the same issue remains at the same severity.",
+  "verdict": "request_changes"
+ }
+}
