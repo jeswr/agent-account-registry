@@ -1665,6 +1665,14 @@
    "model_alias": "opus5",
    "exit_class": "unknown",
    "run_id": "30320365583.1"
+  },
+  {
+   "ts": 1785202208,
+   "provider": "openai",
+   "account": "dc2d751954080e13",
+   "model_alias": "sol",
+   "exit_class": "success",
+   "run_id": "30320341211.1"
   }
  ]
 }
