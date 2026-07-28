@@ -12311,6 +12311,180 @@ def _self_test():
     assert enumerate_disarm_items(repo, [moved], armed_status,
                                   {41: {**provenance[41], "pr_number": True}}) == []
 
+    # ---- [#657 enable / #876 review] THE DISARM-SIDE RESIDUE: DETECTION-ONLY OBSERVATION OF THE
+    # ---- #42 INVARIANT OVER THE ENROLLED ORCHESTRATOR CLASS ------------------------------------
+    # The disarm lane selects candidates on the worker producer shape AND registry #570's exact-App
+    # author gate, so the orchestrator class is invisible to it. Admitting the class THERE would
+    # waive #570 on a dequeue/redraft/relabel WRITE path — an authority escalation. So the
+    # invariant is OBSERVED for that class: same predicate, no write authority.
+    _obs_enrolled = ("jeswr",)
+    _obs_record = dict(provenance[41], recorded_at_run="orchestrator:30209757201.1")
+
+    def _obs_pull(*, sha=sha_b, ref="fix/869-question-park-marker", login="jeswr", draft=False,
+                  marker=sha_a, head_repo=repo, number=41, labels=()):
+        body = "" if marker is None else f"x <!-- sparq-reviewed-sha:{marker} -->"
+        return pull(number, ref, sha, head_repo=head_repo, login=login, draft=draft,
+                    labels=labels, body=body)
+
+    def _observe(pulls_in, status=None, prov=None, authors=_obs_enrolled):
+        return enumerate_disarm_observations(
+            repo, pulls_in, status if status is not None else armed_status,
+            prov if prov is not None else {41: _obs_record}, authors)
+
+    # (1) THE HEADLINE. An enrolled orchestrator-class PR with an armed head off its reviewed-sha
+    #     marker is DETECTED — the exact condition the worker lane disarms, on a PR the worker
+    #     lane's own enumerator returns nothing for. The pair is asserted together, because
+    #     "detected" is only meaningful next to "and the write lane still sees nothing".
+    _obs_row = {"pr_number": 41, "head_sha": sha_b, "reviewed_sha": sha_a, "repo": repo}
+    assert _observe([_obs_pull()]) == [_obs_row], _observe([_obs_pull()])
+    assert enumerate_disarm_items(repo, [_obs_pull()], armed_status, {41: _obs_record}) == [], (
+        "the WRITE-authorised enumerator must still see nothing here — if this ever returns a row, "
+        "#570's exact-App gate has been waived on a write path and this whole design is wrong")
+    # (2) DEFAULT OFF. An empty allowlist — every repo's default — observes nothing at all, so this
+    #     emits exactly nothing for any repo that has not opted in.
+    assert _observe([_obs_pull()], authors=()) == []
+    assert _observe([_obs_pull()], authors=frozenset()) == []
+    # (3) NON-VACUITY: the observer reports a VIOLATION, not merely a class. The same enrolled PR
+    #     whose marker names its live head emits nothing — otherwise (1) would pass just as well
+    #     with the mismatch test deleted, and the census would be a count of enrolled PRs.
+    assert _observe([_obs_pull(marker=sha_b)]) == []
+    #     ...and the unarmed-draft and stale-snapshot DO-NOTHING legs hold for this class too.
+    assert _observe([_obs_pull(draft=True)], status={41: status_of(sha_b)}) == []
+    assert _observe([_obs_pull()], status={}) == []
+    assert _observe([_obs_pull()], status={41: status_of(sha_a, armed=True)}) == []
+    #     ...while a READY-but-unarmed interrupted disarm IS observed, exactly as for the worker
+    #     class — the shared predicate is what makes these agree without a second spelling.
+    assert [row["pr_number"] for row in _observe([_obs_pull()], status={41: status_of(sha_b)})] \
+        == [41]
+    # (4) THE CLASS PREDICATE IS THE SHARED ONE, so nothing else becomes observable. Each row
+    #     differs from (1) in exactly one property.
+    for _why, _pulls, _prov in (
+            ("a FORK head is never observed, on any path — the one predicate no waiver reaches",
+             [_obs_pull(head_repo="attacker/repo")], {41: _obs_record}),
+            ("an author the allowlist does not name", [_obs_pull(login="mallory")],
+             {41: _obs_record}),
+            ("a MACHINE-attested record is not the orchestrator class", [_obs_pull()],
+             {41: provenance[41]}),
+            ("a record minted for a DIFFERENT PR waives nothing", [_obs_pull()],
+             {41: dict(_obs_record, pr_number=40)}),
+            ("no record at all fails closed", [_obs_pull()], {})):
+        assert _observe(_pulls, prov=_prov) == [], f"[#657 enable] {_why}"
+    # (5) THE INVARIANT HAS ONE SPELLING. Driving the shared predicate directly over the WORKER row
+    #     from the block above must yield the row the worker enumerator emits — so "what the lane
+    #     disarms" and "what the census calls a violation" cannot drift into two definitions.
+    assert armed_sha_mismatch(repo, moved, armed_status) == acted[0], armed_sha_mismatch(
+        repo, moved, armed_status)
+    assert armed_sha_mismatch(repo, bound, armed_status) is None
+    for _junk in (None, "not-a-dict", [], 7, {}, {"number": 41}):
+        assert armed_sha_mismatch(repo, _junk, armed_status) is None, repr(_junk)
+    # (6) THE EMISSION. One alert per violation plus a census line that prints EVEN AT ZERO — an
+    #     absent bucket and a zero bucket must not look the same, and a per-violation alert alone
+    #     can never prove the observer ran at all.
+    _zero_lines = format_disarm_observations([])
+    assert len(_zero_lines) == 1 and _zero_lines[0].startswith(DISARM_OBSERVATION_CENSUS), \
+        _zero_lines
+    assert "0 enrolled" in _zero_lines[0] and "none" in _zero_lines[0], _zero_lines
+    _live_lines = format_disarm_observations(_observe([_obs_pull()]))
+    assert len(_live_lines) == 2, _live_lines
+    assert _live_lines[0].startswith(DISARM_OBSERVATION_ALERT), _live_lines
+    assert f"{repo}#41" in _live_lines[0] and sha_b in _live_lines[0] \
+        and sha_a in _live_lines[0], _live_lines
+    assert _live_lines[-1].startswith(DISARM_OBSERVATION_CENSUS) \
+        and "1 enrolled" in _live_lines[-1] and f"{repo}#41" in _live_lines[-1], _live_lines
+    # ...and the alert is a GitHub-Actions ::warning::, i.e. it reaches the run summary rather than
+    # only the log body. This is the whole "continuously visible" claim.
+    assert _live_lines[0].startswith("::warning::"), _live_lines[0]
+    assert format_disarm_observations([None, 7, {"pr_number": True}]) == _zero_lines
+    # (7) DEFENCE IN DEPTH: even if an observation row somehow reached CLAIM's disarm applier, the
+    #     #570 re-binding refuses it. Detection-only is enforced by TWO independent facts — the row
+    #     never enters the plan artifact (asserted at the YAML seam below), and the actor would
+    #     refuse it anyway.
+    _obs_admissible, _obs_reason = _disarm_row_admissible(
+        _obs_row, repo, _obs_pull(), _obs_record, bot)
+    assert _obs_admissible is False and "worker branch" in _obs_reason, (
+        "an observation row must be refused by the disarm applier's own re-binding: this class "
+        f"has no write path. got {(_obs_admissible, _obs_reason)!r}")
+    print("  ok   [#657 enable] the disarm lane DETECTS the #42 armed-SHA invariant on the "
+          "enrolled orchestrator class (every tick, censused even at zero) and has NO write "
+          "authority over it — the write enumerator returns nothing and #570's re-binding "
+          "refuses the row")
+
+    # ---- [#657 enable] THE YAML SEAM. Everything above is a pure function nothing runs. The
+    # measured lesson on this repo is that uncaught mutants live at the workflow seam — an `if:`, a
+    # deleted step, a call site rewired to a constant — so the PLAN step's own two lines are
+    # EXTRACTED and EXECUTED, and the containment claim ("these rows never enter the plan") is
+    # asserted against the PARSED python rather than trusted. ----
+    _obs_seam = _workflow_step_python(
+        "dispatch.yml", "plan", r"(?m)^[ \t]*disarm_observations\.extend\(",
+        r"(?m)^[ \t]*# Deferred-retry items", "detection-only disarm observation")
+    _obs_seam_tree = ast.parse(textwrap.dedent(_obs_seam))
+    _obs_calls = [node for node in ast.walk(_obs_seam_tree) if isinstance(node, ast.Call)
+                  and getattr(node.func, "attr", "") == "enumerate_disarm_observations"]
+    assert len(_obs_calls) == 1, (
+        "dispatch.yml's plan step must call enumerate_disarm_observations exactly once; a deleted "
+        f"call is a silently dark detector. Found {len(_obs_calls)}")
+    # The enrolment argument must be the SAME `enrolled_authors` name the review enumerator was
+    # just handed — hard-coding `()` here leaves every assertion above green while production
+    # observes nothing at all, which is precisely this class of vacuity.
+    assert [getattr(arg, "id", None) for arg in _obs_calls[0].args] == [
+        "repo", "pulls", "pr_status", "provenance", "enrolled_authors"], (
+        "the observation call must be handed the tick's live views and the repo's resolved "
+        f"allowlist, by NAME. Found: {ast.dump(_obs_calls[0])}")
+    # EXECUTED, not merely parsed: the workflow's own line, against a recording stub.
+    _seam_seen = []
+
+    class _ObsStub:
+        @staticmethod
+        def enumerate_disarm_observations(*args):
+            _seam_seen.append(args)
+            return [_obs_row]
+
+    _seam_ns = {"claim_mod": _ObsStub, "disarm_observations": [], "repo": repo,
+                "pulls": [_obs_pull()], "pr_status": armed_status,
+                "provenance": {41: _obs_record}, "enrolled_authors": _obs_enrolled}
+    exec(compile(_obs_seam, "<dispatch.yml plan observation>", "exec"), _seam_ns)  # noqa: S102
+    assert _seam_seen == [(repo, [_obs_pull()], armed_status, {41: _obs_record}, _obs_enrolled)], \
+        _seam_seen
+    assert _seam_ns["disarm_observations"] == [_obs_row], _seam_ns["disarm_observations"]
+
+    # THE EMISSION STEP, executed the same way: the workflow must PRINT every line the formatter
+    # returns. A loop that drops the census line, or a `for` body reduced to `pass`, reds here.
+    _emit_seam = _workflow_step_python(
+        "dispatch.yml", "plan", r"(?m)^[ \t]*for observation_line in ",
+        r"(?m)^[ \t]*PY[ \t]*$", "detection-only disarm emission")
+    _emit_out = io.StringIO()
+
+    class _EmitStub:
+        @staticmethod
+        def format_disarm_observations(rows):
+            return [f"line-{row['pr_number']}" for row in rows] + ["census-line"]
+
+    with contextlib.redirect_stdout(_emit_out):
+        exec(compile(_emit_seam, "<dispatch.yml plan emission>", "exec"),   # noqa: S102
+             {"claim_mod": _EmitStub, "disarm_observations": [_obs_row]})
+    assert _emit_out.getvalue().splitlines() == ["line-41", "census-line"], _emit_out.getvalue()
+
+    # THE CONTAINMENT CLAIM, asserted rather than described: `disarm_observations` must appear in
+    # NO plan-document construction anywhere in the plan step. If it ever becomes a plan field,
+    # CLAIM can read it — and a row CLAIM can read is a row CLAIM can act on, which is exactly the
+    # write authority this design refuses to buy. The whole step is parsed, not just the block
+    # above, so a later addition cannot hide from this.
+    _plan_step = _workflow_step_python(
+        "dispatch.yml", "plan", r"(?m)^[ \t]*document = \{",
+        r"(?m)^[ \t]*PY[ \t]*$", "plan document literal")
+    _doc_assign = next(node for node in ast.walk(ast.parse(textwrap.dedent(_plan_step)))
+                       if isinstance(node, ast.Assign)
+                       and any(getattr(t, "id", "") == "document" for t in node.targets))
+    assert "disarm_observations" not in {
+        getattr(node, "id", "") for node in ast.walk(_doc_assign.value)}, (
+        "the detection-only observations must NEVER be written into the plan artifact — CLAIM "
+        "re-validates and ACTS on plan rows, so a field it can read is a write path for a class "
+        "whose whole point is that it has none")
+    assert "disarm_observations" not in json.dumps(list(PLAN_FIELDS)), PLAN_FIELDS
+    print("  ok   [#657 enable] YAML SEAM (executed): dispatch.yml's plan step calls the observer "
+          "with the repo's RESOLVED allowlist and prints every emitted line — and the rows never "
+          "enter `document`, so CLAIM has no field to act on")
+
     # ---- decide_repair_admission: the LIVE trigger gates the defuse (defect-1 regression) ----
     # trigger holds: drafted proceeds, ready/armed defuses
     assert decide_repair_admission("needs-rebase", False, None, True) == ("proceed", "rebase")
@@ -16576,6 +16750,43 @@ agent = "impl"
                                  enrolled_authors=_authors) == (0, [], []), f"[#835] {_why}"
         print("  ok   [#835] no third-party, fork, foreign-record, machine-attested or "
               "recordless PR becomes re-admittable (5 shapes, one differing property each)")
+
+        # ---- [#657 enable] #769's EPISODE BINDING IS INHERITED BY THE WIDENED CLASS. #769 placed
+        # its `age_park_episode` guard DOWNSTREAM of #844's candidate filter precisely so the class
+        # #835 widened would inherit it. That inheritance was never asserted on an orchestrator-
+        # class row — the #769 block above drives the WORKER fixture — so enabling enrolment is the
+        # moment it stops being a structural argument and has to be a test. If the enable ever
+        # breaks it, a groom AGE park on an enrolled PR becomes its own recovery proof again: it
+        # would re-admit purely by getting old enough, spending a budget groom never granted. ----
+        orch_aged = {}
+        for hours, seconds in (("3h", young), ("7h", old)):
+            orch_aged[hours] = readmit_sweep(
+                healthy_window, rows=[[orch_row()]], provenance={41: orch_record},
+                comments=age_comments, timeline=park_at(seconds),
+                enrolled_authors=orch_enrolled)
+            orch_aged[hours + "-census"] = census_codes()
+        assert orch_aged["3h"] == orch_aged["7h"] == (0, [], []), (
+            "[#657 enable] an ENROLLED orchestrator-class PR carrying groom's age receipt must "
+            f"reach the SAME decision at 3 h and 7 h: {orch_aged['3h']!r} vs {orch_aged['7h']!r}")
+        assert orch_aged["3h-census"] == orch_aged["7h-census"] == "foreign-episode=1", orch_aged
+        # THE CONTROL, and it is what makes the pair above a test of #769 rather than of the class:
+        # the identical enrolled row WITHOUT the age receipt is still ADMITTED at 7 h. Without it,
+        # a widened class that had simply become unre-admittable would pass the assertion above.
+        orch_no_receipt = readmit_sweep(
+            healthy_window, rows=[[orch_row()]], provenance={41: orch_record},
+            timeline=park_at(old), enrolled_authors=orch_enrolled)
+        assert orch_no_receipt[0] == 1 and orch_no_receipt[2] == [(41, 7)], (
+            "[#657 enable] CONTROL: with NO age receipt the enrolled class must still re-admit on "
+            f"the sustained-health heuristic — otherwise the pair above proves nothing. "
+            f"got {orch_no_receipt!r}")
+        assert readmit_sweep(
+            healthy_window, rows=[[orch_row()]], provenance={41: orch_record},
+            timeline=park_at(young), enrolled_authors=orch_enrolled) == (0, [], []), (
+            "[#657 enable] CONTROL: ...and it still refuses at 3 h, so crossing the span is the "
+            "only variable in the receipt-bearing pair")
+        print("  ok   [#657 enable] #769's `foreign-episode` binding is INHERITED by the enrolled "
+              "orchestrator class: refused with an age receipt at BOTH 3 h and 7 h, admitted at "
+              "7 h without one")
     finally:
         globals()["_target_is_human_maintainer"] = prev_target_probe
 
