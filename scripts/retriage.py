@@ -823,7 +823,7 @@ def _self_test():
     _dedup = applied(dual, plan(dual, "owner", "app[bot]", "none"))
     _dedup_plan = plan(_dedup, "owner", "app[bot]", "none")
     chk("[sparq#4809] the de-contradicted board PROMOTES at the floor (it used to stall forever)",
-        (_dedup_plan["action"], static_triage.DERIVED_PRIORITY in _dedup_plan["add"]),
+        (_dedup_plan["action"], static_triage.DERIVED_PRIORITY in _dedup_plan.get("add", [])),
         ("promote", True))
     chk("[sparq#4809] ...and the sweep reaches a FIXED POINT on the third tick — no oscillation",
         plan(applied(_dedup, _dedup_plan), "owner", "app[bot]", "none"),
@@ -838,7 +838,7 @@ def _self_test():
                   "owner", "app[bot]", "none")
     chk("[sparq#4809] HEADLINE: the terminal untriaged-no-priority issue is PROMOTED, and the "
         "derived priority is in the write the applier will send",
-        (_stuck["action"], sorted(_stuck["add"]), _stuck["remove"]),
+        (_stuck["action"], sorted(_stuck.get("add", [])), _stuck.get("remove", [])),
         ("promote", [static_triage.DERIVED_PRIORITY, "status:ready"], ["status:untriaged"]))
 
     # ---- IDEMPOTENCE + the round trip (re-park -> restore the label -> promote lands back on
@@ -858,12 +858,12 @@ def _self_test():
     # which is the sequence the re-park exists to prompt.
     _floored = plan(reparked, "owner", "app[bot]", "none")
     chk("[sparq#4809] a re-parked lost-priority issue is floored by the NEXT sweep, not stalled",
-        (_floored["action"], static_triage.DERIVED_PRIORITY in _floored["add"]), ("promote", True))
+        (_floored["action"], static_triage.DERIVED_PRIORITY in _floored.get("add", [])), ("promote", True))
     # ...and if the human's restore arrives LATE (after that floor landed), the result is an
     # AMBIGUOUS pair. The classifier must DECLINE it — never compound it with a third write, and
     # never silently pick one — so the contradiction stays visible on the issue and a human can
     # resolve it. This is the failure mode of the trade above; it is pinned, not discovered later.
-    _late = applied(_floored and applied(reparked, _floored), {"add": ["priority:P2"]})
+    _late = applied(applied(reparked, _floored), {"add": ["priority:P2"]})
     chk("[sparq#4809] a LATE restore next to the derived floor is DECLINED, never compounded",
         (static_triage.derive_priority(label_set(_late))[1],
          any(lb.startswith("priority:")
