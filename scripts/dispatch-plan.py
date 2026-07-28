@@ -59,15 +59,24 @@ def _roles_of(labels):
 
 
 def _plan_package(labels):
-    """The single conflict partition a plan row reserves (registry issue #112). A one-area
-    issue reserves that area; a NO-area OR MULTI-area issue reserves the serializing global
-    partition, so it can never co-run with in-flight work in ANY of its areas. The old
-    `sorted(packages_of(labels))[0]` kept only the alphabetically-first area, silently
-    dropping every secondary area — an A+B issue could dispatch while B was busy. This mirrors
-    packages_of's empty->global rule and extends it to the multi-area case (fail-closed:
-    over-serialize a multi-area row rather than free a busy sibling crate)."""
+    """The conflict partition KEY a plan row reserves (registry issue #112). A partition key names
+    a SET of areas: a one-area issue reserves that area, a MULTI-area issue reserves EXACTLY its
+    own areas as the canonical sorted `,`-joined key, and a NO-area issue reserves the serializing
+    global partition because its footprint is unknown. The old `sorted(packages_of(labels))[0]`
+    kept only the alphabetically-first area, silently dropping every secondary area — an A+B issue
+    could dispatch while B was busy — and its replacement over-corrected the other way, sending
+    every multi-area row to `__global__` so that "touches A and B" meant "touches everything".
+    Two rows now conflict iff their area sets INTERSECT (lease_schema.packages_conflict), which is
+    narrower than `__global__` exactly where the LABELS prove the footprint and never elsewhere:
+    `packages_of` still maps the no-area case to `{GLOBAL}`, so a zero-label row is unchanged.
+
+    Byte-identical to `lease_schema.plan_package` over the same area set, and dispatch-claim's
+    `_plan_package_agreement()` self-test EXECUTES both to prove it — this copy exists only
+    because dispatch-plan.py ships inside the target repos, which have no lease_schema.py."""
     pkgs = packages_of(labels)
-    return next(iter(pkgs)) if len(pkgs) == 1 else GLOBAL
+    if pkgs == {GLOBAL}:
+        return GLOBAL
+    return ",".join(sorted(pkgs))
 
 
 def roleless_ready(issues):
@@ -1202,15 +1211,25 @@ def _routing_doc():
     chk("[#768] the DEFERRED lane reserves the PR half and the in-flight issue half too",
         _planned(_plan_def), [604])
 
-    # issue #112: a MULTI-area issue reserves the serializing GLOBAL partition, NOT the
-    # alphabetically-first area — else a busy secondary area (here 'worker') could not exclude
-    # it and it would double-dispatch. A single-area issue still reserves just that area.
+    # issue #112: a MULTI-area issue reserves BOTH its areas, NOT the alphabetically-first one —
+    # else a busy secondary area (here 'worker') could not exclude it and it would double-dispatch.
+    # It does NOT reserve the serializing global partition either: that made "touches usage and
+    # worker" mean "touches everything" and self-blocked 13.9% of the ready board. A single-area
+    # issue still reserves just that area; a NO-area issue still reserves everything.
     p_multi = plan_dispatch(
         compute_ready([iss(8, R + ["priority:P1", "role:impl", "area:usage", "area:worker"])]), doc)
-    chk("multi-area -> global package", p_multi[0]["package"], GLOBAL)
+    chk("multi-area -> the canonical BOTH-areas key (never the first area, never global)",
+        p_multi[0]["package"], "usage,worker")
+    chk("multi-area key is order-independent", plan_dispatch(
+        compute_ready([iss(88, R + ["priority:P1", "role:impl", "area:worker", "area:usage"])]),
+        doc)[0]["package"], "usage,worker")
     chk("single-area -> that package", plan_dispatch(
         compute_ready([iss(9, R + ["priority:P1", "role:impl", "area:usage"])]), doc)[0]["package"],
         "usage")
+    # [CONTROL] the fail-closed direction is untouched: a row with NO area label still reserves
+    # every partition. Narrowing this one is the reckless inversion of the change above.
+    chk("[CONTROL] no-area -> the serializing global partition", _plan_package(
+        ["status:ready", "priority:P1", "role:impl"]), GLOBAL)
 
     print("dispatch-plan self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

@@ -423,14 +423,31 @@ def adoptable_holder(current, new_holder):
 
 
 def partition_available(leases, holder_prefix, package):
-    """Whether a repository-scoped package/global partition is free in the active ledger."""
+    """Whether a repository-scoped partition is free in the active ledger.
+
+    A partition key names a SET of areas (`lease_schema.plan_package`), so availability is
+    SET-DISJOINTNESS, not string equality: `{a,b}` is free against a live `{c}` lease and taken
+    against a live `{b,c}` one. `__global__` — the universal set, which zero-area rows still
+    reduce to — intersects everything and therefore still serializes in both directions, exactly
+    as the old `package == "__global__" -> not scoped` special case did.
+
+    THE SAME PREDICATE AS PLAN. `dispatch-claim.filter_busy_area_items` /
+    `revalidate_items_against_live_pulls` / `sibling_lease_conflict` all decide with
+    `lease_schema.packages_conflict` too. Widening one side and not the other produces a scheduler
+    that plans work the allocator then refuses (`package-single-flight` every tick, forever), which
+    is worse than either width — so there is one predicate and every site imports it.
+
+    A lease whose `package` is missing or unreadable reads as the UNIVERSAL set and therefore
+    CONFLICTS. That is a tightening over the old `lease.get("package") in {package, "__global__"}`
+    membership test, which was False for a `None` package and silently declared the partition free;
+    `validate_ledger` requires a non-empty string, so the case is unreachable through the validated
+    path and the fail-closed reading is the only safe one where it is not."""
     scoped = [
         lease for lease in leases
         if str(lease.get("holder", "")).startswith(holder_prefix)
     ]
-    if package == "__global__":
-        return not scoped
-    return not any(lease.get("package") in {package, "__global__"} for lease in scoped)
+    return not any(lease_schema.packages_conflict(lease.get("package"), package)
+                   for lease in scoped)
 
 
 # ---- GitHub CAS I/O -----------------------------------------------------------------------------
@@ -2175,22 +2192,46 @@ def _self_test():
 
             # ---- THE MINT-vs-ADOPT PARTITION AGREEMENT, behaviourally (registry issue #112 / the
             # 2026-07-26 review-lane loop). The dispatcher mints `package` with
-            # dispatch-claim.plan_package (multi-area -> __global__); this heredoc re-derives it and
-            # compares for EQUALITY. Before the reduction was single-sourced, worker.yml's copy was
-            # a private re-implementation held to the minter by a comment, and reverting it to the
-            # pre-#112 alphabetically-first rule left the entire enrolled suite green. These two
-            # rows are the counterfactual pair: a multi-area claim minted `__global__` must be
-            # ADOPTED, and the pre-#112 value for the same issue must be REFUSED. Both flip if the
-            # heredoc's derivation drifts in either direction.
-            multi = {**base_claim, "role": "impl", "package": "__global__"}
+            # dispatch-claim.plan_package; this heredoc re-derives it and compares for EQUALITY.
+            # Before the reduction was single-sourced, worker.yml's copy was a private
+            # re-implementation held to the minter by a comment, and reverting it to the pre-#112
+            # alphabetically-first rule left the entire enrolled suite green. These rows are the
+            # counterfactual set: a multi-area claim minted with the CANONICAL COMPOSITE key must
+            # be ADOPTED, and both the pre-#112 alphabetically-first value AND the pre-area-set
+            # `__global__` value for the same issue must be REFUSED. Each flips if the heredoc's
+            # derivation drifts in either direction.
+            #
+            # WHY REFUSING THE LEGACY `__global__` MINTING IS SAFE HERE, unlike #112: both halves
+            # of THIS seam ship in the registry and deploy together, so a lease minted by the old
+            # dispatcher can only meet a new adopter inside one lease TTL. The adopter releases the
+            # lease and exits, and the NEXT tick's dispatcher — now also on the new reduction —
+            # mints the composite the adopter re-derives. #112 was permanent because the two
+            # derivations were in different files that never converged; this one converges on the
+            # first tick after the merge, which is why the strict equality is kept rather than
+            # widened with a legacy alternative that would then never be removed. (The PLAN artifact
+            # is the seam that genuinely straddles two repos, and it is handled where it lives —
+            # dispatch-claim._legacy_global_minting.)
+            multi = {**base_claim, "role": "impl", "package": "crate-a,crate-b"}
             rc, err, out = _adopt_case(multi, {"PACKAGES": "crate-a,crate-b"})
-            check("worker.yml adopt heredoc ADOPTS a multi-area claim minted as __global__ "
-                  f"(stderr tail: {_tail(err)!r})",
+            check("worker.yml adopt heredoc ADOPTS a multi-area claim minted as the CANONICAL "
+                  f"composite key (stderr tail: {_tail(err)!r})",
                   (rc, "acquired=true" in out), (0, True))
+            rc, err, out = _adopt_case({**multi, "package": "crate-b,crate-a"},
+                                       {"PACKAGES": "crate-a,crate-b"})
+            check("worker.yml adopt heredoc REFUSES a NON-canonical (unsorted) composite key — "
+                  "the reduction is a function of the SET, so only one spelling can be minted",
+                  (rc != 0, "work partition disagrees" in err, "acquired=true" in out),
+                  (True, True, False))
             rc, err, out = _adopt_case({**multi, "package": "crate-a"},
                                        {"PACKAGES": "crate-a,crate-b"})
             check("worker.yml adopt heredoc REFUSES the pre-#112 alphabetically-first partition "
                   "for the same multi-area issue",
+                  (rc != 0, "work partition disagrees" in err, "acquired=true" in out),
+                  (True, True, False))
+            rc, err, out = _adopt_case({**multi, "package": "__global__"},
+                                       {"PACKAGES": "crate-a,crate-b"})
+            check("worker.yml adopt heredoc REFUSES the pre-area-set __global__ minting for a "
+                  "multi-area issue (the reduction moved; the equality check must see it)",
                   (rc != 0, "work partition disagrees" in err, "acquired=true" in out),
                   (True, True, False))
             rc, err, out = _adopt_case({**multi, "package": "crate-a"},
@@ -2198,7 +2239,7 @@ def _self_test():
             check("worker.yml adopt heredoc ADOPTS a single-area claim minted as that area "
                   f"(stderr tail: {_tail(err)!r})",
                   (rc, "acquired=true" in out), (0, True))
-            rc, err, out = _adopt_case({**multi}, {"PACKAGES": ""})
+            rc, err, out = _adopt_case({**multi, "package": "__global__"}, {"PACKAGES": ""})
             check("worker.yml adopt heredoc ADOPTS a NO-area claim minted as __global__ "
                   "(fail-closed: an arealess issue serializes)",
                   (rc, "acquired=true" in out), (0, True))
@@ -2261,6 +2302,48 @@ def _self_test():
           True)
     check("global partition serializes", partition_available(scoped, "owner/repo#", "__global__"),
           False)
+    # ---- the CLAIM-time half of the area-SET partition. These are the allocator's own copy of
+    # lease_schema's red test + controls: PLAN deciding `{A,B}` may co-run with `{C}` while the
+    # allocator still refuses it is the exact one-sided-widening failure (`package-single-flight`
+    # every tick on a row PLAN keeps offering), so the property is pinned at BOTH sites.
+    check("[RED] a {A,B} claim is ADMITTED against a live {C} lease (sets are disjoint)",
+          partition_available(
+              [make_lease("acct01", "owner/repo#1@run", "crate-c", "impl", "terra", now, 100)],
+              "owner/repo#", "crate-a,crate-b"),
+          True)
+    check("[RED] a {A,B} claim is REFUSED against a live {B,C} lease (sets intersect on B)",
+          partition_available(
+              [make_lease("acct01", "owner/repo#1@run", "crate-b,crate-c", "impl", "terra",
+                          now, 100)],
+              "owner/repo#", "crate-a,crate-b"),
+          False)
+    check("[CONTROL] a composite lease still blocks a SINGLE-area claim on one of its atoms",
+          partition_available(
+              [make_lease("acct01", "owner/repo#1@run", "crate-a,crate-b", "impl", "terra",
+                          now, 100)],
+              "owner/repo#", "crate-b"),
+          False)
+    check("[CONTROL] a ZERO-area claim (__global__) is still refused against ANY live lease, and "
+          "a live __global__ lease still refuses a composite claim",
+          [partition_available(scoped, "owner/repo#", "__global__"),
+           partition_available(
+               [make_lease("acct01", "owner/repo#1@run", "__global__", "impl", "terra", now, 100)],
+               "owner/repo#", "crate-a,crate-b")],
+          [False, False])
+    check("[CONTROL] an empty ledger admits every shape",
+          [partition_available([], "owner/repo#", p)
+           for p in ("crate-a", "crate-a,crate-b", "__global__")],
+          [True, True, True])
+    check("a lease with an UNREADABLE package fails closed (it is unknown footprint, not free)",
+          partition_available(
+              [{**make_lease("acct01", "owner/repo#1@run", "crate-a", "impl", "terra", now, 100),
+                "package": None}],
+              "owner/repo#", "crate-b"),
+          False)
+    check("the allocator decides with lease_schema.packages_conflict, not its own copy",
+          [lease_schema.packages_conflict("crate-a,crate-b", "crate-c"),
+           lease_schema.packages_conflict("crate-a,crate-b", "crate-b,crate-c")],
+          [False, True])
 
     class _StubLedger:
         """Drive claim()'s pure decision path without GitHub I/O (accounts + ledger stubbed)."""
