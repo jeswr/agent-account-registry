@@ -10008,12 +10008,34 @@ def _self_test():
         check("the declined arm leaves a SHA-bound receipt naming the reason on the PR",
               any(ARM_DECLINE_MARKER_PREFIX + sha in c and c.startswith("pr comment")
                   for c in raa_calls), True)
+        # The receipt's OWN idempotency, asserted by calling `_record_arm_decline` DIRECTLY.
+        # It cannot be reached through ready_and_arm any more: once a receipt for this head
+        # exists the BOUND re-admits and arms, so the writer is never called a second time. That
+        # made the old end-to-end idempotency check vacuous — it passed because of re-admission,
+        # not because of the guard, and deleting the guard did not turn it red (a survivor in the
+        # round-2 sweep). The guard stays as defence-in-depth for any future caller that reaches
+        # the writer without consulting the bound, so it is pinned where it actually lives.
         decline_bot = {"body": f"x {ARM_DECLINE_MARKER_PREFIX}{sha} -->",
                        "user": {"login": "sparq[bot]"}}
+        for label, comments_in, want_post in (
+                ("a bot receipt for THIS sha suppresses a re-post", (decline_bot,), False),
+                ("a receipt for ANOTHER sha does not suppress it",
+                 ({"body": f"x {ARM_DECLINE_MARKER_PREFIX}{'d' * 40} -->",
+                   "user": {"login": "sparq[bot]"}},), True),
+                ("a FOREIGN app's receipt does not suppress it",
+                 ({"body": f"x {ARM_DECLINE_MARKER_PREFIX}{sha} -->",
+                   "user": {"login": "mallory[bot]"}},), True),
+                ("no receipt at all posts one", (), True)):
+            raa_calls.clear()
+            real_pc = globals()["_paginated_comments"]
+            try:
+                globals()["_paginated_comments"] = lambda repo, pr: list(comments_in)
+                _record_arm_decline("o/r", 41, sha, "failure", bot_login="sparq[bot]")
+            finally:
+                globals()["_paginated_comments"] = real_pc
+            check(f"receipt writer: {label}",
+                  any(c.startswith("pr comment") for c in raa_calls), want_post)
         run_raa(benign_diff=True, arm_gate="failure", comments=(decline_bot,))
-        check("the decline receipt is idempotent for THIS sha (no duplicate every tick)",
-              any(ARM_DECLINE_MARKER_PREFIX in c and c.startswith("pr comment")
-                  for c in raa_calls), False)
         run_raa(benign_diff=True, arm_gate="failure",
                 comments=({"body": f"x {ARM_DECLINE_MARKER_PREFIX}{'d' * 40} -->",
                            "user": {"login": "sparq[bot]"}},))
