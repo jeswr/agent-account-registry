@@ -712,8 +712,18 @@ def _self_test():                                                       # noqa: 
         else:
             print(f"ok   {name}")
 
+    def total(thunk):
+        """Call `thunk`, turning any exception into a comparable value. The derivation and every
+        refusal predicate is documented TOTAL — "never raises, never guesses" — so a raise is a
+        defect that must red a NAMED check here rather than abort the whole suite with a
+        traceback that belongs to no branch."""
+        try:
+            return thunk()
+        except Exception as exc:                      # noqa: BLE001 — a raise IS the failure
+            return ("RAISED", type(exc).__name__)
+
     def refuses(name, reason, thunk):
-        got = thunk()
+        got = total(thunk)
         check(name, got[0] if isinstance(got, tuple) else got, reason)
 
     mint_provenance = _load_mint_provenance()
@@ -758,15 +768,19 @@ def _self_test():                                                       # noqa: 
           MAX_ADVISORY_MENTIONS)
     # THE CONTROL that keeps the hint advisory: a body full of mentions and NO closing keyword
     # still derives NOTHING, and still refuses under the SAME reason as a body with no `#` at all.
+    def mentions_only(text):
+        return derive_issue_number({"title": "t", "body": text}, lambda n: None)
+
     check("a body full of mentions still derives nothing",
-          derive_issue_number({"title": "t", "body": "#7 #8 #9"}, lambda n: None).number, None)
+          total(lambda: mentions_only("#7 #8 #9").number), None)
     check("...under the same reason as a body with no reference at all",
-          derive_issue_number({"title": "t", "body": "#7 #8 #9"}, lambda n: None).reason,
-          derive_issue_number({"title": "t", "body": "nothing"}, lambda n: None).reason)
+          total(lambda: mentions_only("#7 #8 #9").reason),
+          total(lambda: mentions_only("nothing at all").reason))
     check("...and the hint names them so the author can fix it in one edit",
-          all(token in candidate_refusal([], [7, 8])[1] for token in ("#7", "#8")), True)
+          total(lambda: all(token in candidate_refusal([], [7, 8])[1]
+                           for token in ("#7", "#8"))), True)
     check("...while a PR that mentions nothing gets no dangling hint",
-          "does mention" in candidate_refusal([], [])[1], False)
+          total(lambda: "does mention" in candidate_refusal([], [])[1]), False)
 
     # ---- REFUSAL BRANCH 1/4: zero references --------------------------------------------------
     refuses("ZERO closing references refuse by name", REASON_NO_REFERENCE,
@@ -775,7 +789,8 @@ def _self_test():                                                       # noqa: 
     refuses("MULTIPLE closing references refuse by name", REASON_AMBIGUOUS,
             lambda: candidate_refusal([826, 869]))
     check("...and the refusal NAMES the candidates so the author can pick one",
-          all(token in candidate_refusal([826, 869])[1] for token in ("#826", "#869")), True)
+          total(lambda: all(token in candidate_refusal([826, 869])[1]
+                           for token in ("#826", "#869"))), True)
     check("exactly one candidate is not a cardinality refusal", candidate_refusal([7]), None)
 
     def issue(**over):
@@ -829,7 +844,10 @@ def _self_test():                                                       # noqa: 
                 raise RuntimeError("HTTP 502")
             return issue_payload if issue_payload is not None else issue(number=number)
 
-        return derive_issue_number(pull(body=body), read)
+        # `total` so a derivation that RAISES reds these named checks instead of aborting the run:
+        # "TOTAL: never raises, never guesses" is the property, so it is asserted, not assumed.
+        got = total(lambda: derive_issue_number(pull(body=body), read))
+        return got if isinstance(got, DerivedIssue) else DerivedIssue(got, got, str(got), None)
 
     # POSITIVE CONTROL: a well-formed PR with exactly one open referenced issue derives it.
     check("POSITIVE CONTROL: one open referenced issue derives cleanly",
@@ -855,7 +873,10 @@ def _self_test():                                                       # noqa: 
                                             ("Closes #7", issue(state="closed")))],
           [None, None, None, None])
     check("a malformed pull payload refuses rather than raising",
-          derive_issue_number(None, lambda n: issue()).reason, REASON_ISSUE_UNREADABLE)
+          total(lambda: derive_issue_number(None, lambda n: issue()).reason),
+          REASON_ISSUE_UNREADABLE)
+    check("...and so does a payload with no title or body at all",
+          total(lambda: derive_issue_number({}, lambda n: issue()).reason), REASON_NO_REFERENCE)
 
     # ---- the refusal taxonomy + comment --------------------------------------------------------
     check("every per-PR refusal reason is distinct", len(set(PR_REFUSAL_REASONS)),
@@ -1032,8 +1053,9 @@ def _self_test():                                                       # noqa: 
         check(f"the sweep refuses {label} and writes NOTHING",
               (row["refused"], row["refusals"], rec.written),
               (1, {reason: 1}, []))
+        posted = rec.posted[0] if rec.posted else (None, "")
         check(f"...and the refusal for {label} is VISIBLE on the PR",
-              (len(rec.posted), rec.posted[0][0], refusal_marker(reason) in rec.posted[0][1]),
+              (len(rec.posted), posted[0], refusal_marker(reason) in posted[1]),
               (1, 41, True))
 
     refused_by_shared = _Recorder(
@@ -1043,7 +1065,7 @@ def _self_test():                                                       # noqa: 
           (row["refused"], row["refusals"], len(refused_by_shared.posted)),
           (1, {REASON_MINT_REFUSED: 1}, 1))
     check("...with the shared gate's own reason text, verbatim",
-          "the pull request is a DRAFT" in refused_by_shared.posted[0][1], True)
+          total(lambda: "the pull request is a DRAFT" in refused_by_shared.posted[0][1]), True)
 
     # The comment is deduped by reason, so a refusal is never a per-tick comment loop.
     dedupe = _Recorder([pull(number=41, body="no reference")],
