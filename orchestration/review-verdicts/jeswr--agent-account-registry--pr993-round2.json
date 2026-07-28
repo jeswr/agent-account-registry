@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 993,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "55ffd76657704ca948c295aaca4c5ba531e59ffd",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe resume loop remains fail-closed while becoming convergent: a nonzero enable is accepted only after a fresh workflow-state read returns exactly `active`; unreadable, `disabled_manually`, and `disabled_inactivity` states remain fatal, and all four writers are still attempted. The fake now accurately models GitHub CLI's disabled-only enable resolution and clears both manual and inactivity-disabled state on success. The added cases independently exercise the successful disabled-to-active path, the already-active selector miss, transient failure, inactive states, missing write/read grants, exact call order, and final state, so the new acceptance path is non-vacuous. I found no correctness, security, or completeness issue. With no findings in either round, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
