@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 993,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "55ffd76657704ca948c295aaca4c5ba531e59ffd",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change makes resume convergent without weakening its fail-closed postcondition: a failed enable is accepted only after an Actions state read proves the workflow is exactly `active`; unreadable and every non-active state remain fatal, while all four writers are still attempted. The fake models the selector miss and state transition rather than granting unconditional success, and the added scenarios independently cover the already-active accept path, transient failure, inactivity-disabled state, missing write/read grants, exact call ordering, and final workflow states. I found no correctness, security, or non-vacuity issue in the diff.",
+  "verdict": "approve"
+ }
+}
