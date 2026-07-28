@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4799,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "033ce51d70319450caded29544522c60275fba95",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`rust_scalar` maps `xsd:integer` to `RustScalar::I64`, but the XSD integer value space is unbounded. The generated loader therefore rejects valid literals such as `9223372036854775808` with `LoadError::LexicalForm`. This conflicts with the nearby promise that only datatypes representable without loss receive primitives and makes the typed reader stricter than the SHACL shape it claims to represent.",
+    "file": "crates/sparq-wrapper-shacl/src/lower.rs",
+    "fix_hint": "Keep `xsd:integer` as `String` (or introduce an arbitrary-precision representation, which would conflict with the dependency-free output goal). Restrict i64 lowering to integer-derived datatypes whose complete value spaces fit i64, and add a generated-loader test using an in-range and an out-of-i64-range valid `xsd:integer` lexical form.",
+    "severity": "major",
+    "title": "Unbounded xsd:integer is incorrectly lowered to i64"
+   },
+   {
+    "body": "`upper_camel_from_iri` turns a shape IRI ending in `self` into `Self`, but `RESERVED` does not include `Self`. Lowering succeeds and emission produces `pub struct Self`, which Rust rejects because `Self` is a reserved type keyword. Thus accepted models do not reliably satisfy the public claim that emission yields a complete compilable module.",
+    "file": "crates/sparq-wrapper-shacl/src/lower.rs",
+    "fix_hint": "Reserve `Self` (and audit generated item identifiers against Rust's reserved identifiers), returning `LowerError::ReservedName` or deterministically escaping it. Add a test that lowers a shape such as `ex:self`, then either asserts the typed error or compiles the safely escaped output.",
+    "severity": "major",
+    "title": "Shape local name `self` emits the illegal type name `Self`"
+   }
+  ],
+  "progress": null,
+  "summary": "The generator has two correctness holes in its newly public surface. It maps the unbounded XSD integer datatype to i64, so valid SHACL data can be rejected, contradicting the stated lossless mapping criterion. It can also accept a valid shape name that emits the reserved Rust type identifier `Self`, producing source that does not compile. The acceptance compile test covers only friendly identifiers and small integers, so neither defect is detected.",
+  "verdict": "request_changes"
+ }
+}
