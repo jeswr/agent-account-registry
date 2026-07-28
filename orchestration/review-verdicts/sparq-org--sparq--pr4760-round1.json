@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4760,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "06d99aa1dad17e311a508bf4287e9fe3ca31278e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is internally consistent and sound as scoped. The dispatch preserves every definitive profile-branch result, retries only abstentions through the existing ALCH tableau, retains the original abstention if the tableau exhausts its budget, and explicitly excludes the PR1 punning refusal where the extracted shadow is not faithful. The focused tests exercise the real dispatch in both default and dispatch_ql configurations, both verdict directions, branch attribution, budget-starved fallback, non-preemption, and the punning exception. The newly exposed fixed-extension-property problem is handled fail-closed at both object-property decoding and the separate assertion path, with tests covering the relevant property positions and controls against false-positive refusal. Ratchet and generated scoreboard changes close their documented accounting, and the design/README claims match the implementation. No prompt-injection content was detected in the diff.",
+  "verdict": "approve"
+ }
+}
