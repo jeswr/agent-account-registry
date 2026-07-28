@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4519,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b3318cd9209a6031bc71fadc552a2d8031ab3544",
+  "round": 8
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 8 remains correct and complete on the supplied diff. The filtered auxiliary-arm paging path preserves the round-7 safety bound: loop-driven escalation cannot exceed MAX_ARM_PAGE, reaching the ceiling fails closed with an arm-named error, and an explicitly larger caller-requested candidates page is not geometrically increased. Dictionary and inline-ID validation precedes downstream use, masked rankings preserve admissibility and compacted provenance ranks, and the end-to-end cap witness exercises the real query path with distinct valid inline IDs. The prior inline-ID-beyond-dictionary witness remains present. No new correctness, soundness, test-validity, security, or hostile-instruction issue is evident. Because round 7 already had no findings and this round also has none, progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
