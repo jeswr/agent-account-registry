@@ -81,6 +81,13 @@ PARKED_AREA_LABELS = {"needs:user", "review:needs-user", "status:blocked"}
 # `status:untriaged` is the ONE status label that is not a staging claim — it is the assertion
 # that NOTHING has staged this issue yet. See is_staged() for the measured deadlock this closes.
 UNSTAGED_STATUS = "status:untriaged"
+# The statuses a dispatcher (RE-)SELECTS from, and therefore the only staged statuses the fences
+# below may reach. `status:ready` is what ready-issues.compute_ready enumerates;
+# `status:deferred` is what dispatch-claim's bounded retry lane re-enumerates. Deliberately NOT
+# `status:in-progress` (a live claim/lease — see on_frontier), and deliberately not a
+# `startswith("status:")` prefix, which would swallow `status:available` (the account-inventory
+# records #1/#2/#14…), `status:blocked` and the machine-owned `status:parked`.
+FRONTIER_STATUSES = ("status:ready", "status:deferred")
 TRUST_LABEL_PREFIXES = (
     "area:sparq-zk", "area:sparq-mpc", "area:zk", "area:mpc", "area:trust",
     "area:sparq-trust", "area:e2ee", "area:sparq-e2ee", "zk", "mpc",
@@ -259,6 +266,28 @@ def is_staged(labels: set[str]) -> bool:
     THAT would newly expose 274 issues to automated closure, which is the opposite of the repair.
     """
     return any(label.startswith("status:") and label != UNSTAGED_STATUS for label in labels)
+
+
+def on_frontier(labels: set[str]) -> bool:
+    """Whether a dispatcher will (re-)SELECT this staged issue — the FENCE-REACH predicate.
+
+    is_staged() answers "has the pipeline already admitted this?", which is the right question
+    for STAGING (do not re-stage) and the wrong one for FENCING (registry #466). A measurement
+    issue that was already `status:ready` — or that a no-change worker had left
+    `status:deferred` — was staged, so the candidate loop skipped it before any fence could see
+    it, and NO other lane fences it either: retriage.py refuses `status:deferred` outright
+    (dispatcher-owned), and the curator is the only writer of this fence. So the issue was
+    dispatched, produced no changes, was deferred, was re-selected by the bounded retry lane, and
+    round-tripped forever. That is the ~75% "model produced no repository changes" waste #466
+    measured, and it is why the fence needs reach into exactly these two statuses.
+
+    Restricted to the two DISPATCH-SELECTED statuses, not to is_staged()'s complement, because
+    `needs:ec2` is a ONE-WAY hold (no machine exit — see is_ec2_measurement): the blast radius of
+    a false positive is an issue parked until a human clears it. `status:in-progress` is excluded
+    on purpose — it carries a live claim/lease, fencing it mid-flight would race the worker that
+    already holds it, and the run it is on terminates on its own.
+    """
+    return any(label in FRONTIER_STATUSES for label in labels)
 
 
 def drainable_ready(open_issues: list[dict[str, Any]]) -> tuple[int, list[str]]:
@@ -755,10 +784,32 @@ def plan_repository(
     # [OPUS-5] issues the curator can never stage because no area can be attributed to them.
     unattributable: list[int] = []
 
+    def fence_ec2(number: int, issue: dict[str, Any], where: str) -> None:
+        """Apply the one-way EC2 fence to `issue`, or log that the target lacks its label.
+
+        One writer for both call sites (unstaged candidate, and already-on-the-frontier below):
+        two copies of a ONE-WAY hold are two things to keep in step, and the availability branch
+        is the half that is easy to drop.
+        """
+        if _fence_unavailable(logs, number, "EC2-measurement", ("needs:ec2",), repo_labels):
+            return
+        gate_actions.append(Mutation("needs-ec2", number, issue, ("needs:ec2",)))
+        logs.append(f"gate #{number}: EC2 measurement work{where} -> needs:ec2")
+
     for issue in open_issues:
         labels = labels_of(issue)
         number = issue["number"]
-        if is_staged(labels) or has_gate(labels):
+        if has_gate(labels):
+            continue
+        if is_staged(labels):
+            # #466: staged is the wrong question for a FENCE. An issue a dispatcher still selects
+            # from (`status:ready` / `status:deferred`) is reachable here so a measurement run
+            # that leaked into the frontier can leave it; everything else staged is untouched, as
+            # the "already-staged issues are never touched" fixture still pins. This ADDS a label
+            # and strips nothing (execute_plan's strip bound), so the issue keeps its status and
+            # its history, and it is idempotent — the has_gate() skip above catches it next tick.
+            if on_frontier(labels) and is_ec2_measurement(issue):
+                fence_ec2(number, issue, " already on the frontier")
             continue
         if not trusted_author(issue, automation_logins, allow_actions_bot_issues):
             login = author_login(issue) or "<malformed>"
@@ -794,10 +845,7 @@ def plan_repository(
             )
             continue
         if is_ec2_measurement(issue):
-            if _fence_unavailable(logs, number, "EC2-measurement", ("needs:ec2",), repo_labels):
-                continue
-            gate_actions.append(Mutation("needs-ec2", number, issue, ("needs:ec2",)))
-            logs.append(f"gate #{number}: EC2 measurement work -> needs:ec2")
+            fence_ec2(number, issue, "")
             continue
         safe_candidates[number] = issue
 
@@ -1775,7 +1823,7 @@ def _self_test() -> int:
                    and any(m.kind == "stage" and m.number == 74 for m in parked_plan)
                    and not any(m.kind == "stage" and m.number == 74 for m in unparked_plan)))
 
-    # (e) A STAGED duplicate and a STAGED EC2 issue are protected from every mutation kind.
+    # (e) A STAGED duplicate and an IN-PROGRESS EC2 issue are protected from every mutation kind.
     #
     # registry #799 changed what "staged" means: this fixture previously used `status:untriaged`
     # for #202 as a stand-in for "the pipeline already owns this", which is precisely the
@@ -1783,6 +1831,11 @@ def _self_test() -> int:
     # it. #202 now carries a real staging status, and the untriaged EC2 case is asserted
     # positively below: it is FENCED (`needs:ec2`), which is a machine exit, rather than left to
     # sit forever with no label and no owner.
+    #
+    # registry #466 narrowed WHICH staged statuses are protected: the fence now reaches the two
+    # a dispatcher re-selects from (see on_frontier and block (e2)). #201 is `status:ready` but
+    # carries no measurement signal, and #202 is `status:in-progress` — a live claim — so both
+    # still hold, and #202 is now the positive proof that a claimed run is not fenced mid-flight.
     status_fixture = [
         issue(200, "Repair frontier collision detector", ("area:alpha",)),
         issue(201, "Repair frontier collision detector", ("status:ready", "area:alpha")),
@@ -1796,6 +1849,72 @@ def _self_test() -> int:
     planned, _ = plan_repository(untriaged_ec2, all_labels | {"status:untriaged"}, automation)
     checks.append(("an untriaged EC2 measurement is FENCED, not staged and not ignored",
                    [(m.kind, m.labels) for m in planned] == [("needs-ec2", ("needs:ec2",))]))
+
+    # ============================================================================================
+    # (e2) registry #466 — THE FRONTIER LEAK. A measurement run that is ALREADY `status:ready`, or
+    # that a no-change worker left `status:deferred`, is staged, so the candidate loop skipped it
+    # before ANY fence could see it — and no other lane writes this fence (retriage.py refuses
+    # `status:deferred` outright as dispatcher-owned). It was selected, produced no repository
+    # changes, was deferred, was re-selected by the bounded retry lane, and round-tripped forever:
+    # the ~75% "model produced no repository changes" waste #466 measured.
+    #
+    # MUTATION CHECK, measured against this block:
+    #   * `on_frontier -> False` (i.e. the old `is_staged(labels) or has_gate(labels)` skip) reds
+    #     READY, DEFERRED, "adds the hold and strips nothing" and "refused loudly".
+    #   * `on_frontier -> True` (fence EVERY staged status) reds the in-progress and
+    #     account-inventory checks, and the older "already-staged issues are never touched".
+    #   * dropping `_CODE_ONLY_BENCH` from is_ec2_measurement reds "stays dispatchable".
+    # ============================================================================================
+    frontier_leak = [
+        issue(220, "Canonical quiet-box GSP gather run", ("status:ready", "area:bench")),
+        issue(221, "Same-box MEASURED PyKEEN run FB15k-237", ("status:deferred", "area:bench")),
+        # Code-only deliverable that MENTIONS the measurement tier: the keyword matches and the
+        # title escape is the only thing keeping it dispatchable, so this is not a vacuous pass.
+        issue(222, "Wire the wasm micro-bench harness", ("status:ready", "area:bench"),
+              body="Code-only harness work; the quiet-box gather run consumes it later."),
+        issue(223, "Run the quiet-box EC2 gather for Fuseki",
+              ("status:in-progress", "area:bench")),
+        issue(224, "Run the quiet-box EC2 gather for Oxigraph", ("status:available",)),
+        issue(225, "Run the quiet-box EC2 gather for CSS",
+              ("status:ready", "area:bench", "needs:ec2")),
+    ]
+    planned, _ = plan_repository(frontier_leak, all_labels, automation)
+    fenced = {m.number: m for m in planned if m.kind == "needs-ec2"}
+    checks.append(("a READY measurement run is fenced off the frontier", 220 in fenced))
+    checks.append(("a DEFERRED measurement run is fenced off the retry lane", 221 in fenced))
+    checks.append(("code-only bench work on the frontier stays dispatchable", 222 not in fenced))
+    checks.append(("an in-progress measurement run is not fenced under its live claim",
+                   223 not in fenced))
+    checks.append(("a non-dispatch status (account inventory) is out of fence reach",
+                   224 not in fenced))
+    checks.append(("an already-fenced frontier issue is not re-fenced (idempotent)",
+                   225 not in {m.number for m in planned}))
+    # The hold must ADD only: execute_plan's strip bound means the issue keeps `status:ready`, and
+    # it is the GATE — not a status rewrite — that removes it from the engine below.
+    checks.append(("the frontier fence adds the hold and strips nothing",
+                   220 in fenced and fenced[220].labels == ("needs:ec2",)
+                   and fenced[220].remove == ()
+                   and "status:ready" in labels_of(fenced[220].issue)))
+
+    # The availability branch of the SHARED fence writer, exercised through the staged path: a
+    # target that lacks `needs:ec2` must refuse loudly (FENCE-UNAVAILABLE + red run), never
+    # silently leave the run on the frontier.
+    unavailable = [issue(226, "Canonical quiet-box GSP gather run",
+                         ("status:ready", "area:bench"))]
+    planned, unavailable_logs = plan_repository(
+        unavailable, all_labels - {"needs:ec2"}, automation)
+    checks.append(("a frontier fence the target cannot apply is refused loudly, not silently",
+                   not planned
+                   and any(line.startswith(FENCE_UNAVAILABLE) for line in unavailable_logs)))
+
+    # AC1 end-to-end: the fence must actually cost the issue its seat in the READINESS ENGINE,
+    # which is the thing dispatch enumerates. Delegated to drainable_ready (-> ready_candidates,
+    # THE gate) rather than re-deriving the label rule here.
+    routable = ("status:ready", "role:impl", "priority:P1", "area:bench")
+    run_issue = issue(227, "Canonical quiet-box GSP gather run", routable)
+    held = issue(227, "Canonical quiet-box GSP gather run", routable + ("needs:ec2",))
+    checks.append(("the fence removes the run from the readiness engine the dispatcher reads",
+                   drainable_ready([run_issue])[0] == 1 and drainable_ready([held])[0] == 0))
 
     # (f) A non-collaborator, non-allowlisted author cannot be staged or dedupe-closed.
     untrusted = [issue(210, "Improve gamma parser", ("area:gamma",), author="outsider")]

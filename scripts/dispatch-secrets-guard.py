@@ -135,6 +135,12 @@
 # pr-gate's full checkout) and PRESENT (named on a dispatch tick), so the next step that starts
 # loading a script goes red at review time instead of halting the fleet.
 #
+# TRANSIENT source reads (issue #554). #618 fixed the DIAGNOSIS of an unreadable covered set; the
+# COST stayed, because this guard is gating: one blipped read of worker-pr.py or policy/repos.toml
+# and the tick launches nothing. derive_trust_surfaces now reads both through
+# read_source_with_retry — a BOUNDED retry that re-raises rather than degrading to empty text,
+# since empty text resolves to the empty surface, which is the all-22-uncovered false alarm itself.
+#
 # Pure verdict helpers + a stubbed-gh flow (including value-never-echoed sentinels) run under
 # --self-test (registry-selftest gate).
 import itertools
@@ -143,6 +149,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 ENVIRONMENT = "dispatch-secrets"
 REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
@@ -1396,6 +1403,68 @@ def trust_surface_from_worker_pr(source_text):
     raise ValueError("DEFAULT_TRUST_SURFACE_PATHS not found in worker-pr.py")
 
 
+# ---- the covered-set SOURCE read is retried, bounded, and never swallowed (issue #554) ----------
+# The human-arm covered set is derived from two files read off a freshly-materialized sparse
+# checkout. #618 fixed the diagnosis — an empty surface now refuses by naming the DERIVATION instead
+# of emitting "22 privileged scripts outside the human-arm trust surface", a security-policy verdict
+# about the whole script inventory. What it did not fix is the COST: a single transient read fault
+# (a half-materialized checkout, a filesystem blip) still fails a GATING guard job, so that tick
+# launches nothing. A read that can blip gets a bounded retry FIRST.
+#
+# Bounded and non-swallowing are both load-bearing. Unbounded would hang the tick; swallowing to ""
+# would hand `trust_surface_from_worker_pr` an empty module and resolve the surface to the empty
+# tuple — the exact all-uncovered false alarm this issue exists to kill. The last OSError is
+# re-raised instead, so a genuinely-absent source still fails closed with the distinct derivation
+# message.
+SOURCE_READ_ATTEMPTS = 3
+SOURCE_READ_BACKOFF_SECONDS = 0.25
+
+
+def read_source_with_retry(path, attempts=SOURCE_READ_ATTEMPTS, opener=open, sleeper=time.sleep,
+                           backoff=SOURCE_READ_BACKOFF_SECONDS):
+    """Read `path` whole as text, retrying an OSError up to `attempts` reads TOTAL.
+
+    Returns the file's text, or re-raises the last OSError once the budget is spent — it never
+    degrades a failed read into empty text. `attempts` < 1 is a programming error and raises, since
+    a zero budget would read nothing and return None, which is the silent-empty failure mode again.
+    `opener`/`sleeper` are injected so the self-test can prove the retry without a real fault or a
+    real delay."""
+    if attempts < 1:
+        raise ValueError("read_source_with_retry needs at least one attempt "
+                         "(a zero budget reads nothing and cannot fail closed)")
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with opener(path, "r", encoding="utf-8") as handle:
+                return handle.read()
+        except OSError as error:
+            last_error = error
+            if attempt < attempts:
+                sleeper(backoff * attempt)
+    raise last_error
+
+
+def derive_trust_surfaces(repo_root, reader=read_source_with_retry):
+    """(default_surfaces, policy_surfaces, error_or_None): the human-arm covered set, from the TWO
+    live sources (issue #166: policy/repos.toml's per-target list EXTENDS worker-pr.py's mandatory
+    floor). A read/parse fault returns EMPTY surfaces AND names itself, so the caller reports the
+    DERIVATION and refuses to evaluate coverage rather than grading 22 scripts against nothing."""
+    import tomllib
+
+    try:
+        default_surfaces = trust_surface_from_worker_pr(
+            reader(os.path.join(repo_root, "scripts", "worker-pr.py")))
+        policy_doc = tomllib.loads(reader(os.path.join(repo_root, "policy", "repos.toml")))
+        policy_surfaces = tuple(
+            policy_doc["repos"]["jeswr/agent-account-registry"]["readiness"]["security_paths"])
+        if not policy_surfaces:
+            raise ValueError("policy/repos.toml readiness.security_paths is empty")
+    except (OSError, KeyError, TypeError, AttributeError, ValueError,
+            SyntaxError, tomllib.TOMLDecodeError) as error:
+        return (), (), f"{type(error).__name__}: {error}"
+    return default_surfaces, policy_surfaces, None
+
+
 # The slot-allocation listings set-up-account.yml's store step MUST union BEFORE creating the
 # IRREVERSIBLE acct-claims ref (claims are never deleted — a claim on an occupied slot burns it
 # permanently). Post-#101 the ACCTNN_TOKEN secrets live in the dispatch-secrets ENVIRONMENT, so
@@ -2516,6 +2585,103 @@ def _self_test():
          "scripts/probe.sh" in empty_surface[1]),
         (False, True, False))
 
+    # ---- issue #554: a TRANSIENT source read is retried, never mistaken for a coverage gap ------
+    # The run at 05:27 emitted all 22 privileged scripts as "outside the human-arm trust surface"
+    # one tick after the identical guard passed, on identical code — a covered-set READ that came
+    # back unusable, graded as an exfil finding about every script in the repo. The refusal above
+    # fixes the DIAGNOSIS; these fix the recurrence: the read gets a bounded retry before anything
+    # is graded, and a spent budget re-raises rather than degrading to empty text.
+    class _StubHandle:
+        def __init__(self, text):
+            self._text = text
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self):
+            return self._text
+
+    def _stub_opener(failures, text="payload"):
+        """An opener that raises OSError for its first `failures` calls, then serves `text`.
+        `.calls` counts opens, `.naps` the backoffs — a retry that does not happen is countable."""
+        state = {"calls": 0, "naps": []}
+
+        def opener(_path, _mode, encoding=None):
+            state["calls"] += 1
+            if state["calls"] <= failures:
+                raise OSError(5, "transient read blip")
+            return _StubHandle(text)
+
+        opener.state = state
+        return opener
+
+    flaky = _stub_opener(failures=1, text="recovered")
+    try:
+        recovered = read_source_with_retry("scripts/worker-pr.py", opener=flaky,
+                                           sleeper=flaky.state["naps"].append)
+    except OSError as error:
+        # A budget that stopped retrying reports as ONE failing line, not a traceback that
+        # log-scraped failure counts have to guess at (see chk's repr() note).
+        recovered = f"gave up: {error}"
+    chk("source read: ONE transient fault is retried and the read SUCCEEDS (the #554 tick)",
+        (recovered, flaky.state["calls"], len(flaky.state["naps"])),
+        ("recovered", 2, 1))
+    doomed = _stub_opener(failures=99)
+    try:
+        read_source_with_retry("scripts/worker-pr.py", opener=doomed,
+                               sleeper=doomed.state["naps"].append)
+        raised = "no-raise"
+    except OSError as error:
+        raised = str(error.errno)
+    chk("source read: the retry is BOUNDED and re-raises — it never degrades to empty text, "
+        "which is what marks every privileged script uncovered",
+        (raised, doomed.state["calls"], len(doomed.state["naps"])),
+        ("5", SOURCE_READ_ATTEMPTS, SOURCE_READ_ATTEMPTS - 1))
+    chk("source read: the live budget is a RETRY budget (>1 attempt) with a real backoff",
+        (SOURCE_READ_ATTEMPTS > 1, SOURCE_READ_BACKOFF_SECONDS > 0), (True, True))
+    try:
+        read_source_with_retry("x", attempts=0, opener=_stub_opener(0))
+        zero_budget = "no-raise"
+    except ValueError:
+        zero_budget = "raised"
+    except OSError:
+        zero_budget = "os-error"
+    chk("source read: a ZERO attempt budget is refused, not silently read-nothing",
+        zero_budget, "raised")
+
+    # The WIRE: the derivation must go through the retrying reader, and a source that stays
+    # unreadable must come back as EMPTY surfaces PLUS a named error — the input the refusal above
+    # consumes. A reader swapped back to a bare single-shot `open` flips the first of these red.
+    chk("trust surface: the derivation reads its sources through the RETRYING reader",
+        derive_trust_surfaces.__defaults__, (read_source_with_retry,))
+
+    def _dead_reader(_path):
+        # errno 5 (EIO), not 2: a read that stays broken past the retry budget, which is the shape
+        # the guard job saw. (ENOENT would arrive as FileNotFoundError and hide the class.)
+        raise OSError(5, "transient read blip")
+
+    dead = derive_trust_surfaces("/nonexistent-repo-root", reader=_dead_reader)
+    dead_verdict = privileged_script_coverage_verdict(privileged_fixture, dead[0])
+    chk("trust surface: an unreadable source yields EMPTY surfaces + a NAMED read error, and the "
+        "coverage verdict then names the DERIVATION instead of listing every script (#554)",
+        (dead[0], dead[1], dead[2] is not None, "OSError" in (dead[2] or ""),
+         dead_verdict[0], "DERIVATION failure" in dead_verdict[1],
+         "scripts/probe.sh" in dead_verdict[1]),
+        ((), (), True, True, False, True, False))
+
+    def _blank_reader(path):
+        # An empty-but-successful read: the transient blip's other shape. It must NOT resolve to a
+        # usable surface — `ast.parse("")` finds no constant, so the derivation refuses.
+        return "" if path.endswith("worker-pr.py") else "unused"
+
+    blank = derive_trust_surfaces("/nonexistent-repo-root", reader=_blank_reader)
+    chk("trust surface: an EMPTY-but-successful source read refuses too (an empty covered set is "
+        "a read failure, never a coverage verdict)",
+        (blank[0], blank[1], blank[2] is not None), ((), (), True))
+
     # The human-arm trust surface, derived from the TWO live sources (issue #166: the policy list
     # is a per-target EXTENSION unioned onto worker-pr.py's mandatory floor). #528 wrapped this in
     # a broad `except (OSError, KeyError, TypeError, AttributeError, ImportError)` that fell back
@@ -2523,23 +2689,8 @@ def _self_test():
     # assertions below turned into a 22-script "outside the trust surface" verdict rather than a
     # readable "these inputs are missing". The failure reason is now CAPTURED and asserted on its
     # own, so a derivation fault can never again be mistaken for a policy gap.
-    import tomllib
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-    derivation_error = None
-    policy_surfaces = ()
-    default_surfaces = ()
-    try:
-        with open(os.path.join(repo_root, "scripts", "worker-pr.py"), encoding="utf-8") as handle:
-            default_surfaces = trust_surface_from_worker_pr(handle.read())
-        with open(os.path.join(repo_root, "policy", "repos.toml"), "rb") as handle:
-            policy_doc = tomllib.load(handle)
-        policy_surfaces = tuple(policy_doc["repos"]["jeswr/agent-account-registry"]["readiness"][
-            "security_paths"])
-        if not policy_surfaces:
-            raise ValueError("policy/repos.toml readiness.security_paths is empty")
-    except (OSError, KeyError, TypeError, AttributeError, ValueError,
-            SyntaxError, tomllib.TOMLDecodeError) as error:
-        derivation_error = f"{type(error).__name__}: {error}"
+    default_surfaces, policy_surfaces, derivation_error = derive_trust_surfaces(repo_root)
     chk("trust surface: BOTH live sources (worker-pr.py DEFAULT_TRUST_SURFACE_PATHS + "
         "policy/repos.toml security_paths) are readable here — a derivation fault must name "
         "ITSELF, never surface as a 22-script policy finding (issue #618)",
