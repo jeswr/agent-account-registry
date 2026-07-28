@@ -699,6 +699,13 @@ class Sweeper:
             self.errors += 1
             print("::error::regate-sweep: could not list open pull requests — nothing was swept")
             return 1
+        # A tick with NOTHING declared must still say so. An empty declaration file is the exact
+        # silent-inert state #927 is about: a sweeper that prints nothing is indistinguishable from
+        # a sweeper that is not running, and that is how a 58-minute outage becomes invisible.
+        if not self.repairs:
+            self.rows.append(f"CENSUS repair=none scanned={len(pulls)} class=0 "
+                             f"skipped=no-declared-repairs")
+            print(self.rows[-1])
         for repair in self.repairs:
             self._sweep_one(repair, pulls)
         self._publish()
@@ -1334,6 +1341,14 @@ def _test_live_sweep(chk):
     chk("repair: a repair older than the lookback is inert",
         (gh12.updated(), sweeper12.rows[0]),
         ([], repair_census_line(917, "repair-outside-lookback")))
+    gh14, _ = _fixture()
+    sweeper14 = Sweeper("jeswr/agent-account-registry", [], runner=gh14, apply=True,
+                        clock=lambda: NOW, sleeper=lambda _s: None)
+    sweeper14.run()
+    chk("silence: a tick with NO declared repairs still emits a census row — a sweeper that prints "
+        "nothing is indistinguishable from one that is not running",
+        sweeper14.rows, ["CENSUS repair=none scanned=2 class=0 skipped=no-declared-repairs"])
+
     gh13, sweeper13 = _fixture()
     gh13.default_branch = "main"
     chk("repair: a default-branch drift FAILS CLOSED rather than moving branches onto a base it "
