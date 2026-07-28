@@ -112,6 +112,49 @@ CLOSING_REF_RE = re.compile(
     r"#([0-9]+)(?![0-9])",
     re.IGNORECASE)
 
+# QUOTED CONTEXT — stripped BEFORE the grammar runs, and the reason it must be.
+#
+# GitHub does not resolve a closing keyword inside a code block; running the grammar over the raw
+# text does, which makes it strictly MORE permissive than the grammar this file claims to
+# implement. That gap is not cosmetic, because a wrong mint is the ONE outcome here with no
+# recovery: it is silent (no comment is posted on a success), permanent (records are create-only
+# and `existing_record_verdict` refuses to overwrite one with different identifying fields), and
+# from the next tick onwards it is counted as `with_record` — so the sealed census would absorb the
+# error AS A SUCCESS until a human deleted the ledger file.
+#
+# It was also SELF-INFLICTED. `REASON_HINTS[REASON_NO_REFERENCE]` is posted on up to
+# DEFAULT_MAX_COMMENTS pull requests per tick, and quoting that comment back into the PR
+# description — the single most likely author response to receiving it — was enough to mint a
+# record bound to the number in the tool's own worked example. Two independent fixes, because one
+# of them being right is not a reason to leave the other wrong: the hint no longer contains a
+# literal issue number at all (see REASON_HINTS), AND every quoted context is stripped here. The
+# self-test pins that the FULL refusal comment for every reason code is inert when fed back in,
+# even when the passed-through message is itself hostile.
+#
+# Stripping order matters: an HTML comment can contain a fence, a fence can contain backticks, and
+# a blockquote line can contain either.
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+FENCED_BLOCK_RE = re.compile(
+    r"^[ \t]{0,3}(`{3,}|~{3,})[^\n]*$.*?(?:^[ \t]{0,3}\1[ \t]*$|\Z)", re.M | re.S)
+# Content that holds no backtick, delimited by a run of the same length: linear, and an UNBALANCED
+# backtick therefore consumes nothing rather than swallowing the document.
+CODE_SPAN_RE = re.compile(r"(`+)[^`]*?\1")
+BLOCKQUOTE_LINE_RE = re.compile(r"^[ \t]{0,3}>.*$", re.M)
+
+# NEGATED PROSE — a best-effort suppressor, and honestly labelled as one.
+#
+# Unlike the four strips above, this is PROSE, so it cannot be a structural guarantee: an unlisted
+# negator degrades to the old behaviour. What makes it safe to have anyway is HOW it composes —
+# see `candidate_refusal`. A negated reference is removed from the DECLARED set but is still
+# counted for AMBIGUITY, so this rule can only ever turn a mint into a refusal. It can never turn a
+# refusal into a mint, and it can never change WHICH issue is bound. --self-test asserts that
+# property directly rather than trusting the wording.
+NEGATOR_RE = re.compile(
+    r"(?<![0-9A-Za-z_])(?:not|no|never|neither|nor|without|cannot|unable|instead|rather"
+    r"|[A-Za-z]+n['’]t)(?![0-9A-Za-z_])", re.IGNORECASE)
+NEGATION_WINDOW = 64
+SENTENCE_BREAK_RE = re.compile(r"[.!?\n]")
+
 # ADVISORY ONLY. Every same-repository `#N` the PR mentions, closing keyword or not. It is used in
 # exactly one place — the prose of a `no-issue-reference` refusal comment, to name the numbers the
 # author might have meant — and it is NEVER a candidate: a mention is a discussion, a closing
@@ -134,6 +177,7 @@ REASON_REFERENCE_CLOSED = "reference-is-closed"
 REASON_ISSUE_UNREADABLE = "source-issue-unreadable"
 REASON_MINT_REFUSED = "mint-refused"
 REASON_RECORD_PROBE_FAILED = "record-probe-failed"
+REASON_MINT_FAILED = "mint-failed"
 
 PR_REFUSAL_REASONS = (
     REASON_NO_REFERENCE,
@@ -143,30 +187,42 @@ PR_REFUSAL_REASONS = (
     REASON_ISSUE_UNREADABLE,
     REASON_MINT_REFUSED,
     REASON_RECORD_PROBE_FAILED,
+    REASON_MINT_FAILED,
 )
 
-# The ONE refusal that is censused but NOT commented on the PR. A registry-side probe failure is a
-# fact about the REGISTRY, not about the pull request: commenting it would put a transient outage
-# on someone else's PR, permanently (the comment dedupe is by reason, so it would never be
-# retracted). Every OTHER reason is a fact about the PR that its author can act on, so every other
-# reason comments. Asserted exactly, in both directions, by --self-test.
-SILENT_REASONS = frozenset({REASON_RECORD_PROBE_FAILED})
+# The refusals that are censused but NOT commented on the PR. Both are facts about the REGISTRY —
+# a probe that could not be read, a write that failed — not about the pull request. Commenting one
+# would put a transient registry outage on someone else's PR permanently, because the comment
+# dedupe is by reason and would never retract it. Every OTHER reason is a fact about the PR that
+# its author can act on, so every other reason comments. Asserted exactly, in both directions.
+SILENT_REASONS = frozenset({REASON_RECORD_PROBE_FAILED, REASON_MINT_FAILED})
 
-# Target-level refusal (not a per-PR reason): see target_sweep_refusal.
+# Target-level refusals (not per-PR reasons): see target_sweep_refusal.
 REASON_TARGET_NOT_ANNOTATABLE = "target-not-annotatable"
 REASON_TARGET_ROUTING_UNREADABLE = "target-routing-unreadable"
+REASON_TARGET_PULLS_UNREADABLE = "target-pulls-unreadable"
 
 # The operator's next action, per reason. A refusal comment that does not say what to change is
 # just a louder silence.
+# WHY NO HINT HERE CONTAINS A LITERAL ISSUE NUMBER. These strings are posted verbatim onto pull
+# requests, and the likeliest author response to receiving one is to quote it back into the PR
+# description. A worked example reading `Closes #1234` was therefore a live payload that minted a
+# record bound to 1234. The quoted-context strip already neutralises the quoted form; writing the
+# placeholder without digits makes the text inert even when it is pasted UNQUOTED, and --self-test
+# pins both properties over the whole rendered comment.
 REASON_HINTS = {
     REASON_NO_REFERENCE:
-        "Add exactly one closing reference for the source issue — e.g. a `Closes #1234` line in "
-        "the PR description. `Refs #1234` is not a closing reference, and a cross-repository "
-        "`owner/repo#1234` names a different lease partition.",
+        "Add exactly one closing reference for the source issue — a `Closes #<issue-number>` line "
+        "in the PR description, with the real number. `Refs #<issue-number>` is not a closing "
+        "reference, and a cross-repository `owner/repo#<issue-number>` names a different lease "
+        "partition. A keyword inside a code block, a code span, a blockquote or an HTML comment is "
+        "QUOTED context and is deliberately not read as a declaration.",
     REASON_AMBIGUOUS:
         "Leave exactly ONE closing reference in the title and body. The others can stay as plain "
-        "`#1234` mentions — only the closing keywords (`close/closes/closed`, `fix/fixes/fixed`, "
-        "`resolve/resolves/resolved`) are read as the binding.",
+        "`#<issue-number>` mentions — only the closing keywords (`close/closes/closed`, "
+        "`fix/fixes/fixed`, `resolve/resolves/resolved`) are read as the binding. A reference this "
+        "sweep read as NEGATED still counts here, on purpose: it will not silently bind whichever "
+        "one survived.",
     REASON_REFERENCE_IS_PULL:
         "Point the closing reference at the source ISSUE. A pull request cannot be the binding: "
         "the review lane's issue-label map skips pull-request rows while the resolve step reads "
@@ -182,6 +238,11 @@ REASON_HINTS = {
         "Nothing was written, so this PR stays exactly as un-enumerated as it is now.",
 }
 
+# Reasons whose message is PASSED THROUGH from another component rather than built here. Their text
+# is quoted into the comment, so it is rendered as a blockquote — which this file's own strip then
+# treats as quoted context, making even a hostile passthrough inert if the comment is pasted back.
+PASSTHROUGH_REASONS = frozenset({REASON_MINT_REFUSED})
+
 COMMENT_MARKER_PREFIX = "<!-- auto-mint-provenance:refusal:"
 SELF_ID = "> 🤖 **SPARQ agent** — auto-mint (registry #929)"
 
@@ -193,6 +254,15 @@ class DerivedIssue(NamedTuple):
     reason: str | None
     message: str | None
     issue: dict | None
+
+
+class ClosingRefs(NamedTuple):
+    """`declared` is what may BIND (non-negated, outside quoted context); `all_refs` is every
+    closing reference found, and is what AMBIGUITY is judged over. Keeping them apart is what
+    makes the negation rule a pure suppressor — see `candidate_refusal`."""
+
+    declared: list
+    all_refs: list
 
 
 # ---- module loading (same idiom as mint-provenance.py / backfill-provenance.py) -----------------
@@ -226,27 +296,81 @@ def _load_policy_resolve():
 
 
 # ---- pure decisions (every one unit-tested by --self-test) -------------------------------------
-def closing_issue_candidates(title, body):
-    """The DISTINCT, sorted set of same-repository issue numbers this PR declares it closes.
+def strip_quoted_contexts(text):
+    """`text` with every QUOTED context removed: HTML comments, fenced code blocks, inline code
+    spans and blockquote lines.
 
-    Reads the title and the body, exactly like mint-provenance.references_issue reads them, so
-    anything this function accepts also satisfies that function's binding requirement."""
-    text = f"{title or ''}\n{body or ''}"
-    return sorted({int(number) for number in CLOSING_REF_RE.findall(text)})
+    A closing keyword inside any of those is something the author QUOTED — a template, another
+    PR's description, this tool's own refusal comment — not something they declared. GitHub itself
+    does not resolve one, and neither may this."""
+    text = HTML_COMMENT_RE.sub(" ", text or "")
+    text = FENCED_BLOCK_RE.sub(" ", text)
+    text = CODE_SPAN_RE.sub(" ", text)
+    return BLOCKQUOTE_LINE_RE.sub(" ", text)
+
+
+def is_negated(text, keyword_start):
+    """True when a negator appears between the start of `keyword_start`'s sentence and the keyword.
+
+    Best effort by nature. It only ever REMOVES a declaration (see `candidate_refusal`), so a
+    negator this does not know about degrades to "no suppression", never to a different binding."""
+    window = text[max(0, keyword_start - NEGATION_WINDOW):keyword_start]
+    breaks = list(SENTENCE_BREAK_RE.finditer(window))
+    if breaks:
+        window = window[breaks[-1].end():]
+    return bool(NEGATOR_RE.search(window))
+
+
+def closing_references(title, body):
+    """Every same-repository closing reference in the PR's title and body, split into what may
+    BIND and what merely counts for AMBIGUITY.
+
+    Quoted context is stripped first, and the grammar then runs on what is left — so anything this
+    returns is a keyword the author wrote in their own prose. It is still a textual `#N` in the
+    original, so it also satisfies mint-provenance.references_issue's binding requirement."""
+    text = strip_quoted_contexts(f"{title or ''}\n{body or ''}")
+    declared, seen = set(), set()
+    for match in CLOSING_REF_RE.finditer(text):
+        number = int(match.group(1))
+        seen.add(number)
+        if not is_negated(text, match.start()):
+            declared.add(number)
+    return ClosingRefs(sorted(declared), sorted(seen))
+
+
+def closing_issue_candidates(title, body):
+    """The DISTINCT, sorted set of same-repository issue numbers this PR DECLARES it closes."""
+    return closing_references(title, body).declared
 
 
 def mentioned_issue_numbers(title, body):
-    """ADVISORY: every same-repository `#N` the PR mentions, sorted, capped. Never a candidate."""
-    text = f"{title or ''}\n{body or ''}"
+    """ADVISORY: every same-repository `#N` the PR mentions, sorted, capped. Never a candidate.
+
+    Reads the SAME stripped text the grammar does, so the hint never advertises a number that only
+    exists inside a code block the author pasted."""
+    text = strip_quoted_contexts(f"{title or ''}\n{body or ''}")
     return sorted({int(number) for number in MENTION_RE.findall(text)})[:MAX_ADVISORY_MENTIONS]
 
 
-def candidate_refusal(candidates, mentions=()):
+def candidate_refusal(candidates, mentions=(), all_references=None):
     """(reason, message) when the candidate SET cannot name one source issue, else None.
 
     FAIL CLOSED at cardinality, before anything is read: zero candidates and two candidates are
     distinct defects with distinct fixes, so they are distinct named reasons. There is deliberately
-    no tie-break, no "first one wins", and no default. `mentions` only ever reaches the PROSE."""
+    no tie-break, no "first one wins", and no default. `mentions` only ever reaches the PROSE.
+
+    THE AMBIGUITY CHECK RUNS OVER `all_references`, NOT over `candidates`. That ordering is what
+    makes the negation suppressor safe: a reference this file decided was negated is gone from
+    `candidates` but still counted here, so a mis-read negation can only ever produce an AMBIGUOUS
+    refusal — never a mint bound to whichever reference survived. `Closes #7. This does not close
+    #8.` therefore refuses rather than quietly binding #7."""
+    references = list(candidates) if all_references is None else list(all_references)
+    if len(references) > 1:
+        named = ", ".join(f"#{number}" for number in references)
+        return (REASON_AMBIGUOUS,
+                f"this pull request declares {len(references)} distinct closing references "
+                f"({named}); exactly one is needed, because the source issue decides which lease "
+                "partition the review reserves and which object a human hold can park")
     if not candidates:
         seen = ", ".join(f"#{number}" for number in mentions)
         aside = (f" It does mention {seen}; if one of those is the source issue, say so with a "
@@ -255,12 +379,6 @@ def candidate_refusal(candidates, mentions=()):
                 "this pull request declares no closing reference to a source issue in its title "
                 "or body, so the issue that would decide its review lease partition and its "
                 f"human-hold surface cannot be derived.{aside}")
-    if len(candidates) > 1:
-        named = ", ".join(f"#{number}" for number in candidates)
-        return (REASON_AMBIGUOUS,
-                f"this pull request declares {len(candidates)} distinct closing references "
-                f"({named}); exactly one is needed, because the source issue decides which lease "
-                "partition the review reserves and which object a human hold can park")
     return None
 
 
@@ -294,12 +412,13 @@ def derive_issue_number(pull, read_issue):
     if not isinstance(pull, dict):
         return DerivedIssue(None, REASON_ISSUE_UNREADABLE,
                             "the pull request payload is malformed", None)
-    candidates = closing_issue_candidates(pull.get("title"), pull.get("body"))
+    references = closing_references(pull.get("title"), pull.get("body"))
     refusal = candidate_refusal(
-        candidates, mentioned_issue_numbers(pull.get("title"), pull.get("body")))
+        references.declared, mentioned_issue_numbers(pull.get("title"), pull.get("body")),
+        references.all_refs)
     if refusal:
         return DerivedIssue(None, refusal[0], refusal[1], None)
-    number = candidates[0]
+    number = references.declared[0]
     try:
         issue = read_issue(number)
     except Exception as exc:                          # noqa: BLE001 — any read failure refuses
@@ -407,12 +526,18 @@ def already_refused(comments, reason):
 
 def refusal_comment_body(reason, message):
     """The comment left ON the pull request. Credential-free by construction: every message it
-    interpolates is either built in this file or is mint-provenance's own concise refusal text."""
+    interpolates is either built in this file or is mint-provenance's own concise refusal text.
+
+    THE MESSAGE IS RENDERED AS A BLOCKQUOTE. Not decoration: this file's own `strip_quoted_contexts`
+    treats a blockquote line as quoted context, so a comment pasted back into a PR description
+    cannot become a declaration — even for `mint-refused`, whose text comes from another component
+    and is therefore not this file's to vet."""
     hint = REASON_HINTS.get(reason, "")
+    quoted = "\n".join(f"> {line}" for line in str(message).rstrip(".").splitlines() or [""])
     return (
         f"{SELF_ID}\n\n"
         f"**No provenance record could be minted for this PR — `{reason}`.**\n\n"
-        f"{str(message).rstrip('.')}.\n\n"
+        f"{quoted}.\n\n"
         f"{hint}\n\n"
         "Until a record exists this pull request is invisible to the cross-provider review lane: "
         "registry #916 enrolled the orchestrator class, and the per-PR provenance record is the "
@@ -510,8 +635,18 @@ def sweep(targets, *, annotate_repo, read_routing, read_pulls, read_issue, read_
             counters["skipped_targets"][target_repo] = REASON_TARGET_ROUTING_UNREADABLE
             log(f"SKIP target {target_repo} [{REASON_TARGET_ROUTING_UNREADABLE}]: {exc}")
             continue
+        # EVERY tick emits a census, so every reader that can raise is caught. `read_pulls` and
+        # `mint_pr` below used to sit outside any handler: the run went red, but it produced NO
+        # census row, and "the sweep stopped saying anything" is the failure this file exists to
+        # make impossible. A target that cannot be listed is a skipped target with a named reason.
+        try:
+            listed = read_pulls(target_repo)
+        except Exception as exc:                      # noqa: BLE001 — an unlistable target skips
+            counters["skipped_targets"][target_repo] = REASON_TARGET_PULLS_UNREADABLE
+            log(f"SKIP target {target_repo} [{REASON_TARGET_PULLS_UNREADABLE}]: {exc}")
+            continue
         counters["targets"] += 1
-        pulls = enrolled_class_pulls(read_pulls(target_repo), authors)
+        pulls = enrolled_class_pulls(listed, authors)
         counters["enrolled_pulls"] += len(pulls)
         for pull in pulls:
             number = pull["number"]
@@ -532,8 +667,13 @@ def sweep(targets, *, annotate_repo, read_routing, read_pulls, read_issue, read_
                 counters["deferred_cap"] += 1
                 log(f"defer {target_repo}#{number}: the per-tick mint cap ({max_mints}) is spent")
                 continue
-            decision = mint_pr(target_repo, number, derived.number, routing, authors, pull,
-                               derived.issue)
+            try:
+                decision = mint_pr(target_repo, number, derived.number, routing, authors, pull,
+                                   derived.issue)
+            except Exception as exc:                  # noqa: BLE001 — a failed write is censused
+                refuse(target_repo, pull, REASON_MINT_FAILED,
+                       f"the provenance write failed ({exc}); nothing was recorded for this PR")
+                continue
             if decision.action == mint_provenance.ACTION_MINT:
                 counters["minted"] += 1
             elif decision.action == mint_provenance.ACTION_ALREADY:
@@ -659,7 +799,21 @@ def sweep_workflow_seam_report(workflow=None):
     invoke_at = run.find('auto-mint-provenance.py "${args[@]}"')
     step_env = {key: str(value) for key, value in ((step or {}).get("env") or {}).items()}
     permissions = job.get("permissions") or {}
+    checkout = next((s for s in steps if "actions/checkout" in str(s.get("uses") or "")), None)
     return {
+        # THE ARGUMENTS, not merely the invocation. `sweep_invoked` proves the call site exists;
+        # these prove it says what this file's guarantees assume. Rebinding --annotate-repo widens
+        # which repository the run will comment on, and a --max-mints/--max-comments override in
+        # the workflow would silently retire the caps the census advertises — none of which a
+        # "the script is called" assertion can see.
+        "registry_repo_argument": bool(
+            re.search(r'--registry-repo\s+"\$REGISTRY_REPO"', run)),
+        "annotate_repo_argument": bool(
+            re.search(r'--annotate-repo\s+"\$REGISTRY_REPO"', run)),
+        "no_cap_override": not re.search(r"--max-mints|--max-comments", run),
+        # A persisted token in the checkout would leave credentials on disk for every later step.
+        "checkout_persist_credentials": (checkout or {}).get("with", {}).get(
+            "persist-credentials"),
         # THE #929 FINDING: this workflow is self-starting, or it is mint-provenance.yml again.
         "schedule_crons": [str((entry or {}).get("cron")) for entry in schedule
                            if isinstance(entry, dict)],
@@ -764,6 +918,61 @@ def _self_test():                                                       # noqa: 
           closing_issue_candidates("", "Closes the composition defect in #7"), [])
     check("a comment anchor is not an issue reference",
           closing_issue_candidates("", "fixes #issuecomment-5096919798"), [])
+
+    # ---- QUOTED CONTEXT: one test per stripped context, each mutated separately ---------------
+    # Each of these MINTED before the strip existed. A closing keyword the author QUOTED is not a
+    # keyword the author DECLARED, and a wrong mint is the one outcome here with no recovery.
+    check("a keyword inside a FENCED code block is quoted, not declared",
+          closing_issue_candidates("t", "the template we give authors:\n```\nCloses #1234\n```\n"),
+          [])
+    check("...including a ~~~ fence", closing_issue_candidates("t", "~~~\nCloses #1234\n~~~\n"),
+          [])
+    check("...and an UNCLOSED fence strips to the end rather than leaking",
+          closing_issue_candidates("t", "```\nCloses #1234\n"), [])
+    check("a keyword inside an INLINE CODE SPAN is quoted, not declared",
+          closing_issue_candidates("t", "write a `Closes #1234` line in your description"), [])
+    check("...including a multi-backtick span",
+          closing_issue_candidates("t", "write ``Closes #1234`` at the top"), [])
+    check("a keyword inside a BLOCKQUOTE is quoted, not declared",
+          closing_issue_candidates("t", "superseded by #781, whose body reads:\n\n> Closes #777"),
+          [])
+    check("a keyword inside an HTML COMMENT is quoted, not declared",
+          closing_issue_candidates("t", "<!-- template: Closes #1234 -->"), [])
+    check("...even when the HTML comment spans lines",
+          closing_issue_candidates("t", "<!--\nCloses #1234\n-->"), [])
+    # ...and the strip does not eat a real declaration that merely SITS NEAR quoted context.
+    check("a real declaration beside a fenced block still binds",
+          closing_issue_candidates("t", "```\nCloses #1234\n```\n\nCloses #7"), [7])
+    check("...and beside a blockquote too",
+          closing_issue_candidates("t", "> quoted: Closes #1234\n\nCloses #7"), [7])
+    check("an unbalanced backtick consumes nothing",
+          closing_issue_candidates("t", "a ` stray tick, then Closes #7"), [7])
+
+    # ---- NEGATED PROSE: a suppressor that can only ever cause a refusal ------------------------
+    check("negated prose does not declare anything",
+          closing_issue_candidates("t", "this PR does NOT close #1234"), [])
+    for phrase in ("does not close", "doesn't close", "will not fix", "won't fix",
+                   "never closes", "cannot close", "no longer closes", "unable to close",
+                   "neither closes", "closes nothing, and does not close",
+                   "supersedes rather than closes"):
+        check(f"...{phrase!r} suppresses the declaration",
+              closing_issue_candidates("t", f"this PR {phrase} #1234"), [])
+    check("a negator in the PREVIOUS sentence does not suppress the next one",
+          closing_issue_candidates("t", "This is not a revert. Closes #7"), [7])
+    # THE PROPERTY that makes the suppressor safe, asserted directly rather than described: a
+    # negated reference is still counted for AMBIGUITY, so suppression can only turn a mint into a
+    # refusal — never a refusal into a mint, and never a DIFFERENT binding.
+    mixed = closing_references("t", "Closes #7. This does not close #8.")
+    check("a negated reference is dropped from the DECLARED set", mixed.declared, [7])
+    check("...but still counted for AMBIGUITY", mixed.all_refs, [7, 8])
+    check("...so the pull request REFUSES rather than silently binding the survivor",
+          total(lambda: (candidate_refusal(mixed.declared, (), mixed.all_refs)
+                         or ("MINTED-THE-SURVIVOR",))[0]), REASON_AMBIGUOUS)
+    check("...and whenever a number IS derived it is the only closing reference there was",
+          [(closing_references("t", body).declared, closing_references("t", body).all_refs)
+           for body in ("Closes #7", "Closes #7. This does not close #8.",
+                        "this does not close #9")],
+          [([7], [7]), ([7], [7, 8]), ([], [9])])
 
     # ---- the ADVISORY mention list (prose only; never a candidate) -----------------------------
     check("mentions are collected for the hint", mentioned_issue_numbers("", "see #8 and #7"),
@@ -888,8 +1097,11 @@ def _self_test():                                                       # noqa: 
     # ---- the refusal taxonomy + comment --------------------------------------------------------
     check("every per-PR refusal reason is distinct", len(set(PR_REFUSAL_REASONS)),
           len(PR_REFUSAL_REASONS))
-    check("exactly ONE reason is censused without a PR comment, and it is the registry-side one",
-          sorted(SILENT_REASONS), [REASON_RECORD_PROBE_FAILED])
+    check("exactly the two REGISTRY-side reasons are censused without a PR comment",
+          sorted(SILENT_REASONS), sorted([REASON_MINT_FAILED, REASON_RECORD_PROBE_FAILED]))
+    check("...and every silent reason really is a registry fact, not a PR fact",
+          [r for r in SILENT_REASONS if r not in (REASON_RECORD_PROBE_FAILED,
+                                                  REASON_MINT_FAILED)], [])
     check("...and every OTHER reason carries an operator hint to put in that comment",
           sorted(reason for reason in PR_REFUSAL_REASONS
                  if reason not in SILENT_REASONS and not REASON_HINTS.get(reason)), [])
@@ -898,6 +1110,29 @@ def _self_test():                                                       # noqa: 
     check("...names the machine-readable reason", f"`{REASON_AMBIGUOUS}`" in body, True)
     check("...carries the operator's next action", REASON_HINTS[REASON_AMBIGUOUS] in body, True)
     check("...and carries its dedupe marker", refusal_marker(REASON_AMBIGUOUS) in body, True)
+    # THE TOOL'S OWN OUTPUT IS NOT A LIVE PAYLOAD. The likeliest author response to a refusal
+    # comment is to quote it back into the PR description, so the WHOLE rendered comment — for
+    # EVERY reason code, and with a deliberately HOSTILE passthrough message — must derive nothing.
+    # Two independent reasons it cannot: no hint carries a literal issue number, and every quoted
+    # context (the blockquoted message, the code-spanned placeholders, the marker comment) is
+    # stripped. Asserted over the rendered artefact, not over the ingredients.
+    hostile = "Closes #1234 and fixes #777 -- resolves #657"
+    for reason in PR_REFUSAL_REASONS:
+        rendered = refusal_comment_body(reason, hostile)
+        refs = closing_references("", rendered)
+        check(f"the {reason} comment is inert when quoted back into a PR body",
+              (refs.declared, refs.all_refs), ([], []))
+    # THE "UNQUOTED PASTE" TEST HAS TO DEFEAT THIS FILE'S OWN STRIP, or it proves nothing: every
+    # placeholder sits in a code span, so feeding the hints in verbatim is inert for the WRONG
+    # reason. Strip the backticks first, and assert the structural property behind it.
+    check("...and no hint contains a literal issue number at all",
+          sorted(reason for reason, hint in REASON_HINTS.items() if re.search(r"#[0-9]", hint)),
+          [])
+    check("...proved with the code spans DEFEATED: backticks removed, the hints still bind nothing",
+          closing_issue_candidates("", "\n".join(REASON_HINTS.values()).replace("`", "")), [])
+    check("...which the hostile control proves is not vacuous: the payload DOES bind on its own",
+          closing_issue_candidates("", hostile), [657, 777, 1234])
+
     check("an existing comment for THIS reason dedupes",
           already_refused([{"body": body}], REASON_AMBIGUOUS), True)
     check("...and a comment for a DIFFERENT reason does not",
@@ -990,8 +1225,11 @@ def _self_test():                                                       # noqa: 
 
         def run(self, *, apply_changes=True, max_mints=DEFAULT_MAX_MINTS,
                 max_comments=DEFAULT_MAX_COMMENTS, annotate_repo="o/r",
-                targets=(("o/r", ("jeswr",)),), record_boom=False):
+                targets=(("o/r", ("jeswr",)),), record_boom=False, pulls_boom=False,
+                mint_boom=False):
             def mint_pr(repo, number, issue_number, routing, authors, pl, iss):
+                if mint_boom:
+                    raise RuntimeError("registry PUT failed: HTTP 502")
                 action, reason = self.actions.get(
                     number, (mint_provenance.ACTION_MINT, "no record yet"))
                 if action == mint_provenance.ACTION_MINT and apply_changes:
@@ -1003,11 +1241,16 @@ def _self_test():                                                       # noqa: 
                     raise RuntimeError("HTTP 502")
                 return self.records.get(number)
 
+            def read_pulls(repo):
+                if pulls_boom:
+                    raise RuntimeError("pull listing failed: HTTP 502")
+                return self.pulls
+
             return sweep(
                 list(targets), annotate_repo=annotate_repo,
                 read_routing=lambda repo: {"models": {AUTO_IMPL_ALIAS:
                                                       {"provider": "anthropic"}}},
-                read_pulls=lambda repo: self.pulls, read_issue=lambda repo, n:
+                read_pulls=read_pulls, read_issue=lambda repo, n:
                     self.issues.get(n, issue(number=n)),
                 read_record=read_record, mint_pr=mint_pr,
                 read_comments=lambda repo, n: self.comments.get(n, []),
@@ -1113,6 +1356,30 @@ def _self_test():                                                       # noqa: 
     check("a tick with no targets STILL emits a census (a silent minter is the failure mode)",
           (row["targets"], row["enrolled_pulls"], row["lacking_record"]), (0, 0, 0))
 
+    # EVERY tick emits a census, INCLUDING the ticks where a reader or the writer blows up. These
+    # two paths used to raise straight out of sweep(): the run went red but said NOTHING about what
+    # it had done, which is the state requirement 3 exists to prevent.
+    def census_fields(thunk, *fields):
+        """The named census fields, or the raise that PREVENTED a census — which is the failure
+        these two checks exist to catch, so it must red them by name, not abort the run."""
+        row = total(thunk)
+        if not isinstance(row, dict):
+            return ("NO CENSUS EMITTED", row)
+        return tuple(row[field] for field in fields)
+
+    unlistable = _Recorder(clean)
+    check("a target whose pulls cannot be listed still yields a census, with a named reason",
+          census_fields(lambda: unlistable.run(pulls_boom=True),
+                        "targets", "enrolled_pulls", "skipped_targets"),
+          (0, 0, {"o/r": REASON_TARGET_PULLS_UNREADABLE}))
+    failed_write = _Recorder(clean)
+    check("a FAILED provenance write still yields a census, as a named refusal",
+          census_fields(lambda: failed_write.run(mint_boom=True),
+                        "minted", "refused", "refusals") + (failed_write.written,),
+          (0, 1, {REASON_MINT_FAILED: 1}, []))
+    check("...and does not put a registry-side write failure on someone else's PR",
+          failed_write.posted, [])
+
     # THE SHARED WRITER IS REALLY THE ONE THAT DECIDES: drive `_mint_caller` into the real
     # mint-provenance.mint over an issue that reduces to the serializing __global__ partition. The
     # sweep never passes --allow-global-partition, so this must refuse.
@@ -1169,6 +1436,10 @@ def _self_test():                                                       # noqa: 
     check("the sweep job may NOT read run logs (that is backfill's identity source)",
           seam["no_actions_permission"], True)
     check("the sweep is actually invoked", seam["sweep_invoked"], True)
+    check("...against THIS registry, and commenting only on THIS repository",
+          (seam["registry_repo_argument"], seam["annotate_repo_argument"]), (True, True))
+    check("...and the workflow cannot override the per-tick caps", seam["no_cap_override"], True)
+    check("the checkout persists no credentials", seam["checkout_persist_credentials"], False)
     check("the sweep step is unconditional", seam["step_unconditional"], True)
     check("the sweep step is errexit", seam["errexit"], True)
     check("the self-test runs BEFORE the sweep", seam["self_test_before_sweep"], True)
@@ -1259,6 +1530,27 @@ def _self_test():                                                       # noqa: 
              lambda d: sweep_step(d).update(
                  run=str(sweep_step(d)["run"]) + "  --attestation x\n"),
              "no_run_key_argument", False),
+            ("--annotate-repo is rebound to another repository",
+             lambda d: sweep_step(d).update(run=str(sweep_step(d)["run"]).replace(
+                 '--annotate-repo "$REGISTRY_REPO"', '--annotate-repo "sparq-org/sparq"')),
+             "annotate_repo_argument", False),
+            ("--registry-repo is rebound",
+             lambda d: sweep_step(d).update(run=str(sweep_step(d)["run"]).replace(
+                 '--registry-repo "$REGISTRY_REPO"', '--registry-repo "other/reg"')),
+             "registry_repo_argument", False),
+            ("the mint cap is raised at the call site",
+             lambda d: sweep_step(d).update(
+                 run=str(sweep_step(d)["run"]) + "  --max-mints 100\n"),
+             "no_cap_override", False),
+            ("the comment cap is raised at the call site",
+             lambda d: sweep_step(d).update(
+                 run=str(sweep_step(d)["run"]) + "  --max-comments 100\n"),
+             "no_cap_override", False),
+            ("the checkout persists its token",
+             lambda d: next(s for s in d["jobs"]["sweep"]["steps"]
+                            if "actions/checkout" in str(s.get("uses") or ""))["with"].update(
+                                **{"persist-credentials": True}),
+             "checkout_persist_credentials", True),
             ("the manual-dispatch default flips to apply=true",
              lambda d: triggers_of(d)["workflow_dispatch"]["inputs"]["apply"].update(default=True),
              "dispatch_default_is_dry_run", True),
