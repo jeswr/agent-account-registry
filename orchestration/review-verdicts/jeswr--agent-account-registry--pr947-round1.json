@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 947,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4ad7e05f16c750a772c22bc79a8bf4e92a76bbbe",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The documentation change correctly closes the identified allocation hazards: it derives the next account number from the complete non-recyclable union of claim refs, issues, repository secrets, and environment secrets; paginates every listing; fails closed when any source cannot be queried; requires the claim before writes; distinguishes claim collision from unknown failure; and checks both secret scopes for explicit absence immediately before the upsert. The commands consistently use exact anchored account-name patterns, exclude pull requests from the issue-title inventory, retain closed issues as reservations, and avoid exposing token values. No vacuous test or workflow/security-check weakening is introduced by this README-only change.",
+  "verdict": "approve"
+ }
+}
