@@ -943,6 +943,37 @@ jobs:
             --bot-login "${{ steps.target.outputs.bot_login }}" \
             --issue-file "$RUNNER_TEMP/verified-issue.json"
 
+      # [issue #1075] THE MISSING INCREMENT. `trust` above is continue-on-error and runs BEFORE
+      # `prepare`, so a refusal skipped "Record model attempt" entirely: the cycle allocated a
+      # runner, minted an App token and checked out the target repo, then incremented NOTHING.
+      # `max_attempts` was therefore checked against a counter the refusal path could not move and
+      # the deferred-retry lane re-admitted the same issue forever — target #834 was dispatched ~34
+      # times in one day (next-highest: 3), ~18% of the day's dispatch capacity. Each refusal was
+      # CORRECT; only the repetition was the bug, so this charges the cycle instead of widening the
+      # trust boundary by a single login.
+      #
+      # `steps.trust.outcome == 'failure'` is the exact gate: `outcome` is the step's own result
+      # BEFORE continue-on-error rewrites `conclusion` to success (a `!= 'success'` test would also
+      # fire on the SKIPPED case — budget already exhausted, or no claim — and charge a cycle that
+      # never ran). It is deliberately NOT continue-on-error itself: a charge that silently fails to
+      # land restores the unbounded loop, so it must be loud. The run is already dead either way —
+      # `prepare`/`attempt`/`model` are all gated on trust success — and the always() final_state
+      # job still converges the issue exactly as it does for any other pre-model abort.
+      - name: Charge a pre-model trust refusal to the durable per-issue budget
+        id: refusal
+        if: ${{ !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.budget.outputs.exhausted != 'true' && steps.trust.outcome == 'failure' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-live.outputs.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 registry/scripts/worker-issue.py record-refusal \
+            --repo "${{ inputs.target_repo }}" \
+            --issue "${{ inputs.issue_number }}" \
+            --max-attempts "${{ needs.resolve.outputs.max_attempts }}" \
+            --bot-login "${{ steps.target.outputs.bot_login }}" \
+            --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
+            --run-url "$RUN_URL"
+
       # [issue #568] Ownership receipt FIRST, label SECOND — the compare-and-swap ordering. The
       # pre-publish re-check below cannot treat `status:in-progress` as this run's claim: the label
       # is SHARED, so it proves only that SOME run claimed the issue. The run-key-bound claim

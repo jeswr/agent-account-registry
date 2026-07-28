@@ -66,6 +66,33 @@ ATTEMPT_VOID_MARKER = "<!-- sparq-worker-attempt-void:v1"
 # second attempt per run and move the approval anchor — so ownership gets its own marker, and the
 # budget/approval surfaces are untouched. Bot-authored only, like every other durable marker.
 CLAIM_MARKER = "<!-- sparq-worker-claim:v1"
+# [issue #1075] PRE-MODEL REFUSAL receipt — the budget unit for a dispatch that died at the
+# last-step trust/revision revalidation, before the model ever launched.
+#
+# THE DEFECT IT CLOSES. worker.yml's `trust` step is `continue-on-error` and runs BEFORE `prepare`,
+# so a refusal skipped `Record model attempt` entirely: the run consumed a whole dispatch cycle
+# (runner, App token, target checkout) and incremented NOTHING. `max_attempts` is checked against a
+# counter the refusal path could not move, so the deferred-retry lane re-admitted the same issue
+# forever — target issue #834 was dispatched ~34 times in one day (next-highest: 3), ~18% of the
+# day's dispatch capacity. Every one of those refusals was CORRECT (a bot-authored issue with no
+# human `approved` comment); the defect is the unbounded repetition, never the refusal, so the fix
+# BOUNDS the repetition and does not widen the trust boundary by one login.
+#
+# DELIBERATELY a distinct marker from ATTEMPT_MARKER, not an alias of it:
+#   * cost/health accounting (groom.py's stall + model-health windows, count_attempts here) means
+#     "the model ran" — charging a refusal there would invent model spend that never happened;
+#   * find_maintainer_approval anchors approval staleness on ATTEMPT_MARKER ("did the human see the
+#     failure being retried?"). A refusal is not a failed model run, and moving the anchor would
+#     invalidate an `approved` comment a maintainer posted between two refusals — the very gesture
+#     the refusal is asking for. The anchor therefore stays attempt-only.
+# The two counters are SUMMED into one budget by budget_used() and nowhere else, so the per-issue
+# dispatch bound sees every consumed cycle while the model-spend counter stays honest.
+#
+# No void twin (contrast ATTEMPT_VOID_MARKER): a refusal charge is not conditional on an exit class
+# — the cycle was spent by definition — and it is windowed by the SAME human-readmission cutoff as
+# attempts, so a human unpark still re-opens the budget. Bot-authored only, like every other durable
+# marker: a third party can neither forge one to burn an issue's budget nor suppress one.
+REFUSAL_MARKER = "<!-- sparq-worker-refusal:v1"
 # Maintainer-approval convention (issue #31): a HUMAN maintainer approves a retry by commenting
 # the word "approved" on the issue AFTER the worker's most recent attempt receipt. The trusted
 # human set is derived the same way the triage trust-gate derives it — repo collaborator
@@ -103,9 +130,14 @@ def body_sha(body):
     return hashlib.sha256((body or "").encode("utf-8")).hexdigest()
 
 
+def _receipt_run_keys(body, marker):
+    """The run keys carried by one comment body's receipts of `marker`."""
+    return set(re.findall(re.escape(marker) + r" run=(\S+) -->", body))
+
+
 def _attempt_run_keys(body):
     """The run keys carried by the attempt receipts in one comment body."""
-    return set(re.findall(re.escape(ATTEMPT_MARKER) + r" run=(\S+) -->", body))
+    return _receipt_run_keys(body, ATTEMPT_MARKER)
 
 
 def _ownership_receipt(body):
@@ -193,25 +225,69 @@ def attempt_voids(comments, bot_login):
     return voided
 
 
-def count_attempts(comments, bot_login):
-    """Durable worker attempts CHARGED to the budget. A receipt whose run was voided as a
-    credential outage (registry #596 — the model never launched, so no attempt was spent) is
-    subtracted; a receipt with no run key at all is a legacy/degenerate form and stays charged
-    (the fail direction is always toward CHARGING)."""
+def _count_receipts(comments, bot_login, marker, voided=frozenset(), since=None, log=print):
+    """Bot-authored receipts of `marker` CHARGED to a budget, optionally windowed by `since`.
+
+    ONE implementation behind count_attempts/count_refusals and their windowed forms (issue
+    #1075): the refusal counter must charge, window and fail in EXACTLY the way the attempt
+    counter does, and a second hand-written copy is how the two silently drift apart.
+
+    Fail directions, all toward CHARGING (never a fresh budget on unproven data): a receipt whose
+    run key is entirely `voided` is uncharged (registry #596) but one with no run key at all is a
+    legacy/degenerate form and stays charged; a falsy or UNPARSEABLE `since` (loudly) charges the
+    whole history; a receipt with no created_at, or one whose created_at cannot be parsed
+    (loudly), is charged; an instant tie with the cutoff is charged. The window compare is over
+    PARSED aware datetimes (park_policy.parse_ts), never raw strings — an equally-valid spelling
+    like the space-separator "2026-07-23 10:30:00Z" VALIDATES yet sorts lexicographically before
+    "2026-07-23T09:00:00Z", so a string compare read a post-cutoff receipt as pre-cutoff and
+    silently un-charged it (round-4 finding 3 + round-5 finding 2)."""
+    since_instant = None
+    parse_ts = None
+    if since:
+        parse_ts = _park_policy().parse_ts
+        try:
+            since_instant = parse_ts(since)
+        except ValueError:
+            log(f"::warning::readmission cutoff {since!r} is not a parseable timestamp — the "
+                "attempt budget keeps the FULL historical count (never a fresh budget on "
+                "unproven data)")
     bot = bot_login.casefold()
-    voided = attempt_voids(comments, bot_login)
     charged = 0
     for comment in comments:
         if str(comment.get("user", {}).get("login", "")).casefold() != bot:
             continue
         body = str(comment.get("body", ""))
-        if ATTEMPT_MARKER not in body:
+        if marker not in body:
             continue
-        keys = _attempt_run_keys(body)
+        keys = _receipt_run_keys(body, marker)
         if keys and keys <= voided:
             continue
+        if since_instant is not None:
+            created = comment.get("created_at")
+            if isinstance(created, str) and created:
+                try:
+                    created_instant = parse_ts(created)
+                except ValueError:
+                    log(f"::warning::attempt receipt carries a malformed created_at {created!r} "
+                        "— CHARGED against the attempt budget (unprovable time can never "
+                        "authorize exhausted work)")
+                else:
+                    if created_instant < since_instant:
+                        continue
         charged += 1
     return charged
+
+
+def count_attempts(comments, bot_login):
+    """Durable MODEL attempts CHARGED to the budget. A receipt whose run was voided as a
+    credential outage (registry #596 — the model never launched, so no attempt was spent) is
+    subtracted; a receipt with no run key at all is a legacy/degenerate form and stays charged
+    (the fail direction is always toward CHARGING).
+
+    This counter means "the model ran" and is what cost/health accounting reads. A PRE-MODEL
+    refusal is NOT one of these (issue #1075) — see count_refusals; budget_used sums them."""
+    return _count_receipts(comments, bot_login, ATTEMPT_MARKER,
+                           voided=attempt_voids(comments, bot_login))
 
 
 def count_attempts_since(comments, bot_login, since, log=print):
@@ -231,41 +307,45 @@ def count_attempts_since(comments, bot_login, since, log=print):
     "2026-07-23T09:00:00Z", so the old string compare read a post-cutoff receipt as
     pre-cutoff and silently un-charged it; unprovable time always counts AGAINST the budget,
     exactly like the missing-timestamp case); an instant tie with the cutoff is CHARGED."""
-    if not since:
-        return count_attempts(comments, bot_login)
-    parse_ts = _park_policy().parse_ts
-    try:
-        since_instant = parse_ts(since)
-    except ValueError:
-        log(f"::warning::readmission cutoff {since!r} is not a parseable timestamp — the "
-            "attempt budget keeps the FULL historical count (never a fresh budget on "
-            "unproven data)")
-        return count_attempts(comments, bot_login)
-    bot = bot_login.casefold()
     # Void subtraction is GLOBAL, exactly as in worker-pr.count_rounds_since (registry #596): a
     # credential-outage attempt is uncharged whichever side of the readmission cutoff it landed on.
-    voided = attempt_voids(comments, bot_login)
-    charged = 0
-    for comment in comments:
-        if (str(comment.get("user", {}).get("login", "")).casefold() != bot
-                or ATTEMPT_MARKER not in str(comment.get("body", ""))):
-            continue
-        keys = _attempt_run_keys(str(comment.get("body", "")))
-        if keys and keys <= voided:
-            continue
-        created = comment.get("created_at")
-        if isinstance(created, str) and created:
-            try:
-                created_instant = parse_ts(created)
-            except ValueError:
-                log(f"::warning::attempt receipt carries a malformed created_at {created!r} "
-                    "— CHARGED against the attempt budget (unprovable time can never "
-                    "authorize exhausted work)")
-            else:
-                if created_instant < since_instant:
-                    continue
-        charged += 1
-    return charged
+    return _count_receipts(comments, bot_login, ATTEMPT_MARKER,
+                           voided=attempt_voids(comments, bot_login), since=since, log=log)
+
+
+def count_refusals(comments, bot_login):
+    """Durable PRE-MODEL REFUSALS charged to the per-issue dispatch budget (issue #1075).
+
+    One receipt per dispatch cycle that reached the last-step trust/revision revalidation and was
+    refused there. It is a spent cycle — runner, App token and target checkout — so it charges the
+    budget; it is NOT a model attempt, so it never appears in count_attempts (cost/health) and
+    never moves find_maintainer_approval's staleness anchor.
+
+    No void twin: unlike a credential-outage attempt (registry #596), a refusal has no exit class
+    that could un-spend the cycle, so there is nothing to subtract."""
+    return _count_receipts(comments, bot_login, REFUSAL_MARKER)
+
+
+def count_refusals_since(comments, bot_login, since, log=print):
+    """count_refusals windowed by the human-readmission cutoff, on exactly the terms
+    count_attempts_since uses. Load-bearing, not symmetry for its own sake: without it a human
+    unpark would re-open the ATTEMPT half of the budget while the refusal half stayed charged
+    forever, and an issue that once burned its budget on refusals could never be readmitted."""
+    return _count_receipts(comments, bot_login, REFUSAL_MARKER, since=since, log=log)
+
+
+def budget_used(comments, bot_login, since=None, log=print):
+    """The per-issue DISPATCH budget charge: model attempts PLUS pre-model refusals (#1075).
+
+    THE one place the two counters are summed. `max_attempts` bounds dispatch CYCLES, not model
+    spend — a cycle that allocated a runner, minted a token and checked out the target repo before
+    refusing consumed exactly the capacity the bound exists to protect. Keeping the sum here (and
+    the counters distinct underneath) is what lets the budget see every cycle while cost/health
+    accounting still sees only runs where a model actually ran."""
+    if since:
+        return (count_attempts_since(comments, bot_login, since, log)
+                + count_refusals_since(comments, bot_login, since, log))
+    return count_attempts(comments, bot_login) + count_refusals(comments, bot_login)
 
 
 def find_maintainer_approval(comments, bot_login, is_human_maintainer, log=print,
@@ -457,31 +537,36 @@ def _readmission_cutoff(repo, issue):
         is_human=lambda login: _is_human_maintainer(repo, login))
 
 
-def _windowed_attempts(repo, issue, comments, bot_login, max_attempts):
-    """The attempt count CHARGED to the budget: the plain lifetime count below the budget
-    line, the readmission-windowed count at/above it (round-4 finding 1 — the windowed-vs-
-    lifetime split brain). CLAIM grants a readmission on the WINDOWED count
+def _windowed_budget(repo, issue, comments, bot_login, max_attempts):
+    """The dispatch-cycle count CHARGED to the budget: the plain lifetime count below the
+    budget line, the readmission-windowed count at/above it (round-4 finding 1 — the
+    windowed-vs-lifetime split brain). CLAIM grants a readmission on the WINDOWED count
     (dispatch-claim's deferred lane); the old worker-side re-check used the UNWINDOWED
     lifetime count, so the launched retry declared itself exhausted, ran no model, the final
     re-park was vetoed by the very unlabel that granted the readmission, status:ready
     persisted, and every tick relaunched a no-op workflow forever. The cutoff is probed only
-    once the lifetime count is exhausted, exactly like CLAIM."""
-    used = count_attempts(comments, bot_login)
+    once the lifetime count is exhausted, exactly like CLAIM.
+
+    [issue #1075] The charge is budget_used — attempts PLUS pre-model refusals — because the
+    thing `max_attempts` bounds is dispatch cycles. Counting attempts alone left the refusal
+    path incrementing nothing at all, so a permanently-refused issue was re-admitted forever
+    (target #834: ~34 dispatches in one day, ~18% of the day's capacity)."""
+    used = budget_used(comments, bot_login)
     if used < max_attempts:
         return used
     cutoff = _readmission_cutoff(repo, issue)
     if not cutoff:
         return used
-    charged = count_attempts_since(comments, bot_login, cutoff)
+    charged = budget_used(comments, bot_login, cutoff)
     if charged < used:
         print(f"readmission window open: a human unlabeled a park label at {cutoff}; the "
-              f"attempt budget charges {charged} of {used} recorded attempt(s)")
+              f"attempt budget charges {charged} of {used} recorded dispatch cycle(s)")
     return charged
 
 
 def attempt_check(repo, issue, max_attempts, bot_login):
     comments = _paginated(repo, issue, "comments")
-    used = _windowed_attempts(repo, issue, comments, bot_login, max_attempts)
+    used = _windowed_budget(repo, issue, comments, bot_login, max_attempts)
     values = {"used": used, "exhausted": used >= max_attempts}
     _write_outputs(values)
     print(f"worker attempts used: {used}/{max_attempts}")
@@ -494,7 +579,7 @@ def record_attempt(repo, issue, max_attempts, bot_login, run_key):
     # by the check dies here with "exhausted before model launch". Attempt numbering restarts
     # inside a readmission window by design: the budget is windowed, and the receipt's
     # identity is the run key, not the number.
-    used = _windowed_attempts(repo, issue, comments, bot_login, max_attempts)
+    used = _windowed_budget(repo, issue, comments, bot_login, max_attempts)
     exact_marker = f"{ATTEMPT_MARKER} run={run_key} -->"
     for comment in comments:
         if (str(comment.get("user", {}).get("login", "")).casefold() == bot_login.casefold()
@@ -516,6 +601,60 @@ def record_attempt(repo, issue, max_attempts, bot_login, run_key):
     )
     _write_outputs({"number": number})
     print(f"worker attempt recorded: {number}/{max_attempts}")
+
+
+def record_refusal(repo, issue, max_attempts, bot_login, run_key, run_url):
+    """[issue #1075] Charge THIS dispatch cycle to the durable per-issue budget when the
+    last-step trust/revision revalidation REFUSED before the model launched.
+
+    worker.yml runs `trust` with continue-on-error and BEFORE `prepare`, so a refusal skips
+    `Record model attempt` — the cycle cost a runner, an App token and a target checkout and
+    incremented nothing, leaving `max_attempts` unable to bound it. This is the missing
+    increment: same durable comment plane as the attempt receipt, distinct marker, so
+    attempt_check/record_attempt see the spent cycle (budget_used) while cost/health accounting
+    and the maintainer-approval anchor keep seeing model attempts only.
+
+    It does NOT raise on an exhausted budget — the cycle already happened and the charge must
+    land regardless; the NEXT tick's attempt_check reads it and final_state converges the issue
+    to the machine-owned status:parked hold. Idempotent per run key, like every recorder here: a
+    re-entered step re-uses its receipt instead of double-charging.
+
+    The comment carries NO refusal detail beyond the run link. The reason is derived from live
+    target-repo state (author, body, labels, trust verdict) and this receipt is posted into that
+    same public issue, so echoing it here would relay untrusted target text through the bot's own
+    voice; the run log is the trustworthy place for the cause."""
+    comments = _paginated(repo, issue, "comments")
+    # The number quoted to the maintainer is the WINDOWED charge attempt_check will read, not the
+    # lifetime one: after a human readmission the two differ, and a receipt claiming "3/3 used"
+    # on a budget the human just re-opened would read as a terminal state that is not one.
+    charged = _windowed_budget(repo, issue, comments, bot_login, max_attempts)
+    exact_marker = f"{REFUSAL_MARKER} run={run_key} -->"
+    for comment in comments:
+        if (str(comment.get("user", {}).get("login", "")).casefold() == bot_login.casefold()
+                and exact_marker in str(comment.get("body", ""))):
+            _write_outputs({"used": min(charged, max_attempts)})
+            print(f"pre-model refusal already recorded (run {run_key})")
+            return
+    used = min(charged + 1, max_attempts)
+    body = (
+        "> 🤖 SPARQ agent — this dispatch was REFUSED at the last-step trust/issue-revision "
+        "revalidation, before any model ran. No work was attempted and no model spend was "
+        f"incurred, but the dispatch cycle IS charged against this issue's budget "
+        f"({used}/{max_attempts} cycles used), so a permanently-refused issue stops being "
+        "re-dispatched instead of retrying forever (registry #1075).\n\n"
+        f"- Refused run: {run_url}\n\n"
+        "The refusal itself is correct behaviour — the run log above names the cause. If this "
+        "issue should proceed, resolve that cause (for a third-party/bot-authored issue, a human "
+        "maintainer commenting `approved` is the required evidence); once the budget is spent, a "
+        "human must also remove the park label to re-open it.\n\n"
+        f"{exact_marker}"
+    )
+    _gh_json(
+        ["api", "-X", "POST", f"repos/{repo}/issues/{issue}/comments", "--input", "-"],
+        input_doc={"body": body},
+    )
+    _write_outputs({"used": used})
+    print(f"pre-model refusal charged to the dispatch budget: {used}/{max_attempts}")
 
 
 def void_attempt_on_outage(repo, issue, bot_login, run_key, exit_class):
@@ -1913,8 +2052,289 @@ def _self_test():
         else:
             os.environ["GITHUB_OUTPUT"] = saved_output
 
+    _refusal_budget_self_test()
     _followup_label_self_test()
     print("worker-issue self-test PASSED")
+
+
+_WF_STEP_RE = re.compile(r"^      - name: (?P<name>.*)$", re.M)
+
+
+def _workflow_steps(text):
+    """Every `      - name:` step of a workflow, as {name, gate, body}.
+
+    A TEXT split, not a YAML parse, deliberately: this suite runs under bare python (PyYAML is
+    provisioned only for the scripts that import it), and a lazily-imported parser would make the
+    seam assertions below silently un-runnable in exactly the sandbox that is supposed to run
+    them. The usual objection to regex-over-YAML — that it stays green through the mutation it
+    was written to catch — is answered by EXECUTION, not by trust: worker_refusal_seam is run
+    against MUTATED copies of the live workflow and asserted to go red on each one."""
+    marks = list(_WF_STEP_RE.finditer(text))
+    steps = []
+    for index, mark in enumerate(marks):
+        end = marks[index + 1].start() if index + 1 < len(marks) else len(text)
+        body = text[mark.start():end]
+        gate = re.search(r"^        if: (?P<gate>.*)$", body, re.M)
+        steps.append({"name": mark.group("name").strip(),
+                      "gate": gate.group("gate") if gate else "",
+                      "body": body})
+    return steps
+
+
+# The exhausted -> status:parked arm of final_state, matched as an ARM and not as two loose
+# substrings: `status=parked` also appears on the final-attempt-with-no-PR arm below it, so a
+# plain `"status=parked" in text` stays green when the exhaustion arm alone is rewritten.
+_PARK_ARM_RE = re.compile(r'"\$EXHAUSTED" == true \]\]; then(?:(?!\n\s*elif ).)*?\n\s*status=parked',
+                          re.S)
+
+
+def worker_refusal_seam(text):
+    """[issue #1075] Findings about worker.yml's refusal-charging wiring. Pure over the workflow
+    TEXT so the self-test can run it over the LIVE file AND over deliberately broken copies.
+
+    The counter change is inert without this wiring — that is the whole shape of the defect it
+    fixes (a documented invariant that nothing implemented) — so the seam is asserted, not
+    assumed."""
+    steps = _workflow_steps(text)
+    charge = [step for step in steps if "worker-issue.py record-refusal" in step["body"]]
+    park = [step for step in steps if '"$EXHAUSTED" == true' in step["body"]]
+    step = charge[0] if len(charge) == 1 else {"gate": "", "body": ""}
+    return {
+        # The charging step exists, exactly once.
+        "charges_refusal": len(charge) == 1,
+        # `outcome` is the step's own result BEFORE continue-on-error rewrites `conclusion`; the
+        # `== 'failure'` form is what distinguishes a REFUSAL from a step that never ran at all
+        # (a `!= 'success'` gate also fires on `skipped` and charges a cycle nobody spent).
+        "gated_on_trust_failure": "steps.trust.outcome == 'failure'" in step["gate"],
+        # ...and only on a real, claimed, still-in-budget live dispatch.
+        "gated_on_live_dispatch": all(
+            fragment in step["gate"] for fragment in (
+                "!inputs.dry_run",
+                "needs.claim.outputs.acquired == 'true'",
+                "steps.budget.outputs.exhausted != 'true'")),
+        # Idempotency + the readmission window both key on the run identity and the policy bound.
+        "binds_run_key": '--run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"' in step["body"],
+        "binds_max_attempts": '--max-attempts "${{ needs.resolve.outputs.max_attempts }}"'
+                              in step["body"],
+        # A charge that fails silently restores the unbounded loop, so the step must be loud.
+        "charge_is_loud": len(charge) == 1 and "continue-on-error" not in step["body"],
+        # The consequence of an exhausted budget: the machine-owned `status:parked` hold.
+        # It is the DURABLE half, not the whole bound — `parked` also re-applies
+        # `status:deferred` (STATUS_TRANSITIONS) and dispatch.yml deliberately leaves parked rows
+        # in the deferred-retry candidate set (that lane IS the park's readmission hook), so what
+        # actually stops re-admission is dispatch-claim's budget arm reading the same
+        # `budget_used` charge. This finding pins the worker-side half; the claim-side half is
+        # pinned by dispatch-claim's own #1075 seam assertion.
+        "parks_when_exhausted": len(park) == 1 and bool(_PARK_ARM_RE.search(park[0]["body"])),
+    }
+
+
+def _refusal_budget_self_test():
+    """[issue #1075] A pre-model trust refusal is CHARGED to the durable per-issue budget.
+
+    The defect: worker.yml's `trust` step is continue-on-error and precedes `prepare`, so a
+    refusal skipped `Record model attempt` and incremented nothing — `max_attempts` was checked
+    against a counter the refusal path could not move, and the deferred-retry lane re-admitted the
+    same issue forever (target #834: ~34 dispatches in one day, ~18% of the day's capacity).
+
+    Asserted here, end to end: (1) a simulated refusal increments the durable counter; (2)
+    `max_attempts` consecutive refusals exhaust the budget, so the model is refused a launch and
+    final_state's exhaustion arm applies the machine-owned park — the deferred-retry lane's own
+    gate is dispatch-claim's budget arm, which charges the SAME `budget_used` quantity and is
+    pinned by that module's #1075 seam assertion; (3) the refusal counter and the MODEL-attempt
+    counter are distinct, not aliased
+    — including the consent surface (a refusal must not move find_maintainer_approval's staleness
+    anchor); (4) the wiring that makes (1) reachable from the workflow actually exists.
+
+    MUTATION-CHECKED (the acceptance criterion): deleting the refusal charge from budget_used
+    turns (1) and (2) red, aliasing the two markers turns (3) red, and each workflow mutation
+    below turns its own seam finding red — every one of those is executed here, not asserted
+    about."""
+    bot = "sparq[bot]"
+    # --- (3) DISTINCT COUNTERS, not one counter with two names ---------------------------------
+    # Substring containment either way would make one marker silently count the other's receipts.
+    assert ATTEMPT_MARKER not in REFUSAL_MARKER and REFUSAL_MARKER not in ATTEMPT_MARKER
+    mixed = [
+        {"user": {"login": bot}, "created_at": "2026-07-20T00:00:00Z",
+         "body": f"x {ATTEMPT_MARKER} run=1.1 -->"},
+        {"user": {"login": "SPARQ[bot]"}, "created_at": "2026-07-21T00:00:00Z",
+         "body": f"x {REFUSAL_MARKER} run=2.1 -->"},
+        {"user": {"login": bot}, "created_at": "2026-07-22T00:00:00Z",
+         "body": f"x {REFUSAL_MARKER} run=3.1 -->"},
+        # A third party can neither burn the budget nor mint one: not bot-authored, never charged.
+        {"user": {"login": "someone"}, "created_at": "2026-07-22T00:00:00Z",
+         "body": f"x {REFUSAL_MARKER} run=4.1 -->"},
+    ]
+    assert count_attempts(mixed, bot) == 1      # cost/health: only runs where a model ran
+    assert count_refusals(mixed, bot) == 2      # case-insensitive bot match, third party excluded
+    assert budget_used(mixed, bot) == 3         # the dispatch bound sees every spent cycle
+    # The readmission window covers BOTH halves — without it a budget spent on refusals could
+    # never be re-opened by the human unpark gesture, i.e. the park would be terminal.
+    assert count_refusals_since(mixed, bot, "2026-07-22T00:00:00Z") == 1   # tie is charged
+    assert budget_used(mixed, bot, "2026-07-21T12:00:00Z") == 1
+    assert budget_used(mixed, bot, "2026-07-19T00:00:00Z") == 3
+    # A voided attempt (registry #596) stays uncharged through the sum, and no void marker can
+    # un-charge a refusal (the run keys live in different marker namespaces).
+    voided = mixed + [{"user": {"login": bot}, "created_at": "2026-07-22T01:00:00Z",
+                       "body": f"x {ATTEMPT_VOID_MARKER} run=1.1 -->"},
+                      {"user": {"login": bot}, "created_at": "2026-07-22T02:00:00Z",
+                       "body": f"x {ATTEMPT_VOID_MARKER} run=3.1 -->"}]
+    assert count_attempts(voided, bot) == 0
+    assert count_refusals(voided, bot) == 2 and budget_used(voided, bot) == 2
+
+    # The CONSENT surface must not move: a maintainer's `approved`, posted after the last model
+    # attempt, still approves once a later refusal lands. Aliasing the markers is what breaks it —
+    # executed below, so this assertion is not merely restating the implementation.
+    approval_history = [
+        {"user": {"login": bot}, "created_at": "2026-07-20T00:00:00Z",
+         "body": f"x {ATTEMPT_MARKER} run=1.1 -->"},
+        {"user": {"login": "jeswr", "type": "User"}, "created_at": "2026-07-21T00:00:00Z",
+         "body": "approved"},
+        {"user": {"login": bot}, "created_at": "2026-07-22T00:00:00Z",
+         "body": f"x {REFUSAL_MARKER} run=2.1 -->"},
+    ]
+    assert find_maintainer_approval(approval_history, bot, lambda login: login == "jeswr")
+    aliased = [dict(comment, body=comment["body"].replace(REFUSAL_MARKER, ATTEMPT_MARKER))
+               for comment in approval_history]
+    assert find_maintainer_approval(aliased, bot, lambda login: login == "jeswr") is None
+
+    # --- (1) + (2) THE INCREMENT AND THE BOUND, through the real entry points ------------------
+    posts = []
+    state = {"comments": [], "timeline": []}
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run_gh(args, *, input_text=None, check=True):
+        result = _Result()
+        if "/collaborators/" in str(args[1]):
+            result.stdout = "admin" if "/collaborators/jeswr/" in args[1] else "none"
+        return result
+
+    def fake_gh_json(args, *, input_doc=None):
+        body = (input_doc or {}).get("body")
+        if body is not None:
+            posts.append(body)
+            # Receipts land in chronological order; the timestamps matter to the window below.
+            state["comments"].append({"user": {"login": bot},
+                                      "created_at": f"2026-07-2{len(posts)}T00:00:00Z",
+                                      "body": body})
+        return {}
+
+    def fake_paginated(repo, issue, resource):
+        return list(state[resource if resource in state else "comments"])
+
+    seams = {"_run_gh": fake_run_gh, "_gh_json": fake_gh_json, "_paginated": fake_paginated}
+    saved = {name: globals()[name] for name in seams}
+    saved_output = os.environ.get("GITHUB_OUTPUT")
+    globals().update(seams)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            def outputs(call):
+                output_file = Path(tmp) / "outputs.txt"
+                output_file.write_text("", encoding="utf-8")
+                os.environ["GITHUB_OUTPUT"] = str(output_file)
+                call()
+                return dict(line.split("=", 1) for line in
+                            output_file.read_text(encoding="utf-8").splitlines())
+
+            # A fresh issue is admitted: nothing has been spent yet.
+            assert outputs(lambda: attempt_check("o/r", 834, 2, bot)) == {
+                "used": "0", "exhausted": "false"}
+            # (1) ONE refusal charges exactly ONE cycle — the increment the refusal path lacked.
+            outputs(lambda: record_refusal("o/r", 834, 2, bot, "77.1", "https://run/77"))
+            assert len(posts) == 1 and f"{REFUSAL_MARKER} run=77.1 -->" in posts[0]
+            assert ATTEMPT_MARKER not in posts[0]   # never masquerades as model spend
+            assert outputs(lambda: attempt_check("o/r", 834, 2, bot)) == {
+                "used": "1", "exhausted": "false"}
+            # Idempotent per run key: a re-entered step re-uses its receipt, never double-charges.
+            outputs(lambda: record_refusal("o/r", 834, 2, bot, "77.1", "https://run/77"))
+            assert len(posts) == 1
+            assert outputs(lambda: attempt_check("o/r", 834, 2, bot))["used"] == "1"
+            # (2) THE BOUND: max_attempts consecutive pre-model refusals exhaust the budget...
+            outputs(lambda: record_refusal("o/r", 834, 2, bot, "78.1", "https://run/78"))
+            assert len(posts) == 2
+            assert outputs(lambda: attempt_check("o/r", 834, 2, bot)) == {
+                "used": "2", "exhausted": "true"}
+            # ...so the next dispatch is refused a model launch (worker.yml gates `prepare` and
+            # `model` on this, and final_state's exhaustion arm applies the machine-owned park;
+            # dispatch-claim's budget arm reads the same charge and stops re-admitting the row
+            # before a runner is ever allocated).
+            try:
+                record_attempt("o/r", 834, 2, bot, "79.1")
+                raise AssertionError("a budget spent on refusals still launched the model")
+            except WorkerIssueError as exc:
+                assert "exhausted before model launch" in str(exc), exc
+            assert len(posts) == 2   # and no attempt receipt was posted
+            # (3) again, on the LIVE receipts this run produced: not one model attempt among them.
+            assert count_attempts(state["comments"], bot) == 0
+            assert count_refusals(state["comments"], bot) == 2
+            # The exhaustion is UNDOABLE by the same human gesture that re-opens an attempt
+            # budget: a proven-human unlabel after both refusals re-admits the issue.
+            state["timeline"] = [
+                {"event": "labeled", "label": {"name": "status:parked"},
+                 "created_at": "2026-07-23T00:00:00Z",
+                 "actor": {"login": "sparq-orchestrator[bot]"}},
+                {"event": "unlabeled", "label": {"name": "status:parked"},
+                 "created_at": "2026-07-24T00:00:00Z", "actor": {"login": "jeswr"}},
+            ]
+            assert outputs(lambda: attempt_check("o/r", 834, 2, bot)) == {
+                "used": "0", "exhausted": "false"}
+            # A BOT unlabel proves nothing and opens no window (fail toward exhaustion).
+            state["timeline"][1] = {**state["timeline"][1],
+                                    "actor": {"login": "sparq-orchestrator[bot]"}}
+            assert outputs(lambda: attempt_check("o/r", 834, 2, bot)) == {
+                "used": "2", "exhausted": "true"}
+    finally:
+        globals().update(saved)
+        if saved_output is None:
+            os.environ.pop("GITHUB_OUTPUT", None)
+        else:
+            os.environ["GITHUB_OUTPUT"] = saved_output
+
+    # --- (4) THE WORKFLOW SEAM, proven non-vacuous against mutated copies ----------------------
+    workflow = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "worker.yml"
+    assert workflow.is_file(), f"worker.yml not found for the seam check: {workflow}"
+    text = workflow.read_text(encoding="utf-8")
+    live = worker_refusal_seam(text)
+    assert all(live.values()), f"worker.yml refusal wiring is incomplete: {live}"
+
+    charge_step = next(step for step in _workflow_steps(text)
+                       if "worker-issue.py record-refusal" in step["body"])
+    mutants = {
+        # The whole charging step deleted — the pre-fix workflow, exactly.
+        "charges_refusal": text.replace(charge_step["body"], ""),
+        # The gate widened to fire on `skipped` too (budget already exhausted / no claim), which
+        # would charge cycles that were never spent.
+        "gated_on_trust_failure": text.replace("steps.trust.outcome == 'failure'",
+                                               "steps.trust.outcome != 'success'"),
+        # The dry-run/claim/budget guards dropped from that same gate.
+        "gated_on_live_dispatch": text.replace(
+            "&& steps.budget.outputs.exhausted != 'true' && steps.trust.outcome == 'failure' }}",
+            "&& steps.trust.outcome == 'failure' }}"),
+        # The run key dropped: idempotency gone, so a re-entered step double-charges.
+        "binds_run_key": text.replace(
+            charge_step["body"],
+            charge_step["body"].replace(
+                '            --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \\\n', "")),
+        # The policy bound replaced by a hard-coded one.
+        "binds_max_attempts": text.replace(
+            charge_step["body"],
+            charge_step["body"].replace('"${{ needs.resolve.outputs.max_attempts }}"', '"3"')),
+        # The charge made soft: a failed charge silently restores the unbounded loop.
+        "charge_is_loud": text.replace("        id: refusal\n",
+                                       "        id: refusal\n        continue-on-error: true\n"),
+        # The consequence removed: an exhausted budget that converges to `deferred` leaves the
+        # issue in the very label the deferred-retry lane re-admits on.
+        "parks_when_exhausted": _PARK_ARM_RE.sub(
+            lambda match: match.group(0)[:-len("parked")] + "deferred", text, count=1),
+    }
+    for finding, mutated in mutants.items():
+        assert mutated != text, f"the {finding} mutation no longer applies to worker.yml"
+        broken = worker_refusal_seam(mutated)
+        assert broken[finding] is False, f"the {finding} seam check survived its own mutation"
 
 
 def _followup_label_self_test():
@@ -2192,6 +2612,15 @@ def main():
     record.add_argument("--bot-login", required=True)
     record.add_argument("--run-key", required=True)
 
+    # [issue #1075] Charge a PRE-MODEL trust refusal to the same durable per-issue budget. Invoked
+    # from worker.yml the instant the continue-on-error `trust` step fails, i.e. the one path that
+    # spends a whole dispatch cycle without ever reaching `record-attempt`.
+    refusal = subparsers.add_parser("record-refusal", parents=[common])
+    refusal.add_argument("--max-attempts", required=True, type=int)
+    refusal.add_argument("--bot-login", required=True)
+    refusal.add_argument("--run-key", required=True)
+    refusal.add_argument("--run-url", required=True)
+
     # [registry #596] Un-charge this run's attempt when the launch died on the account credential.
     # The class gate lives in worker-pr.is_credential_outage (pure + self-tested), NOT in a workflow
     # `if:` expression, so the non-chargeable rule is testable and shared with the review path.
@@ -2248,6 +2677,9 @@ def main():
             attempt_check(args.repo, args.issue, args.max_attempts, args.bot_login)
         elif args.command == "record-attempt":
             record_attempt(args.repo, args.issue, args.max_attempts, args.bot_login, args.run_key)
+        elif args.command == "record-refusal":
+            record_refusal(args.repo, args.issue, args.max_attempts, args.bot_login,
+                           args.run_key, args.run_url)
         elif args.command == "void-attempt":
             void_attempt_on_outage(args.repo, args.issue, args.bot_login, args.run_key,
                                    args.exit_class)
