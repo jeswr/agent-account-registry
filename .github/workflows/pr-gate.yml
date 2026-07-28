@@ -96,7 +96,7 @@ jobs:
           tar -C "$RUNNER_TEMP/actionlint-bin" -xzf /tmp/actionlint.tar.gz actionlint
           echo "$RUNNER_TEMP/actionlint-bin" >> "$GITHUB_PATH"
 
-      - name: Run the full registry self-test suite
+      - name: Run the full registry self-test suite (sandboxed — no self-test may reach the real gh)
         run: |
           set -euo pipefail
           base_manifest="$RUNNER_TEMP/base-selftest-suite.txt"
@@ -120,14 +120,14 @@ jobs:
           fi
           suite=$(bash scripts/worker-live.sh print-selftest-suite "$base_manifest" "$base_retirements")
           n=0
+          # Every enrolled self-test runs through worker-live.sh's `run-selftest` SANDBOX, never
+          # directly: it puts a refusing `gh` shim first on PATH and reds if any self-test reached
+          # the real binary. Two suites wrote to production in one night with a green gate, so the
+          # control sits OUTSIDE the process rather than inside it. This loop is asserted verbatim
+          # by worker-live.sh's self-test — a direct invocation reintroduced here fails that check.
           for s in $suite; do
             echo "== self-test $s =="
-            case "$s" in
-              *.py) python3 "scripts/$s" --self-test ;;
-              migrate-secrets.sh) bash "scripts/$s" --self-test ;;
-              *.sh) bash "scripts/$s" self-test ;;
-              *) echo "::error::unsupported self-test suite entry: $s"; exit 1 ;;
-            esac
+            bash scripts/worker-live.sh run-selftest "$s"
             ((n += 1))
           done
           [[ "$n" -gt 0 ]] || { echo "::error::self-test suite ran vacuously"; exit 1; }
