@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4375,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3c87546fa2b8831daf76f345578f36e06afb7247",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 7 finds no correctness, soundness, test-validity, or security issue. The specification consistently limits unreadable-versus-absent bound-index solution indistinguishability to requesters whose eligible entry set is empty, while SV-ND-4 expressly permits the existence and dimension observables for requesters holding eligible entries. The related discovery requirements and conformance scenario preserve that same boundary. The change remains an honest proposal: it identifies implementation gaps, requires authorization before ranking, rejects shared approximate structures whose results depend on unreadable entries, and makes no unsupported implementation, privacy, or performance claim.",
+  "verdict": "approve"
+ }
+}
