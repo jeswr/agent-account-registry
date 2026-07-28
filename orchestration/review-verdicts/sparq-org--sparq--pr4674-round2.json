@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4674,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a72d0eb3fd3b7bf04a52f9d186e0e93af5731793",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The function checks only `selected.per_pattern.len() == bgp.patterns.len()`, then treats each public `PrivatePatternSources.pattern` value as authoritative. Duplicate, missing, or out-of-range pattern ids therefore pass validation. In particular, a hand-built two-entry selection can contain an empty entry for pattern 0 plus a non-empty duplicate entry for pattern 0; `empty_patterns` then makes the whole BGP dead even though this is not a valid aligned Phase-2 selection. `combination_is_dead` consequently returns true for every assignment. This violates the documented fail-closed alignment posture and can suppress live work.",
+    "file": "crates/sparq-fedplan-mpc/src/combination.rs",
+    "fix_hint": "Before either rule, require that `per_pattern` contains each pattern id in `0..bgp.patterns.len()` exactly once (or require position `i` to have `pattern == i`), returning `SeamError::DescriptorMismatch` otherwise. Add negative tests for duplicate, missing/out-of-range, and reordered ids according to the chosen invariant.",
+    "severity": "major",
+    "title": "Pattern count validation does not validate the pattern-to-entry mapping"
+   },
+   {
+    "body": "`SourceDescriptorBuilder::char_set` permits duplicate characteristic-set predicate vectors, but `char_sets_complete_for` sums every entry. A descriptor can therefore serve the same `{p}` cohort twice so the duplicate counts equal `p`'s `distinct_subjects`, do likewise for `{q}`, omit the real `{p,q}` cohort, and make both completeness checks pass. Since no served set contains both predicates, Rule C2 then emits a dead pairing and prunes a potentially live combination. Checked arithmetic fixes overflow but does not establish that the served sets form the claimed partition.",
+    "file": "crates/sparq-fedplan-mpc/src/combination.rs",
+    "fix_hint": "Make the guard reject duplicate exact predicate-set keys (and any other locally detectable violation of the characteristic-set partition representation) before using count equality as proof. Add a negative test with duplicated singleton sets whose sums match both predicate partitions while an omitted co-occurrence set would make the pairing live.",
+    "severity": "major",
+    "title": "Duplicate characteristic sets can falsely satisfy the completeness guard"
+   }
+  ],
+  "progress": "improving",
+  "summary": "The two round-one blockers are fixed correctly: subject counts now use checked addition with a non-vacuous overflow regression test, and every candidate index is matched to the descriptor identity with a mismatch test. However, Rule C2 still accepts malformed but publicly constructible selection and characteristic-set structures as proof. Those inputs can make the new answer-pruning path report a live combination as dead. The round is improving because both prior findings were eliminated, but the remaining fail-closed gaps are major and prevent approval.",
+  "verdict": "request_changes"
+ }
+}
