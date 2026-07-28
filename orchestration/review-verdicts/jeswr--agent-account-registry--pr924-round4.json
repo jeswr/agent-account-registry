@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 924,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d745d5cbd53f59a8f92762704089734e255701b5",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`pipefail_delta` is still called on individual physical-line segments. For `set +o pipefail`, followed by `set -o \\\\` on one physical line and `pipefail` on the next, bash re-enables pipefail, but the scanner sees neither physical line as a complete enable and retains `pipefail = False`. It then blanks a subsequent `producer | head -1` shape, allowing the real-workflow assertion to return a false-clean zero. The new exact-count fixture has no backslash-continuation positive control, so it does not catch this bypass.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Track option transitions over shell logical commands, including backslash continuations, before deciding whether subsequent commands are emitted. Add a fixture that disables pipefail, re-enables it using `set -o \\\\` plus `pipefail` on the next physical line, then runs a vulnerable pipeline, and require that pipeline to be counted.",
+    "severity": "major",
+    "title": "Backslash-continued pipefail re-enable still bypasses the workflow guard"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-3 major finding remains unresolved. `_workflow_run_shell` still evaluates each physical line independently, so a backslash-continued `set -o pipefail` executed by bash is not recognized by `pipefail_delta`. The fixture adds same-line separator controls but no multiline logical-command control. Consequently the guard can still suppress a later vulnerable pipeline and report a false-clean zero.",
+  "verdict": "request_changes"
+ }
+}
