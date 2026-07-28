@@ -938,6 +938,16 @@ class Sweeper:
             print(f"::warning::regate-sweep: step summary not written ({exc})")
 
 
+def _coverage_canary_never_called():
+    """DELIBERATELY UNREACHABLE. A coverage instrument that reports this at anything but 0% is
+    attributing lines it should not, and one that reports EVERYTHING at 0% has measured nothing —
+    both failures look like a clean report. scripts/../cover.py refuses to print numbers unless it
+    separates this from a function the self-test certainly runs. Three instruments on this estate
+    failed toward "nothing to report"; this is the cheapest way to notice."""
+    unreachable = "this line must never execute"
+    return unreachable.upper()
+
+
 def _repo_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -1018,6 +1028,7 @@ def _self_test():
     _test_live_sweep(chk)
     _test_entry_point(chk)
     _test_published_census(chk)
+    _test_abort_guards(chk)
     _test_census(chk)
     _test_workflow_seam(chk)
 
@@ -1343,6 +1354,14 @@ def _raises(fn):
     return None
 
 
+# ⚠️ TWO DISTINCT REFUSALS, NAMED SEPARATELY. They both reject `["pr","merge",…]`, so a test that
+# only asserts "it raises" is satisfied by EITHER — deleting one alone then survives, which is the
+# mutually-masking-duplicate-guard shape. The assertions below key on these strings, so each guard
+# has an observer that the other cannot satisfy.
+_DOUBLE_NOT_API = "unexpected FakeGh request: this double serves `gh api` only"
+_DOUBLE_NO_PATH = "unexpected FakeGh request: no repository path"
+
+
 class FakeGh:
     """The `gh` layer, injected as the `runner` callable. Records every request in order, so the
     tests can assert on WHAT WAS NOT CALLED — which is the only way a "does not touch it" control
@@ -1377,13 +1396,12 @@ class FakeGh:
         # arms via a REST path spelling".
         if not args or args[0] != "api":
             raise AssertionError(
-                f"unexpected FakeGh request: this double serves `gh api` only, got {list(args)!r}")
+                f"{_DOUBLE_NOT_API}: got {list(args)!r}")
         method = args[args.index("--method") + 1] if "--method" in args else "GET"
         prefix = f"/repos/{self.repo}"
         path = next((a for a in args if a.startswith(prefix)), None)
         if path is None:
-            raise AssertionError(
-                f"unexpected FakeGh request: no /repos/{self.repo} path in {list(args)!r}")
+            raise AssertionError(f"{_DOUBLE_NO_PATH}: {self.repo} not in {list(args)!r}")
         tail = path[len(prefix):]
         if method == "PUT" and tail.endswith("/update-branch"):
             number = int(tail.split("/")[2])
@@ -1638,9 +1656,13 @@ def _test_live_sweep(chk):
             ("gh pr edit --add-label review:pass", ("pr", "edit", "903", "--add-label",
                                                     REVIEW_PASS_LABEL)),
             ("gh run rerun --failed", ("run", "rerun", "123", "--failed"))):
-        chk(f"double: RAISES on `{label}` instead of answering it with the repository payload — "
-            "the raise must be REACHABLE for CLI argv, which is what it was not",
-            isinstance(_raises(lambda a=argv: probe(a)), AssertionError), True)
+        chk(f"double: REFUSES `{label}` as a non-`api` argv instead of answering it with the "
+            "repository payload — keyed on WHICH guard fired, because the two refusals both "
+            "reject this shape and would otherwise mask each other",
+            _DOUBLE_NOT_API in str(_raises(lambda a=argv: probe(a))), True)
+    chk("double: the SECOND refusal has its own observer — an `api` call to a repository this "
+        "double does not serve is refused for THAT reason, not the first one's",
+        _DOUBLE_NO_PATH in str(_raises(lambda: probe(("api", "/repos/someone/else/pulls/1")))), True)
     chk("double: still serves the `gh api` calls the sweeper really makes",
         isinstance(_raises(lambda: probe(("api", "/repos/jeswr/agent-account-registry"))), Exception),
         False)
@@ -1806,6 +1828,19 @@ def _test_live_sweep(chk):
         "cannot name", isinstance(_raises(sweeper13.run), RegateSweepError), True)
 
 
+def _main_total(chk, argv, runner=None):
+    """`main()` with an escaping exception converted into a NAMED red rather than an abort. Four
+    arming mutants died here by traceback instead of by their own observer until this existed."""
+    try:
+        return main(argv, runner=runner)
+    except SystemExit:
+        raise
+    except BaseException as exc:                                          # noqa: BLE001
+        chk(f"main({argv[:2]}) completed without raising",
+            f"{type(exc).__name__}: {exc}"[:120], "no exception")
+        return None
+
+
 class _pinned_env:
     """Run a block with the ambient CI variables PINNED to known values.
 
@@ -1859,7 +1894,7 @@ def _test_entry_point(chk):
             # marker scan compares against, this PR is wrongly skipped and the sweep does nothing.
             spoof = {"body": MARKER.format(repair=917, head="a" * 40), "user": {"login": "nobody"}}
             gh, _ = _fixture(comments={903: [spoof]})
-            code = main(["--repo", repo, "--repairs-file", path, "--bot-slug", BOT_SLUG,
+            code = _main_total(chk, ["--repo", repo, "--repairs-file", path, "--bot-slug", BOT_SLUG,
                          "--max-moves", "5", "--apply"], runner=gh)
             chk("entry point: main() runs the sweep end to end and exits 0", code, 0)
             chk("entry point: main() wires --bot-slug through as `<slug>[bot]`, so a foreign marker "
@@ -1867,13 +1902,13 @@ def _test_entry_point(chk):
 
             gh2, _ = _fixture(comments={903: [{"body": MARKER.format(repair=917, head="a" * 40),
                                               "user": {"login": BOT_LOGIN}}]})
-            main(["--repo", repo, "--repairs-file", path, "--bot-slug", BOT_SLUG, "--apply"],
+            _main_total(chk, ["--repo", repo, "--repairs-file", path, "--bot-slug", BOT_SLUG, "--apply"],
                  runner=gh2)
             chk("entry point: and OUR OWN marker read through main() does suppress the move",
                 gh2.updated(), [])
 
             gh3, _ = _fixture()
-            main(["--repo", repo, "--repairs-file", path], runner=gh3)
+            _main_total(chk, ["--repo", repo, "--repairs-file", path], runner=gh3)
             chk("entry point: main() DEFAULTS to dry-run — --apply is opt-in, so a mis-wired "
                 "workflow cannot write", [c for c in gh3.calls if "--method" in c], [])
 
@@ -1926,6 +1961,45 @@ def _test_published_census(chk):
             _run_total(chk, "publish", sweeper2), 0)
     finally:
         os.unlink(path)
+
+
+def _test_abort_guards(chk):
+    """The four report-instead-of-raise helpers ARE the safety net that keeps one mutant from
+    masking the rest of a section — and an untested safety net is the shape this PR keeps finding.
+    Each is exercised on its exception arm with a RECORDING chk, so a helper that silently swallows
+    (records nothing) is distinguishable from one that reports."""
+    def recorder():
+        seen = []
+        return seen, lambda name, got, want: seen.append((name, got == want))
+
+    class _Boom:
+        def run(self):
+            raise RuntimeError("tick exploded")
+
+    seen, rec = recorder()
+    chk("abort-guard: _run_total returns None when the tick raises", _run_total(rec, "x", _Boom()),
+        None)
+    chk("abort-guard: ...and RECORDS it as a red rather than swallowing it",
+        [ok for _n, ok in seen], [False])
+    chk("abort-guard: _run_total is transparent for a tick that does NOT raise",
+        (_run_total(rec, "y", type("_", (), {"run": lambda self: 7})()), len(seen)), (7, 1))
+
+    seen2, rec2 = recorder()
+    chk("abort-guard: _main_total returns None when main() raises",
+        _main_total(rec2, ["--repo", "o/r", "--repairs-file", "/nonexistent-repairs.json"]), None)
+    chk("abort-guard: ...and records that red", [ok for _n, ok in seen2], [False])
+    chk("abort-guard: _main_total lets SystemExit through — an argparse rejection is a RESULT, "
+        "not a crash, and swallowing it would make the exit-2 assertions vacuous",
+        _exit_code(lambda: _main_total(rec2, ["--bogus-flag"])), 2)
+
+    chk("abort-guard: _job_or_empty returns {} for a missing job instead of raising",
+        _job_or_empty({"jobs": {}}, "nope"), {})
+    chk("abort-guard: ...while _job itself still RAISES, so the strict form stays available",
+        isinstance(_raises(lambda: _job({"jobs": {}}, "nope")), RegateSweepError), True)
+    chk("abort-guard: _sparse_paths_or_empty returns an empty set when there is no checkout",
+        _sparse_paths_or_empty({"steps": []}), set())
+    chk("abort-guard: ...while _sparse_paths itself still RAISES",
+        isinstance(_raises(lambda: _sparse_paths({"steps": []})), RegateSweepError), True)
 
 
 def _test_census(chk):
