@@ -2379,6 +2379,75 @@ def _self_test():
          granted.census[0]["stuck_readmitted"]),
         (0, [(83, MACHINE_PARK_LABEL)], 1, 1),
     )
+
+    # (k4b) THE RECEIPT KEY IS ROUND-TRIPPED — the WRITE side, which had no guard at all.
+    #
+    # MEASURED (review round 3): both arguments of the minted un-park key
+    # `stuck_receipt(STUCK_UNPARK_MARKER, park["head"], park["gen"])` were unpinned, INCLUDING by
+    # the check immediately above whose name carries the property. That check drives
+    # `parked_pr_api(granted=True)`, and the fixture builds the grant from the SAME head and
+    # generation as the park — so the read side matches by construction and the row cannot
+    # disagree however wrong the written key is.
+    #
+    # THIS IS A DIFFERENT FAILURE FROM M23, and worth naming separately because the question that
+    # catches it is different. M23 was "a value pinned through a pure helper while the call site
+    # recomputes it" — ask *which layer computes this?*. This one is "the fixture derives its
+    # expected value from the same source as the code under test" — ask *does my expected value
+    # come from the same place the code gets it?*. When both sides read `park[...]`, the
+    # assertion is a tautology and no amount of naming it makes it a guard.
+    #
+    # Three assertions, none of which can read its expectation out of `park[...]`, and each
+    # pinning a different consequence:
+    roundtrip_api = parked_pr_api()                    # parked at head "b"*40, generation 1
+    roundtrip_api.set_head(83, "e" * 40)               # the author pushed: the cause recovers
+    _roundtrip_rc, _roundtrip, roundtrip_api = exit_sweep(roundtrip_api)
+    minted = [body for body in _comment_bodies(roundtrip_api.comment_rows[83])
+              if STUCK_UNPARK_MARKER in body]
+    check(
+        "[EXIT MACHINE] ROUND TRIP: the minted un-park key names the PARKED head and the PARKED "
+        "generation — matched against a LITERAL, not against `park[...]`",
+        (len(minted),
+         ("<!-- conflict-resolver stuck-unpark:v1 cause=head-unmoved "
+          f"head={'b' * 40} gen=1 -->") in (minted[0] if minted else "")),
+        (1, True),
+    )
+    # CONSEQUENCE 1 — a WRONG HEAD breaks convergence. The receipt landed and the DELETE did not
+    # (the only crash residue receipt-first ordering can produce); the next tick must recognise
+    # the grant it minted itself, which it can only do if the key it WROTE is the key it READS.
+    # Point the key at the live head and this tick mints a SECOND receipt instead.
+    roundtrip_api.prs[83].setdefault("labels", []).append({"name": MACHINE_PARK_LABEL})
+    residue_rc, residue, roundtrip_api = exit_sweep(roundtrip_api, elapsed_hours=1000.0)
+    check(
+        "[EXIT MACHINE] ROUND TRIP: the crash-residue tick CONVERGES on the receipt it minted "
+        "itself — still exactly ONE, because the key written is the key read",
+        (residue_rc,
+         sum(STUCK_UNPARK_MARKER in body
+             for body in _comment_bodies(roundtrip_api.comment_rows[83])),
+         residue.census[0]["stuck_readmitted"], len(roundtrip_api.labels_removed)),
+        (0, 1, 1, 2),
+    )
+    # CONSEQUENCE 2 — a WRONG GENERATION PRE-GRANTS a park that has not happened yet, and this is
+    # the serious one: a machine hold that clears itself with NO cause proof, i.e. the exact
+    # fail-open this whole PR exists to prevent. Generation 1 recovers by the conflict resolving
+    # (so the head is unchanged and only the GENERATION can be wrong), the PR conflicts again on
+    # the same head and is parked at generation 2 — whose cause has NOT recovered. It must STAND.
+    pregrant_api = parked_pr_api()                     # parked at head "b"*40, generation 1
+    pregrant_api.set_mergeable(83, True)               # the conflict resolved: the cause recovers
+    exit_sweep(pregrant_api)
+    pregrant_api.set_mergeable(83, False)              # ...and it conflicts again, same head
+    pregrant_api.comment_rows[83].append(
+        {"body": stuck_receipt(STUCK_PARK_MARKER, "b" * 40, 2),
+         "user": {"login": bot_login}, "created_at": iso(base_now)})
+    pregrant_api.prs[83].setdefault("labels", []).append({"name": MACHINE_PARK_LABEL})
+    pregrant_rc, pregrant, pregrant_api = exit_sweep(pregrant_api, elapsed_hours=1000.0)
+    check(
+        "[EXIT MACHINE] ROUND TRIP: a LATER park is NOT pre-granted by the previous grant — "
+        "generation 2 with an unmoved head STANDS, and 1000 h does not change that",
+        (pregrant_rc, pregrant.census[0]["stuck_park_stands"],
+         pregrant.census[0]["stuck_readmitted"], pregrant_api.labels_removed[1:]),
+        (0, 1, 0, []),
+    )
+
     # THE CAP. An over-cap park was written in the HUMAN class at park time, so the exit phase
     # must not even consider it — `stuck_unpark_state` refuses to answer.
     check(
@@ -2447,6 +2516,21 @@ def _self_test():
          (STUCK_PARK_MARKER, STUCK_UNPARK_MARKER)),
         (True, True,
          ("<!-- conflict-resolver stuck-park:v1", "<!-- conflict-resolver stuck-unpark:v1")),
+    )
+    # ...and the LABELS themselves, against literals. Found by re-asking the round-3 question of
+    # every row in this block: every class assertion above compares what the resolver wrote
+    # against `MACHINE_PARK_LABEL` / `HUMAN_PARK_LABEL`, which is the SAME constant the resolver
+    # writes from — so repoint either one and every class check still passes while this program
+    # writes a hold no other lane honours. (`needs:user` was already literal-pinned, by the
+    # pre-existing `two distinct attempts add needs:user exactly once`; `review:parked` was not
+    # pinned anywhere.) The cause token is the third value on that wire and is pinned the same
+    # way, since a durable receipt already on a live PR stops parsing if it changes.
+    check(
+        "[EXIT MACHINE] the park LABELS and the cause token are WIRE FORMAT too — pinned to "
+        "literals, because every other class check reads them from the same constant the "
+        "resolver writes from",
+        (MACHINE_PARK_LABEL, HUMAN_PARK_LABEL, STUCK_PARK_CAUSE),
+        ("review:parked", "needs:user", "head-unmoved"),
     )
     check(
         "[EXIT MACHINE] ...control: a `review:parked` with NO receipt of ours is NOT bound, so "
