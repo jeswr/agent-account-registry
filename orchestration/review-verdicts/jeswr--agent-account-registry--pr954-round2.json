@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 954,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "cf0e379fa4ee1f597ad6897f0756250c0687ffea",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The prior round's credential and ordering gap is substantively resolved. The record now specifies a distinct contents-write-only App token, minted before irreversible state changes and applied inline only to the binding ref call; it keeps issue operations on the narrower default token, adds guard mutations for credential scope and ordering, expands the partial-state recovery analysis, and makes the existing claim-ref permission ambiguity a blocking empirical precondition rather than guessing. The three-PR write/backfill/read sequence remains fail-closed and avoids wedging already-enrolled accounts. The proposed executed-fragment and mutation tests are non-vacuous and cover unreadable, unparseable, cardinality, near-miss, hostile-title, namespace-binding, token-spread, and ordering failures. No blocker or major issue remains in this design-only diff.",
+  "verdict": "approve"
+ }
+}
