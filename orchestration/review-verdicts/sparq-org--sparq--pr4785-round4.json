@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4785,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "08bfe026d64a291814ace035ecebbacc53008c24",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete as a research-only design record. The diff clearly separates measured interpreter behavior and structural candidate counts from analytic reasoning and unmeasured gate impact; it repeatedly labels the 501 candidates as an upper bound rather than proven elisions. The proposed rule is conservatively scoped to ACIR checked unsigned addition, excludes Brillig, subtraction, multiplication, and u128 where the argument does not hold, and requires monotone non-reducing propagation, predicate-region equivalence, field-capacity safety, and a surviving downstream cover. The documented max-bits defect is treated as a hard prerequisite, with Noir-source reachability explicitly unproven rather than overstated. The sequencing is fail-closed: prerequisite repair, focused gate measurement, then implementation only on a measured win. The accompanying program record accurately summarizes those limits. No hostile instruction is embedded in the diff; shell commands are ordinary reproduction documentation. No correctness, soundness, test-validity, or security issue is present.",
+  "verdict": "approve"
+ }
+}
