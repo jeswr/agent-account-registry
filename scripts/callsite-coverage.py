@@ -1123,6 +1123,22 @@ def _self_test() -> int:
                   "triggers `_mech` and removes the false-positive valve)",
                   (counters.get("files_changed"), counters.get("symbols_examined"),
                    counters.get("symbols_triggered")), ("1", "0", "0"))
+            # The THIRD advisory layer, and the only one that had no test: `main` swallows a
+            # CoverageError into a `::warning` and returns 0, so an unresolvable base — a shallow
+            # clone, a force-pushed base branch — cannot fail the required gate.
+            buffer = io.StringIO()
+            code, escaped = 0, ""
+            try:
+                with contextlib.redirect_stdout(buffer):
+                    code = main(["--advisory", "--root", str(repo), "--base", "0" * 40])
+            except CoverageError as exc:  # a mutant that re-raises must FAIL BY NAME, not crash
+                code, escaped = -1, f"{exc}"
+            printed = buffer.getvalue()
+            check("ADVISORY SITE main: an UNRESOLVABLE --base is a ::warning and exit 0, never a "
+                  "gate failure — and it must not print a census it could not compute",
+                  (code, escaped,
+                   printed.startswith("::warning::callsite-coverage could not run: git "),
+                   "callsite-coverage census: " in printed), (0, "", True, False))
             # ...and the DEFAULT `--root` is the current directory, which is what the gate step
             # relies on: `python3 scripts/callsite-coverage.py --advisory --base "$base"` passes no
             # `--root` at all, so a mutant that no-ops for the default root would break the gate
