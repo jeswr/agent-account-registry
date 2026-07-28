@@ -527,6 +527,15 @@ def stuck_park_cause_recovered(cause, detail, parked_head):
     re-admission cap within a few ticks and lands the PR in the human terminal SOONER than doing
     nothing. An exit that grants no new attempt is a churn generator, not an exit.
 
+    THE CONTINGENCY THAT EXCLUSION STANDS ON, written down rather than left implicit: it is sound
+    ONLY BECAUSE the attempt marker is keyed by HEAD, so an unmoved head short-circuits every
+    later sweep before any rebase is attempted. A base advance can genuinely turn a conflict
+    clean, so if this program ever learns to retry a mechanical rebase when the BASE moves — key
+    the marker by (head, base), say — then a base advance WOULD grant a new action and this
+    exclusion becomes wrong and must be revisited here. That is a property of the marker's key,
+    not of this predicate, which is exactly why it is recorded at the predicate that depends on
+    it.
+
     Every ambiguity fails toward STAYING PARKED: a malformed live head, a missing mergeability
     field, and an unrecognised cause token all return False."""
     if cause != STUCK_PARK_CAUSE:
@@ -1168,6 +1177,13 @@ class ConflictResolver:
         head = (pr.get("head") or {}).get("sha", "")
         heads = attempt_heads(comments, self.bot_login)
         if head in heads:
+            # PRE-EXISTING DEAD BRANCH, and stated here so the next mutation sweep does not
+            # re-flag it as an uncovered call site. `_handle_conflict` is reached ONLY from
+            # `_process_pr`'s rebase leg, which every `head_sha in heads` branch returns before —
+            # so by construction `head` is never already in `heads` here, and a `raise` in this
+            # arm leaves the whole self-test suite green. It is defensive residue that predates
+            # this change; deleting it is a separate, behaviour-touching decision and is not
+            # folded into a PR whose remit is the class split.
             if len(heads) >= 2:
                 self._escalate_two_head(repo, pr, comments, conflicts)
             else:
@@ -1490,6 +1506,17 @@ def _self_test():
             self.comment_rows = {pr["number"]: [] for pr in pulls}
             self.labels_added = []
             self.labels_removed = []
+            # THE ORDERED MUTATION LOG. Without it this fixture cannot express an ORDERING
+            # property at all: `comment_rows` and `labels_removed` are separate lists, so
+            # "the receipt was posted BEFORE the label was deleted" and "…after" produce
+            # byte-identical state and no assertion over them can tell the two apart.
+            # MEASURED (review round 1): inverting `_stuck_park_phase`'s receipt-first ordering
+            # left the WHOLE 44-script suite green, and the two checks credited with killing it
+            # were in fact killed by a DIFFERENT mutant — deleting the `_post` outright, i.e. a
+            # receipt never minted rather than a receipt minted late. That is #594's stale-SHA
+            # stub again: a fixture that cannot express the property it is credited with testing.
+            # One interleaved log, appended by every mutating entry point, closes it.
+            self.events = []
             self.timelines = {number: [deepcopy(event) for event in events]
                               for number, events in (timelines or {}).items()}
 
@@ -1527,17 +1554,27 @@ def _self_test():
             raise AssertionError(f"unexpected FakeAPI request: {method} {url}")
 
         def comment(self, _repo, number, body):
+            # The event carries a COARSE KIND, not the whole body: an ordering assertion that
+            # pinned prose would go red on any wording change and would then be "fixed" by
+            # loosening it, which is how an ordering guard quietly stops guarding ordering.
+            kind = ("unpark-receipt" if STUCK_UNPARK_MARKER in body
+                    else "park-receipt" if STUCK_PARK_MARKER in body
+                    else "escalation" if ESCALATION_MARKER in body
+                    else "comment")
+            self.events.append((number, "comment", kind))
             self.comment_rows[number].append(
                 {"body": body, "user": {"login": bot_login}, "created_at": iso(self.now)}
             )
 
         def add_label(self, _repo, number, label):
+            self.events.append((number, "add-label", label))
             self.labels_added.append((number, label))
             names = _label_names(self.prs[number])
             if label not in names:
                 self.prs[number].setdefault("labels", []).append({"name": label})
 
         def remove_label(self, _repo, number, label):
+            self.events.append((number, "remove-label", label))
             self.labels_removed.append((number, label))
             self.prs[number]["labels"] = [
                 row for row in self.prs[number].get("labels") or []
@@ -2111,6 +2148,86 @@ def _self_test():
           ("3 distinct-head conflict attempts"
            in escalation_body(EXIT_TWO_HEAD, ("a.py",), 3, HUMAN_PARK_LABEL)),
           True)
+    # THE OVER-CAP BODY, AND ITS GRANT COUNT — the third exit-body shape, and the one that had NO
+    # assertion at all in round 1. MEASURED then: replacing `grants=len(stuck_receipts(...))` with
+    # `generation - 1` SURVIVED the whole suite. Under that mutant a generation-3 escalation tells
+    # a maintainer "2 automatic re-admission(s) on record" when the durable record shows NONE —
+    # which is verbatim the registry #769 finding this PR cites as the reason the count must be
+    # read. It sends the reader hunting a flapping cause instead of whatever kept clearing the
+    # label. So the count is pinned at TWO values: a generation whose grants are 0, and the SAME
+    # generation whose grants are 1. `generation - 1` disagrees with at least one of them for
+    # every generation, so no arithmetic on the generation can satisfy both rows.
+    over_cap_gen = STUCK_UNPARK_MAX + 1
+    over_cap_zero = escalation_body(EXIT_STUCK_GRACE, ("a.py",), 1, HUMAN_PARK_LABEL,
+                                    generation=over_cap_gen, grants=0)
+    over_cap_one = escalation_body(EXIT_STUCK_GRACE, ("a.py",), 1, HUMAN_PARK_LABEL,
+                                   generation=over_cap_gen, grants=1)
+    check(
+        "[BODY] the over-cap body names ITS OWN exit, states the generation, and reports the "
+        "grants READ FROM THE RECEIPTS — 0 grants says 0, not `generation - 1`",
+        (f"park generation {over_cap_gen}" in over_cap_zero,
+         "0 automatic re-admission(s) on record" in over_cap_zero,
+         "stuck-attempt grace-window exit" in over_cap_zero,
+         "distinct-head conflict attempts" in over_cap_zero,
+         f"MACHINE-owned `{MACHINE_PARK_LABEL}` soft hold" in over_cap_zero),
+        (True, True, True, False, False),
+    )
+    check(
+        "[BODY] ...and the SAME generation with one grant on record says 1 — the count tracks "
+        "the receipts, not the generation",
+        ("1 automatic re-admission(s) on record" in over_cap_one,
+         "0 automatic re-admission(s) on record" in over_cap_one,
+         over_cap_zero == over_cap_one),
+        (True, False, False),
+    )
+
+    # (k3b) THE VETO ASYMMETRY. `_escalate_stuck` checks the sticky human-unpark veto BEFORE it
+    # comments; the two-head exit checks it after, because that comment is once-ever
+    # marker-deduped and cannot repeat. MEASURED (review round 1): deleting the `_escalate_stuck`
+    # veto SURVIVED the whole suite — `_apply_park_label`'s veto still suppressed the LABEL, so
+    # the end state looked identical while the behaviour the docstring warns about was fully
+    # restored: a receipt minted for a park that is never applied, a generation spent on it, and
+    # a fresh comment on every tick of a 20-minute cron, on a PR a human explicitly un-parked.
+    stuck_veto_timeline = [
+        {"event": "labeled", "label": {"name": MACHINE_PARK_LABEL},
+         "created_at": "2026-07-18T10:00:00Z", "actor": {"login": bot_login}},
+        {"event": "unlabeled", "label": {"name": MACHINE_PARK_LABEL},
+         "created_at": "2026-07-18T11:00:00Z", "actor": {"login": "jeswr"}},
+    ]
+
+    def stuck_veto_ticks(timelines):
+        """One attempt recorded, then TWO further ticks past the grace window. Two, not one:
+        the defect this pins is per-TICK repetition, which a single tick cannot express."""
+        veto_api = FakeAPI([pull(86, "b" * 40)], timelines=timelines, now=base_now)
+        veto_rebaser = FakeRebaser("conflict")
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            ConflictResolver(veto_api, snapshot, claim, [repo], bot_login, True, 5, veto_rebaser,
+                             stuck_grace_hours=grace, clock=lambda: base_now).run()
+        rows = []
+        for _tick in range(2):
+            sweep = ConflictResolver(
+                veto_api, snapshot, claim, [repo], bot_login, True, 5, veto_rebaser,
+                stuck_grace_hours=grace, clock=lambda: base_now + 1000 * 3600.0)
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                sweep.run()
+            rows.append(sweep.census[0])
+        veto_bodies = _comment_bodies(veto_api.comment_rows[86])
+        return (sum(STUCK_PARK_MARKER in body for body in veto_bodies),
+                veto_api.labels_added,
+                (rows[0]["exit_stuck_grace"], rows[0]["parked_machine"]))
+
+    check(
+        "[EXIT stuck-grace] a human un-park VETOES the machine park BEFORE the comment: no "
+        "receipt is minted, no generation is spent, and a second tick adds nothing",
+        stuck_veto_ticks({86: stuck_veto_timeline}),
+        (0, [], (1, 1)),
+    )
+    check(
+        "[EXIT stuck-grace] ...PAIRED CONTROL: with no human un-park the SAME two ticks mint "
+        "EXACTLY ONE receipt — so the check above is not passing because nothing ever posts",
+        stuck_veto_ticks({}),
+        (1, [(86, MACHINE_PARK_LABEL)], (1, 1)),
+    )
 
     # (k4) THE MACHINE EXIT IS REAL, AND IT IS CAUSE-GATED. A relabelled hold with no exit is
     # worse than the visible one it replaced, so the class split is only honest if the park
@@ -2162,6 +2279,28 @@ def _self_test():
          moved.census[0]["stuck_readmitted"], moved.census[0]["stuck_park_stands"],
          moved.census[0]["resolved"]),
         (0, [(83, MACHINE_PARK_LABEL)], 1, 1, 0, 1),
+    )
+    # RECEIPT-FIRST IS AN ORDERING PROPERTY, so it is asserted over the ORDERED event log and
+    # not over end-state. MEASURED (review round 1): the check above was credited with killing
+    # the inverted-ordering mutant and does not — it cannot, because `comment_rows` and
+    # `labels_removed` are separate lists in which "receipt then unlabel" and "unlabel then
+    # receipt" are byte-identical. What it actually kills is `_post` DELETED, which is the other
+    # defect (a receipt never minted, rather than minted late).
+    #
+    # WHY THE ORDER IS LOAD-BEARING (#610): dying between the two writes must leave
+    # receipt-with-label, which the `grant is not None` branch converges on the next tick.
+    # Inverted, the crash leaves label-gone-with-no-receipt: nothing records that the recovery
+    # was consumed, the PR re-enters the stuck state, and the SAME recovery is earned a second
+    # time — the consume-exactly-once invariant broken by an ordering alone.
+    moved_events = [event for event in moved_api.events if event[0] == 83]
+    check(
+        "[EXIT MACHINE] RECEIPT-FIRST: the un-park receipt is durable BEFORE the label is "
+        "deleted, so the only crash residue is the one the convergence branch can complete",
+        (moved_events.index((83, "comment", "unpark-receipt"))
+         < moved_events.index((83, "remove-label", MACHINE_PARK_LABEL)),
+         [event for event in moved_events
+          if event[2] in ("unpark-receipt", MACHINE_PARK_LABEL)]),
+        (True, [(83, "comment", "unpark-receipt"), (83, "remove-label", MACHINE_PARK_LABEL)]),
     )
     # RECOVERY 2: the conflict resolved. This is why the exit phase runs BEFORE the mergeability
     # classification — after it, the `not-conflicting` return strands the label forever.
