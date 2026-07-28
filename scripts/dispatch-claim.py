@@ -2347,9 +2347,9 @@ def global_reservation_census(occupancy):
     return census
 
 
-# [registry #772] How many unprovenanced `__global__` holders ONE tick may escalate, per target
-# repository. An escalation is a loud, operator-facing artifact, and emitting one per holder per
-# tick would bury the signal it exists to raise, so it is paced.
+# [registry #772 + #677] How many stuck `__global__` holders ONE tick may escalate, PER CAUSE, per
+# target repository. An escalation is a loud, operator-facing artifact, and emitting one per holder
+# per tick would bury the signal it exists to raise, so it is paced.
 #
 # NO LONGER "the same pacing doctrine as STARVATION_PARKS_PER_TICK_MAX" — that cross-reference was
 # true until #822 and is retracted rather than left standing. The two caps bound DIFFERENT harms
@@ -2359,17 +2359,77 @@ def global_reservation_census(occupancy):
 #   * an ESCALATION is a WARNING, so OVER-acting is the expensive direction and 1/tick is right on
 #     its own terms — the harm it guards is a buried signal, not a starved lane.
 #
+# PER CAUSE, not per repository (registry #677). While `missing-provenance` was the only escalated
+# class the two were the same number. They are not the same number once the population is every
+# unknown-crate cause: a single repo-wide cap of 1 lets the LOWEST-numbered holder decide which
+# CLASS gets named, so one `source-no-areas` holder at #52 buries a recordless holder at #4360 on
+# every tick, indefinitely — the classes have DIFFERENT recoveries (GLOBAL_CAUSE_RECOVERIES), so
+# burying one behind another is exactly the harm this cap exists to prevent, not an instance of it.
+#
 # The tick cost is stated so nobody has to re-derive it: at #822's 10-minute floor, N stuck
-# holders take N * 10 minutes for ALL of them to be NAMED in a run log. The measured population
-# was 3 (sparq-org/sparq #4360/#4509/#4528) = 30 minutes to enumerate. That is VISIBILITY latency
-# on a condition that is already permanent and already counted every tick under
-# `partition-starvation-unprovenanced`, not dispatch outage — which is why it is left at 1.
-STARVATION_ESCALATIONS_PER_TICK_MAX = 1
+# holders OF ONE CAUSE take N * 10 minutes for ALL of them to be NAMED in a run log. The measured
+# population was 3 (sparq-org/sparq #4360/#4509/#4528) = 30 minutes to enumerate. That is
+# VISIBILITY latency on a condition that is already permanent and already counted every tick under
+# its own STARVATION_STUCK_BUCKETS reason, not dispatch outage — which is why it is left at 1.
+STARVATION_ESCALATIONS_PER_CAUSE_PER_TICK_MAX = 1
+
+# [registry #677 points 2 + 4] The ONE recovery that clears each UNKNOWN-CRATE `__global__` hold.
+#
+# THIS RETRACTS #772'S OWN NARROWING, which read: "a holder that is `__global__` because its source
+# issue carries no `area:` labels is a partition working as designed and has no provenance recovery
+# — escalating it would be noise". Both halves of that are wrong, and #677 measured why:
+#   * "working as designed" describes the PARTITION, not the STALL. A lane at zero behind an ACTIVE
+#     holder is a stall regardless of WHY that holder's crate is unknown; the exit it lacks is the
+#     same exit in all three cases. #677: "a conservative hold with no exit converts a transient
+#     fault into a permanent stall."
+#   * "has no recovery" is false. `source-no-areas` has the CHEAPEST recovery of the three — label
+#     the source issue — and #677 point 4 names it as the lever that is independent of every other
+#     decision on that issue. It is also the FUTURE MAJORITY of this population: the bd->issue
+#     migration dry run counts 551 of 895 unmigrated beads with NO area label, i.e. 551 future
+#     `source-no-areas` holders against the 3 `missing-provenance` holders #772 sized itself on.
+#
+# `GLOBAL_CAUSE_DECLARED` is DELIBERATELY ABSENT, and that absence is the one judgement of #772's
+# this keeps: a declared hold is repo-wide BY DECLARATION, so there is no unknown to resolve and
+# nothing to repair — its exit is the ordinary review lane landing the PR. The self-test pins the
+# partition of GLOBAL_RESERVATION_CAUSES into {escalated} + {declared} by EQUALITY, so a fifth
+# `__global__` branch added later cannot join either side by default: it must be decided.
+#
+# `{repo}` is the only substitution; the recoveries are `str.format` templates, not f-strings, so
+# the text is inspectable as data by the self-test.
+GLOBAL_CAUSE_RECOVERIES = {
+    GLOBAL_CAUSE_NO_PROVENANCE: (
+        "run the `backfill-provenance` workflow for `{repo}` with `apply=true`. It reconstructs "
+        "the implementer identity from the worker run log and writes the record to the `ledger` "
+        "branch; the reservation then resolves to the PR's real `area:*` set."),
+    GLOBAL_CAUSE_SOURCE_NO_AREAS: (
+        "add one or more `area:*` labels to this PR's provenance-linked source issue on `{repo}`. "
+        "The provenance record is admissible and the source issue is open — the ONLY missing fact "
+        "is which crates it touches, and dispatch cannot infer that. This is registry #677 point "
+        "4, the cheapest lever and the one independent of every other decision there: 551 of the "
+        "895 unmigrated beads carry no `area:` label, and each one reserves this partition once "
+        "migrated."),
+    GLOBAL_CAUSE_SOURCE_UNLISTED: (
+        "the provenance-linked source issue is closed or absent from `{repo}`'s open-issue "
+        "listing, so its `area:*` set cannot be read at all. Close this PR if it is orphaned, or "
+        "re-open and label the source issue so the reservation resolves to real crates."),
+}
+
+# The defer-reason bucket each escalated cause counts into. DISTINCT per cause, for the same reason
+# #738 required `escalate-tier-starved` to be distinguishable from `no-eligible-account`: a class
+# that shares a bucket with another cannot be measured, and these three have different recoveries
+# and wildly different expected populations (3 vs 551). `missing-provenance` keeps #772's original
+# bucket name unchanged, so the existing histogram series is not silently re-based.
+STARVATION_STUCK_BUCKETS = {
+    GLOBAL_CAUSE_NO_PROVENANCE: "partition-starvation-unprovenanced",
+    GLOBAL_CAUSE_SOURCE_NO_AREAS: "partition-starvation-source-no-areas",
+    GLOBAL_CAUSE_SOURCE_UNLISTED: "partition-starvation-source-unlisted",
+}
 
 
-def starvation_provenance_escalation(planned_items, deferred, occupancy, log=print,
-                                     cap=STARVATION_ESCALATIONS_PER_TICK_MAX):
-    """PURE. The unprovenanced `__global__` holder(s) to ESCALATE — the starved lane's MISSING EDGE.
+def starvation_stuck_holders(planned_items, deferred, occupancy, log=print,
+                             cap=STARVATION_ESCALATIONS_PER_CAUSE_PER_TICK_MAX):
+    """PURE. The stuck `__global__` holder(s) to ESCALATE, as `(pr_number, cause)` pairs — the
+    starved lane's MISSING EDGE.
 
     [registry #772] `starvation_park_targets` is the only remedy the sweep has, and it declines
     every holder that is not an un-parked provably-inert draft, because parking an ACTIVE holder
@@ -2381,8 +2441,15 @@ def starvation_provenance_escalation(planned_items, deferred, occupancy, log=pri
     PRs responsible (sparq-org/sparq #4360, #4509, #4528) were still recordless 16h/8h/4h later —
     because `backfill-provenance.yml` is `workflow_dispatch`-only and nothing triggers it.
 
+    [registry #677] EVERY unknown-crate cause, not just `missing-provenance`. #772 shipped the
+    terminal state for one quarter of the population and left the other unknown-crate causes with
+    no park, no escalation and no named exit — measured live at 21:15Z: the lane promoted the next
+    holder the moment the first was parked, and "parking nobody" was again the whole tick. The
+    escalated set is exactly `GLOBAL_CAUSE_RECOVERIES` (see there for why `declared-areas` is
+    excluded and why #772's "escalating it would be noise" is retracted).
+
     THIS FUNCTION FREES NOTHING. It does not touch the area set, the busy union, or the
-    reservation: an unprovenanced PR's crates are genuinely unknowable and under-serialising them
+    reservation: an unknown-crate PR's crates are genuinely unknowable and under-serialising them
     is the corrupting direction (two workers on one crate can produce a semantic conflict that
     compiles and passes). It converts an invisible permanent hold into a COUNTED, CAPPED, NAMED
     one that says which PR, why, and which recovery closes it.
@@ -2392,19 +2459,19 @@ def starvation_provenance_escalation(planned_items, deferred, occupancy, log=pri
         identical two clauses as the park sweep, so the two halves can never disagree about
         whether this tick was starved;
       - the row must be BUSY and hold `__global__` (a `parked-free` row starves nobody);
-      - its cause must be `missing-provenance` SPECIFICALLY. A holder that is `__global__` because
-        its source issue carries no `area:` labels is a partition working as designed and has no
-        provenance recovery — escalating it would be noise;
+      - its cause must have a RECOVERY (`GLOBAL_CAUSE_RECOVERIES`). A `declared-areas` hold is
+        repo-wide by declaration: there is nothing to resolve, so escalating it would be noise;
       - and the park sweep's remedy must NOT apply. An un-parked, provably-inert holder is
         exactly what `starvation_park_targets` selects, so escalating it too would double-report
         the one case that already self-heals.
 
-    Returns at most `cap` PR numbers in ascending order — deterministic, like the park half."""
+    Returns at most `cap` pairs PER CAUSE, ordered by (cause, PR number) — deterministic, like the
+    park half, and paced per cause so no class can bury another (see the cap constant)."""
     if planned_items:
         return []                         # the plan is HEALTHY — nothing is starved
     if not isinstance(deferred, int) or isinstance(deferred, bool) or deferred <= 0:
         return []                         # empty backlog / unreadable count is not starvation
-    stuck = []
+    stuck = {}
     for row in occupancy if isinstance(occupancy, list) else []:
         if not isinstance(row, tuple) or len(row) < 6:
             continue                      # no cause slot — not evidence to escalate on
@@ -2413,37 +2480,46 @@ def starvation_provenance_escalation(planned_items, deferred, occupancy, log=pri
             continue
         if GLOBAL_PACKAGE not in packages:
             continue
-        if cause != GLOBAL_CAUSE_NO_PROVENANCE:
-            continue                      # a declared-area global hold has no provenance recovery
+        if cause not in GLOBAL_CAUSE_RECOVERIES:
+            continue                      # a declared-area global hold has nothing to recover
         if reason == "not-parked" and inactive is True:
             continue                      # the PARK sweep already selects this one — not stuck
         if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
             continue
-        stuck.append(pr_number)
-    if not stuck:
-        return []
-    stuck.sort()
-    if len(stuck) > cap:
-        log(f"starvation escalation paced: {len(stuck)} unprovenanced `{GLOBAL_PACKAGE}` "
-            f"holder(s) {stuck} have no park remedy; escalating {cap} this tick")
-        stuck = stuck[:cap]
-    return stuck
+        stuck.setdefault(cause, []).append(pr_number)
+    escalated = []
+    for cause in sorted(stuck):
+        holders = sorted(stuck[cause])
+        keep = holders[:cap] if isinstance(cap, int) and not isinstance(cap, bool) else []
+        if len(holders) > len(keep):
+            log(f"starvation escalation paced: {len(holders)} `{GLOBAL_PACKAGE}` holder(s) "
+                f"{holders} stuck on `{cause}` have no park remedy; escalating {len(keep)} this "
+                f"tick")
+        escalated.extend((number, cause) for number in keep)
+    return escalated
 
 
-def starvation_provenance_escalation_body(repo, pr_number, deferred):
-    """The operator-facing receipt for ONE escalated unprovenanced holder. Names the PR, the cost,
-    the cause and the ONE recovery that clears it — a hold whose exit nobody can find is the
-    failure mode this replaces (registry #703)."""
+def starvation_stuck_holder_body(repo, pr_number, deferred, cause):
+    """The operator-facing receipt for ONE escalated stuck holder. Names the PR, the cost, the
+    cause and the ONE recovery that clears it — a hold whose exit nobody can find is the failure
+    mode this replaces (registry #703).
+
+    An undeclared cause RAISES rather than rendering a receipt with no recovery in it, on the same
+    doctrine as `record_global_reservation_cause`: a terminal state whose exit line is blank is the
+    thing #703 measured, so it must fail loud instead of shipping."""
+    if cause not in GLOBAL_CAUSE_RECOVERIES:
+        raise DispatchError(
+            f"no declared recovery for `{GLOBAL_PACKAGE}` reservation cause {cause!r} — a stuck "
+            f"holder may only be escalated with the ONE exit that clears it "
+            f"{sorted(GLOBAL_CAUSE_RECOVERIES)}")
     return (
-        f"`{repo}#{pr_number}` reserves the serializing `{GLOBAL_PACKAGE}` partition because it "
-        f"has NO admissible registry provenance record, so the crates it touches are unknowable "
-        f"and the reservation fails closed. {deferred} ready row(s) were deferred behind it this "
-        f"tick and the issue lane planned nothing.\n\n"
+        f"`{repo}#{pr_number}` reserves the serializing `{GLOBAL_PACKAGE}` partition "
+        f"(`{cause}`), so the crates it touches are unknowable and the reservation fails closed. "
+        f"{deferred} ready row(s) were deferred behind it this tick and the issue lane planned "
+        f"nothing.\n\n"
         f"It is NOT a candidate for the starvation park sweep (that only helps an un-parked, "
         f"provably-inert draft), so no automatic remedy applies and the hold does not expire.\n\n"
-        f"**Recovery:** run the `backfill-provenance` workflow for `{repo}` with `apply=true`. It "
-        f"reconstructs the implementer identity from the worker run log and writes the record to "
-        f"the `ledger` branch; the reservation then resolves to the PR's real `area:*` set.")
+        f"**Recovery:** " + GLOBAL_CAUSE_RECOVERIES[cause].format(repo=repo))
 
 
 def live_pull_detail_stub(pull):
@@ -7532,19 +7608,21 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                       f"`{GLOBAL_PACKAGE}` partition is still held")
         # <<< starvation-park-batch
 
-        # [registry #772] The starved lane's MISSING EDGE. The park sweep above declines every
-        # holder that is not an un-parked provably-inert draft — correctly, because parking an
-        # ACTIVE holder frees nothing — and the tick used to END THERE. A lane annihilated by a PR
-        # with no registry provenance record therefore sat at zero indefinitely, uncounted and
-        # unattributed. This does NOT free the partition (the PR's crates are genuinely unknowable
-        # and under-serialising them is the corrupting direction); it gives the class a COUNTED,
-        # CAPPED, NAMED terminal state that says which PR, why, and which recovery closes it.
-        for _escalated in starvation_provenance_escalation(
+        # [registry #772 + #677] The starved lane's MISSING EDGE. The park sweep above declines
+        # every holder that is not an un-parked provably-inert draft — correctly, because parking
+        # an ACTIVE holder frees nothing — and the tick used to END THERE. A lane annihilated by a
+        # PR whose crate is unknowable therefore sat at zero indefinitely, uncounted and
+        # unattributed. This does NOT free the partition (those crates are genuinely unknowable and
+        # under-serialising them is the corrupting direction); it gives EVERY unknown-crate cause a
+        # COUNTED, CAPPED, NAMED terminal state that says which PR, why, and which recovery closes
+        # it. #772 shipped that for `missing-provenance` only, so the causes #677 measured as the
+        # future majority stayed silent; the bucket is per cause so they cannot bury each other.
+        for _stuck, _stuck_cause in starvation_stuck_holders(
                 repository["items"], starved, live_occupancy):
-            defer_reasons["partition-starvation-unprovenanced"] += 1
-            print("::warning title=unprovenanced __global__ holder::"
-                  + starvation_provenance_escalation_body(repo, _escalated, starved).replace(
-                      "\n", " "))
+            defer_reasons[STARVATION_STUCK_BUCKETS[_stuck_cause]] += 1
+            print("::warning title=stuck __global__ holder::"
+                  + starvation_stuck_holder_body(
+                      repo, _stuck, starved, _stuck_cause).replace("\n", " "))
         if starved:
             # The full holder census, once per starved tick: "why is the partition held" is now
             # answerable from the run log alone, for every holder, not just the one escalated.
@@ -18995,13 +19073,18 @@ def _starvation_row(number, *, packages, parked=False, inactive=True, decision="
 
 
 def _escalation_call_site(source):
-    """[registry #772] STRUCTURAL proof that some PRODUCTION function both iterates
-    `starvation_provenance_escalation(...)` and counts each result into the shared
-    `defer_reasons` bucket. Returns that function's name, or None.
+    """[registry #772 + #677] STRUCTURAL proof that some PRODUCTION function both iterates
+    `starvation_stuck_holders(...)` and counts each result into the shared `defer_reasons`
+    histogram UNDER ITS OWN CAUSE'S BUCKET. Returns that function's name, or None.
 
     Walks the parsed tree, not the text: the property is "a live `for` over this call whose body
     increments this counter", which survives reflow/renaming of locals and cannot be satisfied by
-    a string appearing in a comment, a docstring, or a dead branch."""
+    a string appearing in a comment, a docstring, or a dead branch.
+
+    [registry #677] The counter subscript is pinned to `STARVATION_STUCK_BUCKETS[...]` rather than
+    to one literal reason. A literal here would be satisfied by a call site that files all three
+    causes into one bucket — which is precisely the measurement hole the per-cause bucket exists to
+    close, and it would leave every pure-function assertion in this file green."""
     import ast
     tree = ast.parse(source)
     for func in ast.walk(tree):
@@ -19012,14 +19095,15 @@ def _escalation_call_site(source):
                 continue
             call = loop.iter
             if not (isinstance(call, ast.Call)
-                    and getattr(call.func, "id", None) == "starvation_provenance_escalation"):
+                    and getattr(call.func, "id", None) == "starvation_stuck_holders"):
                 continue
             for stmt in ast.walk(loop):
                 if (isinstance(stmt, ast.AugAssign) and isinstance(stmt.op, ast.Add)
                         and isinstance(stmt.target, ast.Subscript)
                         and getattr(stmt.target.value, "id", None) == "defer_reasons"
-                        and isinstance(stmt.target.slice, ast.Constant)
-                        and stmt.target.slice.value == "partition-starvation-unprovenanced"):
+                        and isinstance(stmt.target.slice, ast.Subscript)
+                        and getattr(stmt.target.slice.value, "id", None)
+                        == "STARVATION_STUCK_BUCKETS"):
                     return func.name
     return None
 
@@ -19685,41 +19769,88 @@ def _starvation_sweep_self_test():
     # terminal state and no named recovery. MEASURED: 5 of 84 successful dispatch ticks on
     # 2026-07-27, holders #4360/#4509/#4528 still recordless 16h/8h/4h later.
     active_unprov = occupancy_of(unprovenanced)
+    _no_prov = GLOBAL_CAUSE_NO_PROVENANCE
     assert starvation_park_targets([], 12, active_unprov) == [], "park sweep should decline it"
-    assert starvation_provenance_escalation([], 12, active_unprov) == [51], active_unprov
+    assert starvation_stuck_holders([], 12, active_unprov) == [(51, _no_prov)], active_unprov
     # A PARKED-but-active holder is equally stuck: busy_packages_of_pulls frees only
     # `parked AND inactive`, and the park sweep skips anything already parked.
     parked_active = occupancy_of(dict(unprovenanced, labels=[{"name": MACHINE_PARK_PR_LABEL}]))
     assert parked_active[0][0] == "busy", parked_active
     assert starvation_park_targets([], 12, parked_active) == []
-    assert starvation_provenance_escalation([], 12, parked_active) == [51], parked_active
+    assert starvation_stuck_holders([], 12, parked_active) == [(51, _no_prov)], parked_active
     # ...but the one holder the PARK sweep DOES remedy is never double-reported: an un-parked,
     # provably-inert draft is the park half's own candidate and self-heals next tick.
     inert_unprov = occupancy_of(dict(unprovenanced, draft=True))
     assert starvation_park_targets([], 12, inert_unprov) == [51], inert_unprov
-    assert starvation_provenance_escalation([], 12, inert_unprov) == [], inert_unprov
+    assert starvation_stuck_holders([], 12, inert_unprov) == [], inert_unprov
     print("  ok   #772 missing edge: an unprovenanced holder with NO park remedy reaches the "
           "escalation, and the park half's own candidate is never double-reported")
 
+    # ---- [registry #677] THE OTHER THREE QUARTERS OF THAT POPULATION --------------------------
+    # #772 escalated `missing-provenance` ONLY, so a lane annihilated by a holder whose SOURCE
+    # ISSUE carries no `area:` label — the class #677 measured as the future majority, 551 of 895
+    # unmigrated beads — got no park, no escalation and no named exit: the tick logged "parking
+    # nobody" and ended. Every row below is PRODUCED by busy_packages_of_pulls from the shared
+    # `cause_cases` fixtures, so a hard-coded cause cannot make it pass.
+    #
+    # THIS IS THE RED/GREEN PIVOT of the change: on the pre-#677 selector (`cause !=
+    # GLOBAL_CAUSE_NO_PROVENANCE: continue`) both assertions below return [] and go red.
+    _stuck_by_cause = {}
+    for pull, labels, provenance_map, cause, want_global in cause_cases:
+        rows = occupancy_of(pull, labels=labels, provenance=provenance_map)
+        _stuck_by_cause[cause] = starvation_stuck_holders([], 12, rows)
+        assert starvation_park_targets([], 12, rows) == [], (cause, rows)   # no park remedy
+    assert _stuck_by_cause[GLOBAL_CAUSE_SOURCE_NO_AREAS] == [(52, GLOBAL_CAUSE_SOURCE_NO_AREAS)], \
+        _stuck_by_cause
+    assert _stuck_by_cause[GLOBAL_CAUSE_SOURCE_UNLISTED] == [(53, GLOBAL_CAUSE_SOURCE_UNLISTED)], \
+        _stuck_by_cause
+    # ...and `declared-areas` STILL escalates nothing: it does not even hold the partition, and it
+    # is the one cause with no unknown to resolve. Deleting the GLOBAL_CAUSE_RECOVERIES membership
+    # test (escalate everything) reds here.
+    assert _stuck_by_cause[GLOBAL_CAUSE_DECLARED] == [], _stuck_by_cause
+    assert starvation_stuck_holders([], 12, [_starvation_row(
+        41, packages={GLOBAL_PACKAGE}, inactive=False, cause=GLOBAL_CAUSE_DECLARED)]) == []
+    # The escalated set and the declared set PARTITION the closed enum by EQUALITY, so a fifth
+    # `__global__` branch cannot join either side by default — it has to be decided.
+    assert set(GLOBAL_CAUSE_RECOVERIES) | {GLOBAL_CAUSE_DECLARED} == set(GLOBAL_RESERVATION_CAUSES)
+    assert GLOBAL_CAUSE_DECLARED not in GLOBAL_CAUSE_RECOVERIES
+    assert set(STARVATION_STUCK_BUCKETS) == set(GLOBAL_CAUSE_RECOVERIES), STARVATION_STUCK_BUCKETS
+    # DISTINCT buckets: a class that shares a histogram row with another cannot be measured, and
+    # #772's own bucket name is preserved so the existing series is not silently re-based.
+    assert len(set(STARVATION_STUCK_BUCKETS.values())) == len(STARVATION_STUCK_BUCKETS)
+    assert STARVATION_STUCK_BUCKETS[_no_prov] == "partition-starvation-unprovenanced"
+    print("  ok   #677 stuck-holder coverage: EVERY unknown-crate cause reaches the escalation "
+          "with its own distinct bucket; `declared-areas` still escalates nothing")
+
     # The same two starvation clauses as the park half — the halves can never disagree about
     # whether this tick was starved. Deleting either reds here.
-    assert starvation_provenance_escalation([{"number": 900}], 12, active_unprov) == []
-    assert starvation_provenance_escalation([], 0, active_unprov) == []
-    assert starvation_provenance_escalation([], -1, active_unprov) == []
-    assert starvation_provenance_escalation([], True, active_unprov) == []
-    assert starvation_provenance_escalation([], "12", active_unprov) == []
-    # A holder that is `__global__` for a DECLARED reason has no provenance recovery — escalating
-    # it would be pure noise. Inverting the cause filter reds here.
-    for pull, labels, provenance_map, cause, _global in cause_cases[1:]:
-        rows = occupancy_of(pull, labels=labels, provenance=provenance_map)
-        assert starvation_provenance_escalation([], 12, rows) == [], (cause, rows)
-    # crate-only holders, malformed rows, and pre-#772 5-tuples are not evidence to escalate on
-    assert starvation_provenance_escalation([], 12, [_starvation_row(
-        41, packages={"crate-a"}, cause=GLOBAL_CAUSE_NO_PROVENANCE)]) == []
-    assert starvation_provenance_escalation([], 12, ["junk"]) == []
-    assert starvation_provenance_escalation([], 12, None) == []
-    assert starvation_provenance_escalation(
+    assert starvation_stuck_holders([{"number": 900}], 12, active_unprov) == []
+    assert starvation_stuck_holders([], 0, active_unprov) == []
+    assert starvation_stuck_holders([], -1, active_unprov) == []
+    assert starvation_stuck_holders([], True, active_unprov) == []
+    assert starvation_stuck_holders([], "12", active_unprov) == []
+    # crate-only holders, malformed rows, and pre-#772 5-tuples are not evidence to escalate on.
+    # `inactive=False` is LOAD-BEARING here and #772's version omitted it: with the row's default
+    # `inactive=True` the park-remedy carve-out one branch below swallows it first, so deleting the
+    # `GLOBAL_PACKAGE not in packages` guard left this assertion green (MEASURED — a surviving
+    # mutant on the shipped tree). An ACTIVE crate-only holder reaches the guard and kills it.
+    assert starvation_stuck_holders([], 12, [_starvation_row(
+        41, packages={"crate-a"}, inactive=False, cause=GLOBAL_CAUSE_NO_PROVENANCE)]) == []
+    assert starvation_stuck_holders([], 12, ["junk"]) == []
+    assert starvation_stuck_holders([], 12, None) == []
+    assert starvation_stuck_holders(
         [], 12, [("busy", 41, frozenset({GLOBAL_PACKAGE}), "not-parked", False)]) == []
+    # ...nor is a `parked-free` row: it has ALREADY released its crates, so it starves nobody and
+    # escalating it would report a hold that does not exist. (Both this line and the malformed
+    # PR-number line below cover selector branches that #772 shipped with no executing test —
+    # AGENTS.md item 1, found by running this suite under `trace --count`.)
+    assert starvation_stuck_holders([], 12, [_starvation_row(
+        41, packages={GLOBAL_PACKAGE}, decision="parked-free", inactive=False,
+        cause=GLOBAL_CAUSE_NO_PROVENANCE)]) == []
+    for _bad_number in ("41", True, 0, -1, None):
+        assert starvation_stuck_holders([], 12, [_starvation_row(
+            _bad_number, packages={GLOBAL_PACKAGE}, inactive=False,
+            cause=GLOBAL_CAUSE_NO_PROVENANCE)]) == [], _bad_number
     print("  ok   #772 escalation gating: never fires on a healthy plan, an empty backlog, a "
           "declared-area hold, or a row that cannot carry a cause")
 
@@ -19728,17 +19859,51 @@ def _starvation_sweep_self_test():
     many = [_starvation_row(number, packages={GLOBAL_PACKAGE}, inactive=False,
                             cause=GLOBAL_CAUSE_NO_PROVENANCE) for number in (73, 51, 62)]
     paced = []
-    assert starvation_provenance_escalation([], 12, many, log=paced.append) == [51]
+    assert starvation_stuck_holders([], 12, many, log=paced.append) == [(51, _no_prov)]
     assert any("escalating 1 this tick" in line for line in paced), paced
-    assert starvation_provenance_escalation([], 12, many, cap=2, log=paced.append) == [51, 62]
+    assert starvation_stuck_holders([], 12, many, cap=2, log=paced.append) == [
+        (51, _no_prov), (62, _no_prov)]
+    # PER CAUSE, and this is the regression the generalisation could have introduced: under one
+    # repo-wide cap of 1 the LOWEST-numbered holder decides which CLASS is named, so the
+    # `source-no-areas` holder at #12 would bury the recordless #4360 on every tick forever — a
+    # silent re-creation of the exact "no terminal state" defect, one cause over. Collapsing the
+    # per-cause loop back to a single `[:cap]` over all holders reds here.
+    mixed = many + [_starvation_row(12, packages={GLOBAL_PACKAGE}, inactive=False,
+                                    cause=GLOBAL_CAUSE_SOURCE_NO_AREAS)]
+    assert starvation_stuck_holders([], 12, mixed, log=paced.append) == [
+        (51, _no_prov), (12, GLOBAL_CAUSE_SOURCE_NO_AREAS)], mixed
     # the receipt NAMES the one recovery that clears the hold — a hold whose exit nobody can find
-    # is the failure mode this replaces (#703).
-    receipt = starvation_provenance_escalation_body("o/r", 51, 12)
+    # is the failure mode this replaces (#703) — and each cause names a DIFFERENT one.
+    receipt = starvation_stuck_holder_body("o/r", 51, 12, _no_prov)
     assert "o/r#51" in receipt and "backfill-provenance" in receipt and "apply=true" in receipt, \
         receipt
     assert "12 ready row(s)" in receipt, receipt
-    print("  ok   #772 escalation pacing + receipt: ascending, capped, and the body names the "
-          "backfill recovery that actually clears the hold")
+    labels_receipt = starvation_stuck_holder_body("o/r", 52, 12, GLOBAL_CAUSE_SOURCE_NO_AREAS)
+    assert "`area:*` labels" in labels_receipt and "o/r#52" in labels_receipt, labels_receipt
+    # ...and it must NOT be #772's body wearing a new signature: backfill cannot clear a hold whose
+    # provenance record is already admissible, so naming it here would be a receipt that lies.
+    assert "backfill-provenance" not in labels_receipt, labels_receipt
+    unlisted_receipt = starvation_stuck_holder_body("o/r", 53, 12, GLOBAL_CAUSE_SOURCE_UNLISTED)
+    assert "closed or absent" in unlisted_receipt and "backfill-provenance" not in unlisted_receipt
+    assert len({receipt, labels_receipt, unlisted_receipt}) == 3
+    # A cause with no declared exit RAISES rather than rendering a receipt with a blank recovery.
+    # `except Exception` is NOT laziness: deleting the guard makes the recovery lookup raise a bare
+    # KeyError, which would abort this suite mid-run and record as a kill while every check below
+    # never executed (AGENTS.md item 4, crash-after-partial-run). Naming the type keeps that mutant
+    # a CLEAN red on this row.
+    for _bad in (GLOBAL_CAUSE_DECLARED, "invented-cause", None):
+        try:
+            starvation_stuck_holder_body("o/r", 51, 12, _bad)
+        except DispatchError:
+            continue
+        except Exception as _exc:         # noqa: BLE001 — see above; the TYPE is the assertion
+            raise AssertionError(
+                f"escalating cause {_bad!r} must raise DispatchError, not "
+                f"{type(_exc).__name__}: an unguarded recovery lookup crashes the tick instead of "
+                "refusing the receipt") from None
+        raise AssertionError(f"escalating cause {_bad!r} with no declared recovery must RAISE")
+    print("  ok   #677 escalation pacing + receipt: capped PER CAUSE so no class buries another, "
+          "and each cause's body names the DIFFERENT recovery that actually clears it")
 
     # ---- THE PLAN SEAM: v5 validation of the evidence field -----------------------------------
     base_plan = {
@@ -20085,9 +20250,9 @@ def _starvation_sweep_self_test():
     # ANY indentation, so it cannot tell a live statement from one buried in a dead branch.
     seam = _escalation_call_site(Path(__file__).resolve().read_text(encoding="utf-8"))
     assert seam == "dispatch", (
-        "the production tick must iterate starvation_provenance_escalation(...) AND count each "
-        "escalated holder into defer_reasons['partition-starvation-unprovenanced'] — without "
-        f"both, an unprovenanced __global__ holder is silent again (found {seam!r})")
+        "the production tick must iterate starvation_stuck_holders(...) AND count each escalated "
+        "holder into defer_reasons[STARVATION_STUCK_BUCKETS[cause]] — without both, a stuck "
+        f"__global__ holder is silent again (found {seam!r})")
     print("  ok   #772 call-site seam (AST): the production tick ITERATES the escalation and "
           "COUNTS every escalated holder — a deleted call site or a dropped counter reds here")
 
