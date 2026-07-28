@@ -166,12 +166,79 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
+          n=0
           for f in .github/workflows/*.yml .github/workflows/*.yaml; do
             echo "== yaml-parse $f =="
             python3 -c 'import sys,yaml; yaml.safe_load(open(sys.argv[1]))' "$f"
+            ((n += 1))
           done
+          [[ "$n" -gt 0 ]] || { echo "::error::yaml-parse swept zero workflows (fail closed)"; exit 1; }
           echo "== actionlint =="
           actionlint -color
+
+      - name: yaml-parse + schema-check every issue-form template
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          # [issue #855] The issue FORMS are part of the same trust surface as the workflows that
+          # consume the issues they open (set-up-account.yml's broker, the account enrollment lane),
+          # but the loop above only ever swept .github/workflows/. So a YAML syntax error — or a
+          # form GitHub itself rejects, e.g. a `body:` whose every element is `markdown` and which
+          # therefore collects nothing — merged green here and surfaced only as a silently broken
+          # "New issue" template, with no gate anywhere in between. scripts/grant-account.py's
+          # --self-test reads set-up-account.yml as TEXT, so it catches shape regressions in the
+          # label contract but never malformed YAML. Parse them, and assert the minimum GitHub
+          # enforces at render time. Sweeping zero templates is itself a failure (fail closed): a
+          # rename must break this check loudly rather than turn it into a vacuous pass.
+          python3 - .github/ISSUE_TEMPLATE/*.yml .github/ISSUE_TEMPLATE/*.yaml <<'PY'
+          import pathlib, sys, yaml
+
+          # GitHub's issue-form field types; every type except `markdown` is fillable, and a form
+          # with no fillable field is rejected by GitHub (it renders as a broken template).
+          TYPES = {"markdown", "input", "textarea", "dropdown", "checkboxes"}
+          FILLABLE = TYPES - {"markdown"}
+
+          paths, bad = [pathlib.Path(a) for a in sys.argv[1:]], []
+          for path in paths:
+              print(f"== yaml-parse {path} ==")
+              try:
+                  form = yaml.safe_load(path.read_text(encoding="utf-8"))
+              except yaml.YAMLError as exc:
+                  bad.append(f"{path}: not valid YAML — {exc}")
+                  continue
+              # config.yml is the chooser config (blank_issues_enabled/contact_links), not a form:
+              # parsing it is the whole check.
+              if path.name == "config.yml":
+                  continue
+              if not isinstance(form, dict):
+                  bad.append(f"{path}: top level must be a mapping, got {type(form).__name__}")
+                  continue
+              for key in ("name", "description"):
+                  if not isinstance(form.get(key), str) or not form[key].strip():
+                      bad.append(f"{path}: `{key}:` is required and must be a non-empty string")
+              body = form.get("body")
+              if not isinstance(body, list) or not body:
+                  bad.append(f"{path}: `body:` is required and must be a non-empty list")
+                  continue
+              kinds = []
+              for i, element in enumerate(body):
+                  if not isinstance(element, dict) or element.get("type") not in TYPES:
+                      bad.append(f"{path}: body[{i}] has no valid `type:` "
+                                 f"(one of {', '.join(sorted(TYPES))})")
+                      continue
+                  kinds.append(element["type"])
+              if kinds and not FILLABLE.intersection(kinds):
+                  bad.append(f"{path}: `body:` has no fillable field "
+                             f"(every element is `markdown`) — GitHub rejects this form")
+          for entry in bad:
+              print(f"::error::issue-form template invalid — {entry}")
+          if bad:
+              sys.exit(1)
+          if not paths:
+              print("::error::issue-form check swept zero templates (fail closed)")
+              sys.exit(1)
+          print(f"issue-form check OK: {len(paths)} template(s) parsed")
+          PY
 
       - name: Assert every workflow-passed CLI flag is declared by its script
         run: |
