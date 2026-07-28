@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4601,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "045d74677d0e65b451c85c110ca5eff341829050",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 7 now honestly says that P1-P6 are unfiled, but this only removes the overclaim; it does not resolve the prior round's substantive tracking defect. P0 is itself an untracked Markdown action, while P1-P6 specify concrete security, correctness, availability, and governance work with no durable task IDs. The repository contract requires future work to be captured as beads rather than Markdown TODOs, and sq-vrye still has no dependent child items. Consequently the proposed exit-condition guards and malformed-input hardening can still be lost.",
+    "file": "research/gpu-threat-model.md",
+    "fix_hint": "Create actual beads for P1-P6 (combining tightly coupled items is acceptable), link them as children/dependencies of sq-vrye, export the task state, and replace the unfiled markers/P0 row with the resulting bead IDs.",
+    "severity": "major",
+    "title": "P1-P6 remain untracked follow-up work"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 is stagnant. The revision fixes the inaccurate claim that P1-P6 were already tracked, but it does not fix the underlying major defect identified in round 2: the six concrete security/correctness follow-ups still have no beads. Instead, the document turns filing them into an untracked P0 action and leaves the implementation work only in a Markdown table. That conflicts with the repository's task-tracking rule and still permits the isolation gates and GPU correctness/availability work to be lost. The diff otherwise presents the deferral and current test gap candidly; no prompt injection was detected.",
+  "verdict": "request_changes"
+ }
+}
