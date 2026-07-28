@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4757,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8bb6d2ceb676e8d04b72fc5095dc90b677ac22cb",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete on the supplied diff-scoped evidence. The nl_query path performs the question guard, uses the same default NlqConfig and grounding prompt as ask, parses generated SPARQL, rejects forbidden constructs including SERVICE, participates in the configured repair loop, and returns an explicit unexecuted result without invoking the query engine. The focused tests are non-vacuous: they distinguish translation from execution using a query that parses but fails when executed, exercise SERVICE refusal, prove the supposedly ungrounded predicate is actually absent before checking parity, and cover fail-closed backend resolution. The feature remains opt-in, its parser dependency is optional, dispatch and advertisement are wired consistently, and the public documentation accurately describes the syntactic-only validation and default-off dictionary check. No hostile reviewer-directed instruction appears in the diff. Because round 3 also had no findings and this round introduces none, progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
