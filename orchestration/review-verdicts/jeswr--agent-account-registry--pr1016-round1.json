@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1016,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "08c275f0bd7316769d5031ef62c85ece97f5be99",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The claimed safety property is \"a revocation that is really just missing evidence\" must never be proposed, but `audit()` distinguishes only zero records from nonzero records. With one surviving provenance file for `[redacted-account]`, a pool of eight immediately produces seven `revocation_candidates`; there is no completeness marker, expected-record set, observation-window bound, or reconciliation against the ledger branch. This is especially material because the accompanying audit says the master corpus is known to be incomplete. The test named `...while the row that DOES have evidence still proposes` positively locks in this unsafe inference. A nonempty corpus is not proof that absent handles were unused, so the marquee fail-closed claim does not hold.",
+    "file": "scripts/grant-scope-audit.py",
+    "fix_hint": "Do not emit candidates unless corpus completeness is independently established for that target and observation window. Accept and verify a durable expected-record manifest/range or another authoritative completeness signal, surface the evidence bounds in the report, and add a red test where a nonempty but incomplete corpus proposes no candidates. If completeness cannot be established, report observed handles only and leave `revocation_candidates` empty.",
+    "severity": "blocker",
+    "title": "A partial nonempty corpus is misreported as evidence that handles are unused"
+   },
+   {
+    "body": "`_self_test()` calls `run()` directly and never executes `main()`. Consequently the production controls at the CLI seam are unverified: `--salt-env` parsing, the environment lookup, missing/empty-variable behavior, `--json`, error exit 2, and the promised successful exit 0 all can be broken while every enrolled check stays green. For example, changing `if args.salt_env:` so an explicit mapping request is ignored leaves the complete self-test green and silently produces an unmapped report. This violates the required line-granular entry-point and control-value coverage for an enrolled trust-plane self-test.",
+    "file": "scripts/grant-scope-audit.py",
+    "fix_hint": "Exercise `main()` with isolated argv, environment, stdout, and stderr against temporary inputs. Include positive controls proving default mode is unmapped, an explicitly named populated salt variable produces mapped candidates, a missing variable cannot map, JSON output is parseable and fingerprint-free, read failures return 2, and successful advisory runs return 0.",
+    "severity": "major",
+    "title": "The mapping opt-in and report CLI are entirely outside the self-test"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe audit is not yet sound enough to support revocation candidates. Its central fail-closed claim protects only the completely empty-corpus case; any nonzero but incomplete corpus is treated as complete and turns every unobserved handle into a candidate. The enrolled self-test also skips the CLI entry point that controls whether sensitive identity mapping is enabled. Round 1, so progress is null.",
+  "verdict": "request_changes"
+ }
+}
