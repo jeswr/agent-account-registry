@@ -13,6 +13,10 @@ account to use; the registry applies per-account limits, a cross-codebase concur
 fallback chains, and prompt-cache affinity, and hands back a claim. When the worker finishes it
 releases the claim.
 
+This README is the reference for what the registry **does**. **[`AGENTS.md`](AGENTS.md) is how you
+work ON it** — the author-side pre-flight checklist an agent runs on its own diff before reporting
+done, defined there once and pointed at from the role briefs in `.claude/agents/`.
+
 ## Registry self-test suite
 
 `scripts/selftest-suite.txt` is the authoritative self-test manifest and is checked in both
