@@ -19558,6 +19558,47 @@ def _starvation_park_batch_seam_self_test():
           "stand the WHOLE batch down — writing nothing at all")
 
 
+def _partition_starvation_record_seam_self_test():
+    """[sparq#4821] THE YAML SEAM THAT FEEDS THE WHOLE SELF-HEAL, executed on production source.
+
+    `partition_starvation` is the ONLY channel from the PLAN leg's measurement to the CLAIM leg's
+    park sweep, its un-park half and its provenance escalation. It is written by four lines of
+    `dispatch.yml`, and every assertion about the sweep calls the pure selectors directly — so
+    disabling those four lines leaves the sweep with an empty input and EVERY existing assertion
+    green. MEASURED: mutant Y3 (`if False and starvation.get(...)`) survived the entire suite
+    across `dispatch-claim.py`, `dispatch-plan.py`, `ready-issues.py` and `plan-snapshot.py`.
+    That is this repository's own recorded pattern — the surviving mutant lives in the workflow.
+
+    Extracted and EXECUTED against stubs, in all three states, because the guard has to be right
+    in both directions: a starved lane must record, and a HEALTHY or EMPTY one must not (recording
+    an empty backlog would let the park sweep fire on a lane that has nothing queued)."""
+    block = _workflow_step_python(
+        "dispatch.yml", "plan", r'(?m)^[ \t]*if starvation\.get\("kept"\) == 0',
+        r"(?m)^[ \t]*snapshot_skips\.sort\(", "partition-starvation recording")
+
+    def run(kept, deferred):
+        namespace = {"starvation": {"kept": kept, "deferred": deferred},
+                     "partition_starvation": [], "repo": "example/repo"}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            exec(compile(textwrap.dedent(block), "<dispatch.yml partition starvation>",  # noqa: S102
+                         "exec"), namespace)
+        return namespace["partition_starvation"], out.getvalue()
+
+    rows, printed = run(0, 3)
+    assert rows == [{"repo": "example/repo", "deferred": 3}], rows
+    assert "PARTITION STARVATION example/repo: 0 issue item(s) planned behind 3 row(s)" in printed, \
+        printed
+    # A HEALTHY lane records nothing — parking a holder to buy throughput that is already flowing
+    # is the cost this guard refuses.
+    assert run(2, 3) == ([], ""), run(2, 3)
+    # An EMPTY backlog is not starvation. Recording it would arm the sweep on a lane with nothing
+    # queued, which is the one input `starvation_park_targets` cannot distinguish on its own.
+    assert run(0, 0) == ([], ""), run(0, 0)
+    print("  ok   [sparq#4821] YAML SEAM (executed): dispatch.yml RECORDS partition starvation for "
+          "a starved lane and for neither a healthy nor an empty one — the sweep's only input")
+
+
 def _starvation_sweep_self_test():
     item = {"number": 900, "package": "crate-a", "deferred": False}
     holder = _starvation_row(41, packages={GLOBAL_PACKAGE})
@@ -20495,6 +20536,7 @@ def _starvation_sweep_self_test():
 
     # ---- [registry #822] THE PARK BATCH, EXECUTED on production source -----------------------
     _starvation_park_batch_seam_self_test()
+    _partition_starvation_record_seam_self_test()
 
     # ---- [registry #869] EVERY PARK WRITE SITE STATES ITS CAUSE — ONE CHECK PER SITE ---------
     _park_cause_site_self_test()
