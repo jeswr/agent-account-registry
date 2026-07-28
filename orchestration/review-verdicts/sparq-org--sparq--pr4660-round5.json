@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4660,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "39736c285863a94bfdbda5d2f9d7f2064fdc4205",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The round-4 blocker remains materially unchanged: Store.validateStore and InitOutput.store_validateStore are added to the generated declaration file, but this diff contains no corresponding Rust/wasm implementation or generated JavaScript binding. TypeScript consumers can compile against validateStore and then encounter a missing method/export at runtime. Generated wasm-bindgen declarations must match the runtime artifacts.",
+    "file": "packages/sparq-client/src/generated/sparq_wasm.d.ts",
+    "fix_hint": "Remove the validateStore documentation, method declaration, cross-link, and InitOutput export from this PR. If the API is intended, implement it in the wasm source, add focused stateful/default-graph equivalence tests, update the matching public JS/WASM skill, and regenerate all wasm-bindgen artifacts instead of editing only the declaration file.",
+    "severity": "major",
+    "title": "Generated typings still declare validateStore without a runtime implementation"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant: the same major blocking issue from round 4 remains. The diff still adds Store.validateStore and store_validateStore only to the generated TypeScript declaration file, without corresponding Rust/wasm implementation or generated JavaScript glue in the diff. This advertises a callable API and low-level export that will be absent at runtime. The file-ingest picker refactor and focused tests appear coherent, but they do not resolve the false generated wasm API surface.",
+  "verdict": "request_changes"
+ }
+}
