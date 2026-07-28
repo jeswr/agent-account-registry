@@ -853,22 +853,25 @@ def _self_test():
     #
     # That is deliberate and it is the lesser harm: the alternative is the starvation this change
     # exists to fix — the old behaviour left the issue untriaged indefinitely, waiting on a human
-    # who, measured across two weeks of green retriage runs, did not come. The ROUND TRIP below
-    # still lands on the ORIGINAL label set whenever the restore arrives before the next sweep,
-    # which is the sequence the re-park exists to prompt.
+    # who, measured across two weeks of green retriage runs, did not come.
     _floored = plan(reparked, "owner", "app[bot]", "none")
     chk("[sparq#4809] a re-parked lost-priority issue is floored by the NEXT sweep, not stalled",
         (_floored["action"], static_triage.DERIVED_PRIORITY in _floored.get("add", [])), ("promote", True))
-    # ...and if the human's restore arrives LATE (after that floor landed), the result is an
-    # AMBIGUOUS pair. The classifier must DECLINE it — never compound it with a third write, and
-    # never silently pick one — so the contradiction stays visible on the issue and a human can
-    # resolve it. This is the failure mode of the trade above; it is pinned, not discovered later.
+    # ...and a LATE restore — the human's real priority arriving AFTER that floor landed — is now
+    # RESOLVED rather than declined. An earlier revision of this fixture asserted the pair stayed
+    # declined-and-visible and called that the acceptable failure mode of the trade; PR #1053's
+    # review showed that is the majority path, not an edge case, so the retract rung decides it.
+    # The floor is withdrawn and the restored value governs.
     _late = applied(applied(reparked, _floored), {"add": ["priority:P2"]})
-    chk("[sparq#4809] a LATE restore next to the derived floor is DECLINED, never compounded",
+    _late_plan = plan(_late, "owner", "app[bot]", "none")
+    chk("[sparq#4809] a LATE restore RETRACTS the floor and keeps the human's value",
         (static_triage.derive_priority(label_set(_late))[1],
-         any(lb.startswith("priority:")
-             for lb in plan(_late, "owner", "app[bot]", "none").get("add", []))),
-        ("stated-unreadable", False))
+         static_triage.DERIVED_PRIORITY in _late_plan.get("remove", []),
+         any(lb.startswith("priority:") for lb in _late_plan.get("add", []))),
+        ("floor-retracted", True, False))
+    chk("[sparq#4809] ...landing on the human's priority, with the floor gone",
+        {lb for lb in label_set(applied(_late, _late_plan)) if lb.startswith("priority:")},
+        {"priority:P2"})
     restored = dict(reparked)
     restored["labels"] = reparked["labels"] + [{"name": "priority:P2"}]
     promotion = plan(restored, "owner", "app[bot]", "none")
