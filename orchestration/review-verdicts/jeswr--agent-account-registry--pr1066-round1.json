@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1066,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6011de4b13016ddc8ce45856c4aa3a6c2ff7f172",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_review_fix_standdown_labels` walks every nested `ast.If` independently and collects a matching inner guard without considering its ancestors. For example, wrapping the live `if \"review:parked\" in labels: raise SystemExit(...)` in `if False:` leaves the returned label set unchanged and all three new checks green, while the workflow runs models on machine-parked PRs. The same problem occurs with other unreachable enclosing branches. This directly contradicts the function's claim that it recognizes an executed guard and misses the required conditionally-inert mutation of this trust check.",
+    "file": "scripts/park_policy.py",
+    "fix_hint": "Make the pin establish reachability from the heredoc's top-level admission path, not merely syntactic presence anywhere in the AST. Add a known-positive mutation that wraps the guard in a non-crashing false condition (and assert that the pristine and mutant sources differ) so this exact fail-open change produces a normal FAIL row.",
+    "severity": "major",
+    "title": "AST pin accepts a stand-down guard nested under dead control flow"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe literal-repoint and deletion checks improve coverage of the YAML seam, and the reconciliation test now observes the two machine-label writes using independent literal expectations. However, the new seam checker does not prove that the discovered guard is reachable. A conditionally disabled copy of the guard is still accepted, so the marquee fail-closed claim and its stated test-validity guarantee are not established.",
+  "verdict": "request_changes"
+ }
+}
