@@ -477,8 +477,20 @@ why it does not overturn that decision for the interleaved failure pattern it wa
 (`account-whoami.yml` is manual-dispatch and disabled on a public repo), so refusing it would
 self-latch: no dispatch ⇒ no records ⇒ unproven forever. What it costs is bounded to
 `CREDENTIAL_DEAD_MIN` trial dispatches per health window, after which the evidence turns `dead`.
-`prune` preserves a dead run's tail against the `MAX_RECORDS` cap, so a flood of unrelated records
-cannot silently readmit the account.
+`prune` preserves a dead run's tail against the retention cap and the absolute ceiling, so a flood
+of unrelated records cannot silently readmit the account.
+
+**Health-window retention is time-based, not count-based** (registry #699). `prune` retains
+`max(MAX_RECORDS, everything inside RETENTION_FLOOR_SECONDS)` under an absolute ceiling. Under the
+old count-only cap the wall-clock the window COVERED was `MAX_RECORDS / record-rate`, so a busier
+fleet covered less time — and the aged-out park exit (#691), which requires the window to cover
+`SUSTAINED_HEALTH_SPAN_SECONDS`, shut itself as soon as throughput rose. The time floor makes
+coverage independent of the record rate up to the ceiling; above the ceiling the oldest
+non-preserved records are evicted, coverage can fall back under the span and the exit closes
+again — but `prune` emits a `::warning::` naming the condition, the binding bound and the coverage
+it left, and `dispatch-claim` reports the shortfall once per window load so an under-covered ledger
+is never mistaken for "the parks are not old enough yet". A live backoff is never evicted, by the
+cap or by the ceiling.
 
 **The probe must PROVE its materialization** (same issue). `dispatch.yml`'s probe — the lane that
 spends real capacity — now applies the ledgergate the dashboard lane got in #219/#612: the ACCT_*
