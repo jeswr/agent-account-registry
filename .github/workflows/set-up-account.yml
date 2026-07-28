@@ -1166,11 +1166,24 @@ jobs:
             if ! raw=$(gh api --paginate "repos/$REPO/issues?state=all&per_page=100"); then
               echo "::error::could not enumerate the account issues of $REPO, so it cannot be proven that '$HANDLE' resolves to exactly one record — refusing to activate (fail closed)"; exit 1
             fi
-            mapfile -t nums < <(printf '%s' "$raw" \
+            # Review round 1 of #896: jq's status is CAPTURED, not read through `mapfile < <(...)`.
+            # A `gh` that exits 0 only proves the transfer; the filter still has to process every
+            # record, and bash cannot observe the exit status of a process substitution (`pipefail`
+            # does not reach inside one). So jq could emit the match from an early page, die on a
+            # later unparseable one, and leave `mapfile` succeeding with one element — the count
+            # reads 1 and an arbitrary record is activated off a TRUNCATED enumeration. Assigning
+            # through `if !` puts the filter's failure back on a status bash acts on.
+            if ! matched=$(printf '%s' "$raw" \
                     | jq -r --arg handle "$HANDLE" '
                         .[] | select(has("pull_request") | not)
                             | select(.title == $handle)
-                            | .number')
+                            | .number'); then
+              echo "::error::could not parse the account issues of $REPO to the end, so it cannot be proven that '$HANDLE' resolves to exactly one record — refusing to activate (fail closed)"; exit 1
+            fi
+            # An empty result must stay ZERO matches: a here-string always carries one line, so it
+            # is only reached when there is something to split.
+            nums=()
+            if [ -n "$matched" ]; then mapfile -t nums <<< "$matched"; fi
             if [ "${#nums[@]}" -ne 1 ]; then
               echo "::error::expected exactly one account issue titled '$HANDLE' in any state, found ${#nums[@]} — refusing to activate (fail closed)"; exit 1
             fi
@@ -1330,11 +1343,22 @@ jobs:
           fi
           # `--paginate` emits one JSON array per page; jq iterates each top-level array, so no
           # slurp is needed and no page is silently dropped (the reconcile step reads the same shape).
-          mapfile -t nums < <(printf '%s' "$raw" \
+          # Review round 1 of #896: jq's status is CAPTURED rather than read through
+          # `mapfile < <(...)`, which discards the status of the process substitution (`pipefail`
+          # does not reach inside one) — jq could emit the match from an early page, die on a later
+          # unparseable one, and leave the count reading 1 on a TRUNCATED enumeration. The `gh` exit
+          # code above proves only the transfer; this proves every record was actually processed.
+          if ! matched=$(printf '%s' "$raw" \
                   | jq -r --arg handle "$handle" '
                       .[] | select(has("pull_request") | not)
                           | select(.title == $handle)
-                          | .number')
+                          | .number'); then
+            echo "::error::could not parse the account issues of $REPO to the end, so it cannot be proven that '$handle' resolves to exactly one record — refusing to activate (fail closed)"; exit 1
+          fi
+          # An empty result must stay ZERO matches: a here-string always carries one line, so it is
+          # only reached when there is something to split.
+          nums=()
+          if [ -n "$matched" ]; then mapfile -t nums <<< "$matched"; fi
           if [ "${#nums[@]}" -ne 1 ]; then
             echo "::error::expected exactly one account issue titled '$handle' in any state, found ${#nums[@]} — refusing to activate (fail closed)"; exit 1
           fi

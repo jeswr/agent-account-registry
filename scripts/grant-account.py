@@ -1967,9 +1967,14 @@ elif argv[:1] == ["api"]:
         wanted = found.group(1) if found else "open"   # the API's own default
         records = [record for record in state["issues"]
                    if wanted == "all" or record.get("state", "open") == wanted]
-        pages = [records[index:index + 2] for index in range(0, len(records), 2)] or [[]]
+        pages = [json.dumps(records[index:index + 2])
+                 for index in range(0, len(records), 2)] or ["[]"]
+        # A page body the reader cannot process (truncated, or an error document served with a 200)
+        # — appended AFTER the real records, so a streaming jq emits the match and only then dies.
+        if state.get("issues_bad_page"):
+            pages.append(state["issues_bad_page"])
         for page in (pages if "--paginate" in argv else pages[:1]):
-            print(json.dumps(page))
+            print(page)
     elif "/commits/" in url:
         if "commits" in state.get("fail", []):
             die("commits read rejected")
@@ -2196,6 +2201,20 @@ else:
           (code, final, any(call[:2] == ["issue", "edit"] for call in calls),
            "could not enumerate the account issues" in output),
           (1, ["status:pending"], False, True))
+    # [#896 review round 1] ...and a listing that read FINE but could not be PARSED to the end is
+    # equally not a proof. `gh` exiting 0 only says the transfer worked; the filter still has to
+    # process every record. Read through `mapfile -t nums < <(... | jq ...)` bash DISCARDS the
+    # filter's status (a process substitution's status is unobservable, `pipefail` included), so a
+    # page jq cannot process — served AFTER a page carrying the match — leaves `nums` holding that
+    # one early number and the count reads 1 on a TRUNCATED enumeration: exactly the fail-open the
+    # authoritative carrier exists to close. The bad page here is titled with a NON-matching handle,
+    # so a count of 1 is reachable only by giving up mid-stream.
+    bad_page = '[{"number": 6, "title": "acct08"'   # a truncated page body — unparseable
+    code, final, calls, output = run_activate(issues=[account_issue], issues_bad_page=bad_page)
+    check("[#896 r1] EXECUTED activate: a filter failure AFTER a match refuses AS a parse failure",
+          (code, final, any(call[:2] == ["issue", "edit"] for call in calls),
+           "could not parse the account issues" in output, "found 1" in output),
+          (1, ["status:pending"], False, True, False))
 
     # ------------------------------------------------------------------------------------------
     # [#896] ...AND SO DOES THE INLINE ACTIVATION. `activate_inline` performs a state transition
@@ -2208,7 +2227,7 @@ else:
     # ------------------------------------------------------------------------------------------
     inline_resolve = workflow_block(workflow, "activate_inline", "resolve-account-issue")
 
-    def run_inline(issues, fail=()):
+    def run_inline(issues, fail=(), bad_page=None):
         """Execute the REAL activate_inline resolution fragment.
 
         -> (exit code, resolved issue number, combined output)."""
@@ -2218,7 +2237,8 @@ else:
             (work / "bin" / "gh").write_text(fake_gh, encoding="utf-8")
             (work / "bin" / "gh").chmod(0o755)
             state_file, log_file = work / "state.json", work / "calls.jsonl"
-            state_file.write_text(json.dumps({"issues": issues, "fail": list(fail)}),
+            state_file.write_text(json.dumps({"issues": issues, "fail": list(fail),
+                                              "issues_bad_page": bad_page}),
                                   encoding="utf-8")
             log_file.write_text("", encoding="utf-8")
             script = ("set -euo pipefail\n" + inline_resolve
@@ -2263,6 +2283,15 @@ else:
     check("[#896] EXECUTED inline activation: an unreadable listing refuses AS a failed enumeration",
           (code, resolved, "could not enumerate the account issues" in output,
            "found 0" in output),
+          (1, None, True, False))
+    # ...and, as on the merged path, a listing that arrived fine but could not be PARSED to the end
+    # is refused AS a parse failure — never resolved from the records the filter managed to emit
+    # before it died. Asserting the absence of "found 1" is what makes this row bite: reading the
+    # count through an unchecked process substitution resolves issue #5 here and exits 0.
+    code, resolved, output = run_inline([account_issue], bad_page=bad_page)
+    check("[#896 r1] EXECUTED inline activation: a filter failure AFTER a match refuses AS a parse "
+          "failure",
+          (code, resolved, "could not parse the account issues" in output, "found 1" in output),
           (1, None, True, False))
     # Neither path may carry the index-backed carrier back in (the executed rows above are the
     # proof of behaviour; this is the textual guard against a second, un-executed reintroduction).
