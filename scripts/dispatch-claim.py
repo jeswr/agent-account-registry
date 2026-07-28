@@ -526,6 +526,25 @@ GLOBAL_RESERVATION_CAUSES = (
     GLOBAL_CAUSE_SOURCE_UNLISTED, GLOBAL_CAUSE_SOURCE_NO_AREAS,
 )
 
+# [sparq#4821] The fifth cause, and DELIBERATELY NOT A MEMBER OF THE TUPLE ABOVE: it names a
+# reservation that is NARROWED instead of global, so a bucket for it inside
+# GLOBAL_RESERVATION_CAUSES would be structurally unreachable — `global_reservation_census` only
+# ever counts rows that hold `__global__`. A permanently-zero bucket in a closed enum is a counter
+# that looks like coverage and has none, which is the class this file already tracks.
+#
+# It exists because NARROWING THE RESERVATION MUST NOT UNCOUNT THE POPULATION. The
+# `missing-provenance` holder was loud only by accident: it annihilated the lane, and the lane
+# going to zero is what made anyone look. Once its reservation is narrowed the PR stops starving
+# anything — but its provenance record is STILL missing, so it is still invisible to
+# `enumerate_review_items` and its review loop still does not advance. That harm survives this
+# change intact, and an alarm whose population has quietly moved out from under it is the
+# `early-return-hides-the-population` failure. So the narrowed rows get their own always-printed
+# census (`unprovenanced_narrowed_holders`) at the same leg.
+CAUSE_NO_PROVENANCE_NARROWED = "missing-provenance-narrowed"   # no record, but the PR's OWN
+                                                               # `area:*` labels bound its blast
+                                                               # radius — reserve THOSE, not global
+RESERVATION_CAUSES = GLOBAL_RESERVATION_CAUSES + (CAUSE_NO_PROVENANCE_NARROWED,)
+
 
 def plan_package(areas):
     """The single conflict partition a plan/lease row reserves for a collection of `area:*`
@@ -1668,10 +1687,75 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
     branch-live/provenance-parked kept reserving a crate the enumerator had already handed
     to a human (frontier collapse preserved). A PR with MISSING/invalid provenance is
     invisible to the enumerator but can still carry a latched arm, and its true crate is
-    unknowable — it reserves the GLOBAL partition (fail closed; the old "stray branch
-    reserves nothing" rule freed exactly the crate an armed stray could merge into). A valid
-    record whose source issue is absent from the open-issue map mirrors the enumerator,
-    which still emits that PR as `__global__`.
+    unknowable UNLESS THE PR ITSELF DECLARES IT — see the next paragraph — so it reserves the
+    GLOBAL partition (fail closed; the old "stray branch reserves nothing" rule freed exactly
+    the crate an armed stray could merge into). A valid record whose source issue is absent
+    from the open-issue map mirrors the enumerator, which still emits that PR as `__global__`.
+
+    [sparq#4821] MISSING PROVENANCE + THE PR'S OWN `area:*` LABELS => THOSE AREAS, NOT
+    `__global__`. This is a NARROWING, never a release: a PR with neither a record nor a
+    declared area still reserves the serializing partition, so the fail-closed default stands
+    for every PR whose blast radius is actually unknown.
+
+    The premise the old rule rested on — "its true crate is unknowable" — was TRUE when it was
+    written and is no longer true for every PR. `scripts/pr-area-labels.py` (sparq's
+    `pr-area-label.yml`) now derives `area:*` from the PR's CHANGED PATHS, and it is fail-closed
+    in the SAME direction as this function: it emits NO label at all — leaving the PR on
+    `__global__` — when the file list is missing, PARTIALLY read (the `files(first: 100)`
+    truncation it cross-checks against `changedFiles`), unattributable, or wider than
+    `max_areas`. So on a target that runs it, `area:` on a PR is a machine-derived attestation of
+    blast radius that is STRICTLY BETTER evidence than the source issue's hand-applied labels
+    this function trusts on the provenanced path. Refusing to read it while trusting the weaker
+    signal was the inversion.
+
+    IT IS A NO-OP WHERE THAT EVIDENCE DOES NOT EXIST, without a per-target flag: a target with no
+    deriver produces no PR `area:` labels (MEASURED on this repository: 40 of 40 open PRs declare
+    none, ready-issues._pr_reserving_packages), so every unprovenanced PR there still takes
+    `__global__` exactly as before. The rule reads the target's own attestation instead of a
+    config switch that could drift from it.
+
+    WHY THIS BRANCH. It invents a reservation the PLAN leg never made. PLAN runs the TARGET's
+    readiness engine, whose PR rule is `_reserving_packages` — declared areas, NO global fallback,
+    and its docstring refuses CLAIM's fallback BY NAME after measuring that adopting it drives the
+    sparq frontier to 0. PLAN cannot see provenance at all, so an unprovenanced PR reserves only
+    its declared areas THERE, PLAN commits a frontier on that basis, and CLAIM then deferred every
+    row of it.
+
+    WHY NOT THE OTHER TWO GLOBAL CAUSES — and the two are NOT alike, which is worth stating
+    because the first draft of this comment said they were:
+      * `source-no-areas` — the source issue is OPEN and carries no `area:`. If it is
+        `status:in-progress*` it ALREADY reserves `__global__` on the PLAN side under the
+        unchanged CANDIDATE-side `packages_of` rule, so narrowing it here alone buys nothing.
+      * `source-unlisted` — the source issue is CLOSED, hence absent from PLAN's occupancy
+        entirely, so this branch invents a reservation PLAN never made in exactly the way the
+        missing-provenance branch does. MEASURED over 101 executed dispatch ticks (2026-07-27
+        12:54Z - 2026-07-28 14:52Z): 14 ticks carried a `__global__` reservation and SEVEN of them
+        — sparq-org/sparq#3620 on six consecutive ticks (source issue #3321, closed 07-25) and
+        #4681 on one (source issue #2781, closed 21s before the tick read it) — were this cause.
+        It is the single largest residual, and it is deliberately NOT narrowed HERE because it
+        cannot be narrowed here ALONE: `enumerate_review_items` emits the same PR as a review row
+        whose package is `__global__` (asserted in this file's own self-test), so narrowing only
+        the reservation would leave the two legs describing the same PR differently — the exact
+        LINKAGE PARITY failure the round-2 P2 note above exists to prevent. Both sides have to
+        move together, which is a separate change.
+
+    THE ASSUMPTION, STATED. A target whose PR `area:` labels are NOT derived fail-closed could
+    under-reserve here. On the provenanced path PR labels only ever WIDEN a union, so this is the
+    one branch where they become load-bearing. Both directions of drift are safe by construction
+    on sparq (the deriver only ADDS labels and has no removal path at all, and removing every
+    `area:` label re-arms `__global__`); a partial hand-removal narrows, and that requires repo
+    write — the same trust boundary as the ledger this function already believes.
+
+    AND THE PLACE THAT ASSUMPTION IS WEAKER THAN IT SOUNDS, because "fail-closed deriver" claims
+    more than the mechanism delivers. `derive_areas` cannot emit a PARTIAL set for one run — but
+    what ends up on the PR is `derived ∪ pre-existing`, ACCUMULATED across pushes, and the deriver
+    has no removal path. So a PR whose first push resolved to `area:a` and whose later pushes grew
+    into the `cross-cutting` refusal keeps `area:a` and reserves only `a`, while its true footprint
+    is wider. That exposure is NOT introduced here: the identical accumulated set is already
+    unioned in on the provenanced path above (`areas |= issue_areas or ...`) and is already the
+    whole of PLAN's `_reserving_packages` rule, so this branch inherits it rather than creating it.
+    Removing it means teaching the deriver to RETRACT a label that a later push contradicts, which
+    is a change to the deriver and not to this predicate.
 
     HELD != INACTIVE (round-2 P1 on the 2026-07-18 frontier collapse, DRAFTS-ONLY since
     round 3, listing-or-newer-detail coherent since #519): a human-parked PR —
@@ -1731,8 +1815,27 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
                 areas |= {GLOBAL_PACKAGE}  # closed/unlisted source: the enumerator still
                                            # emits this PR as `__global__` — mirror it
                 cause = GLOBAL_CAUSE_SOURCE_UNLISTED
+        elif areas and GLOBAL_PACKAGE not in areas:
+            # [sparq#4821] missing/invalid linkage, but the PR's OWN path-derived `area:*` labels
+            # bound its blast radius — reserve exactly those. Still fail-closed (it reserves
+            # SOMETHING, so no crate is left unguarded); the blast radius is just no longer the
+            # whole workspace. `areas` is already the PR's declared set from above; nothing is
+            # unioned in.
+            #
+            # `GLOBAL_PACKAGE not in areas` is a CLOSED-ENUM guard, not defensive padding. A PR
+            # wearing the literal label `area:__global__` would otherwise take this branch, reserve
+            # `__global__`, and carry cause `missing-provenance-narrowed` — which is deliberately
+            # NOT a member of GLOBAL_RESERVATION_CAUSES — so `global_reservation_census` would
+            # RAISE DispatchError on a board that is merely unusual, aborting a tick that pre-#4821
+            # completed. Unreachable on today's sparq board (no such label exists among its 99, and
+            # the deriver never auto-creates one), which is exactly why it needs a guard rather than
+            # a comment: nothing would have found it. Such a PR falls to the `else` below and
+            # reserves `__global__` under `missing-provenance`, which is both the correct
+            # attribution and the fail-closed answer.
+            cause = CAUSE_NO_PROVENANCE_NARROWED
         else:
-            areas |= {GLOBAL_PACKAGE}      # missing/invalid linkage — fail closed
+            areas |= {GLOBAL_PACKAGE}      # missing/invalid linkage AND nothing declared — the
+                                           # blast radius is genuinely unknown: fail closed
             cause = GLOBAL_CAUSE_NO_PROVENANCE
         status = (pr_status[number]
                   if isinstance(pr_status, dict) and number in pr_status else _NO_PR_DETAIL)
@@ -2132,6 +2235,10 @@ def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_stat
     # be a second copy of a fold that must agree with the CLAIM leg's. Always printed, including
     # on a tick where every bucket is zero.
     print(format_partition_reservation_census("assemble-reservations", repo, census))
+    # [sparq#4821] Printed from HERE, unconditionally and at zero, for the same reason the line
+    # above is: this is the leg that holds the occupancy rows, and the population it names only
+    # exists because the narrowing removed it from `global_reservation_census`'s population.
+    print(format_unprovenanced_narrowed_census(repo, occupancy))
     return kept
 
 
@@ -2347,6 +2454,50 @@ def global_reservation_census(occupancy):
     return census
 
 
+def unprovenanced_narrowed_holders(occupancy):
+    """PURE. Ascending PR numbers whose reservation was NARROWED because their provenance record
+    is missing but their own `area:*` labels bound them (`CAUSE_NO_PROVENANCE_NARROWED`).
+
+    [sparq#4821] THE POPULATION THAT WOULD OTHERWISE GO DARK. Before the narrowing, a PR with no
+    registry provenance record announced itself by taking the whole dispatch lane to zero, and
+    `global_reservation_census` counted it under `missing-provenance`. After the narrowing it
+    starves nobody and drops straight out of that census's population — but ITS RECORD IS STILL
+    MISSING, so `enumerate_review_items` still cannot see it and its review loop still does not
+    advance. The throughput symptom is fixed; the underlying lost write is not, and it must not
+    become unobservable as a side effect of fixing the symptom.
+
+    Deliberately a SEPARATE counter rather than a fifth bucket in `global_reservation_census`:
+    that function's population is "rows holding `__global__`", and these rows do not, so a bucket
+    there could never be non-zero. Same recorder discipline, different population.
+
+    Rows too short to carry a cause are skipped: a pre-cause 5-tuple predates this branch entirely
+    and cannot have been narrowed by it."""
+    out = []
+    for row in occupancy if isinstance(occupancy, list) else []:
+        if not isinstance(row, tuple) or len(row) < 6:
+            continue
+        if row[0] != "busy" or row[5] != CAUSE_NO_PROVENANCE_NARROWED:
+            continue
+        number = row[1]
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            continue
+        out.append(number)
+    return sorted(out)
+
+
+def format_unprovenanced_narrowed_census(repo, occupancy):
+    """The always-printed one-liner for the narrowed population. ALWAYS, including at zero: a
+    counter that is absent when nothing fired is indistinguishable from one that was never wired,
+    and this repository has paid for that twice (#753/#762)."""
+    holders = unprovenanced_narrowed_holders(occupancy)
+    detail = ", ".join(f"pr#{number}" for number in holders) or "none"
+    return (f"unprovenanced-narrowed census {repo}: {len(holders)} open worker PR(s) have NO "
+            f"registry provenance record but declare their own `area:*` labels, so they reserve "
+            f"those areas instead of `{GLOBAL_PACKAGE}` — {detail}. Their records are still "
+            f"missing and `enumerate_review_items` still cannot see them; recovery is the "
+            f"`backfill-provenance` workflow with apply=true.")
+
+
 # [registry #772 + #677] How many stuck `__global__` holders ONE tick may escalate, PER CAUSE, per
 # target repository. An escalation is a loud, operator-facing artifact, and emitting one per holder
 # per tick would bury the signal it exists to raise, so it is paced.
@@ -2394,13 +2545,27 @@ STARVATION_ESCALATIONS_PER_CAUSE_PER_TICK_MAX = 1
 # partition of GLOBAL_RESERVATION_CAUSES into {escalated} + {declared} by EQUALITY, so a fifth
 # `__global__` branch added later cannot join either side by default: it must be decided.
 #
+# `CAUSE_NO_PROVENANCE_NARROWED` is absent for a DIFFERENT reason, and the two absences must not be
+# confused: it is not a `__global__` cause at all (sparq#4821 — such a PR reserves its own declared
+# areas), so it is not in GLOBAL_RESERVATION_CAUSES and never starves the lane. It has nothing to
+# escalate, but it IS still a lost registry write, which is why it keeps its own always-printed
+# counter (`unprovenanced_narrowed_holders`) instead of a recovery here.
+#
 # `{repo}` is the only substitution; the recoveries are `str.format` templates, not f-strings, so
 # the text is inspectable as data by the self-test.
 GLOBAL_CAUSE_RECOVERIES = {
     GLOBAL_CAUSE_NO_PROVENANCE: (
-        "run the `backfill-provenance` workflow for `{repo}` with `apply=true`. It reconstructs "
-        "the implementer identity from the worker run log and writes the record to the `ledger` "
-        "branch; the reservation then resolves to the PR's real `area:*` set."),
+        "this PR has NO admissible registry provenance record AND declares no `area:*` label of "
+        "its own, so nothing bounds it (sparq#4821 narrows a PR that DOES declare its own areas "
+        "to exactly those, under `" + CAUSE_NO_PROVENANCE_NARROWED + "`, and such a PR never "
+        "reaches this receipt). Run the `backfill-provenance` workflow for `{repo}` with "
+        "`apply=true`: it reconstructs the implementer identity from the worker run log and "
+        "writes the record to the `ledger` branch; the reservation then resolves to the PR's "
+        "real `area:*` set.\n\n"
+        "**Faster partial recovery (sparq#4821):** labelling the PR with the `area:*` sections it "
+        "actually touches narrows the reservation to those on the very next tick, with or without "
+        "the record. It does NOT fix the missing record — the PR stays invisible to the review "
+        "enumerator until the backfill runs — but it stops the lane being starved meanwhile."),
     GLOBAL_CAUSE_SOURCE_NO_AREAS: (
         "add one or more `area:*` labels to this PR's provenance-linked source issue on `{repo}`. "
         "The provenance record is admissible and the source issue is open — the ONLY missing fact "
@@ -4431,8 +4596,22 @@ def _current_issue_matches(repo, item, trusted_bots, allow_actions_bot_issues=Fa
         # busy/gated label still fails closed. CLAIM flips deferred->ready on dispatch.
         if "status:deferred" not in labels:
             return False, "issue is no longer deferred"
-        if "status:ready" in labels:
-            return False, "issue already re-attested ready (normal path will dispatch it)"
+        # [registry #1054] THE SAME FALSE PREMISE, WRITTEN TWICE. This used to read
+        #     if "status:ready" in labels:
+        #         return False, "issue already re-attested ready (normal path will dispatch it)"
+        # The normal path will NOT dispatch it. Reaching this line requires `status:deferred`
+        # (asserted immediately above), and `status:deferred` is in `BUSY_OR_GATED` /
+        # `ready-issues.BUSY_STATUS`, so the ready lane refuses the identical row — the deferred
+        # row can never appear in `compute_ready`'s output, which is exactly why no double
+        # dispatch is possible here. PLAN's candidate filter carried the same sentence and the
+        # same error (dispatch.yml, fixed in this PR); removing it there alone changed NOTHING,
+        # because PLAN's deferred->ready swap is IN-MEMORY for the readiness computation only —
+        # dispatch.yml emits `details[number]`, the REAL labels, and this function re-fetches
+        # them live. MEASURED against the live board at the first draft of this PR: of 32
+        # ready+deferred pairs, PLAN admitted 32 and this line rejected 32, with no backfill;
+        # deleting only this `return` admitted 32/32, and the lone-deferred control was unmoved
+        # at 6/49 both ways. So the PLAN-side census moved from 1 to 9 while dispatchable work
+        # stayed at 1. A fix at one layer of a two-layer premise is not a fix.
         if any(label in DEFERRED_GATED or label.startswith("needs:") for label in labels):
             return False, "deferred issue is otherwise busy or gated"
         return True, ""
@@ -4797,7 +4976,9 @@ def _capacity_recovery_probe(model_health, health_window, now):
 
     Both exits return the SAME evidence shape and are consumed by the SAME admission, so both
     inherit — unchanged, and this is deliberate rather than incidental — the unconditional refusal
-    on any human-owned hold or human-applied park, the strictly-after-the-park ordering check, the
+    on any human-owned hold, on a human-applied HUMAN-terminal park, and on a human-applied
+    MACHINE park with no bot `class=capacity` park-reason receipt, the strictly-after-the-park
+    ordering check, the
     consumed-exactly-once evidence key, and the AUTO_READMISSION_MAX cap."""
     def probe(parked_at):
         if health_window is None or not parked_at:
@@ -5217,7 +5398,18 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
                 auto_receipts=worker_pr.auto_readmission_records(comments, bot_login),
                 auto_marker_count=worker_pr.auto_readmission_marker_count(comments, bot_login),
                 auto_evidence=evidence_probe, live_holds=holds, log=log,
-                census=park_census)
+                census=park_census,
+                # The BOT's own machine-readable classification of this park episode. Required
+                # only on the human-applied-machine-park branch, where nothing else can prove the
+                # park was a capacity stop rather than a judgement; a bot park carries one by
+                # construction (PARK_CAUSES.capacity-unspecified exists so it always does).
+                reason_records=_park_policy.park_reason_records(comments, bot_login, log=log),
+                # The INSTANCE binding's evidence: reconcile attestations, from the SAME comments
+                # page already read. Deliberately NOT bot-filtered here — park_instance_attested
+                # applies the sound filter (written by the actor that applied THIS park), because
+                # reconcile-park-misescalation.py is hand-run under a maintainer token and its
+                # markers are authored by that maintainer, not by the App.
+                attestations=_park_policy.reconcile_attestations(comments))
             if action == "auto-mint":
                 # RECEIPT FIRST, then the labels (see the docstring).
                 post_comment(repo, number, worker_pr.auto_readmission_receipt(
@@ -5363,7 +5555,8 @@ def starvation_unpark_body(packages):
         "while the issue lane was fully starved behind it. Re-derived against the live pull "
         f"listing on this tick, it now reserves {reserved} and **not** `{GLOBAL_PACKAGE}` — "
         "usually because its registry provenance record has since been recorded, so its area "
-        "linkage resolves.\n\n"
+        "linkage resolves, or because it acquired `area:*` labels of its own, which bound its "
+        "blast radius on their own (sparq#4821).\n\n"
         f"The `{MACHINE_PARK_PR_LABEL}` label is removed and the PR re-enters the ordinary review "
         "lane unchanged. No review judgement was made when it was parked, and none is made now. "
         "Human-owned holds are never touched by this sweep — if one is live, the park stands.\n\n"
@@ -5529,10 +5722,18 @@ def starvation_park_body(repo, pr_number, deferred, issue_url):
         "it excludes against **every** crate in the workspace at once. On this dispatch tick the "
         f"issue lane planned **0** items while **{deferred}** ready issue row(s) were deferred "
         "behind that reservation — the worker lane was fully starved.\n\n"
-        "The usual cause is a **missing or unreadable registry provenance record** for this PR: "
-        "`busy_packages_of_pulls` fails closed on unresolvable linkage and adds "
-        f"`{GLOBAL_PACKAGE}` to the reservation. Adding `area:*` labels to the PR cannot remove "
-        "it — the fail-closed default is unioned in on top of them.\n\n"
+        "The usual cause is a **missing or unreadable registry provenance record** for this PR "
+        "together with **no `area:*` label of its own**: `busy_packages_of_pulls` fails closed on "
+        f"a blast radius it cannot bound and reserves `{GLOBAL_PACKAGE}`.\n\n"
+        # [sparq#4821] This paragraph used to say the opposite — "adding `area:*` labels to the PR "
+        # cannot remove it, the fail-closed default is unioned in on top of them" — which was true
+        # of the code as it then stood and told the one reader who could act that no action existed.
+        # The union is now a NARROWING for this cause, so the sentence is not merely stale, it
+        # points away from the working remedy.
+        "**A human remedy now exists and takes effect on the next tick:** add the `area:*` "
+        "label(s) this PR actually touches. A PR that declares its own areas reserves *those* and "
+        f"not `{GLOBAL_PACKAGE}`, even with its provenance record still missing — and the un-park "
+        "half below then releases this park by itself.\n\n"
         "## Why this PR\n\n"
         "It is an open worker PR that (a) holds that partition, (b) is not already parked, and "
         "(c) is a provably inert draft with no arm latch — so parking it **contributes to freeing "
@@ -6130,7 +6331,12 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                         auto_receipts=worker_pr.auto_readmission_records(comments, bot_login),
                         auto_marker_count=worker_pr.auto_readmission_marker_count(
                             comments, bot_login),
-                        live_holds=sorted(HUMAN_HOLD_PR_LABELS & set(labels)))
+                        live_holds=sorted(HUMAN_HOLD_PR_LABELS & set(labels)),
+                        # Same classification proof the minting sweep applies, from the SAME
+                        # comments this gate already read — the read-only proof gate and the
+                        # minting sweep must never disagree about whether a park is admissible.
+                        reason_records=_park_policy.park_reason_records(comments, bot_login),
+                        attestations=_park_policy.reconcile_attestations(comments))
                 if not park_action:
                     print(f"defer review {repo}#{number}: machine capacity park stands "
                           f"(durable receipts/label; {park_detail})")
@@ -15955,16 +16161,171 @@ agent = "impl"
     stray_items = enumerate_review_items(repo, [stray_closed], busy_prov, [],
                                          issue_labels, now)
     assert [item["package"] for item in stray_items] == [GLOBAL_PACKAGE], stray_items
-    # [round-2 P2] MISSING/invalid provenance: invisible to the enumerator but still able to
-    # carry a latched arm, and its true crate is unknowable — global reservation (fail
-    # closed), even when the PR wears area labels of its own
+    # [round-2 P2] MISSING/invalid provenance and NOTHING DECLARED: invisible to the enumerator
+    # but still able to carry a latched arm, and its blast radius is genuinely unknown — global
+    # reservation (fail closed). THIS HALF IS UNCHANGED BY sparq#4821 and is the half that keeps
+    # the rule fail-closed; deleting it would turn the narrowing into a release.
     assert busy_packages_of_pulls(repo, [stray_closed], issue_labels, {}) == {GLOBAL_PACKAGE}
-    assert GLOBAL_PACKAGE in busy_packages_of_pulls(
-        repo, [pull(61, "sparq-agent/issue-999-1-1", sha_a, labels=["area:crate-a"])],
-        issue_labels, {})
     assert busy_packages_of_pulls(
         repo, [stray_closed], issue_labels,
         {61: {**busy_record(61, 999), "issue": True}}) == {GLOBAL_PACKAGE}
+    # ---- [sparq#4821] ...but a PR that DECLARES its own areas reserves THOSE, not `__global__`.
+    # MEASURED live: sparq-org/sparq#4799 declared area:deps + area:sparq-wrapper +
+    # area:sparq-wrapper-shacl and reserved every crate in the workspace anyway, taking 26 plan
+    # items to 0 kept. This assertion is the DIRECT REVERSAL of a decision this file previously
+    # pinned ("global reservation ... even when the PR wears area labels of its own"), and the
+    # reversal is not a change of taste: the premise "its true crate is unknowable" stopped being
+    # true for labelled PRs when sparq's fail-closed path deriver (scripts/pr-area-labels.py)
+    # shipped. The reservation is NARROWED, never removed. ----
+    _stray_labelled = pull(61, "sparq-agent/issue-999-1-1", sha_a,
+                           labels=["area:crate-a", "area:crate-z"])
+    assert busy_packages_of_pulls(repo, [_stray_labelled], issue_labels, {}) == {
+        "crate-a", "crate-z"}, "an unprovenanced PR's OWN areas must bound its reservation"
+    # A SINGLE declared area is the SAME rule, and it needs its own row because the multi-area
+    # fixture above cannot see it. MEASURED: `elif areas:` -> `elif len(areas) > 1:` reverts this
+    # branch to byte-identical pre-#4821 behaviour for every one-area PR — the whole-lane stall,
+    # restored — and survived all 241 checks, because every assertion that reached the branch used
+    # the two-area fixture. One area is not a corner: 23 of 67 open sparq worker PRs declare
+    # exactly one, INCLUDING sparq-org/sparq#4562 (`area:sparq-hdt`), one of the six holders this
+    # change was measured to narrow. A fixture narrower than its population scores honestly and
+    # proves nothing about half the input.
+    _stray_one_area = pull(64, "sparq-agent/issue-999-1-1", sha_a, labels=["area:crate-a"])
+    assert busy_packages_of_pulls(repo, [_stray_one_area], issue_labels, {}) == {"crate-a"}, \
+        "a SINGLE declared area must bound the reservation exactly as two do (len(areas) > 1)"
+    assert GLOBAL_PACKAGE not in busy_packages_of_pulls(
+        repo, [_stray_one_area], issue_labels, {}), \
+        "a one-area unprovenanced PR must not seize the serializing partition"
+    # ...and the whole-lane consequence for the one-area case, at the leg that actually drops rows:
+    # the holder's own crate goes, its sibling survives. Under `len(areas) > 1` this returns [].
+    assert [item["number"] for item in filter_busy_area_items(
+        plan_items, repo, [_stray_one_area], issue_labels, {}, leases=[], now=now)] == [9], \
+        "one SINGLE-area unprovenanced holder must no longer drop every item"
+    # THE CLOSED-ENUM EDGE. A PR wearing the literal label `area:__global__` reserves the
+    # serializing partition, so its cause must be one `global_reservation_census` accepts;
+    # `missing-provenance-narrowed` is deliberately NOT in that enum, so routing this row through
+    # the narrowed branch makes the census RAISE and aborts a tick that used to complete. Kills
+    # dropping the `GLOBAL_PACKAGE not in areas` conjunct.
+    _stray_global_label = pull(65, "sparq-agent/issue-999-1-1", sha_a,
+                               labels=[f"area:{GLOBAL_PACKAGE}", "area:crate-a"])
+    _global_label_occ = []
+    assert busy_packages_of_pulls(repo, [_stray_global_label], issue_labels, {},
+                                  occupancy=_global_label_occ) == {GLOBAL_PACKAGE, "crate-a"}
+    assert [row[5] for row in _global_label_occ] == [GLOBAL_CAUSE_NO_PROVENANCE], _global_label_occ
+    # Caught as an AssertionError ON PURPOSE. Without the `except`, dropping the guard makes the
+    # closed-enum recorder raise `DispatchError` straight out of the suite — which reads as a
+    # CRASH, and a crash is not a kill: a harness that only checks the exit code would score this
+    # guard as covered when nothing had detected anything. Converting it here makes the mutant die
+    # by NAME, at the assertion written for it.
+    try:
+        _global_label_census = global_reservation_census(_global_label_occ)
+    except DispatchError as exc:                                          # pragma: no cover
+        raise AssertionError(
+            "an `area:__global__`-labelled unprovenanced PR must NOT be routed through the "
+            "narrowed cause: `missing-provenance-narrowed` is not in GLOBAL_RESERVATION_CAUSES, "
+            f"so the closed-enum census raised instead of counting it and aborted the tick — {exc}"
+        ) from exc
+    assert _global_label_census == {GLOBAL_CAUSE_NO_PROVENANCE: 1}, \
+        "an `area:__global__`-labelled PR must land in a DECLARED global cause, not raise"
+    assert unprovenanced_narrowed_holders(_global_label_occ) == [], _global_label_occ
+    # ...and the narrowing is EXACTLY the declared set — not a superset that quietly still
+    # contains the serializing partition, which would leave the lane at zero while the assertion
+    # above passed if it had been written as a membership test.
+    assert GLOBAL_PACKAGE not in busy_packages_of_pulls(repo, [_stray_labelled], issue_labels, {})
+    # THE WHOLE-LANE CONSEQUENCE, at the leg where the frontier actually dies: the sibling rows
+    # in OTHER crates survive. `plan_items` names crate-a and crate-b; the holder declares
+    # crate-a and crate-z, so crate-b must be kept. Pre-fix this returned [].
+    # The leg's PRINTED narrowed census is captured from the SAME call, because every other
+    # assertion on that line in this file reads it at ZERO. MEASURED: mutant M10 — passing `[]`
+    # instead of the leg's own `occupancy` to the formatter, so the population is permanently
+    # reported as empty — survived the whole suite until this row existed. That is the exact
+    # vacuity this counter was added to prevent, in the counter itself.
+    _narrow_leg = io.StringIO()
+    with contextlib.redirect_stdout(_narrow_leg):
+        _narrow_kept = filter_busy_area_items(
+            plan_items, repo, [_stray_labelled], issue_labels, {}, leases=[], now=now)
+    assert [item["number"] for item in _narrow_kept] == [9], \
+        "one unprovenanced holder must no longer drop every item"
+    assert ("unprovenanced-narrowed census example/repo: 1 open worker PR(s) have NO registry "
+            "provenance record") in _narrow_leg.getvalue(), _narrow_leg.getvalue()
+    assert "— pr#61." in _narrow_leg.getvalue(), _narrow_leg.getvalue()
+    # ...and its OWN crate is still genuinely reserved — the narrowing must not become a release.
+    assert filter_busy_area_items(
+        [plan_items[0]], repo, [_stray_labelled], issue_labels, {}, leases=[], now=now) == []
+    # THE CAUSE IS ATTRIBUTED TO THE NARROWED BUCKET, and NOT to any `__global__` bucket — the
+    # population must stay counted after it stops starving the lane (the alarm-loses-its-
+    # population class). Both directions, because `global_reservation_census` counting it would
+    # be as wrong as nothing counting it.
+    _narrow_occ = []
+    busy_packages_of_pulls(repo, [_stray_labelled], issue_labels, {}, occupancy=_narrow_occ)
+    assert [row[5] for row in _narrow_occ] == [CAUSE_NO_PROVENANCE_NARROWED], _narrow_occ
+    assert unprovenanced_narrowed_holders(_narrow_occ) == [61], _narrow_occ
+    assert global_reservation_census(_narrow_occ) == {}, _narrow_occ
+    # A `parked-free` row has already RELEASED its crates, so it is not in this population either
+    # — counting it would report a PR as holding areas it does not hold. Kills dropping the
+    # `row[0] != "busy"` guard.
+    assert unprovenanced_narrowed_holders(
+        [("parked-free", 62, frozenset({"crate-a"}), "parked", True,
+          CAUSE_NO_PROVENANCE_NARROWED)]) == []
+    # A pre-cause 5-tuple is SKIPPED, not indexed. Kills relaxing `len(row) < 6` to `< 5`.
+    # Caught and re-raised for the same reason the `area:__global__` census assertion above is: the
+    # relaxed guard raises IndexError, and a bare `assert` would let that surface as a CRASH. A
+    # crash is not a kill — nothing detected anything, the file merely broke — so the mutant is
+    # converted into a failure that names the contract it violated. MEASURED: mutant M13 was scored
+    # `killed` by an exit-code-only harness and `CRASH-NOT-KILL` by one that reads the exception.
+    try:
+        _legacy_row_holders = unprovenanced_narrowed_holders(
+            [("busy", 63, frozenset({"crate-a"}), "not-parked", False)])
+    except IndexError as exc:                                             # pragma: no cover
+        raise AssertionError(
+            "a pre-cause 5-tuple must be SKIPPED by unprovenanced_narrowed_holders, not indexed: "
+            f"the length guard admitted a row with no cause slot and it raised — {exc}") from exc
+    assert _legacy_row_holders == [], _legacy_row_holders
+    # Ascending and de-duplicated by construction, whatever order the listing arrived in.
+    assert unprovenanced_narrowed_holders([
+        ("busy", 90, frozenset({"c"}), "not-parked", False, CAUSE_NO_PROVENANCE_NARROWED),
+        ("busy", 12, frozenset({"c"}), "not-parked", False, CAUSE_NO_PROVENANCE_NARROWED),
+        ("busy", 40, frozenset({"c"}), "not-parked", False, GLOBAL_CAUSE_DECLARED),
+    ]) == [12, 90]
+    assert CAUSE_NO_PROVENANCE_NARROWED not in GLOBAL_RESERVATION_CAUSES, (
+        "a narrowed row never holds `__global__`, so a bucket for it in the global census would "
+        "be structurally unreachable")
+    assert CAUSE_NO_PROVENANCE_NARROWED in RESERVATION_CAUSES
+    # ...and the un-narrowed holder still lands in `missing-provenance`, so the two causes cannot
+    # be collapsed into one another.
+    _global_occ = []
+    busy_packages_of_pulls(repo, [stray_closed], issue_labels, {}, occupancy=_global_occ)
+    assert global_reservation_census(_global_occ) == {GLOBAL_CAUSE_NO_PROVENANCE: 1}, _global_occ
+    assert unprovenanced_narrowed_holders(_global_occ) == [], _global_occ
+    # THE CENSUS LINE IS PRINTED AT ZERO TOO. A counter that appears only when it fires cannot be
+    # distinguished from one that was never wired (#753/#762) — and this line is the ONLY thing
+    # that still names the missing-record population once it stops starving the lane.
+    assert "0 open worker PR(s) have NO registry provenance record" in (
+        format_unprovenanced_narrowed_census(repo, []))
+    assert "pr#61" in format_unprovenanced_narrowed_census(repo, _narrow_occ)
+    assert "none" in format_unprovenanced_narrowed_census(repo, _global_occ)
+    # ...and at TWO holders, because a one-holder fixture cannot see a formatter that names only
+    # the first. Self-audit prompted by the sparq#4821 review: the single-area miss was one
+    # instance of "fixture narrower than population", and this line had the same shape (n<=1 only).
+    _two_narrow = [("busy", 61, frozenset({"crate-a"}), "not-parked", False,
+                    CAUSE_NO_PROVENANCE_NARROWED),
+                   ("busy", 77, frozenset({"crate-b"}), "not-parked", False,
+                    CAUSE_NO_PROVENANCE_NARROWED)]
+    assert "2 open worker PR(s)" in format_unprovenanced_narrowed_census(repo, _two_narrow)
+    assert "— pr#61, pr#77." in format_unprovenanced_narrowed_census(repo, _two_narrow), \
+        format_unprovenanced_narrowed_census(repo, _two_narrow)
+    # A PROVENANCED PR is untouched by any of this: its source issue's areas still union in, so a
+    # PR declaring one crate whose source issue names another reserves BOTH. Kills a "tidy-up"
+    # that routes every PR through the declared-only branch.
+    assert busy_packages_of_pulls(
+        repo, [pull(60, "sparq-agent/issue-8-1-1", sha_a, labels=["area:crate-z"])],
+        {8: ["role:impl", "area:crate-a"]}, busy_prov) == {"crate-a", "crate-z"}
+    # ...and a provenanced PR whose source issue has NO areas STILL takes `__global__` even though
+    # it declares its own. That branch is deliberately NOT narrowed (its source issue is known and
+    # already reserves `__global__` on the PLAN side), so a mutant that moves the `elif areas:`
+    # test above the provenance check turns this red.
+    assert GLOBAL_PACKAGE in busy_packages_of_pulls(
+        repo, [pull(60, "sparq-agent/issue-8-1-1", sha_a, labels=["area:crate-z"])],
+        {8: ["role:impl"]}, busy_prov)
     # a global plan item never co-runs with ANY in-flight worker PR
     assert filter_busy_area_items([{"number": 3, "package": "__global__", "deferred": False}],
                                   repo, [in_review], issue_labels, busy_prov,
@@ -16399,9 +16760,20 @@ agent = "impl"
         "reserving.single-area=1 reserving.single-area.kept=0 reserving.single-area.deferred=1 "
         "reserving.multi-area=0 reserving.multi-area.kept=0 reserving.multi-area.deferred=0 "
         "reserving.global=0 reserving.global.kept=0 reserving.global.deferred=0")
+    # [sparq#4821] ...and the narrowed-population line, on the SAME unconditional footing. Asserted
+    # here rather than only in isolation because this is the tripwire that pins the leg's WHOLE
+    # stdout: wrapping the emission in `if holders:` — the natural "tidy-up" that would make the
+    # missing-record population invisible on every healthy tick — reds exactly this line.
+    expected_narrowed_log = (
+        "unprovenanced-narrowed census example/repo: 0 open worker PR(s) have NO registry "
+        "provenance record but declare their own `area:*` labels, so they reserve those areas "
+        "instead of `__global__` — none. Their records are still missing and "
+        "`enumerate_review_items` still cannot see them; recovery is the `backfill-provenance` "
+        "workflow with apply=true.")
     assert assembler_kept == [], assembler_kept
     assert assembler_output.getvalue().splitlines() == [expected_assembler_log,
-                                                        expected_reservation_log], \
+                                                        expected_reservation_log,
+                                                        expected_narrowed_log], \
         assembler_output.getvalue()
     assert assembler_census["by_reason"]["crate-conflict"] == 1, assembler_census
     assert assembler_census["by_held_area"] == {"crate-b": 1}, assembler_census
@@ -16559,6 +16931,16 @@ agent = "impl"
         "reserving.single-area=3 reserving.single-area.kept=0 reserving.single-area.deferred=3 "
         "reserving.multi-area=0 reserving.multi-area.kept=0 reserving.multi-area.deferred=0 "
         "reserving.global=0 reserving.global.kept=0 reserving.global.deferred=0",
+        # [sparq#4821] pr#60 holds `__global__` for cause `source-no-areas` — a KNOWN source issue
+        # with no `area:` label — which this change deliberately does NOT narrow. So this fixture
+        # also pins the negative: the narrowed census reads ZERO on a board whose whole-lane stall
+        # is real, and a mutant that routes every `__global__` cause through the narrowing would
+        # both empty `expected_stall_log`'s defer lines and put pr#60 on this one.
+        "unprovenanced-narrowed census example/repo: 0 open worker PR(s) have NO registry "
+        "provenance record but declare their own `area:*` labels, so they reserve those areas "
+        "instead of `__global__` — none. Their records are still missing and "
+        "`enumerate_review_items` still cannot see them; recovery is the `backfill-provenance` "
+        "workflow with apply=true.",
     ]
     stall_census = {}
     for stall_order in (stall_pulls, list(reversed(stall_pulls))):
@@ -16586,7 +16968,14 @@ agent = "impl"
         # able to disagree about which area is held or which PR holds it.
         from_log = {}
         reservation_lines = 0
+        narrowed_lines = 0
         for line in stall_output.getvalue().splitlines():
+            if line.startswith("unprovenanced-narrowed census "):
+                # [sparq#4821] Counted, not merely tolerated — same discipline as the line below.
+                # A laxer `continue` on an unrecognised prefix would let the emission be deleted
+                # with every assertion in this loop still green.
+                narrowed_lines += 1
+                continue
             if line.startswith("assemble-reservations "):
                 # [OPUS-5] The reservation-shape line is the leg's OTHER emission and is
                 # re-derived below against the census it was folded from; it carries no
@@ -16600,6 +16989,7 @@ agent = "impl"
             assert parsed, line
             record_partition_defer(from_log, parsed.group(1), parsed.group(3), parsed.group(4))
         assert reservation_lines == 1, stall_output.getvalue()
+        assert narrowed_lines == 1, stall_output.getvalue()
         # ...and the emitted reservation line must be re-derivable from the census the same leg
         # filled, so the operator's log and Gate A's numbers cannot disagree about the shapes.
         assert format_partition_reservation_census(
@@ -16812,9 +17202,13 @@ agent = "impl"
         with contextlib.redirect_stdout(enum_output):
             assert filter_busy_area_items(rows, repo, holders, enum_labels, busy_prov,
                                           leases=enum_leases, now=now, census=enum_census) == []
+        # [sparq#4821] The narrowed-population line is part of the leg's EXACT output for every
+        # declared reason, re-derived from the formatter rather than pasted — so it cannot drift
+        # from the emission, and dropping the emission reds all four reason cases at once.
         assert enum_output.getvalue().splitlines() == [
             assemble_line,
-            format_partition_reservation_census("assemble-reservations", repo, enum_census)], \
+            format_partition_reservation_census("assemble-reservations", repo, enum_census),
+            format_unprovenanced_narrowed_census(repo, [])], \
             (reason, enum_output.getvalue())
         assert enum_census["by_reason"][reason] == 1, (reason, enum_census)
         assert sum(enum_census["by_reason"].values()) == 1, (reason, enum_census)
@@ -17075,7 +17469,10 @@ agent = "impl"
         "assemble-reservations example/repo rows=0 deferred=0 deferred_global=0 "
         "reserving.single-area=0 reserving.single-area.kept=0 reserving.single-area.deferred=0 "
         "reserving.multi-area=0 reserving.multi-area.kept=0 reserving.multi-area.deferred=0 "
-        "reserving.global=0 reserving.global.kept=0 reserving.global.deferred=0"], \
+        "reserving.global=0 reserving.global.kept=0 reserving.global.deferred=0",
+        # [sparq#4821] THE QUIETEST POSSIBLE TICK — no rows, no pulls — still names the narrowed
+        # population at zero. This is the row that kills `if holders: print(...)`.
+        format_unprovenanced_narrowed_census(area_repo, [])], \
         empty_out.getvalue()
     assert empty_census["by_reservation"] == {
         "single-area": {"kept": 0, "deferred": 0},
@@ -17502,13 +17899,87 @@ agent = "impl"
         assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
         print("  ok   auto-readmit (e): a human-owned hold on either surface is never "
               "auto-re-admitted")
-        # A(e'): a park the MAINTAINER applied is human-owned — only a human clears it.
-        human_park = {41: [{"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
-                            "created_at": park_stamp, "actor": {"login": "jeswr"},
-                            "performed_via_github_app": None}], 7: []}
-        count, posted, cleared = readmit_sweep(recovered_window, timeline=human_park)
+        # A(e'): BOTH OWNERSHIP FACTS, END TO END THROUGH THE REAL SWEEP — the real timeline
+        # parser, the real comment reader, the real label writes.
+        #
+        # A maintainer who stamps the MACHINE-owned soft hold is re-admitted ONLY when this bot's
+        # own park-reason receipt already classified the episode `class=capacity`. A maintainer who
+        # stamps the HUMAN-owned terminal is asking a question and still refuses. And a
+        # maintainer-stamped machine park with NO bot receipt refuses too — that is the population
+        # review measured (5 of 12 live sparq PRs), where `cause_gated_park_episode` is inert by
+        # its own clause 1 so #769's age guard cannot fire either.
+        def maintainer_park(label):
+            return {41: [{"event": "labeled", "label": {"name": label},
+                          "created_at": park_stamp, "actor": {"login": "jeswr"},
+                          "performed_via_github_app": None}], 7: []}
+
+        # The class receipt (bot-authored) AND the INSTANCE attestation (authored by the actor
+        # that applies the park, one second before it — the real reconcile script's receipt-first
+        # ordering). Both are required now; the rows below vary each independently.
+        capacity_receipt_comment = [
+            {"user": {"login": readmit_bot},
+             "body": "capacity park\n\n" + _park_policy.park_reason_marker("budget")},
+            {"user": {"login": "jeswr"}, "created_at": park_stamp,
+             "body": f"audit\n\n{_park_policy.RECONCILE_MARKER} pr=41 window=w -->"},
+        ]
+        class_only_comment = capacity_receipt_comment[:1]
+        attestation_only_comment = capacity_receipt_comment[1:]
+        count, posted, cleared = readmit_sweep(
+            recovered_window, timeline=maintainer_park(MACHINE_PARK_PR_LABEL),
+            comments=capacity_receipt_comment)
+        assert (count, cleared) == (1, [(41, 7)]), (count, posted, cleared)
+        assert len(posted) == 1 and worker_pr_mod.AUTO_READMIT_MARKER in posted[0][1], posted
+        print("  ok   auto-readmit (e): a MAINTAINER-applied MACHINE park with the bot's own "
+              "class=capacity receipt IS re-admitted (receipt-first)")
+        count, posted, cleared = readmit_sweep(
+            recovered_window, timeline=maintainer_park(MACHINE_PARK_PR_LABEL))
         assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
-        print("  ok   auto-readmit (e): a MAINTAINER-applied park is never auto-re-admitted")
+        print("  ok   auto-readmit (e): the SAME park with NO bot receipt is NOT re-admitted — "
+              "the machine never clears a park it never classified")
+        # THE INSTANCE BINDING, end to end: the class receipt alone is not enough, and the
+        # attestation alone is not enough. Each is removed independently from the pair above.
+        count, posted, cleared = readmit_sweep(
+            recovered_window, timeline=maintainer_park(MACHINE_PARK_PR_LABEL),
+            comments=class_only_comment)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (e): the class receipt WITHOUT an instance attestation is "
+              "refused — the record must be about THIS park, not about the PR")
+        count, posted, cleared = readmit_sweep(
+            recovered_window, timeline=maintainer_park(MACHINE_PARK_PR_LABEL),
+            comments=attestation_only_comment)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (e): an instance attestation WITHOUT a class receipt is "
+              "refused too — the two conjuncts are independent")
+        count, posted, cleared = readmit_sweep(
+            recovered_window, timeline=maintainer_park(MACHINE_PARK_PR_LABEL),
+            comments=[capacity_receipt_comment[0],
+                      {"user": {"login": "drive-by"}, "created_at": park_stamp,
+                       "body": f"x\n\n{_park_policy.RECONCILE_MARKER} pr=41 -->"}])
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (e): an attestation by an actor that did NOT apply the park "
+              "is ignored — a third party cannot bind somebody else's act")
+        injection_receipt_comment = [{
+            "user": {"login": readmit_bot},
+            "body": "flagged\n\n" + _park_policy.park_reason_marker("injection"),
+        }]
+        count, posted, cleared = readmit_sweep(
+            recovered_window, timeline=maintainer_park(MACHINE_PARK_PR_LABEL),
+            comments=injection_receipt_comment)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (e): a QUESTION-class bot receipt refuses the same park")
+        # A third party cannot forge the classification: same marker, non-bot author.
+        forged = [{"user": {"login": "drive-by"},
+                   "body": "x\n\n" + _park_policy.park_reason_marker("budget")}]
+        count, posted, cleared = readmit_sweep(
+            recovered_window, timeline=maintainer_park(MACHINE_PARK_PR_LABEL), comments=forged)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (e): a NON-bot author cannot forge the capacity receipt")
+        count, posted, cleared = readmit_sweep(
+            recovered_window, timeline=maintainer_park(_park_policy.HUMAN_PARK_LABEL),
+            comments=capacity_receipt_comment)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (e): a MAINTAINER-applied HUMAN TERMINAL is still never "
+              "auto-re-admitted, receipt or no receipt")
 
         # ------------------------------------------------------------------------------------
         # [G5] END-TO-END: the census the REAL sweep emits, from the REAL sweep's own log.
@@ -17529,7 +18000,10 @@ agent = "impl"
         # window is still broken, so nothing is re-admitted and both PRs reach a refusal.
         census_row_42 = dict(parked_row, number=42,
                              head={**parked_row["head"], "ref": "sparq-agent/issue-8-def"})
-        census_timeline = dict(human_park)
+        # #41's park must be the HUMAN TERMINAL specifically: a maintainer-applied MACHINE soft
+        # hold is re-admitted now, so it would no longer produce a `human-applied` census row at
+        # all and this fixture would be asserting an empty cohort.
+        census_timeline = dict(maintainer_park(_park_policy.HUMAN_PARK_LABEL))
         census_timeline[42] = [{"event": "labeled",
                                 "label": {"name": MACHINE_PARK_PR_LABEL},
                                 "created_at": park_stamp, "actor": {"login": readmit_bot},
@@ -18106,14 +18580,40 @@ agent = "impl"
         count, posted, cleared = readmit_sweep(healthy_window, timeline=aged_timeline,
                                                labels={7: ["status:parked", "needs:user"]})
         assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
-        human_aged_park = {41: [{"event": "labeled",
-                                 "label": {"name": MACHINE_PARK_PR_LABEL},
-                                 "created_at": aged_park_stamp, "actor": {"login": "jeswr"},
-                                 "performed_via_github_app": None}], 7: []}
-        count, posted, cleared = readmit_sweep(healthy_window, timeline=human_aged_park)
+        # BOTH ownership gates decide here too — the aged-out heuristic exit inherits them
+        # UNCHANGED from the cause-recovery exit, so the two can never drift. This is the exit
+        # review measured firing for 12 of 12 admissions, so an untested "inherits unchanged"
+        # claim here is precisely the one that would have mattered.
+        def human_aged_park(label):
+            return {41: [{"event": "labeled", "label": {"name": label},
+                          "created_at": aged_park_stamp, "actor": {"login": "jeswr"},
+                          "performed_via_github_app": None}], 7: []}
+
+        aged_capacity_receipt = [
+            {"user": {"login": readmit_bot},
+             "body": "capacity park\n\n" + _park_policy.park_reason_marker("budget")},
+            {"user": {"login": "jeswr"}, "created_at": aged_park_stamp,
+             "body": f"audit\n\n{_park_policy.RECONCILE_MARKER} pr=41 window=w -->"},
+        ]
+        count, posted, cleared = readmit_sweep(
+            healthy_window, timeline=human_aged_park(_park_policy.HUMAN_PARK_LABEL),
+            comments=aged_capacity_receipt)
         assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
-        print("  ok   aged-out exit: a human-owned hold and a MAINTAINER-applied park refuse it "
-              "exactly as they refuse the cause-recovery path")
+        count, posted, cleared = readmit_sweep(
+            healthy_window, timeline=human_aged_park(MACHINE_PARK_PR_LABEL))
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        count, posted, cleared = readmit_sweep(
+            healthy_window, timeline=human_aged_park(MACHINE_PARK_PR_LABEL),
+            comments=aged_capacity_receipt)
+        assert (count, cleared) == (1, [(41, 7)]), (count, posted, cleared)
+        count, posted, cleared = readmit_sweep(
+            healthy_window, timeline=human_aged_park(MACHINE_PARK_PR_LABEL),
+            comments=aged_capacity_receipt[:1])
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   aged-out exit: a human-owned hold, a MAINTAINER-applied HUMAN TERMINAL, a "
+              "MAINTAINER-applied MACHINE park with NO bot capacity receipt, and one with a class "
+              "receipt but NO instance attestation all refuse it exactly as they refuse the "
+              "cause-recovery path — neither gate is bypassable via the #691 heuristic")
 
         # ---- the MIGRATION PRECONDITION, as the production function computes it -------------
         # Never hand-set: _legacy_migration_provable is the expression main() evaluates.
@@ -19352,6 +19852,83 @@ def _starvation_park_batch_seam_self_test():
           "stand the WHOLE batch down — writing nothing at all")
 
 
+def _partition_starvation_record_seam_self_test():
+    """[sparq#4821] THE YAML SEAM THAT FEEDS THE WHOLE SELF-HEAL, executed on production source.
+
+    `partition_starvation` is the ONLY channel from the PLAN leg's measurement to the CLAIM leg's
+    park sweep, its un-park half and its provenance escalation. It is written by four lines of
+    `dispatch.yml`, and every assertion about the sweep calls the pure selectors directly — so
+    disabling those four lines leaves the sweep with an empty input and EVERY existing assertion
+    green. MEASURED: mutant Y3 (`if False and starvation.get(...)`) survived the entire suite
+    across `dispatch-claim.py`, `dispatch-plan.py`, `ready-issues.py` and `plan-snapshot.py`.
+    That is this repository's own recorded pattern — the surviving mutant lives in the workflow.
+
+    Extracted and EXECUTED against stubs, in all three states, because the guard has to be right
+    in both directions: a starved lane must record, and a HEALTHY or EMPTY one must not (recording
+    an empty backlog would let the park sweep fire on a lane that has nothing queued)."""
+    block = _workflow_step_python(
+        "dispatch.yml", "plan", r'(?m)^[ \t]*if starvation\.get\("kept"\) == 0',
+        r"(?m)^[ \t]*snapshot_skips\.sort\(", "partition-starvation recording")
+
+    def run(kept, deferred):
+        namespace = {"starvation": {"kept": kept, "deferred": deferred},
+                     "partition_starvation": [], "repo": "example/repo"}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            exec(compile(textwrap.dedent(block), "<dispatch.yml partition starvation>",  # noqa: S102
+                         "exec"), namespace)
+        return namespace["partition_starvation"], out.getvalue()
+
+    rows, printed = run(0, 3)
+    assert rows == [{"repo": "example/repo", "deferred": 3}], rows
+    assert "PARTITION STARVATION example/repo: 0 issue item(s) planned behind 3 row(s)" in printed, \
+        printed
+    # A HEALTHY lane records nothing — parking a holder to buy throughput that is already flowing
+    # is the cost this guard refuses.
+    assert run(2, 3) == ([], ""), run(2, 3)
+    # An EMPTY backlog is not starvation. Recording it would arm the sweep on a lane with nothing
+    # queued, which is the one input `starvation_park_targets` cannot distinguish on its own.
+    assert run(0, 0) == ([], ""), run(0, 0)
+    print("  ok   [sparq#4821] YAML SEAM (executed): dispatch.yml RECORDS partition starvation for "
+          "a starved lane and for neither a healthy nor an empty one — the sweep's only input")
+
+    # ---- ...and the `assemble-census` line it sits under, for the same reason one layer up.
+    # THIS LINE IS THE INSTRUMENT. `reason.global-reservation=` is the only per-tick record of
+    # whether the serializing partition was held, and the duty cycle of this defect class is
+    # measurable ONLY from it — 11 executed ticks in the sparq#4821 measurement window are
+    # permanently unmeasurable because they predate it. Nothing asserted its shape: mutant Y4
+    # (drop the `reason.` bucket list) survived the whole four-script suite, which would have made
+    # the class invisible again with everything green. Executed, on the production source.
+    census_block = _workflow_step_python(
+        "dispatch.yml", "plan", r'(?m)^[ \t]*print\("assemble-census " \+ " "\.join\(',
+        r'(?m)^[ \t]*# Recorded ONLY for a genuinely starved lane', "assemble-census emission")
+    census_out = io.StringIO()
+    with contextlib.redirect_stdout(census_out):
+        exec(compile(textwrap.dedent(census_block), "<dispatch.yml assemble census>",  # noqa: S102
+                     "exec"),
+             {"repo": "example/repo", "rows_before_assemble": 6,
+              # TWO entries in EVERY bucket, deliberately. A fixture with one area and one holder
+              # cannot distinguish "emits the bucket list" from "emits the bucket list's first
+              # element" — the same fixture-narrower-than-population miss the sparq#4821 review
+              # caught on the single-area branch, one layer over.
+              "partition_census": {"total": 6, "kept": 0,
+                                   "by_reason": {"global-reservation": 4, "crate-conflict": 2},
+                                   "by_held_area": {GLOBAL_PACKAGE: 4, "crate-b": 2},
+                                   "by_holder": {"3620": 2, "4804": 4}}})
+    assert census_out.getvalue().strip() == (
+        "assemble-census example/repo rows_before=6 deferred=6 kept=0 reason.crate-conflict=2 "
+        f"reason.global-reservation=4 area.{GLOBAL_PACKAGE}=4 area.crate-b=2 "
+        "holder.pr3620=2 holder.pr4804=4"), \
+        census_out.getvalue()
+    # BRACE-FREE, asserted rather than described: GitHub's secret masker rewrites `{`/`}` to `***`,
+    # so a census that ever grew a JSON dump would arrive corrupted on the feed that reads it.
+    assert "{" not in census_out.getvalue() and "}" not in census_out.getvalue(), \
+        census_out.getvalue()
+    print("  ok   [sparq#4821] YAML SEAM (executed): the `assemble-census` line carries the "
+          "per-reason / per-held-area / per-holder buckets — the only per-tick record that the "
+          "serializing partition was held, and brace-free so the masker cannot eat it")
+
+
 def _starvation_sweep_self_test():
     item = {"number": 900, "package": "crate-a", "deferred": False}
     holder = _starvation_row(41, packages={GLOBAL_PACKAGE})
@@ -19884,6 +20461,34 @@ def _starvation_sweep_self_test():
     print("  ok   #772 missing edge: an unprovenanced holder with NO park remedy reaches the "
           "escalation, and the park half's own candidate is never double-reported")
 
+    # ---- [sparq#4821] THE TWO PARK RECEIPTS, WHICH HAD NO ASSERTION AT ALL. ------------------
+    # `starvation_park_body` has exactly ONE production call site and was unguarded anywhere, so
+    # reverting it to the sentence it used to carry — "Adding `area:*` labels to the PR cannot
+    # remove it — the fail-closed default is unioned in on top of them" — passed green. That
+    # sentence is now FALSE, and it is worse than stale: it is read by the one person who can act,
+    # and it tells them the only remedy available to them does not work. A text nothing asserts is
+    # a text anything can revert.
+    _park_receipt = starvation_park_body("o/r", 51, 12, "https://example.invalid/issues/1")
+    assert "cannot remove" not in _park_receipt, _park_receipt
+    assert "**A human remedy now exists and takes effect on the next tick:** add the `area:*` " \
+        "label(s) this PR actually touches" in _park_receipt, _park_receipt
+    assert f"reserves *those* and not `{GLOBAL_PACKAGE}`" in _park_receipt, _park_receipt
+    # ...and the receipt still states the cause it is parking for, which is now the CONJUNCTION —
+    # a missing record AND no declared area. Dropping either half misdescribes the population.
+    assert "missing or unreadable registry provenance record" in _park_receipt, _park_receipt
+    assert "no `area:*` label of its own" in _park_receipt, _park_receipt
+    # The park receipt must keep carrying its attributable cause marker, or the un-park half can
+    # never prove the park is one this sweep applied and the park loses its machine exit.
+    assert _park_policy.park_reason_marker(STARVATION_PARK_CAUSE) in _park_receipt, _park_receipt
+    # The UN-park receipt names the second way the reservation can clear, which this change
+    # created. Without it the comment claims a provenance record landed when none did.
+    _unpark_receipt = starvation_unpark_body(frozenset({"crate-a"}))
+    assert "acquired `area:*` labels of its own" in _unpark_receipt, _unpark_receipt
+    assert "sparq#4821" in _unpark_receipt, _unpark_receipt
+    assert STARVATION_UNPARK_MARKER in _unpark_receipt, _unpark_receipt
+    print("  ok   [sparq#4821] the park / un-park / escalation receipts state the `area:*` remedy "
+          "that now exists — asserted, so the old false sentence cannot come back green")
+
     # ---- [registry #677] THE OTHER THREE QUARTERS OF THAT POPULATION --------------------------
     # #772 escalated `missing-provenance` ONLY, so a lane annihilated by a holder whose SOURCE
     # ISSUE carries no `area:` label — the class #677 measured as the future majority, 551 of 895
@@ -19976,6 +20581,16 @@ def _starvation_sweep_self_test():
     assert "o/r#51" in receipt and "backfill-provenance" in receipt and "apply=true" in receipt, \
         receipt
     assert "12 ready row(s)" in receipt, receipt
+    # [sparq#4821] The `missing-provenance` population is now NARROWER than "unprovenanced": a PR
+    # that declares its own areas no longer holds the partition at all (it carries
+    # `missing-provenance-narrowed` and reserves exactly those areas), so the only PRs reaching
+    # THIS cause's receipt are those declaring NONE. The receipt must say so, or it tells its
+    # reader the cause is the missing record alone and sends them to the backfill when a label
+    # would clear the lane today. Asserted THROUGH the rendered body, not against the dict: #677
+    # moved this prose into GLOBAL_CAUSE_RECOVERIES, and a move is exactly how a sentence nothing
+    # renders-and-checks goes missing.
+    assert "declares no `area:*` label of its own" in receipt, receipt
+    assert "labelling the PR with the `area:*` sections it actually touches" in receipt, receipt
     labels_receipt = starvation_stuck_holder_body("o/r", 52, 12, GLOBAL_CAUSE_SOURCE_NO_AREAS)
     assert "`area:*` labels" in labels_receipt and "o/r#52" in labels_receipt, labels_receipt
     # ...and it must NOT be #772's body wearing a new signature: backfill cannot clear a hold whose
@@ -20469,6 +21084,7 @@ def _starvation_sweep_self_test():
 
     # ---- [registry #822] THE PARK BATCH, EXECUTED on production source -----------------------
     _starvation_park_batch_seam_self_test()
+    _partition_starvation_record_seam_self_test()
 
     # ---- [registry #869] EVERY PARK WRITE SITE STATES ITS CAUSE — ONE CHECK PER SITE ---------
     _park_cause_site_self_test()
@@ -20476,6 +21092,19 @@ def _starvation_sweep_self_test():
     # ---- THE YAML SEAM: structural, on PARSED nodes ------------------------------------------
     _starvation_yaml_seam_self_test()
     _census_yaml_seam_self_test()
+
+    # ---- [registry #972] THE REFUSED REVIEW'S EXIT — seam + executed block -------------------
+    # [registry #979 round-2] The containment-discipline claim is asserted from TWO independent
+    # statements in two different functions, on purpose. MEASURED: tautologising the assertion
+    # inside _identity_refusal_seam_self_test was the ONE mutant of this round that survived —
+    # a single `assert X == []` has no guard but a second, independent assertion of the same
+    # property, and this is it. (The property is deliberately NOT folded into
+    # _identity_refusal_seam_violations: that list is what every seam mutant is judged by, so a
+    # violation present on EVERY document would make every mutant trivially "caught".)
+    _seam_pins = _identity_seam_pin_discipline_violations()
+    assert not _seam_pins, ("#972 seam pin discipline (independent second assertion): "
+                            f"{_seam_pins}")
+    _identity_refusal_seam_self_test()
 
 
 # ==================================================================================================
@@ -21303,6 +21932,773 @@ def _starvation_yaml_seam_self_test():
           "caught as named violations")
 
 
+# ==================================================================================================
+# [registry #972] THE REFUSED REVIEW'S MISSING EXIT — review-fix.yml's target-identity seam.
+#
+# THE DEFECT, measured: the `run` job's `Verify target App identity and default branch` step refused
+# jeswr/agent-account-registry#961 (`pull request author is not the registry App bot`, review run
+# 30340804869) and the `outcome` job was SKIPPED — its `if:` conjunct could not be satisfied because
+# the run job died before binding any of the three outputs it tests. So NOTHING durable was written:
+# no verdict, no round, no `review:*` transition. The next PLAN/CLAIM tick re-derived a
+# byte-identical world and launched the identical run. A refusal with no recorded outcome is an
+# infinite retry, and the interlock in `enrolment_enable_error` could see none of it.
+#
+# THIS IS ENTIRELY A YAML-SEAM FIX, which is where this repo keeps measuring its vacuous guards. So
+# every pin below is one of exactly TWO kinds, and NEVER a substring containment:
+#
+#   (1) EQUALITY on a PARSED node — an `if:` expression, an `env:` value, a job output, a `needs:`
+#       list, a step id or a step ORDER. A `&& false` conjunct, an `if: false`, a deleted `needs:`
+#       and an env re-pointed at the neighbouring output are all invisible to containment and
+#       every one of them silently restores the loop; equality sees each of them.
+#
+#   (2) EXECUTION of the workflow's own code — the identity python block (`_identity_block_run`),
+#       the fail-closed stop (`_identity_stop_violations`) and the recording invocation
+#       (`_identity_record_violations`). Text containment cannot tell a LIVE statement from a dead
+#       one, which is not a theory: this PR's round-1 review MEASURED eight non-crashing mutants
+#       that survived precisely because two pins here were containment checks on shell source —
+#       `: # exit 1`, `if false; then exit 1; fi`, `echo "would exit 1"` and `continue-on-error:
+#       true` for the stop, and `echo <cmd>`, a commented-out command, `false && <cmd>` and
+#       `if false; then <cmd>; fi` for the recorder. Four of them left the refusal with NO durable
+#       outcome (#972 restored invisibly while this suite printed "all mutants caught"); three
+#       disabled the only barrier between a refusal and a model holding a target-scoped App token.
+#
+# The claim is CHECKED, not asserted: `_identity_seam_pin_discipline_violations` walks this
+# module's own AST and reds if any pin in this section reaches a containment operator over a
+# workflow script — the negation of the claim, grepped by the code that makes it.
+_IDENTITY_SEAM_RUN_OUTPUT = "${{ steps.target.outputs.refusal }}"
+_IDENTITY_SEAM_REFUSE_IF = "${{ steps.target.outputs.bot_login == '' }}"
+_IDENTITY_SEAM_RECORD_IF = "${{ needs.run.outputs.identity_refusal != '' }}"
+_IDENTITY_SEAM_REVERIFY_IF = (
+    "${{ inputs.mode == 'review' && needs.run.outputs.identity_refusal == '' }}")
+_IDENTITY_SEAM_OUTCOME_IF = (
+    "${{ always() && needs.claim.outputs.acquired == 'true' && "
+    "(needs.run.outputs.verdict_ok == 'success' || needs.run.outputs.fix_done == 'success' || "
+    "needs.run.outputs.verdict_stale_reason != '' || "
+    "needs.run.outputs.identity_refusal != '') }}")
+_IDENTITY_SEAM_RECORD_ENV = "${{ needs.run.outputs.identity_refusal }}"
+
+
+def _identity_step(steps):
+    """The `run` job's target-identity step, addressed by its STEP ID (parsed), not by a string in
+    its script — the id is what every downstream `steps.target.outputs.*` reference resolves to, so
+    it is the only address that cannot drift from the consumers."""
+    for index, step in enumerate(steps or []):
+        if isinstance(step, dict) and step.get("id") == "target":
+            return index, step
+    return -1, None
+
+
+def _identity_block_run(script, *, full_name="o/r", default_branch="main",
+                        login="registry-admin[bot]", user_id="42",
+                        pr_author="registry-admin[bot]", target_repo="o/r"):
+    """EXECUTE review-fix.yml's target-identity python over one shaped input; return the outputs
+    the WORKFLOW's own code bound.
+
+    Executed and never grepped, for a reason this PR measured on its own first draft: a structural
+    check for the substring ``refusal=`` in the step's script SURVIVED a mutant that demoted the
+    write to ``pass  # refusal={code}``. Text containment cannot tell a live statement from a dead
+    one; running it can."""
+    import tempfile
+    begin = script.index("<<'PY'\n") + len("<<'PY'\n")
+    block = textwrap.dedent(script[begin:script.index("\nPY", begin)])
+    with tempfile.TemporaryDirectory() as tmp:
+        repo_json = Path(tmp) / "target.json"
+        user_json = Path(tmp) / "app-user.json"
+        out_file = Path(tmp) / "github-output"
+        repo_json.write_text(json.dumps(
+            {"full_name": full_name, "default_branch": default_branch}), encoding="utf-8")
+        user_json.write_text(json.dumps({"login": login, "id": user_id}), encoding="utf-8")
+        out_file.write_text("", encoding="utf-8")
+        saved_argv, saved_env = sys.argv, dict(os.environ)
+        sys.argv = ["-", str(repo_json), str(user_json)]
+        os.environ.update({"TARGET_REPO": target_repo, "PR_AUTHOR": pr_author,
+                           "GITHUB_OUTPUT": str(out_file)})
+        try:
+            exec(compile(block, "<review-fix.yml target identity>", "exec"),  # noqa: S102
+                 {"__name__": "__rf_identity__"})
+            code = 0
+        except SystemExit as exc:
+            code = exc.code
+        finally:
+            sys.argv = saved_argv
+            os.environ.clear()
+            os.environ.update(saved_env)
+        bound = dict(line.split("=", 1)
+                     for line in out_file.read_text(encoding="utf-8").splitlines() if line)
+    return code, bound
+
+
+# [registry #979 round-2 finding 1] A workflow `run:` script is not shell until the runner has
+# substituted its GitHub expressions, so `${{ … }}` becomes an inert literal before bash sees it
+# (bash would otherwise reject `${{` as a bad substitution and every execution below would degrade
+# into an unrunnable-seam "violation" that is really a harness bug).
+_IDENTITY_SEAM_GHA_EXPR_RE = re.compile(r"\$\{\{.*?\}\}", re.S)
+# The runner's DEFAULT shell for a `run:` step on ubuntu-latest. Executing the script under any
+# other semantics would prove a property the production runner does not have, so the steps below
+# are additionally pinned to declare NO `shell:` of their own.
+_IDENTITY_SEAM_SHELL = ["bash", "-e"]
+
+
+def _identity_shell_step(script, *, env=None, path_prefix=None):
+    """EXECUTE one workflow `run:` script the way the runner does and return its exit status.
+
+    [registry #979 round-2 finding 1] This exists because ``"exit 1" in step["run"]`` cannot tell a
+    LIVE statement from a dead one: `: # exit 1`, `if false; then exit 1; fi` and
+    `echo "would exit 1"` all contain the substring and all leave the job GREEN. Only running it
+    can distinguish them, exactly as `_identity_block_run` above already does for the python
+    block."""
+    source = _IDENTITY_SEAM_GHA_EXPR_RE.sub("__gha_expr__", script)
+    with tempfile.TemporaryDirectory() as tmp:
+        entry = Path(tmp) / "step.sh"
+        entry.write_text(source, encoding="utf-8")
+        run_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": tmp,
+                   "LC_ALL": "C"}
+        if path_prefix:
+            run_env["PATH"] = f"{path_prefix}:{run_env['PATH']}"
+        run_env.update(env or {})
+        return subprocess.run(_IDENTITY_SEAM_SHELL + [str(entry)], cwd=tmp, env=run_env,
+                              capture_output=True, text=True, timeout=60, check=False).returncode
+
+
+def _identity_stop_violations(step):
+    """The FAIL-CLOSED STOP, proved by RUNNING it. It is the only thing between a refused identity
+    and a model launched with a target-scoped App token, so nothing here is a containment check.
+
+    Three properties, all of which a green-looking mutant can break independently: the script
+    EXITS NON-ZERO when executed; the step declares no `shell:` of its own (so the thing executed
+    here is the thing the runner executes); and the step declares no `continue-on-error:` (a
+    truthy one keeps the job going past a failed stop, which is the same admission hole with the
+    `exit 1` still sitting there in plain text)."""
+    out = []
+    script = step.get("run")
+    if not isinstance(script, str):
+        return ["the refusal stop has no `run:` script, so it cannot FAIL the job — the run "
+                "would continue past an unverified target identity"]
+    if step.get("shell") is not None:
+        out.append(f"the refusal stop declares its own `shell:` ({step.get('shell')!r}); the "
+                   "#972 stop is pinned by EXECUTION under the runner's default `bash -e`, and a "
+                   "different shell is a different set of semantics than the one proved here")
+    if step.get("continue-on-error") is not None:
+        out.append(f"the refusal stop declares `continue-on-error: "
+                   f"{step.get('continue-on-error')!r}` — a failed stop would no longer stop the "
+                   "JOB, so the run continues to the target checkout and the model launches with "
+                   "an unverified target identity (the `exit 1` is still there and is inert)")
+    try:
+        code = _identity_shell_step(script)
+    except Exception as exc:      # noqa: BLE001 — an unrunnable stop proves nothing
+        return out + [f"the refusal stop could not be executed ({exc!r}), so its failure cannot "
+                      "be proved — treated as broken"]
+    if code == 0:
+        out.append(f"the refusal stop EXECUTES to exit {code} — it no longer FAILS the job, so "
+                   "the run would continue past an unverified target identity (a demoted, "
+                   "commented-out or conditionally-dead `exit 1` still contains the text)")
+    return out
+
+
+def _identity_record_violations(step):
+    """The RECORDING invocation, proved by RUNNING the step with `python3` shimmed.
+
+    [registry #979 round-2 finding 1] ``'--reason "$IDENTITY_REFUSAL"' in step["run"]`` survives
+    `echo python3 …`, a whole-command comment-out, and `false && python3 …` — three mutants under
+    which the refusal reaches NO durable outcome and #972's loop is restored invisibly. The shim
+    answers the only question that matters: was the recorder actually INVOKED, and with which
+    argv."""
+    out = []
+    script = step.get("run")
+    if not isinstance(step.get("run"), str):
+        return ["the identity-refusal step has no `run:` script, so no recorder is invoked and "
+                "the refusal reaches no durable outcome"]
+    if step.get("shell") is not None:
+        out.append(f"the identity-refusal step declares its own `shell:` ({step.get('shell')!r}); "
+                   "the invocation is pinned by EXECUTION under the runner's default `bash -e`")
+    sentinel = "seam-sentinel-not-a-declared-code"
+    with tempfile.TemporaryDirectory() as shim_dir:
+        argv_log = Path(shim_dir) / "argv.json"
+        shim = Path(shim_dir) / "python3"
+        shim.write_text(
+            # An ABSOLUTE interpreter shebang, never `/usr/bin/env python3`: the shim IS `python3`
+            # and is first on PATH, so an env lookup would resolve back to itself and hang.
+            f"#!{sys.executable}\n"
+            "import json, sys\n"
+            f"open({str(argv_log)!r}, 'a', encoding='utf-8').write("
+            "json.dumps(sys.argv[1:]) + '\\n')\n",
+            encoding="utf-8")
+        shim.chmod(0o755)
+        try:
+            code = _identity_shell_step(script, env={"IDENTITY_REFUSAL": sentinel},
+                                        path_prefix=shim_dir)
+        except Exception as exc:      # noqa: BLE001
+            return out + [f"the identity-refusal step could not be executed ({exc!r}), so the "
+                          "recorder invocation cannot be proved — treated as broken"]
+        invocations = [json.loads(line) for line in
+                       argv_log.read_text(encoding="utf-8").splitlines() if line.strip()] \
+            if argv_log.exists() else []
+    recorder = next((argv for argv in invocations if "identity-refusal" in argv), None)
+    if recorder is None:
+        out.append(f"the identity-refusal step EXECUTES without ever INVOKING the recorder "
+                   f"(exit={code}, python3 invocations={invocations!r}) — the command is echoed, "
+                   "commented out or conditionally dead, so the refusal reaches no durable "
+                   "outcome and the PR is re-dispatched forever (registry #972 verbatim)")
+        return out
+    if code != 0:
+        out.append(f"the identity-refusal step exits {code} even when the recorder succeeds — a "
+                   "failing recording step takes the whole outcome job, and therefore the "
+                   "refusal record, down with it")
+    if [sentinel] != [value for flag, value in zip(recorder, recorder[1:])
+                      if flag == "--reason"]:
+        out.append(f"the identity-refusal step did not pass --reason from $IDENTITY_REFUSAL "
+                   f"exactly once (argv={recorder!r}) — a hard-coded or absent reason records "
+                   "the wrong refusal, or none (env, never interpolated into the shell source — "
+                   "issue #199)")
+    return out
+
+
+# [registry #979 round-2 finding 1] THE NEGATION OF THIS SECTION'S OWN CLAIM, MADE CHECKABLE.
+# Round 1 asserted "never a substring containment" in prose while two pins were exactly that, and
+# nothing could tell. So the claim is now derived from the AST of these functions instead of being
+# written down: every containment operator that survives inside a pin function must appear in the
+# inventory below WITH the reason it is not a text check on a workflow script, and an inventory
+# entry that no longer matches anything is itself a violation (a stale exemption is how the next
+# containment pin hides).
+_IDENTITY_SEAM_PIN_FUNCTIONS = (
+    "_identity_refusal_seam_violations",
+    "_identity_block_violations",
+    "_identity_stop_violations",
+    "_identity_record_violations",
+)
+_IDENTITY_SEAM_CONTAINMENT_METHODS = (
+    "startswith", "endswith", "find", "rfind", "index", "count", "search", "match", "fullmatch")
+_IDENTITY_SEAM_DECLARED_CONTAINMENT = {
+    # Membership in a PARSED `needs:` LIST of job names. Not text: the list IS the thing pinned,
+    # and no rewriting of any script can add or remove a member of it.
+    ("_identity_refusal_seam_violations", "'run' not in (outcome_job.get('needs') or [])"),
+    # The step FINDER, not a pin. It ADDRESSES the recording step; whether that step actually
+    # records anything is decided by EXECUTING it in _identity_record_violations. A mutant that
+    # renames the command away makes this find nothing, which is its own named violation.
+    ("_identity_refusal_seam_violations", "'identity-refusal' in s['run']"),
+    # POSITION lookups in the PARSED steps list — this is `list.index`, not `str.find`: they are
+    # what pins step ORDER (the stop immediately after `target`; the recorder after the App-token
+    # mint), and no rewriting of any script text can move a step.
+    ("_identity_refusal_seam_violations", "(run_job.get('steps') or []).index(stop)"),
+    ("_identity_refusal_seam_violations", "steps.index(record)"),
+    # Membership in the dict of OUTPUTS the workflow's own python actually BOUND (parsed from the
+    # step's GITHUB_OUTPUT file), not in its source text.
+    ("_identity_block_violations", "'refusal' in ok_bound"),
+    # Membership in the ARGV the recorder was actually INVOKED with — a runtime value produced by
+    # executing the step, not a substring of the step.
+    ("_identity_record_violations", "'identity-refusal' in argv"),
+}
+
+
+def _identity_seam_pin_discipline_violations(source=None):
+    """The seam's methodology claim, PROVED over its own AST rather than asserted in a comment.
+
+    Returns named violations for every containment operator inside a #972 pin function that is not
+    declared in `_IDENTITY_SEAM_DECLARED_CONTAINMENT`, and for every declaration that no longer
+    matches anything. `source` is for driving the check against a KNOWN POSITIVE in the self-test
+    (an instrument that has never reported a defect has not been shown to be able to)."""
+    if source is None:
+        source = Path(__file__).resolve().read_text(encoding="utf-8")
+    found = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.FunctionDef) or node.name not in _IDENTITY_SEAM_PIN_FUNCTIONS:
+            continue
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Compare) and any(
+                    isinstance(op, (ast.In, ast.NotIn)) for op in inner.ops):
+                found.add((node.name, ast.unparse(inner)))
+            elif isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute) \
+                    and inner.func.attr in _IDENTITY_SEAM_CONTAINMENT_METHODS:
+                found.add((node.name, ast.unparse(inner)))
+    out = []
+    for name, expression in sorted(found - _IDENTITY_SEAM_DECLARED_CONTAINMENT):
+        out.append(f"{name} contains an UNDECLARED containment operator {expression!r}. The #972 "
+                   "seam claims every pin is equality on a parsed node or execution of the "
+                   "workflow's own code; a containment check on workflow SOURCE survives "
+                   "`: # exit 1`, `echo <cmd>` and `false && <cmd>`. Replace it with execution or "
+                   "equality, or declare it in _IDENTITY_SEAM_DECLARED_CONTAINMENT with the "
+                   "reason it is not a text check")
+    for name, expression in sorted(_IDENTITY_SEAM_DECLARED_CONTAINMENT - found):
+        out.append(f"_IDENTITY_SEAM_DECLARED_CONTAINMENT declares {expression!r} in {name}, which "
+                   "no longer exists — a stale exemption is exactly the hole a future containment "
+                   "pin would hide in; delete the declaration")
+    return out
+
+
+def _identity_block_violations(step):
+    """The two properties the #972 exit rests on, proved by RUNNING the workflow's own block:
+    a genuine App-bot PR still passes and binds `bot_login`, and a refusal binds a REFUSAL CODE
+    and NO `bot_login`. Never raises — an unrunnable block is a violation, not a pass."""
+    try:
+        script = step.get("run")
+        if not isinstance(script, str):
+            return ["jobs.run step `target` has no `run:` script"]
+        ok_code, ok_bound = _identity_block_run(script)
+        no_code, no_bound = _identity_block_run(script, pr_author="some-human")
+    except Exception as exc:      # noqa: BLE001 — an unrunnable seam proves nothing
+        return [f"jobs.run step `target` could not be executed ({exc!r}), so the #972 exit "
+                "cannot be proved — treated as broken"]
+    out = []
+    if ok_code != 0 or ok_bound.get("bot_login") != "registry-admin[bot]" \
+            or "refusal" in ok_bound:
+        out.append(f"the identity block no longer ADMITS a genuine App-bot-authored PR "
+                   f"(exit={ok_code!r}, bound={ok_bound!r})")
+    if no_bound.get("bot_login"):
+        out.append(f"the identity block BINDS bot_login on a refused PR (bound={no_bound!r}) — "
+                   "the fail-closed stop would not fire and the run would continue past an "
+                   "unverified target identity")
+    if not no_bound.get("refusal"):
+        out.append(f"the identity block RECORDS NO refusal code for a non-App-bot author "
+                   f"(bound={no_bound!r}) — the refusal is invisible to the outcome job and the "
+                   "PR is re-dispatched forever (registry #972 verbatim)")
+    return out
+
+
+def _identity_refusal_seam_violations(document):
+    """Every way review-fix.yml's #972 exit can be silently disabled, as NAMED violations.
+
+    Returns a sorted list — empty means the seam is intact. Positive proof only: an unreadable or
+    unexpectedly-shaped document is a violation, never a pass."""
+    out = []
+    jobs = (document or {}).get("jobs") if isinstance(document, dict) else None
+    if not isinstance(jobs, dict):
+        return ["review-fix.yml exposes no jobs mapping"]
+    run_job = jobs.get("run") if isinstance(jobs.get("run"), dict) else {}
+    outcome_job = jobs.get("outcome") if isinstance(jobs.get("outcome"), dict) else {}
+
+    # (1) The refusal must LEAVE the run job. Without this output nothing downstream can see it.
+    got = (run_job.get("outputs") or {}).get("identity_refusal")
+    if got != _IDENTITY_SEAM_RUN_OUTPUT:
+        out.append(f"jobs.run.outputs.identity_refusal must be {_IDENTITY_SEAM_RUN_OUTPUT!r} "
+                   f"(found {got!r}) — re-pointing or dropping it makes every refusal invisible "
+                   "to the outcome job again")
+
+    # (2) The identity step must still exist under the id the whole seam addresses...
+    index, step = _identity_step(run_job.get("steps"))
+    if step is None:
+        out.append("jobs.run has no step with id `target` — the #972 seam has no anchor")
+    else:
+        # ...and it must still WRITE the refusal, and still bind bot_login ONLY on its success
+        # path. Both are decided by RUNNING the workflow's own block — never by grepping it. A
+        # containment check here survived a `pass  # refusal={code}` mutant on this PR's first
+        # draft, which is precisely the class of false green the seam keeps producing.
+        out.extend(_identity_block_violations(step))
+
+    # (3) The FAIL-CLOSED stop. It is the only thing standing between a refusal and the model, now
+    #     that the identity step exits 0 on refusal. Compared for EQUALITY: `!= ''`, an added
+    #     `&& false`, an `always()`, or a re-point at another output all change this string.
+    stop = None
+    for candidate in (run_job.get("steps") or []):
+        if isinstance(candidate, dict) and candidate.get("if") == _IDENTITY_SEAM_REFUSE_IF:
+            stop = candidate
+            break
+    if stop is None:
+        ifs = [s.get("if") for s in (run_job.get("steps") or []) if isinstance(s, dict)]
+        out.append(f"jobs.run has no step whose `if:` is EXACTLY {_IDENTITY_SEAM_REFUSE_IF!r} — "
+                   f"without it a refused identity check no longer STOPS the run (found {ifs!r})")
+    else:
+        stop_index = (run_job.get("steps") or []).index(stop)
+        if index >= 0 and stop_index != index + 1:
+            out.append("the refusal stop must be the step IMMEDIATELY after `target`: any step "
+                       "between them runs with an unverified target identity")
+        # ...and it must actually FAIL, proved by EXECUTING it — never by looking for `exit 1` in
+        # its text, which four independently green mutants satisfy while the stop is inert.
+        out.extend(_identity_stop_violations(stop))
+
+    # (4) The outcome job must ADMIT the refusal path...
+    if outcome_job.get("if") != _IDENTITY_SEAM_OUTCOME_IF:
+        out.append(f"jobs.outcome.if must be EXACTLY {_IDENTITY_SEAM_OUTCOME_IF!r} (found "
+                   f"{outcome_job.get('if')!r}) — dropping the identity_refusal disjunct, or "
+                   "the `always()`, skips the job and restores the no-exit loop")
+    if "run" not in (outcome_job.get("needs") or []):
+        out.append("jobs.outcome must still `needs: run` — the refusal reaches it as a job "
+                   "output and nothing else")
+
+    # (5) ...and it must SURVIVE it. reverify fails on an empty verdict handoff, and a failed
+    #     step takes the recording step down with the job.
+    steps = outcome_job.get("steps") if isinstance(outcome_job.get("steps"), list) else []
+    reverify = next((s for s in steps if isinstance(s, dict) and s.get("id") == "reverify"), None)
+    if reverify is None:
+        out.append("jobs.outcome has no step with id `reverify` — the #972 gating cannot be "
+                   "pinned")
+    elif reverify.get("if") != _IDENTITY_SEAM_REVERIFY_IF:
+        out.append(f"jobs.outcome step `reverify` `if:` must be EXACTLY "
+                   f"{_IDENTITY_SEAM_REVERIFY_IF!r} (found {reverify.get('if')!r}) — without the "
+                   "identity_refusal conjunct it fails on the empty verdict handoff and takes "
+                   "the refusal record down with the whole job")
+
+    # (6) The recording step itself: present, correctly gated, fed from the job output via ENV,
+    #     invoking the CLI that owns the closed enum — and AFTER the token it needs.
+    record = next((s for s in steps if isinstance(s, dict)
+                   and isinstance(s.get("run"), str)
+                   and "identity-refusal" in s["run"]), None)
+    if record is None:
+        out.append("jobs.outcome has no step invoking `worker-pr.py identity-refusal` — the "
+                   "refusal reaches no durable outcome")
+    else:
+        if record.get("if") != _IDENTITY_SEAM_RECORD_IF:
+            out.append(f"the identity-refusal step's `if:` must be EXACTLY "
+                       f"{_IDENTITY_SEAM_RECORD_IF!r} (found {record.get('if')!r})")
+        env_got = (record.get("env") or {}).get("IDENTITY_REFUSAL")
+        if env_got != _IDENTITY_SEAM_RECORD_ENV:
+            out.append(f"the identity-refusal step's env.IDENTITY_REFUSAL must be "
+                       f"{_IDENTITY_SEAM_RECORD_ENV!r} (found {env_got!r}) — re-pointing it at a "
+                       "neighbouring output feeds the recorder the wrong reason")
+        # ...and the recorder must actually be INVOKED with that reason, proved by EXECUTING the
+        # step against a `python3` shim — never by looking for the flag in the step's text, which
+        # `echo <cmd>`, a commented-out command and `false && <cmd>` all satisfy inertly.
+        out.extend(_identity_record_violations(record))
+        token_index = next((i for i, s in enumerate(steps) if isinstance(s, dict)
+                            and s.get("id") == "app-token-outcome"), None)
+        if token_index is None or steps.index(record) < token_index:
+            out.append("the identity-refusal step must run AFTER `app-token-outcome`: it writes "
+                       "the park with that token, and before it there is none")
+    return sorted(out)
+
+
+def _identity_refusal_seam_self_test():
+    import yaml  # self-test-only, same lazy import as _workflow_step_python
+    import ast
+    worker_pr = _probe_worker_pr()
+    path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "review-fix.yml"
+    text = path.read_text(encoding="utf-8")
+    live = yaml.safe_load(text)
+    assert _identity_refusal_seam_violations(live) == [], \
+        _identity_refusal_seam_violations(live)
+
+    # ---- (0) [registry #979 round-2 finding 1] THE METHODOLOGY CLAIM, CHECKED RATHER THAN
+    # ASSERTED. Round 1's comment said "never a substring containment" while two pins were exactly
+    # that, and nothing in the suite could contradict the sentence. This walks the pins' own AST.
+    #
+    # THE INSTRUMENT IS VALIDATED AGAINST A KNOWN POSITIVE FIRST, because a checker that has never
+    # reported anything has not been shown to be ABLE to: the same source, with one containment
+    # pin injected into a pin function, must red — and the guard is worthless if it does not.
+    _pin_canary = re.sub(
+        r"(def _identity_stop_violations\(step\):\n)",
+        r"\1    _canary = 'exit 1' in str(step.get('run'))\n",
+        Path(__file__).resolve().read_text(encoding="utf-8"), count=1)
+    _canary_found = _identity_seam_pin_discipline_violations(_pin_canary)
+    assert "'exit 1' in str(step.get('run'))" in " ".join(_canary_found), (
+        "the containment-discipline checker FAILED ITS OWN KNOWN POSITIVE: an injected "
+        "`'exit 1' in step['run']` pin was not reported, so a clean report from it proves "
+        f"nothing (got {_canary_found!r})")
+    assert _pin_canary != Path(__file__).resolve().read_text(encoding="utf-8"), \
+        "the containment canary did not actually edit the source (a no-op canary validates " \
+        "nothing)"
+    print("  ok   #979 the containment-discipline checker REDS on a known-positive injected "
+          "containment pin (instrument validated before it is trusted)")
+    _pin_violations = _identity_seam_pin_discipline_violations()
+    assert _pin_violations == [], _pin_violations
+    print(f"  ok   #979 every containment operator surviving in the "
+          f"{len(_IDENTITY_SEAM_PIN_FUNCTIONS)} #972 pin functions is DECLARED with the reason "
+          "it is not a text check on workflow source (and no declaration is stale)")
+
+    # ---- (0b) [registry #979 round-2] THE VIOLATION BRANCHES NO DOCUMENT MUTANT DRIVES.
+    # Line-granular coverage of the two new executing pins found six such lines; each gets a test
+    # rather than a rationalisation, because an unreachable violation branch is a guard nobody has
+    # shown to work. All of them are POSITIVE-PROOF branches: an unreadable or unrunnable step is
+    # a violation, never a pass.
+    _live_stop = next(s for s in live["jobs"]["run"]["steps"]
+                      if isinstance(s, dict) and s.get("if") == _IDENTITY_SEAM_REFUSE_IF)
+    _live_record = next(s for s in live["jobs"]["outcome"]["steps"]
+                        if isinstance(s, dict) and isinstance(s.get("run"), str)
+                        and "identity-refusal" in s["run"])
+    assert _identity_stop_violations({"run": ["nope"]}) and \
+        _identity_record_violations({"run": ["nope"]}), \
+        "a non-string `run:` on the stop or the recorder must be a VIOLATION, not a crash"
+    # An UNRUNNABLE seam proves nothing, so it is a violation too: point the executor at a shell
+    # that does not exist and both pins must SAY SO rather than returning a clean list.
+    _saved_shell = list(_IDENTITY_SEAM_SHELL)
+    globals()["_IDENTITY_SEAM_SHELL"] = ["/nonexistent/no-such-shell-979", "-e"]
+    try:
+        _unrunnable = (_identity_stop_violations(_live_stop),
+                       _identity_record_violations(_live_record))
+    finally:
+        globals()["_IDENTITY_SEAM_SHELL"] = _saved_shell
+    assert all(any("could not be executed" in v for v in group) for group in _unrunnable), \
+        f"an unrunnable stop/recorder must be a named violation, got {_unrunnable!r}"
+    # The recorder RAN, and the step still failed: a failing recording step takes the outcome job
+    # — and therefore the refusal record — down with it, so it is its own violation.
+    _record_rc = _identity_record_violations({"run": _live_record["run"] + "\nexit 3\n"})
+    assert any("exits 3 even when the recorder succeeds" in v for v in _record_rc), _record_rc
+    # A STALE containment declaration is a violation in its own right (it is the hole a future
+    # containment pin hides in): remove the pin one of them describes and the checker must say so.
+    _stale_source = Path(__file__).resolve().read_text(encoding="utf-8").replace(
+        'if "run" not in (outcome_job.get("needs") or []):',
+        'if not (outcome_job.get("needs") or []):', 1)
+    assert _stale_source != Path(__file__).resolve().read_text(encoding="utf-8"), \
+        "the stale-declaration fixture did not edit the source (it would prove nothing)"
+    _stale = _identity_seam_pin_discipline_violations(_stale_source)
+    assert any("no longer exists" in v for v in _stale), _stale
+    print("  ok   #979 every violation branch of the two executing pins is DRIVEN: non-string "
+          "`run:`, an unrunnable shell, a recorder that ran inside a failing step, and a stale "
+          "containment declaration")
+
+    # ---- (A) THE BLOCK ITSELF, EXECUTED. Not a re-implementation: the workflow's own python.
+    _, step = _identity_step(live["jobs"]["run"]["steps"])
+    block = textwrap.dedent(step["run"][step["run"].index("<<'PY'\n") + 7:
+                                        step["run"].index("\nPY", step["run"].index("<<'PY'\n"))])
+
+    def drive(**kwargs):
+        return _identity_block_run(step["run"], **kwargs)
+
+    # THE PASS. The App bot authored its own PR: bot_login binds, no refusal is written.
+    code, bound = drive()
+    assert code == 0 and bound.get("bot_login") == "registry-admin[bot]" \
+        and "refusal" not in bound, (code, bound)
+    print("  ok   #972 the identity block still PASSES a genuine App-bot-authored PR")
+
+    # THE RED TEST'S FIRST HALF, by execution: the #657 self-attested class (human author) is
+    # refused with a NAMED code, and binds NO bot_login — which is what fails the run.
+    code, bound = drive(pr_author="jeswr")
+    assert code == 0 and bound == {"refusal": "author-not-app-bot"}, (code, bound)
+    print("  ok   #972 a self-attested (human-authored) PR refuses with a NAMED reason and "
+          "binds no bot_login")
+
+    # THE PAIRED CONTROL: a genuine foreign author — a spoofed `*[bot]` login from some OTHER
+    # App, the exact attacker this gate exists for — is refused identically. The missing exit is
+    # closed WITHOUT becoming an admission hole.
+    for hostile in ("evil[bot]", "mallory", "registry-admin[bot]x"):
+        code, bound = drive(pr_author=hostile)
+        assert code == 0 and bound == {"refusal": "author-not-app-bot"}, (hostile, code, bound)
+    print("  ok   #972 CONTROL: a spoofed/foreign author is STILL refused and still binds no "
+          "bot_login (the exit is not an admission hole)")
+
+    # ...and each of the other three refusals reaches its own declared code.
+    for name, kwargs, want in (
+            ("wrong target", {"full_name": "other/repo"}, "wrong-target"),
+            ("unsafe default branch", {"default_branch": "../evil"}, "unsafe-default-branch"),
+            ("non-App login", {"login": "human", "pr_author": "human"}, "not-an-app-bot"),
+            ("non-numeric App id", {"user_id": "abc", "pr_author": "registry-admin[bot]"},
+             "not-an-app-bot")):
+        code, bound = drive(**kwargs)
+        assert code == 0 and bound == {"refusal": want}, (name, code, bound)
+    print("  ok   #972 every refusal in the block reaches its own declared code and binds no "
+          "bot_login")
+
+    # ---- (B) THE DRIFT LOCK. The codes the workflow EMITS are exactly the codes worker-pr.py
+    # DECLARES. Derived from the AST of the workflow's own block (a regex over the text would
+    # count a code named in a comment), and from the production dict — not from a third list.
+    emitted = {node.args[0].value
+               for node in ast.walk(ast.parse(block))
+               if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+               and node.func.id == "refuse" and node.args
+               and isinstance(node.args[0], ast.Constant)
+               and isinstance(node.args[0].value, str)}
+    assert emitted == set(worker_pr.IDENTITY_REFUSAL_REASONS), (
+        "review-fix.yml's refusal codes and worker-pr.IDENTITY_REFUSAL_REASONS have DRIFTED: "
+        f"workflow emits {sorted(emitted)}, worker-pr declares "
+        f"{sorted(worker_pr.IDENTITY_REFUSAL_REASONS)}. An undeclared code makes the recording "
+        "step fail, which puts the PR straight back into the #972 loop.")
+    print(f"  ok   #972 drift lock: all {len(emitted)} workflow refusal codes are declared in "
+          "worker-pr.IDENTITY_REFUSAL_REASONS (AST-derived, both directions)")
+
+    # ---- (C) THE SECOND TICK. What the exit DELIVERS INTO: the production enumerator must stop
+    # seeing the PR. An exit that re-admits into the identical failing state produces nothing.
+    def _enumerated(labels):
+        return [item["state"] for item in enumerate_review_items(
+            PROBE_REPO,
+            [orchestrator_probe_pull() | {"labels": [{"name": n} for n in labels]}],
+            {orchestrator_probe_pull()["number"]: orchestrator_probe_record()},
+            [], {}, "2026-07-28T00:00:00Z",
+            enrolled_authors=(PROBE_ENROLLED_LOGIN,))]
+
+    before = _enumerated(("review:needs",))
+    after = _enumerated(("review:needs", "review:needs-user"))
+    assert before and not after, (
+        "the #972 exit must REMOVE the PR from the review frontier: the enumerator saw "
+        f"{before!r} before the park and {after!r} after (it must be empty, or the next tick "
+        "re-dispatches the identical run)")
+    print(f"  ok   #972 the terminal park DELIVERS an exit: enumerated {before} before, nothing "
+          "after — the second tick cannot re-dispatch it")
+
+    # ---- (D) THE YAML-SEAM MUTANTS. Two per guard: DELETED and CONDITIONALLY INERT. Every one
+    # is non-crashing (the violation list is returned, never an exception), and each must be
+    # caught as a NAMED violation.
+    # A mutant that does not actually MUTATE is a false kill waiting to happen: the violations it
+    # "caught" would be some pre-existing condition, not its own edit. So every mutant is required
+    # to change the parsed document, and to be caught by a NAMED violation.
+    def mutant(edit):
+        document = yaml.safe_load(text)
+        edit(document)
+        changed = document != yaml.safe_load(text)
+        return changed, _identity_refusal_seam_violations(document)
+
+    def run_steps(d):
+        return d["jobs"]["run"]["steps"]
+
+    def outcome_steps(d):
+        return d["jobs"]["outcome"]["steps"]
+
+    def find(steps, pred):
+        return next(s for s in steps if isinstance(s, dict) and pred(s))
+
+    def record_step(d):
+        return find(outcome_steps(d), lambda s: isinstance(s.get("run"), str)
+                    and "identity-refusal" in s["run"])
+
+    def stop_step(d):
+        return find(run_steps(d), lambda s: s.get("if") == _IDENTITY_SEAM_REFUSE_IF)
+
+    seam_mutants = {
+        # --- the run-job output (the wire out of the refusal) ---
+        "run output identity_refusal DELETED":
+            lambda d: d["jobs"]["run"]["outputs"].pop("identity_refusal"),
+        "run output identity_refusal re-pointed at a NEIGHBOURING step output":
+            lambda d: d["jobs"]["run"]["outputs"].__setitem__(
+                "identity_refusal", "${{ steps.target.outputs.bot_login }}"),
+        # --- the identity step's refusal writer ---
+        "the refuse() helper is DELETED (raise-instead-of-record, i.e. the #972 defect)":
+            lambda d: _identity_step(run_steps(d))[1].__setitem__(
+                "run", _identity_step(run_steps(d))[1]["run"].replace("def refuse(", "def _x(")),
+        "the refusal output write is COMMENTED OUT":
+            lambda d: _identity_step(run_steps(d))[1].__setitem__(
+                "run", _identity_step(run_steps(d))[1]["run"].replace(
+                    'handle.write(f"refusal={code}\\n")', 'pass  # refusal={code}')),
+        "the identity step loses its id (every steps.target.* reference dangles)":
+            lambda d: _identity_step(run_steps(d))[1].pop("id"),
+        "the identity step's `run:` is replaced by a non-string":
+            lambda d: _identity_step(run_steps(d))[1].__setitem__("run", ["nope"]),
+        # THE ADMISSION HOLE, stated as a mutant. Inverting the author comparison makes the gate
+        # refuse the App's OWN PRs and ADMIT every foreign author — the exact direction #972 must
+        # not drift in while closing the missing exit. It is caught on BOTH halves.
+        "the authorship comparison is INVERTED (admits every foreign author)":
+            lambda d: _identity_step(run_steps(d))[1].__setitem__(
+                "run", _identity_step(run_steps(d))[1]["run"].replace(
+                    'if os.environ["PR_AUTHOR"] != login:',
+                    'if os.environ["PR_AUTHOR"] == login:')),
+        # --- the fail-closed stop ---
+        "the refusal stop step is DELETED":
+            lambda d: d["jobs"]["run"].__setitem__(
+                "steps", [s for s in run_steps(d)
+                          if not (isinstance(s, dict)
+                                  and s.get("if") == _IDENTITY_SEAM_REFUSE_IF)]),
+        "the refusal stop is made CONDITIONALLY INERT (&& false)":
+            lambda d: stop_step(d).__setitem__(
+                "if", "${{ steps.target.outputs.bot_login == '' && false }}"),
+        "the refusal stop no longer FAILS (exit 1 -> exit 0)":
+            lambda d: stop_step(d).__setitem__(
+                "run", stop_step(d)["run"].replace("exit 1", "exit 0")),
+        "the refusal stop is moved AFTER the target checkout":
+            lambda d: run_steps(d).insert(
+                _identity_step(run_steps(d))[0] + 1, {"name": "wedge", "run": "true"}),
+        # [registry #979 round-2 finding 1] THE FOUR THAT SURVIVED ROUND 1. Every one of them
+        # leaves `exit 1` in the step's text — the pin here used to be `"exit 1" not in run` —
+        # and every one of them lets the job continue to the target checkout and the model with
+        # an UNVERIFIED target identity. They die now because the stop is EXECUTED.
+        "the refusal stop's `exit 1` is COMMENTED OUT (the text survives, the exit does not)":
+            lambda d: stop_step(d).__setitem__(
+                "run", stop_step(d)["run"].replace("exit 1", ": # exit 1")),
+        "the refusal stop's `exit 1` is made CONDITIONALLY DEAD (if false; then exit 1; fi)":
+            lambda d: stop_step(d).__setitem__(
+                "run", stop_step(d)["run"].replace(
+                    "exit 1", "if false; then exit 1; fi")),
+        "the refusal stop's `exit 1` is DEMOTED TO A MESSAGE (echo \"would exit 1\")":
+            lambda d: stop_step(d).__setitem__(
+                "run", stop_step(d)["run"].replace("exit 1", 'echo "would exit 1"')),
+        "the refusal stop gains continue-on-error: true (it fails, the JOB does not)":
+            lambda d: stop_step(d).__setitem__("continue-on-error", True),
+        "the refusal stop declares its own shell (different semantics than the one proved)":
+            lambda d: stop_step(d).__setitem__("shell", "bash --noprofile {0}"),
+        # --- the outcome job's admission ---
+        "the outcome job's identity_refusal disjunct is DELETED":
+            lambda d: d["jobs"]["outcome"].__setitem__(
+                "if", _IDENTITY_SEAM_OUTCOME_IF.replace(
+                    " || needs.run.outputs.identity_refusal != ''", "")),
+        # The exact shape that survived a CONTAINMENT check on a sibling PR tonight: the disjunct
+        # is still present character-for-character, and is dead. Equality sees it.
+        "the outcome job's disjunct is made CONDITIONALLY INERT (&& false)":
+            lambda d: d["jobs"]["outcome"].__setitem__(
+                "if", _IDENTITY_SEAM_OUTCOME_IF.replace(
+                    "needs.run.outputs.identity_refusal != '') }}",
+                    "(needs.run.outputs.identity_refusal != '' && false)) }}")),
+        "the outcome job loses always() (a failed run job skips it again)":
+            lambda d: d["jobs"]["outcome"].__setitem__(
+                "if", _IDENTITY_SEAM_OUTCOME_IF.replace("always() && ", "")),
+        "the outcome job stops depending on run":
+            lambda d: d["jobs"]["outcome"].__setitem__(
+                "needs", [n for n in d["jobs"]["outcome"]["needs"] if n != "run"]),
+        # --- surviving the path once admitted ---
+        "reverify's identity_refusal conjunct is DELETED (the job dies before recording)":
+            lambda d: find(outcome_steps(d), lambda s: s.get("id") == "reverify").__setitem__(
+                "if", "${{ inputs.mode == 'review' }}"),
+        "reverify loses its id (the #972 gating can no longer be addressed)":
+            lambda d: find(outcome_steps(d), lambda s: s.get("id") == "reverify").pop("id"),
+        "reverify's conjunct is made CONDITIONALLY INERT (|| true)":
+            lambda d: find(outcome_steps(d), lambda s: s.get("id") == "reverify").__setitem__(
+                "if", _IDENTITY_SEAM_REVERIFY_IF.replace(
+                    "needs.run.outputs.identity_refusal == ''",
+                    "(needs.run.outputs.identity_refusal == '' || true)")),
+        # --- the recording step ---
+        "the identity-refusal recording step is DELETED":
+            lambda d: d["jobs"]["outcome"].__setitem__(
+                "steps", [s for s in outcome_steps(d)
+                          if not (isinstance(s.get("run"), str)
+                                  and "identity-refusal" in s["run"])]),
+        "the recording step is guarded by if: false":
+            lambda d: record_step(d).__setitem__("if", "${{ false }}"),
+        "the recording step is made CONDITIONALLY INERT (&& false)":
+            lambda d: record_step(d).__setitem__(
+                "if", "${{ needs.run.outputs.identity_refusal != '' && false }}"),
+        "the recording step's env is re-pointed at a NEIGHBOURING output":
+            lambda d: record_step(d)["env"].__setitem__(
+                "IDENTITY_REFUSAL", "${{ needs.run.outputs.verdict_stale_reason }}"),
+        "the recording step stops passing --reason from the env":
+            lambda d: record_step(d).__setitem__(
+                "run", record_step(d)["run"].replace(
+                    '--reason "$IDENTITY_REFUSAL"', "--reason author-not-app-bot")),
+        "the recording step is hoisted ABOVE the App-token mint it needs":
+            lambda d: outcome_steps(d).insert(0, outcome_steps(d).pop(
+                outcome_steps(d).index(record_step(d)))),
+        # [registry #979 round-2 finding 1] THE FOUR THAT SURVIVED ROUND 1 on this side. Each
+        # keeps `--reason "$IDENTITY_REFUSAL"` character-for-character — the pin here used to be
+        # a containment check for exactly that string — while the recorder is NEVER INVOKED. On
+        # every one of them the refusal writes no census row and no park, so #972's loop is
+        # restored INVISIBLY while this suite prints "all mutants caught". They die now because
+        # the step is EXECUTED against a `python3` shim that reports whether it ran.
+        "the recording invocation is DEMOTED TO AN ECHO (argv printed, recorder never runs)":
+            lambda d: record_step(d).__setitem__(
+                "run", record_step(d)["run"].replace(
+                    "python3 registry/scripts/worker-pr.py",
+                    "echo python3 registry/scripts/worker-pr.py")),
+        "the recording invocation is COMMENTED OUT entirely":
+            lambda d: record_step(d).__setitem__(
+                "run", record_step(d)["run"].replace(
+                    "python3 registry/scripts/worker-pr.py",
+                    "# python3 registry/scripts/worker-pr.py")),
+        "the recording invocation is made CONDITIONALLY INERT (false && <cmd>)":
+            lambda d: record_step(d).__setitem__(
+                "run", record_step(d)["run"].replace(
+                    "python3 registry/scripts/worker-pr.py",
+                    "false && python3 registry/scripts/worker-pr.py")),
+        "the recording invocation is wrapped in a DEAD branch (if false; then <cmd>; fi)":
+            lambda d: record_step(d).__setitem__(
+                "run", record_step(d)["run"].replace(
+                    "python3 registry/scripts/worker-pr.py",
+                    "if false; then python3 registry/scripts/worker-pr.py").replace(
+                    '--reason "$IDENTITY_REFUSAL"', '--reason "$IDENTITY_REFUSAL"; fi')),
+        "the recording step declares its own shell (different semantics than the one proved)":
+            lambda d: record_step(d).__setitem__("shell", "bash --noprofile {0}"),
+        # --- whole-document shapes ---
+        "the run job's steps are replaced by a scalar":
+            lambda d: d["jobs"]["run"].__setitem__("steps", "nope"),
+        "the document is not a jobs mapping at all":
+            lambda d: d.__setitem__("jobs", "nope"),
+    }
+    results = {name: mutant(edit) for name, edit in seam_mutants.items()}
+    inert = [name for name, (changed, _v) in results.items() if not changed]
+    assert not inert, (
+        f"#972 seam mutants that did not actually MUTATE the document (a no-op mutant proves "
+        f"nothing and would report a pre-existing violation as its own kill): {inert}")
+    survivors = [name for name, (_c, violations) in results.items() if not violations]
+    assert not survivors, f"#972 review-fix.yml seam mutants NOT caught: {survivors}"
+    for name, (_c, violations) in results.items():
+        print(f"    killed by [{violations[0][:88]}] <- {name}")
+    print(f"  ok   #972 YAML seam: all {len(seam_mutants)} structural review-fix.yml mutants "
+          "(deleted AND conditionally-inert, per guard) MUTATE the document and are caught as "
+          "named violations")
+
+
 # ---- [registry #764] THE ABSORBING-PARK MACHINE EXIT ----------------------------------
 # Every guard below has a NAMED test that goes RED when the guard is deleted or inverted, and the
 # tests drive `absorbing_park_leg` ITSELF — the leg named in the fix — not only its pure helpers.
@@ -21642,6 +23038,21 @@ def _absorbing_park_leg_self_test():
         exec(block_source, namespace)  # noqa: S102 — the workflow's own block
         return [row["number"] for row in namespace["deferred_input"]]
 
+    def run_filter_rows(labels, block_source=block):
+        """`run_filter` but returning the EMITTED ROWS, so the deferred->ready swap the block
+        performs on its way out is assertable and not just its selection."""
+        rows = [{"number": 1, "state": "OPEN", "labels": sorted(labels), "open_blockers": 0}]
+        namespace = {"readiness_input": rows, "linked": set(),
+                     "details": {1: ({"author_association": "OWNER"}, sorted(labels), "")},
+                     "trusted": lambda _issue, _bots: True, "repo_trusted_bots": set()}
+        exec(block_source, namespace)  # noqa: S102 — the workflow's own block
+        return namespace["deferred_input"]
+
+    def _dispatch_plan():
+        """The READY lane's engine, loaded the same way the `#112` reduction rows above load it."""
+        return _load_module("registry_dispatch_plan",
+                            Path(__file__).resolve().with_name("dispatch-plan.py"))
+
     parked = ["status:deferred", "status:parked", "priority:P2", "role:impl", "area:x"]
     chk("[#764] the PLAN filter ADMITS a parked+deferred item (the park is a readmission hook)",
         run_filter(parked), [1])
@@ -21651,6 +23062,112 @@ def _absorbing_park_leg_self_test():
     assert mutated != block, "the needs:* clause moved — this mutation must stay live"
     chk("[#764] YAML seam: deleting the needs:* clause RESTORES the defect (retired item planned)",
         run_filter(parked + ["needs:user"], mutated), [1])
+
+    # (10) [registry #1054] THE OWNERSHIP GAP, at the same YAML seam. The filter used to skip a
+    # deferred row that also carried `status:ready` because "the ready lane owns it". It does not:
+    # `status:deferred` is in `ready-issues.BUSY_STATUS`, so the ready lane refuses the identical
+    # row. Both lanes excluded it, each believing the other held it, and on the live registry board
+    # 2026-07-28 that was 30 of 32 `status:ready` issues — a dispatchable frontier of ZERO. The
+    # WRITER is closed in triage.py; this seam is what stops the state being a DEADLOCK when any
+    # other actor (the maintainer did it to 6 of the 30) writes the pair by hand.
+    pair = ["status:deferred", "status:ready", "priority:P2", "role:impl", "area:x"]
+    rows = run_filter_rows(pair)
+    chk("[#1054] the PLAN filter ADMITS a ready+deferred pair instead of stranding it",
+        [row["number"] for row in rows], [1])
+    # The swap at the foot of the block is a set union, so an already-`status:ready` row must be
+    # handed to the engine in the SAME shape as a lone deferred row — not double-labelled, not
+    # left carrying `status:deferred` into a readiness computation that would refuse it again.
+    chk("[#1054] ...and the deferred->ready swap is IDEMPOTENT when status:ready is already there",
+        (rows[0]["labels"] if rows else None,
+         (run_filter_rows([lb for lb in pair if lb != "status:ready"]) or [{}])[0].get("labels")),
+        (sorted(set(pair) - {"status:deferred"}), sorted(set(pair) - {"status:deferred"})))
+    # THE COMPOSITION that made this a deadlock rather than a delay: the OTHER lane must genuinely
+    # refuse the same row. Asserting only this lane's admission would leave "both lanes take it"
+    # (a double-dispatch) indistinguishable from the fix.
+    _ready_rows = [{"number": 1, "state": "OPEN", "labels": sorted(pair), "open_blockers": 0}]
+    chk("[#1054] ...while the READY lane still refuses it — status:deferred stays BUSY, unrelaxed",
+        [row["number"] for row in _dispatch_plan().compute_ready(list(_ready_rows))], [])
+    # Every other gate on the pair must still hold, or this admission is a hole rather than a fix.
+    for gate in ("needs:user", "status:in-progress", "status:blocked", "trust:untrusted",
+                 "status:untriaged"):
+        chk(f"[#1054] ...and the pair is STILL gated by {gate}", run_filter(pair + [gate]), [])
+    # MUTATION at the YAML seam. Restoring the one clause that was deleted must restore the
+    # deadlock — and it must do so while `deferred_input`, the loop and the swap are all still
+    # structurally present, which is exactly what the assertions above inspect.
+    regressed = block.replace('if "status:deferred" not in labels:',
+                              'if "status:deferred" not in labels or "status:ready" in labels:')
+    assert regressed != block, "the #1054 candidate clause moved — this mutation must stay live"
+    chk("[#1054] YAML seam: restoring the `status:ready` clause RESTORES the deadlock",
+        run_filter(pair, regressed), [])
+    chk("[#1054] ...and the restored clause leaves a LONE deferred row admitted — so only the "
+        "pair row above can kill it",
+        run_filter([lb for lb in pair if lb != "status:ready"], regressed), [1])
+
+    # (11) [registry #1054 round 2] THE PLAN->CLAIM COMPOSITION — the seam this fix first FAILED at,
+    # and the reason a PLAN-side census is not evidence of work. PLAN's deferred->ready swap is
+    # IN-MEMORY, for the readiness computation only: `dispatch.yml` emits `details[number]` — the
+    # REAL labels — so every admitted pair arrives at CLAIM still carrying `status:deferred` AND
+    # `status:ready`, and CLAIM re-fetches them live anyway. The first draft of this PR removed the
+    # `status:ready` clause from PLAN alone; PLAN's frontier went 1 -> 9 and dispatchable work
+    # stayed at 1, because `_current_issue_matches` carried a SECOND copy of the same false premise
+    # ("normal path will dispatch it") and rejected 32 of 32 pairs with no backfill. `grep` for that
+    # sentence returned exactly one hit — the source line — so nothing anywhere covered this seam.
+    # These rows are that cover: they run PLAN's real block, build the item EXACTLY as dispatch.yml
+    # builds it, and put it through the real CLAIM predicate.
+    _real_labels = sorted(pair)
+    _planned = run_filter_rows(pair)
+    chk("[#1054] the swap is IN-MEMORY: PLAN's row carries ready-without-deferred, but the ITEM "
+        "dispatch.yml emits carries the REAL labels — so CLAIM sees the pair, not the swap",
+        (_planned[0]["labels"] if _planned else None, "status:deferred" in _real_labels),
+        (sorted(set(pair) - {"status:deferred"}), True))
+    _body = "deferred retry work"
+
+    def _live_issue(labels, body=_body):
+        """The payload CLAIM's own live re-fetch returns — the shape that makes the swap moot."""
+        return {"state": "open", "user": {"login": "maintainer"}, "author_association": "MEMBER",
+                "labels": [{"name": name} for name in labels], "body": body}
+
+    def _claim_admits(match_fn, labels, module_globals=None):
+        item = {"number": 700, "labels": sorted(labels), "author": "maintainer",
+                "body_sha": hashlib.sha256(_body.encode()).hexdigest(), "deferred": True}
+        target = globals() if module_globals is None else module_globals
+        prev_json, prev_trust = target.get("_gh_json"), target.get("_issue_is_trusted")
+        target["_gh_json"] = lambda _args: _live_issue(item["labels"])
+        target["_issue_is_trusted"] = lambda *a, **k: True
+        try:
+            return match_fn("example/repo", item, frozenset())
+        finally:
+            target["_gh_json"], target["_issue_is_trusted"] = prev_json, prev_trust
+
+    _passed, _why = _claim_admits(_current_issue_matches, _real_labels)
+    chk("[#1054] END-TO-END: a pair PLAN admits is also admitted by CLAIM (PLAN-side census alone "
+        "is NOT dispatchable work)", (_passed, _why), (True, ""))
+    chk("[#1054] ...and CLAIM still REFUSES a deferred row that is genuinely gated",
+        _claim_admits(_current_issue_matches, _real_labels + ["needs:user"])[0], False)
+    # The CLAIM-side mutant: restore the second copy of the premise. PLAN still admits the row —
+    # every row above this one stays green — and the composition dies. That is precisely the shape
+    # that shipped, so it must be pinned from BOTH ends.
+    _claim_src = Path(__file__).resolve().read_text(encoding="utf-8")
+    # The anchor is ASSEMBLED at runtime so the full literal never appears in this file — a test
+    # that quotes its own target counts itself and fails closed on a healthy tree (it did, once).
+    _anchor = '        return False, "issue is no longer ' + 'deferred"\n'
+    assert _claim_src.count(_anchor) == 1, (
+        "[#1054] the deferred CLAIM gate moved — this mutation must stay live "
+        f"(anchor occurrences: {_claim_src.count(_anchor)})")
+    _regressed_claim = _claim_src.replace(
+        _anchor,
+        _anchor
+        + '        if "status:ready" in labels:\n'
+        + '            return False, "issue already re-' + 'attested ready"\n')
+    _ns = {"__name__": "dispatch_claim_mutant", "__file__": str(Path(__file__).resolve())}
+    exec(compile(_regressed_claim, "<mutant:claim-reattested>", "exec"), _ns)  # noqa: S102
+    _mut_match = _ns["_current_issue_matches"]
+    chk("[#1054] MUTANT claim-reattested: restoring the SECOND copy of the premise makes CLAIM "
+        "reject the pair PLAN just admitted — the exact defect that shipped",
+        _claim_admits(_mut_match, _real_labels, _ns)[0], False)
+    chk("[#1054] ...while that mutant still admits a LONE deferred row — so only the pair row "
+        "above can kill it, and a lone-deferred control cannot mask it",
+        _claim_admits(_mut_match, sorted(set(pair) - {"status:ready"}), _ns)[0], True)
 
 
 def _dispatch_yaml_block(path, step_id, marker):

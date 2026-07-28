@@ -396,6 +396,81 @@ jobs:
   # the maintainer via the SAME ALERT_REPO/ALERT_TOKEN routing (locked decision 22c); it auto-closes
   # on an explicit GROOM success. It downloads no sweep artifact and reads only the job RESULT, so no
   # token or ledger data reaches it.
+  # [OPUS-5] CI EXECUTION-LATENCY WATCHDOG (companion to sparq-org/sparq#4810). Maintainer-asked
+  # for alerting when runners are not picked up for crons or delayed for other dispatches. The
+  # existing ring (dispatch-stall / metrics-stale / cron-keepalive / triage-stock) watches NAMED
+  # lanes for LIVENESS; none of them measures execution LATENCY, and a full-tree grep for
+  # latenc|duration|elapsed|run_started_at|percentile over every script on master finds no
+  # workflow-run-duration or queue-wait consumer. Three modes: a scheduled lane firing below what
+  # GitHub will actually deliver (this mode produces NO artifact — there is no run to inspect), a run
+  # held in `queued` past a measured threshold (runner availability proper — MEASURED here:
+  # seven pr-gate runs held 12.8-99.5 min inside 00:58Z-02:24Z on 2026-07-28), and a run
+  # `in_progress` past its own lane's measured duration (it consumes capacity while looking healthy).
+  #
+  # Hosted here with NO `needs:` and NO `if:`, exactly like metrics-stale and dispatch-stall: a
+  # watcher hosted inside the watched job cannot observe the watched job's absence. The alert step is
+  # `continue-on-error: true` so a watchdog fault can never red the grooming sweep. The signal is one
+  # rolling `ops-alert` per mode, closed on explicit recovery. It holds `issues: write` and nothing
+  # that could label a PR — in particular it never applies `needs:user` or any other hold.
+  ci-latency:
+    name: WATCHDOG (is CI execution latency inside its measured band?)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # SECRET-EXFIL GUARD (issue #101): reads ALERT_TOKEN/ALERT_REPO (the private-alert routing
+    # secrets), so it is bound to the default-branch-only `dispatch-secrets` environment where those
+    # secrets live, exactly as groom-alert and dispatch-stall are.
+    environment: dispatch-secrets
+    permissions:
+      actions: read    # list workflow runs + live run state
+      contents: read   # minimum for the sparse checkout below
+      issues: write    # upsert/close the rolling ci-latency ops-alert issues
+    steps:
+      # KEEP IN SYNC with REQUIRED_FILES in scripts/ci-latency-alert.py — the self-test asserts
+      # both directions, so dropping an input reds instead of making the YAML-seam assertions
+      # silently unreachable on the live path. `.github/workflows` is an INPUT, not incidental:
+      # M1 derives each lane's expectation from the workflow files themselves.
+      - name: Check out ONLY the watchdog's inputs (pinned, sparse, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/ci-latency-alert.py
+            scripts/selftest-suite.txt
+            .github/workflows/groom.yml
+            .github/workflows
+          sparse-checkout-cone-mode: false
+      - name: Ensure PyYAML for the watchdog's workflow parsing
+        run: |
+          set -euo pipefail
+          if python3 -c 'import yaml' 2>/dev/null; then
+            echo "PyYAML already present; no install needed"
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/ci-latency-requirements.txt" <<'REQ'
+          pyyaml==6.0.2 \
+              --hash=sha256:80bab7bfc629882493af4aa31a4cfa43a4c57c83813253626916b8c7ada83476 \
+              --hash=sha256:1f71ea527786de97d1a0cc0eacd1defc0985dcf6b3f17bb77dcfc8c34bec4dc5
+          REQ
+          python3 -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary=:all: -r "$RUNNER_TEMP/ci-latency-requirements.txt"
+          python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
+      # A detector is never trusted to watch anything before it has proved itself on this tick's
+      # code, so the self-test runs FIRST and is NOT continue-on-error.
+      - name: Self-test the CI execution-latency watchdog (hermetic fixtures)
+        run: python3 registry/scripts/ci-latency-alert.py --self-test
+      - name: Alert maintainer if CI execution latency is outside its measured band
+        id: ci-latency
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          ALERT_REPO: ${{ secrets.ALERT_REPO }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MAINTAINER_HANDLE: jeswr
+        run: python3 registry/scripts/ci-latency-alert.py
+
   groom-alert:
     name: ALERT (hard GROOM-job failure)
     needs: [groom]

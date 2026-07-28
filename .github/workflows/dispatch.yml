@@ -218,7 +218,16 @@ jobs:
       # check-run listing skips THAT PR with a recorded reason instead of failing the sweep —
       # the run-29617040167 fix) and reads check runs gate-filtered (check_name=gate, the
       # d2c0dd0 pattern) so merge-queue churn heads with hundreds of runs stay one small page.
+      # [sparq#4819 round 2] `id:` so scripts/dispatch-plan.py --self-test can LOCATE this step and
+      # refuse the ways it can stop producing while every assertion downstream stays green. The
+      # readiness (consumer) seam has been pinned since #4329; this PRODUCER seam was not, and the
+      # round-1 review measured four survivors here — the step disabled with `if: false`, its
+      # failure swallowed by `continue-on-error:`, its invocation neutralised with `|| true`, and
+      # the output file renamed. Each degrades to the fail-safe every-PR-reserves path WITH a
+      # warning, so none of them is a correctness hole; all four are silent throughput loss, which
+      # is the same class as the defect this whole change closes.
       - name: Snapshot target issues and pull requests (authenticated, registry-inline only)
+        id: snapshot
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -572,22 +581,217 @@ jobs:
                       return False, "planner does not RESERVE a pull request's declared area"
                   return True, "reserves PR areas and never dispatches a PR row"
 
+              # [sparq#4819] NO `>>> ... <<<` SENTINELS HERE, ON PURPOSE: nothing extracts this
+              # range on its own, and a marker implying a guard it does not have is the vacuity
+              # class this repository already tracks. What covers this block is stronger — the
+              # WHOLE step heredoc is extracted and EXECUTED by scripts/dispatch-plan.py
+              # --self-test (`_run_readiness`), so the CALL SITE below is under test too, which
+              # is where every uncaught mutant in this repo's history has lived.
+              # THE TWO PARTITION LEGS DISAGREED ABOUT THE SAME PR. CLAIM's
+              # `busy_packages_of_pulls` frees a machine-parked (`review:parked`) PR's crates when
+              # `_pull_inactivity_decision` proves it a defused draft, and says so every tick
+              # (`claim-revalidation free: crate X freed via parked pr#N` — MEASURED 142 events
+              # over 57 crates in ONE tick). But THIS leg runs FIRST and COMMITS the frontier, and
+              # `occupancy_input` carried only {number,state,labels,open_blockers,pull_request} —
+              # no `draft`, no `auto_merge` — so the predicate could not be evaluated where the
+              # decision was made. PLAN reserved exactly the crates CLAIM was about to free. The
+              # registry's carve-out was live, loud, and DEAD.
+              #
+              # WHAT IT IS WORTH, AND WHAT THAT NUMBER IS NOT. A round-1 comment here read
+              # "frontier 1 -> 9 with the attestation carried" and claimed a verbatim replay as
+              # its source. That measured the LEVER — this consumer against a planner that
+              # already honoured the field — not the state either PR shipped: sparq's
+              # `dispatch-plan.py` did not export `INERT_FIELD`, so a verbatim replay of the
+              # merged trees printed `NOT STAMPED (planner declares no inertness contract)` and
+              # released nothing. The re-export landed in sparq#4823 round 2; the figure below is
+              # a replay of THAT pair. It is a per-tick yield, not a property of this code —
+              # releasing a key only moves the frontier when some candidate was waiting on
+              # exactly that key, so it swings with the board and a repeat run will differ.
+              #
+              # MEASURED by replaying this step verbatim (2026-07-28, live sparq snapshot: 1721
+              # issue rows / 91 open PRs / 33 `review:parked`, sparq's own engine, this repo's
+              # `inertness_attestation` as producer). What is RELEASED is structural and
+              # reproduced on every board it was run against: 33 of 33 parked PRs attested inert;
+              # PR-held `area:` keys 40 -> 25, 15 fully released with NO key losing a holder that
+              # is not itself an attested machine park; `docs` 34 -> 25 and `ci` 30 -> 27 stay
+              # held, as the union rule requires; candidates unchanged.
+              #
+              # NO FRONTIER DELTA IS PINNED HERE, and the omission is deliberate. An earlier
+              # revision of this comment hard-coded one; three verbatim replays of this step over
+              # the same week returned +7, +2 and +3 while agreeing on the release semantics every
+              # time. The spread IS the finding — a released key moves the frontier only if some
+              # candidate happened to be waiting on exactly that key — so any single figure here
+              # is stale by the next tick and misleads the next reader. For a CURRENT number read
+              # the censuses this step already prints every tick:
+              #   `parked-release census <repo>: stamped|NOT STAMPED (...); N of M attested inert;
+              #    K machine-parked row(s) release their areas: ...`
+              #   `partition census <repo>: candidates= frontier= partition-deferred= ...`
+              #
+              # NOT a second predicate — an ANSWER. `raw-inertness-<i>.json` is written by the
+              # AUTHENTICATED registry-inline snapshot step (plan-snapshot.py), which runs before
+              # ANY target code executes (REG-4), from the registry's OWN
+              # `_pull_inactivity_decision` over the same listing+detail pair CLAIM reads. This
+              # step, which is the hostile half, only reads the boolean. Two implementations of
+              # "would parking this PR really free its crates?" is the drift that caused the
+              # defect; a third would make it worse.
+              #
+              # FAIL-CLOSED AT EVERY SEAM, AND THE LIST IS EXHAUSTIVE. Missing file, UNREADABLE OR
+              # TRUNCATED file, incomplete document, non-dict items, non-decimal key, non-True
+              # value, PR absent from the map -> False -> the row keeps its areas, i.e. exactly
+              # today's behaviour. Round 2 made the truncated case match these words: it used to
+              # raise out of `json.loads` and kill the step for every target. And the field is
+              # stamped ONLY on a planner that PROVES it consumes it correctly in BOTH directions
+              # (`inert_aware`, probed by execution against the loaded engine — never sniffed from
+              # an attribute, the `pr_row_aware` doctrine). A target that has not shipped the
+              # consumer is byte-identical to today and says so out loud, with an ANNOTATION.
+              #
+              # WHAT FAIL-CLOSED DOES *NOT* MEAN HERE. It does not mean the map is unforgeable.
+              # The target's `dispatch-plan.py` is `exec_module`d ~250 lines above, BEFORE this
+              # read, in this job, on this filesystem — a hostile target can rewrite
+              # `raw-inertness-<i>.json` at import time (demonstrated: `0 of 1` -> `2999 of
+              # 2999`). PLAN is the unprivileged advisory half by construction; CLAIM re-derives
+              # `_pull_inactivity_decision` over its own authenticated read before any launch, so
+              # a forged map can only over-propose rows CLAIM then drops. Same fail-direction as
+              # the trust and linked-PR filters below.
+              inert_map = {}
+              inert_path = Path(out_dir, f"raw-inertness-{index}.json")
+              if not inert_path.is_file():
+                  print(f"::warning::{repo}: no inertness attestation "
+                        f"(raw-inertness-{index}.json absent) — every open PR reserves its areas, "
+                        "including provably-inert machine-parked drafts CLAIM will free later "
+                        "this tick. PLAN and CLAIM will disagree (sparq#4819).")
+              else:
+                  # UNREADABLE/TRUNCATED DEGRADES, it does not abort. Round-2 review: the words
+                  # above claim every seam degrades to today's behaviour, but a truncated or
+                  # empty document raised out of `json.loads` and killed the step for EVERY
+                  # target repo. `raw-issues-*.json` DOES hard-fail that way and is right to —
+                  # a partial issue listing plans the wrong frontier. This document is different
+                  # in kind: it is an OPTIONAL enhancement whose ABSENT case already degrades two
+                  # lines up, so hard-failing on truncation made "absent" and "half-written" —
+                  # the same accident, one fsync apart — behave oppositely. The words and the
+                  # behaviour now agree, and the direction is the conservative one: every PR
+                  # reserves its areas, exactly as before sparq#4819.
+                  try:
+                      inert_doc = json.loads(inert_path.read_text(encoding="utf-8"))
+                  except (ValueError, OSError, UnicodeDecodeError) as exc:
+                      inert_doc = None
+                      print(f"::warning::{repo}: inertness attestation is unreadable "
+                            f"({type(exc).__name__}) — falling back to every-PR-reserves "
+                            "(fail closed, sparq#4819).")
+                  if (isinstance(inert_doc, dict) and inert_doc.get("complete") is True
+                          and isinstance(inert_doc.get("items"), dict)):
+                      # `isdecimal`, NOT `isdigit`. Round-2 review found a real crash: `isdigit()`
+                      # admits Unicode digit-but-not-decimal characters — "²" (SUPERSCRIPT
+                      # TWO) and every other superscript/circled digit answer True — and `int()`
+                      # then raises ValueError out of the comprehension, killing the readiness
+                      # step for EVERY target repo. The key is a JSON object key, i.e. attacker-
+                      # reachable in any hostile-producer story, and one such key was a total
+                      # PLAN outage rather than a dropped row. `isdecimal()` is exactly the set
+                      # `int()` accepts, so the guard and the conversion now agree.
+                      inert_map = {int(number): value is True
+                                   for number, value in inert_doc["items"].items()
+                                   if str(number).isdecimal()}
+                  elif inert_doc is not None:
+                      print(f"::warning::{repo}: inertness attestation is malformed or "
+                            "incomplete — falling back to "
+                            "every-PR-reserves (fail closed, sparq#4819).")
+
+              def inert_aware(planner):
+                  """Does `planner` release a machine-parked area on an ATTESTED row and HOLD it
+                  otherwise? Both directions, PROBED BY EXECUTION against the loaded engine.
+
+                  An attribute sniff would pass for a planner that merely declares the constants;
+                  what must be true is the BEHAVIOUR, and only the second probe can see it. The
+                  refusal direction is checked first and is the one that matters: an engine that
+                  frees a machine park with NO attestation is the unconditional-release fix
+                  sparq#4819 explicitly forbids, and it must not be handed attestations that make
+                  it look sanctioned. Fail-closed: anything unprovable returns (None, why) and the
+                  field is not stamped at all, leaving today's behaviour exactly."""
+                  field = getattr(planner, "INERT_FIELD", None)
+                  label = getattr(planner, "MACHINE_PARK_PR_LABEL", None)
+                  if not isinstance(field, str) or not isinstance(label, str):
+                      return None, "planner declares no inertness contract"
+                  area = "area:__inert_probe__"
+                  rival = {"number": 999000012, "state": "OPEN", "open_blockers": 0,
+                           "labels": ["status:ready", "priority:P0", "role:impl", area]}
+                  holder = {"number": 999000011, "state": "OPEN", "open_blockers": 0,
+                            "pull_request": {}, "labels": [area, label]}
+                  try:
+                      held = [row.get("number") for row in planner.compute_ready(
+                          [dict(holder), dict(rival)])]
+                      freed = [row.get("number") for row in planner.compute_ready(
+                          [dict(holder, **{field: True}), dict(rival)])]
+                  except Exception as exc:                        # noqa: BLE001 — hostile target
+                      return None, f"probe raised {type(exc).__name__}"
+                  if held:
+                      return None, ("planner RELEASES a machine-parked area with no attestation "
+                                    "— refusing to feed it attestations")
+                  if freed != [999000012]:
+                      return None, "planner ignores the inertness attestation"
+                  return field, (f"releases an attested machine park via `{field}` and holds an "
+                                 "unattested one")
+
               occupancy_input = []
               pr_aware, pr_aware_why = pr_row_aware(dispatch)
+              inert_field, inert_why = inert_aware(dispatch)
+              if inert_field is None:
+                  # THE ANNOTATION ASYMMETRY THAT HID THE FIRST ROUND'S NO-OP. Both `::warning::`
+                  # annotations above cover the FILE seams — attestation absent, attestation
+                  # malformed. This one, the PLANNER seam, was a plain `print` buried mid-line in
+                  # the census. It is also the ONLY degradation that fired: the producer wrote a
+                  # complete document, every parked PR attested, and the target's dispatch-plan.py
+                  # did not export the two names, so the whole answer was computed and DISCARDED
+                  # with no annotation anywhere in the run. Round 1 shipped as a measured no-op
+                  # underneath a green run for exactly this reason.
+                  #
+                  # ALWAYS annotated when it fires, including when nothing attested inert this
+                  # tick: a degradation that only announces itself on ticks that had something to
+                  # lose is invisible on precisely the ticks where the loss is being established.
+                  # The counts ride along so the magnitude is readable without a second query.
+                  print(f"::warning::{repo}: PLAN computed an inertness attestation "
+                        f"({sum(1 for value in inert_map.values() if value)} of "
+                        f"{len(inert_map)} open PR(s) provably inert) and DISCARDED it — "
+                        f"{inert_why}. Machine-parked areas stay reserved here while CLAIM frees "
+                        "them later this tick, so PLAN and CLAIM disagree (sparq#4819).")
               if pr_aware:
                   for pull in pr_rows:
                       pr_number = pull.get("number")
                       if not isinstance(pr_number, int) or pr_number <= 0:
                           raise SystemExit("target pull-request row is malformed")
-                      occupancy_input.append({
+                      row = {
                           "number": pr_number,
                           "state": "OPEN",
                           "labels": label_names(pull),
                           "open_blockers": 0,
                           "pull_request": {},
-                      })
+                      }
+                      if inert_field is not None:
+                          # `inert_map`'s values were normalised to real booleans with `is True`
+                          # where the document was parsed; a second `is True` here would be a
+                          # redundant guard no mutant can kill, i.e. a guard that looks like
+                          # protection and is not. One normalisation point, tested at that point.
+                          row[inert_field] = inert_map.get(pr_number, False)
+                      occupancy_input.append(row)
                   print(f"{repo}: PLAN occupancy carries {len(occupancy_input)} open pull-request "
                         f"row(s) — {pr_aware_why}")
+                  # ALWAYS printed, INCLUDING at zero and including when the field is not stamped:
+                  # a carve-out that silently stops firing is indistinguishable from one that has
+                  # nothing to free, and this repository has already paid for that twice
+                  # (#753/#762). Names every released crate so the throughput/conflict trade
+                  # sparq#4819 accepts is auditable per tick rather than argued about.
+                  released = sorted(
+                      (row["number"], sorted(lb[5:] for lb in row["labels"]
+                                             if lb.startswith("area:")))
+                      for row in occupancy_input
+                      if inert_field is not None and row.get(inert_field) is True
+                      and getattr(dispatch, "MACHINE_PARK_PR_LABEL", None) in row["labels"])
+                  detail = ", ".join(f"pr#{number}:{'+'.join(areas) or '<none>'}"
+                                     for number, areas in released) or "none"
+                  print(f"parked-release census {repo}: "
+                        f"{'stamped' if inert_field else 'NOT STAMPED'} "
+                        f"({inert_why}); {sum(1 for value in inert_map.values() if value)} of "
+                        f"{len(inert_map)} open PR(s) attested inert; "
+                        f"{len(released)} machine-parked row(s) release their areas: {detail}")
               else:
                   print(f"::warning::{repo}: target readiness engine is NOT pull-request-aware "
                         f"({pr_aware_why}) — PLAN reserves the ISSUE half of every unit of work "
@@ -710,13 +914,34 @@ jobs:
               # extracted between these sentinels and RUN against fixtures; removing either
               # sentinel makes that extraction FAIL CLOSED. Its only inputs are
               # `readiness_input`, `linked`, `details`, `trusted` and `repo_trusted_bots`.
+              #
+              # [registry #1054] THE OWNERSHIP GAP. This filter used to read
+              #     if "status:deferred" not in labels or "status:ready" in labels: continue
+              # — skipping any deferred row that also carried `status:ready`, on the premise that
+              # the ORDINARY ready lane owned it. That premise is false, and provably so in the
+              # ONE state where the clause can fire: reaching it requires `status:deferred`, and
+              # `status:deferred` is in `ready-issues.BUSY_STATUS`, so `compute_ready` refuses the
+              # very same row (`readiness defer #N: busy: status:deferred`). The clause therefore
+              # never once prevented a double-selection — by construction no row can be in both
+              # `ready` and this candidate set — and its only reachable effect was to make the
+              # ready+deferred pair invisible to BOTH lanes at once, each excluding it in the
+              # belief that the other held it. MEASURED on the live registry board 2026-07-28:
+              # 30 of 32 `status:ready` issues carried the pair, clean ready frontier = 0.
+              # The pair's WRITER is closed separately in scripts/triage.py (the classifier was
+              # re-stamping `status:ready` onto issues the dispatcher had just deferred); this
+              # half makes the deadlock non-recurrent for any pair a HUMAN writes — the maintainer
+              # did exactly that to 6 of the 30, and today that gesture achieves nothing at all.
+              # The swap below is idempotent when `status:ready` is already present (set union),
+              # so an admitted pair is handed to the engine in the same shape as a lone deferred
+              # row. This does NOT relax the busy set: `status:deferred` still means busy to the
+              # ready lane, and every other gate on this row is re-derived live by CLAIM.
               retry_gated = {"status:blocked", "status:in-progress",
                              "status:in-progress-review", "status:untriaged", "trust:untrusted"}
               deferred_input = []
               for row in readiness_input:
                   labels = set(row["labels"])
                   number = row["number"]
-                  if "status:deferred" not in labels or "status:ready" in labels:
+                  if "status:deferred" not in labels:
                       continue
                   if labels & retry_gated or any(l.startswith("needs:") for l in labels):
                       continue
@@ -751,6 +976,32 @@ jobs:
               deferred_ready = dispatch.compute_ready(
                   occupancy_input + in_flight_input + deferred_input,
                   in_progress_packages=taken)
+              # [sparq#4819] Same no-sentinel rule as the attestation block above: the whole
+              # heredoc is executed by `_run_readiness`, so this line is asserted on its real
+              # output rather than pattern-matched. The READY lane has named its partition attrition every tick since the
+              # `partition census` line above landed; this lane, which runs the SAME
+              # one-unit-per-package selection over its own candidate set AND inherits the ready
+              # lane's `taken` keys on top, printed NOTHING. So "the retry lane offered 2 rows"
+              # was indistinguishable from "the retry lane had 2 candidates" and from "the retry
+              # lane is broken", and no amount of reading the log could tell them apart. Same
+              # shape as the ready census deliberately — same field names, always printed,
+              # ZERO INCLUDED — so the two lanes are comparable line-for-line. Costs no API
+              # requests: `deferred_input` and `deferred_ready` are already in memory. Its only
+              # inputs are `deferred_input`, `deferred_ready`, `taken`, `dispatch` and `repo`.
+              _def_selected = {row.get("number") for row in deferred_ready}
+              _def_contended = {}
+              for _row in deferred_input:
+                  if _row.get("number") in _def_selected:
+                      continue
+                  for _pkg in dispatch.packages_of(dispatch.labels_of(_row)):
+                      _def_contended[_pkg] = _def_contended.get(_pkg, 0) + 1
+              _def_top = ", ".join(
+                  f"{_k}={_v}" for _k, _v in
+                  sorted(_def_contended.items(), key=lambda kv: (-kv[1], kv[0]))[:8]) or "none"
+              print(f"deferred census {repo}: candidates={len(deferred_input)} "
+                    f"frontier={len(deferred_ready)} "
+                    f"partition-deferred={max(0, len(deferred_input) - len(deferred_ready))} "
+                    f"ready-lane-keys-held={len(taken)} top-contended: {_def_top}")
 
               routing_doc = dispatch._routing_doc()
               flagged_rows = [(row, False) for row in dispatch.plan_dispatch(ready, routing_doc)]

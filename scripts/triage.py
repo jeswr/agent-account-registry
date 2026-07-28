@@ -8,7 +8,10 @@ Given an issue's labels + type, decide the labels to ADD/REMOVE and whether it i
   * role     — from a `kind:*` label, the issue type, or (last resort, issue #225) the issue's
                `area:*` default; a trust-surface area forces the trust-plane role (see
                TRUST_PLANE_ROLE).
-  * priority — kept if a valid single `priority:P0..P4` is present; else triage is incomplete.
+  * priority — a stated valid single `priority:P0..P4` is authoritative and never touched;
+               otherwise one is DERIVED at the BOTTOM of the range (`derive_priority`), so a
+               derived priority can never outrank a stated one. An issue carrying an UNREADABLE
+               stated priority (two labels, or one out of range) is declined, not overwritten.
   * package  — the existing `area:<section>` labels are the package. A NO-area issue is parked
                `needs:area` (it would otherwise reserve the serializing __global__ partition).
   * ready    — `status:ready` iff a valid single priority AND a role AND an `area:<section>` AND
@@ -47,6 +50,54 @@ import subprocess
 import sys
 
 ROLE_LABELS = frozenset({"docs", "impl", "ci", "research", "site"})
+
+# ---------------------------------------------------------------------------------------------------
+# STATUSES TRIAGE DOES NOT OWN — the `status:ready` promotion is WITHHELD while one is live.
+#
+# `status:ready` carries TWO meanings that this repository never separated:
+#   (a) triage's CLASSIFICATION attestation — "this issue has a role, a priority and an area";
+#   (b) the dispatcher's ORCHESTRATION posture — "no lane is holding this issue".
+# triage() is the sole author of (a) and has no business asserting (b): `status:deferred` belongs
+# to dispatch-claim's bounded retry lane, the in-progress pair to a live claim/lease, and
+# `status:parked` to park_policy. While any of them is live, (b) is FALSE, so writing the label
+# does not attest anything — it manufactures a contradictory pair.
+#
+# MEASURED (registry #1054, 2026-07-28, live board, 460 open issues): 30 of the 32 open
+# `status:ready` issues ALSO carried `status:deferred`, and the census of the LAST `status:ready`
+# addition on each of those 30 says 30/30 were created by adding `status:ready` to an issue that
+# ALREADY carried `status:deferred` — 24 of them by `github-actions[bot]` (this workflow) on that
+# one day, 6 by the maintainer on 2026-07-18. Not one arose the other way round.
+#
+# The trigger is `triage-issue.yml`'s `[labeled, unlabeled]` types (#607). The dispatcher defers an
+# issue as three App-token writes (+status:deferred, -status:in-progress, -status:ready); the App's
+# token is NOT the repository GITHUB_TOKEN, so those events DO start a run, and 18-21s later this
+# classifier — which reads only role/priority/area/needs/kind — re-stamps `status:ready` over the
+# defer that just happened. Verbatim from #1037's timeline:
+#     16:27:04 labeled   status:deferred    by sparq-orchestrator[bot]
+#     16:27:06 unlabeled status:ready       by sparq-orchestrator[bot]
+#     16:27:27 labeled   status:ready       by github-actions[bot]      <- here
+#
+# The resulting pair is invisible to BOTH lanes — `status:deferred` is in `ready-issues.BUSY_STATUS`
+# so the ready lane refuses it, and dispatch.yml's deferred-retry candidate filter skipped any row
+# already carrying `status:ready` on the (false) premise that the ready lane owned it. Each lane
+# excluded it believing the other had it, so the board's dispatchable frontier was EMPTY.
+#
+# WITHHOLD, never STRIP. This branch declines to ADD the label; it never removes one that is
+# already there. Removing it would silently revert a deliberate human gesture (the 6 rows above are
+# exactly that: the maintainer re-attesting readiness on a stuck deferred issue), and a classifier
+# firing on an unrelated `labeled` event is the wrong actor to retract someone else's attestation.
+# The pair that a human writes is instead HANDLED, by the deferred-retry lane in dispatch.yml.
+#
+# `status:untriaged` is deliberately ABSENT: it is triage's OWN label, the assertion that nothing
+# has classified this issue yet, and clearing it is in scope precisely because triage wrote it.
+# The `else` (not-classification-complete) branch is untouched — it was implicated in 0 of the 30.
+DISPATCHER_OWNED_STATUS = frozenset({
+    "status:deferred",            # dispatch-claim bounded retry lane (locked decision 20)
+    "status:in-progress",         # a live claim/lease
+    "status:in-progress-review",  # a published worker PR cycling through review
+    "status:parked",              # park_policy.py machine capacity park
+    "status:blocked",             # groom/curator hold
+})
 
 # ---------------------------------------------------------------------------------------------------
 # TRUST-PLANE ROLE — INTERIM MAPPING (TODO: registry #582 / #225).
@@ -197,6 +248,105 @@ def _valid_priority(labels):
     return len(ps) == 1
 
 
+# ---------------------------------------------------------------------------------------------------
+# [OPUS-5] PRIORITY DERIVATION — the classifier's own missing input (sparq#4809).
+#
+# THE DEFECT. `_role` has a five-rung derivation ladder ending in a type/area default, so a role is
+# almost always produced. Priority had NO derivation at all: it was read, never written. That
+# asymmetry is the whole bug. `triage()` declares `ready` only when a valid `priority:P0..P4` is
+# ALREADY present, and it is the only writer `retriage.py --apply` has, so an issue opened without
+# one was TERMINAL — and `status:untriaged` is itself a busy state in both engines
+# (`ready-issues.BUSY_STATUS`, dispatch-claim), so such an issue is not merely unlabelled, it is
+# excluded from the frontier entirely. scripts/triage-stock-alert.py already names this exactly:
+# `classifier-incomplete` is a FIXED POINT, "the classifier cannot produce its own missing input",
+# measured at 263 of 274 stuck issues missing `priority:*`. retriage.yml has reported success on
+# every scheduled run for two weeks while that population grew.
+#
+# THE TENSION, AND WHY THE VALUE IS P4 AND NOT P3. A blanket mid-range default really does destroy
+# prioritisation: `ready-issues.compute_ready` sorts candidates by `(priority, number)`, so a
+# default that lands ABOVE the bottom rung displaces hand-triaged work and P0 loses its lane. The
+# resolution is not to classify more cleverly, it is to pick the one value that CANNOT displace
+# anything. `DERIVED_PRIORITY` is the bottom of the range, so:
+#
+#     A DERIVED PRIORITY CAN NEVER OUTRANK A STATED ONE.
+#
+# That is an ordering invariant, checked directly in `_self_test`, not a heuristic that happens to
+# behave. It also means P4 here is NOT a guess about urgency — guessing is what a mid-range default
+# does. It is the true statement "no human has prioritised this", rendered in the only vocabulary
+# the frontier reads, and ordered last accordingly. A derived-P4 issue can only ever be selected
+# when its partition is otherwise idle, i.e. when the alternative was dispatching nothing at all.
+#
+# DELIBERATELY NOT A `needs:priority` GATE. The obvious alternative — mark the absence loud with a
+# new `needs:*` label — is the one shape that is definitely wrong here, and this repo has already
+# paid for learning it. `retriage.plan()` skips every `needs:*`-gated issue BEFORE it classifies,
+# so minting such a gate would strand the issue behind a door the sweep itself refuses to open;
+# retriage.py declines to mint `needs:area` for precisely that reason ("re-creating the exact hole
+# #586 closes"). A gate would convert silent invisibility into loud invisibility, which is not the
+# outcome being bought.
+#
+# WHAT IS DECLINED. Exactly one class, and it is the class where writing would DESTROY information:
+# an issue that already carries a `priority:*` label the engine cannot read — two of them, or one
+# out of range. There a human HAS expressed intent and the machine simply cannot recover it, so
+# overwriting it with the floor would silently discard a possible P0. Those keep their labels
+# untouched and stay out of the frontier, and the contradiction is visible on the issue itself.
+# This is a small population by construction, and that is the honest outcome, not a hedge: with a
+# bottom-of-range floor there is no OTHER class where declining beats ordering-last, because the
+# floor makes no claim that could be wrong.
+DERIVED_PRIORITY = "priority:P4"
+
+
+def derive_priority(labels):
+    """(label_to_add | None, reason, labels_to_remove). Never overrides a stated priority.
+
+    reason ∈ {"stated", "floor-retracted", "stated-unreadable", "ready-attested-regression",
+    "unprioritised-floor"}. Only the last one writes; only `floor-retracted` removes.
+    """
+    if _valid_priority(labels):
+        return None, "stated", frozenset()          # a human's priority is authoritative
+    valid = {lb for lb in labels if _PRIO.match(lb)}
+    if DERIVED_PRIORITY in valid and len(valid) == 2:
+        # ---- THE RETRACT RUNG (PR #1053 review) — WITHOUT THIS, THE FLOOR CREATES THE CLASS IT
+        # ---- FIXES, ON THE MAJORITY PATH.
+        # `triage-issue.yml` fires on `opened`, so the floor lands within a second or two of
+        # creation. But a priority usually arrives LATER: measured on this board, 16 of the 30 most
+        # recent prioritised open issues (53%) were priority-labelled more than 90s after creation,
+        # almost all by `sparq-orchestrator[bot]` — which will not strip a floor it did not write.
+        # Two valid priorities make `_valid_priority` return False, so without this rung that
+        # perfectly ordinary sequence (open -> floored -> labelled P1) DEMOTED the issue off the
+        # frontier and left it there until a human manually removed `priority:P4`.
+        #
+        # The ordering invariant was never wrong — a derived priority still cannot OUTRANK a stated
+        # one — but the argument was about outranking and the effect was about BLOCKING. Those are
+        # different failures and only the first was guarded.
+        #
+        # So: exactly the floor plus exactly ONE other valid rank means the floor is ours and the
+        # other is authoritative. Retract the floor and keep theirs. This converges in one tick and
+        # cannot oscillate: the post-state has a single valid priority, which returns "stated"
+        # above and derives nothing further.
+        #
+        # DELIBERATELY NOT EXTENDED to a pair with no floor in it (P1+P2): that ambiguity is
+        # genuine, is a human's to resolve, and stays declined below. The residual case this rung
+        # DOES decide against a human is a deliberate `priority:P4` plus a second actor's
+        # `priority:P1` — indistinguishable from ours, since the floor carries no provenance. That
+        # pair was already ambiguous-and-stuck before this change, so resolving it toward the
+        # non-floor value is strictly better than the status quo, not a new loss.
+        return None, "floor-retracted", frozenset({DERIVED_PRIORITY})
+    if any(lb.startswith("priority:") for lb in labels):
+        return None, "stated-unreadable", frozenset()   # DECLINE: ambiguous/out-of-range, human's
+    if "status:ready" in labels:
+        # DECLINE — THE LABEL-REGRESSION LANE (#586), and the one rung this derivation cannot go
+        # without. `triage()` only ever attests `status:ready` on an issue that HAD a valid
+        # priority, so a `status:ready` issue with no readable priority did not arrive here
+        # unprioritised: it LOST one. Flooring it would overwrite a human's P0..P3 with P4 and,
+        # worse, is not even stable — retriage's re-park lane exists so a human restores the real
+        # value, and a restored `priority:P2` landing next to a derived `priority:P4` is an
+        # AMBIGUOUS pair, i.e. permanently stuck. This decline is what keeps the #586 re-park lane
+        # intact; the "lost priority is re-parked" and "ROUND TRIP" fixtures in retriage.py's
+        # self-test fail without it, which is how it was found.
+        return None, "ready-attested-regression", frozenset()
+    return DERIVED_PRIORITY, "unprioritised-floor", frozenset()
+
+
 def _area_default(labels):
     """The role ALL of the issue's `area:<value>` labels agree on; None whenever that cannot be
     established — the mapped areas disagree, no `area:*` label is present, or ANY `area:*` label is
@@ -276,7 +426,8 @@ def triage(labels, issue_type="task", trusted=True, known_labels=None):
     """
     labels = set(labels)
     if not trusted or "trust:untrusted" in labels:
-        return {"add": set(), "remove": set(), "ready": False, "role": None, "warnings": []}
+        return {"add": set(), "remove": set(), "ready": False, "role": None, "warnings": [],
+                "priority_reason": "untrusted"}
     role = _role(labels, issue_type)
     add, remove, warnings = set(), set(), []
     existing = _roles_of(labels)
@@ -302,22 +453,105 @@ def triage(labels, issue_type="task", trusted=True, known_labels=None):
     has_area = any(lb.startswith("area:") for lb in labels)
     # ANY needs:* gate (needs:design B2, needs:user, needs:area) blocks ready. kind:epic too.
     gated = any(lb.startswith("needs:") for lb in labels)
-    ready = (bool(role) and _valid_priority(labels) and has_area and not gated
+    # The derived priority is part of the label set the rest of this function reasons over, exactly
+    # as a derived `role:*` is — `effective`, not `labels`, is what "does this issue have a
+    # priority" now means. Deriving it but testing the UNDERIVED set is the vacuous shape: the
+    # value would be written and the readiness verdict would not move, which is the status quo
+    # with an extra API call. `kind:epic` is excluded because an epic is a tracking umbrella that
+    # is never dispatchable, so writing a priority onto one is pure churn.
+    derived, priority_reason, retract = ((None, "epic", frozenset()) if "kind:epic" in labels
+                                         else derive_priority(labels))
+    effective = (labels | ({derived} if derived else set())) - retract
+    ready = (bool(role) and _valid_priority(effective) and has_area and not gated
              and "kind:epic" not in labels)
+    if derived:
+        add.add(derived)
+    remove |= retract
     if ready:
-        add.add("status:ready")
+        # [registry #1054] `ready` stays the CLASSIFICATION verdict — retriage.py and
+        # triage-stock-alert.py both read it as exactly that ("is the classifier done with this
+        # issue"), and flipping it here would make them call a fully-classified issue incomplete.
+        # What is withheld is only the LABEL WRITE, because the label additionally asserts an
+        # orchestration posture that a live dispatcher status contradicts. See
+        # DISPATCHER_OWNED_STATUS for the measured census.
+        held = sorted(labels & DISPATCHER_OWNED_STATUS)
+        if held:
+            warnings.append(
+                f"withholding status:ready: {', '.join(held)} is live and is owned by the "
+                f"dispatcher/worker/park lane, not by triage (registry #1054) — adding the "
+                f"readiness attestation here would strand the issue in a ready+busy pair that "
+                f"NEITHER the ready lane nor the deferred-retry lane can select")
+        else:
+            add.add("status:ready")
         remove.add("status:untriaged")
         remove.add("needs:area")
     else:
         add.add("status:untriaged")
         remove.add("status:ready")
         # a triage-complete-but-no-area, non-gated, non-epic issue parks needs:area (actionable).
-        if (bool(role) and _valid_priority(labels) and not has_area
+        if (bool(role) and _valid_priority(effective) and not has_area
                 and "kind:epic" not in labels and not gated):
             add.add("needs:area")
     add, remove = add - labels, remove & labels
     _assert_role_invariant(labels, add, remove, ready)
-    return {"add": add, "remove": remove, "ready": ready, "role": role, "warnings": warnings}
+    return {"add": add, "remove": remove, "ready": ready, "role": role, "warnings": warnings,
+            # Reported so a caller can COUNT the decline population instead of inferring it from
+            # the absence of a write — scripts/triage-stock-alert.py keys its worklist on this.
+            "priority_reason": priority_reason}
+
+
+# ---------------------------------------------------------------------------------------------------
+# QUARANTINE AUTHORIZATION — who may clear `trust:untrusted` (#607; PR #998 round 1 finding 1).
+#
+# `triage-issue.yml` fires on label events (#607) so a lost triage label is reclassified at the
+# moment of the regression. That trigger also means the workflow now SEES a `trust:untrusted`
+# removal, and it has to decide what to do about one. The first cut decided by EVENT TYPE — label
+# events were exempted from the quarantine write, on the premise that only a triage/write actor can
+# label an issue so no third party could emit one. That premise contradicts the workflow's own trust
+# rule: trust there is write+ (admin/maintain/write) exactly as in scripts/trust-gate.py, so a
+# `triage`-role collaborator is UNTRUSTED — and `triage` is precisely the permission that manages
+# labels. Under an event-type exemption such an actor could strip `trust:untrusted` off a
+# third-party issue and nothing would restore it, clearing the hard gate that ready-issues.py,
+# curate-frontier.py and dispatch-claim.py all read off that one label.
+#
+# So authorization is bound to the ACTOR that emitted the event, not to the event's type.
+
+# The events on which a WRITE+ actor is asserting the label set deliberately — the only place a
+# maintainer's un-quarantine can be honoured. Every other event re-asserts quarantine.
+TRUSTED_ACTOR_LABEL_EVENTS = ("labeled", "unlabeled")
+
+
+def _trust_flag(value):
+    """A trust flag is TRUE only for the exact string ``'1'`` (or a real ``True``).
+
+    Fail-closed coercion, and it lives in the pure function rather than in an untested CLI line:
+    an empty/unset shell variable, ``'true'``, ``'none'`` or any other spelling reads as UNTRUSTED,
+    which can only ever ADD quarantine.
+    """
+    return value is True or str(value).strip() == "1"
+
+
+def quarantine_required(action, author_trusted, actor_trusted):
+    """Must this event (re-)apply the `trust:untrusted` + `status:untriaged` quarantine? FAIL-CLOSED.
+
+    `action` is the issue event's `action` (opened/edited/reopened/labeled/unlabeled/...);
+    `author_trusted` is the ISSUE AUTHOR's write+ verdict; `actor_trusted` is the write+ verdict for
+    the login that emitted THIS event. The two are independent probes — the author's trust says
+    nothing about who just moved the labels.
+
+    True unless one of exactly two things holds:
+      * the AUTHOR is trusted — there is nothing to quarantine; or
+      * a TRUSTED ACTOR asserted the label set on a label event — the deliberate maintainer
+        un-quarantine, the one path that may clear the gate.
+
+    Everything else — an untrusted actor's `unlabeled`, an unknown/new event type, an unreadable
+    trust flag — returns True, i.e. RESTORES the quarantine. The caller's write is `--add-label`,
+    which is idempotent: it re-adds a stripped label and is a no-op when the label is still there,
+    so this same answer covers both "keep quarantined" and "put the gate back".
+    """
+    if _trust_flag(author_trusted):
+        return False
+    return not (str(action).strip() in TRUSTED_ACTOR_LABEL_EVENTS and _trust_flag(actor_trusted))
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -646,11 +880,23 @@ def _self_test():
     r = triage(["priority:P2", "kind:docs", "area:docs"], "task")
     chk("docs ready", (r["ready"], "role:docs" in r["add"], "status:ready" in r["add"]),
         (True, True, True))
-    # missing priority -> untriaged.
+    # [sparq#4809] A MISSING priority is now DERIVED at the floor, so this issue is ready and the
+    # priority label is written. This assertion used to read `(False, True)` — that WAS the defect:
+    # the classifier could not produce its own missing input, so the issue was terminal.
     r = triage(["area:usage"], "feature")
-    chk("no priority -> untriaged", (r["ready"], "status:untriaged" in r["add"]), (False, True))
-    # ambiguous priority -> untriaged.
-    chk("ambiguous priority", triage(["priority:P1", "priority:P2"], "feature")["ready"], False)
+    chk("no priority -> DERIVED at the floor, and ready",
+        (r["ready"], DERIVED_PRIORITY in r["add"], "status:untriaged" in r["add"]),
+        (True, True, False))
+    # ...but deriving a priority does NOT relax any other gate: no area is still not ready.
+    chk("derived priority does not substitute for a missing area",
+        (triage(["role:impl"], "feature")["ready"],
+         "needs:area" in triage(["role:impl"], "feature")["add"]), (False, True))
+    # ambiguous priority -> untriaged, AND the floor is NOT written over it (the DECLINE exit).
+    r = triage(["priority:P1", "priority:P2", "area:usage"], "feature")
+    chk("ambiguous priority", r["ready"], False)
+    chk("[sparq#4809] a STATED-but-unreadable priority is DECLINED, never overwritten",
+        (any(lb.startswith("priority:") for lb in r["add"]), r["priority_reason"]),
+        (False, "stated-unreadable"))
     # trust-surface area forces the trust-plane role.
     chk("trust surface -> trust-plane role",
         triage(["priority:P1", "area:worker"], "feature")["role"], TRUST_PLANE_ROLE)
@@ -809,7 +1055,12 @@ def _self_test():
         False)
     # untrusted -> no-op.
     chk("untrusted no-op", triage(["priority:P1", "trust:untrusted"], "feature"),
-        {"add": set(), "remove": set(), "ready": False, "role": None, "warnings": []})
+        {"add": set(), "remove": set(), "ready": False, "role": None, "warnings": [],
+         "priority_reason": "untrusted"})
+    # ...and the derivation must not become a way IN for untrusted content either: an untrusted
+    # issue with NO priority is still a total no-op, not a floor write.
+    chk("[sparq#4809] untrusted + no priority is still a no-op — the derivation writes nothing",
+        triage(["area:usage", "trust:untrusted"], "feature")["add"], set())
     # respect an explicit role:* on a NON-trust area — do NOT derive a second (ambiguity broke
     # autonomous dispatch upstream).
     r = triage(["priority:P2", "role:research", "area:usage"], "feature")
@@ -1213,10 +1464,21 @@ def _self_test():
     # invisible to retriage (which only revisits status:untriaged). Pinned statically so it cannot
     # regress: the label mutation carries no `|| true`, the step runs under `set -e`, and a post-read
     # proves both labels landed. (Only the courtesy comment may be best-effort.)
-    quarantine = re.search(r"\n {6}- name: Quarantine.*?(?=\n {6}- name: |\Z)",
-                           "\n".join(line for line in open(triage_wf, encoding="utf-8").read()
-                                     .splitlines() if not line.strip().startswith("#")), re.S)
-    quarantine_body = quarantine.group(0) if quarantine else ""
+    wf_body = "\n".join(line for line in open(triage_wf, encoding="utf-8").read().splitlines()
+                        if not line.strip().startswith("#"))
+
+    def wf_step(step_name):
+        """The EXECUTABLE body of one workflow step, comment lines already dropped."""
+        found = re.search(r"\n {6}- name: " + re.escape(step_name) + r".*?(?=\n {6}- name: |\Z)",
+                          wf_body, re.S)
+        return found.group(0) if found else ""
+
+    def step_if(body):
+        """The step's `if:` expression VERBATIM (empty string when the step has none)."""
+        return next((line.split("if:", 1)[1].strip() for line in body.splitlines()
+                     if line.strip().startswith("if:")), "")
+
+    quarantine_body = wf_step("Quarantine + notify (untrusted author)")
     chk("[#595 f5] the quarantine step exists and runs under set -e",
         bool(quarantine_body) and "set -euo pipefail" in quarantine_body, True)
     chk("[#595 f5] no `|| true` on the quarantine LABEL mutation",
@@ -1225,6 +1487,305 @@ def _self_test():
     chk("[#595 f5] the quarantine labels are verified by a post-read before success",
         all(token in quarantine_body for token in ("--json labels", "trust:untrusted",
                                                    "refusing to report success")), True)
+
+    # -----------------------------------------------------------------------------------------------
+    # [#607] THE TRIGGER LIST IS THE PREVENTION MECHANISM, so it is pinned by EXACT SET, never by
+    # containment. `labeled`/`unlabeled` are distinct issue event types: without them, stripping a
+    # `priority:*` / `role:*` / `area:*` label off a `status:ready` issue re-ran no classifier at all
+    # (the original #178 mechanism) and left it stranded until retriage's sweep (#586). A dropped
+    # token here is exactly the regression #607 fixed and a substring check would not see it.
+    # The parse is deliberately FAIL-CLOSED, not tolerant: a trigger list this regex cannot read
+    # (e.g. reformatted to block style) yields the empty set and reds this row rather than passing
+    # on evidence it never found — keep the flow-style list, or teach the regex the new shape.
+    trigger = re.search(r"\non:\n  issues:\n    types: \[([^\]]*)\]", wf_body)
+    trigger_types = sorted(t.strip() for t in (trigger.group(1) if trigger else "").split(",")
+                           if t.strip())
+    chk("[#607] triage-issue.yml fires on the LABEL events too — exact trigger set",
+        trigger_types, ["edited", "labeled", "opened", "reopened", "unlabeled"])
+    # THE MARQUEE CLAIM, checked at the step that actually delivers it (AGENTS.md pre-flight 9/11):
+    # a trigger that reaches a classifier step gated on the event type would be inert. The
+    # classifier's ONLY condition is trust — exact match, so `&& false` or a re-added event-type
+    # exclusion goes red here.
+    chk("[#607] the classifier step is gated by TRUST ALONE (no event-type condition), so it DOES "
+        "run on labeled/unlabeled",
+        step_if(wf_step("Static triage (trusted author)")), "steps.trust.outputs.trusted == '1'")
+    # -----------------------------------------------------------------------------------------------
+    # [PR #998 round 1, findings 1+2] QUARANTINE REMOVAL IS AUTHORIZED BY THE **ACTOR**, NEVER BY THE
+    # EVENT TYPE. #607's first cut exempted `labeled`/`unlabeled` from the quarantine write because
+    # "only a triage/write actor can label an issue". That premise contradicts the trust rule three
+    # steps up: trust is write+ (admin/maintain/write), so a `triage`-role collaborator is UNTRUSTED
+    # here — and `triage` is exactly the permission that manages labels. Under the exemption such an
+    # actor could strip `trust:untrusted` off a THIRD-PARTY issue and nothing would restore it,
+    # clearing the hard gate ready-issues.py / curate-frontier.py / dispatch-claim.py read. Round 1
+    # finding 2 is why this section exists at all: the shipped checks pinned the trigger list, the
+    # `if:` strings and `triage()` fixed points, and NEVER constructed the case the change created —
+    # an external author with a DISTINCT label-event actor. These rows do.
+    trust_body = wf_step("Trust-gate the AUTHOR and the label-event ACTOR")
+    chk("[#998 f1] the job binds ACTOR to the event SENDER (never the issue author) and ACTION to "
+        "the event action",
+        (bool(re.search(r"\n      ACTOR: \$\{\{ github\.event\.sender\.login \}\}", wf_body)),
+         bool(re.search(r"\n      ACTION: \$\{\{ github\.event\.action \}\}", wf_body))), (True, True))
+    chk("[#998 f1] the trust step probes the ACTOR's permission SEPARATELY from the author's — the "
+        "author's trust says nothing about who just moved the labels",
+        (bool(re.search(r'author_trusted=\$\(trust_of "\$AUTHOR"\)', trust_body)),
+         bool(re.search(r'actor_trusted=\$\(trust_of "\$ACTOR"\)', trust_body))), (True, True))
+    # EXACT SET, not containment: adding `triage|` here is the whole vulnerability and a substring
+    # check would not see it.
+    perm_arm = re.search(r'case "\$perm" in\n\s*([a-z|]+)\) echo 1', trust_body)
+    chk("[#998 f1] WRITE+ ONLY: the permissions that grant trust are EXACTLY admin/maintain/write — "
+        "`triage` (which CAN move labels) and `read` are not among them",
+        sorted(perm_arm.group(1).split("|")) if perm_arm else [], ["admin", "maintain", "write"])
+    chk("[#998 f1] the trust step emits the `quarantine` output the gate below reads, and computes "
+        "it by CALLING this module — ONE definition of the rule, no YAML copy no test could kill",
+        (bool(re.search(r'quarantine=\$\(python3 scripts/triage\.py --quarantine-decision\b',
+                        trust_body)),
+         'echo "quarantine=$quarantine" >> "$GITHUB_OUTPUT"' in trust_body), (True, True))
+    # Pinned as the WHOLE expression: a substring check survives `&& false`, and the second row
+    # kills a re-introduced event-type allowlist (the exact defect round 1 found) by name.
+    quarantine_if = step_if(quarantine_body)
+    chk("[#998 f1] the quarantine step's `if:` is EXACTLY the module's decision",
+        quarantine_if, "steps.trust.outputs.quarantine == '1'")
+    chk("[#998 f1] the gate names NO event type — an event-type allowlist here would be a second, "
+        "untestable copy of the rule",
+        ("github.event.action" in quarantine_if, "contains(" in quarantine_if), (False, False))
+    chk("[#998 f1] the quarantine write RESTORES a stripped gate: an idempotent `--add-label` of "
+        "BOTH labels, so the same decision covers keep-quarantined and put-the-gate-back",
+        bool(re.search(r"gh issue edit .*--add-label trust:untrusted --add-label status:untriaged",
+                       quarantine_body)), True)
+
+    # THE DECISION, EXECUTED over the full matrix. Every expected value below is written out BY HAND
+    # (AGENTS.md pre-flight 2b): none of it is computed from TRUSTED_ACTOR_LABEL_EVENTS or from
+    # quarantine_required(), so widening that constant — or inverting the rule — cannot move the code
+    # and its expectation together. The ACTIONS are cross-checked against the workflow's OWN trigger
+    # list read above, so a new trigger type that nobody judged reds the coverage row.
+    quarantine_table = {
+        # untrusted AUTHOR + untrusted ACTOR — EVERY event re-asserts the gate, label events included.
+        # `("unlabeled", "0", "0")` IS the reported hole: a triage-role actor stripping the label.
+        ("opened", "0", "0"): "1", ("edited", "0", "0"): "1", ("reopened", "0", "0"): "1",
+        ("labeled", "0", "0"): "1", ("unlabeled", "0", "0"): "1",
+        # untrusted AUTHOR + WRITE+ ACTOR — only a LABEL event is the deliberate un-quarantine; a
+        # content event still quarantines (a maintainer editing a third-party issue approves nothing).
+        ("opened", "0", "1"): "1", ("edited", "0", "1"): "1", ("reopened", "0", "1"): "1",
+        ("labeled", "0", "1"): "0", ("unlabeled", "0", "1"): "0",
+        # trusted AUTHOR — there is nothing to quarantine, whoever the actor is.
+        ("opened", "1", "0"): "0", ("edited", "1", "0"): "0", ("reopened", "1", "0"): "0",
+        ("labeled", "1", "0"): "0", ("unlabeled", "1", "0"): "0",
+        ("opened", "1", "1"): "0", ("edited", "1", "1"): "0", ("reopened", "1", "1"): "0",
+        ("labeled", "1", "1"): "0", ("unlabeled", "1", "1"): "0",
+    }
+    chk("[#998 f2] the truth table judges EVERY trigger type the workflow subscribes to",
+        sorted({row[0] for row in quarantine_table}), trigger_types)
+    chk("[#998 f2] ...crossed with both trust axes independently — 4 rows per event, none missing",
+        len(quarantine_table), 4 * len(trigger_types))
+    chk("[#998 f2] quarantine_required() matches the hand-written truth table on every row",
+        sorted(row for row, want in quarantine_table.items()
+               if ("1" if quarantine_required(*row) else "0") != want), [])
+    # The two headline rows, named so a regression says WHICH direction broke (pre-flight 9).
+    chk("[#998 f1] THE HOLE: external author, `trust:untrusted` stripped by a TRIAGE-role actor -> "
+        "the quarantine is RESTORED, so the removal never clears the downstream hard gate",
+        quarantine_required("unlabeled", "0", "0"), True)
+    chk("[#998 f1] ...and the genuinely authorized path still works: a WRITE+ actor's removal stands",
+        quarantine_required("unlabeled", "0", "1"), False)
+    chk("[#998 f1] those two differ ONLY in the ACTOR's permission — the decision is actor-bound, "
+        "not event-bound",
+        quarantine_required("unlabeled", "0", "0") == quarantine_required("unlabeled", "0", "1"),
+        False)
+    for why, action, author_trust, actor_trust in (
+            ("an event type nobody judged", "deleted", "0", "1"),
+            ("a missing action (unset shell variable)", "", "0", "1"),
+            ("an unreadable ACTOR flag", "unlabeled", "0", "true"),
+            ("an unreadable AUTHOR flag", "opened", "yes", "1"),
+            ("an empty AUTHOR flag", "labeled", "", "0")):
+        chk(f"[#998 f1] FAIL-CLOSED: {why} still quarantines",
+            quarantine_required(action, author_trust, actor_trust), True)
+
+    # END-TO-END on the workflow's OWN argv (pre-flight 9/11: check the evidence path, not the
+    # object it names). The tokens come from the workflow FILE with the shell variables substituted,
+    # so a renamed flag, a dropped `--actor-trusted`, or a swapped argument order lands here.
+    def decide_via_cli(action, author_trust, actor_trust):
+        argv = next((a for a in workflow_argvs(
+            triage_wf, "triage.py",
+            {"ACTION": action, "author_trusted": author_trust, "actor_trusted": actor_trust,
+             "REPO": "o/r", "NUM": "7"}) if "--quarantine-decision" in a), None)
+        if argv is None:
+            return "NO --quarantine-decision INVOCATION IN THE WORKFLOW"
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = main(list(argv))
+        return (code, buffer.getvalue().strip())
+    chk("[#998 f2] END-TO-END on the workflow's argv: external author, triage-role actor strips "
+        "`trust:untrusted` -> the CLI says QUARANTINE",
+        decide_via_cli("unlabeled", "0", "0"), (0, "1"))
+    chk("[#998 f2] END-TO-END on the workflow's argv: external author, WRITE+ maintainer removes it "
+        "-> the CLI says LEAVE IT REMOVED",
+        decide_via_cli("unlabeled", "0", "1"), (0, "0"))
+    chk("[#998 f2] END-TO-END on the workflow's argv: a triage-role actor cannot clear the gate by "
+        "ADDING a label either",
+        decide_via_cli("labeled", "0", "0"), (0, "1"))
+    # The two ASYMMETRIC rows. Every case above happens to agree under a SWAP of the two trust
+    # arguments at the call site — 0/0 is symmetric and `unlabeled` 0/1 reads the same either way, a
+    # value-identical survivor (AGENTS.md pre-flight 4), measured surviving before these were added.
+    # These two DISAGREE under the swap, so `--author-trusted "$actor_trusted" --actor-trusted
+    # "$author_trusted"` dies here.
+    chk("[#998 f2] END-TO-END: a WRITE+ maintainer touching a THIRD-PARTY issue's CONTENT approves "
+        "nothing — the author is still untrusted, so it quarantines",
+        decide_via_cli("opened", "0", "1"), (0, "1"))
+    chk("[#998 f2] END-TO-END: a trusted author's issue is never quarantined, whoever the actor is",
+        decide_via_cli("opened", "1", "0"), (0, "0"))
+    # THE DEFAULTS ARE THE UNTRUSTED SPELLING. The workflow passes every flag today, so a fail-OPEN
+    # default is invisible to every row above — but it is what a dropped argument falls back on, and
+    # a `default="1"` on either flag was measured SURVIVING before these two rows existed. Each row
+    # omits exactly the flag it pins.
+    def decide_bare(*argv):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = main(["--quarantine-decision", *argv])
+        return (code, buffer.getvalue().strip())
+    chk("[#998 f1] FAIL-CLOSED DEFAULT: with no trust flags at all, the decision is QUARANTINE",
+        decide_bare(), (0, "1"))
+    chk("[#998 f1] FAIL-CLOSED DEFAULT: a dropped `--actor-trusted` on a label event does NOT "
+        "authorize the removal",
+        decide_bare("--action", "unlabeled", "--author-trusted", "0"), (0, "1"))
+
+    # NO SELF-TRIGGER LOOP. The primary reason is GitHub's own rule — a write made with the
+    # repository's GITHUB_TOKEN starts no workflow run (the rule dispatch.yml's dead `workflow_run`
+    # doorbell measured on 2026-07-17), and this workflow's `gh` calls all run on `github.token`.
+    # These rows are the INDEPENDENT second reason, and the one this module owns: `triage()` is a
+    # FIXED POINT, so replaying it over its own post-state plans NOTHING — and an empty plan issues
+    # no `gh` call at all (asserted below) — so a triage-emitted label event terminates the cascade
+    # after one step even if that suppression rule ever changed. The first-pass plan is asserted
+    # NON-EMPTY in the same row: over a settled label set the fixed-point claim is vacuously true.
+    for case, seed in (("promotes to ready", ["priority:P1", "area:docs", "kind:docs"]),
+                       # the only seed whose FIRST pass plans a real REMOVAL (role swap + the
+                       # untriaged->ready demotion); without it every planned `remove` is filtered
+                       # away by the seed itself and the remove half of the fixed point is untested.
+                       ("role swap", ["priority:P1", "area:docs", "kind:docs", "role:impl",
+                                      "status:untriaged"]),
+                       ("gated by needs:user", ["priority:P1", "area:docs", "needs:user"]),
+                       ("lost-role repair", ["priority:P1", "area:worker", "status:ready"]),
+                       ("no area -> needs:area", ["priority:P1", "kind:docs"])):
+        first = triage(seed, "task")
+        settled = sorted((set(seed) | first["add"]) - first["remove"])
+        replay = triage(settled, "task")
+        chk(f"[#607] triage() is a FIXED POINT ({case}): the first pass mutates, the replay over "
+            "its own post-state plans nothing",
+            (bool(first["add"] or first["remove"]), sorted(replay["add"]), sorted(replay["remove"])),
+            (True, [], []))
+
+    # -----------------------------------------------------------------------------------------------
+    # [registry #1054] THE READY+BUSY PAIR — triage must not re-mint `status:ready` over a live
+    # defer. The fixture below is the VERBATIM label set registry #1037 held at 2026-07-28T16:27:06Z,
+    # the instant `sparq-orchestrator[bot]` finished deferring it; 21 seconds later this classifier
+    # stamped `status:ready` back on, and the issue has been undispatchable ever since.
+    deferred_1037 = ["area:dispatch", "priority:P1", "role:impl", "self-improvement",
+                     "status:deferred"]
+    r = triage(deferred_1037, "task")
+    post = (set(deferred_1037) | r["add"]) - r["remove"]
+    chk("[#1054] a freshly-DEFERRED, classification-complete issue is NOT re-promoted to ready",
+        ("status:ready" in r["add"], "status:ready" in post,
+         {"status:ready", "status:deferred"} <= post),
+        (False, False, False))
+    # `ready` is the CLASSIFICATION verdict and MUST stay true — retriage.py (`classifier-incomplete`)
+    # and triage-stock-alert.py (`machine_owed`) both read it as "has the classifier finished with
+    # this issue", and a withheld LABEL is not an unfinished classification. Flipping the field
+    # instead of the write would silently re-open registry #799's untriaged deadlock.
+    chk("[#1054] ...but the classification VERDICT retriage/stock-alert consume is unchanged",
+        (r["ready"], r["role"], len(r["warnings"])), (True, "impl", 1))
+    # `any(...)` over the list, never `warnings[0]`: a mutant that suppresses the warning entirely
+    # must be killed by THIS NAMED ROW, not by an IndexError that aborts every row after it.
+    chk("[#1054] ...and the withholding is NAMED in a warning, not silent",
+        any("withholding status:ready" in w and "status:deferred" in w for w in r["warnings"]),
+        True)
+    # The CONTROL, and the half that kills an inverted guard: with no dispatcher-owned status live,
+    # the promotion is unchanged. Without this row, `if not held` passes every assertion above.
+    chk("[#1054] CONTROL: with no dispatcher status live the promotion still fires",
+        sorted(triage(["area:dispatch", "priority:P1", "role:impl", "status:untriaged"],
+                      "task")["add"]), ["status:ready"])
+    # Every member of the set, individually — a guard that keeps the CONSTANT but drops one member
+    # is the mutation a whole-set assertion cannot see (`status:deferred` is 30/30 of the measured
+    # population, but the in-progress pair was re-minted on the same timelines).
+    for held_label in sorted(DISPATCHER_OWNED_STATUS):
+        seed = ["area:dispatch", "priority:P1", "role:impl", held_label]
+        chk(f"[#1054] ...for each dispatcher-owned status individually: {held_label}",
+            "status:ready" in triage(seed, "task")["add"], False)
+    # Still a FIXED POINT under the new branch: the withheld plan must be EMPTY, not oscillating.
+    chk("[#1054] the withheld plan is a fixed point (no add, no remove, no churn)",
+        (sorted(r["add"]), sorted(r["remove"])), ([], []))
+    # [#1054 round 2] THE SECOND ROUTE OUT OF THE FRONTIER. The `status:untriaged` strip is
+    # DELIBERATELY outside the withhold: `status:untriaged` is triage's OWN label, and clearing it
+    # is exactly what leaves a clean lone-`status:deferred` row the retry lane can select. Move the
+    # strip inside the guard and the issue lands `status:untriaged` + `status:deferred` instead —
+    # which `dispatch.yml`'s `retry_gated` refuses — re-stranding it by a DIFFERENT route while
+    # every row above stays green. Found by review; it survived the first round of mutants.
+    _du = ["area:dispatch", "priority:P1", "role:impl", "status:deferred", "status:untriaged"]
+    _rdu = triage(_du, "task")
+    _post_du = (set(_du) | _rdu["add"]) - _rdu["remove"]
+    chk("[#1054] a DEFERRED+UNTRIAGED complete issue is left as a CLEAN lone-deferred row "
+        "(untriaged stripped, ready still withheld) — the retry lane's only admissible shape",
+        (sorted(_post_du), "status:untriaged" in _rdu["remove"]),
+        (["area:dispatch", "priority:P1", "role:impl", "status:deferred"], True))
+
+    # MUTATION. Every row above passes against a guard that is present but INERT, so the guard is
+    # re-derived from this file's own source with the behaviour broken and the STRUCTURE those rows
+    # inspect left intact — the constant still exists, `held` is still computed, the branch is still
+    # there. Each mutant must be killed by a NAMED assertion below, never by an exception.
+    import os as _os  # noqa: PLC0415 — this suite imports os function-locally throughout
+    _self_path = _os.path.abspath(__file__)
+    with open(_self_path, encoding="utf-8") as _fh:
+        _src = _fh.read()
+
+    def _mutant(old, new, label):
+        mutated = _src.replace(old, new)
+        assert mutated != _src, f"[#1054] mutation target moved ({label}) — refusing to pass"
+        namespace = {"__name__": "triage_mutant", "__file__": _self_path}
+        exec(compile(mutated, f"<mutant:{label}>", "exec"), namespace)  # noqa: S102
+        return namespace["triage"]
+
+    # (m1) the constant survives by NAME but is emptied — the "name inside a zero-valued counter"
+    # shape: every structural check for DISPATCHER_OWNED_STATUS still finds it.
+    _m1 = _mutant('DISPATCHER_OWNED_STATUS = frozenset({\n    "status:deferred",',
+                  'DISPATCHER_OWNED_STATUS = frozenset({\n    ' + '"__never__",', "emptied-set")
+    chk("[#1054] MUTANT emptied-set (constant present, membership gone) RE-MINTS the pair",
+        "status:ready" in _m1(deferred_1037, "task")["add"], True)
+    # (m2) the guard is computed and the warning still raised — but the write happens anyway. This
+    # is the mutant a warnings-only or `ready`-only assertion cannot distinguish.
+    _m2 = _mutant("        if held:\n", "        if False:\n", "guard-never-fires")
+    chk("[#1054] MUTANT guard-never-fires RE-MINTS the pair",
+        "status:ready" in _m2(deferred_1037, "task")["add"], True)
+    # (m3) inverted: withholds on the CLEAN issue and promotes on the deferred one. Killed only by
+    # the CONTROL row's mirror below, which is why the control exists.
+    _m3 = _mutant("        if held:\n", "        if not held:\n", "inverted-guard")
+    chk("[#1054] MUTANT inverted-guard RE-MINTS the pair",
+        "status:ready" in _m3(deferred_1037, "task")["add"], True)
+    chk("[#1054] MUTANT inverted-guard ALSO breaks the clean promotion (the control's mirror)",
+        "status:ready" in _m3(["area:dispatch", "priority:P1", "role:impl"], "task")["add"], False)
+    # (m4) the set keeps four of its five members and loses only `status:deferred` — structurally
+    # identical, non-empty, and the exact 30/30 measured population walks straight through it.
+    _m4 = _mutant('    "status:deferred",            # dispatch-claim bounded retry lane',
+                  '    # (removed by mutation)       # dispatch-claim bounded retry lane',
+                  "one-member-dropped")
+    chk("[#1054] MUTANT one-member-dropped (4 of 5 members intact) RE-MINTS the measured pair",
+        "status:ready" in _m4(deferred_1037, "task")["add"], True)
+    chk("[#1054] ...while its surviving members still withhold — so only the per-member rows kill it",
+        "status:ready" in _m4(["area:dispatch", "priority:P1", "role:impl",
+                               "status:in-progress"], "task")["add"], False)
+    # (m5) THE REVIEW-FOUND SURVIVOR: the guard fires, `status:ready` is correctly withheld, and the
+    # issue is STILL stranded — because the `status:untriaged` strip moved inside the guard, so a
+    # deferred+untriaged row keeps a label `retry_gated` refuses. Withholding the promotion is not
+    # sufficient; the row also has to be left in a shape the retry lane can take.
+    _m5 = _mutant("            add.add(\"status:ready\")\n        remove.add(\"status:untriaged\")\n"
+                  "        remove.add(\"needs:area\")\n",
+                  "            add.add(\"status:ready\")\n            remove.add(\"status:untriaged\")\n"
+                  "            remove.add(\"needs:area\")\n", "strip-inside-guard")
+    _r5 = _m5(_du, "task")
+    chk("[#1054] MUTANT strip-inside-guard withholds ready CORRECTLY but re-strands the row as "
+        "untriaged+deferred, which retry_gated refuses",
+        sorted((set(_du) | _r5["add"]) - _r5["remove"]),
+        ["area:dispatch", "priority:P1", "role:impl", "status:deferred", "status:untriaged"])
+    chk("[#1054] ...and it leaves the CLEAN promotion untouched — so only the deferred+untriaged "
+        "row above can kill it",
+        sorted(_m5(["area:dispatch", "priority:P1", "role:impl", "status:untriaged"],
+                   "task")["add"]), ["status:ready"])
 
     # -----------------------------------------------------------------------------------------------
     # THE LIVE `gh` ARGV live_gh builds (shared by triage --apply and retriage --apply): an EMPTY
@@ -1246,6 +1807,122 @@ def _self_test():
         calls, [["gh", "issue", "edit", "7", "-R", "o/r", "--add-label", "role:impl",
                  "--remove-label", "role:docs"]])
 
+    # ---------------------------------------------------------------------------------------------
+    # [sparq#4809] THE HEADLINE GUARD: A DERIVED PRIORITY CAN NEVER OUTRANK A STATED ONE.
+    #
+    # This is the property the whole change rests on. If it does not hold, deriving a priority
+    # really does destroy prioritisation — hand-triaged P0..P3 work starts losing its lane to
+    # issues nobody ranked — and the right answer would have been to leave the backlog invisible.
+    # So it is asserted twice: once about the CONSTANT, and once about the CONSEQUENCE, executed
+    # through the real frontier engine rather than restated as a fact about the source.
+    _ranks = {f"priority:P{n}": n for n in range(5)}
+    chk("[sparq#4809] the derived priority is READABLE by the engine that consumes it — a typo "
+        "here writes a label `_valid_priority` rejects, and nothing is ever ready again",
+        _valid_priority({DERIVED_PRIORITY}), True)
+    chk("[sparq#4809] the derived priority is the numerically LOWEST rank the engine accepts — "
+        "the entire reason supplying the missing input does not displace triaged work",
+        _ranks[DERIVED_PRIORITY], max(_ranks.values()))
+    # `derive_priority` may return the floor or NOTHING — never any other rank. Exhaustive over the
+    # stated-priority shapes a label set can take, so a future rung that returns P0/P1/P2 for some
+    # signal is caught even where no hand-written case covers that signal.
+    _returned = {derive_priority(set(extra) | {"area:usage"})[0] for extra in (
+        (), ("priority:P0",), ("priority:P3",), ("priority:P4",), ("priority:P7",),
+        ("priority:P1", "priority:P2"), ("priority:",), ("kind:epic",), ("needs:user",),
+        ("role:impl", "from:agent", "self-improvement"))}
+    chk("[sparq#4809] derive_priority returns ONLY the floor or nothing, never another rank",
+        _returned - {None, DERIVED_PRIORITY}, set())
+
+    # THE CONSEQUENCE, EXECUTED. The two rows below contest ONE package, so the frontier must pick
+    # exactly one of them. The derived row's labels are produced by RUNNING triage() — this consumes
+    # the real derivation, so a test that still passed after the derivation was deleted or re-ranked
+    # would have to be lying about something it actually ran.
+    _ready_mod = load_sibling("ready-issues.py", "registry_ready_issues_selftest_priority")
+    _quiet = lambda *_a, **_k: None                                            # noqa: E731
+    _derived_labels = sorted({"role:impl", "area:usage"} | triage(["role:impl", "area:usage"],
+                                                                  "task")["add"])
+    _derived_row = {"number": 900, "state": "OPEN", "labels": _derived_labels, "open_blockers": 0}
+    _stated_row = {"number": 100, "state": "OPEN", "open_blockers": 0,
+                   "labels": ["status:ready", "role:impl", "area:usage", "priority:P1"]}
+    chk("[sparq#4809] HEADLINE: a DERIVED-priority issue never displaces a STATED-priority one on "
+        "a contested package (run through the real ready-issues frontier)",
+        [i["number"] for i in _ready_mod.compute_ready([_derived_row, _stated_row], log=_quiet)],
+        [100])
+    # ...and the mirror image, which is what makes the guard above a TRADE-OFF rather than a no-op:
+    # the derived row IS dispatchable when nothing stated contests its package. Without this, the
+    # change could buy visibility while dispatching nothing — the status quo with extra writes.
+    chk("[sparq#4809] HEADLINE: a DERIVED-priority issue IS selected when its package is idle",
+        [i["number"] for i in _ready_mod.compute_ready([_derived_row], log=_quiet)], [900])
+
+    # ---------------------------------------------------------------------------------------------
+    # [OPUS-5 #1053 review] THE COLLISION THE FLOOR ITSELF CREATES — the majority path, not an edge.
+    #
+    # The ordering invariant above ("a derived priority can never OUTRANK a stated one") is true and
+    # was never the problem. The problem is that the argument is about outranking and the damage is
+    # about BLOCKING: a floor written at `opened` and a priority stated 90s later are TWO valid
+    # priorities, `_valid_priority` returns False for the pair, and the issue leaves the frontier.
+    # Measured on this board, 53% of recently-prioritised issues are labelled >90s after creation,
+    # so without the retract rung this change MANUFACTURES the stuck state it exists to remove.
+    #
+    # Driven as a real loop to a fixed point rather than as three hand-written expectations: the
+    # bound is the claim, so a rung that re-derives on the next tick has to fail here.
+    _labels = {"role:impl", "area:groom"}
+    _trace, _injected = [], False
+    for _tick in range(6):
+        _r = triage(_labels, "task")
+        _trace.append(_r["priority_reason"])
+        _next = (_labels | _r["add"]) - _r["remove"]
+        if not _injected:                       # the actor states the real priority, post-floor
+            _next |= {"priority:P1"}
+            _injected = True
+        if _next == _labels:
+            break
+        _labels = _next
+    chk("[#1053] open-without-priority -> floor -> a stated P1 arrives -> CONVERGES on the stated "
+        "value, floor retracted, in BOUNDED ticks with no oscillation",
+        (_labels == {"role:impl", "area:groom", "priority:P1", "status:ready"}, len(_trace),
+         _trace), (True, 3, ["unprioritised-floor", "floor-retracted", "stated"]))
+    chk("[#1053] the retract is a REMOVE of the floor, not an overwrite of the stated value",
+        (triage({"role:impl", "area:groom", "priority:P4", "priority:P1"}, "task")["remove"],
+         triage({"role:impl", "area:groom", "priority:P4", "priority:P1"}, "task")["ready"]),
+        ({DERIVED_PRIORITY}, True))
+    # THE LINE THE RETRACT MUST NOT CROSS. A pair with no floor in it is a GENUINE ambiguity and is
+    # a human's to resolve — retracting there would be the machine picking a winner between two
+    # stated values. Asserted for every unordered P0..P3 pair, not just one example.
+    for _a in range(4):
+        for _b in range(_a + 1, 4):
+            _pair = {f"priority:P{_a}", f"priority:P{_b}", "role:impl", "area:groom"}
+            chk(f"[#1053] P{_a}+P{_b} (no floor) still DECLINES untouched — not the machine's to "
+                f"resolve", (derive_priority(_pair)[1], derive_priority(_pair)[2],
+                             triage(_pair, "task")["ready"]),
+                ("stated-unreadable", frozenset(), False))
+    # ...and three-way sets, including ones containing the floor, are ambiguous too: "exactly one
+    # other rank" is the whole precondition, so a floor + two stated values must not retract.
+    chk("[#1053] floor + TWO stated ranks is still ambiguous — the retract needs exactly one",
+        derive_priority({"priority:P4", "priority:P1", "priority:P2"})[1], "stated-unreadable")
+    chk("[#1053] a LONE floor is authoritative — nothing to retract against",
+        derive_priority({DERIVED_PRIORITY})[1], "stated")
+
+    # ---- guards that were correct but unasserted (#1053 review: surviving mutants N1/N2/N7/N9) ----
+    chk("[#1053/N2] a lone OUT-OF-RANGE priority declines — it is a human's typo, not a vacancy",
+        (derive_priority({"priority:P7"})[1], derive_priority({"priority:P7"})[0]),
+        ("stated-unreadable", None))
+    chk("[#1053/N9] an epic is never given a priority — a tracking umbrella is not dispatchable",
+        (triage(["kind:epic", "role:impl", "area:groom"], "task")["priority_reason"],
+         any(lb.startswith("priority:")
+             for lb in triage(["kind:epic", "role:impl", "area:groom"], "task")["add"])),
+        ("epic", False))
+    chk("[#1053/N1] RUNG ORDER: an unreadable stated priority is decided BEFORE the ready-attested "
+        "regression rung, so a doubly-broken issue reports the human-owned reason",
+        derive_priority({"status:ready", "priority:P1", "priority:P2"})[1], "stated-unreadable")
+    # [#1053/N7] PINNED DECISION, not an accident: the floor IS written to an issue that cannot
+    # become ready (here, `needs:user`-gated). It is deliberate — the value is correct the moment
+    # the gate lifts, and the retract rung means a later stated priority is not a trap. What must
+    # NOT happen is the gate being bypassed.
+    _gated = triage(["role:impl", "area:groom", "needs:user"], "task")
+    chk("[#1053/N7] a gated issue IS floored (deliberate) but is NEVER made ready by it",
+        (DERIVED_PRIORITY in _gated["add"], _gated["ready"], "status:ready" in _gated["add"]),
+        (True, False, False))
+
     print("triage self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -1265,6 +1942,14 @@ def build_parser():
     ap.add_argument("--number", default="")
     ap.add_argument("--known-labels", default="",
                     help="comma-separated repo label set; enables the #582 existence check")
+    # The quarantine authorization decision triage-issue.yml gates its quarantine step on. Prints
+    # `1` (apply/restore the quarantine) or `0`. Defaults are the UNTRUSTED spelling on every flag,
+    # so a dropped argument fails closed to `1` rather than silently un-quarantining.
+    ap.add_argument("--quarantine-decision", action="store_true",
+                    help="print 1/0: must this issue event (re-)apply the quarantine labels?")
+    ap.add_argument("--action", default="", help="the issue event action (opened/unlabeled/...)")
+    ap.add_argument("--author-trusted", default="0", help="1 if the issue AUTHOR is write+")
+    ap.add_argument("--actor-trusted", default="0", help="1 if the event ACTOR is write+")
     return ap
 
 
@@ -1273,6 +1958,9 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.self_test:
         return _self_test()
+    if a.quarantine_decision:
+        print("1" if quarantine_required(a.action, a.author_trusted, a.actor_trusted) else "0")
+        return 0
     if a.apply:
         if not a.repo or not a.number:
             ap.error("--apply requires --repo and --number")

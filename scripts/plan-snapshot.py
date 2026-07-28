@@ -78,6 +78,7 @@ from pathlib import Path
 import re
 import sys
 import time
+import traceback
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -580,6 +581,77 @@ def _pr_status_snapshot(fetch, claim, repo, pulls, concurrency=SNAPSHOT_CONCURRE
     return status_items, skips
 
 
+def _reason_histogram(reasons):
+    counts = {}
+    for reason in reasons.values():
+        counts[reason] = counts.get(reason, 0) + 1
+    return ", ".join(f"{name}={count}" for name, count in sorted(counts.items())) or "none"
+
+
+def inertness_attestation(claim, pulls, status_items):
+    """PURE per-PR "is this pull request provably inert?" map, for the PLAN-side partition.
+
+    [sparq#4819] THE DEFECT THIS CLOSES. Two partition legs decide `area:` occupancy for the same
+    PR. CLAIM's (`busy_packages_of_pulls`) frees a machine-parked PR's crates when
+    `_pull_inactivity_decision` proves it is a defused draft — MEASURED 142 free events over 57
+    crates in one tick. PLAN's (the target repo's own readiness engine, run in a LATER, hostile
+    step that holds no token and may not see this repository at all) had no way to evaluate that
+    predicate, so it reserved exactly the crates CLAIM was about to free, and it did so BEFORE the
+    frontier was committed. The registry's carve-out was live, loud, and dead.
+
+    The fix is NOT a second predicate. This walks the SAME `_pull_inactivity_decision`, with the
+    SAME detail-beats-listing coherence rule CLAIM applies, and writes only its ANSWER — so the
+    target engine consumes a decision it can never re-derive differently. A second implementation
+    of "would parking this PR really free its crates?" is precisely the mint-vs-adopt drift that
+    produced the defect.
+
+    Returned as `{"items": {"<number>": bool}, "reasons": {"<number>": str}}`; the reasons ride
+    along ONLY for the census line and diagnostics — nothing decides on them.
+
+    WHERE IT RUNS, STATED CORRECTLY. This function runs in the authenticated registry-inline
+    snapshot step, which precedes all target-code execution (REG-4) — so the attestation is
+    COMPUTED from data no target has touched. An earlier draft of this docstring went one step
+    further and said "no target can influence the attestation it later consumes". That is FALSE
+    and was corrected in round 2: the readiness step `exec_module`s the target's
+    `dispatch-plan.py` (dispatch.yml line ~399) BEFORE it reads `raw-inertness-<i>.json`
+    (line ~644), both in the same job on the same filesystem, so a hostile target can rewrite the
+    file at import time and hand itself any map it likes. DEMONSTRATED by execution: a target that
+    rewrote the document turned `0 of 1` into `2999 of 2999`.
+
+    That is not a hole this function opens or can close, and it is NOT the trust boundary that
+    matters, which is why the architecture is deliberately left alone. PLAN is the unprivileged,
+    advisory half by design (see this step's own header): it holds no token, and CLAIM
+    independently re-derives `_pull_inactivity_decision` over its OWN authenticated read before
+    any worker launches. A target that forges this map can therefore only over-propose rows CLAIM
+    then drops — the same fail-direction as the trust and linked-PR filters above it. Verified by
+    execution against a working positive control: latched, non-draft, resumed and unprovable PRs
+    all read `busy` at CLAIM, and only a genuinely-inert one reads `parked-free`.
+
+    FAILS CLOSED IN EVERY DIRECTION. A malformed row, an unparseable number, a latch, a
+    non-draft bit, a head that moved between the listing and the detail read — every one of them
+    yields False, because `_pull_inactivity_decision` is fail-closed and nothing here second-
+    guesses it. A PR absent from the map is likewise not attested, and the consumer treats
+    "absent" as "occupies".
+    """
+    items, reasons = {}, {}
+    for pull in pulls if isinstance(pulls, list) else []:
+        if not isinstance(pull, dict):
+            continue
+        number = pull.get("number")
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            continue
+        record = (status_items or {}).get(str(number), (status_items or {}).get(number))
+        # The DETAIL read is the newer half of the split snapshot and is authoritative when it
+        # exists — same precedence CLAIM uses. `pr_ci_status` normalises the raw record into the
+        # {head_sha, armed, draft} shape the predicate wants; an absent record leaves the
+        # listing's own atomic row to supply the proof (or to refuse to).
+        status = claim.pr_ci_status(record) if record is not None else claim._NO_PR_DETAIL
+        inactive, reason = claim._pull_inactivity_decision(pull, status)
+        items[str(number)] = bool(inactive)
+        reasons[str(number)] = str(reason)
+    return {"items": items, "reasons": reasons}
+
+
 def snapshot_targets(fetch, claim, repos, out_dir, concurrency=SNAPSHOT_CONCURRENCY):
     # Phase 1 — every repo-level listing is independent of every other, so the walks
     # overlap. Each walk is UNCHANGED: the same serial page-walk to a short page, the same
@@ -608,7 +680,184 @@ def snapshot_targets(fetch, claim, repos, out_dir, concurrency=SNAPSHOT_CONCURRE
         Path(out_dir, f"raw-prstatus-{index}.json").write_text(
             json.dumps({"complete": True, "items": status_items, "skips": skips}),
             encoding="utf-8")
+        inert = inertness_attestation(claim, pulls, status_items)
+        Path(out_dir, f"raw-inertness-{index}.json").write_text(
+            json.dumps({"complete": True, **inert}), encoding="utf-8")
+        print(f"SNAPSHOT inertness {repo}: {sum(inert['items'].values())} of "
+              f"{len(inert['items'])} open PR(s) provably inert "
+              f"({_reason_histogram(inert['reasons'])})")
     print(f"SNAPSHOT complete for {len(repos)} target repo(s)")
+
+
+_SELFTEST_CHILD_ENV = "PLAN_SNAPSHOT_SELFTEST_CHILD"
+
+
+def _pin_cli_verdict_contract_out_of_process():
+    """Assert, FROM ANOTHER PROCESS, that `--self-test` always prints a verdict line.
+
+    [sparq#4819 round 4] WHY THIS IS NOT ANOTHER TURN OF THE RECURSION. Round 3 shipped an
+    in-process probe of `_run_checks` and I argued the residual was irreducible — "a guard on a
+    guard, and the recursion has to stop". That was wrong, and the way it was wrong is the useful
+    part: the in-process probe only ever observed the reporter's RETURN VALUE, so it could not see
+    a reporter that RAISED, and it could not see anything at all that failed OUTSIDE `_run_checks`.
+    `_self_test`'s prologue is ~83 straight-line statements (`claim = _load_claim()`,
+    `gate = claim.CI_GATE_CHECK`, ...) and MEASURED, renaming `CI_GATE_CHECK` in
+    `dispatch-claim.py` — an ordinary cross-file product regression — produced EXIT=1,
+    ZERO verdict lines and ZERO bytes of stdout: the exact symptom this file claims to have fixed,
+    still reproducible on the file that claims it.
+
+    Changing the OBSERVER'S FRAME is what breaks the circularity. A different process observing the
+    CLI contract is not a guard on a guard: it makes no assumption about which part of `_self_test`
+    survives, because it only reads the CLI's stdout and exit status. Anything that can escape —
+    prologue, reporter, an import, a `SystemExit` — is inside what it observes.
+
+    Returns a list of failure strings (empty == contract holds). Never raises for a contract
+    breach; a subprocess timeout is reported as a failure row like any other.
+    """
+    import collections
+    import contextlib
+    import shutil
+    import signal
+    import subprocess
+    import tempfile
+
+    completed = collections.namedtuple("completed", "returncode stdout stderr")
+    # The child suite runs in ~1s; 60s is ~50x headroom on a loaded runner and is the
+    # DETECTION BOUND for the fork-storm mutation above, so it is deliberately not larger.
+    CHILD_TIMEOUT_SECONDS = 60
+    failures = []
+    source = Path(__file__).resolve().parent
+    marquee = "the_inertness_attestation_adopts_the_claim_predicate_and_fails_closed"
+    with tempfile.TemporaryDirectory() as tmp:
+        tree = Path(tmp, "scripts")
+        # `dispatch-claim.py` loads siblings by name (park_policy, gh_retry, ...), so the whole
+        # scripts/ tree is copied rather than the two files this touches.
+        shutil.copytree(source, tree)
+        # The child MUST NOT run this pin, or every run forks forever. TWO independent stops,
+        # because MEASURED the env var alone was not enough: deleting that one dict key produced
+        # a fork storm that left 53 orphaned processes on the box, since every generation opens
+        # its OWN session and a process-group kill therefore cannot reach its grandchildren.
+        #   1. the env var, which is also what makes the child ANNOUNCE the skip; and
+        #   2. this textual neutralisation of the COPY, which makes recursion structurally
+        #      impossible whatever the environment says.
+        # (2) is asserted non-no-op below, so it cannot rot into a comment. It edits only the
+        # branch that decides whether to run THIS pin — `main`'s CLI boundary, the contract
+        # actually under test, is copied byte-for-byte.
+        #
+        # THE ANCHOR IS THE `else:` BRANCH, NOT THE `if`. My first cut searched for the bare
+        # guard line — which is ALSO the text of the `guard_line = "..."` assignment a few lines
+        # up in THIS function, so `replace(..., 1)` rewrote the pin's own variable and left the
+        # real guard untouched. The child then recursed anyway (measured: 62s, 51 orphans). A
+        # neutraliser whose source contains the pattern it searches for will match itself; the
+        # anchor below includes the dispatch line that exists ONLY at the real site, and the
+        # count is asserted to be exactly 1 so this class of near-miss reds instead of silently
+        # rewriting the wrong occurrence.
+        child_source = tree / "plan-snapshot.py"
+        child_text = child_source.read_text(encoding="utf-8")
+        anchor = ("    else:\n"
+                  "        cli_failures = _pin_cli_verdict_contract_out_of_process()")
+        if child_text.count(anchor) != 1:
+            failures.append(
+                f"could not uniquely locate the recursion dispatch in the copied CLI "
+                f"({child_text.count(anchor)} matches) — refusing to spawn a child that could "
+                "fork forever")
+            return failures
+        child_source.write_text(
+            child_text.replace(anchor, "    else:\n        cli_failures = []  # [self-test copy] "
+                                       "recursion structurally disabled", 1), encoding="utf-8")
+        env = dict(os.environ, **{_SELFTEST_CHILD_ENV: "1", "PYTHONDONTWRITEBYTECODE": "1"})
+
+        def run_child():
+            """Run the copied CLI in its OWN process group, so a timeout reaps the WHOLE tree.
+
+            MEASURED, and the reason this is not a plain `subprocess.run`: deleting
+            `_SELFTEST_CHILD_ENV` from `env` — one dict key — turns this into a fork storm, and
+            the run hung past 120s rather than failing. `subprocess.run(timeout=...)` kills only
+            the DIRECT child, orphaning every grandchild. With a new session plus a group kill,
+            that mutation degrades to a BOUNDED, NAMED "control run timed out" failure instead of
+            a hung CI job. The guard is load-bearing; this makes its removal survivable."""
+            proc = subprocess.Popen(
+                [sys.executable, "-B", str(tree / "plan-snapshot.py"), "--self-test"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+                start_new_session=True)
+            try:
+                out, err = proc.communicate(timeout=CHILD_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.communicate(timeout=30)
+                return None
+            return completed(proc.returncode, out, err)
+
+        # POSITIVE CONTROL FIRST — validate the instrument against a known answer. Without it a
+        # broken COPY would also print FAILED and this pin would pass for the wrong reason.
+        control = run_child()
+        if control is None:
+            failures.append("the unmutated control run timed out")
+        elif control.returncode != 0 or "plan-snapshot self-test PASSED" not in control.stdout:
+            failures.append(
+                f"the unmutated control did not pass out of process (rc={control.returncode}); "
+                f"stdout tail: {control.stdout[-200:]!r} stderr tail: {control.stderr[-200:]!r}")
+        elif f"ok   {marquee}" not in control.stdout:
+            # ...and it ran the REAL suite, not a stub that prints a verdict line and exits.
+            failures.append("the control run never executed the marquee inertness guard")
+        elif _SELFTEST_CHILD_ENV not in control.stdout:
+            # ...and the recursion guard REACHED it. Without this the fork-storm mutation is
+            # detectable only as a timeout, i.e. only after 120 wasted seconds.
+            failures.append(f"the control run did not report {_SELFTEST_CHILD_ENV} — the "
+                            "recursion guard is not reaching the child")
+
+        # THE INJECTED FAILURE: the measured cross-file regression, in the PROLOGUE — the region
+        # `_run_checks` cannot reach and the in-process probe cannot see.
+        claim_path = tree / "dispatch-claim.py"
+        before = claim_path.read_text(encoding="utf-8")
+        after = before.replace("\nCI_GATE_CHECK = ", "\nCI_GATE_CHECK_RENAMED_BY_SELFTEST = ", 1)
+        if after == before:
+            failures.append("the injected prologue failure is a NO-OP — `CI_GATE_CHECK` was not "
+                            "found in the copied dispatch-claim.py, so this pin proves nothing")
+        else:
+            claim_path.write_text(after, encoding="utf-8")
+            broken = run_child()
+            if broken is None:
+                failures.append("the injected-failure run timed out")
+            else:
+                if broken.returncode == 0:
+                    failures.append("a prologue failure exited 0 — it would be banked as a pass")
+                if "plan-snapshot self-test FAILED" not in broken.stdout:
+                    failures.append(
+                        "a prologue failure printed NO verdict line on stdout "
+                        f"({len(broken.stdout)} bytes) — the CLI boundary is not converting an "
+                        "escape into a reportable verdict")
+    return failures
+
+
+def _run_checks(checks):
+    """Run `checks` in order, fail-fast, returning (ok, rows) where each row NAMES its check.
+
+    [sparq#4819 round 3] Separated from `_self_test` so the reporting itself is testable against
+    fakes — a reporter asserted only by the suite it reports on cannot witness its own regression.
+
+    An `AssertionError` is a KILL: the guard fired, which is the outcome a mutation battery is
+    entitled to count. ANY other exception is a CRASH: the harness or the product raised, which is
+    NOT a kill and is labelled differently so a mutation run cannot bank it as one. Both are
+    non-ok, so the exit code is identical either way and no failure can be reported as a pass.
+    The traceback is still printed on a crash, because that is the case someone has to debug.
+    """
+    rows = []
+    for check in checks:
+        try:
+            check()
+        except AssertionError as exc:
+            rows.append(f"  FAIL {check.__name__}: {exc}")
+            return False, rows
+        except BaseException as exc:                # noqa: BLE001 — classified, then re-reported
+            traceback.print_exc()
+            rows.append(f"  CRASH {check.__name__}: {type(exc).__name__}: {exc} — NOT a kill, "
+                        "the harness or the product raised")
+            return False, rows
+        rows.append(f"  ok   {check.__name__}")
+    return True, rows
 
 
 def _self_test():
@@ -1022,7 +1271,8 @@ def _self_test():
             "repo-level listing walks did not overlap: the barrier timed out after "
             f"{seen['walks']} of {parties} walks started")
         assert seen["walks"] == parties, seen
-        assert written == ["raw-issues-0.json", "raw-issues-1.json", "raw-prstatus-0.json",
+        assert written == ["raw-inertness-0.json", "raw-inertness-1.json",
+                           "raw-issues-0.json", "raw-issues-1.json", "raw-prstatus-0.json",
                            "raw-prstatus-1.json", "raw-pulls-0.json",
                            "raw-pulls-1.json"], written
 
@@ -1258,17 +1508,155 @@ def _self_test():
                     got = "stop"
             assert got == want, (label, got, want)
 
-    snapshot_parallel_output_is_identical_to_serial()
-    per_pr_reads_actually_overlap()
-    repo_listings_overlap_across_repos()
-    in_flight_reads_never_exceed_the_requested_bound()
-    concurrency_stays_inside_the_secondary_rate_limit_budget()
-    sweep_fatal_listing_failure_is_still_fatal()
-    retry_after_is_honoured_and_capped()
-    the_three_403s_are_told_apart()
-    budget_403_is_not_retried_and_is_sweep_fatal()
-    budget_403_is_never_downgraded_to_a_per_item_skip()
-    the_reserve_stops_the_sweep_before_the_budget_is_gone()
+    def the_inertness_attestation_adopts_the_claim_predicate_and_fails_closed():
+        """[sparq#4819] The PLAN-side attestation must be `_pull_inactivity_decision`'s ANSWER —
+        never an independent re-derivation of it — and every unprovable shape must read False.
+
+        Every row is asserted `is claim._pull_inactivity_decision(...)[0]`, not against a literal:
+        a hand-written expectation would let this suite and the predicate drift apart silently,
+        which is the exact two-legs-disagree defect the attestation exists to end. The literal
+        `want` column is carried alongside so the row still fails if BOTH sides regress together.
+        """
+        def listing(number, *, draft=True, latch=..., sha="a" * 40):
+            row = {"number": number, "state": "open",
+                   "head": {"ref": f"sparq-agent/issue-{number}-1-1", "sha": sha,
+                            "repo": {"full_name": repo}}}
+            if draft is not ...:
+                row["draft"] = draft
+            if latch is not ...:
+                row["auto_merge"] = latch
+            return row
+
+        armed_latch = {"enabled_by": {"login": "u"}, "merge_method": "squash"}
+        cases = [
+            ("draft + explicit-null latch is the atomic single-read proof",
+             listing(1, latch=None), None, True),
+            ("a LATCHED draft is never inert", listing(2, latch=armed_latch), None, False),
+            ("a NON-draft never frees", listing(3, draft=False, latch=None), None, False),
+            ("a pre-#517 row with NO auto_merge key proves nothing (ABSENCE != NULL)",
+             listing(4), None, False),
+            ("a row with no draft bit at all proves nothing", listing(5, draft=..., latch=None),
+             None, False),
+            ("a malformed head sha proves nothing", listing(6, latch=None, sha="zz"), None, False),
+            ("a garbage latch shape proves nothing", listing(7, latch="garbage"), None, False),
+            # DETAIL beats listing, in both directions — the round-4 split-snapshot race.
+            ("a newer detail confirming the defused draft frees", listing(8, latch=None),
+             {"head_sha": "a" * 40, "auto_merge": None, "draft": True, "mergeable": True}, True),
+            ("a newer detail saying the draft went READY holds", listing(9, latch=None),
+             {"head_sha": "a" * 40, "auto_merge": None, "draft": False, "mergeable": True}, False),
+            ("a newer detail carrying a latch holds", listing(10, latch=None),
+             {"head_sha": "a" * 40, "auto_merge": armed_latch, "draft": True}, False),
+            ("a detail whose head MOVED means the listing row is stale", listing(11, latch=None),
+             {"head_sha": "b" * 40, "auto_merge": None, "draft": True}, False),
+            ("an unreadable detail record holds (pr_ci_status -> {})", listing(12, latch=None),
+             {"head_sha": "not-a-sha"}, False),
+        ]
+        for label, row, record, want in cases:
+            items = {str(row["number"]): record} if record is not None else {}
+            got = inertness_attestation(claim, [row], items)
+            status = (claim.pr_ci_status(record) if record is not None
+                      else claim._NO_PR_DETAIL)
+            expected, reason = claim._pull_inactivity_decision(row, status)
+            assert got["items"][str(row["number"])] is expected is want, (label, got, want)
+            assert got["reasons"][str(row["number"])] == reason, (label, got, reason)
+        # Hostile shapes never enter the map at all, and never raise.
+        junk = inertness_attestation(claim, ["x", None, 42, {"number": True},
+                                             {"number": -1}, {"no": "number"}], {})
+        assert junk == {"items": {}, "reasons": {}}, junk
+        assert inertness_attestation(claim, None, None) == {"items": {}, "reasons": {}}
+        # An int-keyed status map (the in-memory shape) resolves the same as the JSON str keys.
+        row13 = listing(13, latch=None)
+        detail = {"head_sha": "a" * 40, "auto_merge": armed_latch, "draft": True}
+        assert inertness_attestation(claim, [row13], {13: detail})["items"]["13"] is False
+        assert inertness_attestation(claim, [row13], {"13": detail})["items"]["13"] is False
+
+    # [sparq#4819 round 3] A GUARD THAT FIRES MUST SAY WHICH GUARD FIRED. This suite used to be a
+    # flat call sequence, so any failure escaped as a bare traceback with NO verdict line at all —
+    # `--self-test | grep -cE "self-test (PASSED|FAILED)"` returned 0. MEASURED on this file's
+    # marquee guard: mutating `inertness_attestation` to fail open (attest every PR inert) was
+    # detected, but reported as an unlabelled `AssertionError` indistinguishable from the harness
+    # itself breaking. That distinction is the point — a crash is not a kill — and the sibling
+    # data-shape guards in dispatch-plan.py already report named rows, so this file's HEADLINE
+    # guard was the one with the weakest reporting.
+    #
+    # FAIL-FAST IS PRESERVED. `_run_checks` stops at the first failure exactly as the flat
+    # sequence did (several checks share module-level fixture state, so continuing past a failure
+    # would report cascades, not findings). What changed is only the reporting, and the exit code
+    # is unchanged in both directions.
+    # THE REPORTER IS PINNED FIRST, and with plain `if`/`print` rather than `assert` or
+    # `_run_checks` itself. Both of those would route the announcement of a broken reporter
+    # THROUGH the thing under test: measured, an `assert` here escaped as a bare traceback with
+    # zero verdict lines under three separate reporter mutations — reproducing, inside the fix,
+    # the exact defect the fix exists to remove. Fakes only, so no real check is disturbed.
+    def _fake_pass():
+        return None
+
+    def _fake_kill():
+        raise AssertionError("the guard fired")
+
+    def _fake_crash():
+        raise TypeError("the harness broke")
+
+    # The crash branch prints a traceback by design; silence it for the PROBE only so a passing
+    # run stays readable. Real crashes still print, because that is the case someone must debug.
+    with contextlib.redirect_stderr(io.StringIO()):
+        _probe = {
+            "pass": _run_checks((_fake_pass,)),
+            "kill": _run_checks((_fake_pass, _fake_kill, _fake_pass)),
+            "crash": _run_checks((_fake_crash,)),
+        }
+    _want = {
+        "pass": (True, ["  ok   _fake_pass"]),
+        # A KILL (AssertionError = the guard fired) and a CRASH (anything else = the harness or
+        # the product raised) must be LABELLED DIFFERENTLY. Collapsing them is how a crash gets
+        # banked as a kill by a mutation run.
+        "kill": (False, ["  ok   _fake_pass", "  FAIL _fake_kill: the guard fired"]),
+        "crash": (False, ["  CRASH _fake_crash: TypeError: the harness broke — NOT a kill, "
+                          "the harness or the product raised"]),
+    }
+    _bad = [f"{name}: got {_probe[name]!r}, want {_want[name]!r}"
+            for name in _want if _probe[name] != _want[name]]
+    if _bad:
+        for _row in _bad:
+            print(f"  FAIL _run_checks reporter self-check — {_row}")
+        print("plan-snapshot self-test FAILED")
+        return 1
+
+    ok, rows = _run_checks((
+        the_inertness_attestation_adopts_the_claim_predicate_and_fails_closed,
+        snapshot_parallel_output_is_identical_to_serial,
+        per_pr_reads_actually_overlap,
+        repo_listings_overlap_across_repos,
+        in_flight_reads_never_exceed_the_requested_bound,
+        concurrency_stays_inside_the_secondary_rate_limit_budget,
+        sweep_fatal_listing_failure_is_still_fatal,
+        retry_after_is_honoured_and_capped,
+        the_three_403s_are_told_apart,
+        budget_403_is_not_retried_and_is_sweep_fatal,
+        budget_403_is_never_downgraded_to_a_per_item_skip,
+        the_reserve_stops_the_sweep_before_the_budget_is_gone,
+    ))
+    for row in rows:
+        print(row)
+    if not ok:
+        print("plan-snapshot self-test FAILED")
+        return 1
+
+    # THE OUTER PIN, IN A DIFFERENT PROCESS. Runs LAST on purpose: it re-runs the whole suite in a
+    # child, so a genuine product regression reds its own named row above first, rather than
+    # surfacing as "the control run did not pass".
+    if os.environ.get(_SELFTEST_CHILD_ENV):
+        # Announced, never silent. If this variable is ever set in CI by accident, the log says the
+        # outer pin did not run instead of showing an unqualified PASSED.
+        print(f"  ok   CLI verdict contract — SKIPPED ({_SELFTEST_CHILD_ENV} set: child process)")
+    else:
+        cli_failures = _pin_cli_verdict_contract_out_of_process()
+        if cli_failures:
+            for failure in cli_failures:
+                print(f"  FAIL CLI verdict contract (out of process) — {failure}")
+            print("plan-snapshot self-test FAILED")
+            return 1
+        print("  ok   CLI verdict contract, observed out of process")
 
     print("plan-snapshot self-test PASSED")
     return 0
@@ -1281,7 +1669,26 @@ def main():
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
-        return _self_test()
+        # [sparq#4819 round 4] THE CLI BOUNDARY IS THE LAST PLACE AN ESCAPE CAN BE NAMED.
+        # `_self_test` has ~83 straight-line prologue statements outside `_run_checks`, and
+        # `_run_checks` can itself raise; either way the old bare `return _self_test()` let the
+        # exception reach the interpreter, which prints a traceback to STDERR and no verdict line
+        # at all. MEASURED: renaming `CI_GATE_CHECK` in dispatch-claim.py gave EXIT=1 with ZERO
+        # bytes of stdout. Nothing was ever banked as a pass — CI runs this under
+        # `set -euo pipefail`, and the return below is still 1 — so the loss was purely
+        # DIAGNOSTIC, which is exactly what this change is about.
+        #
+        # SCOPED TO --self-test DELIBERATELY: the real snapshot path below must keep propagating
+        # SystemExit/FetchError to the workflow unchanged. KeyboardInterrupt is re-raised because
+        # a human pressing Ctrl-C is not a test result and must not be reported as one.
+        try:
+            return _self_test()
+        except KeyboardInterrupt:
+            raise
+        except BaseException:                     # noqa: BLE001 — re-reported, never swallowed
+            traceback.print_exc()
+            print("plan-snapshot self-test FAILED")
+            return 1
     if not args.repos_file or not args.out_dir:
         parser.error("repos_file and out_dir are required unless --self-test is used")
     token = os.environ.get("GH_TOKEN", "")

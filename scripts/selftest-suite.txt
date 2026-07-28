@@ -2,6 +2,7 @@ account-usage.py
 backfill-provenance.py
 broker-refresh.py
 chain_preference.py
+ci-latency-alert.py
 cross-resolver-agreement.py
 curate-frontier.py
 dashboard-gen.py
@@ -13,8 +14,10 @@ dispatch-stall-alert.py
 dispatch-tick-floor.py
 gh_retry.py
 grant-account.py
+grant-scope-audit.py
 groom-alert.py
 groom.py
+latch-watchdog.py
 lease_schema.py
 ledger-invariant.py
 ledger_retry.py
@@ -30,7 +33,9 @@ plan-alert.py
 plan-snapshot.py
 policy-resolve.py
 ready-issues.py
+reconcile-conflict-park.py
 reconcile-park-misescalation.py
+regate-sweep.py
 resolve-conflicts.py
 retriage.py
 route-resolve.py

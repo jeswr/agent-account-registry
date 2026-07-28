@@ -1,0 +1,93 @@
+# [registry #953] The MACHINE EXIT from a conflict-resolver-manufactured `needs:user` on a PR.
+#
+# `resolve-conflicts.py` carries `needs:user` in HARD_EXCLUDE_LABELS and is also the only writer of
+# that label on these PRs, so a PR it escalates can never be touched by it again: no rebase, no
+# convergence on the moving default branch, and no `pr-gate` run at all while CONFLICTING
+# (registry #853). #941 fixes the SOURCE forward and says so explicitly ("No existing `needs:user`
+# is cleared"); this workflow owns the population the old path already parked.
+#
+# PR trees are untrusted, and unlike the resolver this job never clones one: it reads the GitHub
+# API, and the only mutations it can make are ONE comment and the removal of ONE label.
+name: reconcile-conflict-park
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Explicit off-peak minutes, the same throttling-resistant convention the other privileged
+    # crons use. :16/:36/:56 sit shortly BEFORE conflict-resolver's :01/:21/:41, so a park released
+    # here is picked up by the very next resolver sweep rather than waiting a full cycle, and clear
+    # of dispatch (:03/:13/...) and groom (:07/:22/...).
+    - cron: '16,36,56 * * * *'
+
+permissions: {}
+
+concurrency:
+  group: registry-reconcile-conflict-park
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    name: Release machine-applied conflict parks whose cause has recovered
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # REGISTRY_ADMIN_APP_ID/KEY live in the default-branch-restricted environment used by the
+    # existing dispatch/groom/conflict-resolver privileged crons. That server-side policy rejects a
+    # manual dispatch of a modified non-default-branch workflow before either mint can read the
+    # secrets.
+    environment: dispatch-secrets
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python (pinned)
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Install the self-test's YAML parser
+        run: python3 -m pip install --disable-pip-version-check pyyaml
+
+      # Reuse the same authoritative policy-derived per-owner target scopes as groom.yml and
+      # conflict-resolver.yml, so a new policy owner cannot silently fall out of this sweep.
+      - name: Resolve enabled target repos per owner from policy
+        id: owners
+        run: |
+          set -euo pipefail
+          python3 scripts/groom.py --print-owner-repos --policy-file policy/repos.toml \
+            | tee -a "$GITHUB_OUTPUT"
+
+      - name: Mint jeswr reconcile App token (pinned)
+        id: target-token-jeswr
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: jeswr
+          repositories: ${{ steps.owners.outputs.jeswr_names }}
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Self-test, then release recovered parks
+        env:
+          GH_TOKEN: ${{ steps.target-token-jeswr.outputs.token }}
+          BOT_SLUG: ${{ steps.target-token-jeswr.outputs.app-slug }}
+          TARGET_REPOS: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ -n "${GH_TOKEN:-}" ]] || { echo '::error::no target App token was minted'; exit 1; }
+          [[ -n "${BOT_SLUG:-}" ]] || { echo '::error::the App slug did not reach this step'; exit 1; }
+          # --max-clears bounds ONE run; --reconcile-max bounds ONE pull request for its whole
+          # life, so a PR that keeps re-acquiring the park cannot loop through this exit. Both
+          # flags are asserted at this call site by `--self-test` (block (i)), so unwiring either
+          # one fails the gate rather than silently unbounding the sweep.
+          python3 scripts/reconcile-conflict-park.py --self-test
+          python3 scripts/reconcile-conflict-park.py \
+            --apply \
+            --repos "$TARGET_REPOS" \
+            --bot-login "${BOT_SLUG}[bot]" \
+            --max-clears 5 \
+            --reconcile-max 2

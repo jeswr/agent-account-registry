@@ -535,3 +535,94 @@ and requires `review` to admit and `fix` to refuse.
 4. **`enrolment_enable_error` returning `None` is not a green light.** It checks *wiring*, not
    readiness; every blocker found so far was outside what it can express. `policy/repos.toml` is
    again deliberately unchanged.
+
+---
+
+## 10. §9.5 item 1's other half — the refusal that recorded NOTHING (Claude Opus 5, 2026-07-28)
+
+> 🤖 **SPARQ agent** — registry #972. This section deliberately fixes **one half** of a problem
+> §9.5 item 1 named, and says clearly which half it does **not** touch.
+
+### 10.1 The measured failure
+
+With the first-ever `orchestrator` record minted (`orchestrator:30338368066.1`, PR #961) the lane
+ran end to end for the first time:
+
+| leg | run | result |
+|---|---|---|
+| PLAN, enumerated #961 | 30339511626 | ✅ |
+| CLAIM, dispatched review round 1 | 30340312044 | ✅ |
+| `review-fix.yml` `resolve` (exported `self_attested=true`) | 30340804869 | ✅ |
+| **`run` → `Verify target App identity and default branch`** | 30340804869 | ❌ `pull request author is not the registry App bot` |
+| **`outcome`** | 30340804869 | **skipped** |
+
+That step is a **sixth #657 consumer**, downstream of the `resolve` job that had already admitted
+the PR, and unreachable by all four of `enrolment_enable_error`'s wiring facts.
+
+### 10.2 The half this PR does NOT fix, and why
+
+**The authorship gate is untouched.** Widening it is a security-posture decision about the job
+that hands a model a target-scoped App token, and §9.5 item 1 already says that needs a *design*
+decision rather than a shape widening. `refuse("author-not-app-bot")` refuses exactly what
+`raise SystemExit("pull request author is not the registry App bot")` refused, for exactly the
+same population — asserted by executing the workflow's own block against a spoofed `*[bot]`
+login, a bare human login, and a near-miss `registry-admin[bot]x`.
+
+### 10.3 The half it does fix: a refusal must RECORD itself
+
+The `run` job died before binding any output the `outcome` job's `if:` tests, so `outcome` was
+skipped and **nothing durable was written** — no verdict, no round, no `review:*` transition. The
+next tick therefore re-derived a byte-identical world and launched the identical run. #961 escaped
+only because a human armed and merged it.
+
+`always()` was **already** on the `outcome` job and was never the defect. The **conjunct** was.
+
+Four wires, all structural:
+
+1. the identity step names its refusal (`refusal=<code>`) and exits 0 **without** binding
+   `bot_login`;
+2. the next step fails the job whenever `bot_login` is empty — **fail-closed by construction**:
+   the only value that lets the run continue is one written after every predicate passed;
+3. `jobs.outcome.if` gains an `identity_refusal != ''` disjunct, and `reverify` gains the matching
+   conjunct so the job survives the path it now admits;
+4. `worker-pr.py identity-refusal` records it.
+
+### 10.4 The two decisions, argued from the code
+
+**The round is NOT consumed.** `round-record` runs strictly *after* the identity step, so zero
+rounds are charged today and the only question is whether to start. The round budget is the
+*reviewer's*: `decide_budget` grades progress between rounds and extends on improvement or a
+model-tier bump, so a round in which no reviewer ran is indistinguishable from a stagnant one and
+would count against the PR for work nobody did. #596 settled the same shape one step down this
+same job for credential outages. And decisively: charging rounds delivers the PR into the `budget`
+park, which is **capacity**-class and therefore *has* an automatic re-admission — which would hand
+it straight back to the identical refusal. Consuming the round buys a strictly worse exit.
+
+**The cap is ONE, and the park is question-class.** The gate reads the target repo's
+`full_name`/`default_branch`, the App's own login and the PR's author. A re-dispatch changes none
+of them, so a retry is identical *by construction*. That is the property that separates the two
+halves of `PARK_CAUSES`: every capacity cause caps something that can come out differently next
+attempt (`budget`, `dispatch-missed`, `nochange`, `gatefail`); every question cause is terminal on
+first observation because nothing can (`history-rewritten`, `routing-unresolvable`,
+`marker-corrupt`). `target-identity` is the latter. The machine exit is the cause itself, not a
+timer: the durable receipt names the reason, and the park's own `readmission_cutoff` re-opens the
+budget on a human gesture once the cause is gone.
+
+### 10.5 What this does and does NOT change about enrolment
+
+`enrolment_enable_error` still takes four wiring facts and still reads `None`. A **fifth** fact for
+this step is deliberately NOT added, because a fifth fact reading `False` would force the
+un-enrol-or-widen decision this PR is scoped out of. What *has* changed is the interlock's
+premise: its refusal condition is "every enrolled PR would be enumerated and then refused, dropped
+or merged, **on every tick, forever**". After this PR, the identity leg refuses **once**, names its
+reason, and leaves the frontier. That is a bounded, counted, visible non-delivery instead of an
+invisible unbounded one — so §9.5 item 4 stands, sharper: the interlock checks wiring, and the
+honest statement of the lane's current delivery is *zero reviews, one named park per PR*, until the
+Half-A decision lands.
+
+### 10.6 Sequencing — this fix must land BEFORE #937
+
+#937 (`auto-mint-provenance.yml`) mints records automatically. Landing it first would feed the
+whole population into a loop with no exit — one dispatch per PR per ~10-minute tick, each burning
+a claim, a runner and an account lease, forever. Landing this first makes auto-minting bounded: the
+worst case becomes one terminal, named park per PR.

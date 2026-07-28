@@ -984,6 +984,270 @@ _derive_full_selftest_suite() {
 FULL_SELFTEST_SUITE=$(_derive_full_selftest_suite "$SCRIPT_DIR" "$SELFTEST_MANIFEST") ||
   die 'registry-selftest gate: self-test manifest validation failed (fail closed)'
 
+# ─── SELF-TEST SANDBOX: stop enrolled self-tests reaching the real `gh` ──────────────────────
+#
+# Measured twice in one night, both with a GREEN suite:
+#   * a watchdog suite wrote ~567 comments to a live PR (plus 4 to a live issue) across 175 runs,
+#     because `def __init__(self, ..., gh=run_gh)` binds the function OBJECT at definition time --
+#     patching the module attribute could not reach it, so the reads were faked and the WRITES were
+#     real;
+#   * a second suite, observed under a PATH shim, issued 18 real `gh pr merge` invocations against
+#     five live PRs, and an earlier probe 17 real `POST /issues/<n>/comments` on the same PRs.
+#
+# Every in-process control -- poisoning a module attribute, injecting a runner, asserting on a
+# double -- lives INSIDE the process the code can bypass, which is precisely how both incidents
+# happened. A PATH shim sits OUTSIDE it, so it catches default-argument bindings, optional runners,
+# bare `subprocess` calls and `bash -c` shell-outs from rendered YAML without anyone having to
+# enumerate them first. That is its value; it is not totality.
+#
+# WHAT IT DOES NOT CATCH, all three MEASURED on this tree rather than reasoned about. A PATH shim
+# binds the child's ENVIRONMENT, so a child that steps outside that environment is outside the
+# control:
+#   1. an ABSOLUTE path -- a plain `/usr/bin/gh` call reaches the real binary (gh 2.94.0), the run
+#      exits 0 and the escape log stays EMPTY;
+#   2. a child that REPLACES PATH (`env={"PATH": "/usr/bin", ...}`) -- likewise reaches it;
+#   3. a child that keeps PATH but drops GH_ESCAPE_LOG -- the shim still refuses (exit 97), so the
+#      write is PREVENTED, but nothing is recorded and the run exits 0.
+# No enrolled self-test does any of these today, and a repo sweep finds exactly one absolute-path
+# invocation -- the `${WORKER_GH_BIN:-/usr/bin/gh}` seam this sandbox defaults into itself.
+#
+# FAIL CLOSED, with NO read allow-list. `gh` is refused outright, reads included: an escaping read
+# is still a correctness and rate-limit problem, and an allow-list is an inventory of escapes
+# somebody has to keep complete -- the same defect one level up. A self-test that genuinely needs
+# `gh` output already has the right mechanism and does not need an exception: ship a fixture fake
+# and prepend its directory to PATH, as scripts/trust-gate.py, scripts/dashboard-gen.py and
+# scripts/dispatch-secrets-guard.py already do. A script-local fake is prepended AHEAD of this
+# sandbox, so it keeps winning and never reaches the shim.
+
+# Fixture identity for every hermeticity test below. A test that PROVES the sandbox refuses `gh`
+# must, by construction, be the one test that runs while the sandbox is mutated off -- so its argv
+# is the argv that reaches the live estate when the guard fails. It therefore names a repo that
+# CANNOT exist and a subcommand `gh` does not have. A third production-write incident tonight came
+# from a hermeticity fixture that named a LIVE pull request.
+SELFTEST_UNRESOLVABLE_REPO='sparq-selftest-invalid/does-not-exist-0000000000'
+
+# Materialize the sandbox `gh` into <bindir>. Refuses `gh` outright: logs the argv as evidence,
+# names itself on STDERR (never stdout -- self-tests parse stdout), and exits non-zero so the
+# escaping call does not receive a forged success.
+_selftest_sandbox_materialize() {
+  local bindir=$1
+  mkdir -p -- "$bindir" || return 1
+  cat > "$bindir/gh" <<'SANDBOX_GH'
+#!/bin/sh
+# registry self-test sandbox — see _selftest_sandbox_materialize in scripts/worker-live.sh
+printf '%s\t%s\n' "${SELFTEST_SANDBOX_SCRIPT:-<unknown>}" "$*" >> "$GH_ESCAPE_LOG"
+printf 'registry self-test sandbox: REFUSED a real `gh` invocation: gh %s\n' "$*" >&2
+exit 97
+SANDBOX_GH
+  chmod +x -- "$bindir/gh" || return 1
+}
+
+# KNOWN-POSITIVE VALIDATION of the instrument itself. An empty escape log is evidence of nothing
+# unless the shim is actually first on PATH -- a shim that never intercepts writes an empty file
+# that looks exactly like success, and five instruments failed that way in one night. Drive a
+# deliberate call through and require it to be captured. Returns 0 iff interception is proven.
+_selftest_sandbox_intercepts() {
+  local bindir=$1 log=$2
+  : > "$log" || return 1
+  PATH="$bindir:$PATH" GH_ESCAPE_LOG="$log" SELFTEST_SANDBOX_SCRIPT='<canary>' \
+    gh __sandbox_canary__ >/dev/null 2>&1 || true
+  grep -q '__sandbox_canary__' "$log" 2>/dev/null || return 1
+  : > "$log"
+}
+
+# Run ONE enrolled self-test inside the sandbox.
+#
+# SCOPE, stated precisely rather than as a totality claim. This is the only place THE ENROLLED-SUITE
+# RUNNER executes a self-test: pr-gate.yml's suite loop and registry_selftest_gate below both come
+# through here, and within that lane a newly added script cannot forget to opt in, because
+# enrollment is compulsory -- _derive_full_selftest_suite REFUSES any script that advertises
+# `--self-test` without a manifest entry, and refuses any manifest entry that lost its entrypoint.
+# For the SUITE lane, "enrolled" and "sandboxed" are therefore the same set by construction.
+#
+# It is NOT the only place in the repo. MEASURED: 21 further invocations across 10 production
+# workflows run an enrolled self-test DIRECTLY as a preflight, 15 of them in token-bearing jobs --
+# `groom.yml:445` runs `groom-alert.py --self-test` with both GH_TOKEN and ALERT_TOKEN in scope.
+# Those are outside this sandbox and are tracked in issue #991; they are a separate change because
+# several of those workflows use sparse checkouts that do not contain worker-live.sh at all.
+run_enrolled_selftest() {
+  local script=$1 root=${2:-$SCRIPT_DIR} sandbox rc
+  sandbox=$(mktemp -d) || { printf '::error::self-test sandbox: mktemp failed\n' >&2; return 1; }
+  if _selftest_sandbox_materialize "$sandbox/bin"; then
+    _run_selftest_in_sandbox "$sandbox/bin" "$sandbox/gh-escapes.log" "$script" "$root"
+    rc=$?
+  else
+    printf '::error::self-test sandbox could not be materialized; refusing to run %s unsandboxed\n' \
+      "$script" >&2
+    rc=1
+  fi
+  # Removed by the EXACT path mktemp handed back -- never a glob. ~10 agents share /tmp on this box,
+  # and `rm -rf /tmp/<prefix>-*` from a sibling agent is a near miss that has already happened.
+  rm -rf -- "$sandbox"
+  return "$rc"
+}
+
+# The sandboxed run itself, with the shim directory passed IN so the self-test can drive it with a
+# deliberately BLIND sandbox and prove the canary refusal actually fires. Keeping the mktemp in the
+# caller is what makes that call site reachable from a test at all.
+_run_selftest_in_sandbox() {
+  local bindir=$1 log=$2 script=$3 root=$4
+  local rc
+  local -a argv
+  case "$script" in
+    # migrate-secrets.sh accepts `--self-test | self-test`; every other enrolled shell script
+    # advertises the bare `self-test)` form that _derive_full_selftest_suite discovers.
+    *.py) argv=(python3 "$root/$script" --self-test) ;;
+    *.sh) argv=(bash "$root/$script" self-test) ;;
+    *) printf '::error::unsupported self-test suite entry: %s\n' "$script" >&2
+       return 1 ;;
+  esac
+  # KNOWN-POSITIVE VALIDATION, on every single run. Prove the shim is really first on PATH BEFORE
+  # the emptiness assertion below is allowed to mean anything: a shim that never intercepts writes
+  # an empty log that is indistinguishable from success, and instruments fail toward
+  # "nothing to report".
+  if ! _selftest_sandbox_intercepts "$bindir" "$log"; then
+    printf '::error::self-test sandbox is NOT intercepting `gh` (the canary was not captured); refusing to run %s, because an empty escape log would prove nothing\n' \
+      "$script" >&2
+    return 1
+  fi
+  # WORKER_GH_BIN is an ABSOLUTE-path seam (`"${WORKER_GH_BIN:-/usr/bin/gh}"`, see _cmd_write_back)
+  # that a PATH shim cannot see. Default it into the sandbox so the fallback cannot reach the real
+  # binary; a self-test that sets it per-command to its own capturing fake still wins.
+  if PATH="$bindir:$PATH" GH_ESCAPE_LOG="$log" SELFTEST_SANDBOX_SCRIPT="$script" \
+     WORKER_GH_BIN="$bindir/gh" "${argv[@]}"; then rc=0; else rc=$?; fi
+  # THE ASSERTION. A `gh` that reached the shim is a self-test touching the LIVE estate, so it reds
+  # even when the self-test itself reported success -- which is exactly the shape of both incidents:
+  # green suite, real writes. Never trust the child's exit code to carry this.
+  if [[ -s "$log" ]]; then
+    printf '::error::self-test %s reached the real `gh` (%s intercepted invocation(s)) — a self-test must never touch the live estate\n' \
+      "$script" "$(wc -l < "$log" | tr -d ' ')" >&2
+    sed 's/^/::error::gh-escape /' "$log" >&2
+    return 1
+  fi
+  return "$rc"
+}
+
+# PURE (self-tested): print the body of a shell function, normalised to stripped, comment-free
+# lines. Used to pin registry_selftest_gate's self-test call sites. Prints nothing for an absent
+# file or an absent function, which fails closed against any expected value.
+_shell_function_body() {
+  local file=$1 fn=$2
+  [[ -f "$file" ]] || return 0
+  awk -v fn="$fn" '
+    { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+    line ~ /^#/ || line == "" { next }
+    !on && line == fn "() {" { on = 1; next }
+    on && line == "}" { exit }
+    on { print line }
+  ' "$file"
+}
+
+# PURE (self-tested): the body of the `run-selftest)` CLI arm, normalised to stripped, comment-free
+# lines. Pinned by EXACT BLOCK because this arm is the one place whose exit code pr-gate.yml trusts
+# for every row -- and a mutant that SUPPRESSES that exit code (`run_enrolled_selftest "$2" || true`)
+# is SELF-MASKING: it discards the status of the very process whose assertions detect it, so no
+# runtime row can kill it through the pr-gate frame. MEASURED: `|| true` -> the row fires (1 FAIL)
+# yet `run-selftest` still exits 0. A source-level assertion is immune to that, because it does not
+# travel through the mutated exit path. (`; true` is NOT such a mutant: under `set -euo pipefail`
+# errexit exits at the non-zero return before it is reached -- measured identical to baseline.)
+_run_selftest_cli_arm() {
+  local file=$1
+  [[ -f "$file" ]] || return 0
+  awk '
+    { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+    line ~ /^#/ || line == "" { next }
+    line == "run-selftest)" { on = 1; print line; next }
+    on && line == ";;" { print line; exit }
+    on { print line }
+  ' "$file"
+}
+
+# PURE (self-tested): the self-test DISPATCH blocks of registry_selftest_gate -- every top-level
+# loop in its body that runs an enrolled self-test -- printed VERBATIM and normalised, as one
+# comparable value.
+#
+# This replaced a COUNTING pin (`direct=N runner=M`). Review demonstrated that a count is FORGEABLE:
+# a compensating mutant reverted a real call site to `python3 "$SCRIPT_DIR/$name" --self-test`
+# (spelled past the counter's regex) and added a DEAD `if false; then run_enrolled_selftest ...; fi`
+# to restore the tally. It forged the expected value, SURVIVED at 433/433 with zero FAIL rows, and
+# put an UNSANDBOXED self-test back in the worker lane -- which runs with ambient `gh` credentials.
+# A decoy cannot satisfy an exact-block match, because the decoy IS a difference. Any counting
+# assertion on a security boundary has this hole; prefer exact source blocks.
+_registry_gate_selftest_dispatch() {
+  _shell_function_body "$1" registry_selftest_gate | python3 -c '
+import re, sys
+
+lines = [l.rstrip("\n") for l in sys.stdin]
+blocks, buf, depth = [], None, 0
+
+def opens(l):
+    return (l.endswith("; do") or l.endswith("; then") or l.endswith(" in")
+            or l == "do" or l == "then")
+
+def closes(l):
+    return l in ("done", "fi", "esac")
+
+for line in lines:
+    if buf is None:
+        if line.endswith("; do"):
+            buf, depth = [line], 1
+        continue
+    buf.append(line)
+    if opens(line):
+        depth += 1
+    elif closes(line):
+        depth -= 1
+        if depth == 0:
+            blocks.append(buf)
+            buf = None
+for b in blocks:
+    text = "\n".join(b)
+    if "run_enrolled_selftest" in text or "self-test" in text:
+        print("\n".join(b))
+'
+}
+
+# PURE (self-tested): pr-gate.yml's INDEPENDENT escape channel -- the report file it initialises
+# and the assertion that reds on any `::error::gh-escape` row -- normalised, as one comparable value.
+#
+# It is pinned separately from the suite loop because it is a SEPARATE signal: the loop trusts
+# run-selftest's EXIT STATUS, this trusts its OUTPUT, and the point is that one being silenced does
+# not silence the other. Measured before this pin existed: deleting the channel outright, and making
+# it conditionally inert, BOTH survived the whole suite at 434/434 with zero FAIL rows -- a guard
+# added in the same round as its own mutation sweep, with no mutant covering it.
+#
+# The `tee` line is deliberately NOT matched here: it already belongs to the suite-loop block, and
+# pinning it twice would let two assertions mask each other's mutants.
+_pr_gate_escape_channel() {
+  local file=$1
+  [[ -f "$file" ]] || return 0
+  awk '
+    { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+    line ~ /^#/ || line == "" { next }
+    line ~ /^escapes=/ { print line; next }
+    line == ": > \"$escapes\"" { print line; next }
+    line ~ /^if grep -q .\^::error::gh-escape / { on = 1; print line; next }
+    on { print line }
+    on && line == "fi" { exit }
+  ' "$file"
+}
+
+# PURE (self-tested): print pr-gate.yml's self-test loop -- `for s in $suite; do` through its
+# `done` -- normalised to stripped, comment-free lines, so the gate's ACTUAL suite invocation can be
+# pinned by exact whole-block match. Prints nothing when the file or the loop is absent, which fails
+# closed against any expected block.
+_pr_gate_suite_loop() {
+  local file=$1
+  [[ -f "$file" ]] || return 0
+  awk '
+    { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+    line ~ /^#/ || line == "" { next }
+    line == "for s in $suite; do" { on = 1 }
+    on { print line }
+    on && line == "done" { exit }
+  ' "$file"
+}
+
 # [issue #824] Dependencies the enrolled suite EXECUTES but this repo does not ship. They are
 # preinstalled on the ubuntu-latest runner the gate actually runs on, but ABSENT from the
 # unprivileged model container (no root, no sudo, no pip) -- where roughly a THIRD of the suite then
@@ -1483,11 +1747,7 @@ registry_selftest_gate() {
     kind=${t%%:*}; name=${t#*:}
     if [[ "$kind" == self ]]; then
       printf 'worker-live: self-test %s\n' "$name"
-      if [[ "$name" == *.sh ]]; then
-        bash "scripts/$name" self-test || die "self-test failed: $name"
-      else
-        python3 "scripts/$name" --self-test || die "self-test failed: $name"
-      fi
+      run_enrolled_selftest "$name" || die "self-test failed: $name"
       direct=$((direct + 1))
     fi
   done
@@ -1513,11 +1773,7 @@ registry_selftest_gate() {
   for script in $FULL_SELFTEST_SUITE; do
     [[ -f "scripts/$script" ]] || continue
     printf 'worker-live: suite self-test %s\n' "$script"
-    if [[ "$script" == *.sh ]]; then
-      bash "scripts/$script" self-test || die "suite self-test failed: $script"
-    else
-      python3 "scripts/$script" --self-test || die "suite self-test failed: $script"
-    fi
+    run_enrolled_selftest "$script" || die "suite self-test failed: $script"
     ran=$((ran + 1))
   done
 
@@ -5348,6 +5604,22 @@ HOOKPATCH
   # planted in it, and the commit rebuilt from the verified patch. The push is expected to fail
   # (the fixture has no remote), which is exactly the cut we want: everything up to and including
   # the commit has run, nothing was published. ----
+  # HERMETIC BOUNDARY for publish_pr's final step. Its last action is a live `gh pr create`, and
+  # MEASURED before the self-test sandbox existed this block issued
+  #   gh pr create --repo jeswr/agent-account-registry --base main --head sparq-agent/issue-575-99-1
+  # against the REAL registry repo on every suite run -- reached because `_git_push_authenticated`
+  # had already FAILED and publish_pr continued anyway (errexit is disabled inside the `if ( … )`
+  # condition below, so the failing push does not abort). Only the fixture's fake `GH_TOKEN` stopped
+  # it from opening a draft PR. Route `gh` through a recording fixture so the row is hermetic; the
+  # underlying "a failed push does not abort publish_pr" defect is tracked separately.
+  local pubbin="$tmp/publish-bin" pubcap="$tmp/publish-gh-calls"
+  mkdir -p "$pubbin"
+  cat > "$pubbin/gh" <<PUBGH
+#!/bin/sh
+printf '%s\n' "\$*" >> "$pubcap"
+exit 1
+PUBGH
+  chmod 755 "$pubbin/gh"
   local wpub="$tmp/bundle-pub" pubroot="$tmp/bundle-pubroot" pub_rc
   git clone -q "$wsrc" "$wpub"
   git -C "$wpub" remote remove origin
@@ -5364,7 +5636,7 @@ HOOK
               ISSUE_NUMBER=575 TARGET_DEFAULT_BRANCH=main \
               TARGET_BOT_LOGIN='sparq-agent[bot]' TARGET_BOT_ID=12345 \
               GH_TOKEN=ghs_fake_publisher GITHUB_OUTPUT="$tmp/pub.out" \
-              GIT_CONFIG_NOSYSTEM=1 HOME="$tmp/no-home"
+              GIT_CONFIG_NOSYSTEM=1 HOME="$tmp/no-home" PATH="$pubbin:$PATH"
        publish_pr ) > "$tmp/pub.log" 2>&1; then pub_rc=0; else pub_rc=$?; fi
   chk "#575 publish: it stops at the push (no remote in the fixture), having built the commit" \
     "$([[ "$pub_rc" -ne 0 ]] && printf stopped || printf pushed)" "stopped"
@@ -5400,12 +5672,276 @@ HOOK
               ISSUE_NUMBER=575 TARGET_DEFAULT_BRANCH=main \
               TARGET_BOT_LOGIN='sparq-agent[bot]' TARGET_BOT_ID=12345 \
               GH_TOKEN=ghs_fake_publisher GITHUB_OUTPUT="$tmp/pub2.out" \
-              GIT_CONFIG_NOSYSTEM=1 HOME="$tmp/no-home"
+              GIT_CONFIG_NOSYSTEM=1 HOME="$tmp/no-home" PATH="$pubbin:$PATH"
        publish_pr ) > "$tmp/pub2.log" 2>&1; then pub2_rc=0; else pub2_rc=$?; fi
   chk "#575 publish: a tampered bundle is refused at push time too (defence in depth)" \
     "$([[ "$pub2_rc" -ne 0 ]] && printf refused || printf published)" "refused"
   chk "#575 publish: and it left the publisher checkout untouched (no commit, no branch)" \
     "$(git -C "$wpub2" rev-parse HEAD)" "$wbase"
+
+  # ================================================================================================
+  # SELF-TEST SANDBOX — no enrolled self-test may reach the real `gh`.
+  # Measured on this tree before the sandbox existed: the enrolled suite was GREEN while three of its
+  # 44 rows called the real binary — `gh pr create --repo jeswr/agent-account-registry …` from THIS
+  # script's own #575 publish block, `gh issue comment` x5 from grant-account.py, and an
+  # ambient-credentialed `gh api repos/<invalid>/collaborators/…` read from trust-gate.py. Every
+  # assertion below is therefore driven through FIXTURE scripts, never through the enrolled suite, so
+  # the rows stay hermetic and cannot start passing because some other script was fixed.
+  # ================================================================================================
+  local sbx="$tmp/sandbox" sbxbin="$tmp/sandbox/bin" sbxlog="$tmp/sandbox/escapes.log"
+  mkdir -p "$sbx"
+  _selftest_sandbox_materialize "$sbxbin"
+  : > "$sbxlog"
+  local shim_out shim_rc
+  shim_out=$(GH_ESCAPE_LOG="$sbxlog" SELFTEST_SANDBOX_SCRIPT=fixture.py \
+    "$sbxbin/gh" __sandbox_probe__ --repo "$SELFTEST_UNRESOLVABLE_REPO" 2>/dev/null) \
+    && shim_rc=0 || shim_rc=$?
+  chk "sandbox shim: REFUSES a gh invocation (non-zero, never a forged success)" \
+    "$([[ "$shim_rc" -ne 0 ]] && printf refused || printf allowed)" "refused"
+  # STDOUT must stay clean: several enrolled self-tests parse the stdout of what they drive, and a
+  # chatty shim would corrupt their assertions instead of the escape being reported on its own.
+  chk "sandbox shim: writes NOTHING to stdout" "${shim_out:-<empty>}" "<empty>"
+  chk "sandbox shim: records the offending script AND the full argv as evidence" \
+    "$(cat "$sbxlog")" \
+    "$(printf 'fixture.py\t__sandbox_probe__ --repo %s' "$SELFTEST_UNRESOLVABLE_REPO")"
+  # The instrument must be canary-validated before its emptiness means anything (five instruments
+  # failed for want of this in one night). Prove BOTH directions: a real shim is detected, and a
+  # `gh` that does not log — i.e. a shim that is not really intercepting — is REFUSED, not trusted.
+  local deadbin="$tmp/sandbox/dead-bin"
+  mkdir -p "$deadbin"
+  printf '%s\n' '#!/bin/sh' 'exit 0' > "$deadbin/gh"
+  chmod 755 "$deadbin/gh"
+  chk "sandbox canary: a materialized shim is detected as intercepting" \
+    "$(_selftest_sandbox_intercepts "$sbxbin" "$sbxlog" && printf intercepts || printf blind)" \
+    "intercepts"
+  chk "sandbox canary: a NON-logging gh is reported BLIND (an empty log is not evidence)" \
+    "$(_selftest_sandbox_intercepts "$deadbin" "$sbxlog" && printf intercepts || printf blind)" \
+    "blind"
+
+  local sfix="$tmp/sandbox/fixtures"
+  mkdir -p "$sfix"
+  printf '%s\n' 'import sys' 'sys.exit(0)' > "$sfix/clean.py"
+  # THE INCIDENT SHAPE: a self-test that calls gh, ignores the result, and reports SUCCESS. Both
+  # production incidents looked exactly like this — a green suite over real writes — so the sandbox
+  # must red on the ESCAPE LOG, never on the child's exit code.
+  printf '%s\n' 'import subprocess, sys' \
+    "REPO = '$SELFTEST_UNRESOLVABLE_REPO'" \
+    'subprocess.run(["gh", "__sandbox_probe__", "--repo", REPO], capture_output=True)' \
+    'sys.exit(0)' > "$sfix/escaper.py"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    "gh __sandbox_probe__ --repo $SELFTEST_UNRESOLVABLE_REPO || true" 'exit 0' \
+    > "$sfix/escaper.sh"
+  # The ABSOLUTE-path seam: `"${WORKER_GH_BIN:-/usr/bin/gh}"` bypasses PATH entirely, so a PATH shim
+  # alone cannot see it. The sandbox defaults the variable into itself; this fixture proves it.
+  printf '%s\n' 'import os, subprocess, sys' \
+    'subprocess.run([os.environ.get("WORKER_GH_BIN", "/usr/bin/gh"), "__sandbox_probe__"],' \
+    '               capture_output=True)' 'sys.exit(0)' > "$sfix/ghbin.py"
+  printf '%s\n' 'import sys' 'sys.exit(3)' > "$sfix/failer.py"
+  # The SUPPORTED escape hatch, and the reason no read allow-list is needed: a self-test that needs
+  # gh output ships its own fake and prepends it to PATH, so it is found AHEAD of the sandbox and
+  # never reaches the shim. If this row ever goes red, fail-closed has become unworkable and the
+  # allow-list argument would have to be revisited — it is the load-bearing control on that claim.
+  printf '%s\n' 'import os, subprocess, sys, tempfile' \
+    'with tempfile.TemporaryDirectory() as d:' \
+    '    p = os.path.join(d, "gh")' \
+    '    open(p, "w").write("#!/bin/sh\nprintf FAKE-OK\n")' \
+    '    os.chmod(p, 0o755)' \
+    '    env = dict(os.environ, PATH=d + os.pathsep + os.environ["PATH"])' \
+    '    r = subprocess.run(["gh", "__sandbox_probe__"], capture_output=True, text=True, env=env)' \
+    'sys.exit(0 if r.stdout == "FAKE-OK" else 1)' > "$sfix/ownfake.py"
+
+  _sbx() { run_enrolled_selftest "$1" "$sfix" >/dev/null 2>&1 && printf clean || printf refused; }
+  chk "sandbox: a self-test that touches no gh runs and PASSES" "$(_sbx clean.py)" "clean"
+  chk "sandbox: a self-test that reaches gh is REFUSED even though it exited 0 (the incident shape)" \
+    "$(_sbx escaper.py)" "refused"
+  chk "sandbox: the refusal covers enrolled SHELL scripts too, not just python" \
+    "$(_sbx escaper.sh)" "refused"
+  chk "sandbox: the WORKER_GH_BIN absolute-path seam is refused too (PATH alone cannot see it)" \
+    "$(_sbx ghbin.py)" "refused"
+  chk "sandbox: a self-test's OWN failure is still propagated (the sandbox adds a verdict, never swallows one)" \
+    "$(_sbx failer.py)" "refused"
+  chk "sandbox: a self-test shipping its own PATH fake still wins and is NOT refused" \
+    "$(_sbx ownfake.py)" "clean"
+  chk "sandbox: an unsupported suite entry is refused rather than run unsandboxed" \
+    "$(_sbx notes.txt)" "refused"
+  # THE CANARY CALL SITE, not just the canary function: drive a real sandboxed run with a BLIND
+  # shim directory (a `gh` that does not log). The run must REFUSE rather than proceed and then
+  # report an empty escape log as a pass. Without this row, deleting the interception check from
+  # _run_selftest_in_sandbox leaves every other row above green.
+  chk "sandbox: a run whose shim is BLIND is refused, not reported clean on an empty log" \
+    "$(_run_selftest_in_sandbox "$deadbin" "$tmp/sandbox/blind.log" clean.py "$sfix" >/dev/null 2>&1 \
+       && printf clean || printf refused)" "refused"
+  chk "sandbox: the SAME run with a working shim is clean (the row above is not always-refused)" \
+    "$(_run_selftest_in_sandbox "$sbxbin" "$tmp/sandbox/live.log" clean.py "$sfix" >/dev/null 2>&1 \
+       && printf clean || printf refused)" "clean"
+
+  # ---- THE GUARD'S OWN INVOCATION. Everything above pins run_enrolled_selftest itself; none of it
+  # pins the two places that CALL it, and a guard whose call sites are unpinned can be bypassed
+  # without a single row going red. The marquee guard is the least-tested thing in a PR by default,
+  # so pin both lanes: registry_selftest_gate structurally (it needs a git tree, actionlint and a
+  # dependency preflight, so driving it hermetically is not worth the fixture), and the
+  # `run-selftest` CLI arm pr-gate.yml calls by EXECUTING it. ----
+  local expected_dispatch
+  expected_dispatch=$(cat <<'DISPATCH'
+for t in "${targets[@]}"; do
+kind=${t%%:*}; name=${t#*:}
+if [[ "$kind" == self ]]; then
+printf 'worker-live: self-test %s\n' "$name"
+run_enrolled_selftest "$name" || die "self-test failed: $name"
+direct=$((direct + 1))
+fi
+done
+for script in $FULL_SELFTEST_SUITE; do
+[[ -f "scripts/$script" ]] || continue
+printf 'worker-live: suite self-test %s\n' "$script"
+run_enrolled_selftest "$script" || die "suite self-test failed: $script"
+ran=$((ran + 1))
+done
+DISPATCH
+)
+  chk "registry_selftest_gate's self-test dispatch is EXACTLY the expected blocks" \
+    "$(_registry_gate_selftest_dispatch "$SCRIPT_DIR/worker-live.sh")" "$expected_dispatch"
+  local gatefix="$tmp/sandbox/gatefix"
+  mkdir -p "$gatefix"
+  printf '%s\n' 'registry_selftest_gate() {' '  for t in "${targets[@]}"; do' \
+    '    python3 "scripts/$name" --self-test || die "self-test failed: $name"' \
+    '  done' '}' > "$gatefix/reverted.sh"
+  # THE FORGED-COUNT MUTANT that defeated the previous counting pin: a real call site reverted to a
+  # direct invocation SPELLED PAST the old regex, plus a DEAD `if false` decoy restoring the tally.
+  # It forged `direct=0 runner=2` and survived at 433/433. Against an exact block the decoy is
+  # itself the difference, so it cannot compensate.
+  printf '%s\n' 'registry_selftest_gate() {' '  for t in "${targets[@]}"; do' \
+    '    python3 "$SCRIPT_DIR/$name" --self-test || die "self-test failed: $name"' \
+    '    if false; then run_enrolled_selftest "$name"; fi' \
+    '  done' '  for script in $FULL_SELFTEST_SUITE; do' \
+    '    run_enrolled_selftest "$script" || die "suite self-test failed: $script"' \
+    '  done' '}' > "$gatefix/forged.sh"
+  chk "dispatch check is NON-VACUOUS: a call site reverted to direct invocation no longer matches" \
+    "$([[ "$(_registry_gate_selftest_dispatch "$gatefix/reverted.sh")" == "$expected_dispatch" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "dispatch check is NON-VACUOUS: a DEAD-decoy forgery of the old count no longer matches" \
+    "$([[ "$(_registry_gate_selftest_dispatch "$gatefix/forged.sh")" == "$expected_dispatch" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "dispatch check fails CLOSED when the function cannot be read" \
+    "$([[ "$(_registry_gate_selftest_dispatch "$gatefix/absent.sh" 2>/dev/null)" == "$expected_dispatch" ]] \
+       && printf missed || printf caught)" "caught"
+
+  # The CLI arm, EXECUTED. A fixture SCRIPT_DIR carrying its own manifest lets the real
+  # `run-selftest` arm run end to end: pr-gate.yml is pinned by exact-block match to a string
+  # naming this arm, so if the arm swallows the runner's exit code the gate goes GREEN over an
+  # escape and every other row here stays green with it.
+  local clifix="$tmp/sandbox/clifix"
+  mkdir -p "$clifix"
+  cp "$SCRIPT_DIR/worker-live.sh" "$clifix/worker-live.sh"
+  printf '%s\n' 'import subprocess, sys' \
+    "REPO = '$SELFTEST_UNRESOLVABLE_REPO'" \
+    'if "--self-test" in sys.argv:' \
+    '    subprocess.run(["gh", "__sandbox_probe__", "--repo", REPO], capture_output=True)' \
+    '    sys.exit(0)' > "$clifix/escaper.py"
+  # Present, NOT enrolled, and deliberately advertises no `--self-test` (a script that advertised
+  # one without a manifest entry could not exist -- the derivation refuses at load). It exits 0 on
+  # any argv, so deleting the enrollment check yields rc=0 rather than an incidental failure.
+  printf '%s\n' 'import sys' 'sys.exit(0)' > "$clifix/helper.py"
+  printf '%s\n' 'escaper.py' 'worker-live.sh' > "$clifix/selftest-suite.txt"
+  : > "$clifix/selftest-retirements.txt"
+  local cli_rc cli_out
+  cli_out=$(bash "$clifix/worker-live.sh" run-selftest escaper.py 2>&1) && cli_rc=0 || cli_rc=$?
+  chk "run-selftest CLI arm PROPAGATES the sandbox refusal (swallowing it greens the gate)" \
+    "$([[ "$cli_rc" -ne 0 ]] && printf propagated || printf swallowed)" "propagated"
+  chk "run-selftest CLI arm reports the escape it refused (value, not just a non-zero exit)" \
+    "$(grep -c '^::error::gh-escape escaper.py' <<< "$cli_out")" "1"
+  cli_out=$(bash "$clifix/worker-live.sh" run-selftest helper.py 2>&1) && cli_rc=0 || cli_rc=$?
+  chk "run-selftest CLI arm REFUSES an unenrolled script rather than running it" \
+    "$([[ "$cli_rc" -ne 0 ]] && printf refused || printf ran)" "refused"
+  chk "and the refusal names ENROLLMENT as the reason, not an incidental failure" \
+    "$(grep -c 'is not enrolled in the self-test manifest' <<< "$cli_out")" "1"
+  # The arm's exit code is what pr-gate.yml trusts for EVERY row, so a suppressor added here greens
+  # the whole gate -- and does it while discarding the status that would carry its own detection.
+  # Pin the arm's source by exact block; that assertion does not travel through the mutated path.
+  local expected_arm
+  expected_arm=$(printf '%s\n' 'run-selftest)' \
+    "[[ \$# -eq 2 ]] || die 'usage: worker-live.sh run-selftest <enrolled-script>'" \
+    'case " $FULL_SELFTEST_SUITE " in' \
+    '*" $2 "*) ;;' \
+    '*) die "run-selftest: $2 is not enrolled in the self-test manifest (fail closed)" ;;' \
+    'esac' 'run_enrolled_selftest "$2"' ';;' | paste -sd'|' -)
+  chk "run-selftest CLI arm is EXACTLY the expected block (no exit-code suppressor)" \
+    "$(_run_selftest_cli_arm "$SCRIPT_DIR/worker-live.sh" | paste -sd'|' -)" "$expected_arm"
+  local armfix="$tmp/sandbox/armfix"
+  mkdir -p "$armfix"
+  printf '%s\n' '  run-selftest)' '    run_enrolled_selftest "$2" || true' '    ;;' > "$armfix/or-true.sh"
+  printf '%s\n' '  run-selftest)' '    run_enrolled_selftest "$2"; true' '    ;;' > "$armfix/semi.sh"
+  chk "the arm check is NON-VACUOUS: an '|| true' suppressor no longer matches" \
+    "$([[ "$(_run_selftest_cli_arm "$armfix/or-true.sh" | paste -sd'|' -)" == "$expected_arm" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "the arm check is NON-VACUOUS: a trailing '; true' no longer matches either" \
+    "$([[ "$(_run_selftest_cli_arm "$armfix/semi.sh" | paste -sd'|' -)" == "$expected_arm" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "the arm check fails CLOSED when the file cannot be read" \
+    "$([[ "$(_run_selftest_cli_arm "$armfix/absent.sh" 2>/dev/null | paste -sd'|' -)" == "$expected_arm" ]] \
+       && printf missed || printf caught)" "caught"
+
+  # ---- THE YAML SEAM. pr-gate.yml is where the gate actually runs the suite, and a mutation there
+  # is invisible to every python assertion in this repo. Pin the loop by EXACT WHOLE-BLOCK match:
+  # substring containment is not enough (`--apply-DROPPED` survived a containment check, and a
+  # conditionally-inert `&& false` satisfied one), and comparing the whole block additionally
+  # catches an `if false; then` wrapper, which only shows up as EXTRA lines. A missing file or a
+  # renamed loop yields an empty extraction, which fails closed against the expected block. ----
+  local expected_loop
+  expected_loop=$(printf '%s\n' 'for s in $suite; do' 'echo "== self-test $s =="' \
+    'bash scripts/worker-live.sh run-selftest "$s" 2>&1 | tee -a "$escapes"' \
+    '((n += 1))' 'done' | paste -sd'|' -)
+  chk "pr-gate.yml suite loop routes EVERY entry through the sandbox runner (exact block)" \
+    "$(_pr_gate_suite_loop "$SCRIPT_DIR/../.github/workflows/pr-gate.yml" | paste -sd'|' -)" \
+    "$expected_loop"
+  # NON-VACUITY of the extractor itself: it must actually change under the mutants it claims to
+  # catch, or the row above is a constant comparing itself.
+  local loopfix="$tmp/sandbox/loopfix"
+  mkdir -p "$loopfix"
+  printf '%s\n' '      - name: x' '        run: |' '          for s in $suite; do' \
+    '            echo "== self-test $s =="' '            bash scripts/worker-live.sh run-selftest "$s" && false' \
+    '            ((n += 1))' '          done' > "$loopfix/inert.yml"
+  printf '%s\n' '      - name: x' '        run: |' '          for s in $suite; do' \
+    '            echo "== self-test $s =="' '            if false; then' \
+    '              bash scripts/worker-live.sh run-selftest "$s" 2>&1 | tee -a "$escapes"' '            fi' \
+    '            ((n += 1))' '          done' > "$loopfix/if-false.yml"
+  chk "pr-gate loop check is NON-VACUOUS: an appended '&& false' no longer matches" \
+    "$([[ "$(_pr_gate_suite_loop "$loopfix/inert.yml" | paste -sd'|' -)" == "$expected_loop" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "pr-gate loop check is NON-VACUOUS: a conditionally-inert 'if false' no longer matches" \
+    "$([[ "$(_pr_gate_suite_loop "$loopfix/if-false.yml" | paste -sd'|' -)" == "$expected_loop" ]] \
+       && printf missed || printf caught)" "caught"
+  # THE INDEPENDENT CHANNEL. R4/R5 measured: deleting this block, and making it conditionally inert,
+  # both SURVIVED the whole suite at 434/434 with zero FAIL rows before this pin existed.
+  local expected_channel
+  expected_channel=$(cat <<'CHANNEL'
+escapes="$RUNNER_TEMP/gh-escape-report.txt"
+: > "$escapes"
+if grep -q '^::error::gh-escape ' "$escapes"; then
+echo "::error::a self-test reached the real gh — see the gh-escape rows above"
+exit 1
+fi
+CHANNEL
+)
+  chk "pr-gate.yml keeps the INDEPENDENT ::error:: escape channel (exact block)" \
+    "$(_pr_gate_escape_channel "$SCRIPT_DIR/../.github/workflows/pr-gate.yml")" "$expected_channel"
+  printf '%s\n' '          escapes="$RUNNER_TEMP/gh-escape-report.txt"' '          : > "$escapes"' \
+    "          if false && grep -q '^::error::gh-escape ' \"\$escapes\"; then" \
+    '            exit 1' '          fi' > "$loopfix/chan-inert.yml"
+  printf '%s\n' '          escapes="$RUNNER_TEMP/gh-escape-report.txt"' '          : > "$escapes"' \
+    > "$loopfix/chan-deleted.yml"
+  chk "channel check is NON-VACUOUS: a conditionally-inert channel no longer matches" \
+    "$([[ "$(_pr_gate_escape_channel "$loopfix/chan-inert.yml")" == "$expected_channel" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "channel check is NON-VACUOUS: a DELETED channel no longer matches" \
+    "$([[ "$(_pr_gate_escape_channel "$loopfix/chan-deleted.yml")" == "$expected_channel" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "channel check fails CLOSED on an unreadable workflow" \
+    "$([[ "$(_pr_gate_escape_channel "$loopfix/absent.yml" 2>/dev/null)" == "$expected_channel" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "pr-gate loop check fails CLOSED on an unreadable workflow" \
+    "$([[ "$(_pr_gate_suite_loop "$loopfix/absent.yml" 2>/dev/null | paste -sd'|' -)" == "$expected_loop" ]] \
+       && printf missed || printf caught)" "caught"
 
   if [[ "$failures" -eq 0 ]]; then
     printf 'worker-live self-test PASSED\n'
@@ -5432,6 +5968,18 @@ case "${1:-}" in
     [[ $# -eq 3 ]] || die 'usage: worker-live.sh print-selftest-suite <base-manifest> <base-retirements>'
     _derive_full_selftest_suite "$SCRIPT_DIR" "$SELFTEST_MANIFEST" "$2" "$3"
     ;;
+  # The sandboxed self-test runner pr-gate.yml's suite loop calls. It is the only entrypoint the
+  # ENROLLED-SUITE LANE uses -- it is NOT the only way an enrolled self-test runs in this repo:
+  # 21+ invocations across 10 production workflows call one directly as a preflight (issue #991),
+  # and this arm does not reach them.
+  run-selftest)
+    [[ $# -eq 2 ]] || die 'usage: worker-live.sh run-selftest <enrolled-script>'
+    case " $FULL_SELFTEST_SUITE " in
+      *" $2 "*) ;;
+      *) die "run-selftest: $2 is not enrolled in the self-test manifest (fail closed)" ;;
+    esac
+    run_enrolled_selftest "$2"
+    ;;
   self-test) self_test ;;
-  *) die 'usage: worker-live.sh <model|gate|bundle|verify-bundle|publish|review|fix|push-fix|write-back|print-selftest-suite|self-test>' ;;
+  *) die 'usage: worker-live.sh <model|gate|bundle|verify-bundle|publish|review|fix|push-fix|write-back|print-selftest-suite|run-selftest|self-test>' ;;
 esac

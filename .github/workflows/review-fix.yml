@@ -861,6 +861,12 @@ jobs:
       # in the separate `outcome` job below, which executes no target code.
       contents: read
     outputs:
+      # [registry #972] The target-identity refusal CODE, or empty. Non-empty means this run was
+      # refused BEFORE the reviewer launched and the refusal is DETERMINISTIC (the gate reads the
+      # target repo, this App's login and the PR author — a re-dispatch changes none of them), so
+      # the `outcome` job must record a terminal, counted outcome instead of leaving the world
+      # unchanged for the next tick to re-dispatch into. Bound from a step that SUCCEEDS.
+      identity_refusal: ${{ steps.target.outputs.refusal }}
       reviewed_sha: ${{ steps.review.outputs.reviewed_sha }}
       verdict_ok: ${{ steps.verdict.outcome }}
       verdict_b64: ${{ steps.handoff.outputs.verdict_b64 }}
@@ -969,25 +975,69 @@ jobs:
               repo = json.load(handle)
           with open(sys.argv[2], encoding="utf-8") as handle:
               user = json.load(handle)
+
+          # [registry #972] A REFUSAL MUST RECORD ITSELF. Every predicate below still refuses
+          # exactly what it refused before — none of them is widened, and the model still never
+          # runs — but the refusal now names a CODE from worker-pr.IDENTITY_REFUSAL_REASONS and
+          # leaves this step at exit 0 WITHOUT binding `bot_login`, so the next step (which fails
+          # the job) and the `outcome` job can both see it. Until this, the refusal raised, the
+          # `run` job died, the `outcome` job's `if:` went unsatisfied, and NOTHING durable was
+          # written — so the next dispatch tick re-derived a byte-identical world and re-launched
+          # the identical run, forever. Measured on this registry's own PR #961 (review run
+          # 30340804869: `Apply outcome` SKIPPED).
+          #
+          # The FAIL DIRECTION is unchanged and is enforced by the NEXT step, not by this one:
+          # `bot_login` is written on the success path ALONE, and the next step fails the job
+          # whenever it is empty. So every exit from this block that is not a full pass — a
+          # refusal, an exception, a `refuse()` whose code was mistyped — stops the run.
+          def refuse(code):
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+                  handle.write(f"refusal={code}\n")
+              print(f"::error::target identity refused: {code}")
+              raise SystemExit(0)
+
           if repo.get("full_name") != os.environ["TARGET_REPO"]:
-              raise SystemExit("App token read the wrong target")
+              refuse("wrong-target")
           default_branch = repo.get("default_branch")
           login = user.get("login")
           user_id = str(user.get("id", ""))
           if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", str(default_branch)):
-              raise SystemExit("target has an unsafe default branch")
+              refuse("unsafe-default-branch")
           if not re.fullmatch(r"[A-Za-z0-9_.-]+\[bot\]", str(login)) or not user_id.isdigit():
-              raise SystemExit("target token did not identify a GitHub App bot")
+              refuse("not-an-app-bot")
           # Authoritative authorship check: the PR must be authored by THIS App bot — a spoofed
-          # bot-suffixed author from some other App never reaches the model.
+          # bot-suffixed author from some other App never reaches the model. DELIBERATELY NOT
+          # WIDENED for the #657 self-attested class (research/657-orchestrator-pr-admission.md
+          # §9.5 item 1): handing a target-scoped App token to a model on a PR this App did not
+          # author is a security-posture decision, not a shape widening. #972 fixes the missing
+          # EXIT, not the gate.
           if os.environ["PR_AUTHOR"] != login:
-              raise SystemExit("pull request author is not the registry App bot")
+              refuse("author-not-app-bot")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"default_branch={default_branch}\n")
               output.write(f"bot_login={login}\n")
               output.write(f"bot_id={user_id}\n")
           print(f"target token verified for {repo['full_name']} at {default_branch}")
           PY
+
+      # [registry #972] THE REFUSAL, made to fail the job from a step whose predecessor SUCCEEDED
+      # — which is what makes `steps.target.outputs.refusal` reliably readable as a job output.
+      #
+      # FAIL-CLOSED BY CONSTRUCTION: the only value that lets the run continue is a NON-EMPTY
+      # `bot_login`, and the step above writes that on its success path alone, after every
+      # predicate has passed. So this condition cannot become an admission hole in the direction
+      # that matters — getting it wrong stops the run, it never starts one. No `always()`: a step
+      # above that CRASHED (a network read, a malformed payload) is a TRANSIENT, the job is
+      # already failing, and a transient must keep its retry-next-tick behaviour rather than
+      # earning a terminal park.
+      - name: Refuse the run when the target App identity did not verify
+        if: ${{ steps.target.outputs.bot_login == '' }}
+        env:
+          REFUSAL: ${{ steps.target.outputs.refusal }}
+        run: |
+          echo "::error::the target App identity gate refused this run (${REFUSAL:-unverified});" \
+               "the outcome job records it as a terminal, counted refusal"
+          exit 1
 
       - name: Checkout target default branch with scoped App token (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -1408,7 +1458,14 @@ jobs:
     # non-empty) skips the fix step, so fix_done is 'skipped' and this job used to be skipped with
     # it — which is exactly why the PR kept review:changes and the fix lane re-admitted it forever.
     # The lane hand-over below is the only step that runs on that path.
-    if: ${{ always() && needs.claim.outputs.acquired == 'true' && (needs.run.outputs.verdict_ok == 'success' || needs.run.outputs.fix_done == 'success' || needs.run.outputs.verdict_stale_reason != '') }}
+    #
+    # [registry #972] adds the FOURTH admission, for the same class of defect one layer earlier: a
+    # target-identity refusal kills the `run` job BEFORE any of the three outputs above can be
+    # bound, so this job was SKIPPED — no verdict, no round, no `review:*` transition — and the
+    # next dispatch tick re-derived a byte-identical world and re-launched the identical run,
+    # forever. `always()` was already here and was never the defect; the CONJUNCT was. The
+    # refusal-recording step below is the only step that runs on that path.
+    if: ${{ always() && needs.claim.outputs.acquired == 'true' && (needs.run.outputs.verdict_ok == 'success' || needs.run.outputs.fix_done == 'success' || needs.run.outputs.verdict_stale_reason != '' || needs.run.outputs.identity_refusal != '') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # SECRET-EXFIL GUARD (issue #101): reads REGISTRY_ADMIN_APP_ID/KEY + PROVENANCE_SALT, which
@@ -1425,9 +1482,14 @@ jobs:
           path: registry
           persist-credentials: false
 
+      # [registry #972] `identity_refusal == ''` is LOAD-BEARING, not cosmetic: on the refusal path
+      # this job now runs in `review` mode with an EMPTY verdict handoff, so without the conjunct
+      # this step fails ("verdict handoff is empty") and takes the whole job — and therefore the
+      # refusal record — down with it, restoring the very loop #972 closes. Every later step is
+      # already gated on `steps.reverify.outcome == 'success'`, so `skipped` keeps them all off.
       - name: Reconstruct and re-validate the verdict on fresh registry code
         id: reverify
-        if: ${{ inputs.mode == 'review' }}
+        if: ${{ inputs.mode == 'review' && needs.run.outputs.identity_refusal == '' }}
         env:
           VERDICT_B64: ${{ needs.run.outputs.verdict_b64 }}
           FILES_B64: ${{ needs.run.outputs.files_b64 }}
@@ -1465,6 +1527,45 @@ jobs:
           repositories: ${{ needs.resolve.outputs.target_name }}
           permission-issues: write
           permission-pull-requests: write
+
+      # [registry #972] THE EXIT. The `run` job's target-identity gate refused this run before the
+      # reviewer launched; that refusal is correct and is NOT relaxed anywhere in this PR. What
+      # this step adds is that it is now RECORDED: one census row naming the refusal code, and one
+      # terminal question-class park (`review:needs-user` + `needs:user`, park cause
+      # `target-identity`) so the world the next dispatch tick reads has CHANGED. No review round
+      # is charged — `round-record` never ran, no reviewer launched, and charging one would route
+      # the PR into the CAPACITY `budget` park whose automatic re-admission would hand it straight
+      # back to the identical refusal. Full argument in worker-pr.identity_refusal.
+      #
+      # The cap is ONE per (PR, reason), enforced by the durable receipt inside that function, not
+      # by this `if:` — a re-run of this job re-reads the receipt and writes nothing.
+      - name: Record the target-identity refusal (terminal, counted, no round charged)
+        if: ${{ needs.run.outputs.identity_refusal != '' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          REGISTRY_ALERT_TOKEN: ${{ github.token }}
+          # Privacy routing (locked decision 22c), same posture as every other alert site here.
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+          MAINTAINER_HANDLE: jeswr
+          # Workflow-derived value reaches the CLI via env ONLY — never interpolated into this
+          # `run:` shell source (issue #199). The CLI re-validates it against the closed
+          # IDENTITY_REFUSAL_REASONS enum and REFUSES anything outside it.
+          IDENTITY_REFUSAL: ${{ needs.run.outputs.identity_refusal }}
+        run: |
+          # --bot-login is the login that AUTHORS the receipt (this job's own outcome-scoped App
+          # token), NOT `needs.resolve.outputs.pr_author`: the receipt reader's trust filter has
+          # to match the writer, and on the whole #657 class the PR author is a human while the
+          # comment is posted by the App. Getting this wrong would silently disable the
+          # idempotence check — it could never find its own receipt.
+          python3 registry/scripts/worker-pr.py identity-refusal \
+            --repo "${{ inputs.target_repo }}" \
+            --pr "${{ inputs.pr_number }}" \
+            --issue "${{ needs.resolve.outputs.issue }}" \
+            --bot-login "${{ steps.app-token-outcome.outputs.app-slug }}[bot]" \
+            --head-sha "${{ needs.resolve.outputs.head_sha }}" \
+            --reason "$IDENTITY_REFUSAL"
 
       - name: Apply the review outcome (findings, labels, escalation)
         id: outcome

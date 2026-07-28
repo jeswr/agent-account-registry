@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "_README": [
+    "MASTER-SIDE GATE REPAIRS, declared so scripts/regate-sweep.py can re-qualify the open PRs",
+    "each repair already unblocked (issue #927). Adding a record here is a CLAIM, made in the same",
+    "reviewed diff as the fix, that a `gate` failure carrying these assertion signatures was caused",
+    "by the named defect and not by the PR under test.",
+    "",
+    "Fields:",
+    "  repair_pr   the PR that landed the fix on master. Its merged_at and merge_commit_sha are",
+    "              resolved at sweep time, so the record does not have to know its own merge SHA.",
+    "  harness     the scripts/selftest-suite.txt entry whose self-test carried the assertion.",
+    "              Validated against the manifest by the self-test: a typo sweeps nobody.",
+    "  signatures  the assertion NAMES, exactly as the harness prints them after `FAIL `, up to",
+    "              (not including) the `: <got> (want <want>)` tail. A candidate PR is swept only",
+    "              when EVERY failure in its gate log matches one of these — a PR that also failed",
+    "              on its own merits is refused and stays red.",
+    "  why         why these signatures are attributable to this repair rather than to the PR.",
+    "",
+    "A record goes inert REPAIR_LOOKBACK_HOURS after its PR merged. Records are kept afterwards as",
+    "the audit trail for what was swept and on what grounds; they cost nothing but a skipped row."
+  ],
+  "repairs": [
+    {
+      "repair_pr": 917,
+      "harness": "worker-live.sh",
+      "signatures": [
+        "no `producer | early-exiting consumer` survives anywhere in scripts/*.sh (#879)"
+      ],
+      "why": "#888 added a SIGPIPE scanner over scripts/*.sh; the scanner's own definition line in worker-live.sh matched the pattern it searches for, so the assertion fired on every PR regardless of that PR's content (#910). #917 excludes the scanner's own file. The assertion therefore says nothing about the PR under test on any tree without #917, which is exactly what makes a failure carrying only this signature attributable to the repair. Measured: at its worst the registry ran 3 of 3 red and merged zero PRs in 58 minutes; 7 of 37 open PRs still carried this failure after #917 landed, and every one of the six re-qualified by hand went green on a moved head."
+    }
+  ]
+}

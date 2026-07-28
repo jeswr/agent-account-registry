@@ -1,0 +1,98 @@
+# Issue #927: when a master-side gate fix lands, nothing un-reds the PRs it unblocks. #917 repaired
+# #910 on master and repaired NOTHING already open — 7 of 37 PRs stayed red on a bug that no longer
+# existed. This sweeper moves the branch of every PR whose `gate` failure is ATTRIBUTABLE to a
+# declared master-side repair (orchestration/gate-repairs.json), and stops there: it never arms.
+#
+# It moves the branch rather than re-running the job because `gh run rerun` re-tests the SAME tree —
+# GitHub does not recompute a stale merge ref (#920), so the fix is not present in what is graded.
+#
+# The whole attribution argument lives in scripts/regate-sweep.py's header. Read it before widening
+# anything here: a sweeper that rebases every red PR burns CI and hides real failures.
+name: regate-sweep
+
+on:
+  workflow_dispatch:
+  schedule:
+    # :09/:29/:49 — three ticks an hour, which is the TICKS_PER_HOUR the script's drain arithmetic
+    # is asserted against. The minutes are free of every other registry cron: conflict-resolver
+    # (1/21/41), dispatch (3/13/...), groom + retriage (7/22/37/52), metrics (11/26/41/56),
+    # curate (17/47) and dashboard + groom-leases (*/15).
+    - cron: '9,29,49 * * * *'
+
+permissions: {}
+
+concurrency:
+  group: registry-regate-sweep
+  # NOT cancel-in-progress: a tick cancelled between `update-branch` and its marker comment would
+  # leave a moved head with no idempotence record, and the next tick would move it again.
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: Re-qualify PRs a master-side gate fix already unblocked
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # App secrets live only in this environment, whose default-branch deployment policy rejects a
+    # dispatch of a modified non-default-branch copy of this workflow before the mint can read them.
+    environment: dispatch-secrets
+    permissions:
+      contents: read
+    steps:
+      # No `ref:` — the repair declaration is read from the DEFAULT BRANCH. A pull request must not
+      # be able to declare itself attributable, and pinning a ref here would be exactly that hole.
+      - name: Checkout the registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          # KEEP THIS LIST IN SYNC — REQUIRED_FILES in scripts/regate-sweep.py is asserted against
+          # this very block, so a trimmed checkout reds the gate instead of silently disabling the
+          # self-test's YAML-seam assertions.
+          sparse-checkout: |
+            scripts/regate-sweep.py
+            orchestration/gate-repairs.json
+            scripts/selftest-suite.txt
+            .github/workflows/regate-sweep.yml
+
+      - name: Set up Python (pinned)
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Install the YAML parser the self-test asserts the workflow seam with
+        run: python3 -m pip install --disable-pip-version-check pyyaml
+
+      # NOT continue-on-error, and NOT `github.token`. A push made with a workflow's own
+      # GITHUB_TOKEN does not trigger `pull_request` workflows, so a branch moved under it would
+      # never re-run `pr-gate` — every sweep would move heads and re-qualify nothing, silently.
+      # The App installation token does trigger them, which is the entire mechanism.
+      - name: Mint the registry App token (contents+PRs write, this repository only)
+        id: registry-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: jeswr
+          repositories: agent-account-registry
+          permission-contents: write        # push the moved branch
+          permission-pull-requests: write   # marker comment + remove the arming label
+
+      - name: Self-test, then re-qualify at most five PRs
+        id: sweep
+        env:
+          GH_TOKEN: ${{ steps.registry-token.outputs.token }}
+          APP_SLUG: ${{ steps.registry-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          # The marker scan only counts comments THIS App wrote. Without the slug an unrestricted
+          # scan would let anyone able to comment pin a PR out of the class permanently.
+          [[ -n "${APP_SLUG:-}" ]] || { echo '::error::the App mint delivered no slug'; exit 1; }
+          python3 registry/scripts/regate-sweep.py --self-test
+          python3 registry/scripts/regate-sweep.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --repairs-file registry/orchestration/gate-repairs.json \
+            --max-moves 5 \
+            --lookback-hours 24 \
+            --bot-slug "$APP_SLUG" \
+            --apply
