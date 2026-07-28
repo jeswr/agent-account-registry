@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4660,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "af61eadbf80e4b29795d821c562b9a2ca058dace",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new picker helper preserves raw File identity for binary/decompression-aware callers, cleanly distinguishes cancellation from picker unavailability/failure, retains per-handle read failures, and keeps the existing text picker behavior by composing the helper with readFiles. The import drawer correctly merges picker and decompression rejections and avoids reopening a dialog after cancellation. The focused tests exercise the helper's load-bearing contracts, option forwarding, fallback signaling, and partial handle failure. No correctness, soundness, security, or hostile-instruction issue was found in the diff.",
+  "verdict": "approve"
+ }
+}
