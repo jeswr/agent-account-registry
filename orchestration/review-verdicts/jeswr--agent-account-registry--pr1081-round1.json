@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1081,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "67051f1a3306e974acb9d3db9a4463dad42de433",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The matching-refs call enumerates the exact `acct-requests/$ISSUE/` namespace, but the jq filter uses `select(test(...))` and silently drops every ref that does not match the expected grammar. If such a ref is corrupted, hand-created, or uses a format the parser does not recognize, `bindings` may become empty and the workflow emits `resume=false`/`stage=fresh`. That is fail-open relative to the stated invariant: the workflow has not proved that no prior capture is bound to this request, so a fresh run can burn another slot and potentially orphan the earlier credential. The comment even acknowledges hand-created bogus refs and chooses to ignore them. The added test harness cannot catch this because its jq stub injects parsed outputs and explicitly does not execute the ref-grammar filter.",
+    "file": ".github/workflows/set-up-account.yml",
+    "fix_hint": "Treat every ref returned under the request-specific prefix as evidence that must parse successfully. Fail closed if any returned ref has an invalid shape or if the number of parsed bindings differs from the number enumerated; only an actually empty API result may authorize `stage=fresh`. Add a non-vacuous test using the real jq filter (or an equivalent parser unit) where a malformed ref is returned and assert nonzero status with neither `resume=true` nor `resume=false` emitted.",
+    "severity": "major",
+    "title": "Malformed request bindings are ignored, allowing an unproven fresh enrollment"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new pre-capture binding and normal resume path are thoughtfully fail-closed, but reconciliation silently discards malformed refs found under the request's dedicated binding prefix. That makes the negative evidence incomplete: a nonconforming or partially corrupted binding can exist while the workflow concludes there is no stored binding and starts a fresh enrollment. The hermetic harness explicitly stubs out the jq program, so it cannot detect this behavior. This is a major trust-plane gap in the marquee recovery path.",
+  "verdict": "request_changes"
+ }
+}
