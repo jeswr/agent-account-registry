@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4734,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6dad83ee3ad4ee7d93b2756e78c0e6af72a39edf",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Report::total_derived is documented to receive no contribution from incremental maintenance, but MaterializedOwlGraph's fallback rematerialization calls materialize_owl_rl under the currently active profiler. Its round() calls and final reconcile_total therefore add the full rebuild's derived closure count to the report. That count includes consequences already visible before the triggering insert/delete, so it is neither zero under the stated incremental contract nor the net closure change caused by the mutation. Direct counting-mode maintenance reports zero, making the same logical operation's accounting path-dependent. The fallback integration test checks ticks/rounds but never asserts report.total_derived(), so it does not expose this.",
+    "file": "crates/sparq-reason/src/profile.rs",
+    "fix_hint": "Define and enforce one contract for rebuilds. If incremental operations must contribute zero, suppress or isolate total_derived accounting while still attributing INCREMENTAL_REBUILD timing (and decide explicitly whether delegated batch ticks should remain observable); then assert total_derived() == 0 in the real fallback-rebuild test using a fixture with pre-existing derived facts. Alternatively expose rebuild accounting in a distinct operation-aware field and revise the Report/Progress docs and tests so rebuilt facts cannot be mistaken for net-new incremental consequences.",
+    "severity": "major",
+    "title": "Fallback rebuilds count the rebuilt closure as newly derived incremental facts"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2's direct insert/delete accounting defect is fixed: incremental ticks now separate base mutations from derived facts and the strengthened test exercises a one-to-many consequence followed by deletion. However, the fallback rebuild path still violates the newly documented Report::total_derived contract. MaterializedOwlGraph::rematerialize delegates to materialize_owl_rl while the same profiler remains active, so its batch rounds and reconcile_total add the rebuilt closure's derived facts to total_derived. Those are not the net-new facts caused by the incremental mutation and can include consequences that were already visible before it. This contradicts the public statement that incremental maintenance contributes nothing and makes totals depend on whether maintenance happened to take the direct or fallback path. The fallback test confirms rounds are captured but does not assert the total, so it misses the inconsistency. This is a new major finding after the prior finding was addressed, hence progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
