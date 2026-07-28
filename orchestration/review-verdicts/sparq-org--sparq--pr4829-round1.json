@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4829,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "84ecf5a83b50aaed6f0555b549922e12f3d904fc",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The script injects all ten faults into one file and considers the self-test successful whenever the single `nargo test` invocation exits nonzero. That exit status establishes only that at least one generated test failed; it does not establish that every test failed. The new Rust unit tests verify that each assertion was textually changed, but not that each changed assertion reaches the circuit or causes its own Noir test to fail. Thus nine vacuous sections can still hide behind one working section, contradicting the PR's load-bearing non-vacuity claim.",
+    "file": "zk/xpath/scripts/run_differential_harness.sh",
+    "fix_hint": "Exercise each fault independently: generate ten variants with exactly one fault enabled, run `nargo test` for each variant (or run the named Noir test alone), and require every variant/run to fail. Keep the clean all-tests run as-is. Alternatively, capture machine-readable per-test results from one run and verify that every generated test function failed, if `nargo` reliably provides such output.",
+    "severity": "major",
+    "title": "Combined fault run does not prove each generated test can fail"
+   }
+  ],
+  "progress": null,
+  "summary": "The change records one textual fault in every generated test, but the executable self-test still runs all faults together and accepts any nonzero `nargo test` result. Consequently, a single functioning test can make the self-test pass while the other nine tests are vacuous, which is exactly the failure mode the PR claims to eliminate.",
+  "verdict": "request_changes"
+ }
+}
