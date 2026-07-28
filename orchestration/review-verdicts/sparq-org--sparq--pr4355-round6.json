@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4355,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "35d1a89fe08e727f125514f15d9317cdec8d2cc8",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 6 resolves the prior major finding. The source gate now rejects `eval` and `std` in Typst code positions, and the load-bearing negative test includes the exact reflective construction from round 5 (`eval(\"j\" + \"son\", mode: \"code\")`) together with a fragmented timing path and requires the real `auditTimingSources` path to report it. The README and skill claims were narrowed to describe this as a source-text gate rather than a capability sandbox, while accurately enumerating the newly covered reflective routes. No remaining correctness, soundness, test-validity, or security issue is evident in the diff-scoped change.",
+  "verdict": "approve"
+ }
+}
