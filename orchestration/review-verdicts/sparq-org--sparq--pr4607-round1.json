@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4607,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "31ac640cc0550b753c8b8721eb5f37b4c63100b8",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new `el` feature enables only `sparq-reason-el/rbox`, but the reasoner documents that without `cdomain` all concrete-domain shapes are placed in `Report::skipped_axioms`. The same diff repeatedly presents `classify` and `--reason el` as producing the complete hierarchy of an OWL 2 EL ontology, including in the CLI README and skills. Valid EL inputs using supported datatype restrictions can therefore produce an incomplete lattice under the advertised command. Reporting `skipped_axioms` after classification is honest about a particular run, but it does not make the unconditional public capability claim correct.",
+    "file": "crates/sparq-cli/Cargo.toml",
+    "fix_hint": "Either enable `sparq-reason-el/cdomain` in the CLI's `el` feature and add an end-to-end concrete-domain test, or consistently narrow all new CLI/README/skill claims to the actually enabled E1+E2 fragment. If keeping cdomain disabled, explicitly say that valid EL concrete-domain axioms are skipped and may make the hierarchy incomplete; do not call the general OWL 2 EL result complete.",
+    "severity": "major",
+    "title": "The CLI feature omits cdomain while advertising complete OWL 2 EL classification"
+   }
+  ],
+  "progress": null,
+  "summary": "The CLI wiring and end-to-end tests cover the new feature-on and feature-off dispatch paths, but the shipped feature set does not support the completeness claim made throughout the new public documentation. The CLI enables only sparq-reason-el/rbox; concrete-domain reasoning remains disabled, even though concrete-domain constructs are part of the supported EL surface when cdomain is enabled and are counted as skipped_axioms otherwise. This makes the advertised \u201ccomplete OWL 2 EL\u201d hierarchy false for valid EL ontologies containing those constructs. The report is useful, but a runtime skip warning does not make an unconditional completeness claim accurate.",
+  "verdict": "request_changes"
+ }
+}
