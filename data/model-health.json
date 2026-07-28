@@ -1,30 +1,6 @@
 {
  "records": [
   {
-   "ts": 1785222869,
-   "provider": "anthropic",
-   "account": "488920c2efe2b3fb",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "30335173133.1"
-  },
-  {
-   "ts": 1785223137,
-   "provider": "anthropic",
-   "account": "488920c2efe2b3fb",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "30336846108.1"
-  },
-  {
-   "ts": 1785223350,
-   "provider": "fleet",
-   "account": "5f5b2dc3fb8e231b",
-   "model_alias": "",
-   "exit_class": "success",
-   "run_id": "30337709984.1"
-  },
-  {
    "ts": 1785223391,
    "provider": "anthropic",
    "account": "efb4eb2781de6958",
@@ -1640,6 +1616,14 @@
    "model_alias": "opus5",
    "exit_class": "unknown",
    "run_id": "30364359541.1"
+  },
+  {
+   "ts": 1785249495,
+   "provider": "fleet",
+   "account": "5f5b2dc3fb8e231b",
+   "model_alias": "",
+   "exit_class": "success",
+   "run_id": "30368660917.1"
   }
  ]
 }
