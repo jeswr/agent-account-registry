@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4841,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "11d587c33ce192008d525494784faa46b27df314",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves both round-2 major findings. Soft-branch lowering now tracks scope per traversal path rather than with a global emitted set, so each independently binding OPTIONAL or NOT EXISTS branch restates a shared target's class and attribute constraints; the converging-target tests exercise both OPTIONAL/OPTIONAL and OPTIONAL/NOT EXISTS cases. The handoff restore gate now suppresses hydration only before the first workspace has loaded, and its tests cover a live handoff followed by a workspace switch. The implementation and tests are consistent with the documented SPARQL scope semantics, and no new correctness, soundness, security, or test-validity issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
