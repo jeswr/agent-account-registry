@@ -984,6 +984,73 @@ _derive_full_selftest_suite() {
 FULL_SELFTEST_SUITE=$(_derive_full_selftest_suite "$SCRIPT_DIR" "$SELFTEST_MANIFEST") ||
   die 'registry-selftest gate: self-test manifest validation failed (fail closed)'
 
+# [issue #824] Dependencies the enrolled suite EXECUTES but this repo does not ship. They are
+# preinstalled on the ubuntu-latest runner the gate actually runs on, but ABSENT from the
+# unprivileged model container (no root, no sudo, no pip) -- where roughly a THIRD of the suite then
+# cannot run at all: the jq rows die on migrate-secrets.sh's own `command -v jq` refusal, the PyYAML
+# rows die on ModuleNotFoundError. Nothing fails OPEN, but every one of those rows reads exactly
+# like a regression, so an agent validating its own change in-container cannot tell "the environment
+# could not test this" from "this change broke it" without root-causing each row by hand -- and is
+# tempted to wave the whole block through. So un-runnability is made a FIRST-CLASS, up-front
+# verdict: probe BEFORE a single row runs, name the missing dependency and the rows it blocks, and
+# refuse under its own ENV-BLOCKED class. Same shape as the #704 interpreter floor -- a partial
+# suite is not a result, and it is emphatically not a pass.
+#
+# Row format: <label>|<probe-kind>|<probe-arg>|<consumer-ERE>. The ERE is LAST because it contains
+# `|` itself; `read` hands the unsplit remainder to its final variable.
+SELFTEST_ENV_REQUIREMENTS='jq|command|jq|(^|[^[:alnum:]_./-])jq([^[:alnum:]_-]|$)
+PyYAML|pymodule|yaml|^[[:space:]]*(import[[:space:]]+yaml|from[[:space:]]+yaml[[:space:]]+import)'
+
+# Probe ONE dependency: rc 0 present, rc 1 absent. Not pure by nature -- it asks the environment.
+# An unrecognised probe kind reports ABSENT, never present: a typo'd requirement row must fail the
+# gate closed rather than be silently read as "satisfied".
+_selftest_dep_present() {
+  local kind=$1 probe=$2
+  case "$kind" in
+    command) command -v "$probe" >/dev/null 2>&1 ;;
+    pymodule)
+      python3 -c 'import importlib.util,sys; sys.exit(0 if importlib.util.find_spec(sys.argv[1]) else 1)' \
+        "$probe" >/dev/null 2>&1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# PURE (self-tested): print each suite entry under <dir> whose body matches a dependency's ERE --
+# i.e. the rows an absent dependency blocks. REPORT-ONLY: the refusal below keys on the PROBE alone,
+# so a pattern that under-matches downgrades the message and never the verdict.
+_selftest_dep_consumers() {
+  local dir=$1 suite=$2 pattern=$3 entry
+  for entry in $suite; do
+    [[ -f "$dir/$entry" ]] || continue
+    if grep -Eq -- "$pattern" "$dir/$entry" 2>/dev/null; then
+      printf '%s\n' "$entry"
+    fi
+  done
+  return 0
+}
+
+# PURE (self-tested) given its injected probe: render the ENV-BLOCKED verdict for a requirement
+# table. Prints one `ENV-BLOCKED ...` line per dependency the probe reports ABSENT, naming the suite
+# rows it blocks, and returns 1; prints nothing and returns 0 ONLY when every dependency is present.
+# The probe is passed as a function name so the self-test can drive both directions offline, on
+# whatever the runner happens to have installed.
+_selftest_env_blocked() {
+  local table=$1 dir=$2 suite=$3 probe_fn=${4:-_selftest_dep_present}
+  local label kind probe pattern rows blocked=0
+  while IFS='|' read -r label kind probe pattern; do
+    [[ -n "$label" ]] || continue
+    if "$probe_fn" "$kind" "$probe" </dev/null; then
+      continue
+    fi
+    rows=$(_selftest_dep_consumers "$dir" "$suite" "$pattern" | paste -sd' ' -)
+    printf 'ENV-BLOCKED %s (%s: %s) is unavailable -- suite rows it blocks: %s\n' \
+      "$label" "$kind" "$probe" "${rows:-<none identified>}"
+    blocked=1
+  done <<< "$table"
+  return "$blocked"
+}
+
 # PURE: the touched paths (relative to the target root) that this gate must lint. Reads a
 # newline-delimited path list on stdin (the caller passes `git diff --name-only` output); the
 # self-test feeds a fixture. Prints, one per line: "self:<script>" for a touched script that has a
@@ -1390,6 +1457,17 @@ _ensure_actionlint() {
 }
 
 registry_selftest_gate() {
+  # [issue #824] DEPENDENCY PREFLIGHT, before a single row runs. An unrunnable row must never be
+  # confused with a failing one, and a suite that is mostly unrunnable must never read as "the gate
+  # passed". ENV-BLOCKED is reported as its OWN class -- and it is still a REFUSAL, because "we
+  # could not test this" is not evidence that the change is safe.
+  local envreport
+  if ! envreport=$(_selftest_env_blocked \
+    "$SELFTEST_ENV_REQUIREMENTS" "$SCRIPT_DIR" "$FULL_SELFTEST_SUITE"); then
+    printf '%s\n' "$envreport" >&2
+    die 'registry-selftest gate: ENV-BLOCKED -- a dependency the suite EXECUTES is unavailable, so part of the suite cannot run at all (see the ENV-BLOCKED lines above). This is NOT a test failure and NOT a pass: install the dependency (jq and PyYAML are preinstalled on ubuntu-latest, where this gate runs) or run the gate where it exists.'
+  fi
+
   local changed
   changed="$(git status --porcelain=v1 --untracked-files=all -z | _porcelain_changed_paths)" \
     || die 'registry-selftest gate: changed-path listing refused (fail closed)'
@@ -2740,6 +2818,88 @@ self_test() {
     "$(_python_version_at_least "" 3.11)" "unknown"
   chk "python floor: a garbage version string is NOT waved through" \
     "$(_python_version_at_least 'not.a.version' 3.11)" "unknown"
+
+  # --- [issue #824] suite dependency preflight. The unprivileged model container has no jq and no
+  # PyYAML, so ~1/3 of the enrolled suite cannot execute there at all; before the preflight each
+  # affected row died on its own and read exactly like a regression. The reporter is driven through
+  # a FAKE probe so BOTH directions are proven offline whatever this runner has installed, and the
+  # REAL probe is then exercised both ways so the fake cannot be the only thing under test. ---
+  local dep_fixture="$tmp/dep-preflight"
+  mkdir -p "$dep_fixture"
+  printf '%s\n' 'import yaml' 'value = 1' > "$dep_fixture/uses-yaml.py"
+  printf '%s\n' '#!/usr/bin/env bash' 'jq -r .a "$1"' > "$dep_fixture/uses-jq.sh"
+  printf '%s\n' 'import json' 'note = "mentions jqueue, not the binary"' > "$dep_fixture/plain.py"
+  local dep_suite='uses-yaml.py uses-jq.sh plain.py'
+  _dep_probe_all_present() { return 0; }
+  _dep_probe_none_present() { return 1; }
+  _dep_probe_no_yaml() { if [[ "$2" == yaml ]]; then return 1; fi; return 0; }
+
+  local dep_out dep_rc
+  if dep_out=$(_selftest_env_blocked "$SELFTEST_ENV_REQUIREMENTS" "$dep_fixture" "$dep_suite" \
+    _dep_probe_all_present); then dep_rc=0; else dep_rc=1; fi
+  chk "#824 preflight: every dependency present -> rc 0" "$dep_rc" "0"
+  chk "#824 preflight: every dependency present -> NO ENV-BLOCKED line" "$dep_out" ""
+
+  if dep_out=$(_selftest_env_blocked "$SELFTEST_ENV_REQUIREMENTS" "$dep_fixture" "$dep_suite" \
+    _dep_probe_no_yaml); then dep_rc=0; else dep_rc=1; fi
+  chk "#824 preflight: one absent dependency REFUSES (rc 1), it is not advisory" "$dep_rc" "1"
+  chk "#824 preflight: the absent dependency is named under its own ENV-BLOCKED class" \
+    "$(printf '%s\n' "$dep_out" | grep -c '^ENV-BLOCKED PyYAML ')" "1"
+  chk "#824 preflight: the report names the blocked row" \
+    "$(printf '%s\n' "$dep_out" | grep -c 'uses-yaml\.py')" "1"
+  chk "#824 preflight: it does NOT blame rows the present dependencies cover" \
+    "$(printf '%s\n' "$dep_out" | grep -c 'uses-jq\.sh')" "0"
+  chk "#824 preflight: a PRESENT dependency emits no line of its own" \
+    "$(printf '%s\n' "$dep_out" | grep -c '^ENV-BLOCKED jq ')" "0"
+
+  if dep_out=$(_selftest_env_blocked "$SELFTEST_ENV_REQUIREMENTS" "$dep_fixture" "$dep_suite" \
+    _dep_probe_none_present); then dep_rc=0; else dep_rc=1; fi
+  chk "#824 preflight: every dependency absent -> one ENV-BLOCKED line per dependency" \
+    "$(printf '%s\n' "$dep_out" | grep -c '^ENV-BLOCKED ')" "2"
+  chk "#824 preflight: the jq row is matched by its consumer pattern, the plain row is not" \
+    "$(printf '%s\n' "$dep_out" | grep -c 'plain\.py')" "0"
+
+  # The patterns are asserted against the REAL tree, not just the fixture: a rename or a rewrite
+  # that moves a known consumer out of its dependency's report flips these red.
+  local dep_real
+  if dep_real=$(_selftest_env_blocked "$SELFTEST_ENV_REQUIREMENTS" "$SCRIPT_DIR" \
+    "$FULL_SELFTEST_SUITE" _dep_probe_none_present); then dep_rc=0; else dep_rc=1; fi
+  chk "#824 preflight: the REAL jq requirement names migrate-secrets.sh among its blocked rows" \
+    "$(printf '%s\n' "$dep_real" | grep '^ENV-BLOCKED jq ' | grep -c 'migrate-secrets\.sh')" "1"
+  chk "#824 preflight: the REAL PyYAML requirement names metrics.py among its blocked rows" \
+    "$(printf '%s\n' "$dep_real" | grep '^ENV-BLOCKED PyYAML ' | grep -c '[[:space:]]metrics\.py\([[:space:]]\|$\)')" "1"
+  chk "#824 preflight: every requirement row declares label|kind|probe|pattern" \
+    "$(printf '%s\n' "$SELFTEST_ENV_REQUIREMENTS" | awk -F'|' 'NF<4 {bad++} END {print bad+0}')" "0"
+
+  # The REAL probe, both directions -- otherwise the fixture assertions above could all be passing
+  # against a probe that is simply broken in one direction.
+  local dep_verdict
+  if _selftest_dep_present pymodule json; then dep_verdict=present; else dep_verdict=absent; fi
+  chk "#824 probe: a stdlib module reads as PRESENT" "$dep_verdict" "present"
+  if _selftest_dep_present pymodule no_such_module_824; then dep_verdict=present; else dep_verdict=absent; fi
+  chk "#824 probe: a missing module reads as ABSENT" "$dep_verdict" "absent"
+  if _selftest_dep_present command bash; then dep_verdict=present; else dep_verdict=absent; fi
+  chk "#824 probe: an installed binary reads as PRESENT" "$dep_verdict" "present"
+  if _selftest_dep_present command no-such-binary-824; then dep_verdict=present; else dep_verdict=absent; fi
+  chk "#824 probe: a missing binary reads as ABSENT" "$dep_verdict" "absent"
+  if _selftest_dep_present bogus-kind bash; then dep_verdict=present; else dep_verdict=absent; fi
+  chk "#824 probe: an unrecognised probe kind is ABSENT, never waved through" "$dep_verdict" "absent"
+
+  # The WIRING, asserted on the PARSED gate body (comment/format churn cannot move it): without
+  # these the reporter above could be perfectly correct and simply never reached. The preflight must
+  # be called, must REFUSE rather than warn-and-continue, and must run before the gate classifies or
+  # validates anything -- an ENV-BLOCKED verdict discovered halfway through is the mid-suite
+  # confusion this closes.
+  local gate_body
+  gate_body=$(declare -f registry_selftest_gate)
+  chk "#824 wiring: the gate calls the dependency preflight" \
+    "$(printf '%s\n' "$gate_body" | grep -c '_selftest_env_blocked')" "1"
+  chk "#824 wiring: an ENV-BLOCKED preflight REFUSES the gate, it does not warn and continue" \
+    "$(printf '%s\n' "$gate_body" | grep -c "die 'registry-selftest gate: ENV-BLOCKED")" "1"
+  chk "#824 wiring: the preflight runs BEFORE any changed-path classification" \
+    "$(printf '%s\n' "$gate_body" \
+      | grep -n '_selftest_env_blocked\|_porcelain_changed_paths' \
+      | head -1 | grep -c '_selftest_env_blocked')" "1"
 
   # --- codex provider-model argv contract (sol/luna, and terra on docs lanes). Claude empty
   # is rejected upstream by the _run_headless_harness normalization, so it never reaches this
