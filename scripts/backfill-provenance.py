@@ -791,6 +791,25 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
     # unfalsifiable — a PR that fell out of an uncounted `continue` was indistinguishable from
     # one that was never in the population, which is how two silent exits survived below.
     population = 0
+    # [registry #776 x #876] THE #657 ORCHESTRATOR CLASS IS OUTSIDE THE POPULATION, and therefore
+    # outside the seal. This is a decision about what "the population" MEANS, not a loosening:
+    #
+    #   1. The seal's whole power comes from `population` being incremented at ONE branch that is
+    #      genuinely UPSTREAM of many exits — six of them below. The orchestrator branch has
+    #      exactly one counted outcome, immediately adjacent, so incrementing `population` there
+    #      too would be arithmetic that can never disagree with itself: zero added seal coverage,
+    #      and a denominator that means no more than "whatever I happened to count". A seal that
+    #      cannot fail is the thing this change exists to stop shipping.
+    #   2. Substantively, backfill CANNOT ever record this class and must not try (#876/#827:
+    #      there is no worker run to source an identity from, `mint-provenance.py` owns it). A
+    #      population containing PRs the script is structurally forbidden to act on makes
+    #      `recorded / population` a ratio of nothing.
+    #
+    # So it gets its OWN counter rather than riding `skipped`. #876's point — that the class must
+    # be VISIBLE rather than fall out of an accidental shape test — is fully preserved: it is
+    # named on the completion line, in its own bucket. What it stops doing is inflating a bucket
+    # that means "already carries an admissible record".
+    out_of_scope = 0
     for pull in pulls:
         if not isinstance(pull, dict):
             continue
@@ -822,7 +841,7 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
                 # is not news: it stays invisible. Nothing is written, nothing is claimed.
                 continue
             if orchestrator_record is not None:
-                skipped += 1
+                out_of_scope += 1
                 print(f"skip #{number}: #657 orchestrator class — provenance is minted by "
                       "scripts/mint-provenance.py, never backfilled (there is no worker run to "
                       "source an identity from), and the class is NON-DRAFT by design so draft "
@@ -963,9 +982,12 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
         _ensure_draft(target_repo, number, is_draft, apply_changes, state=state,
                       no_draft_convert=no_draft_convert)
     mode = "recorded" if apply_changes else "would record"
+    # `out-of-scope` rides OUTSIDE the parenthesised population figure on purpose: the reader must
+    # be able to tell "this run adjudicated N worker PRs" from "and declined M PRs that were never
+    # its job", which is exactly the distinction folding the #657 class into `skipped` destroyed.
     print(f"backfill complete: {mode} {written}, repaired {repaired}, skipped {skipped}, "
           f"needs-human {needs_human}, blocked {blocked} "
-          f"(population {population})")
+          f"(population {population}) out-of-scope {out_of_scope}")
     # [registry #776] THE SEAL. Every worker PR left this loop through exactly one counted exit,
     # or this raises. Bare statement on purpose — see seal_population's docstring: a
     # `reason = ...` / `if reason: raise` shape has a deletable seam, and a mutant that deleted
@@ -1976,10 +1998,30 @@ def _self_test():
     orch_records = {"orchestration/provenance/9003.json":
                     real_claim.orchestrator_probe_record(9003)}
 
-    on_out, on_probes, on_states = orch_backfill(
-        True, [orch_pull_row, worker_pull_row], orch_records)
+    # [registry #776 x #876] THE COMPOSITION, and the red test for the population decision. This
+    # run carries BOTH classes at once — one worker PR and one ADMITTED #657 orchestrator PR —
+    # which is exactly the pair that broke: #876's orchestrator counter sits ABOVE this change's
+    # `population += 1`, so counting the class as a population OUTCOME made `accounted` exceed
+    # `population` and `seal_population` raised on every real run. backfill() records the decision
+    # that the class is OUTSIDE the population; this is the row that fails if it is ever folded
+    # back in, and it is a NAMED row rather than an uncaught traceback so the failure says so.
+    sealed = None
+    try:
+        on_out, on_probes, on_states = orch_backfill(
+            True, [orch_pull_row, worker_pull_row], orch_records)
+    except BackfillError as exc:
+        on_out, on_probes, on_states, sealed = "", [], [], str(exc)
+    check("[#776 x #876] a run carrying BOTH a worker PR and an admitted orchestrator PR SEALS: "
+          "the orchestrator class is outside the population, so it cannot outnumber it",
+          sealed, None)
     off_out, off_probes, off_states = orch_backfill(
         False, [orch_pull_row, worker_pull_row], orch_records)
+    # ...and it lands in its OWN bucket. Folding it into `skipped` would conflate "not this
+    # script's job" with "already carries an admissible record" — two facts a reader of the
+    # completion line has to be able to tell apart, and the reason the seal broke at all.
+    check("[#776 x #876] the orchestrator PR is counted OUT OF POPULATION, in its own bucket, "
+          "never as a `skipped` worker PR",
+          ("(population 1) out-of-scope 1" in on_out, "skipped 1" in on_out), (True, False))
 
     # (1) ENROLLED: the class is RECOGNISED and explicitly skipped — never minted (backfill's
     #     only identity source is a worker run log the class has no analogue for) and never
@@ -2008,9 +2050,16 @@ def _self_test():
         check(f"[#657] FROZEN worker-class control ({state}): the worker PR's outcome is "
               "byte-for-byte the pre-#657 one",
               [line for line in out.splitlines() if "#9002" in line], WORKER_LINES)
-    check("[#657] FROZEN worker-class control: the two runs agree on the count line",
-          ("backfill complete: would record 1, skipped 1, needs-human 0" in on_out,
-           "backfill complete: would record 1, skipped 0, needs-human 0" in off_out),
+    # STRONGER than the pre-#776 form of this control, which asserted `skipped 1` ON and
+    # `skipped 0` OFF — i.e. enrolment DID move a population counter. With the class out of the
+    # population, every population counter is now byte-identical between the two runs and only the
+    # out-of-scope bucket moves, which is what "enrolment must not move the worker lane" means.
+    POPULATION_LINE = ("backfill complete: would record 1, repaired 0, skipped 0, "
+                       "needs-human 0, blocked 0 (population 1)")
+    check("[#657] FROZEN worker-class control: enrolment moves ONLY the out-of-scope bucket — "
+          "every population counter is identical between the two runs",
+          (f"{POPULATION_LINE} out-of-scope 1" in on_out,
+           f"{POPULATION_LINE} out-of-scope 0" in off_out),
           (True, True))
     # (4) THE FORK GATE, hoisted above every waivable predicate: a fork head is never admitted
     #     to the class however enrolled its author is, and is never read for.
