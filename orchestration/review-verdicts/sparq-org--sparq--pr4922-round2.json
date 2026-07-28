@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4922,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c9c35dc322ba503f6a44a2f8489869281a750c67",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and complete. The default MCP resources and prompts capabilities are wired through the real JSON-RPC dispatch; graph reads preserve default/named-graph isolation, reserved-URI behavior, budgeted materialization, and distinct not-found versus internal-error handling. Prompt IRI interpolation validates with oxrdf::NamedNode before rendering and rejects hostile or missing inputs. The end-to-end tests exercise the real dispatch, capability advertisement, protocol error codes, graph isolation, prompt rendering/refusal, and read-only behavior. Public documentation and dependency/feature declarations match the implementation. No correctness, soundness, security, or vacuous-test issue was found.",
+  "verdict": "approve"
+ }
+}
