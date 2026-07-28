@@ -346,8 +346,30 @@ def trusted_author(
     )
 
 
-def is_automation_author(issue: dict[str, Any], automation_logins: set[str]) -> bool:
-    return author_login(issue) in automation_logins
+def is_automation_author(
+    issue: dict[str, Any],
+    automation_logins: set[str],
+    allow_actions_bot_issues: bool = False,
+) -> bool:
+    """The CLOSE-side author predicate: only AUTOMATION output may be dedupe-closed.
+
+    Deliberately NARROWER than `trusted_author`, and it must stay that way. `trusted_author`
+    also admits a collaborator ASSOCIATION, so an issue a human wrote is trusted enough to be
+    STAGED but must never be auto-closed as a duplicate — closing a wrongly-identified duplicate
+    destroys tracked work, and the human who filed it is the one who can judge.
+
+    What was broken (sparq issue #4329): this predicate ignored `allow_actions_bot_issues` while
+    the staging gate honoured it, so on a target whose policy sets the flag (sparq does) the
+    curator STAGED `github-actions[bot]` issues and then refused to dedupe-close them, reporting
+    the misdiagnosis "is human-authored". Measured over six consecutive live curator runs: 8
+    duplicates identified, `close=0` every time. The flag is now threaded through — and ONLY the
+    flag: association-based trust still cannot close anything.
+    """
+    login = author_login(issue)
+    return bool(login) and (
+        login in automation_logins
+        or (allow_actions_bot_issues and login == ACTIONS_BOT_LOGIN)
+    )
 
 
 def issue_text(issue: dict[str, Any]) -> str:
@@ -805,14 +827,18 @@ def plan_repository(
             if (
                 number in safe_candidates
                 and not has_status(labels)
-                and is_automation_author(duplicate, automation_logins)
+                and is_automation_author(duplicate, automation_logins,
+                                        allow_actions_bot_issues)
             ):
                 close_options.append(Mutation(
                     "close", number, duplicate, canonical=canonical_number,
                     canonical_issue=canonical,
                 ))
             elif number in safe_candidates:
-                logs.append(f"keep #{number}: duplicate of #{canonical_number} is human-authored")
+                logs.append(
+                    f"keep #{number}: duplicate of #{canonical_number} is not "
+                    f"automation-authored ({author_login(duplicate) or '<malformed>'!r})"
+                )
 
     close_options.sort(key=lambda mutation: (mutation.canonical or 0, mutation.number))
     close_actions = close_options[:close_limit]
@@ -1794,6 +1820,158 @@ def _self_test() -> int:
     planned, _ = plan_repository(human_duplicates, all_labels, automation)
     checks.append(("human-authored duplicate is never closed",
                    not any(m.kind == "close" and m.number == 221 for m in planned)))
+    # ...INCLUDING on a target whose policy allows the actions bot. The close-side predicate is
+    # deliberately NARROWER than the staging one: `allow_actions_bot_issues` must admit exactly
+    # `github-actions[bot]` and nothing else. Flipping the call site to trusted_author() — the
+    # literal recommendation in sparq #4329 — closes #221, a maintainer's own OWNER-authored
+    # issue. This row is what makes that regression visible on a target with the flag set.
+    planned, logs = plan_repository(human_duplicates, all_labels, automation,
+                                     allow_actions_bot_issues=True)
+    checks.append(("human-authored duplicate is never closed EVEN WITH the actions-bot flag on",
+                   not any(m.kind == "close" and m.number == 221 for m in planned)))
+    # ...and the decline REASON must name the predicate that actually fired. The old text said
+    # "is human-authored" for every decline, which is what turned a one-flag defect into six runs
+    # of a confident misdiagnosis about `github-actions[bot]` issues.
+    checks.append((
+        "[#4329] the decline reason names the real predicate and the author, not 'human-authored'",
+        any("keep #221: duplicate of #220 is not automation-authored ('maintainer')" in line
+            for line in logs)
+        and not any("human-authored" in line for line in logs)))
+
+    # [sparq #4329] THE DEFECT: dedup detection already found these clusters and then declined
+    # every close as "human-authored" — but the author is `github-actions[bot]` and the sparq
+    # policy row sets allow_actions_bot_issues = true. The staging gate honoured the flag
+    # (trusted_author) while the close gate ignored it (is_automation_author), so the issues were
+    # trusted enough to STAGE but not to DEDUPE. Six consecutive live curator runs: close=0.
+    actions_duplicates = [
+        issue(230, "[bench-flake] suite alpha benchmarks in the soft zone",
+              ("area:bench",), author=ACTIONS_BOT_LOGIN),
+        issue(231, "[bench-flake] suite alpha benchmarks in the soft zone",
+              ("area:bench",), author=ACTIONS_BOT_LOGIN),
+    ]
+    planned, logs = plan_repository(actions_duplicates, all_labels, automation)
+    # ASSERTED OVER THE LINES THAT CARRY THE PROPERTY, not over every line in the log. The first
+    # version of this row was `all("undispatchable author ..." in line for line in logs)`, which is
+    # a CHANGE DETECTOR: it reds the moment anyone anywhere in plan_repository logs anything else,
+    # and #799's `frontier: ...` depth line plus #687's readiness-refusal lines duly broke it on
+    # master. What is actually being pinned is that BOTH actions-bot issues were refused BY THE
+    # STAGING PREDICATE and that the refusal NAMES the author — so match exactly those lines and
+    # assert the set of issues they cover.
+    staging_denials = sorted(
+        int(match.group(1)) for match in (
+            re.match(r"skip #(\d+): undispatchable author 'github-actions\[bot\]'", line)
+            for line in logs)
+        if match)
+    checks.append((
+        "[#4329] WITHOUT the policy flag an actions-bot duplicate is refused at the STAGING gate, "
+        "so it never reaches the close path at all",
+        not planned and staging_denials == [230, 231]))
+    planned, logs = plan_repository(actions_duplicates, all_labels, automation,
+                                    allow_actions_bot_issues=True)
+    checks.append((
+        "[#4329] WITH the policy flag the actions-bot duplicate is finally closed against its "
+        "canonical",
+        [(m.kind, m.number, m.canonical) for m in planned if m.kind == "close"]
+        == [("close", 231, 230)]
+        and any("close #231: duplicate of canonical #230" in line for line in logs)))
+    # THE TRUST PREDICATE, WITH A REAL RED TEST. `is_automation_author` decides whether a machine
+    # may CLOSE someone's issue, so a guard on it that passes for the wrong reason is worse than no
+    # guard. The first version of this row used an author with the DEFAULT association, which
+    # `trusted_author` refuses at the STAGING gate — so nothing was ever planned, the close-side
+    # predicate was never consulted, and the row stayed green for ANY implementation of it,
+    # including one that closed every `[bot]` issue in the repo. VACUOUS.
+    #
+    # The fixture therefore uses an author the STAGING gate ADMITS (a COLLABORATOR association) and
+    # the close gate must still refuse: the cluster is provably reached — the decline line names
+    # the close-side predicate and this author — and no close is planned.
+    other_bot_duplicates = [
+        issue(240, "Rebuild delta index shard", ("area:alpha",), author="stranger[bot]",
+              association="COLLABORATOR"),
+        issue(241, "Rebuild delta index shard", ("area:alpha",), author="stranger[bot]",
+              association="COLLABORATOR"),
+    ]
+    planned, logs = plan_repository(other_bot_duplicates, all_labels, automation,
+                                    allow_actions_bot_issues=True)
+    checks.append((
+        "[#4329] the actions-bot flag admits ONLY github-actions[bot], not any other bot — and "
+        "the CLOSE gate is what refuses it, having actually been reached",
+        not any(m.kind == "close" for m in planned)
+        and any("keep #241: duplicate of #240 is not automation-authored ('stranger[bot]')" in line
+                for line in logs)))
+    # EXACT LOGIN, asserted directly on the predicate. Suffix matching on `"<x>[bot]"` was
+    # deliberately removed from this repo, so the neighbours below — a different bot, the constant
+    # carried as a suffix, the constant carried as a prefix, the login without its `[bot]` tag, and
+    # a malformed empty login — must every one of them be False. A `login.endswith(...)` or
+    # `ACTIONS_BOT_LOGIN in login` implementation reds here.
+    def _authored_by(login: str) -> dict[str, Any]:
+        return {"user": {"login": login}, "author_association": "NONE"}
+
+    neighbours = (ACTIONS_BOT_LOGIN, "stranger[bot]", "evil-github-actions[bot]",
+                  "github-actions[bot]-evil", "github-actions", "")
+    checks.append((
+        "[#4329] the close-side trust predicate matches github-actions[bot] by EXACT LOGIN",
+        [is_automation_author(_authored_by(login), automation, allow_actions_bot_issues=True)
+         for login in neighbours] == [True, False, False, False, False, False]))
+    checks.append((
+        "[#4329] ...and WITHOUT the policy flag even the exact login is refused — the flag is the "
+        "only thing that admits it, association-based trust still closes nothing",
+        [is_automation_author(_authored_by(login), automation) for login in neighbours]
+        == [False] * len(neighbours)))
+    # The close gate stays strictly NARROWER than the staging gate, stated as the invariant rather
+    # than as a list of spellings: anything it admits, `trusted_author` must already admit. This is
+    # what forbids the sparq #4329 suggestion (call `trusted_author` here) — that predicate also
+    # admits a collaborator ASSOCIATION, i.e. it would let the curator close a human's issue.
+    checks.append((
+        "[#4329] the close gate can never admit an author the staging gate would refuse",
+        all(trusted_author(_authored_by(login), automation, allow_actions_bot_issues=True)
+            for login in neighbours
+            if is_automation_author(_authored_by(login), automation,
+                                    allow_actions_bot_issues=True))
+        and not is_automation_author(
+            {"user": {"login": "maintainer"}, "author_association": "OWNER"}, automation,
+            allow_actions_bot_issues=True)))
+    # ...and the flag must not resurrect the STAGING denial either (a duplicate that is not even
+    # a safe candidate can never be closed).
+    gated_actions_duplicates = [
+        issue(250, "Sharpen omega tokenizer", ("area:alpha",), author=ACTIONS_BOT_LOGIN),
+        issue(251, "Sharpen omega tokenizer", ("area:alpha", "needs:user"),
+              author=ACTIONS_BOT_LOGIN),
+    ]
+    planned, _ = plan_repository(gated_actions_duplicates, all_labels, automation,
+                                 allow_actions_bot_issues=True)
+    checks.append((
+        "[#4329] a GATED actions-bot duplicate is never closed (close requires a safe candidate)",
+        not any(m.kind == "close" and m.number == 251 for m in planned)))
+    # ...nor may the flag close a duplicate the pipeline has already admitted (status:*).
+    staged_actions_duplicates = [
+        issue(260, "Prune stale lease records", ("area:alpha",), author=ACTIONS_BOT_LOGIN),
+        issue(261, "Prune stale lease records", ("area:alpha", "status:ready"),
+              author=ACTIONS_BOT_LOGIN),
+    ]
+    planned, _ = plan_repository(staged_actions_duplicates, all_labels, automation,
+                                 allow_actions_bot_issues=True)
+    checks.append((
+        "[#4329] an already-status:* actions-bot duplicate is never closed",
+        not any(m.kind == "close" and m.number == 261 for m in planned)))
+    # The similarity bar is unchanged: near-miss titles are NOT a cluster, flag or no flag.
+    unrelated_actions = [
+        issue(270, "Improve alpha parser throughput", ("area:alpha",), author=ACTIONS_BOT_LOGIN),
+        issue(271, "Rewrite the omega planner", ("area:alpha",), author=ACTIONS_BOT_LOGIN),
+    ]
+    planned, _ = plan_repository(unrelated_actions, all_labels, automation,
+                                 allow_actions_bot_issues=True)
+    checks.append((
+        "[#4329] the >=0.7 title-Jaccard confidence bar still gates the close path",
+        not any(m.kind == "close" for m in planned)))
+    # The run cap still bounds a bulk close.
+    capped = [issue(280 + i, "Retune the vector recall sweep", ("area:alpha",),
+                    author=ACTIONS_BOT_LOGIN) for i in range(8)]
+    planned, logs = plan_repository(capped, all_labels, automation, close_limit=2,
+                                    allow_actions_bot_issues=True)
+    checks.append((
+        "[#4329] the per-run close cap still bounds the newly-unblocked closes",
+        sum(1 for m in planned if m.kind == "close") == 2
+        and any("defer 5 duplicate close(s): run cap is 2" in line for line in logs)))
 
     bench_fixture = [
         issue(230, "Run canonical gather on same-box EC2", ("area:bench",)),
