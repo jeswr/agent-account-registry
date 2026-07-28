@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4788,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4d3efbe166f4a21b181f5c89457ed73185958a18",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior major findings. The publication predicate now requires the [package] value to be exactly the boolean token false and includes regressions for registry allow-lists, true, absence, inheritance, and declarations outside [package]. The dependency trip-wire now resolves renamed workspace-dependency aliases before scanning every other workspace crate and covers inherited, table-form, target-specific, and direct renamed dependencies, with negative controls for prefix-sharing crates and the non-edge workspace declaration itself. The current workspace member layout is entirely crates/*, matching the scan boundary. The deferral record remains explicit that this is not a threat model, documents live assurance and supply-chain exposures, and makes no unsupported safety claim.",
+  "verdict": "approve"
+ }
+}
