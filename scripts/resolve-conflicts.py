@@ -1122,8 +1122,20 @@ class ConflictResolver:
         program's own bot-authored park receipts is on record, so another mechanism's park is
         never cleared here — and, symmetrically, park_policy.CAUSE_GATED_PARK_OWNERS makes this
         park ineligible for dispatch-claim's sustained-fleet-health heuristic, whose only
-        condition this class could ever satisfy is being old enough."""
-        if MACHINE_PARK_LABEL not in _label_names(detail):
+        condition this class could ever satisfy is being old enough.
+
+        A HUMAN-OWNED HOLD OUTRANKS THIS PHASE ENTIRELY (park_policy.human_owned_holds — the ONE
+        rule, shared with capacity_park_admission's own refusal rather than re-derived). A PR
+        wearing `needs:user` or `review:needs-user` alongside our machine park is a PR a human has
+        taken, and no automatic path may act on it: this program's remit is its OWN park, not the
+        maintainer's queue. It is also what keeps this change strictly forward-looking — the ten
+        live PRs holding a machine-applied `needs:user` are untouched by construction, because
+        they carry no receipt of ours AND they carry a human-owned hold."""
+        labels = _label_names(detail)
+        if MACHINE_PARK_LABEL not in labels:
+            return "none", ""
+        holds = _park_policy.human_owned_holds(labels)
+        if holds:
             return "none", ""
         comments = self.api.comments(repo, number)
         park, grant = stuck_unpark_state(comments, self.bot_login)
@@ -2007,6 +2019,53 @@ def _self_test():
         (1, 1, 0, 0),
     )
 
+    # (k2b) THE OTHER TWO-HEAD CALL SITES. MEASURED while writing this block, and it is the
+    # finding that matters most here: re-pointing EITHER of the two `_escalate_two_head` call
+    # sites in `_process_pr` at `_escalate_stuck` left the WHOLE 44-script suite green. (k2)
+    # above drives the rebaser, so it only ever reaches the `_handle_conflict` tail — the
+    # exhaustion exit had 1/3 site coverage at 3/3 confidence, which is the exact shape that hid
+    # this defect class in #594 and #886. Each site now gets a case that reaches IT alone, off
+    # pre-seeded durable markers rather than through a rebase.
+    def seeded_attempt(attempt, head):
+        return {"body": f"<!-- conflict-resolver attempt={attempt} head={head} -->\n"
+                        "- conflict-file: \"src/value.py\"",
+                "user": {"login": bot_login}, "created_at": iso(base_now)}
+
+    def seeded_two_head_sweep(number, live_head):
+        """A PR with TWO recorded attempt heads already on record, swept 1000 h past the grace
+        window — so if the exhaustion exit ever routed through the grace-window exit, it would
+        park machine-class here instead of escalating."""
+        seeded_api = FakeAPI([pull(number, live_head)], now=base_now)
+        seeded_api.comment_rows[number] = [seeded_attempt(1, "1" * 40),
+                                           seeded_attempt(2, "2" * 40)]
+        seeded_rebaser = FakeRebaser("conflict")
+        sweep = ConflictResolver(
+            seeded_api, snapshot, claim, [repo], bot_login, True, 5, seeded_rebaser,
+            stuck_grace_hours=grace, clock=lambda: base_now + 1000 * 3600.0)
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            sweep.run()
+        seeded_bodies = _comment_bodies(seeded_api.comment_rows[number])
+        return (seeded_api.labels_added,
+                sum(ESCALATION_MARKER in body for body in seeded_bodies),
+                sum(STUCK_PARK_MARKER in body for body in seeded_bodies),
+                len(seeded_rebaser.calls),
+                (sweep.census[0]["exit_two_head"], sweep.census[0]["exit_stuck_grace"],
+                 sweep.census[0]["parked_machine"], sweep.census[0]["parked_human"]))
+
+    check(
+        "[EXIT two-distinct-heads] CALL SITE `head in heads`: a head that ALREADY has an attempt "
+        "marker, with a second head on record, takes the HUMAN terminal — not the grace-window "
+        "park, even 1000 h past the window",
+        seeded_two_head_sweep(84, "2" * 40),
+        ([(84, HUMAN_PARK_LABEL)], 1, 0, 0, (1, 0, 0, 1)),
+    )
+    check(
+        "[EXIT two-distinct-heads] CALL SITE `head not in heads`: a NEW head with two failed "
+        "heads on record escalates to the HUMAN terminal without spending another rebase",
+        seeded_two_head_sweep(85, "3" * 40),
+        ([(85, HUMAN_PARK_LABEL)], 1, 0, 0, (1, 0, 0, 1)),
+    )
+
     # (k3) THE BODY MATCHES THE EXIT — both directions (Fix 2). ONE hard-coded body served both
     # exits, so a timeout was reported as "two distinct-head conflict attempts": a specific,
     # checkable, FALSE claim in 9 of the 10 live cases. Asserting only that "a comment was posted"
@@ -2149,6 +2208,23 @@ def _self_test():
         (over_cap_rc, over_cap_api.labels_removed,
          over_cap.census[0]["stuck_readmitted"], over_cap.census[0]["stuck_park_stands"]),
         (0, [], 0, 0),
+    )
+    # NOTHING THIS PROGRAM DOES CLEARS A HUMAN HOLD. The ten live PRs this change exists to stop
+    # producing keep their machine-applied `needs:user`: the fix is the SOURCE fix, applied
+    # forward, and the triage deliberately cleared none of them. Two independent reasons make that
+    # true here — they carry no receipt of ours, and a human-owned hold outranks the exit phase —
+    # so this asserts the SECOND one, which is the only one a later PR could accidentally remove.
+    held_by_human = parked_pr_api()
+    held_by_human.prs[83].setdefault("labels", []).append({"name": HUMAN_PARK_LABEL})
+    held_by_human.set_head(83, "e" * 40)             # its cause HAS recovered — and it stays put
+    human_rc, human_sweep, held_by_human = exit_sweep(held_by_human, elapsed_hours=1000.0)
+    check(
+        "[EXIT MACHINE] a human-owned hold outranks the exit: a PROVEN recovery clears NOTHING "
+        "while `needs:user` is live, and the machine park is left exactly as it was",
+        (human_rc, held_by_human.labels_removed, held_by_human.labels_added,
+         human_sweep.census[0]["stuck_readmitted"],
+         human_sweep.census[0]["skipped"].get("hard-exclusion-label")),
+        (0, [], [], 0, 1),
     )
     # THE TRUST FILTER. A third party cannot forge a park receipt and talk this program into
     # clearing a `review:parked` it never applied, nor into skipping a PR it owns.
