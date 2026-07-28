@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4355,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4f0025190a083d6f6839e31e1fdc17972998bddd",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The prior-round bypass remains unchanged. A paper can construct the loader itself, for example `#let grab = eval(\"j\" + \"son\", mode: \"code\")`, then call it with a timing path assembled from fragments and render the returned record value. This source matches none of LOADER_CALL, LOADER_ALIAS, GENERATED_TIMING_FILE, INTERNALS, ANY_IMPORT, or TIMING_IMPORT. The comment's claimed structural backstop\u2014that a loader must be named somewhere\u2014is therefore false, and the test's bypass fixtures still cover only direct and aliased loaders, not reflective construction. Consequently the build gate does not establish the stronger README/SKILL claims that paper sources cannot load data from disk and that constructed paths cannot bypass forced provenance.",
+    "file": "site/scripts/timing-source-gate.mjs",
+    "fix_hint": "Prefer a structural build boundary where paper compilation cannot address the raw timing JSON and receives only provenance-rendering data/content. If retaining the lexical gate, reject reflective/code-evaluation constructs such as `eval` conservatively and add a negative fixture that constructs `json` from string fragments, combines the timing path from fragments, and requires `auditTimingSources` to report the source.",
+    "severity": "major",
+    "title": "Reflective eval still bypasses the timing-source gate"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant: the round-4 major provenance-boundary bypass remains. The lexical gate still explicitly admits that runtime fragment assembly is beyond its analysis, while incorrectly claiming a loader must nevertheless be named. Typst's eval can construct both the loader binding and timing-file path from fragments, so none of the gate's regexes match and the negative tests remain incomplete. The README and skill therefore continue to overstate that constructed paths cannot bypass the boundary and that papers cannot load data from disk.",
+  "verdict": "request_changes"
+ }
+}
