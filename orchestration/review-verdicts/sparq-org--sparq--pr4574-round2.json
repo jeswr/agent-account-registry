@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4574,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "181108bbc9c0b6d54401dfed035c4aeb530b56bf",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new `inserting` hand-off logic is inside `propagate`, but `insert` still builds `pending` with `added.iter().filter(|f| !self.index.contains(f))`. The relevant case is precisely an asserted fact already present in the closure because the recursive layer derives it, so it is excluded from `pending`; `propagate([], true)` performs no layer recomputation and the fact remains in `layer_derived`. This is materially the same major defect reported in round 1 and contradicts the new bidirectional ownership claims.",
+    "file": "crates/sparq-reason/src/incremental.rs",
+    "fix_hint": "Pass a separate ownership-transfer trigger for newly asserted facts already in the closure, and recompute each affected layer without treating those facts as positive closure deltas for counted rules or downstream propagation. Ensure the layer-derived contribution is removed while the asserted base copy exists.",
+    "severity": "major",
+    "title": "Insertion-side ownership transfer is still unreachable"
+   },
+   {
+    "body": "The deterministic insertion assertion checks membership, mode, and rebuild count, all of which pass when insertion performs no propagation at all. The randomized differential checks closure equality, base length, mode, and rebuild count, and counts only deletion-direction transfers; none observes whether an asserted already-derived fact was removed from layer ownership. Thus the tests cannot fail when the insertion hand-off branch is unreachable.",
+    "file": "crates/sparq-reason/tests/incremental_n3_prop.rs",
+    "fix_hint": "Add a test-visible ownership invariant or a behavioral witness that distinguishes base-only ownership from simultaneous stale layer ownership after asserting an already-derived fact. Include an explicit insertion-transfer counter/assertion and a mutation check that fails when insertion-side layer maintenance is disabled.",
+    "severity": "major",
+    "title": "Insertion-direction coverage remains vacuous"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 remains blocked by the same insertion-side gap as round 1. The propagation changes can settle insertion ownership only when an insertion reaches `propagate`, but `MaterializedN3Graph::insert` still filters every already-derived fact out of `pending`. Consequently, asserting a layer-derived fact does not recompute the layer or transfer ownership, while the added tests observe only closure/base/rebuild state and remain unable to distinguish that broken bookkeeping from a correct hand-off. The deletion-side change may be effective, but the advertised bidirectional ownership invariant is neither implemented nor non-vacuously tested.",
+  "verdict": "request_changes"
+ }
+}
