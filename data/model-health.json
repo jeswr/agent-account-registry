@@ -1905,6 +1905,14 @@
    "run_id": "30343743521.1"
   },
   {
+   "ts": 1785228498,
+   "provider": "anthropic",
+   "account": "efb4eb2781de6958",
+   "model_alias": "opus5",
+   "exit_class": "unknown",
+   "run_id": "30343805079.1"
+  },
+  {
    "ts": 1785228499,
    "provider": "openai",
    "account": "dc2d751954080e13",
