@@ -10963,6 +10963,16 @@ def _self_test():
         # ...and the SAME record is refused by the shared field admission, so this is not a second
         # opinion that could drift from the one the lane enforces.
         assert provenance_admission_error(_record, 41, admit_orchestrator=True) is not None, _class
+    # The predicate's SECOND clause (no review chain for a declared provider) is UNREACHABLE today
+    # and a mutation sweep says so — it survives, honestly, because these two tables agree. It is
+    # kept as defence in depth for the moment they do not, and the premise that makes it
+    # unreachable is asserted here so the redundancy is a checked fact rather than an assumption:
+    # add a provider to IMPL_PROVIDERS without a REVIEW_CHAIN entry and THIS line reds, which is
+    # the review that would then have to consider the clause.
+    assert set(REVIEW_CHAIN) == set(IMPL_PROVIDERS), (
+        "every registered implementer provider must have a review chain to invert INTO, or "
+        "review_enrolment_class_error's second clause stops being unreachable",
+        sorted(REVIEW_CHAIN), sorted(IMPL_PROVIDERS))
     # THE LOAD-BEARING HALF: the AUTHOR allowlist is NOT what blocks those two classes. It refuses
     # their `[bot]` logins as well — but relaxing THAT alone would admit a PR the lane still cannot
     # pick a reviewer for, i.e. it would manufacture exactly the "labelled but never reviewed"
@@ -12487,6 +12497,14 @@ def _self_test():
         assert armed_sha_mismatch(repo, _malformed, armed_status) is None, repr(_bad_sha)
         assert enumerate_disarm_items(repo, [_malformed], armed_status, provenance) == [], \
             "a malformed head sha is not a provable latch — never act on one"
+        # ...and with a HOSTILE status map that AGREES with the malformed head, so the sha shape
+        # gate is what refuses rather than the snapshot-coherence check downstream of it. Without
+        # this the two are indistinguishable and the shape gate is untested (measured: it survived
+        # a mutation until this line existed).
+        _agreeing = {41: dict(status_of(sha_b, armed=True), head_sha=_bad_sha)}
+        assert armed_sha_mismatch(repo, _malformed, _agreeing) is None, repr(_bad_sha)
+        assert enumerate_disarm_items(repo, [_malformed], _agreeing, provenance) == [], \
+            repr(_bad_sha)
     for _bad_number in (0, -1, True, False, 41.0, "41", None, [], {}):
         _numbered = dict(moved, number=_bad_number)
         assert armed_sha_mismatch(repo, _numbered, armed_status) is None, repr(_bad_number)
@@ -12513,6 +12531,20 @@ def _self_test():
         repo, [pull(41, "sparq-agent/issue-7-1-1", sha_b, login=bot, draft=False,
                     body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")],
         armed_status, provenance, bot_login=bot)] == [41]
+    # (5d) ...and the HEAD-REF half of that candidate filter, which the author gate alone does NOT
+    #      cover. This is not hypothetical: sparq #4460 is the release-plz RELEASE PR — authored by
+    #      the CORRECT App bot, on `release-plz-<timestamp>`. The worker producer shape is what
+    #      keeps the disarm write path off it, so deleting the head-ref gate would aim
+    #      dequeue/redraft/relabel at the crates.io release PR. Measured: this survived a mutation
+    #      until this line existed, because every author-gate fixture also failed the ref gate.
+    for _non_worker in ("release-plz-2026-07-27T02-19-35Z", "fix/ordinary-branch",
+                        "dependabot/github_actions/actions-minor"):
+        assert enumerate_disarm_items(
+            repo, [pull(41, _non_worker, sha_b, login=bot, draft=False,
+                        body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")],
+            armed_status, provenance, bot_login=bot) == [], (
+            "[#570/#657] the TRUSTED App's own PR on a NON-worker branch must still be outside "
+            f"the disarm write path — {_non_worker!r} is the release/dependabot shape")
     # (6) THE EMISSION. One alert per violation plus a census line that prints EVEN AT ZERO — an
     #     absent bucket and a zero bucket must not look the same, and a per-violation alert alone
     #     can never prove the observer ran at all.
