@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4768,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4b612e0df0945eec9d2b9d716e788e7977a9d799",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding: the supply-chain skill now consistently describes the advisory check as fail-closed and gating, with the daily monitor correctly characterized as defense in depth. The rustls-pemfile removal is coherent across both production TLS loaders, feature declarations, lockfile, tests, cargo-deny, cargo-vet, VEX, and compliance evidence. The replacement preserves certificate-chain filtering/order and first-private-key behavior, explicitly restores the prior no-key diagnostic, and adds a focused non-vacuous loader test covering bundled cert/key input and missing-section failures. No correctness, soundness, test-validity, or security issue remains in the supplied diff.",
+  "verdict": "approve"
+ }
+}
