@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1069,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6f94eb3f4d42054825a8077eacf8811f33836337",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior blocker. For a due lease whose holder run cannot be classified because the Actions probe fails or returns unreadable data, plan_renewal now advances expires_at to a short grace deadline clamped by issued_at plus the absolute renewal ceiling. That makes the retained lease effective for every expiry-based duplicate-suppression consumer while preserving a bounded fail-safe. reclaim() writes the grace-only change, so the protection reaches the ledger rather than existing only in the pure planner. The new tests are non-vacuous with respect to the prior finding: they pass the held and unheld alternatives through reclaim_expired, partition_available, and choose_account, and the end-to-end transaction test verifies the PUT carries a future expiry. The workflow grants the narrowly required actions: read permission, and the test parses the permissions block rather than matching a comment. Live, dead, unknown, no-run, malformed-timestamp, lead-window, ceiling, CAS, and probe-mapping paths are coherently covered. No blocking correctness, soundness, test-validity, or security issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
