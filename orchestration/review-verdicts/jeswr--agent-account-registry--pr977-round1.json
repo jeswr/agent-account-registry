@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 977,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "25ce7951f1afc92f0b2662950e8f1aaac9db8fd9",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly centralizes trust-surface derivation, routes both source reads through a bounded retry helper, and preserves fail-closed behavior after exhausted retries or parse/schema failures. The helper retries only OSError, applies a finite positive backoff, rejects a zero-attempt budget, and re-raises the final read error rather than returning empty content. The derivation continues to distinguish input failure from a policy coverage finding by returning empty surfaces with a named error, while the existing live assertions require successful derivation before coverage can pass. The added self-tests are non-vacuous: they check recovery after one fault, exact exhaustion counts and re-raise behavior, live default wiring to the retry helper, named derivation failure, and empty-read refusal. No trust check, audit trail, permission boundary, token handling, or workflow execution surface is weakened.",
+  "verdict": "approve"
+ }
+}
