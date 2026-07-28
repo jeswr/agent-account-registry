@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4555,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bc3430dca012a06ae99c6d921253b27cf0b5a902",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The research record still hard-codes benchmark-style measurements throughout sections 6, 7, and 10, including opcode totals and percentages, package-level deltas, synthetic-chain results, corpus sizes, and test-run counts. The companion program record repeats those measurements in a table. Repository policy prohibits hard-coded performance numbers in Markdown and treats work-box measurements as non-canonical; labeling the figures non-canonical does not make embedding them compliant. This is materially the same major finding as round 3.",
+    "file": "research/noir-dominated-overflow-elision-7161.md",
+    "fix_hint": "Move raw opcode counts, percentages, package deltas, fixture results, corpus sizes, and other quantitative run measurements into the repository's approved generated/result artifact mechanism. Link that artifact from both changed Markdown files and retain only qualitative, evidence-bounded conclusions in the prose.",
+    "severity": "major",
+    "title": "Hard-coded performance measurements remain in Markdown"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is stagnant. The same major repository-policy violation remains: both changed Markdown files embed extensive hard-coded performance and benchmark-style measurements, including opcode totals, percentages, per-package deltas, corpus and test counts, and synthetic-chain results. Calling the measurements non-canonical does not satisfy the explicit prohibition on hard-coded performance numbers in Markdown. Move quantitative results to the repository's approved generated/result artifact mechanism and leave only qualitative, evidence-scoped conclusions plus a link in these records.",
+  "verdict": "request_changes"
+ }
+}
