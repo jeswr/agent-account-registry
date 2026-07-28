@@ -1,36 +1,6 @@
 {
  "leases": [
   {
-   "account": "efb4eb2781de6958",
-   "claim_id": "6e3b3f7e23104b319f598f00be5528bb",
-   "holder": "fix:sparq-org/sparq#4355@dispatch-30344092012.1",
-   "package": "site-papers",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785229046,
-   "expires_at": 1785235346
-  },
-  {
-   "account": "488920c2efe2b3fb",
-   "claim_id": "75a53a2c9b1f404f9596a97a662bfd12",
-   "holder": "fix:sparq-org/sparq#4578@dispatch-30344092012.1",
-   "package": "wrapper",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785229057,
-   "expires_at": 1785235357
-  },
-  {
-   "account": "efb4eb2781de6958",
-   "claim_id": "0ab8dc415d7043b6990f62b963c15963",
-   "holder": "fix:sparq-org/sparq#4768@dispatch-30344092012.1",
-   "package": "sparq-lws-core",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785229065,
-   "expires_at": 1785235365
-  },
-  {
    "account": "488920c2efe2b3fb",
    "claim_id": "55795082a6d249398855a4685785bf3d",
    "holder": "sparq-org/sparq#3387@30351350188.1",
@@ -39,16 +9,6 @@
    "model": "opus5",
    "issued_at": 1785234944,
    "expires_at": 1785241244
-  },
-  {
-   "account": "488920c2efe2b3fb",
-   "claim_id": "84c4a920f290459d8b16814767d8a7e5",
-   "holder": "review:sparq-org/sparq#4199@dispatch-30350988046.1",
-   "package": "site-specs",
-   "role": "review",
-   "model": "opus5",
-   "issued_at": 1785234944,
-   "expires_at": 1785239144
   },
   {
    "account": "488920c2efe2b3fb",
