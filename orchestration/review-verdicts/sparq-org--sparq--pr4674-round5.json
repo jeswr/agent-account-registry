@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4674,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bff9615d8ee75b9e505c515d90bb3c1c6e1eb3bf",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`char_sets_complete_for` sorts each key but neither rejects nor deduplicates repeated predicates within one `CharSet`. Consequently `{p}` and `{p,p}` compare as distinct keys although they denote the same exact predicate set, while `char_set_has` counts each entry once. Supplying `{p}` plus `{p,p}`, and `{q}` plus `{q,q}`, with balanced `distinct_subjects` totals and no served `{p,q}` cohort can make both completeness checks pass. Rule C2 may then mark the same-source pairing dead and prune a combination that can contribute. `duplicate_char_sets_decline_the_prune` tests repeated identical vectors only, so it does not exercise the prior-round counterexample.",
+    "file": "crates/sparq-fedplan-mpc/src/combination.rs",
+    "fix_hint": "Canonicalize every key as a mathematical set before checking repeated keys, or fail closed if any `CharSet` contains a duplicate predicate. Add a non-vacuous negative test using `{p}`, `{p,p}`, `{q}`, and `{q,q}` with balanced totals and no served co-occurrence key; assert that no dead pairing, candidate prune, or dead-combination verdict is emitted.",
+    "severity": "major",
+    "title": "Duplicate predicates within a characteristic-set key still bypass the completeness guard"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-four major recall-safety defect remains. The new guard rejects duplicate sorted vectors but still treats a characteristic-set key as a list rather than a mathematical predicate set: `{p}` and `{p,p}` remain different keys. Since `char_set_has` counts each characteristic-set entry once regardless of repeated predicates inside it, balanced `{p}`/`{p,p}` and `{q}`/`{q,q}` entries can satisfy both completeness equalities while omitting the live `{p,q}` cohort. Rule C2 may then report the same-source pairing dead and suppress a contributing combination. The added test again covers repeated identical keys, not this counterexample. Progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
