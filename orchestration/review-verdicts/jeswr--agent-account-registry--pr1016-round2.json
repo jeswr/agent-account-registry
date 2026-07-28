@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1016,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5a585596f158cae9c83ef040fda727a76742c925",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`collect_evidence()` records the filename in `observed`, while `record_fingerprint()` parses but ignores the document's `pr_number`; `audit()` then declares completeness solely from the filename set. Thus an expected `o--a--pr2.json` whose document actually belongs to PR 1 satisfies manifest entry 2. That can conceal a missing expected record and move the row to `scoped`, turning absence in an incomplete corpus into revocation candidates. This is not hypothetical in the enrolled test: `_record()` always writes `pr_number: 1`, but the corpus names records `--pr2.json` and `--pr3.json`, and the manifest still verifies them as complete. The marquee evidence-path claim therefore remains fail-open under a filename/content mismatch.",
+    "file": "scripts/grant-scope-audit.py",
+    "fix_hint": "Parse and validate each record's positive integer `pr_number`, require it to equal the PR number encoded by its exact canonical filename for the attributed target, and refuse the entire audit on any mismatch. Make record filename parsing exact rather than a broad prefix match. Add a red test where an expected filename contains a different `pr_number`, plus a positive end-to-end fixture in which every filename, document PR number, and manifest entry agree.",
+    "severity": "blocker",
+    "title": "Completeness trusts filenames without binding them to each record's PR number"
+   }
+  ],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 fixes the unmapped/partial-corpus behavior and now exercises the CLI seam, but the completeness proof is still unsound at the evidence boundary. The manifest is checked against filenames while the record's own `pr_number` is ignored, so a misnamed or substituted record can satisfy an expected slot and enable false revocation candidates. The self-test fixtures themselves demonstrate this: records named `--pr2.json` and `--pr3.json` contain `\"pr_number\": 1` yet are accepted as complete. One blocker remains versus a blocker and major in round 1, so progress is improving.",
+  "verdict": "request_changes"
+ }
+}
