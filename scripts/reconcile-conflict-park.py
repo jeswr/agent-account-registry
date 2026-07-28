@@ -760,9 +760,22 @@ def _self_test():
                 dynamic.append(name)
         elif isinstance(node, clock_ast.Attribute) and node.attr in NOW_ATTRS:
             reached.add(node.attr)
-    check("this module cannot read the current time BY ANY SPELLING — no time module is imported, "
-          "no dynamic import exists, and no current-time attribute is reached anywhere",
+    # SCOPE, stated honestly rather than in a title that outruns it. This catches every IN-PROCESS
+    # clock — `import time`, `from time import time`, `datetime.utcnow()`, `__import__("time")`,
+    # `importlib.import_module`. It does NOT catch an OUT-OF-PROCESS one: `subprocess.run(["date"])`
+    # or reading `/proc/uptime` would evade it. Those survive, and the honest mitigation is that
+    # this module's ONLY subprocess call is `gh` (asserted separately) — not that the scan is total.
+    check("no IN-PROCESS clock is reachable: no time module is imported by any spelling, no "
+          "dynamic import exists, and no current-time attribute is reached",
           (sorted(imported & TIME_MODULES), dynamic, sorted(reached)), ([], [], []))
+    argv0 = [node for node in clock_ast.walk(module_ast)
+             if isinstance(node, clock_ast.Call)
+             and getattr(node.func, "attr", "") == "run"
+             and getattr(getattr(node.func, "value", None), "id", "") == "subprocess"]
+    check("...and the ONLY subprocess this module can spawn is `gh`, which is what bounds the "
+          "out-of-process clocks the scan above cannot see",
+          (len(argv0), [getattr(call.args[0].elts[0], "value", None) for call in argv0]),
+          (1, ["gh"]))
     check("...and `verdict` additionally takes no time-shaped parameter, so a timed branch cannot "
           "be wired in from a caller either",
           sorted(name for name in inspect.signature(verdict).parameters
@@ -992,6 +1005,38 @@ def _self_test():
     check("the census emission is reached UNCONDITIONALLY from main — never deleted, and never "
           "guarded by a population test",
           (len(top_level), guarded), (1, []))
+
+    # --- (g4) MALFORMED SHAPES. Every one of these is a fail-closed path that a hostile or merely
+    # degraded API response reaches, and each was unexecuted until a line-granular coverage run
+    # named it. A defensive branch nobody has run is a guess, not a defence.
+    malformed_census = []
+    census_record(malformed_census, "o/r", 1, "cleared-head-moved", "d", True)
+    census_record("not-a-list", "o/r", 2, "cleared-head-moved", "d", True)   # must not raise
+    malformed_census.extend(["not-a-dict", {"code": "human-applied", "number": "seven"}])
+    counts_m, cleared_m, terminal_m, reachable_m, unclassified_m, lanes_m = census_summary(
+        malformed_census)
+    check("a non-list census sink is a silent no-op, a non-dict row and a non-integer PR number "
+          "are counted rather than dropped, and neither can enter a population list",
+          (len(malformed_census), counts_m.get("malformed"), counts_m.get("human-applied"),
+           cleared_m, terminal_m, reachable_m, unclassified_m,
+           lanes_m["lane_visible"]),
+          (3, 1, 1, [1], [], [], [], [1]))
+    check("a non-dict comment cannot contribute a receipt, and a non-`labeled` timeline event is "
+          "ignored by BOTH ownership rules rather than counted as an application",
+          (clear_receipts(["not-a-dict", None], "bot"),
+           human_ever_applied([event("unlabeled", "needs:user", "2026-07-28T01:00:00Z", "jeswr")],
+                              "needs:user", is_jeswr),
+           machine_applied([event("unlabeled", "needs:user", "2026-07-28T01:00:00Z",
+                                  "sparq-orchestrator[bot]")], "needs:user")),
+          (([], 0), False, False))
+    load_failures = []
+    try:
+        _load("registry_missing_helper", "no-such-helper-file.py")
+    except Exception as exc:      # noqa: BLE001 — the point is that it raises at all
+        load_failures.append(type(exc).__name__)
+    check("a missing registry helper fails LOUDLY at import rather than degrading to a module "
+          "with no predicates",
+          bool(load_failures), True)
 
     # --- (h) the audit comment ----------------------------------------------------------------
     body = audit_body(710, "head-moved", head_b, 1, "the live head is not the attempted head")
@@ -1249,22 +1294,6 @@ def _self_test():
           "quietly",
           parser_errors, [2])
 
-    class ExplodingGh(FakeGh):
-        def parked_pulls(self, repo, label):
-            raise RuntimeError("repo unreadable")
-
-    buffer, errbuf = io.StringIO(), io.StringIO()
-    with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(errbuf):
-        repo_errors = []
-        try:
-            considered_bad = reconcile_repo(ExplodingGh({}), "o/r", "bot", "jeswr", True, 5,
-                                           RECONCILE_MAX, [])
-        except RuntimeError as exc:
-            repo_errors.append(str(exc))
-            considered_bad = None
-    check("[SWEEP] an unreadable REPOSITORY propagates to main's per-repo handler rather than "
-          "being swallowed as an empty population",
-          (repo_errors, considered_bad), (["repo unreadable"], None))
     check("machine_applied resolves an EXACT-INSTANT human/bot tie toward HUMAN ownership, across "
           "both `Z` and `+00:00` spellings of the same instant",
           [machine_applied([event("labeled", "needs:user", bot_when, "sparq-orchestrator[bot]"),
@@ -1273,6 +1302,161 @@ def _self_test():
                                         ("2026-07-28T01:00:00Z", "2026-07-28T01:00:00+00:00"),
                                         ("2026-07-28T01:00:00+00:00", "2026-07-28T01:00:00Z"))],
           [False, False, False])
+
+    # --- (h4) THE WHOLE STACK, DRIVEN THROUGH `main()` ----------------------------------------
+    # Everything above stops at `reconcile_repo` and substitutes a fake CLIENT, which leaves the
+    # four real entry points — `_gh`, `_paginated`, `parked_pulls`, `issue_labels`, `timeline` —
+    # and `main`'s own sweep loop unexecuted. A canary-gated line-coverage run measured 40
+    # uncovered lines concentrated exactly there, and ten mutants inside that gap survived the
+    # whole suite. So this block stubs ONE thing — the `subprocess` module global — and drives the
+    # REAL stack from `main(argv)` down to the real HTTP argv.
+    #
+    # Stubbing at the BOTTOM is deliberate. Faking reads while leaving writes real is how a sibling
+    # agent posted 567 comments to a live PR; here the single seam is below both, so a write that
+    # escaped the fake would have to spawn a real `gh` process, and the recorded argv proves it did
+    # not. `subprocess` is resolved as a module global at call time, so no default-argument binding
+    # captures the real one at definition time.
+    class FakeApi:
+        def __init__(self, issues, fail_repo=None):
+            self.issues, self.fail_repo = issues, fail_repo
+            self.reads, self.writes = [], []
+
+        @staticmethod
+        def _result(stdout="null", returncode=0, stderr=""):
+            return types.SimpleNamespace(stdout=stdout, returncode=returncode, stderr=stderr)
+
+        def run(self, argv, capture_output=None, text=None, env=None, check=None):
+            args = list(argv)[1:]
+            if self.fail_repo and any(self.fail_repo in str(part) for part in args):
+                return self._result("", 1, "server exploded")
+            if "-X" in args:
+                self.writes.append(tuple(args))
+                return self._result()
+            path = args[-1]
+            self.reads.append(path)
+            if "--paginate" in args:
+                if "/comments" in path:
+                    rows = self.issues[int(path.split("/issues/")[1].split("/")[0])]["comments"]
+                elif "/timeline" in path:
+                    rows = self.issues[int(path.split("/issues/")[1].split("/")[0])]["timeline"]
+                else:
+                    rows = [row["issue"] for row in self.issues.values()]
+                return self._result(json.dumps([rows]))
+            if "/pulls/" in path:
+                return self._result(json.dumps(
+                    self.issues[int(path.rsplit("/", 1)[1])]["pull"]))
+            number = int(path.rsplit("/", 1)[1])
+            return self._result(json.dumps(
+                {"labels": [{"name": name}
+                            for name in self.issues.get(number, {}).get("source_labels", [])]}))
+
+    def stack_row(number, *, is_pr=True, labels=("needs:user",), ref="fix/x", head=head_b,
+                  mergeable=False, attempted=head_a, author="bot", source_labels=(),
+                  escalated=True):
+        issue = {"number": number, "labels": [{"name": name} for name in labels]}
+        if is_pr:
+            issue["pull_request"] = {"url": f"https://api.github.com/pulls/{number}"}
+        comments = ([{"user": {"login": author},
+                      "body": f"<!-- conflict-resolver attempt=1 head={attempted} -->"}]
+                    + ([{"user": {"login": author}, "body": esc}] if escalated else [])
+                    if attempted else [])
+        return {"issue": issue, "comments": comments,
+                "timeline": [event("labeled", "needs:user", "2026-07-28T01:00:00Z",
+                                   "sparq-orchestrator[bot]")],
+                "pull": {"head": {"sha": head, "ref": ref}, "mergeable": mergeable},
+                "source_labels": list(source_labels)}
+
+    import tempfile
+    import types
+
+    def drive(api, argv):
+        """Run the REAL main() over the REAL GhClient with only `subprocess` faked."""
+        global subprocess
+        saved, out, err = subprocess, io.StringIO(), io.StringIO()
+        try:
+            subprocess = types.SimpleNamespace(run=api.run)
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = main(argv)
+        finally:
+            subprocess = saved
+        payload = out.getvalue().split("CONFLICT-PARK-CENSUS ", 1)
+        return code, (json.loads(payload[1]) if len(payload) > 1 else None), out.getvalue()
+
+    summary_file = os.path.join(tempfile.mkdtemp(), "summary.md")
+    stack = FakeApi({
+        # An ISSUE — not a pull request — carrying `needs:user`. It must never be touched.
+        100: stack_row(100, is_pr=False),
+        # A LANE head whose SOURCE ISSUE holds a needs:* the release would strand.
+        101: stack_row(101, ref="sparq-agent/issue-101-9-1", source_labels=["needs:external-audit"]),
+        # Releasable.
+        102: stack_row(102),
+        # Attempt + escalation markers authored by a THIRD PARTY, not the bot.
+        103: stack_row(103, author="drive-by"),
+        # A bot ATTEMPT marker with NO escalation receipt: the resolver tried and is still trying,
+        # so no terminal was ever written and this is not a park to release. This row is what makes
+        # `escalation_recorded` load-bearing — with `heads` empty (as on #103) a hard-coded True
+        # still refuses, so only a case with a real attempt and no receipt can catch it.
+        104: stack_row(104, escalated=False),
+    })
+    code, census_json, transcript = drive(stack, [
+        "--repos", "o/r", "--bot-login", "bot", "--apply", "--token", "tok",
+        "--summary-path", summary_file])
+    def stack_code(number):
+        """The refusal/admit code the run recorded for ONE pr, read from the run's own per-PR
+        line. Asserting a COUNT cannot tell two PRs sharing a code apart, which is exactly the
+        confusion that would let a third-party-manufactured park pass as a bot attempt."""
+        for line in transcript.splitlines():
+            if f"#{number}: " in line:
+                return line.split("[", 1)[1].split("/", 1)[0] if "[" in line else line.strip()
+        return None
+
+    released = [int(w[3].split("/issues/")[1].split("/")[0]) for w in stack.writes
+                if "DELETE" in w]
+    check("[STACK] driving the REAL main() over the REAL client: only the releasable PR is "
+          "written to, and exactly one comment plus one label delete are issued",
+          (code, released, sorted({w[2] for w in stack.writes}), len(stack.writes)),
+          (0, [102], ["DELETE", "POST"], 2))
+    check("[STACK] an ISSUE carrying `needs:user` is never swept — this program acts on pull "
+          "requests only, and dropping that filter would let it edit issues",
+          (100 in (census_json or {}).get("released", []),
+           any("/issues/100/" in str(w) for w in stack.writes),
+           sorted(census_json["codes"])),
+          (False, False, ["cleared-head-moved", "not-population", "residual-hold"]))
+    check("[STACK] a bot ATTEMPT with NO escalation receipt is not a park — the resolver is still "
+          "working on it, and no terminal was ever written",
+          (stack_code(104), 104 in census_json["released"]), ("not-population", False))
+    check("`escalation_recorded` reads the receipt rather than assuming it: an attempt comment "
+          "alone, or any other prose, is not an escalation",
+          [escalation_recorded(bodies) for bodies in
+           ([], ["nothing here"], [f"<!-- conflict-resolver attempt=1 head={head_a} -->"],
+            [esc])],
+          [False, False, False, True])
+    check("[STACK] the LANE head's SOURCE ISSUE is really fetched, and its hold refuses the "
+          "release — through the live `issue_labels`, not a fake",
+          (stack_code(101), any(read.endswith("/issues/101") for read in stack.reads)),
+          ("residual-hold", True))
+    check("[STACK] attempt and escalation markers authored by a THIRD PARTY do not make a "
+          "population — a drive-by comment cannot manufacture a park for this program to clear",
+          (stack_code(103), 103 in census_json["released"]), ("not-population", False))
+    check("[STACK] the census reaches the STEP SUMMARY file, and records that this run applied",
+          ("conflict-park reconciliation census" in open(summary_file, encoding="utf-8").read(),
+           census_json["apply"], census_json["considered"]),
+          (True, True, 4))
+
+    dry_stack = FakeApi({102: stack_row(102)})
+    dry_code, dry_census, _ = drive(dry_stack, ["--repos", "o/r", "--bot-login", "bot"])
+    check("[STACK] WITHOUT --apply the very same population is reported as released but NOTHING "
+          "is written — a silent no-op that still printed RELEASE would otherwise pass",
+          (dry_code, dry_stack.writes, dry_census["released"], dry_census["apply"]),
+          (0, [], [102], False))
+
+    boom = FakeApi({102: stack_row(102)}, fail_repo="o/r")
+    boom_code, boom_census, _ = drive(boom, ["--repos", "o/r", "--bot-login", "bot", "--apply"])
+    check("[STACK] an unreadable REPOSITORY reds the run through main's own handler and is named "
+          "in the census — never swallowed into a clean exit zero",
+          (boom_code, len(boom_census["errors"]), "o/r" in boom_census["errors"][0],
+           boom_census["considered"]),
+          (1, 1, True, 0))
 
     # --- (i) THE YAML SEAM. Pin the CALL SITE, not only the Python ----------------------------
     # Every uncaught mutant in this repo's measured mutation runs lived at a workflow `if:`, a
