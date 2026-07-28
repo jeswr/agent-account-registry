@@ -216,6 +216,18 @@ MAX_ADVISORY_MENTIONS = 6
 
 REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 
+# How much of a refusal's own text the census carries, and how many DISTINCT causes per reason code.
+# Bounded on both axes because the row is written to the job log every tick: a census that can grow
+# with the population is a census nobody reads.
+CENSUS_CAUSE_CHARS = 120
+MAX_CENSUS_CAUSES = 4
+
+
+def refusal_cause(message):
+    """The one-line, whitespace-collapsed, truncated form of a refusal message for the census."""
+    text = " ".join(str(message or "").split())
+    return text[:CENSUS_CAUSE_CHARS] if text else "(no message)"
+
 # ---- the refusal taxonomy ----------------------------------------------------------------------
 REASON_NO_REFERENCE = "no-issue-reference"
 REASON_AMBIGUOUS = "ambiguous-issue-reference"
@@ -713,6 +725,8 @@ def census_row(counters):
             f"(with_record={row['with_record']} minted={row['minted']} "
             f"refused={row['refused']} deferred_cap={row['deferred_cap']})")
     row["lacking_record"] = row["enrolled_pulls"] - row["with_record"]
+    row["refusal_causes"] = {reason: sorted(causes)
+                             for reason, causes in (row.get("refusal_causes") or {}).items()}
     return row
 
 
@@ -739,6 +753,14 @@ def new_counters(*, mint_cap, comment_cap, apply_changes):
         "commented": 0,
         "comment_deferred_cap": 0,
         "refusals": {},
+        # WHY each reason fired, bounded. `refusals` counts reason CODES, and one code —
+        # `mint-refused` — carries two operationally opposite situations: the shared gate declining a
+        # particular pull request (the lane is working) and the lane being unable to run at all (an
+        # unreadable source issue, an alias missing from the routing catalog). Only the passthrough
+        # TEXT separates them, and that text reached the log line and the PR comment but never the
+        # machine-readable row — so the row could not tell an operator whether the lane was healthy
+        # or dead. This carries a capped, deduplicated, truncated summary of it.
+        "refusal_causes": {},
         "skipped_targets": {},
         "mint_cap": mint_cap,
         "comment_cap": comment_cap,
@@ -759,6 +781,10 @@ def sweep(targets, *, annotate_repo, read_routing, read_pulls, read_issue, read_
     def refuse(repo, pull, reason, message):
         counters["refused"] += 1
         counters["refusals"][reason] = counters["refusals"].get(reason, 0) + 1
+        causes = counters["refusal_causes"].setdefault(reason, [])
+        cause = refusal_cause(message)
+        if cause not in causes and len(causes) < MAX_CENSUS_CAUSES:
+            causes.append(cause)
         log(f"REFUSE {repo}#{pull['number']} [{reason}]: {message}")
         if reason in SILENT_REASONS:
             return
@@ -1584,9 +1610,31 @@ def _self_test():                                                       # noqa: 
                 apply_changes=apply_changes, max_mints=max_mints, max_comments=max_comments,
                 log=lambda *_a, **_k: None)
 
+    class _NoCensus(dict):
+        """A census row that was never emitted, whose every field reads back as a NAMED marker.
+
+        Production code in this file is allowed to raise in exactly one place — `census_row`'s seal,
+        which STOPS a tick whose counters do not account for the population. That is correct
+        behaviour, but in the harness a raise out of `sweep()` aborted the run with a traceback
+        belonging to no branch: MEASURED, an `enrolled_pulls += 0` mutant killed the suite with
+        `0 FAIL` rows at check 183 of 311, and a `declared`/`all_refs` swap reded one named check and
+        then abandoned the remaining 106. Both are now named failures instead."""
+
+        def __init__(self, why):
+            super().__init__()
+            self.why = why
+
+        def __missing__(self, _key):
+            return ("NO CENSUS EMITTED", self.why)
+
+    def run_row(recorder, **kwargs):
+        """`recorder.run(**kwargs)`'s census row, or a row whose every field names the raise."""
+        row = total(lambda: recorder.run(**kwargs))
+        return row if isinstance(row, dict) else _NoCensus(row)
+
     clean = [pull(number=41, body="Closes #7")]
     rec = _Recorder(clean)
-    row = rec.run()
+    row = run_row(rec)
     check("POSITIVE CONTROL: the sweep mints the well-formed PR, once",
           (row["minted"], rec.written), (1, [("o/r", 41, 7)]))
     check("...and the census counts it as lacking a record beforehand", row["lacking_record"], 1)
@@ -1607,20 +1655,20 @@ def _self_test():                                                       # noqa: 
 
     # IDEMPOTENCE: a second tick over the record the first one wrote is a NO-OP.
     rec2 = _Recorder(clean, records={41: json.dumps({"pr_number": 41})})
-    row2 = rec2.run()
+    row2 = run_row(rec2)
     check("IDEMPOTENCE: a PR that already has a record is never re-minted",
           (row2["minted"], row2["with_record"], rec2.written, rec2.posted), (0, 1, [], []))
     # ...and if the record appears BETWEEN the probe and the mint, the shared writer's own
     # create-only verdict still lands as a no-op rather than a write.
     rec3 = _Recorder(clean, actions={41: (mint_provenance.ACTION_ALREADY, "identical")})
-    row3 = rec3.run()
+    row3 = run_row(rec3)
     check("...and a race that resolves to `already-minted` writes nothing either",
           (row3["minted"], row3["with_record"], rec3.written), (0, 1, []))
 
     # THE CAP.
     many = [pull(number=n, body="Closes #7") for n in (41, 42, 43, 44, 45)]
     capped = _Recorder(many)
-    row4 = capped.run(max_mints=2)
+    row4 = run_row(capped, max_mints=2)
     check("CAP: at most `max_mints` records are written in one tick",
           (row4["minted"], len(capped.written)), (2, 2))
     check("...and the rest are censused as cap-deferred, not lost", row4["deferred_cap"], 3)
@@ -1638,7 +1686,7 @@ def _self_test():                                                       # noqa: 
             ("a reference to a closed issue", [pull(number=41, body="Closes #7")],
              {7: issue(state="closed")}, REASON_REFERENCE_CLOSED)):
         rec = _Recorder(payloads, issues=issues)
-        row = rec.run()
+        row = run_row(rec)
         check(f"the sweep refuses {label} and writes NOTHING",
               (row["refused"], row["refusals"], rec.written),
               (1, {reason: 1}, []))
@@ -1652,7 +1700,7 @@ def _self_test():                                                       # noqa: 
     # observed that the ambiguity gate is fed `all_refs` on the production path. This drives a
     # negated body through the real writer and asserts the tick wrote NOTHING.
     negated = _Recorder([pull(number=41, body="Closes #7. This does not close #8.")])
-    row = negated.run()
+    row = run_row(negated)
     check("the sweep REFUSES a negated-reference PR end to end and writes nothing",
           (row["minted"], row["refused"], row["refusals"], negated.written, negated.handed),
           (0, 1, {REASON_AMBIGUOUS: 1}, [], []))
@@ -1663,7 +1711,7 @@ def _self_test():                                                       # noqa: 
     # ...and the suppressor really is applied on that path too: a body whose only reference is
     # negated refuses for having NO declaration rather than binding the one it suppressed.
     only_negated = _Recorder([pull(number=41, body="This PR does not close #7.")])
-    row = only_negated.run()
+    row = run_row(only_negated)
     check("...while a body whose ONLY reference is negated refuses as un-declared, not by binding",
           (row["minted"], row["refusals"], only_negated.written),
           (0, {REASON_NO_REFERENCE: 1}, []))
@@ -1676,7 +1724,7 @@ def _self_test():                                                       # noqa: 
                                pull(number=42, body="Closes #7", user={"login": "stranger"}),
                                pull(number=43, body="Closes #7",
                                     user={"login": "dependabot[bot]"})])
-    row = mixed_authors.run()
+    row = run_row(mixed_authors)
     check("the sweep counts and mints the ENROLLED class ONLY — a stranger and a bot are neither",
           (row["enrolled_pulls"], row["minted"], mixed_authors.written),
           (1, 1, [("o/r", 41, 7)]))
@@ -1684,42 +1732,70 @@ def _self_test():                                                       # noqa: 
     # THE REFUSAL COMMENT CARRIES THE DERIVATION'S OWN MESSAGE. Without this, `refuse()` could be
     # handed a constant and every author would get an unactionable comment naming no numbers.
     messaged = _Recorder([pull(number=41, body="it relates to #7 and to #8")])
-    messaged.run()
+    run_row(messaged)
     check("the posted comment carries the DERIVATION's message, not a generic one",
           total(lambda: all(token in messaged.posted[0][1]
                             for token in ("#7", "#8", "declares no closing reference"))), True)
 
     refused_by_shared = _Recorder(
         clean, actions={41: (mint_provenance.ACTION_REFUSE, "the pull request is a DRAFT")})
-    row = refused_by_shared.run()
+    row = run_row(refused_by_shared)
     check("a refusal from the SHARED gate is censused and commented too",
           (row["refused"], row["refusals"], len(refused_by_shared.posted)),
           (1, {REASON_MINT_REFUSED: 1}, 1))
     check("...with the shared gate's own reason text, verbatim",
           total(lambda: "the pull request is a DRAFT" in refused_by_shared.posted[0][1]), True)
+    # ...and the MACHINE-READABLE row says which situation it was. `mint-refused` covers both "the
+    # gate declined this PR" (the lane is working) and "the lane could not run at all", and the
+    # reason CODE is identical for the two — so a census carrying only the code cannot tell an
+    # operator whether the sweep is healthy or dead. That distinction is the whole operational value
+    # of the row, so it is asserted with the two shapes side by side.
+    check("...and the census row itself names WHY, not just the reason code",
+          row.get("refusal_causes"), {REASON_MINT_REFUSED: ["the pull request is a DRAFT"]})
+    outage = run_row(_Recorder(
+        clean, actions={41: (mint_provenance.ACTION_REFUSE,
+                             "the implementer alias 'opus5' is not in the target's routing "
+                             "catalog")}))
+    check("...so a working lane declining ONE pr and a lane that cannot run at all are "
+          "distinguishable in the JSON, under the SAME reason code",
+          (outage.get("refusals"), outage.get("refusal_causes")),
+          ({REASON_MINT_REFUSED: 1},
+           {REASON_MINT_REFUSED: ["the implementer alias 'opus5' is not in the target's routing "
+                                  "catalog"]}))
+    many_causes = run_row(_Recorder(
+        [pull(number=n, body="Closes #7") for n in range(41, 49)],
+        actions={n: (mint_provenance.ACTION_REFUSE, f"distinct cause {n}") for n in range(41, 49)}),
+        max_mints=8, max_comments=8)
+    check("...and the cause list is BOUNDED, so a census cannot grow with the population",
+          total(lambda: (len(many_causes.get("refusal_causes", {}).get(REASON_MINT_REFUSED, [])),
+                         many_causes.get("refusals"))),
+          (MAX_CENSUS_CAUSES, {REASON_MINT_REFUSED: 8}))
+    check("...and each cause is one truncated line, never a multi-line message",
+          (refusal_cause("a\nb   c" + "x" * 400), refusal_cause("")),
+          ("a b c" + "x" * (CENSUS_CAUSE_CHARS - 5), "(no message)"))
 
     # The comment is deduped by reason, so a refusal is never a per-tick comment loop.
     dedupe = _Recorder([pull(number=41, body="no reference")],
                        comments={41: [{"body": refusal_comment_body(REASON_NO_REFERENCE, "x")}]})
-    row = dedupe.run()
+    row = run_row(dedupe)
     check("an already-commented refusal is censused again but NOT re-commented",
           (row["refused"], row["commented"], dedupe.posted), (1, 0, []))
 
     comment_capped = _Recorder([pull(number=n, body="no reference") for n in (41, 42, 43)])
-    row = comment_capped.run(max_comments=2)
+    row = run_row(comment_capped, max_comments=2)
     check("COMMENT CAP: refusal comments are bounded per tick too",
           (row["refused"], row["commented"], len(comment_capped.posted)), (3, 2, 2))
     check("...and the un-commented refusals are censused as cap-deferred",
           row["comment_deferred_cap"], 1)
 
     dry = _Recorder(clean + [pull(number=42, body="no reference")])
-    row = dry.run(apply_changes=False)
+    row = run_row(dry, apply_changes=False)
     check("a DRY RUN decides everything and writes NOTHING — no record, no comment",
           (row["minted"], row["refused"], dry.written, dry.posted), (1, 1, [], []))
     check("...and says so in the census", row["apply"], False)
 
     probe_failed = _Recorder(clean)
-    row = probe_failed.run(record_boom=True)
+    row = run_row(probe_failed, record_boom=True)
     check("an UNREADABLE record probe refuses (never 'nothing is recorded') and writes nothing",
           (row["minted"], row["refusals"], probe_failed.written),
           (0, {REASON_RECORD_PROBE_FAILED: 1}, []))
@@ -1727,13 +1803,13 @@ def _self_test():                                                       # noqa: 
           probe_failed.posted, [])
 
     foreign = _Recorder(clean)
-    row = foreign.run(targets=(("other/repo", ("jeswr",)),))
+    row = run_row(foreign, targets=(("other/repo", ("jeswr",)),))
     check("a target this run cannot annotate is SKIPPED, loudly, and swept for nothing",
           (row["targets"], row["enrolled_pulls"], row["skipped_targets"], foreign.written),
           (0, 0, {"other/repo": REASON_TARGET_NOT_ANNOTATABLE}, []))
 
     empty = _Recorder([])
-    row = empty.run(targets=())
+    row = run_row(empty, targets=())
     check("a tick with no targets STILL emits a census (a silent minter is the failure mode)",
           (row["targets"], row["enrolled_pulls"], row["lacking_record"]), (0, 0, 0))
 
@@ -1859,38 +1935,48 @@ def _self_test():                                                       # noqa: 
             sys.argv, sys.stderr = saved_argv, saved_stderr
         return seen
 
+    def fwd(seen, *keys):
+        """What main() forwarded, or a NAMED marker per missing key.
+
+        A mutant that stops calling `sweep` (or drops a keyword) must red a check, not raise a
+        KeyError from inside the assertion and abort every later check with it."""
+        got = tuple(seen.get(key, "NOT-FORWARDED") for key in keys)
+        return got[0] if len(keys) == 1 else got
+
     ran = main_call(["--registry-repo", "o/r", "--annotate-repo", "o/r"])
     check("main() forwards the DRY RUN by default — apply_changes is args.apply, not True",
-          ran["apply_changes"], False)
+          fwd(ran, "apply_changes"), False)
     check("...and the WRITER is built dry too, which is the whole meaning of --apply",
-          ran["mint_caller_args"], ("o/r", False))
+          fwd(ran, "mint_caller_args"), ("o/r", False))
     check("...and the caps it forwards are the parsed arguments' defaults",
-          (ran["max_mints"], ran["max_comments"]), (DEFAULT_MAX_MINTS, DEFAULT_MAX_COMMENTS))
-    check("...and --annotate-repo reaches the sweep as given", ran["annotate_repo"], "o/r")
+          fwd(ran, "max_mints", "max_comments"), (DEFAULT_MAX_MINTS, DEFAULT_MAX_COMMENTS))
+    check("...and --annotate-repo reaches the sweep as given", fwd(ran, "annotate_repo"), "o/r")
     check("...and the readers are the ones _gh_readers built for THIS registry",
-          (ran["gh_readers_repo"], ran["read_routing"], ran["post_comment"]),
+          fwd(ran, "gh_readers_repo", "read_routing", "post_comment"),
           ("o/r", "reader-routing", "reader-post"))
     check("...and the population comes from the master-protected enrolment authority",
-          ran["targets"], [("o/r", ("jeswr",))])
-    check("...and a clean run returns 0", ran["returned"], 0)
+          fwd(ran, "targets"), [("o/r", ("jeswr",))])
+    check("...and a clean run returns 0", fwd(ran, "returned"), 0)
 
     applied = main_call(["--registry-repo", "o/r", "--annotate-repo", "o/r", "--apply"])
     check("--apply reaches BOTH the writer factory and the comment switch, together",
-          (applied["mint_caller_args"], applied["apply_changes"]), (("o/r", True), True))
+          fwd(applied, "mint_caller_args", "apply_changes"), (("o/r", True), True))
 
     capped = main_call(["--registry-repo", "o/r", "--annotate-repo", "o/r",
                         "--max-mints", "1", "--max-comments", "2"])
     check("the per-tick caps main() forwards are the OPERATOR's, not constants",
-          (capped["max_mints"], capped["max_comments"]), (1, 2))
+          fwd(capped, "max_mints", "max_comments"), (1, 2))
 
     other = main_call(["--registry-repo", "reg/istry", "--annotate-repo", "other/repo"])
     check("...and --registry-repo and --annotate-repo are DISTINCT arguments, not one value",
-          (other["gh_readers_repo"], other["mint_caller_args"][0], other["annotate_repo"]),
+          total(lambda: (other["gh_readers_repo"], other["mint_caller_args"][0],
+                         other["annotate_repo"])),
           ("reg/istry", "reg/istry", "other/repo"))
 
     check("a run enrolling NOBODY sweeps nothing rather than defaulting to an author",
           main_call(["--registry-repo", "o/r", "--annotate-repo", "o/r"],
-                    policy={"repos": {"o/r": {"enabled": True}}})["targets"], [])
+                    policy={"repos": {"o/r": {"enabled": True}}}).get("targets",
+                                                                       "NOT-FORWARDED"), [])
     for missing in (["--registry-repo", "o/r"], ["--annotate-repo", "o/r"], []):
         check(f"main() REFUSES rather than guessing when {missing or 'everything'} is all it has",
               main_call(missing).get("exit"), 2)
@@ -1983,32 +2069,38 @@ def _self_test():                                                       # noqa: 
         finally:
             globals()["_read_policy"] = saved_policy
 
-    fake, (r_routing, r_pulls, r_issue, r_record, r_comments, r_post), _ = readers_for(
+    fake, _built, _ = readers_for(
         payloads={"pulls?state=open": [[{"number": 41}, {"number": 42}], [{"number": 43}]],
                   "/comments": [[{"body": "a"}], [{"body": "b"}]]})
+    check("_gh_readers returns exactly the six readers the sweep's signature needs",
+          total(lambda: len(_built)), 6)
+    r_routing, r_pulls, r_issue, r_record, r_comments, r_post = (
+        list(_built) + [lambda *a, **k: "MISSING-READER"] * 6)[:6]
     check("read_pulls FLATTENS the paginated slurp — an unflattened page list would make the "
           "population silently EMPTY while the census reported enrolled_pulls=0",
-          [row["number"] for row in r_pulls("o/r")], [41, 42, 43])
+          total(lambda: [row["number"] for row in r_pulls("o/r")]), [41, 42, 43])
     check("...and it asks for OPEN pulls, paginated, from the target",
-          any("--paginate" in c and any("repos/o/r/pulls?state=open&per_page=100" in p
-                                       for p in c) for c in fake.calls), True)
-    check("read_comments flattens its pages too", [row["body"] for row in r_comments("o/r", 41)],
-          ["a", "b"])
+          total(lambda: any("--paginate" in c
+                            and any("repos/o/r/pulls?state=open&per_page=100" in p for p in c)
+                            for c in fake.calls)), True)
+    check("read_comments flattens its pages too",
+          total(lambda: [row["body"] for row in r_comments("o/r", 41)]), ["a", "b"])
     check("...and reads the comments of THE PR IT WAS ASKED ABOUT, not a fixed thread",
-          any(any("repos/o/r/issues/41/comments" in p for p in c) for c in fake.calls), True)
+          total(lambda: any(any("repos/o/r/issues/41/comments" in p for p in c)
+                            for c in fake.calls)), True)
     fake.calls.clear()
     r_issue("o/r", 7)
-    check("read_issue reads the ISSUES endpoint — `pulls/{n}` would make every reference resolve "
-          "as a pull request",
-          fake.calls, [["api", "repos/o/r/issues/7"]])
+    check("read_issue reads the ISSUES endpoint — a `pulls/{n}` edit would make every reference "
+          "resolve as a pull request",
+          total(lambda: fake.calls), [["api", "repos/o/r/issues/7"]])
     fake.calls.clear()
     r_record("o/r", 41)
     check("read_record probes the REGISTRY's own provenance path on the ledger ref",
-          fake.calls, [["probe", "reg/istry", "provenance/o/r/41.json", "ledger"]])
+          total(lambda: fake.calls), [["probe", "reg/istry", "provenance/o/r/41.json", "ledger"]])
     r_post("o/r", 41, "the refusal body")
     check("post_comment posts the body it was GIVEN, to that PR",
-          (fake.posted[0][:5], "-f" in fake.posted[0],
-           "body=the refusal body" in fake.posted[0]),
+          total(lambda: (fake.posted[0][:5], "-f" in fake.posted[0],
+                         "body=the refusal body" in fake.posted[0])),
           (["api", "-X", "POST", "repos/o/r/issues/41/comments", "-f"], True, True))
 
     # THE PATH-TRAVERSAL GUARD, at its ONLY call site. The predicate has an exhaustive fixture table
@@ -2048,7 +2140,7 @@ def _self_test():                                                       # noqa: 
                         "targets", "enrolled_pulls", "skipped_targets") + (routing_boom.written,),
           (0, 0, {"o/r": REASON_TARGET_ROUTING_UNREADABLE}, []))
     annotate_boom = _Recorder([pull(number=41, body="no reference")])
-    row = annotate_boom.run(comments_boom=True)
+    row = run_row(annotate_boom, comments_boom=True)
     check("a refusal whose ANNOTATION fails is still censused, and the tick continues",
           (row["refused"], row["refusals"], annotate_boom.written),
           (1, {REASON_NO_REFERENCE: 1}, []))
