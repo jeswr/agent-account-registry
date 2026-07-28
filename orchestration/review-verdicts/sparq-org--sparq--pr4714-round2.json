@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4714,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "41b83cbcebade5e9f9d9d08904b611c976895b16",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major security-contract defect is resolved. The diff removes the false \"non-reversible\" characterization everywhere it touched, explicitly documents that FNV-1a is an unkeyed non-cryptographic checksum permitting offline guessing, identifies UPDATE payload sensitivity, and adds a non-vacuous witness test that reproduces the exposed fingerprint from candidate text. The UPDATE registry wiring shares the HTTP-visible registry with both initial and restored writer instances, carries the cancellation flag into the real update budget, and holds the RAII guard across application. The end-to-end tests exercise the real HTTP list/cancel path, verify whole-update rollback, registry cleanup, and continued writer availability. No new correctness, soundness, security, or hostile-instruction issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
