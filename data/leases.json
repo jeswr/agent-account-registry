@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "488920c2efe2b3fb",
-   "claim_id": "7ebdd6bab71f4d5485f17a7c9434fcea",
-   "holder": "sparq-org/sparq#3030@30320296016.1",
-   "package": "upstream",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785202067,
-   "expires_at": 1785208367
-  },
-  {
-   "account": "488920c2efe2b3fb",
    "claim_id": "125d3be5937e4be789ea56fdd8b6b349",
    "holder": "sparq-org/sparq#3297@30320300769.1",
    "package": "sparq-fedplan-mpc",
