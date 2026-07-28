@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4856,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "73dbddfb2a8e14f125ae47ec952f9d8a21182199",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The component-indexed lowering is coherent and complete for its documented subset. A non-ground quoted position is first captured by the ordinary pattern join, then UnpackTriple rejects non-triple IDs and binds or checks components left-to-right. Compiler bound-state handling correctly makes repeated variables, variables shared with a plain position in the same atom, and variables correlated from earlier atoms checks rather than destructive rebindings. Nested object quotations are emitted after their parent unpack, and semi-naive delta indices continue to identify Pattern steps rather than deferred unpack steps. Ground quoted terms use the same Dict structural interning path as loaded data, while unsupported variable-bearing conclusions, negation bodies, and structurally impossible triple terms fail loudly. The tests exercise real compile/bind/eval paths and cover constants, correlation, repeated variables, opacity, nesting, derived-fact rounds, and rejection cases; they are not vacuous. Documentation matches the implemented envelope. No security or correctness defect was found. The targeted test could not be run in this environment because cargo is unavailable.",
+  "verdict": "approve"
+ }
+}
