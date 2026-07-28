@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4649,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "205ae9861c7dc21996b8e591e3160e8f13e304dd",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 finds no correctness, soundness, test-validity, or security defect. The boundary logic remains conservative for Unicode, PN_LOCAL escapes, and context-dependent prefixed-name punctuation, while genuine delimiter-adjacent typos retain a positive control. The parser-backed tests are non-vacuous, the scan work is bounded against adversarial punctuation runs, and the canary still fails without applying any suggestion. With round 3 also reporting no issues, progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
