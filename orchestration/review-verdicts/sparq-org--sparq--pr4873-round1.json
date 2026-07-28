@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4873,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a64d97b412d2ce9e884778eba1e9294e62481652",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is coherent and complete as scoped. The differential harness keeps sparq-vs-sparq comparisons strict, uses RDFC-1.0 canonicalization only when blank nodes require isomorphism, preserves duplicate sensitivity with a raw-count guard, and narrowly adjudicates Oxigraph's xsd:integer lexical collapse only after an independent structural normalization makes both snapshots equal. LOAD substitution is explicitly bounded to generated ground N-Triples and is backed by tests for both the engine capability mismatch and semantic equivalence. The added tests exercise positive and negative comparator behavior, generator coverage, constrained triple-term handling, exact lexical-term deletion, and injected-divergence detection; they are not vacuous. No hostile reviewer-directed instruction was found in the diff.",
+  "verdict": "approve"
+ }
+}
