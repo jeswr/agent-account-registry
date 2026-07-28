@@ -22,16 +22,6 @@
   },
   {
    "account": "efb4eb2781de6958",
-   "claim_id": "86a9b60cfe6f45c6b6f8df4cd7df9422",
-   "holder": "jeswr/agent-account-registry#824@30316893187.1",
-   "package": "ci",
-   "role": "ci",
-   "model": "opus5",
-   "issued_at": 1785197903,
-   "expires_at": 1785200603
-  },
-  {
-   "account": "efb4eb2781de6958",
    "claim_id": "d0cfc6c32daa472eab14afd7eb1ee094",
    "holder": "sparq-org/sparq#2641@30317426519.1",
    "package": "sparq-fedplan-mpc",
