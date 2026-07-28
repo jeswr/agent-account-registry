@@ -1,49 +1,62 @@
 {
-  "generated_at": "2026-07-28T18:22:55Z",
+  "generated_at": "2026-07-28T18:46:27Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 1643,
-      "issues_ready": 393,
-      "issues_closed_1h": 8,
+      "issues_open": 1652,
+      "issues_ready": 391,
+      "issues_closed_1h": 4,
       "issues_closed_24h": 66,
-      "prs_open": 87,
-      "prs_draft": 70,
+      "prs_open": 90,
+      "prs_draft": 73,
       "prs_opened_1h": 8,
-      "prs_closed_1h": 0,
-      "prs_merged_1h": 7,
+      "prs_closed_1h": 1,
+      "prs_merged_1h": 4,
       "prs_merged_24h": 62,
-      "review_changes_backlog": 14,
+      "review_changes_backlog": 18,
       "needs_user_parked": 22,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 13,
+      "review_lane_runs_1h": 20,
       "worker_attempts_1h": 10,
       "worker_success_rate_1h": 0.8,
       "pr_open_rate": 8.0,
-      "pr_close_rate": 7.0,
-      "net_pr_flow": 1.0
+      "pr_close_rate": 5.0,
+      "net_pr_flow": 3.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 455,
-      "issues_ready": 85,
+      "issues_open": 457,
+      "issues_ready": 87,
       "issues_closed_1h": 1,
       "issues_closed_24h": 55,
       "prs_open": 30,
       "prs_draft": 20,
       "prs_opened_1h": 0,
-      "prs_closed_1h": 1,
-      "prs_merged_1h": 2,
+      "prs_closed_1h": 0,
+      "prs_merged_1h": 1,
       "prs_merged_24h": 81,
       "review_changes_backlog": 3,
       "needs_user_parked": 13,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 2,
+      "review_lane_runs_1h": 1,
       "worker_attempts_1h": 5,
       "worker_success_rate_1h": 0.6,
       "pr_open_rate": 0.0,
-      "pr_close_rate": 3.0,
-      "net_pr_flow": -3.0
+      "pr_close_rate": 1.0,
+      "net_pr_flow": -1.0
     }
   },
-  "alerts": []
+  "alerts": [
+    {
+      "target": "sparq-org/sparq",
+      "classification": "backlog-growing",
+      "fire": true,
+      "summary": "open PRs 90 > 40 and net PR flow +3.0/hr (open 8.0 > close 5.0) sustained over 2 snapshots",
+      "metrics": {
+        "prs_open": 90,
+        "net_pr_flow": 3.0,
+        "pr_open_rate": 8.0,
+        "pr_close_rate": 5.0
+      }
+    }
+  ]
 }
