@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4780,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "654819a225ff90a8a26180c4a607115e44dc3577",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The cross-round `seen` set is keyed only by `(certifier IRI, certified_issuer IRI)`. Distinct signed Certification records with the same endpoints can differ in `certifier_key`, `certified_key`, scope, window, or signature. During a round, all successes are collected before `seen` is extended; if one record for A\u2192B succeeds while a sibling A\u2192B record fails because its matching A key/rule is not in the current frontier, the shared pair is then marked seen. If that matching A rule reaches a later frontier, the sibling is skipped without evaluation. The cycle gate does not make this redundant when the sibling has a different `certified_key`, because the rule produced by the first record does not match that key. Thus a valid later-hop rule can be silently omitted, contrary to the claim that each edge remains eligible until it succeeds and that the set merely prevents an individual edge from firing twice.",
+    "file": "crates/sparq-trust/src/graph.rs",
+    "fix_hint": "Track successful Certification records by a collision-free identity covering all gate-relevant fields (or by their stable input index while iterating `certifications`) rather than endpoint pair. Add a regression with two A\u2192B certifications sharing endpoints but using different certifier/certified keys: one succeeds early, while the other becomes anchored only at a later hop; assert the later record is still evaluated and derives. Keep the cumulative matching-key cycle gate unchanged.",
+    "severity": "major",
+    "title": "Endpoint-pair `seen` key conflates distinct certification edges"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 resolves the prior frontier-versus-known admission mismatch with a substantive argument and a non-vacuous regression test: stale anchors can no longer produce an extra admission because a previously successful edge is rejected by the cumulative cycle gate. However, the new depth-N loop introduces a separate missed-derivation bug: `seen` identifies an edge only by endpoint IRIs, although distinct Certification values may share those endpoints while differing in keys, scope, signature, or validity. Success of one such certification suppresses every sibling at later rounds, including one that failed only because its matching certifier rule had not reached the frontier yet. This violates the documented per-edge processing and can silently omit a legitimate effective rule. Because this is a new major finding after round 1, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
