@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 791,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "66a16f35d5bc0de3da5cbf09e7b42c639f996188",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The file explicitly says \"THIS MODULE IS THE DECISION PLANE ONLY, AND IT HAS NO CALLER YET\" and that nothing imports it. The diff adds no workflow or existing orchestration caller, so no terminal review-loop park or backlog item can collect trusted marker/label/receipt facts, resolve per-owner credentials and the opposite-provider judge, invoke adjudication, reassert the exact head/base before mutation, perform a guarded label/state transition, or write the durable receipt. The self-tests exercise only isolated helpers and cannot show the feature operating on a PR. Thus the change still drains no stuck park and remains incomplete for the stated auto-adjudication feature.",
+    "file": "scripts/stuck_adjudicator.py",
+    "fix_hint": "Add and test the actual review-loop and bounded backlog-sweep integration. It must fail closed on account/token/routing ambiguity; prove machine ownership of the hold and receipts; derive marker state, trust-surface, security, and gate-weakening facts from trusted inputs; enforce opposite-provider orchestration-tier routing; bind every transition and receipt to the exact PR head/base; and cover these authority-bearing paths with end-to-end tests.",
+    "severity": "blocker",
+    "title": "The adjudicator still has no executable orchestration path"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 leaves the prior blocker materially unchanged. The module still explicitly states that it has no caller and changes no orchestration behavior. The added policy cause, pure decision helpers, and extensive self-tests are fail-closed and non-vacuous in isolation, but no review-loop workflow or backlog sweep actually collects trusted park facts, resolves and asserts an opposite-provider judge, invokes adjudication, applies an exact-head-bound transition, or persists the trusted receipt. Therefore the claimed stuck-escalation capability still cannot operate on any PR.",
+  "verdict": "request_changes"
+ }
+}
