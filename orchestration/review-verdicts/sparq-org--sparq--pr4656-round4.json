@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4656,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "51e3b27b02cd71b229c8a008702014839c342b02",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 finds no correctness, soundness, test-validity, or security defect in the changed scope. The prior durability correction remains intact: watermark persistence writes and syncs the temporary file, atomically renames it, then syncs the containing directory on Unix, with post-rename sync failures propagating before the relay advances its in-memory watermark. The focused tests exercise initial creation, replacement, restart/resume behavior, temporary-file consumption, and the Unix parent-directory-sync boundary without overclaiming power-loss proof. Relay delivery remains ordered and at-least-once, commits only a successfully flushed prefix, fails closed when retention has removed a required offset, and exposes rebase gaps explicitly. NATS framing uses byte lengths, validates subjects before writes, redacts credentials from Debug output, and treats broker/protocol failures as errors. The feature remains default-off, has an explicit feature-matrix leg, and the public documentation accurately states its plaintext/no-TLS and durability boundaries.",
+  "verdict": "approve"
+ }
+}
