@@ -902,6 +902,47 @@ def workflow_block(text, step_id, marker):
     return "\n".join(line[pad:] for line in kept)
 
 
+def issue_form_prefill(text, field_id):
+    """The dedented `value: |` prefill of the ONE issue-form field whose `id:` is `field_id`.
+
+    #883 review round 1: an issue form is a MINT PATH — the text it pre-populates is what an
+    operator submits verbatim, so its defaults must be asserted against the same derivation the
+    broker uses rather than trusted as prose. Scoped to the one field (the scan stops at the next
+    `- type:` element) and fails LOUDLY when the field, or its prefill, is missing or empty, so a
+    renamed field can never leave an assertion about the prefill passing on empty text."""
+    if not isinstance(text, str):
+        raise GrantError("cannot read an issue-form prefill from a non-text document — refusing")
+    heads = [index for index, line in enumerate(text.split("\n"))
+             if re.fullmatch(rf"\s*(?:-\s+)?id:\s*{re.escape(field_id)}\s*", line)]
+    if len(heads) != 1:
+        raise GrantError(
+            f"issue form must carry exactly one field `id: {field_id}`, found {len(heads)} — "
+            "refusing to assert against a prefill that cannot be located (fail closed)")
+    lines = text.split("\n")
+    for index in range(heads[0] + 1, len(lines)):
+        if re.fullmatch(r"\s*-\s+type:.*", lines[index]):
+            break
+        opener = re.fullmatch(r"(\s*)value:\s*\|[-+0-9]*\s*", lines[index])
+        if opener is None:
+            continue
+        indent = len(opener.group(1))
+        body = []
+        for line in lines[index + 1:]:
+            if line.strip() and (len(line) - len(line.lstrip())) <= indent:
+                break
+            body.append(line)
+        if not any(line.strip() for line in body):
+            raise GrantError(
+                f"issue-form field `id: {field_id}` extracted to an EMPTY prefill — refusing")
+        # `default=0` leaves the emptiness REFUSAL above as the only thing that can reject an empty
+        # prefill: without it, removing that guard raises ValueError here and takes the suite down
+        # mid-run, which records as a kill while every later row silently never executes.
+        pad = min((len(line) - len(line.lstrip()) for line in body if line.strip()), default=0)
+        return "\n".join(line[pad:] if line.strip() else "" for line in body).strip("\n") + "\n"
+    raise GrantError(
+        f"issue-form field `id: {field_id}` carries no block `value: |` prefill — refusing")
+
+
 def workflow_step_env(text, step_id):
     """The `env:` mapping declared by the ONE step whose `id:` is `step_id` (comments stripped).
 
@@ -1826,6 +1867,41 @@ def _self_test():
           (empty_cap if isinstance(empty_cap, str) else empty_cap["max_concurrent_workers"],
            '"${WORKERS:?' in register),
           (1, True))
+    # ...and the OTHER mint path — the manual registration form — must agree with that derivation.
+    # #883 review round 1 (MAJOR): the broker stopped minting cap-1 accounts, but
+    # .github/ISSUE_TEMPLATE/account.yml, the repo's canonical hand-registration UI, still
+    # pre-populated `max_concurrent_workers: 1`. An operator submitting the prefill unedited minted
+    # exactly the defect #278 removed, beside brokered accounts that carry their provider's value.
+    # The prefill is therefore read as a RECORD — parsed by the real allocator, then compared to
+    # the EXECUTED default for the provider the prefill itself declares — so neither a reverted
+    # literal, nor a trailing comment (which makes the cap parse to 1 silently, per the row above),
+    # nor a drift in the broker's default can leave the two mint paths disagreeing.
+    account_form = (root / ".github/ISSUE_TEMPLATE/account.yml").read_text(encoding="utf-8")
+    # Both the extraction and the parse go through `real_parser`: a failure of either must land as
+    # a legible RED row, never as a traceback that aborts the suite below it (AGENTS.md item 4,
+    # crash-after-partial-run). The loud-refusal behaviour itself is asserted separately below.
+    prefill = real_parser(issue_form_prefill, account_form, "spec")
+    prefilled = real_parser(claim.validate_account_record, "acct42", prefill)
+    prefilled_provider = prefilled.get("provider") if isinstance(prefilled, dict) else None
+    check("[#883] the manual account form's prefill is a record the REAL allocator accepts",
+          real_parser(claim.account_record_schema_errors, "acct42", prefill), [])
+    check("[#883] ...and it prefills its own provider's DERIVED cap, never the rejected literal 1",
+          (prefilled_provider,
+           prefilled["max_concurrent_workers"] if isinstance(prefilled, dict) else prefilled,
+           int(defaults_for(prefilled_provider or "anthropic")[2])),
+          ("anthropic", 4, 4))
+    check("[#883] a renamed field, or a prefill deleted from it, fails the extraction LOUDLY",
+          (refuses(issue_form_prefill, account_form, "no-such-field", needle="found 0"),
+           # ...and a field with no prefill refuses even when a LATER element has one: the scan is
+           # scoped to the named field, so this can never assert against a neighbour's text.
+           refuses(issue_form_prefill, "- type: textarea\n  id: spec\n  attributes:\n"
+                   "    label: x\n- type: textarea\n  id: other\n  attributes:\n"
+                   "    value: |\n      provider: openai\n", "spec",
+                   needle="no block `value: |` prefill"),
+           refuses(issue_form_prefill, "- type: textarea\n  id: spec\n  attributes:\n"
+                   "    value: |\n- type: input\n", "spec", needle="EMPTY prefill"),
+           refuses(issue_form_prefill, None, "spec", needle="non-text document")),
+          (True, True, True, True))
 
     # ------------------------------------------------------------------------------------------
     # [#263] A LABEL NAME IS DATA, NEVER SHELL — EXECUTED, not asserted in prose.
