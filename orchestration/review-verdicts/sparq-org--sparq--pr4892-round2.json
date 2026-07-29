@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4892,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0dae34319205a988adafadc1e99cac937f806164",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains documentation-only and accurately records that the pinned distroless digest is an OCI multi-platform index used by buildx to select the target architecture. It does not change the image reference, build behavior, dependencies, or runtime behavior. The imperative wording is maintainer-facing operational guidance about preserving the multi-platform pinning invariant, not an instruction directed at the reviewer. No correctness, soundness, test-validity, or security issue is present.",
+  "verdict": "approve"
+ }
+}
