@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5005,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ae9957926bbaecff5439b0779a2fb44136f664d2",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. Both materializers now compile their cached rule sets and assemble/validate all input facts before the first mutation of the caller's Graph; reserved graphs are excluded during assembly itself, and strip_reserved_graphs runs only after successful evaluation. The new regression test is non-vacuous: it first creates a non-empty authorization view, injects an invalid reserved principal through the real WAC and ACP assembly paths, observes Err, and verifies the prior view remains unchanged. The compiled-vs-text differentials compare non-empty installed authorization views for WAC, ACP, and ACP provenance, while the direct-fact round-trip test checks the shared fact adapter. No new correctness, soundness, test-validity, or security issue is evident in the diff-scoped evidence.",
+  "verdict": "approve"
+ }
+}
