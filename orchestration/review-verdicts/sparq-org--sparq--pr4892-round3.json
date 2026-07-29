@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4892,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0dae34319205a988adafadc1e99cac937f806164",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-3 diff is unchanged in substance from round 2: it only documents that the pinned distroless digest is an OCI multi-platform image index and explains the invariant maintainers must preserve when replacing it. It does not alter the image reference, build configuration, dependencies, or runtime behavior. The imperative wording is operational guidance within a Dockerfile comment, not an instruction directed at the reviewer. No correctness, soundness, test-validity, or security issue is present.",
+  "verdict": "approve"
+ }
+}
