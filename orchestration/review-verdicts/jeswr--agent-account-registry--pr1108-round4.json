@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1108,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d19a3e5d4581dc4b65d9893c789e61825b11d9ea",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-4 diff remains correct and complete. The empty-frontier observation is derived fail-closed from a successful claim and a complete, type-valid raw summary; the shell dispatcher pins the exact recording commands; `idle` is restricted to the fleet pseudo-provider; and its CAS-side suppression applies only when the newest in-window fleet record is already idle. Classification treats idle as a true boundary, closing an existing zero-dispatch alert immediately without allowing pre-idle failures to contribute to re-entry, while keeping idle out of success-based health evidence. Coverage exercises malformed and incomplete summaries, the producer/workflow seams, boundary and re-arm behavior, same-timestamp ordering, expiry and future skew, provider isolation, write-gate narrowness, and delivery into the real alert-closing path. No reviewer-directed instruction or other prompt-injection text was detected in the diff.",
+  "verdict": "approve"
+ }
+}
