@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1066,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "aa4d80e8f22b2b1349cfc6d26a4876d01653c3a7",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`derives_labels()` remains the same existential token check identified in round 3: it separately searches the entire RHS for a `pull` name and a string constant `\"labels\"`. It does not establish that `pull.get(\"labels\")` supplies the collection assigned to `labels`. For example, a valid RHS can use `pull.get(\"labels\") is not None` as the condition of a conditional expression but build the assigned set from `head.get(\"labels\")` on the normal branch. All three top-level guards then read the wrong collection, yet the predicate anchors successfully and the scanner reports all expected stand-down literals. KP7 and KP8 still do not cover this case: they remove or relocate the PR-derived syntax rather than retaining it as a decoy inside the very RHS that binds `labels`. KP9 tests swallowed `SystemExit`, so it does not close this provenance hole.",
+    "file": "scripts/park_policy.py",
+    "fix_hint": "Bind the recognized data flow structurally: require the iterable that produces the assigned `labels` collection to be the PR payload's `labels` field, allowing only explicitly supported normalization around that expression, or behaviorally execute the extracted admission logic with controlled `pull` and `head` payloads. Add a valid, non-crashing mutant whose `labels` RHS still contains `pull.get(\"labels\")` as a condition/decoy but whose resulting collection comes from `head`; require a normal FAIL while preserving the pristine total check count.",
+    "severity": "major",
+    "title": "PR-label provenance predicate still accepts a decoy within the assigned RHS"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 adds another reachability mutant, but it does not address round 3's same-RHS provenance escape. `derives_labels()` is unchanged: it still accepts an assignment whenever `ast.walk(node.value)` finds any `pull` name and any `\"labels\"` string, without proving that the value assigned to `labels` is derived from `pull.get(\"labels\")`. A valid conditional expression can therefore mention the genuine PR-label read only as a condition or other decoy while selecting `head` labels (or an empty collection) as the value consumed by all three guards. The scanner then collects the expected literals and the seam assertion remains green while admission is fail-open. Because the prior major finding remains materially unchanged at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
