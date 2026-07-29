@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4930,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "78e910a2113365115e6681678135e1db679f8be1",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`pit_snapshot` is keyed only by `(base_generation, target_generation)`, and `resolve_point_in_time` consults it before `rewind` can inspect the retained rebase marker. Online restore replaces the ring with a lineage whose generation numbering restarts, so the new lineage can later reach the same numeric base/target pair as a cached old-lineage reconstruction. In that case `pit_cached` returns the old graph with HTTP 200 even though the requested instant resolved within the new lineage. The field comment's claim that restore renumbers generations such that the key stops matching is incorrect: numbering restarts and can collide later.",
+    "file": "crates/sparq-server/src/http.rs",
+    "fix_hint": "Make lineage identity part of the cache key, or synchronously invalidate the PIT cache whenever restore/rebase changes lineage. Ensure cache lookup cannot bypass validation of a rebase gap. Add a real-path test that fills the cache for an old-lineage `(base,target)` pair, performs an online restore, advances the new lineage to the same numeric pair, and verifies `?at=` never returns the old graph.",
+    "severity": "major",
+    "title": "Point-in-time cache can serve a snapshot from a previous restored lineage"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 1's CDC publish-to-append race is materially fixed by the new fail-closed guard and a real-path-focused regression test. However, the reconstruction cache introduces a new cross-lineage correctness bug: its key contains only numeric base/target generations, while online restore explicitly restarts generation numbering. A cached snapshot from the old lineage can therefore be returned for the same numeric pair in the restored lineage before the rebase marker is checked, silently serving unrelated historical data. Because this is a new major finding, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
