@@ -91,16 +91,6 @@
    "expires_at": 1785306981
   },
   {
-   "account": "9e13ea21abf27e68",
-   "claim_id": "9ba958a66cd14772b62412de82b03093",
-   "holder": "fix:sparq-org/sparq#4967@dispatch-30423131125.1",
-   "package": "ci",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785300729,
-   "expires_at": 1785307029
-  },
-  {
    "account": "51bde6688e140866",
    "claim_id": "1d2d52602cca4eaa88590ffac8e46e01",
    "holder": "jeswr/agent-account-registry#232@30423489721.1",
