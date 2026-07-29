@@ -4023,7 +4023,14 @@ def _run_gh(args, *, check=True, retry_transient=False):
         result = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
     if check and result.returncode != 0:
         operation = args[0] if args else "request"
-        raise DispatchError(f"GitHub {operation} failed")
+        error = DispatchError(f"GitHub {operation} failed")
+        # [OPUS-5] CARRY THE STATUS ONTO THE ERROR. The retry layer already recovered it
+        # (`GhResult.gh_http_status`, from gh's own message or the GH_DEBUG trace) and then this
+        # function threw it away, so every caller saw one indistinguishable "GitHub api failed" —
+        # a permanent 404 and a transient 502 were the same object. `_gh_json_optional` is the
+        # only consumer, and it admits exactly one status; everything else still fails closed.
+        error.http_status = getattr(result, "gh_http_status", None)
+        raise error
     return result
 
 
@@ -4036,6 +4043,30 @@ def _gh_json(args):
         return json.loads(result.stdout or "null")
     except json.JSONDecodeError as exc:
         raise DispatchError("GitHub returned malformed JSON") from exc
+
+
+ABSENT = object()   # the artifact does not exist — an ANSWER, not a failed read
+
+
+def _gh_json_optional(args):
+    """`_gh_json` for a read where NON-EXISTENCE is a legitimate answer: a DEFINITIVE HTTP 404
+    returns `ABSENT` instead of raising. EVERY other failure still raises `DispatchError`,
+    INCLUDING a 404 whose status the retry layer could not recover (`http_status is None`, the
+    registry #748 statusless shape) — "the read failed and we cannot say why" is not proof the
+    artifact is missing, and treating it as such is the fail-OPEN direction.
+
+    ONE fetch, through `_gh_json`, so every existing stub/seam that intercepts reads intercepts
+    this one too and the two cannot drift. The status rides on the raised `DispatchError`
+    (`_run_gh`), recovered by `gh_retry` from gh's own message or the `GH_DEBUG=api` trace; this
+    function does not re-parse stderr itself. Use it ONLY where absence and "not present / not
+    blocking" are the same answer — never where absence would silently satisfy a safety
+    predicate."""
+    try:
+        return _gh_json(args)
+    except DispatchError as exc:
+        if getattr(exc, "http_status", None) == "404":
+            return ABSENT
+        raise
 
 
 LIVE_CHECK_RUN_PAGE_LIMIT = 10   # 1000 runs per aggregator NAME on one head — a hard backstop
@@ -4618,11 +4649,55 @@ def _open_blockers(repo, body):
     open-blocker count. Returns the sorted list of blocker numbers still OPEN. Fail-closed: a
     blocker whose live state cannot be fetched, or whose state is anything other than exactly
     "open"/"closed", raises DispatchError (the item then defers, per the per-item resilience in
-    dispatch()), so a row CLAIM cannot prove unblocked is never dispatched."""
+    dispatch()), so a row CLAIM cannot prove unblocked is never dispatched.
+
+    [OPUS-5] ONE outcome is NOT a failed fetch: a reference to a number that DOES NOT EXIST in
+    this repository (a definitive HTTP 404). It cannot be an OPEN blocker, and PLAN already reads
+    it that way — dispatch.yml's blocker-union computes `int(n) in open_numbers` over the issue
+    snapshot, so a nonexistent number contributes ZERO there. Raising here made the two halves
+    disagree in the ONE direction that can never self-clear: PLAN offers the row every tick, CLAIM
+    404s on it every tick, and the item is stranded with no machine exit for as long as the text
+    stands.
+
+    WHY A 404 HERE CANNOT MEAN "NO ACCESS TO THIS REPOSITORY" — the premise the whole narrowing
+    rests on, and it is a property of the CALL SITE, not of this function. GitHub returns 404
+    rather than 403 for a repository the token cannot see, so in general a 404 is ambiguous
+    between "no such issue" and "no such repo, to you". It is not ambiguous on this path:
+    `_current_issue_matches` has ALREADY read `repos/{repo}/issues/{item['number']}` successfully
+    — that read is the first statement in the function and any failure raises out of it before
+    `_open_blockers` is ever called. So by the time we get here the token is PROVEN able to read
+    issues in this exact repository, and the only remaining reading of a 404 is that the number
+    names nothing. Move this call anywhere that has not already proven repository access and the
+    narrowing becomes unsound: a permissions 404 would then silently drop a REAL blocker.
+
+    SCOPE, stated so nobody later assumes the class is closed: this is 404-ONLY, not
+    example-detection. `BLOCKED_BY_RE` still reads back a marker quoted as an EXAMPLE when the
+    number it names happens to be a live open issue — MEASURED: a body containing an inline-code
+    `Blocked-by: #53` still returns [53]. That residual is a silent FALSE HOLD, and it is the
+    tolerable half of the pair: PLAN holds the row too (53 IS in `open_numbers`), so both halves
+    agree and the row is merely delayed rather than stranded forever by a disagreement neither
+    side can resolve. Stripping quoted contexts before the regex is the real fix for that half
+    and belongs with the marker grammar, in BOTH engines at once (cf. sparq#4995).
+
+    MEASURED on sparq-org/sparq#3817 — an issue whose BODY documents the marker syntax (an
+    inline-code `Blocked-by: #99999`) and which `BLOCKED_BY_RE` therefore reads back as a live
+    edge. The sparq ready lane's frontier is ONE row wide, and this issue was that row on 13 of
+    13 executed ticks over 4+ hours: the lane's ENTIRE per-tick capacity, spent on a phantom
+    edge. Not a marginal loss — a total occupancy loss on a width-1 frontier. (Removing it is
+    SUBSTITUTION, not addition: the frontier is width 1 both ways. The replacement head is real
+    work rather than a permanent refusal, which is the whole of the gain here.)
+
+    Every OTHER read failure — 5xx, 403, a statusless read — still fails closed, so this narrows
+    the refusal to the single case where non-existence IS the answer rather than the absence of
+    one."""
     numbers = sorted({int(match) for match in BLOCKED_BY_RE.findall(body)})
     still_open = []
     for number in numbers:
-        blocker = _gh_json(["api", f"repos/{repo}/issues/{number}"])
+        blocker = _gh_json_optional(["api", f"repos/{repo}/issues/{number}"])
+        if blocker is ABSENT:
+            # The reference names nothing in this repository, so it holds nothing. Same answer
+            # PLAN derives; NOT a licence to admit a read that merely failed.
+            continue
         state = blocker.get("state") if isinstance(blocker, dict) else None
         if state == "open":
             still_open.append(number)
@@ -10269,6 +10344,102 @@ def _self_test():
             pass
     # the parser is byte-identical to the ready engine's blocker regex (no silent divergence)
     assert BLOCKED_BY_RE.findall("Blocked-by: #7 and blocked-by:#8") == ["7", "8"]
+    # ------------------------------------------------------------------------------------------
+    # [OPUS-5] A MARKER NAMING A NONEXISTENT ISSUE IS NOT A BLOCKER — AND NOT A FAILED READ.
+    # `BLOCKED_BY_RE` reads back any `Blocked-by: #N` in the body, INCLUDING one an issue quotes
+    # as an EXAMPLE of the syntax, and CLAIM then fetched #N live and raised on the 404. PLAN's
+    # own blocker-union (`int(n) in open_numbers`) scores the same reference ZERO, so the two
+    # halves disagreed in the one direction that never self-clears: offered every tick, refused
+    # every tick. MEASURED on sparq-org/sparq#3817 (body: an inline-code `Blocked-by: #99999`) —
+    # `route-policy-failed` on 13 of 13 executed ticks over 4+ hours. The sparq ready lane's
+    # frontier is ONE row wide, so that is the lane's ENTIRE per-tick capacity spent on a phantom
+    # edge: a total occupancy loss, not a marginal one. 404-ONLY, not example-detection — a
+    # quoted marker naming a LIVE open issue is still read as an edge, and the row below pins
+    # that residual so the scope cannot be misremembered as wider than it is.
+    #
+    # FIVE ROWS, EACH KILLING A DIFFERENT MUTANT of the narrowed refusal:
+    #   (a) delete the `is ABSENT` arm / the `== "404"` arm  -> row (a) reds
+    #   (b) widen it to any failed read (drop the status test) -> row (b) reds
+    #   (c) widen it to any refusal status (401/403/422)       -> row (c) reds
+    #   (d) drop `error.http_status =` in _run_gh              -> row (d) reds
+    #   (e) SCOPE: a quoted example naming a LIVE issue still holds -> row (e) reds
+    # Row (d) is the one that makes (a)-(c) non-vacuous: without it the production path can never
+    # produce the status these rows hand the classifier, and the guard would be dead in the tree.
+    # Row (e) pins what this change deliberately does NOT do, so a later reader cannot mistake it
+    # for example-detection and so a future fix to THAT half has to update these words on purpose.
+    def _absent_gh_json(status):
+        def fake(args):
+            found = re.search(r"/issues/(\d+)$", args[-1])
+            if not found or int(found.group(1)) != 99999:
+                return {"state": "open"}          # the REAL blocker still reads open
+            error = DispatchError("GitHub api failed")
+            if status is not None:
+                error.http_status = status
+            raise error
+        return fake
+
+    _quoted = "docs: nothing stops `Blocked-by: #99999`\n\nBlocked-by: #42\n"
+    _saved_gh_json = globals()["_gh_json"]
+    try:
+        # (a) the 404 reference holds nothing; the REAL open marker on the same body still does.
+        globals()["_gh_json"] = _absent_gh_json("404")
+        assert _open_blockers("example/repo", _quoted) == [42], (
+            "a `Blocked-by:` marker naming an issue that does not exist must hold nothing — and "
+            "must not suppress a real open blocker in the same body")
+        assert _open_blockers("example/repo", "Blocked-by: #99999\n") == []
+        assert _gh_json_optional(["api", "repos/example/repo/issues/99999"]) is ABSENT
+        # (e) THE SCOPE BOUND, asserted rather than described. This narrowing is 404-ONLY: a
+        # marker quoted as an EXAMPLE whose number IS a live open issue is still an edge, and the
+        # row is still held. That residual is deliberate at this scope — PLAN's `open_numbers`
+        # holds it too, so both halves agree and the row is delayed, never stranded by a
+        # disagreement neither side can resolve. If someone teaches the marker grammar to strip
+        # quoted contexts, THIS row goes red and the docstring above must be rewritten with it.
+        assert _open_blockers(
+            "example/repo", "docs: nothing stops `Blocked-by: #53` in prose\n") == [53], (
+            "scope check: this change is 404-only, NOT example-detection — a quoted marker "
+            "naming a LIVE open issue must still hold the row")
+        # (b)/(c) every OTHER failure still fails closed — including a statusless read and every
+        # non-404 refusal status. Absence of a status is not proof of absence of the artifact.
+        for _status in (None, "401", "403", "422", "429", "500", "502", "503"):
+            globals()["_gh_json"] = _absent_gh_json(_status)
+            for _probe in (lambda: _open_blockers("example/repo", "Blocked-by: #99999\n"),
+                           lambda: _gh_json_optional(
+                               ["api", "repos/example/repo/issues/99999"])):
+                try:
+                    _probe()
+                    raise AssertionError(
+                        f"a failed blocker read with status {_status!r} must fail closed")
+                except DispatchError:
+                    pass
+    finally:
+        globals()["_gh_json"] = _saved_gh_json
+    # (d) the PRODUCTION path really puts the status on the error — otherwise (a)-(c) test a
+    # classifier no live read can ever reach. `_run_gh(retry_transient=True)` goes through
+    # gh_retry, whose GhResult carries `gh_http_status`; assert BOTH directions.
+    _saved_retry = _gh_retry.run_gh
+    try:
+        for _wire, _want in (("404", "404"), ("502", "502"), (None, None)):
+            _gh_retry.run_gh = (lambda _w: lambda _args: _gh_retry.GhResult(
+                _args, 1, "", "boom", status=_w))(_wire)
+            try:
+                _run_gh(["api", "repos/example/repo/issues/99999"], retry_transient=True)
+                raise AssertionError("a failed gh read must raise")
+            except DispatchError as exc:
+                assert getattr(exc, "http_status", "MISSING") == _want, (
+                    f"_run_gh must carry gh_http_status {_want!r} onto the DispatchError; "
+                    f"got {getattr(exc, 'http_status', 'MISSING')!r}")
+        # ...and the classifier consumes THAT error, end to end, with no stubbed _gh_json.
+        _gh_retry.run_gh = lambda _args: _gh_retry.GhResult(_args, 1, "", "boom", status="404")
+        assert _gh_json_optional(["api", "repos/example/repo/issues/99999"]) is ABSENT
+        assert _open_blockers("example/repo", "Blocked-by: #99999\n") == []
+        _gh_retry.run_gh = lambda _args: _gh_retry.GhResult(_args, 1, "", "boom", status="502")
+        try:
+            _open_blockers("example/repo", "Blocked-by: #99999\n")
+            raise AssertionError("a 502 blocker read must still fail closed end to end")
+        except DispatchError:
+            pass
+    finally:
+        _gh_retry.run_gh = _saved_retry
     # ------------------------------------------------------------------------------------------
     # [sparq #4329] NATIVE dependency edges at the AUTHORITATIVE gate. CLAIM re-derived blockers
     # from the BODY alone, so a dependency added through GitHub's native UI passed the very check
