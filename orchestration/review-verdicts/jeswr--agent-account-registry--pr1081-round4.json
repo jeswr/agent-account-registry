@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1081,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f352a7046417df18bf7cdef79de600f35868f2e9",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The workflow creates `BINDING_REF` and only then runs `gh secret set`. If that store fails before writing, the binding remains. Reconciliation initially observes binding+404, but a later out-of-band write to the same environment secret changes the durable state to binding+exists; the next retry then emits `resume=true` and `stage=register`, creating an account around a credential this enrollment never captured. The two absence probes merely prove the secret was absent before the binding; they do not attribute a later secret write to this invocation. The added tests explicitly bless bound+exists and bound+404 separately but still omit the provenance-breaking sequence `binding created -> store fails -> 404 -> out-of-band secret appears -> retry`, so they cannot detect this defect.",
+    "file": ".github/workflows/set-up-account.yml",
+    "fix_hint": "Introduce durable protocol state that distinguishes capture intent from capture completion, and permit `stage=register` only when completion is attributable to this enrollment. Add an executable transition test for `binding created -> store fails -> secret absent -> out-of-band secret created -> retry` and require refusal. If GitHub's secret API cannot provide an atomic or identity-bound completion proof around `gh secret set`, treat the ambiguous pre-store-binding state as manual-recovery-only rather than inferring completion from secret existence.",
+    "severity": "major",
+    "title": "The pre-store binding still cannot prove that this enrollment stored the credential"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 adds substantial fail-closed parsing, binding enumeration, authorization binding, and mutation coverage, but it does not resolve round 3's credential-provenance defect. The durable binding is still created before `gh secret set`, and reconciliation still treats the later existence of the named secret as proof that this enrollment completed the store. If the store fails after the binding is created, then an out-of-band writer later creates that secret, the retry follows the new `stage=register` path and adopts the unrelated credential. Moving both absence probes before the binding only excludes writes visible before binding creation; it cannot distinguish a successful store from a failed store followed by a later write. The new executable rows continue to test bound+404 and bound+exists as isolated states, not the required failed-store/later-write transition. The same major finding therefore remains, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
