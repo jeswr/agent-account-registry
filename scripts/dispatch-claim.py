@@ -5587,8 +5587,43 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
                 # applies the sound filter (written by the actor that applied THIS park), because
                 # reconcile-park-misescalation.py is hand-run under a maintainer token and its
                 # markers are authored by that maintainer, not by the App.
-                attestations=_park_policy.reconcile_attestations(comments))
-            if action == "auto-mint":
+                attestations=_park_policy.reconcile_attestations(comments),
+                # [registry #1310] THE RECEIPT-LESS VOID EXIT's inputs, all four from the SAME
+                # comments page already read. `void_offered=True` marks THIS call as the minting
+                # one: the read-only CLAIM proof gate below omits it and can therefore only
+                # CONVERGE an already-receipted void, never grant one.
+                #
+                # Every one of these has a default that reproduces the pre-#1310 behaviour exactly,
+                # which makes a forgotten argument SILENT rather than loud — so the wiring is
+                # AST-asserted in this file's own self-test. Three fixes on this repo were correct,
+                # tested and structurally unable to execute; one measured +17 locally and +0 in
+                # production because a caller let a parameter take its default.
+                self_id_rows=_park_policy.self_identified_machine_comments(comments),
+                void_receipts=_park_policy.receiptless_void_records(comments, bot_login, log=log),
+                void_marker_count=_park_policy.receiptless_void_marker_count(comments, bot_login),
+                void_offered=True)
+            if action == "void-mint":
+                # RECEIPT FIRST, then the labels — the ordering every park writer here uses, and it
+                # matters more for a ONE-SHOT exit than for a capped one: dying after the receipt is
+                # converged by the "void-receipt" branch on a later tick, whereas dying after the
+                # label would spend the only void this PR will ever get and leave no public record
+                # of why the park was cleared.
+                # The one clock read on this path. `capacity_park_admission` is deliberately
+                # clock-free — every other instant it reasons about is read from GitHub — so the
+                # GRANT instant is stamped here, in the same UTC idiom the rest of this file uses.
+                post_comment(repo, number, _park_policy.receiptless_void_comment(
+                    evidence, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    pr_number=number))
+                clear_labels(number, issue_number)
+                readmitted += 1
+                log(f"void-receiptless {repo}#{number}: a receipt-less machine park was voided for "
+                    f"want of a receipt — {detail}")
+            elif action == "void-receipt":
+                clear_labels(number, issue_number)
+                readmitted += 1
+                log(f"void-receiptless {repo}#{number}: converging an already-receipted "
+                    f"receipt-less void — {detail}")
+            elif action == "auto-mint":
                 # RECEIPT FIRST, then the labels (see the docstring).
                 post_comment(repo, number, worker_pr.auto_readmission_receipt(
                     evidence["key"], evidence["at"]))
@@ -6514,7 +6549,19 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                         # comments this gate already read — the read-only proof gate and the
                         # minting sweep must never disagree about whether a park is admissible.
                         reason_records=_park_policy.park_reason_records(comments, bot_login),
-                        attestations=_park_policy.reconcile_attestations(comments))
+                        attestations=_park_policy.reconcile_attestations(comments),
+                        # [registry #1310] `void_offered` is deliberately NOT passed: this gate is
+                        # READ-ONLY and must never mint a void. What it DOES need is the
+                        # convergence — a void the sweep has already receipted must be visible
+                        # here, or the machine's own re-admission would be invisible to the gate
+                        # that reads it and the PR would defer forever. That is the #614 deadlock,
+                        # and the `auto_receipts` argument beside this one exists for exactly the
+                        # same reason on the automatic path.
+                        self_id_rows=_park_policy.self_identified_machine_comments(comments),
+                        void_receipts=_park_policy.receiptless_void_records(
+                            comments, bot_login),
+                        void_marker_count=_park_policy.receiptless_void_marker_count(
+                            comments, bot_login))
                 if not park_action:
                     print(f"defer review {repo}#{number}: machine capacity park stands "
                           f"(durable receipts/label; {park_detail})")
@@ -20866,6 +20913,47 @@ def _starvation_sweep_self_test():
         f"{len(_census_emitters)}"
     print("  ok   [G5] the sweep is WIRED to the census (AST-asserted: census= keyword + one "
           "emitter, immune to a comment that merely names it)")
+
+    # [registry #1310] THE RECEIPT-LESS VOID WIRING, on the PARSED TREE for the same measured reason
+    # as the census above. Every one of these four arguments has a default that reproduces the
+    # pre-#1310 behaviour EXACTLY, which is the right fail direction but makes a forgotten argument
+    # SILENT: the sweep would keep passing its self-test, keep logging "park stands", and clear
+    # nothing. That is precisely the shape of a fix measured at +17 locally and +0 in production.
+    _void_kwargs = {"self_id_rows", "void_receipts", "void_marker_count", "void_offered"}
+    _void_wired = [
+        call for call in _ast.walk(_sweep_tree)
+        if isinstance(call, _ast.Call) and isinstance(call.func, _ast.Attribute)
+        and call.func.attr == "capacity_park_admission"
+        and _void_kwargs <= {kw.arg for kw in call.keywords}]
+    assert len(_void_wired) == 1, \
+        f"_readmit_capacity_parks must pass all of {sorted(_void_kwargs)} to " \
+        f"capacity_park_admission exactly once; found {len(_void_wired)}"
+    # ...and `void_offered` must be the LITERAL True. Passing the keyword with a falsy value would
+    # satisfy the check above while leaving the minting sweep unable to mint — a wiring assertion
+    # that proves only the spelling is the vacuous kind this repo has shipped before.
+    _void_offered = [kw for kw in _void_wired[0].keywords if kw.arg == "void_offered"]
+    assert (len(_void_offered) == 1
+            and isinstance(_void_offered[0].value, _ast.Constant)
+            and _void_offered[0].value.value is True), \
+        "the sweep must pass void_offered=True as a literal — it is the ONLY call site permitted " \
+        "to mint a void, and a falsy value would make the exit inert while looking wired"
+    # The MINT must be RECEIPT-FIRST. Asserted on the tree rather than on a comment: within the
+    # `action == "void-mint"` branch the post_comment call must precede the clear_labels call. For a
+    # ONE-SHOT exit the reverse order spends the PR's only void and leaves no public record of why
+    # the park was cleared.
+    _void_branch = [
+        node for node in _ast.walk(_sweep_tree)
+        if isinstance(node, _ast.If) and any(
+            isinstance(sub, _ast.Constant) and sub.value == "void-mint"
+            for sub in _ast.walk(node.test))]
+    assert len(_void_branch) == 1, f"expected exactly one void-mint branch, found {len(_void_branch)}"
+    _void_calls = [node.func.id for node in _ast.walk(_void_branch[0])
+                   if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name)
+                   and node.func.id in {"post_comment", "clear_labels"}]
+    assert _void_calls[:2] == ["post_comment", "clear_labels"], \
+        f"the void mint must be RECEIPT-FIRST (post_comment before clear_labels); got {_void_calls}"
+    print("  ok   [#1310] the receipt-less VOID is WIRED (AST-asserted: all four keywords, "
+          "void_offered=True as a LITERAL, and the mint is receipt-first)")
 
     # RECEIPT-FIRST: a crash between the two leaves an explained PR with no label, never a
     # mysterious label with no explanation.
