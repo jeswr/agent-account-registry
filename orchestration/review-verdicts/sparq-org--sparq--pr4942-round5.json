@@ -1,0 +1,44 @@
+{
+ "host_envelope": {
+  "pr": 4942,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bbbc8a29c0445eccaa5f37f1a0b2a905a9e4a47c",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The reject at file-decompress.ts:85-100 is unconditional and sits in maybeDecompressBytes, shared by maybeDecompressFile (web FILE tab) and fetchRdfDocument (URL tab). The URL tab is rendered on both personas (import-drawer.tsx:496 has no `native` guard, unlike the FILE tab at 470/479) and onImportUrl (line 355) calls fetchRdfDocument unconditionally.\n\nConsequence inside the Tauri desktop app: importing https://host/data.nt.bz2 fails with 'Bzip2 archives are supported only by the desktop app.' The message is self-contradictory in the context it renders.\n\nIt is also a capability regression, not just wording. On main this path reached decompressDatasetBytes, whose bzip2 branch (packages/sparq-client/src/decompress.ts:327, decodeBzip2 at 144-153) decodes via a lazily-imported seek-bzip with the buffer shim installed inside the call; seek-bzip@^2.0.0 and buffer@^6.0.3 are still declared in packages/sparq-client/package.json:45-47 and gui/app/package.json:22-33. The desktop FILE tab is unaffected (native loader), so the loss is confined to desktop URL imports, but it is real.\n\nIf the actual motivation is that in-browser bzip2 does not work, that argument applies equally to the Tauri webview and the message must say so plainly instead of pointing at the desktop app. Nothing in this diff documents such a failure.",
+    "file": "gui/app/src/lib/file-decompress.ts",
+    "fix_hint": "Make the gate persona-aware rather than global. Either (a) give maybeDecompressBytes an options arg (e.g. `{ allowBzip2 }` / `{ nativeLoaderAvailable }`) that import-drawer threads from the same `native` flag it already uses at lines 470/479, rejecting only on web; or (b) keep the global reject but route the desktop URL fetch through the native loader for bzip2. Either way the thrown text must be true where it is shown -- e.g. 'Bzip2 archives cannot be decoded in the browser; use the desktop app.' on web, and no reject (or different wording) under Tauri. Add a file-decompress.test.ts case pinning BOTH branches: rejected with the allow-flag off, decompression attempted with it on.",
+    "severity": "major",
+    "title": "bzip2 hard-reject fires on the DESKTOP persona's URL tab, telling a desktop user to use the desktop app"
+   },
+   {
+    "body": "Every other surface got a bzip2 caveat (WebFilePane paragraph ~line 727, drop hint ~768, DialogPrimitive.Description 450-453, status-bar title, engine-context doc, gui/README.md). UrlPane (import-drawer.tsx:973-999) was missed: it still reads 'Fetch an RDF document, including a compressed archive, from a URL', with nothing saying bzip2 is excluded.\n\nWorse, the FormatNote just below passes `compressed={isCompressed(url)}`, and rdf-format.ts:28 COMPRESSION_EXTS still contains 'bz2'. Typing a .bz2 URL therefore renders an affirmative 'compressed' affordance and the import then hard-fails -- the same silently-misleading pattern the FILE tab was cleaned up to remove.",
+    "file": "gui/app/src/components/workbench/import-drawer.tsx",
+    "fix_hint": "Bring the UrlPane paragraph in line with the WebFilePane wording (gzip/zip/zstd decoded in-tab; bzip2 and HDT desktop-only), and stop presenting .bz2/.tbz URLs as supported-compressed on the web persona -- either drop them from the isCompressed()-driven hint on web, or have FormatNote render an explicit 'bzip2 requires the desktop app' warning instead of the neutral compressed badge.",
+    "severity": "minor",
+    "title": "URL-tab copy and the compressed hint were not narrowed alongside the file-tab copy"
+   },
+   {
+    "body": "The test is titled '.zst upload is decoded before RDF format detection' but cannot discriminate the format-detection half. guessFormat() calls stripCompression(), whose COMPRESSION_EXTS (gui/app/src/lib/rdf-format.ts:28) already contains 'zst', so guessFormat('browser-upload.nt.zst') and guessFormat('browser-upload.nt') both return 'ntriples'. Reverting import-drawer.tsx:271 to guessFormat(file.name) leaves this test green. The payload is N-Triples, a valid Turtle subset, so even a wrong 'turtle' guess would parse and the SELECT would still match.\n\nThe test is non-vacuous for the zstd DECODE (undecompressed frame bytes would decode to mojibake and the ok banner would never appear), so this is not a blocker. But the round-2-fix storedZip unit test pins effectiveName only at the SHIM level (file-decompress.test.ts:172-173); nothing exercises the drawer plumbing at import-drawer.tsx:271 and :608, so no test goes red if that plumbing regresses.",
+    "file": "gui/e2e-playwright/specs/browser-upload.web.spec.ts",
+    "fix_hint": "Use a member whose format is unreachable from the outer name and not Turtle-compatible: a STORED zip named bundle.zip whose single member is payload.nq holding a quad in a named graph (reuse the storedZip helper shape from file-decompress.test.ts). guessFormat('bundle.zip') is 'turtle' (zip is not in COMPRESSION_EXTS), Turtle rejects the 4th term, and asserting the quad lands with its graph preserved goes red the moment line 271 regresses. Rename the existing test to what it actually pins -- e.g. '.zst upload is decompressed before parsing'.",
+    "severity": "minor",
+    "title": "The new e2e cannot fail on the effectiveName wiring it is named after"
+   },
+   {
+    "body": "The comment above WEB_RDF_ACCEPT now asserts 'Tar containers (.tgz/.tbz) are unsupported because decompression yields TAR rather than RDF'. Only .tbz is actually enforced (it is in the new bzip2 suffix list at file-decompress.ts:93). .tgz was merely dropped from WEB_RDF_ACCEPT, which is only a picker filter: handleDrop (import-drawer.tsx:684-714) hands every dropped File straight to readFilesWithDecompress with no accept check, and a user can select 'All files' in the dialog. Such a .tgz still matches CODEC_EXTENSIONS.gzip in @sparq/client, gunzips to TAR bytes, and reaches the RDF parser as binary garbage with a confusing parse error -- while .tbz at least gets an explicit (if wrongly-worded) message. Pre-existing behaviour, but the new comment now overstates it.",
+    "file": "gui/app/src/components/workbench/import-drawer.tsx",
+    "fix_hint": "Either reject .tgz/.tar.gz explicitly next to the bzip2 check in maybeDecompressBytes with an honest message ('tar archives are not supported -- upload the RDF file directly'), or soften the comment to say .tgz is merely excluded from the picker filter rather than unsupported.",
+    "severity": "nit",
+    "title": "The new .tgz comment claims tar containers are unsupported, but nothing rejects them"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 reviews the SAME head round 4 did (HEAD=bbbc8a29 'address review round 2'; the only two gui/ commits on the branch are 4d1c0aff, which added the feature + .zst e2e, and bbbc8a29, which added the bzip2 reject + bzip2/zip unit tests). No commit landed after round 4, so all four round-4 findings reproduce verbatim at the same severities => stagnant.\n\nI re-verified the blocking one independently rather than inheriting it. The reject lives in the SHARED maybeDecompressBytes (file-decompress.ts:85-100), which both maybeDecompressFile and fetchRdfDocument call. The URL tab is persona-independent: import-drawer.tsx:496 renders `{tab === \"url\" && <UrlPane .../>}` with no `native` guard (only the FILE tab branches, lines 470/479), and onImportUrl (line 355) calls fetchRdfDocument(target) unconditionally. So inside the Tauri desktop shell, importing https://host/data.nt.bz2 now throws 'Bzip2 archives are supported only by the desktop app.' That message is false where it is displayed, and it is a real capability loss: packages/sparq-client/src/decompress.ts still implements the bzip2 codec end-to-end (CODEC_EXTENSIONS.bzip2 line 33, decodeBzip2 lines 144-153 lazily importing seek-bzip plus the buffer shim), and seek-bzip/buffer remain declared deps in BOTH packages/sparq-client/package.json and gui/app/package.json. Nothing in the diff shows the browser bzip2 path is broken; it is simply switched off for every persona with a desktop-only excuse.\n\nI also confirmed the good parts hold: the raw zstd e2e fixture is spec-valid (descriptor 0x20 => single-segment, 1-byte FCS, raw last block (len<<3)|1) and non-vacuous for the DECODE half, and the storedZip unit test is a genuine effectiveName pin at the shim level.",
+  "verdict": "request_changes"
+ }
+}
