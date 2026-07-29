@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4876,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1545442e810a0009a1ea1283c2230a622f1a0da0",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 3 still says there are 16 marker sites, 10 corrected, and 6 untouched. At the PR head, `rg -n 'M2-next:' crates/sparq-lws-core/src` finds 8 literal occurrences: notifications/ws.rs (3), notifications/mod.rs (1), store/reconcile.rs (1), lib.rs (1), store/blob.rs (1), and ldp/content.rs (1). In particular, the claimed untouched inventory says `store/blob.rs` \u00d73 and `store/sparq.rs`, but the former has one literal occurrence and the latter has none. The table also labels notifications as \u00d73 although four literal marker occurrences remain there. Thus the claimed exhaustive sweep is still neither arithmetically nor factually reproducible.",
+    "file": "research/lws-branch-port-triage.md",
+    "fix_hint": "Re-run and document the inventory against both the base and PR head. Define explicitly whether a site is a literal marker occurrence, a changed diff hunk, or a conceptual deferred item; do not mix those units. Update the 16/10/6 totals, the stale/corrected breakdown, the notifications count, and the untouched-site list so every count is reproducible from the stated method. If conceptual items are useful, list them separately from literal marker occurrences.",
+    "severity": "major",
+    "title": "M2-next sweep inventory still does not match the PR head"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is stagnant. The sole major finding from round 3 remains materially unchanged: the triage record still claims an exhaustive inventory of 16 `M2-next:` marker sites, with 10 corrected and 6 untouched, but the PR-head crate contains only 8 literal occurrences. The stated remaining-site breakdown is also inconsistent with the tree: `store/blob.rs` has one literal occurrence rather than three, and `store/sparq.rs` has none. Because section 3 explicitly presents these numbers as the verified basis for the sweep and deferred-item accounting, this remains a correctness/completeness defect in the load-bearing triage evidence.",
+  "verdict": "request_changes"
+ }
+}
