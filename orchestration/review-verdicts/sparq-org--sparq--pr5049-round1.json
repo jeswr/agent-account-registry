@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5049,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "70acae738eb37679848592c586aaab470888a731",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The changed measurement language says the EC2 wall reading is \"the decision input\" while retaining the \"Canonical measurement\" heading. SPARQ's performance-evidence rules state that work-box/EC2 timings are non-canonical and must not be presented as canonical evidence. Host wall time is noisy and cannot by itself justify adoption, even when parse_ns_per_byte is correctly classified as advisory. The same conceptual conflict also remains in the other edited \"Canonical measurement\" entries that lead with EC2 ingest wall deltas.",
+    "file": "research/engine-performance-review.md",
+    "fix_hint": "Describe EC2 wall time as advisory/non-canonical supporting evidence and identify the deterministic ratchets or another reproducible gated metric as the adoption decision criterion. If no reproducible timing gate exists, state that adoption requires corroborated repeated measurements plus deterministic correctness/size gates, without labeling EC2 timing canonical.",
+    "severity": "major",
+    "title": "EC2 wall time is incorrectly promoted to canonical decision evidence"
+   }
+  ],
+  "progress": null,
+  "summary": "The edits correctly clarify that parse_ns_per_byte is advisory, but they replace it with EC2 wall time as the decision input under a \"Canonical measurement\" heading. Repository policy explicitly treats EC2/work-box timings as non-canonical, so the performance adoption criterion remains unsound and contradicts the governing review contract.",
+  "verdict": "request_changes"
+ }
+}
