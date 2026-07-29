@@ -217,9 +217,17 @@ def _append_step_summary(line, env=None):
 
 # ---- THE YAML SEAM -----------------------------------------------------------------------------
 # Every uncaught mutant this repo has measured sat at a workflow `if:`, a step, or a call site.
-# These two assertions are pinned EXACTLY (tokenised argv, exact adjacency, exact env expressions),
-# because a report that is wired to the wrong field, made conditional, or fed by a checkout that
-# cannot resolve its operands is a report that says nothing while looking present.
+# These two assertions are pinned EXACTLY (whole `run:` body, tokenised argv, exact env
+# expressions), because a report that is wired to the wrong field, made conditional, or fed by a
+# checkout that cannot resolve its operands is a report that says nothing while looking present.
+#
+# ⚠️ THE BODY IS PINNED WHOLE, NOT SEARCHED. A `run:` body is a shell script, so "the invocation is
+# in there somewhere, spelled right" is not the same claim as "the invocation runs". `true ||
+# python3 scripts/gate-staleness.py ...` contains the exact argv, in the exact order, preceded by
+# the exact interpreter — and never executes the reporter. Nothing downstream would notice, because
+# this command always exits 0 BY DESIGN (see "THE FAIL DIRECTION"), so its absence is silent by
+# construction. That is the whole reason the seam, not the exit code, is this report's guard against
+# vacuity: the guard has to refuse a body that merely CONTAINS the command.
 def _assert_unconditional(scope, mapping):
     if "if" in mapping:
         raise AssertionError(f"{scope} carries an `if:` — this report must run on every gate run")
@@ -246,17 +254,27 @@ def assert_report_seam(job):
     if "${{" in run:
         raise AssertionError("the step interpolates `${{ }}` into its `run:` body — event fields "
                              "must reach it through `env:`")
-    if "set -euo pipefail" not in [line.strip() for line in run.splitlines()]:
-        raise AssertionError("the step's `run:` body does not `set -euo pipefail`")
-    tokens = shlex.split(run)
-    if INVOCATION not in tokens:
-        raise AssertionError(f"{INVOCATION} is not invoked as its own argv token")
-    index = tokens.index(INVOCATION)
-    if index == 0 or tokens[index - 1] != "python3":
-        raise AssertionError(f"{INVOCATION} is not invoked as `python3 {INVOCATION}`")
-    want = ["--head-sha", f"${HEAD_SHA_ENV}", "--base-ref", f"${BASE_REF_ENV}"]
-    if tokens[index + 1:] != want:
-        raise AssertionError(f"the argv after {INVOCATION} is {tokens[index + 1:]}, want {want}")
+    # The body must BE the two documented commands — not merely contain them somewhere. See the
+    # section comment above: a shell prefix costs one token and silently deletes the report.
+    lines = [line.strip() for line in run.splitlines() if line.strip()]
+    if len(lines) != 2:
+        raise AssertionError(
+            f"the step's `run:` body has {len(lines)} non-blank line(s), want exactly 2 — "
+            f"`set -euo pipefail` then the {INVOCATION} invocation, and nothing else")
+    if lines[0] != "set -euo pipefail":
+        raise AssertionError(f"the step's `run:` body opens with {lines[0]!r}, want the exact line "
+                             "`set -euo pipefail`")
+    try:
+        tokens = shlex.split(lines[1])
+    except ValueError as exc:
+        raise AssertionError(f"the step's invocation line does not tokenise as shell words ({exc})")
+    want = ["python3", INVOCATION, "--head-sha", f"${HEAD_SHA_ENV}", "--base-ref",
+            f"${BASE_REF_ENV}"]
+    if tokens != want:
+        raise AssertionError(
+            f"the step's invocation line tokenises to {tokens}, want exactly {want} — the whole "
+            f"line must BE the invocation, because a `true ||` prefix, a `|| true` suffix or a "
+            f"leading `#` leaves every token in place while the report never runs")
     env = step.get("env")
     if not isinstance(env, dict):
         raise AssertionError("the step declares no `env:` block")
@@ -576,6 +594,33 @@ def _self_test():
     for name, mutation in report_mutants():
         chk(f"the seam check REFUSES when {name}",
             bool(_refused(assert_report_seam, mutate(mutation))), True)
+
+    # ---- SHELL-LEVEL INERTNESS is a SEPARATE experiment from the YAML `if: false` above, and the
+    # one this seam exists for. Each mutant below leaves the step present, unconditional, without
+    # `continue-on-error`, spelling the exact interpreter and the exact argv in the exact order —
+    # and exits 0 with the reporter never run. None of them crashes, so nothing else in the gate
+    # could notice. Each row asserts WHICH assertion refused it, so a refusal for an unrelated
+    # reason cannot be banked as a kill (AGENTS.md pre-flight item 4, "false kill").
+    LINE_COUNT = "non-blank line"      # the body is not the two documented commands
+    INVOCATION_LINE = "invocation line"  # the line is not exactly the invocation
+
+    def _sub(job, old, new):
+        job["steps"][1].update({"run": job["steps"][1]["run"].replace(old, new)})
+
+    def inert_mutants():
+        yield ("the invocation is short-circuited by a `true ||` prefix", INVOCATION_LINE,
+               lambda j: _sub(j, "python3 ", "true || python3 "))
+        yield ("the invocation's failure is swallowed by a `|| true` suffix", INVOCATION_LINE,
+               lambda j: j["steps"][1].update(
+                   {"run": j["steps"][1]["run"].rstrip("\n") + " || true\n"}))
+        yield ("the invocation is commented out", INVOCATION_LINE,
+               lambda j: _sub(j, "python3 ", "# python3 "))
+        yield ("the body exits before reaching the invocation", LINE_COUNT,
+               lambda j: _sub(j, "set -euo pipefail\n", "set -euo pipefail\nexit 0\n"))
+
+    for name, fragment, mutation in inert_mutants():
+        chk(f"the seam check REFUSES when {name}, naming the {fragment!r} requirement",
+            fragment in _refused(assert_report_seam, mutate(mutation)), True)
 
     def checkout_mutants():
         yield "the checkout step is dropped", lambda j: j["steps"].pop(0)
