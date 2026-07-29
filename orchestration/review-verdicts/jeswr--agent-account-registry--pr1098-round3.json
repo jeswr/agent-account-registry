@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1098,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ed4c88068cfe3250746a682be318a365d3288ebd",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 remains sound. The refusal receipt is bot-authored, run-key-idempotent, windowed by the same proven-human readmission cutoff as attempts, and kept distinct from model-attempt cost, health, void, and approval-staleness surfaces. Both worker-side and claim-side allocation gates consume the shared dispatch-cycle budget. The workflow exports the post-charge refusal exhaustion result with the pre-charge budget result as a skipped-step fallback, so a terminal refusal reaches the existing parked state without breaking ordinary exhausted runs. The added checks exercise the recorder, counter separation, readmission, workflow bindings, and final-state shell path, and include targeted non-crashing mutations for the new YAML seam. I found no remaining correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
