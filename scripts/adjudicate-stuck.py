@@ -423,6 +423,47 @@ def _now():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _maintainer_probe(repo):
+    """(is_human, unverifiable) — the strict collaborator-PERMISSION probe this sweep reads hold
+    OWNERSHIP through, plus the list that makes an unreadable lookup fail CLOSED.
+
+    REVIEW FINDING (round 2). Ownership used to be asked as `login == --maintainer`, i.e. login
+    EQUALITY against one configured handle. `label_application_machine_owned` defines every
+    non-App actor that fails the probe as machine-owned, so that spelling made a direct
+    `review:needs-user` (or source `needs:user`) by EVERY human maintainer or collaborator except
+    that single login machine-owned — and this sweep would clear their hold, contradicting the
+    receipt's own promise that re-applying the label is sticky. Ownership is a PERMISSION
+    question, so it is answered by the same shared strict probe every other park consumer uses:
+    `park_policy.probe_maintainer` over `HUMAN_MAINTAINER_PERMISSIONS`, exactly as
+    `dispatch-claim._target_is_human_maintainer` and `curate-frontier._is_human_maintainer` do.
+
+    THE FAIL DIRECTION IS INVERTED HERE, so it is handled here. probe_maintainer answers an
+    unverifiable actor with "not human", which is the safe direction for a park VETO (no veto)
+    and the UNSAFE one for this consumer, where "not human" is precisely what authorises deleting
+    the hold. So every permission read that does not produce a payload — transport blip, expired
+    or wrong-owner mint, a not-a-collaborator 404, a malformed body — is RECORDED in
+    `unverifiable`, and `_sweep_one` turns any recorded entry into human-owned/NOT clearable. The
+    label writes require a PROOF that a machine applied the hold, never the absence of one."""
+    unverifiable = []
+
+    def read_permission(login):
+        try:
+            payload = _gh_json(["api", f"repos/{repo}/collaborators/"
+                                + urllib.parse.quote(str(login), safe="") + "/permission"])
+        except Exception as exc:  # noqa: BLE001 — recorded, re-raised to the shared classifier
+            unverifiable.append(f"{login} ({str(exc)[:80]})")
+            raise
+        if not isinstance(payload, dict):
+            unverifiable.append(f"{login} (malformed collaborator permission payload)")
+            raise RuntimeError(f"malformed collaborator permission payload for {login}")
+        return payload.get("permission")
+
+    def is_human(login):
+        return park_policy.probe_maintainer(repo, login, read_permission)
+
+    return is_human, unverifiable
+
+
 def _sweep_one(args, worker_pr, row, applied):
     """Adjudicate ONE parked PR. Returns (disposition, cause, detail); writes only under
     --apply, and only after the audit comment that authorises the writes."""
@@ -435,14 +476,20 @@ def _sweep_one(args, worker_pr, row, applied):
                   == args.bot_login.casefold()]
     # FAIL CLOSED on the hold-ownership probe: anything unreadable counts as "a human applied
     # it", so an unreadable timeline never authorises a re-admission.
+    is_human, unverifiable = _maintainer_probe(args.repo)
     try:
         applied_by_human = not park_policy.label_application_machine_owned(
             args.repo, number, park_policy.HUMAN_PR_PARK_LABEL,
-            lambda _repo, _num: timeline,
-            is_human=lambda login: login.casefold() == args.maintainer.casefold(),
-            log=lambda *_a, **_k: None)
+            lambda _repo, _num: timeline, is_human=is_human, log=lambda *_a, **_k: None)
     except Exception as exc:  # noqa: BLE001
         return (None, None, f"hold-ownership probe failed ({exc})")
+    # ...and fail closed on the PERMISSION half of that probe too: probe_maintainer answers an
+    # unreadable lookup with "not human", which here would read as "a machine applied it".
+    if unverifiable:
+        return (None, None,
+                "hold ownership is UNPROVABLE — no collaborator permission could be read for "
+                f"{'; '.join(unverifiable)[:200]}, and an unverifiable actor never authorises "
+                "clearing a human terminal")
 
     pull = _gh_json(["api", f"repos/{args.repo}/pulls/{number}"])
     head = (pull or {}).get("head") or {}
@@ -460,14 +507,20 @@ def _sweep_one(args, worker_pr, row, applied):
     # visible stall for a silent one. Unreadable => human-owned => the whole move is refused.
     issue_hold_machine_owned = False
     if issue_number and park_policy.HUMAN_PARK_LABEL in set(issue_labels):
+        issue_is_human, issue_unverifiable = _maintainer_probe(args.repo)
         try:
             issue_hold_machine_owned = park_policy.label_application_machine_owned(
                 args.repo, issue_number, park_policy.HUMAN_PARK_LABEL,
                 lambda _repo, _num: _paginated(args.repo, issue_number, "timeline"),
-                is_human=lambda login: login.casefold() == args.maintainer.casefold(),
-                log=print)
+                is_human=issue_is_human, log=print)
         except Exception as exc:  # noqa: BLE001
             return (None, None, f"source-issue hold-ownership probe failed ({exc})")
+        # A permission lookup this sweep could not read proves nothing about who applied the
+        # issue hold, and adjudicate() refuses a live `needs:user` it cannot prove machine-owned.
+        if issue_unverifiable:
+            print(f"  #{number}: source-issue hold ownership unprovable — no collaborator "
+                  f"permission for {'; '.join(issue_unverifiable)[:200]}")
+            issue_hold_machine_owned = False
 
     def quiet(*_args, **_kwargs):
         """Marker readers log per malformed record; this sweep prints its own per-PR line."""
@@ -527,7 +580,9 @@ def main(argv=None):
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--repo")
     parser.add_argument("--bot-login")
-    parser.add_argument("--maintainer", default=os.environ.get("MAINTAINER_HANDLE", "jeswr"))
+    # NO `--maintainer`: who counts as human is NOT configuration. It is the target repo's
+    # collaborator permission, read per actor (`_maintainer_probe`) — a single configured handle
+    # made every OTHER maintainer's hold machine-owned and therefore clearable.
     parser.add_argument("--apply", action="store_true",
                         help="write. Without it the run is a DRY RUN and mutates nothing.")
     parser.add_argument("--limit", type=int, default=0,
@@ -851,7 +906,7 @@ def _self_test():
     # LITERAL, not park_policy.HUMAN_PR_PARK_LABEL: a repoint of the terminal must surface here as
     # a red row rather than follow the fixture silently (AGENTS.md pre-flight §2c).
     terminal = "review:needs-user"
-    argv = ["--repo", "o/r", "--bot-login", bot, "--maintainer", "human-owner"]
+    argv = ["--repo", "o/r", "--bot-login", bot]
 
     quiet = _run_main(argv, {"issues?state=open": [[]]})
     check("an EMPTY population is a REAL quiet tick: exit 0, with the all-zero census still "
@@ -948,6 +1003,138 @@ def _self_test():
           {"12/comments": (True, True, True, False, True, ["12"]),
            "DELETE": (True, True, True, False, True, ["12"]),
            "13/comments": (True, True, True, True, False, ["13"])})
+
+    # ---- WHO OWNS THE HOLD IS A PERMISSION QUESTION (round-2 review finding). ----------------
+    # The probe used to be `login == --maintainer`, and label_application_machine_owned calls
+    # every non-App actor that FAILS the probe machine-owned — so a hold applied directly by any
+    # human maintainer other than that ONE configured login authorised this sweep to delete it.
+    # These rows vary NOTHING but the actor (and the permission the target repo reports for it)
+    # across one otherwise re-admissible capacity park, so the disposition can come from nothing
+    # else. Permission strings are LITERALS, never derived from HUMAN_MAINTAINER_PERMISSIONS
+    # (AGENTS.md pre-flight §2c), and the unreadable cases pin the FAIL-CLOSED direction.
+    def probe_answer(payload):
+        """(answer, unverifiable rows, endpoints read) for one actor, with `gh api` answering
+        `payload` — an Exception INSTANCE is raised in its place."""
+        calls = []
+
+        def fake_gh_json(call):
+            calls.append(next((arg for arg in call if arg.startswith("repos/")), ""))
+            if isinstance(payload, Exception):
+                raise payload
+            return payload
+
+        saved = globals()["_gh_json"]
+        try:
+            globals()["_gh_json"] = fake_gh_json
+            is_human, unverifiable = _maintainer_probe("o/r")
+            with contextlib.redirect_stdout(io.StringIO()):
+                answer = is_human("second-maintainer")
+        finally:
+            globals()["_gh_json"] = saved
+        return answer, len(unverifiable), calls
+
+    graded = {permission: probe_answer({"permission": permission})
+              for permission in ("admin", "maintain", "write", "triage", "read", "none")}
+    check("EVERY collaborator holding a write-class permission is human — not one hard-coded "
+          "login — and a below-write permission is not",
+          {permission: run[0] for permission, run in graded.items()},
+          {"admin": True, "maintain": True, "write": True,
+           "triage": False, "read": False, "none": False})
+    check("...read per ACTOR from the TARGET repo's own collaborator-permission endpoint",
+          graded["admin"][2], ["repos/o/r/collaborators/second-maintainer/permission"])
+    check("...and a DEFINITIVE not-a-maintainer answer is a result, not an outage (nothing "
+          "recorded), while every unreadable one is recorded so the caller can fail CLOSED",
+          [graded["admin"][1], graded["read"][1]]
+          + [probe_answer(payload)[:2] for payload in
+             (RuntimeError("gh api failed: 502 Bad Gateway"), None, ["admin"], "admin")],
+          [0, 0] + [(False, 1)] * 4)
+
+    app_driven = {"slug": "app"}
+
+    def held(pr_actor=bot, pr_via_app=app_driven, issue_held=False,
+             pr_permission="maintain", issue_actor=bot, issue_via_app=app_driven,
+             issue_permission="maintain"):
+        """ONE capacity-parked worker draft (#12, source issue #77) that is re-admissible in
+        every respect except who applied its holds. `*_permission` of None makes that actor's
+        collaborator lookup FAIL, which is the unprovable-ownership case."""
+        def label_event(label, actor, via_app):
+            return {"event": "labeled", "label": {"name": label},
+                    "created_at": "2026-07-20T00:00:00Z", "actor": {"login": actor},
+                    "performed_via_github_app": via_app}
+
+        def permission(value):
+            return ({"permission": value} if value
+                    else RuntimeError("gh api failed: 502 Bad Gateway"))
+
+        # `source` is the LITERAL park_policy.HUMAN_PARK_LABEL, so a repoint reds these rows.
+        source = "needs:user"
+        return {"issues?state=open": [[{"number": 12, "labels": [{"name": terminal}],
+                                        "pull_request": pr_row}]],
+                "issues/12/comments": [[{"user": {"login": bot},
+                                         "body": "the round budget ran out "
+                                         + park_policy.park_reason_marker("budget")}]],
+                "issues/12/timeline": [[label_event(terminal, pr_actor, pr_via_app)]],
+                f"collaborators/{pr_actor}": permission(pr_permission),
+                f"collaborators/{issue_actor}": permission(issue_permission),
+                "pulls/12": {"head": {"sha": "d" * 40, "ref": "sparq-agent/issue-77-3"},
+                             "draft": True},
+                # BEFORE the bare issue key: the stub matches endpoint SUBSTRINGS in insertion
+                # order, and "issues/77" is a prefix of "issues/77/timeline".
+                "issues/77/timeline": [[label_event(source, issue_actor, issue_via_app)]],
+                "issues/77": {"labels": [{"name": source}] if issue_held else []}}
+
+    machine = _run_main(argv + ["--apply"], held())
+    check("CONTROL: the machine-owned path stays REACHABLE — an App-driven hold is returned to "
+          "the loop with the full re-entry transaction",
+          (machine[0], _endpoints(machine[2]), "1 returned to the loop" in machine[1]),
+          (0, [("POST", "issues/12/comments"),
+               ("DELETE", "issues/12/labels/review%3Aneeds-user"),
+               ("POST", "issues/12/labels")], True))
+    human_pr = _run_main(argv + ["--apply"], held(pr_actor="second-maintainer", pr_via_app=None))
+    check("a `review:needs-user` applied DIRECTLY by an authorized human who is NOT the one login "
+          "this sweep used to hard-code is HUMAN-owned: refused, with no comment and no label "
+          "write of any kind",
+          (human_pr[0], human_pr[2],
+           "0 returned to the loop, 0 genuinely human, 1 refused, 0 errored" in human_pr[1]),
+          (0, [], True))
+    read_only = _run_main(argv + ["--apply"], held(pr_actor="drive-by", pr_via_app=None,
+                                                   pr_permission="read"))
+    check("...and it is the permission VALUE that decided that, not merely the actor being "
+          "non-App: a read-permission actor proves no human ownership",
+          (read_only[0], _endpoints(read_only[2])[:1], "1 returned to the loop" in read_only[1]),
+          (0, [("POST", "issues/12/comments")], True))
+    blind_pr = _run_main(argv + ["--apply"], held(pr_actor="second-maintainer", pr_via_app=None,
+                                                  pr_permission=None))
+    check("...while a permission lookup that cannot be READ fails CLOSED — the hold stands, "
+          "nothing is written, and the refusal says UNPROVABLE rather than claiming a proof",
+          (blind_pr[0], blind_pr[2], "UNPROVABLE" in blind_pr[1], "1 refused" in blind_pr[1]),
+          (0, [], True, True))
+    human_issue = _run_main(argv + ["--apply"],
+                            held(issue_held=True, issue_actor="second-maintainer",
+                                 issue_via_app=None))
+    check("the SOURCE-ISSUE hold is probed the same way: a `needs:user` applied by any authorized "
+          "human holds the work, so the PR behind it is refused and NEITHER half is written",
+          (human_issue[0], human_issue[2], "1 refused" in human_issue[1]), (0, [], True))
+    machine_issue = _run_main(argv + ["--apply"], held(issue_held=True))
+    check("...CONTROL: the same issue hold applied by the App IS lifted, so the issue-half write "
+          "is reachable and only the ACTOR separates these two rows",
+          (machine_issue[0], _endpoints(machine_issue[2])),
+          (0, [("POST", "issues/12/comments"),
+               ("DELETE", "issues/12/labels/review%3Aneeds-user"),
+               ("POST", "issues/12/labels"),
+               ("DELETE", "issues/77/labels/needs%3Auser")]))
+    blind_issue = _run_main(argv + ["--apply"],
+                            held(issue_held=True, issue_actor="second-maintainer",
+                                 issue_via_app=None, issue_permission=None))
+    check("...and an unreadable permission on the ISSUE half fails closed too: the PR is never "
+          "re-admitted behind a hold this sweep could not prove a machine applied",
+          (blind_issue[0], blind_issue[2], "unprovable" in blind_issue[1]), (0, [], True))
+    with contextlib.redirect_stderr(io.StringIO()):
+        no_knob = _raises(lambda: main(["--repo", "o/r", "--bot-login", bot,
+                                        "--maintainer", "x"]), SystemExit)
+    check("and there is NO configured-human knob to re-narrow this with: a `--maintainer`-style "
+          "flag is refused by the parser rather than silently accepted",
+          no_knob, True)
 
     # ---- THE YAML SEAM. The exit status above is only a signal if the CRON reads it. -----------
     workflow = _workflow_source()

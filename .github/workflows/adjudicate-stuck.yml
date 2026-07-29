@@ -67,6 +67,13 @@ jobs:
           python3 scripts/groom.py --print-owner-repos --policy-file policy/repos.toml \
             | tee -a "$GITHUB_OUTPUT"
 
+      # Hold OWNERSHIP is read through the SAME per-owner mint: for every non-App actor that
+      # applied a hold the sweep reads `collaborators/{login}/permission` on the target repo
+      # (adjudicate-stuck._maintainer_probe — who counts as human is the target's collaborator
+      # permission, never a configured handle). That read needs only the metadata scope every
+      # installation token already carries, so no permission below is widened for it, and a
+      # lookup this token cannot answer fails CLOSED: the park stays exactly where it is.
+      #
       # continue-on-error on each mint: a missing install for one owner DEFERS that owner's
       # parked PRs to the next tick (loudly, below) — it never adjudicates them with the wrong
       # credential, and never aborts the other owner's sweep.
