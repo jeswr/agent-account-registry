@@ -109,12 +109,17 @@ declares it. The declaration, its measured basis and its fail-safe live in ONE p
 `dispatch-claim.NON_RESERVING_PARTITIONS`, and nothing else in the file knows the names.
 
 Measured over the busy-occupancy population this leg actually reads, counting holder **pairs** that
-share at least one changed file: `ci` 0/10 pairs and `docs` 0/10 (and over the wider `area:`-labelled
-open-PR population, 40/406 = 9.9% and 30/630 = 4.8%) — against **`deps` 21/21 = 100%**, every pair on
+share at least one changed file: `ci` 0/15 pairs and `docs` 0/10 (and over the wider `area:`-labelled
+open-PR population, 40/435 = 9.2% and 30/630 = 4.8%) — against **`deps` 21/21 = 100%**, every pair on
 `Cargo.lock`, and 57.1% for the crate areas. `deps` and the crate areas therefore still reserve, and
 `__global__` can never be exempted: `non_reserving_partitions()` validates the declaration through
 `package_areas` itself and voids the **whole** set — never a part of it — for anything malformed,
 degrading to today's fully-reserving behaviour.
+
+The exemption matches an **exact partition atom, never a prefix**: `ci-fragments` is a separate atom
+that never conflicts with `ci` under `packages_conflict`, so it keeps reserving. sparq#4928 does the
+opposite for a reason that does not apply here — its `keys_conflict` is longest-ancestor containment,
+where `ci-fragments` *does* conflict with `ci`.
 
 This is the occupancy half of sparq-org/sparq#4928, which does the same thing to the **other**
 occupancy leg (the target's own readiness engine, which decides what PLAN *offers*). Both are

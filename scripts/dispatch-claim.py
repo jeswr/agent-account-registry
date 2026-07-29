@@ -1694,22 +1694,29 @@ def _pull_inactivity_decision(pull, status=_NO_PR_DETAIL):
 # that are not provably-inert parked drafts), counting holder PAIRS that share >= 1 changed file:
 #
 #     reserved area   busy holders   pairs   sharing >=1 file
-#     ci                    6          10        0   (  0.0%)  -> exempt (and the MOST-held key)
+#     ci                    6          15        0   (  0.0%)  -> exempt (and the MOST-held key)
 #     docs                  5          10        0   (  0.0%)  -> exempt (second most-held)
 #     deps                  1           0        -            -> NOT exempt
 #
 # and over the wider `area:`-LABELLED open-PR population on the same snapshot, which is the
 # population #4928 measured and is the one that bounds the risk as PRs un-park:
 #
-#     area:ci      30 holders, 406 pairs,  40 colliding (  9.9%)  -> exempt
+#     area:ci      30 holders, 435 pairs,  40 colliding (  9.2%)  -> exempt
 #     area:docs    36 holders, 630 pairs,  30 colliding (  4.8%)  -> exempt
 #     area:deps     7 holders,  21 pairs,  21 colliding (100.0%)  -> NOT exempt, every pair
 #                                                                    collides on `Cargo.lock`
 #     crate areas                                       ( 57.1%)  -> NOT exempt
 #                                        (sparq research/crate-region-parallelism.md §4)
 #
+# EVERY PAIR COUNT IS nCr OVER THE HOLDERS, with no exclusions. The first version of this table
+# read `ci` 10 and 406 pairs, because the counter dropped any PR whose changed-file list came back
+# EMPTY — conflating a failed read with a genuinely empty PR. sparq#4182 is genuinely empty
+# (`changed_files: 0`), it intersects nothing, and it is a real non-colliding participant: it
+# belongs in the denominator. Restoring it gives 15 and 435, which is exactly C(6,2) and C(30,2).
+# A read that FAILS would still be excluded, and would be named.
+#
 # HONESTY NOTE ON THOSE NUMBERS: #4928's table reads 5% for `ci` and 3% for `docs`; the
-# re-measurement above reads 9.9% and 4.8% on a later board. The numbers are NOT identical and the
+# re-measurement above reads 9.2% and 4.8% on a later board. The numbers are NOT identical and the
 # larger pair is the one recorded here. The CONCLUSION is unchanged and is an order-of-magnitude
 # argument, not a threshold one: `ci`/`docs` collide at single-digit percent while `deps` collides
 # at 100% and crate areas at 57.1%.
@@ -1806,9 +1813,12 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
     signal was the inversion.
 
     IT IS A NO-OP WHERE THAT EVIDENCE DOES NOT EXIST, without a per-target flag: a target with no
-    deriver produces no PR `area:` labels (MEASURED on this repository: 40 of 40 open PRs declare
-    none, ready-issues._pr_reserving_packages), so every unprovenanced PR there still takes
-    `__global__` exactly as before. The rule reads the target's own attestation instead of a
+    deriver produces no PR `area:` labels (MEASURED on this repository 2026-07-29: 40 of 41 open
+    PRs declare none, ready-issues._pr_reserving_packages — the single exception is a HAND-applied
+    `area:` label, not a derived one, so the "no deriver here" premise is intact; the figure was
+    40 of 40 when written), so every unprovenanced PR there still takes `__global__` as before.
+    The same 40-of-40 figure is quoted in `scripts/ready-issues.py` (x2), `scripts/dispatch-plan.py`
+    and `.github/workflows/dispatch.yml` and is stale there by the same one row. The rule reads the target's own attestation instead of a
     config switch that could drift from it.
 
     WHY THIS BRANCH. It invents a reservation the PLAN leg never made. PLAN runs the TARGET's
@@ -1952,11 +1962,17 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
         # INERT, because the live re-check runs last and defers the row anyway. Both legs are
         # pinned END-TO-END and INDEPENDENTLY in the self-test.
         #
-        # AFTER every fail-closed branch above, never before: the `__global__` fallbacks decide on
-        # the UN-narrowed `areas`, so a PR that declares only `area:ci` and has no admissible
-        # provenance record still takes the `missing-provenance` branch and reserves `__global__`.
-        # Narrowing first would empty its area set and flip it into `missing-provenance-narrowed`
-        # — a WIDENING dressed as a narrowing, and the one way this change could fail open.
+        # AFTER every fail-closed branch above, never before, and the direction matters in exactly
+        # the opposite way to how an earlier draft of this comment stated it. Those branches decide
+        # on the UN-narrowed `areas`. A PR that declares only `area:ci` and has no admissible
+        # provenance record therefore takes the `elif areas and GLOBAL_PACKAGE not in areas` branch
+        # — `missing-provenance-narrowed`, its own labels bounding it — and, once narrowed here,
+        # reserves NOTHING. Narrowing FIRST would empty `areas` before that `elif` is evaluated,
+        # dropping the very same PR into the `else`: `missing-provenance`, reserving `__global__`,
+        # i.e. ONE cross-cutting PR stalling the entire fleet. That is a WIDENING dressed as a
+        # narrowing and the one way this change could fail open, which is why the ordering is
+        # pinned by an executed assertion (`[#4929] ... applied AFTER every fail-closed branch`)
+        # and by mutant M13 rather than by this paragraph.
         #
         # The occupancy ROW carries the narrowed set too, so `busy` stays exactly the union of the
         # busy rows' packages — the invariant `partition_defer_attribution` reads when it says an
@@ -17349,6 +17365,43 @@ agent = "impl"
     assert reserving_areas({"ci", "docs", "deps", "crate-b"}) == {"deps", "crate-b"}
     print("  ok   [#4929] the released key set is EXACTLY {ci, docs} — measured as the reserved "
           "set an all-four-area occupant loses")
+
+    # EXACT PARTITION ATOM, NEVER A PREFIX — and this is the one place the two repositories'
+    # declarations deliberately DIFFER, so it is pinned rather than left to be inferred.
+    #
+    # sparq#4928 exempts on `partition_path(key)[0]`, so `ci-fragments` travels with `ci`. It has
+    # to: sparq's `keys_conflict` is longest-ancestor containment, so `ci-fragments` CONFLICTS with
+    # `ci`, and exempting one without the other would leave `ci-fragments` reserving a partition
+    # `ci` itself does not. Here `packages_conflict` is flat set INTERSECTION over `,`-separated
+    # atoms — `ci-fragments` and `ci` never conflict in the first place — so no such incoherence
+    # exists and a prefix rule would buy nothing while silently exempting every FUTURE `ci-*` /
+    # `docs-*` key on the strength of a measurement taken on neither. That is the "too LARGE a
+    # set" direction `non_reserving_partitions` voids the whole declaration to avoid.
+    #
+    # `area:ci-fragments` is a LIVE sparq label (0 open PR holders and 0 open issue holders on the
+    # measured snapshot, so this is currently inert either way — which is precisely why it needs an
+    # assertion and not a comment: a prefix mutant passed 265/265 before this line existed).
+    assert reserving_areas({"ci-fragments"}) == {"ci-fragments"}
+    assert reserving_areas({"ci-fragments", "ci", "docs-site"}) == {"ci-fragments", "docs-site"}
+    assert non_reserving_partitions({"ci-fragments"}) == frozenset({"ci-fragments"})
+    # ...END-TO-END, at both legs, and PAIRED with the `ci` case on the same board so the
+    # assertion cannot be satisfied by an exemption that has simply stopped working.
+    xcut_prefix_labels = {97: ["area:ci-fragments", "role:impl"]}
+    xcut_prefix_prov = {**xcut_prov, 97: busy_record(97, 97)}
+    prefix_census = {}
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert filter_busy_area_items(
+            [xcut_row(70, "ci-fragments")], repo, [xcut_pr(97)], xcut_prefix_labels,
+            xcut_prefix_prov, leases=[], now=now, census=prefix_census) == []
+        assert revalidate_items_against_live_pulls(
+            [xcut_row(70, "ci-fragments")], repo,
+            [[dict(xcut_pr(97), auto_merge=None, draft=False)]], xcut_prefix_labels,
+            xcut_prefix_prov, leases=[], now=now) == set()
+    assert prefix_census["by_reason"]["crate-conflict"] == 1, prefix_census
+    a_kept, c_ok, _a, _c, _log = both_legs([xcut_row(70, "ci")], [xcut_pr(90)])
+    assert a_kept == [70] and c_ok == [70], (a_kept, c_ok)
+    print("  ok   [#4929] the exemption matches an EXACT partition atom, never a prefix: "
+          "`ci-fragments` STILL reserves at both legs while `ci` does not")
 
     # THE ORDERING that makes this a narrowing and not a widening, pinned. An UNPROVENANCED PR
     # whose only declared area is `ci` must reserve NOTHING. Applying the exemption BEFORE the
