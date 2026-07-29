@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4866,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "19755f0bfdb0d30b5a898be860b74f5ce356183f",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`open_validated` computes `record_len(dim, degree)` before its checked `count.checked_mul(record_len)` chain, but `record_len` itself uses unchecked `8 + dim * 4 + degree * 4`. Because `dim` and `degree` are attacker-controlled u32 header values and wasm32 is supported, values near u32::MAX can panic under overflow checks or wrap to a bogus record length before validation. The new malformed-header coverage still uses a huge count only, so it does not prove fail-clean behavior for hostile dimension or degree fields.",
+    "file": "crates/sparq-vamana/src/graph.rs",
+    "fix_hint": "Use checked multiplication and addition to construct the record length on the open path, returning a descriptive error before the value is used. Add an `open_from_bytes` regression with u32::MAX dimension and/or degree; preferably put the arithmetic in a width-independent checked helper so the 32-bit overflow case is directly testable on 64-bit CI.",
+    "severity": "major",
+    "title": "Forged graph dimensions still overflow record-size arithmetic on wasm32"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant. The prior major finding remains: the untrusted u32 `dim` and `degree` header fields are converted to usize and passed to `record_len`, which still performs unchecked `8 + dim * 4 + degree * 4` arithmetic before the checked count/body calculation. On wasm32, hostile dimensions can overflow or wrap before validation. The malformed-file test still checks only an extreme count and does not exercise extreme dimension or degree fields.",
+  "verdict": "request_changes"
+ }
+}
