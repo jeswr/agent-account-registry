@@ -66,6 +66,7 @@ import os
 import re
 import subprocess
 import sys
+from urllib.parse import quote
 
 ALERT_LABEL = "ops-alert"
 
@@ -95,6 +96,29 @@ SKIP_STREAK_THRESHOLD = 4
 
 ARTIFACT_PAGE_SIZE = 100
 ARTIFACT_MAX_PAGES = 3
+
+# PROVENANCE — AN ARTIFACT NAME IS NOT EVIDENCE OF WHO WROTE IT (review round 1).
+# `/repos/{repo}/actions/artifacts` is REPOSITORY-WIDE: it lists what every workflow in this repo
+# uploaded, and a `pull_request` run executes the PR branch's OWN workflow files. So any
+# contributor who can open a PR could otherwise publish an artifact named
+# `groom-mint-tick.ok-<owner>` to reset a real streak and auto-close a live alert, or a `.skip-`
+# marker on four ticks to fabricate one. Name grammar is a parser, not an authenticator.
+#
+# A marker therefore only counts when its `workflow_run.id` is in a run set this reader derived
+# INDEPENDENTLY, from the workflow-scoped runs listing, and confirmed to be:
+#   - the groom workflow BY PATH (exact match on GROOM_WORKFLOW — the endpoint is already scoped to
+#     that file, and the field is re-checked so a redirect/rename cannot widen it),
+#   - on the repository's DEFAULT BRANCH, read from the repo itself and never assumed, and
+#   - triggered by an allowed event.
+# `schedule` is the WHOLE allowlist on purpose: GitHub only ever schedules a workflow on the
+# default branch, so it is the one trigger that cannot be aimed at a ref, and the streak this file
+# reports is denominated in scheduled ticks in the threshold sizing above and in the alert body
+# below. `workflow_dispatch` is deliberately excluded even though groom declares it — it can be run
+# from any ref by anyone with write access, and excluding it can only ever LOWER the tick count
+# (delaying a page), never fabricate a skip.
+ALLOWED_TICK_EVENTS = ("schedule",)
+RUN_PAGE_SIZE = 100
+GH_JSON_ACCEPT = "Accept: application/vnd.github+json"
 
 ALERT_MARKER_PREFIX = "<!-- groom-mint-alert:v1 key=groom-mint-gap owner="
 ALERT_MARKER_RE = re.compile(
@@ -168,12 +192,56 @@ def _artifacts(payload):
     return [entry for entry in entries if isinstance(entry, dict)]
 
 
-def tick_records(payload, into=None):
-    """-> {run_id: (created_at, ok_owners, skip_owners)} for every parseable, unexpired marker.
+def tick_runs(payload, default_branch):
+    """The workflow-runs listing -> {run_id: run_created_at} for the runs allowed to produce a
+    marker. Everything else in the repository is denied.
+
+    FAIL CLOSED on every field: a run entry that does not EXACTLY name this workflow's path, sit on
+    the default branch and carry an allowed event is dropped, so its artifacts are not evidence
+    however they are named. An unknown/empty `default_branch` admits NOTHING rather than matching
+    every branch — a wildcard here would restore the whole spoof.
+
+    The VALUE is the run's own creation time, never the artifact's upload time: a re-run of an old
+    tick uploads a marker stamped now, and ordering evidence on that would let it jump ahead of
+    newer scheduled ticks and reset a live streak."""
+    runs = {}
+    if not isinstance(default_branch, str) or not default_branch:
+        return runs
+    entries = payload.get("workflow_runs") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        return runs
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        run_id = entry.get("id")
+        if not isinstance(run_id, int) or isinstance(run_id, bool):
+            continue
+        if entry.get("path") != GROOM_WORKFLOW:
+            continue
+        if entry.get("event") not in ALLOWED_TICK_EVENTS:
+            continue
+        if entry.get("head_branch") != default_branch:
+            continue
+        created = entry.get("created_at")
+        if not isinstance(created, str) or not created:
+            continue
+        runs[run_id] = created
+    return runs
+
+
+def tick_records(payload, runs, into=None):
+    """-> {run_id: (run_created_at, artifact_created_at, ok_owners, skip_owners)} for every
+    parseable, unexpired marker uploaded BY A RUN IN `runs`.
+
+    `runs` is the provenance gate (see ALLOWED_TICK_EVENTS): a marker whose run this reader has not
+    independently confirmed to be a default-branch scheduled groom run is dropped, however
+    well-formed its name — repository-wide artifact names are writable by any run in this repo.
 
     Keyed on the RUN id, not on the artifact id: a re-run uploads a second marker under the same
-    run, and counting one tick twice would let a two-tick outage reach a four-tick threshold. The
-    newest `created_at` for a run wins, so a re-run's marker supersedes the original's."""
+    run, and counting one tick twice would let a two-tick outage reach a four-tick threshold.
+    WITHIN a run the newest upload wins (a re-run re-executes the mints, so it is the fresher truth
+    for that tick); ACROSS runs the ordering is the run's own creation time, which a re-run does not
+    change."""
     records = {} if into is None else into
     for entry in _artifacts(payload):
         if entry.get("expired") is True:
@@ -185,25 +253,27 @@ def tick_records(payload, into=None):
         run_id = run.get("id") if isinstance(run, dict) else None
         if not isinstance(run_id, int) or isinstance(run_id, bool):
             continue
+        if run_id not in runs:
+            continue
         created = entry.get("created_at")
         if not isinstance(created, str) or not created:
             continue
         previous = records.get(run_id)
-        if previous is None or created > previous[0]:
-            records[run_id] = (created, parsed[0], parsed[1])
+        if previous is None or created > previous[1]:
+            records[run_id] = (runs[run_id], created, parsed[0], parsed[1])
     return records
 
 
 def ordered_ticks(records):
     """Marker ticks NEWEST FIRST -> [(ok_owners, skip_owners)].
 
-    Sorted on (created_at, run_id) rather than trusting the endpoint's ordering: the artifacts
-    listing returns newest-first today, but a watchdog should not have a correctness dependency on
-    an undocumented ordering, and the run id breaks ties between two markers stamped in the same
-    second. The timestamps are RFC3339 in UTC with fixed width, so a lexical sort IS a chronological
-    one."""
+    Sorted on the RUN's (created_at, run_id) rather than trusting the endpoint's ordering: the
+    artifacts listing returns newest-first today, but a watchdog should not have a correctness
+    dependency on an undocumented ordering, and the run id breaks ties between two runs created in
+    the same second. The timestamps are RFC3339 in UTC with fixed width, so a lexical sort IS a
+    chronological one."""
     ordered = sorted(records.items(), key=lambda item: (item[1][0], item[0]), reverse=True)
-    return [(ok, skip) for _run_id, (_created, ok, skip) in ordered]
+    return [(ok, skip) for _run_id, (_run_created, _created, ok, skip) in ordered]
 
 
 def owners_seen(ticks):
@@ -334,8 +404,46 @@ def _gh_json(args, label="groom-mint"):
         return None
 
 
+def read_default_branch(repo, runner):
+    """The repository's default branch, or None if it cannot be established.
+
+    Never guessed and never defaulted to a name: the branch is half the provenance check, and a
+    hard-coded fallback would silently accept markers from whatever branch happened to carry that
+    name. None propagates to "no evidence this tick", which neither pages nor closes."""
+    payload = runner(["api", "-H", GH_JSON_ACCEPT, f"/repos/{repo}"])
+    branch = payload.get("default_branch") if isinstance(payload, dict) else None
+    return branch if isinstance(branch, str) and branch else None
+
+
+def read_tick_runs(repo, default_branch, runner):
+    """-> {run_id: created_at} for the groom runs whose markers count, or None if the listing is
+    refused (no provenance set at all, which must fail loud rather than admit everything).
+
+    Scoped FOUR ways: the endpoint is keyed on the groom workflow FILE, the query pins the default
+    branch and the event, and `tick_runs` re-checks path/event/branch on every returned row — a
+    server-side filter this reader cannot see the effect of is not a check it should rely on alone.
+
+    ONE request per allowed event, so the RUN_PAGE_SIZE window is spent entirely on runs that can
+    be evidence: a shared window could otherwise be crowded out by `workflow_dispatch` runs, which
+    would silently shorten the provable history."""
+    runs = {}
+    for event in ALLOWED_TICK_EVENTS:
+        payload = runner(["api", "-H", GH_JSON_ACCEPT,
+                          f"/repos/{repo}/actions/workflows/{os.path.basename(GROOM_WORKFLOW)}/runs"
+                          f"?per_page={RUN_PAGE_SIZE}&branch={quote(default_branch, safe='')}"
+                          f"&event={quote(event, safe='')}"])
+        if payload is None:
+            return None
+        runs.update(tick_runs(payload, default_branch))
+    return runs
+
+
 def read_ticks(repo, runner=None, threshold=SKIP_STREAK_THRESHOLD):
-    """The artifacts listing this watchdog costs -> (ticks_newest_first, truncated).
+    """The listings this watchdog costs -> (ticks_newest_first, truncated).
+
+    Three reads: the repo (for the default branch), the groom workflow's runs (the PROVENANCE set —
+    without it an artifact name is just a string any run in this repo can write), then the
+    repository-wide artifacts listing filtered through that set.
 
     Pages only until it has THRESHOLD+1 ticks — one more than the streak can consume, so the tick
     that would BREAK the streak is always in view — or the page runs dry. At today's density page
@@ -346,18 +454,25 @@ def read_ticks(repo, runner=None, threshold=SKIP_STREAK_THRESHOLD):
 
     `runner` is resolved at CALL time, not bound as a default: a default argument captures the
     function object at definition, which makes the live path unpatchable and every stubbed-flow
-    assertion below quietly exercise the real `gh`. -> (None, False) if the FIRST page is refused;
-    without it there is no evidence at all and the caller must fail loud, not read "healthy"."""
+    assertion below quietly exercise the real `gh`. -> (None, False) if ANY of the three reads that
+    would leave the evidence unvalidated is refused; without them there is no evidence at all and
+    the caller must fail loud, not read "healthy"."""
     runner = runner or _gh_json
+    default_branch = read_default_branch(repo, runner)
+    if default_branch is None:
+        return None, False
+    runs = read_tick_runs(repo, default_branch, runner)
+    if runs is None:
+        return None, False
     records, wanted = {}, threshold + 1
     for page in range(1, ARTIFACT_MAX_PAGES + 1):
-        payload = runner(["api", "-H", "Accept: application/vnd.github+json",
+        payload = runner(["api", "-H", GH_JSON_ACCEPT,
                           f"/repos/{repo}/actions/artifacts"
                           f"?per_page={ARTIFACT_PAGE_SIZE}&page={page}"])
         if payload is None:
             return (None, False) if page == 1 else (ordered_ticks(records), True)
         entries = _artifacts(payload)
-        tick_records(payload, into=records)
+        tick_records(payload, runs, into=records)
         if len(records) >= wanted or not entries:
             return ordered_ticks(records), False
     return ordered_ticks(records), len(records) < wanted
@@ -435,10 +550,12 @@ def main():
 
     ticks, truncated = read_ticks(registry_repo)
     if ticks is None:
-        # Fail loud: without the listing there is no evidence at all, so neither a page nor a
-        # close is defensible. The step's continue-on-error keeps the alarm isolated.
-        print("::warning::groom-mint: the artifacts listing was refused — no mint evidence this "
-              "tick (next tick retries)")
+        # Fail loud: without the repo, the groom-run provenance set and the artifacts listing there
+        # is no VALIDATED evidence at all, so neither a page nor a close is defensible. The step's
+        # continue-on-error keeps the alarm isolated.
+        print("::warning::groom-mint: a listing this watchdog needs to VALIDATE mint evidence was "
+              "refused (repo, groom runs, or artifacts) — no mint evidence this tick (next tick "
+              "retries)")
         return 1
     if truncated:
         print(f"::warning::groom-mint: only {len(ticks)} mint-outcome tick(s) were reachable "
@@ -556,10 +673,16 @@ def _sparse_paths(job, path="registry"):
     return {line.strip() for line in str(spec).splitlines() if line.strip()}
 
 
+def _triggers(workflow):
+    """A workflow's `on:` block. PyYAML resolves the bare key `on` to the BOOLEAN True under YAML
+    1.1, so a plain `.get("on")` reads None on every workflow in this repo."""
+    return (workflow or {}).get("on", (workflow or {}).get(True)) or {}
+
+
 def _cron_period_minutes(workflow):
     """Minutes between fires for `m-59/N * * * *`, `*/N * * * *`, or an explicit minute list."""
-    triggers = workflow.get("on", workflow.get(True)) or {}
-    crons = [entry["cron"] for entry in (triggers.get("schedule") or []) if "cron" in entry]
+    crons = [entry["cron"] for entry in (_triggers(workflow).get("schedule") or [])
+             if "cron" in entry]
     if len(crons) != 1:
         raise GroomMintAlertError(f"expected exactly one cron schedule, found {len(crons)}")
     minute = crons[0].split()[0]
@@ -592,6 +715,7 @@ def _self_test():
         ("org/registry", None))
 
     _test_marker_grammar(chk)
+    _test_provenance(chk)
     _test_tick_records(chk)
     _test_streaks(chk)
     _test_verdict_and_decide(chk)
@@ -642,7 +766,96 @@ def _artifact(name, run_id=101, created_at="2026-07-29T18:00:00Z", expired=False
             "workflow_run": {"id": run_id}}
 
 
+# NOT `master`/`main`: a fixture branch that collides with the value under test turns a
+# "value-identical survivor" into a false kill (AGENTS.md item 4). Nothing in this repo is on it.
+FIXTURE_BRANCH = "trunk-fixture"
+
+
+def _run_row(run_id, created_at="2026-07-29T18:00:00Z", path=GROOM_WORKFLOW, event="schedule",
+             branch=FIXTURE_BRANCH):
+    return {"id": run_id, "created_at": created_at, "path": path, "event": event,
+            "head_branch": branch}
+
+
+def _test_provenance(chk):
+    """WHO CAN WRITE THE THING THIS READS (AGENTS.md item 5). `/actions/artifacts` is
+    repository-wide and a `pull_request` run executes the PR branch's own workflow files, so the
+    artifact NAME is author-controlled text. Only the run-provenance set makes it evidence."""
+    listing = {"workflow_runs": [
+        _run_row(101, "2026-07-29T18:00:00Z"),
+        _run_row(102, "2026-07-29T18:15:00Z"),
+    ]}
+    chk("provenance: a default-branch scheduled run of THIS workflow is the accepted shape",
+        tick_runs(listing, FIXTURE_BRANCH),
+        {101: "2026-07-29T18:00:00Z", 102: "2026-07-29T18:15:00Z"})
+
+    # One row per rejection reason, so each is a line-anchored kill of its own guard rather than a
+    # single row that stays red if any one of them is deleted.
+    for label, row in (
+            ("another workflow in this repo", _run_row(901, path=".github/workflows/dispatch.yml")),
+            ("a workflow path that merely ENDS with ours",
+             _run_row(902, path="x/" + GROOM_WORKFLOW)),
+            ("a run with no workflow path at all", _run_row(910, path=None)),
+            ("a run with no event at all", _run_row(911, event=None)),
+            ("a pull_request run (a fork's PR runs its OWN workflow files)",
+             _run_row(903, event="pull_request")),
+            ("a workflow_dispatch run (aimable at any ref by any writer)",
+             _run_row(904, event="workflow_dispatch")),
+            ("a run on a non-default branch", _run_row(905, branch="attacker-branch")),
+            ("a run with no head branch at all", _run_row(906, branch=None)),
+            ("a run with no creation time", _run_row(907, created_at="")),
+            ("a bool run id", _run_row(True)),
+            ("a non-dict row", "not-a-dict"),
+    ):
+        chk(f"provenance: {label} yields NO accepted run",
+            tick_runs({"workflow_runs": [row]}, FIXTURE_BRANCH), {})
+    chk("provenance: an unknown/empty default branch admits NOTHING — never a wildcard",
+        (tick_runs(listing, ""), tick_runs(listing, None), tick_runs(listing, True)),
+        ({}, {}, {}))
+    # Measured: WITHOUT the explicit default-branch guard the equality check alone still rejects
+    # every row above, so those three are satisfied by a mutant that deletes it — and a run with no
+    # head branch would then MATCH an unknown default branch and be admitted. Absent is not a match.
+    chk("provenance: a branchless run cannot match an unknown default branch (absent is not a "
+        "match, on either side)",
+        (tick_runs({"workflow_runs": [_run_row(908, branch=None)]}, None),
+         tick_runs({"workflow_runs": [_run_row(909, branch="")]}, "")), ({}, {}))
+    chk("provenance: a malformed runs payload yields no accepted runs",
+        (tick_runs({"workflow_runs": "nope"}, FIXTURE_BRANCH), tick_runs(None, FIXTURE_BRANCH),
+         tick_runs({}, FIXTURE_BRANCH)), ({}, {}, {}))
+
+    # The two provenance READERS, and the URLs they actually build. The workflow file name is
+    # written out in full here on purpose: deriving the expectation from GROOM_WORKFLOW would
+    # compare the code against the constant it reads from and could not fail (AGENTS.md item 2b).
+    asked = []
+
+    def capture(payload):
+        def runner(args):
+            asked.append(args[-1])
+            return payload
+        return runner
+
+    chk("provenance: the default branch is read from the REPO, and a refused/blank/absent answer "
+        "is None rather than a guess",
+        (read_default_branch("o/r", capture({"default_branch": FIXTURE_BRANCH})),
+         read_default_branch("o/r", capture({"default_branch": ""})),
+         read_default_branch("o/r", capture({"default_branch": 7})),
+         read_default_branch("o/r", capture({})), read_default_branch("o/r", capture(None)),
+         asked[0]),
+        (FIXTURE_BRANCH, None, None, None, None, "/repos/o/r"))
+    asked.clear()
+    chk("provenance: ONE runs listing per allowed event, scoped to the groom workflow FILE, the "
+        "default branch and that event",
+        (read_tick_runs("o/r", FIXTURE_BRANCH, capture({"workflow_runs": []})), asked),
+        ({}, ["/repos/o/r/actions/workflows/groom.yml/runs"
+              f"?per_page={RUN_PAGE_SIZE}&branch={FIXTURE_BRANCH}&event={event}"
+              for event in ALLOWED_TICK_EVENTS]))
+    chk("provenance: a REFUSED runs listing is None, never an empty (permissive) run set",
+        read_tick_runs("o/r", FIXTURE_BRANCH, lambda args: None), None)
+
+
 def _test_tick_records(chk):
+    runs = {101: "2026-07-29T18:00:00Z", 102: "2026-07-29T18:15:00Z", 104: "2026-07-29T18:20:00Z",
+            105: "2026-07-29T18:25:00Z"}
     payload = {"artifacts": [
         _artifact("groom-mint-tick.ok-sparq-org.skip-jeswr", 101, "2026-07-29T18:00:00Z"),
         _artifact("groom-mint-tick.ok-sparq-org.ok-jeswr", 102, "2026-07-29T18:15:00Z"),
@@ -654,10 +867,24 @@ def _test_tick_records(chk):
         "not-a-dict",
     ]}
     chk("records: only well-formed unexpired markers with a real run id count",
-        sorted(tick_records(payload)), [101, 102])
+        sorted(tick_records(payload, runs)), [101, 102])
     chk("records: a malformed payload yields no ticks (and therefore no streak)",
-        (tick_records({"artifacts": "nope"}), tick_records(None), tick_records({})),
-        ({}, {}, {}))
+        (tick_records({"artifacts": "nope"}, runs), tick_records(None, runs),
+         tick_records({}, runs)), ({}, {}, {}))
+
+    # THE SPOOF. A marker with a PERFECT name, uploaded by a run outside the provenance set — the
+    # shape any repository collaborator (or fork PR) can publish. It must contribute nothing, in
+    # BOTH directions: no `.ok-` that resets a live streak, and no `.skip-` that fabricates one.
+    spoof = {"artifacts": [
+        _artifact("groom-mint-tick.ok-jeswr.ok-sparq-org", 666, "2026-07-29T23:00:00Z"),
+        _artifact("groom-mint-tick.skip-jeswr.skip-sparq-org", 667, "2026-07-29T23:30:00Z"),
+    ]}
+    chk("records: perfectly-named markers from runs OUTSIDE the provenance set are not evidence",
+        (tick_records(spoof, runs), tick_records(spoof, {})), ({}, {}))
+    chk("records: ... and one spoofed `ok` cannot reset a real skip streak",
+        [sorted(skip) for _ok, skip in ordered_ticks(tick_records(
+            {"artifacts": payload["artifacts"] + spoof["artifacts"]}, {101: runs[101]}))],
+        [["jeswr"]])
 
     # A RE-RUN uploads a second marker under the SAME run id. Counting it twice would let a
     # two-tick outage reach a four-tick threshold; the NEWEST marker for a run must win outright.
@@ -666,19 +893,38 @@ def _test_tick_records(chk):
         _artifact("groom-mint-tick.ok-jeswr", 200, "2026-07-29T19:00:00Z"),
     ]}
     chk("records: a re-run is ONE tick, and its newest marker wins",
-        tick_records(rerun), {200: ("2026-07-29T19:00:00Z", {"jeswr"}, set())})
+        tick_records(rerun, {200: "2026-07-29T17:55:00Z"}),
+        {200: ("2026-07-29T17:55:00Z", "2026-07-29T19:00:00Z", {"jeswr"}, set())})
+
+    # ... but a re-run of an OLD tick keeps that tick's PLACE. Its marker is uploaded now, so
+    # ordering on the artifact's timestamp would float a stale `ok` to the front of the history and
+    # silently close a live alert. Ordering is the RUN's creation time, which a re-run cannot move.
+    late_runs = {310: "2026-07-29T17:00:00Z", 311: "2026-07-29T18:00:00Z",
+                 312: "2026-07-29T19:00:00Z"}
+    late = {"artifacts": [
+        _artifact("groom-mint-tick.ok-jeswr", 310, "2026-07-29T23:00:00Z"),   # re-run of the OLDEST
+        _artifact("groom-mint-tick.skip-jeswr", 311, "2026-07-29T18:00:30Z"),
+        _artifact("groom-mint-tick.skip-jeswr", 312, "2026-07-29T19:00:30Z"),
+    ]}
+    late_ticks = ordered_ticks(tick_records(late, late_runs))
+    chk("records: a LATE re-run of an old tick cannot supersede newer scheduled evidence",
+        ([sorted(skip) for _ok, skip in late_ticks],
+         skip_streaks(late_ticks, {"jeswr"})),
+        ([["jeswr"], ["jeswr"], []], {"jeswr": 2}))
 
     # ORDERING is derived, never inherited from the endpoint. Feed the pages scrambled.
+    scrambled_runs = {301: "2026-07-29T17:00:00Z", 302: "2026-07-29T18:00:00Z",
+                      303: "2026-07-29T19:00:00Z"}
     scrambled = {"artifacts": [
         _artifact("groom-mint-tick.skip-jeswr", 301, "2026-07-29T17:00:00Z"),
         _artifact("groom-mint-tick.ok-jeswr", 303, "2026-07-29T19:00:00Z"),
         _artifact("groom-mint-tick.skip-jeswr", 302, "2026-07-29T18:00:00Z"),
     ]}
     chk("records: ticks come back NEWEST FIRST regardless of listing order",
-        [sorted(skip) for _ok, skip in ordered_ticks(tick_records(scrambled))],
+        [sorted(skip) for _ok, skip in ordered_ticks(tick_records(scrambled, scrambled_runs))],
         [[], ["jeswr"], ["jeswr"]])
     chk("records: owners_seen unions both classifications across every tick",
-        sorted(owners_seen(ordered_ticks(tick_records(payload))))
+        sorted(owners_seen(ordered_ticks(tick_records(payload, runs))))
         , ["jeswr", "sparq-org"])
 
 
@@ -773,69 +1019,106 @@ def _test_paging(chk):
     """The listing is repo-wide and shared with dispatch's, dashboard's and worker's artifacts, so
     a page can be full of something else entirely. The crawl must keep going until the tick that
     would BREAK the streak is in view — THRESHOLD+1 ticks — and must SAY SO when it cannot."""
-    def pager(pages):
+    def pager(pages, runs, refuse=()):
+        """A `gh api` stub for all THREE reads the crawl makes. The runs listing answers only the
+        run ids in `runs`, so every fixture below is filtered through the real provenance gate
+        rather than past it."""
         calls = []
 
         def runner(args):
-            # `[?&]page=` — a bare `page=(\d+)` matches `per_page=100` first, which silently
-            # collapses every page of this fixture onto one key and makes the crawl untested.
-            page = int(re.search(r"[?&]page=(\d+)", args[-1]).group(1))
-            calls.append(page)
-            return pages.get(page, {"artifacts": []})
+            url = args[-1]
+            if "/actions/artifacts" in url:
+                if "artifacts" in refuse:
+                    return None
+                # `[?&]page=` — a bare `page=(\d+)` matches `per_page=100` first, which silently
+                # collapses every page of this fixture onto one key and makes the crawl untested.
+                page = int(re.search(r"[?&]page=(\d+)", url).group(1))
+                calls.append(page)
+                return pages.get(page, {"artifacts": []})
+            if "/actions/workflows/" in url:
+                return None if "runs" in refuse else {"workflow_runs": [
+                    _run_row(run_id, created) for run_id, created in sorted(runs.items())]}
+            return None if "repo" in refuse else {"default_branch": FIXTURE_BRANCH}
         return runner, calls
 
     def marker(run_id, minute):
         return _artifact("groom-mint-tick.skip-jeswr", run_id,
                          f"2026-07-29T18:{minute:02d}:00Z")
 
+    def runs_for(*run_ids):
+        return {run_id: f"2026-07-29T18:{index:02d}:00Z"
+                for index, run_id in enumerate(run_ids)}
+
     # One dense page: THRESHOLD+1 ticks found, so exactly ONE request.
-    dense = {1: {"artifacts": [marker(300 + i, i) for i in range(SKIP_STREAK_THRESHOLD + 1)]}}
-    runner, calls = pager(dense)
+    dense_ids = tuple(300 + i for i in range(SKIP_STREAK_THRESHOLD + 1))
+    dense = {1: {"artifacts": [marker(run_id, i) for i, run_id in enumerate(dense_ids)]}}
+    runner, calls = pager(dense, runs_for(*dense_ids))
     ticks, truncated = read_ticks("o/r", runner=runner)
     chk("paging: a page carrying THRESHOLD+1 ticks costs exactly one request",
         (len(calls), len(ticks), truncated), (1, SKIP_STREAK_THRESHOLD + 1, False))
+
+    # The same dense page with NO run in the provenance set: perfect names, zero evidence. Without
+    # this row the crawl could ignore `runs` entirely and every assertion here would still pass.
+    runner, calls = pager(dense, {})
+    ticks, truncated = read_ticks("o/r", runner=runner)
+    chk("paging: a page full of perfectly-named markers from unvalidated runs yields NO ticks",
+        (calls, ticks, truncated), ([1, 2], [], False))
 
     # Exactly THRESHOLD ticks on a FULL page is one short of what the crawl wants: the tick that
     # would BREAK the streak is not yet in view, so it must page on rather than stopping on a
     # history it cannot prove the edges of. (Measured: without this row, `wanted = threshold`
     # survived the whole suite.)
-    edge = {1: {"artifacts": [marker(700 + i, i) for i in range(SKIP_STREAK_THRESHOLD)]
+    edge_ids = tuple(700 + i for i in range(SKIP_STREAK_THRESHOLD))
+    edge = {1: {"artifacts": [marker(run_id, i) for i, run_id in enumerate(edge_ids)]
                 + [_artifact("publish-bundle", 800)]}}
-    runner, calls = pager(edge)
+    runner, calls = pager(edge, runs_for(*edge_ids))
     ticks, truncated = read_ticks("o/r", runner=runner)
     chk("paging: THRESHOLD ticks is one short of what the crawl wants, so it pages on",
         (calls, len(ticks), truncated), ([1, 2], SKIP_STREAK_THRESHOLD, False))
 
     # An artifact storm: one groom tick per page. The crawl must walk on, and then REPORT that it
     # stopped short rather than presenting a 3-tick history as the whole truth.
+    storm_ids = tuple(400 + page for page in range(1, ARTIFACT_MAX_PAGES + 1))
     storm = {page: {"artifacts": [_artifact("publish-bundle", 900 + page)] * 40
                     + [marker(400 + page, page)]}
              for page in range(1, ARTIFACT_MAX_PAGES + 1)}
-    runner, calls = pager(storm)
+    runner, calls = pager(storm, runs_for(*storm_ids))
     ticks, truncated = read_ticks("o/r", runner=runner)
     chk("paging: under an artifact storm it pages to the cap and REPORTS the short history",
         (calls, len(ticks), truncated),
         (list(range(1, ARTIFACT_MAX_PAGES + 1)), ARTIFACT_MAX_PAGES, True))
 
     # A dry page ends the crawl without claiming truncation — the history really is that short.
-    runner, calls = pager({1: {"artifacts": [marker(500, 1)]}})
+    runner, calls = pager({1: {"artifacts": [marker(500, 1)]}}, runs_for(500))
     ticks, truncated = read_ticks("o/r", runner=runner)
     chk("paging: a page that runs dry ends the crawl and is NOT reported as truncated",
         (calls, len(ticks), truncated), ([1, 2], 1, False))
 
-    # A REFUSED first page is no evidence at all -> None, so main() fails loud instead of reading
-    # an empty history as "every owner recovered" and closing live alerts.
-    chk("paging: a refused FIRST page yields no evidence, never an empty history",
+    # A REFUSED read is no evidence at all -> None, so main() fails loud instead of reading an
+    # empty history as "every owner recovered" and closing live alerts. Each of the three reads
+    # gets its own row: refusing the repo or the runs listing leaves the artifacts UNVALIDATED,
+    # which must be exactly as fatal as having no artifacts at all.
+    for label, kind in (("repo (so the default branch is unknown)", "repo"),
+                        ("groom runs listing (so nothing can be validated)", "runs"),
+                        ("FIRST artifacts page", "artifacts")):
+        runner, _calls = pager({1: {"artifacts": [marker(500, 1)]}}, runs_for(500),
+                               refuse=(kind,))
+        chk(f"paging: a refused {label} yields no evidence, never an empty history",
+            read_ticks("o/r", runner=runner), (None, False))
+    chk("paging: a runner that refuses everything yields no evidence",
         read_ticks("o/r", runner=lambda *a, **k: None), (None, False))
     # A refusal PART WAY through keeps what it has and flags it as short.
     half = {1: {"artifacts": [marker(600, 1)] * 1 + [_artifact("other", 1)] * 99}}
-    runner, _calls = pager(half)
+    runner, _calls = pager(half, runs_for(600))
 
     def flaky(args):
         # `&page=1`, anchored on the separator for the same reason as above: `per_page=100`
         # contains the substring `page=1`, so a looser test here would answer EVERY page and the
-        # mid-crawl refusal would never actually be exercised.
-        return runner(args) if "&page=1" in args[-1] else None
+        # mid-crawl refusal would never actually be exercised. The repo and runs reads must still
+        # be answered or the crawl never reaches page two at all.
+        if "/actions/artifacts" not in args[-1] or "&page=1" in args[-1]:
+            return runner(args)
+        return None
     chk("paging: a refusal after page one keeps the evidence it has and flags it short",
         (lambda pair: (len(pair[0]), pair[1]))(read_ticks("o/r", runner=flaky)), (1, True))
 
@@ -859,7 +1142,8 @@ def _test_readers(chk):
 
     def fake_run(cmd, capture_output=False, text=False, env=None, check=False):
         seen.append(list(cmd))
-        return scripted["result"]
+        router = scripted.get("router")
+        return _Result(0, router(list(cmd))) if router else scripted["result"]
 
     saved_run = subprocess.run
     try:
@@ -887,15 +1171,41 @@ def _test_readers(chk):
              "SENTINEL-PAYLOAD" in buffer.getvalue()), (None, True, False))
 
         # read_ticks must reach the API through _gh_json when no runner is injected — otherwise
-        # every paging assertion above is about a function the live path never calls.
+        # every paging assertion above is about a function the live path never calls. All THREE
+        # reads are routed, so the provenance gate is exercised on the live path too.
         seen.clear()
-        scripted["result"] = _Result(0, json.dumps({"artifacts": [
-            _artifact("groom-mint-tick.skip-jeswr", 700, "2026-07-29T18:00:00Z")]}))
+
+        def live_router(cmd):
+            url = cmd[-1]
+            if "/actions/artifacts" in url:
+                return json.dumps({"artifacts": [
+                    _artifact("groom-mint-tick.skip-jeswr", 700, "2026-07-29T18:00:00Z")]})
+            if "/actions/workflows/" in url:
+                return json.dumps({"workflow_runs": [_run_row(700, "2026-07-29T18:00:00Z")]})
+            return json.dumps({"default_branch": FIXTURE_BRANCH})
+
+        scripted["router"] = live_router
         ticks, _truncated = read_ticks("o/r")
-        chk("reader: read_ticks with NO injected runner goes through the real gh api reader",
-            (seen and seen[0][:2], "/repos/o/r/actions/artifacts" in (seen[0][-1] if seen else ""),
+        scripted["router"] = None
+        urls = [cmd[-1] for cmd in seen]
+        chk("reader: read_ticks with NO injected runner goes through the real gh api reader for "
+            "the repo, the groom RUNS listing and the artifacts listing",
+            (seen and seen[0][:2], urls[0] if urls else None,
+             any("/actions/workflows/groom.yml/runs?" in url and f"branch={FIXTURE_BRANCH}" in url
+                 for url in urls),
+             any("/repos/o/r/actions/artifacts" in url for url in urls),
              [sorted(skip) for _ok, skip in ticks]),
-            (["gh", "api"], True, [["jeswr"]]))
+            (["gh", "api"], "/repos/o/r", True, True, [["jeswr"]]))
+        # The SAME live path with a run whose provenance does not check out yields nothing.
+        seen.clear()
+        scripted["router"] = lambda cmd: (
+            live_router(cmd) if "/actions/workflows/" not in cmd[-1]
+            else json.dumps({"workflow_runs": [
+                _run_row(700, "2026-07-29T18:00:00Z", event="pull_request")]}))
+        spoofed, _truncated = read_ticks("o/r")
+        scripted["router"] = None
+        chk("reader: on the LIVE path a marker whose run fails provenance is not evidence",
+            spoofed, [])
 
         # --- _open_alerts --------------------------------------------------------------------
         scripted["result"] = _Result(0, json.dumps([
@@ -1197,7 +1507,50 @@ def _test_workflow_seam(chk):
     """THE YAML SEAM — where the vacuity lives. Both ends of the artifact-name contract, the
     ordering that makes the marker mean "this tick reached the mint stage", and the watchdog's own
     ungated hosting."""
+    def emit_marker_name(run_body, outcomes):
+        """RUN the live marker step's shell with fixture mint outcomes -> the single `name=` value
+        it writes to GITHUB_OUTPUT (None if it failed, or wrote anything other than exactly one).
+
+        Parsing the producer's `env:` and its loop body proves the two ENDS of the mapping agree;
+        only executing it proves the LOOP delivers every owner into the name (AGENTS.md item 11).
+        The step is pure shell over three environment variables and a temp file — no network, no
+        token, no GitHub — so running it is the cheapest honest test of the seam. Nested inside
+        this test on purpose: `_test_authority_ceiling` scans the LIVE half for the argv heads this
+        script can build, and a module-level `["bash", ...]` there would widen that ceiling.
+
+        Nothing but PATH is inherited: an ambient `SPARQ_MINT_OUTCOME` in the caller's environment
+        would otherwise silently supply an input a fixture below means to withhold."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            output = os.path.join(tmp, "github-output")
+            with open(output, "w", encoding="utf-8"):
+                pass
+            env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                   "GITHUB_OUTPUT": output, "RUNNER_TEMP": tmp}
+            env.update(outcomes)
+            done = subprocess.run(["bash", "-c", run_body], env=env,
+                                  capture_output=True, text=True, check=False)
+            if done.returncode != 0:
+                return None
+            with open(output, encoding="utf-8") as handle:
+                emitted = [line[len("name="):] for line in handle.read().splitlines()
+                           if line.startswith("name=")]
+        return emitted[0] if len(emitted) == 1 else None
+
     workflow = _load_workflow(GROOM_WORKFLOW)
+
+    # --- PROVENANCE: the events whose runs may produce evidence --------------------------------
+    # The allowlist is only a check if the events on it are ones groom is actually triggered by;
+    # an allowlist naming no live trigger would validate every marker out of existence and the
+    # detector would read "unknown" forever while looking perfectly healthy.
+    triggers = _triggers(workflow)
+    chk("seam: every event this reader accepts as provenance IS a live groom trigger",
+        sorted(event for event in ALLOWED_TICK_EVENTS if event in triggers),
+        sorted(ALLOWED_TICK_EVENTS))
+    chk("seam: `workflow_dispatch` is a groom trigger and is deliberately NOT provenance — it can "
+        "be aimed at any ref, so its markers must not count",
+        ("workflow_dispatch" in triggers, "workflow_dispatch" in ALLOWED_TICK_EVENTS),
+        (True, False))
 
     # --- the PRODUCER half, in the `groom` job ------------------------------------------------
     groom = _job(workflow, GROOM_JOB)
@@ -1236,16 +1589,79 @@ def _test_workflow_seam(chk):
         [f"steps.{mint_id}.outcome" in marker_env for mint_id in MINT_STEP_IDS]
         + ["outputs.token" in (marker_env + run_body)], [True, True, False])
 
-    # ROUND TRIP against the LIVE owner list. Every check above tests one END of the contract;
-    # this one tests what the transition DELIVERS INTO — it takes the owners the workflow actually
-    # mints for, builds the exact names that shell emits for them, and pushes them through the
-    # live parser. A grammar both halves agree on but that yields no owners would satisfy
-    # everything above and still detect nothing (AGENTS.md item 11).
-    minted_owners = {str((_step(groom, mint_id).get("with") or {}).get("owner"))
-                     for mint_id in MINT_STEP_IDS}
+    owner_of = {mint_id: str((_step(groom, mint_id).get("with") or {}).get("owner"))
+                for mint_id in MINT_STEP_IDS}
+    minted_owners = set(owner_of.values())
     chk("seam: every mint step names a well-formed owner login",
         sorted(owner for owner in minted_owners if OWNER_RE.match(owner)),
         sorted(minted_owners))
+    chk("seam: the mint steps name DISTINCT owners (a duplicate would hide one owner's gap "
+        "behind the other's marker entry)", len(minted_owners), len(MINT_STEP_IDS))
+
+    # THE PRODUCER MAPPING (review round 1). Everything above reads the loop's generic BODY, which
+    # is identical whatever it iterates over — so deleting one owner's entry from the loop's item
+    # list left all of it green while the live marker silently stopped naming that owner. An owner
+    # missing from a reached tick is scored streak 0 by `skip_streaks`, i.e. RECOVERY, so that
+    # deletion auto-closes a live alert and blinds the detector for that owner permanently.
+    #
+    # So the one-to-one mapping is asserted directly: exactly one entry per mint step, pairing that
+    # step's `with.owner` with the env var carrying that same step's `.outcome`.
+    outcome_var = {}
+    for name, value in (marker_step.get("env") or {}).items():
+        for mint_id in MINT_STEP_IDS:
+            if str(value).strip() == "${{ steps.%s.outcome }}" % mint_id:
+                outcome_var[mint_id] = name
+    chk("seam: every mint step's outcome reaches the marker through exactly one env var",
+        sorted(outcome_var), sorted(MINT_STEP_IDS))
+    entry_re = re.compile(
+        r'"([A-Za-z0-9][A-Za-z0-9-]*)=\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}"')
+    chk("seam: the producer's entry list is EXACTLY one `<owner>=<that owner's outcome var>` per "
+        "mint step — no owner dropped, none invented, none wired to the wrong mint",
+        sorted(entry_re.findall(run_body)),
+        sorted((owner_of[mint_id], outcome_var[mint_id]) for mint_id in outcome_var))
+
+    # ... and then the producer is EXECUTED, because an entry literal that the loop never consumes
+    # is still vacuous. Pure shell over three env vars and a temp file: no network, no token.
+    all_success = {var: "success" for var in outcome_var.values()}
+    chk("seam: RUNNING the live producer with every mint successful emits ONE name that parses to "
+        "exactly the minted owner set",
+        parse_marker_name(emit_marker_name(run_body, all_success)), (minted_owners, set()))
+    chk("seam: RUNNING it with no outcome set at all marks every owner SKIPPED — an absent "
+        "outcome must fail closed, never read as a successful mint",
+        parse_marker_name(emit_marker_name(run_body, {})), (set(), minted_owners))
+    # The harness's own fail-closed path: a producer that RUNS but exits non-zero has emitted no
+    # marker, whatever it managed to write first. Without this row that branch never executes, and
+    # a broken producer could satisfy the rows above from a partial write.
+    chk("seam: a producer that exits non-zero yields NO name, however much it wrote first",
+        emit_marker_name(run_body + "\nexit 3\n", all_success), None)
+    for mint_id in MINT_STEP_IDS:
+        owner = owner_of[mint_id]
+        # A mint whose outcome var went missing is caught by the check above; substitute a name
+        # that cannot occur so the rows below RED instead of raising. A mutant that aborts the
+        # suite records as a kill while every check after it never runs (AGENTS.md item 4).
+        mint_var = outcome_var.get(mint_id, "MINT_OUTCOME_VAR_MISSING")
+        one_down = {var: ("success" if other != mint_id else "failure")
+                    for other, var in outcome_var.items()}
+        chk(f"seam: RUNNING it with only `{mint_id}` failed skips EXACTLY `{owner}` — this is the "
+            "one-to-one wiring, and it reds if that entry reads another mint's outcome var",
+            parse_marker_name(emit_marker_name(run_body, one_down)),
+            (minted_owners - {owner}, {owner}))
+        # MUTANT: delete this owner's entry from the live producer. The all-success emission must
+        # STOP matching the minted owner set, or the assertion above is satisfiable without the
+        # entry and the whole seam is decorative.
+        pattern = re.compile(
+            r'\s*"%s=\$\{%s(?::-[^}]*)?\}"' % (re.escape(owner), re.escape(mint_var)))
+        mutant, removed = pattern.subn("", run_body, count=1)
+        chk(f"seam: MUTANT — deleting `{owner}`'s entry is detected (one entry removed, and the "
+            "emitted marker then no longer names the minted owner set)",
+            (removed, parse_marker_name(emit_marker_name(mutant, all_success))
+             == (minted_owners, set())), (1, False))
+
+    # ROUND TRIP against the LIVE owner list. The checks above test the producer; this one tests
+    # what the transition DELIVERS INTO — it takes the owners the workflow actually mints for,
+    # builds the exact names that shell emits for them, and pushes them through the live parser. A
+    # grammar both halves agree on but that yields no owners would satisfy everything above and
+    # still detect nothing (AGENTS.md item 11).
     for word, expected in ((MARKER_OK, (minted_owners, set())),
                            (MARKER_SKIP, (set(), minted_owners))):
         built = TICK_MARKER_PREFIX + "".join(
@@ -1265,9 +1681,15 @@ def _test_workflow_seam(chk):
     # Denominated in the LIVE cron period, not a duplicated `15`: retention and threshold are only
     # coherent together, and slowing the cron is exactly how a retention window that looks generous
     # silently stops covering a threshold-length streak.
+    retention_minutes = int((upload.get("with") or {}).get("retention-days") or 0) * 24 * 60
     chk("seam: the marker is retained long enough to prove a threshold-length streak",
-        int((upload.get("with") or {}).get("retention-days") or 0) * 24 * 60
-        >= (SKIP_STREAK_THRESHOLD + 1) * _cron_period_minutes(workflow), True)
+        retention_minutes >= (SKIP_STREAK_THRESHOLD + 1) * _cron_period_minutes(workflow), True)
+    # The PROVENANCE window has to outlast the artifacts it validates. One page of scheduled runs
+    # is the whole run set this reader will accept; if it reached back less far than retention,
+    # markers still in the listing would quietly stop being validatable — a shortened history with
+    # nothing to show for it. Denominated in the live cron, so speeding the cron up reds here.
+    chk("seam: one page of scheduled runs reaches back at least as far as the marker retention",
+        RUN_PAGE_SIZE * _cron_period_minutes(workflow) >= retention_minutes, True)
 
     # ORDER. The marker must be written AFTER both mints (or it cannot know their outcome) and
     # BEFORE the sweep (or a sweep failure erases the tick's only mint evidence).

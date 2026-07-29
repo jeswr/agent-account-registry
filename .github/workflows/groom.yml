@@ -193,6 +193,15 @@ jobs:
       # contents, so no download and no token — and pages once an owner has been skipped on
       # SKIP_STREAK_THRESHOLD consecutive ticks.
       #
+      # THE NAME IS NOT PROVENANCE (review round 1). `/repos/{repo}/actions/artifacts` is
+      # repository-WIDE and a `pull_request` run executes the PR branch's OWN workflow files, so
+      # anyone who can open a PR here could publish an artifact called `groom-mint-tick.ok-jeswr`.
+      # The watchdog therefore counts a marker only when its run is in a set it derives
+      # independently from the groom workflow's own runs listing: this workflow file BY PATH, on
+      # the DEFAULT BRANCH, triggered by `schedule` (the one trigger that cannot be aimed at a
+      # ref). A marker uploaded by the `workflow_dispatch` runs this file also declares is
+      # deliberately NOT evidence — excluding it can only ever delay a page, never fabricate one.
+      #
       # THE NAME IS THE WHOLE SIGNAL, and its grammar is asserted from BOTH sides
       # (scripts/groom-mint-alert.py's TICK_MARKER_PREFIX/MARKER_OK/MARKER_SKIP against this very
       # step, by its --self-test):
@@ -609,10 +618,15 @@ jobs:
   # self-grooming half its target surface indefinitely with nothing to page on.
   #
   # This job closes that hole with the same posture dispatch-stall uses one job above: alarm on the
-  # CONDITION, not on the run. It reads ONE artifacts listing, derives a per-owner consecutive-skip
-  # streak from the marker NAMES the `groom` job uploads (no download, no token, no secret), and
-  # upserts one rolling `ops-alert` per owner past the threshold, auto-closing on the first tick
-  # that mints again.
+  # CONDITION, not on the run. It derives a per-owner consecutive-skip streak from the marker NAMES
+  # the `groom` job uploads (no download, no token, no secret) and upserts one rolling `ops-alert`
+  # per owner past the threshold, auto-closing on the first tick that mints again.
+  #
+  # It costs THREE reads, and the first two are the provenance check, not overhead: the artifacts
+  # listing is repository-wide and an artifact name is author-controlled text, so the repo's default
+  # branch and the groom workflow's own scheduled runs on it are read FIRST and a marker counts only
+  # if its run is in that set. Any of the three refused = no validated evidence = neither a page nor
+  # a close (see ALLOWED_TICK_EVENTS in scripts/groom-mint-alert.py).
   #
   # NO `needs:` and NO `if:`, on purpose and asserted by scripts/groom-mint-alert.py's self-test —
   # a watchdog suppressed by the failure of the sweep it shares a workflow file with is not a
@@ -630,7 +644,7 @@ jobs:
     environment: dispatch-secrets
     # Repair authority, never admission authority. Pinned by the self-test.
     permissions:
-      actions: read   # list this repo's artifacts (the only signal)
+      actions: read   # list this repo's artifacts AND the groom runs that validate them
       contents: read  # the sparse checkout below
       issues: write   # upsert/close the rolling per-owner ops-alert issues
     steps:
