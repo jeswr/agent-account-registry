@@ -620,7 +620,7 @@ def rendered_prose(html, repo):
     so a positive allowlist over that vocabulary has a well-defined unknown case, and the unknown
     case here REFUSES.
 
-    HONEST LIMITS — MEASURED, over a 105-shape corpus rendered by the live `POST /markdown` and
+    HONEST LIMITS — MEASURED, over a 106-shape corpus rendered by the live `POST /markdown` and
     frozen in `scripts/fixtures/auto-mint-provenance/rendered-oracle.json`, plus every rendered
     title and body of the live enrolled-class population.
 
@@ -631,11 +631,14 @@ def rendered_prose(html, repo):
     not only by measurement: `closing_references` requires GitHub's own anchor as a conjunct, so a
     row cannot bind without it.
 
-    THE RESIDUAL DIVERGENCES ALL POINT THE OTHER WAY — 24 corpus rows where GitHub resolves the
-    reference and this file refuses. The list is pinned BY NAME in --self-test, so this paragraph
-    cannot drift away from what the corpus measures — which is exactly what it did for three
-    rounds. They are not one kind, so they are not summarised as one:
+    THE RESIDUAL DIVERGENCES ALL POINT THE OTHER WAY — 25 corpus rows where GitHub emitted an
+    anchor somewhere in the row and this file refuses. The list is pinned BY NAME in --self-test,
+    so this paragraph cannot drift away from what the corpus measures — which is exactly what it did
+    for three rounds. They are not one kind, so they are not summarised as one:
 
+      * ONE IS NOT A DIVERGENCE AT ALL: `a quoted anchor cannot resolve a run-on written in prose`.
+        The oracle column is DOCUMENT-level, and that row deliberately mixes an unresolved run-on in
+        prose with a resolved mention in a blockquote. GitHub resolves neither as a declaration.
       * DELIBERATE GRAMMAR NARROWING (9 rows): a bare mention, `Refs #N`, a cross-repository
         `owner/repo#N`, a conventional-commit scope `fix(#869):`, a keyword inside another word,
         a keyword not adjacent to the number, `Closes GH-929`, `Closes <issue URL>`, and
@@ -1510,6 +1513,13 @@ RENDERED_ORACLE_CORPUS = (
     ('a number that does not exist is not a reference', 't', 'Closes #99999999', False),
     ('an unresolved run-on beside a real declaration still binds the real one', 't',
      'Closes #929abc and closes #929', True),
+    # WHERE THE ANCHOR IS COLLECTED FROM, and why it is only from PROSE. A blockquote QUOTING a
+    # reference carries a real `issue-link` anchor, so collecting anchors regardless of quote depth
+    # would let quoted text SATISFY the third conjunct for a run-on the author wrote in their own
+    # prose — a spurious mint out of two halves neither of which is a declaration. MEASURED on this
+    # exact body: `anchored` is empty as shipped and `[929]` with the quote-depth guard removed.
+    ('a quoted anchor cannot resolve a run-on written in prose', 't',
+     'Closes #929abc\n\n> quoting an old comment that says #929\n', False),
 )
 
 
@@ -1722,10 +1732,19 @@ def _self_test():                                                       # noqa: 
     # row GitHub resolves and this file refuses — the recoverable direction. The count is pinned so
     # the `rendered_prose` docstring cannot drift away from what the corpus measures, which is
     # exactly what happened for three rounds.
-    check("...so every remaining divergence is a MISSED mint, and there are 24 of them",
+    #
+    # ONE ROW IN THIS LIST IS NOT A TRUE DIVERGENCE, and saying so is cheaper than a number that
+    # quietly means two things. `github_linkified` is a DOCUMENT-level column — "GitHub anchored
+    # #929 somewhere in this row" — and `a quoted anchor cannot resolve a run-on written in prose`
+    # deliberately mixes contexts: the anchor GitHub emitted is for the QUOTED mention, not for the
+    # `#929abc` run-on, which GitHub does not resolve either. It is listed because the column cannot
+    # tell the two apart, not because a declaration was missed. SAFETY is unaffected either way.
+    check("...so every remaining divergence is a MISSED mint, and there are 25 of them",
           sorted(label for label, binds in oracle_binds.items()
                  if oracle["github_linkified"].get(label) and not binds),
-          sorted(["GH- form", "Refs is not a closing keyword", "bare mention", "blockquote",
+          sorted(["GH- form", "Refs is not a closing keyword",
+                  "a quoted anchor cannot resolve a run-on written in prose",
+                  "bare mention", "blockquote",
                   "blockquote lazy paragraph", "bold emphasis around the keyword",
                   "code span between keyword and number", "conventional-commit scope",
                   "emphasis inside the keyword", "html <blockquote> passthrough",
@@ -1924,6 +1943,14 @@ def _self_test():                                                       # noqa: 
     foreign = refs("t", "Closes #7", lambda _t: (
         '<p>Closes #7 (see <a class="issue-link" '
         'href="https://github.com/other/repo/issues/7">other/repo#7</a>)</p>'))
+    # ...and the anchor must be in PROSE. A blockquote that merely QUOTES a reference carries a real
+    # `issue-link` anchor; letting it satisfy the conjunct would mint from two halves neither of
+    # which is a declaration. MEASURED with the live renderer before this row existed.
+    quoted_anchor = refs("t", "Closes #7abc", lambda _t: (
+        '<p>Closes #7abc</p><blockquote><p>see <a class="issue-link" href="https://github.com/'
+        + ORACLE_CONTEXT_REPO + '/issues/7">#7</a></p></blockquote>'))
+    check("ANCHOR HALF — an anchor inside QUOTED context does not resolve a run-on in prose",
+          (quoted_anchor.declared, quoted_anchor.unresolved), ([], [7]))
     check("ANCHOR HALF — an anchor into ANOTHER repository does not resolve OUR number",
           (foreign.declared, foreign.unresolved), ([], [7]))
     # ...and a `pull/` href DOES satisfy it, deliberately. Dropping it would make
