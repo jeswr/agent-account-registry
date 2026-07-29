@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4962,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d650c85c0ac9185631db33091b07b776148a7d46",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change adds a fail-closed create-specific authorization path that rejects control-document names and structurally ambiguous child names before consulting ACL state. The bounded repeated percent-decoding, final-segment suffix check, and definitive denial behavior are internally consistent with the documented threat model. The integration test is non-vacuous: it materializes the real WAC authorization view, establishes that the attacker genuinely has Append and can create a benign child, then verifies that control-document spellings remain denied; it also covers controllers, alternate modes, unmaterialized state, existing ACL shadowing, and unsafe segments. The new public API is re-exported and its corresponding access-control skill and crate README are updated. No correctness, soundness, security, or test-validity defect is evident in the diff.",
+  "verdict": "approve"
+ }
+}
