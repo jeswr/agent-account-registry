@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4957,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "15b9f224da1cf291a6156b7a713c9d544592da6d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior major findings. Pre-session admission now classifies the complete top-level JSON value before dispatch, refuses mixed or multiple-initialize batches, and has a non-vacuous mutation witness proving a smuggled tools/call is not executed. Connection handling now uses an atomic bounded permit acquired before worker spawn, releases it through Drop on every worker exit path, refuses over-cap sockets without spawning, and includes a real-socket slow/incomplete-request test demonstrating the cap and subsequent slot recovery. The feature remains opt-in, the public documentation was updated, and no new correctness, soundness, or security defect was found in the changed paths.",
+  "verdict": "approve"
+ }
+}
