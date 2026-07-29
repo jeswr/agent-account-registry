@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5076,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "83abf94e386b19f691729d463d6ea154ab3bbc1a",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 9 now correctly states that imported citations were rewritten with RSS/PSS namespaces and in-repo section pointers, but `crates/sparq-lws-core/README.md:110` still says: \"Doc-comments here still cite source-repo paths; \u00a71 of that record maps each one.\" That stale public-facing statement contradicts this diff's migration description and the new crate-level documentation. Although the contradiction is outside this file, it directly makes this file's claim that the citation estate is now consistently rewritten incomplete.",
+    "file": "research/lws-design-records.md",
+    "fix_hint": "Update the crate README in this PR to describe the current state: citations are namespaced and doc-comments point to `research/lws-design-records.md`, while the original upstream ADR/design trees are still absent and the in-repo record is a reconstruction rather than a transcription.",
+    "severity": "minor",
+    "title": "The rewritten-citation claim still conflicts with the crate README"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-2 inconsistency in \u00a79 is fixed: the limitations now accurately say that citations were rewritten to resolve through the reconstructed record while the upstream trees remain absent. However, the PR leaves the crate README saying the opposite\u2014 that doc-comments still contain stale source-repo citations and only the map makes them resolvable. That makes the migration's public documentation inconsistent and means the citation rewrite is not complete as documented. This is materially the same minor documentation-completeness problem as round 2, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
