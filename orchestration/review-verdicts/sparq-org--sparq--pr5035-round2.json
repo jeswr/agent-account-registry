@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5035,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5b7f9860a3447dd34de2b98c6afbfffb06fd3eba",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`result_vars` deliberately unions the two engines' headers, but `compare_select` never compares those headers for equality. Therefore an engine may incorrectly omit or add a projected variable (especially a projected-but-unbound variable) while producing identical bound row maps, and the harness reports `Multiset`/`Ordered` success or a row-choice skip instead of a mismatch. The new regression proves that headers preserve the variable needed for window-totality analysis, but it supplies matching headers and does not prove that a header defect is detected. This leaves the round-1 requirement to preserve and require compatible result variables unresolved.",
+    "file": "crates/sparq-bench/src/fuzz.rs",
+    "fix_hint": "Before window classification or row comparison, compare the two result-variable headers under the intended projection-order policy and return a mismatch when their variable sets differ. Then use that validated header set for `is_total_order` (keeping the bound-row union only as a defensive consistency check). Add a mutation regression where one `Answer` drops projected-but-unbound `?o` from its header while both row maps are identical; the comparison must fail rather than pass or skip.",
+    "severity": "major",
+    "title": "Result-header disagreements are silently accepted"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-1 sliced-row totality defect is partially addressed: projected-but-unbound variables are now retained from result headers, and the new regression exercises that path. However, the implementation unions the two headers without ever requiring them to agree. That makes a real result-shape divergence invisible, so the value-level differential remains incomplete at the same major severity.",
+  "verdict": "request_changes"
+ }
+}
