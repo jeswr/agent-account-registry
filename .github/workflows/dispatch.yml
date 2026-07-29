@@ -240,6 +240,14 @@ jobs:
       # this tick publishes is one no target code was ever in a position to touch. A restore that
       # finds nothing is not an error: plan-snapshot.py degrades an absent or malformed store to
       # exactly today's unconditional sweep.
+      #
+      # SIZE, measured rather than assumed, because each tick writes a NEW key (cache entries are
+      # immutable, so there is no overwrite) and they accumulate until GitHub's 7-day / 10 GB LRU
+      # reclaims them: the 214 check-runs payloads of a live tick total 440 KiB — mean 2.1 KiB,
+      # largest 13.6 KiB — so ~0.43 MiB per tick, and even at the floor's 6 ticks/h ceiling for a
+      # full 7 days that is ~0.42 GiB against a 10 GB repository quota. Nothing else in this
+      # repository uses actions/cache, so the only entries this can ever evict are its own older
+      # ones.
       - name: Restore the cross-tick ETag store (pinned)
         id: etag-restore
         uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
