@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4988,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "45f2b689241457eb5c0c17d5abba5aaf9342c4aa",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The prior-round issue remains: stub_with_timeout constructs sparq-oracle-stub-<pid>-<counter>.py in std::env::temp_dir(), writes it with fs::write, and executes that path. The symlink regression test likewise creates sparq-oracle-victim-<pid>.txt there with fs::write. A local user can pre-create either predictable path as a symlink, so cargo test may overwrite another file writable by the runner; the executable stub also remains vulnerable to replacement between creation and spawn. Securing production Scratch does not secure these test-executed paths.",
+    "file": "crates/sparq-bench/src/oracle.rs",
+    "fix_hint": "Create each executable stub and the victim inside private tempfile::TempDir instances, or use securely and atomically created NamedTempFile/create_new handles with appropriate permissions. Execute only the securely created stub path. Keep only the inert planted symlink names directly in the shared temp directory, while their target and all executable test artifacts live in private owner-only directories.",
+    "severity": "major",
+    "title": "Test helpers still use predictable files in the shared temp directory"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 leaves the round-3 major security finding materially unchanged. Although production Scratch uses a private owner-only TempDir, stub_with_timeout still writes and then executes a predictable PID/counter-derived Python path directly under the shared system temp directory, and the symlink regression test still writes its victim to a predictable PID-derived shared-temp path. Another local user can pre-create either as a symlink, causing the test runner to overwrite a writable link target; the stub path also retains a substitution/race risk before Python executes it. Progress is stagnant because the same major issue remains at the same severity.",
+  "verdict": "request_changes"
+ }
+}
