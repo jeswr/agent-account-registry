@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4994,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1c132a91338695201b6c465d099142f8be1930a4",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior major findings. Verification now separates authenticated mappings from unauthenticated body-marker decoys, authenticating only via the migration label, an exact checkpoint pair, or the existing migration-owned author/title contract; focused tests cover both a sole decoy and a decoy beside a valid mapping. Edge detection now rejects numeric-prefix collisions such as expected #2 versus present #20/#21, and the shared predicate is exercised for both verifier and writer behavior. The focused self-test passes. No new correctness, soundness, test-validity, or security issue was found in the diff.",
+  "verdict": "approve"
+ }
+}
