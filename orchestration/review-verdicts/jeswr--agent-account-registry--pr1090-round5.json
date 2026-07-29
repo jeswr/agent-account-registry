@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1090,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "dcd45c0f29d9110388dadd7581b3fbc0453d379c",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "sanitize_message removes only `\\n` before calling sanitize_subject. For a line such as `claim 0123abcd [redacted-account] bench/impl\\r\\n`, the subject passed to LEGACY_CLAIM_SUBJECT_RE ends in `\\r`, so the `$`-anchored pattern does not match and the handle remains. In contrast, scan uses message.splitlines(), which strips the CRLF and classifies the same line as a legacy subject. Thus rewrite runs filter-branch, moves the local branch, creates refs/original/, and only then refuses in post-verification. CRLF is valid commit-message data, so the rewrite is incomplete for an input its verifier explicitly recognizes.",
+    "file": "scripts/ledger-history-purge.py",
+    "fix_hint": "Split each line into content and its exact line terminator (supporting at least `\\n`, `\\r\\n`, and `\\r`), sanitize only the content, then append the terminator byte-for-byte. Add a non-vacuous test with a real CRLF legacy claim message that proves scan reports an exposure before rewrite, rewrite succeeds, the subject is handle-free afterward, and the remaining message bytes/line ending are preserved.",
+    "severity": "major",
+    "title": "CRLF legacy claim lines are detected but not sanitized"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe regate-sweep clock injection is correctly carried into Sweeper and the new entry-point controls distinguish a live dry run from an expired/inert sweep. However, the history purge has a message-boundary mismatch: scan recognizes legacy claim lines terminated with CRLF, while sanitize_message passes the trailing carriage return into sanitize_subject, whose anchored regex then does not match. Rewrite therefore changes the local ref and creates refs/original/, then fails its post-scan with the exposure still present. Because this prevents the documented purge from completing on valid Git commit-message bytes and consumes the one-shot backup namespace, I am requesting changes. This is a new major finding after round 4's clean verdict, so progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
