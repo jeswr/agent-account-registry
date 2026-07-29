@@ -61,6 +61,19 @@ jobs:
       # the author's trust says NOTHING about (PR #998 r1 f1). Both are judged below.
       ACTOR: ${{ github.event.sender.login }}
       ACTION: ${{ github.event.action }}
+      # The issue's REAL GitHub issue type, straight from the event payload (#598). This step used
+      # to pass the LITERAL `--type task`, so `ROLE_BY_TYPE["task"]` always resolved and the
+      # area-derived role default added for #225 could never fire in production — it was
+      # defence-in-depth against a caller that did not exist. Passing the payload's own value makes
+      # it load-bearing: an UNTYPED issue, and one whose type is outside ROLE_BY_TYPE, now derive
+      # their role from the issue's `area:*` instead of being silently rewritten to `task`
+      # (-> role:impl). Concretely: an untyped `area:docs` issue reaches the docs chain, which is
+      # the derivation #225 declared and this caller was overriding.
+      # This expression is EMPTY when the issue carries no type — `triage.normalize_issue_type`
+      # keeps it empty (GitHub's own "no type" answer) and `_role` falls through to the area map.
+      # Read through env and quoted at the use site, never interpolated into the shell: issue-type
+      # names are org-owned rather than author-owned, but the untrusted-input posture is uniform.
+      ISSUE_TYPE: ${{ github.event.issue.type.name }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -149,4 +162,4 @@ jobs:
       # post-condition failure must turn this step RED, not strand an issue quietly.
       - name: Static triage (trusted author)
         if: steps.trust.outputs.trusted == '1'
-        run: python3 scripts/triage.py --apply --repo "$REPO" --number "$NUM" --type task
+        run: python3 scripts/triage.py --apply --repo "$REPO" --number "$NUM" --type "$ISSUE_TYPE"

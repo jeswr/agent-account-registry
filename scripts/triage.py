@@ -228,6 +228,18 @@ AREA_ROLE_DEFAULT = {
 }
 _PRIO = re.compile(r"^priority:P([0-4])$")
 ROLE_PREFIX = "role:"
+# [#598] The type assumed when a CALLER SAYS NOTHING AT ALL — the `triage()` signature default and
+# the `--type` CLI default, i.e. hand-runs and direct in-process calls. It is NOT what an issue
+# GitHub reports as untyped resolves to: that is `""`, which `_role` deliberately falls through to
+# the area map (#225's decided semantics; `normalize_issue_type`).
+#
+# THE #598 DEFECT this names: both triage callers used to pass this string as a LITERAL —
+# `triage-issue.yml` ran `--type task`, `retriage.plan()` called `classify(labels, "task", ...)` —
+# so `ROLE_BY_TYPE["task"]` ALWAYS resolved, whatever the issue's real type was, and
+# AREA_ROLE_DEFAULT (#225) was defence-in-depth that could not fire in production. Both callers now
+# pass the issue's REAL GitHub type, so an untyped issue and a type outside ROLE_BY_TYPE both reach
+# the area map, which is what #225 built it for.
+DEFAULT_ISSUE_TYPE = "task"
 
 
 class RoleInvariantError(RuntimeError):
@@ -395,6 +407,10 @@ def _role(labels, issue_type):
     # type (or a type outside ROLE_BY_TYPE) still derives a role instead of silently becoming
     # undispatchable. Strictly a WIDENING — it fires only where the type map returned None, so no
     # existing derivation changes.
+    # [#598] `issue_type` is now the issue's REAL type (normalized by `normalize_issue_type` in
+    # `triage()`), not the literal `task` both callers used to hard-code — which is what makes this
+    # line reachable in production at all. It fires for an UNTYPED issue (`""`) and for any type
+    # GitHub reports that ROLE_BY_TYPE does not name; a mapped type still short-circuits above it.
     return ROLE_BY_TYPE.get(issue_type) or _area_default(labels)
 
 
@@ -412,8 +428,31 @@ def _assert_role_invariant(current, add, remove, ready):
             "registry #582: that state is silently undispatchable and terminal")
 
 
-def triage(labels, issue_type="task", trusted=True, known_labels=None):
+def normalize_issue_type(raw):
+    """GitHub's issue-type NAME -> a ROLE_BY_TYPE key. THE one definition (#598).
+
+    GitHub renders the type as a DISPLAY name (`"Bug"`, `"Documentation"`) while ROLE_BY_TYPE is
+    keyed lower-case, so this lower-cases and strips. Every shape carrying no usable name — `None`
+    (how GitHub renders an issue with NO type), `""`, whitespace, and any non-string (a raw
+    `{"name": …}` object handed in by mistake, schema drift) — collapses to `""`, which `_role`
+    already treats as "no type": `ROLE_BY_TYPE.get("")` is None, so the derivation falls through to
+    the area map. That is #225's decided semantics, unchanged here — #598 changes the CALLERS, not
+    this contract.
+
+    The case fold is a FIX, not cosmetics: before #598 nothing lower-cased, so a real GitHub `Bug`
+    would have missed `ROLE_BY_TYPE["bug"]` and silently derived its role from the area map instead
+    — a typed issue treated as untyped. Both directions are pinned by `_self_test`.
+    """
+    return raw.strip().lower() if isinstance(raw, str) else ""
+
+
+def triage(labels, issue_type=DEFAULT_ISSUE_TYPE, trusted=True, known_labels=None):
     """Return {add:set, remove:set, ready:bool, role:str|None, warnings:list}.
+
+    `issue_type` is the issue's RAW GitHub type NAME (#598) — display-cased, `""`/None when the
+    issue has no type. Normalized here, ONCE, by `normalize_issue_type`, so every caller (the
+    `--type` CLI, retriage's planner, a direct call) gets the same mapping and no caller has to
+    remember to lower-case. An untyped issue derives its role from its `area:*` (issue #225).
 
     Untrusted -> a no-op (the trust layer quarantines/notifies; content is never inspected here).
 
@@ -428,7 +467,7 @@ def triage(labels, issue_type="task", trusted=True, known_labels=None):
     if not trusted or "trust:untrusted" in labels:
         return {"add": set(), "remove": set(), "ready": False, "role": None, "warnings": [],
                 "priority_reason": "untrusted"}
-    role = _role(labels, issue_type)
+    role = _role(labels, normalize_issue_type(issue_type))
     add, remove, warnings = set(), set(), []
     existing = _roles_of(labels)
     if role:
@@ -1020,6 +1059,54 @@ def _self_test():
     # never entered any dispatch plan).
     r = triage(["priority:P2", "area:usage"], "")
     chk("untyped registry issue becomes ready", (r["ready"], "role:impl" in r["add"]), (True, True))
+
+    # -----------------------------------------------------------------------------------------------
+    # [#598] THE TYPE NORMALIZER. The single definition every caller routes through, so nobody has
+    # to remember to lower-case a GitHub DISPLAY name. Each row is a distinct shape and each one
+    # dies on a different mutation: dropping `.lower()`, dropping `.strip()`, dropping the
+    # `isinstance` guard, or "helpfully" defaulting an empty type to DEFAULT_ISSUE_TYPE (which
+    # would silently re-close the #225 area fallback this issue exists to open).
+    for _raw, _want in (("bug", "bug"), ("Bug", "bug"), ("  Task  ", "task"),
+                        ("Documentation", "documentation"), ("", ""), ("   ", ""), (None, ""),
+                        ({"name": "Bug"}, ""), (7, "")):
+        chk(f"[#598] normalize_issue_type({_raw!r})", normalize_issue_type(_raw), _want)
+    # ...and the case fold is LOAD-BEARING, not cosmetic: an un-folded `Bug` misses ROLE_BY_TYPE and
+    # a TYPED issue would be derived as if it were untyped. `area:docs` is the one area whose
+    # fallback role differs from `ROLE_BY_TYPE["bug"]`, so it is the only fixture that can tell the
+    # two apart — this row reads `impl` and goes RED the moment the fold is removed.
+    chk("[#598] a DISPLAY-cased type still resolves through ROLE_BY_TYPE, not the area map",
+        triage(["priority:P2", "area:docs"], "Bug")["role"], "impl")
+    # The #598 payoff, both directions on the SAME label set, so neither can be faked by a constant:
+    # a type ROLE_BY_TYPE names wins; a type it does not name (and no type at all) falls through to
+    # the area map. Before #598 both callers passed the literal `task`, so only the first row was
+    # ever reachable in production.
+    chk("[#598] a MAPPED type wins over the area default",
+        triage(["priority:P2", "area:docs"], "task")["role"], "impl")
+    chk("[#598] an UNMAPPED type falls through to the area default",
+        triage(["priority:P2", "area:docs"], "Documentation")["role"], "docs")
+    chk("[#598] ...and so does an UNTYPED issue (the #225 semantics, unchanged)",
+        triage(["priority:P2", "area:docs"], "")["role"], "docs")
+    # The fallback is still FAIL-CLOSED for an area the map cannot classify: an unmapped type does
+    # NOT invent a role, it leaves the issue parked. (Kills "widen the fallback to a default role".)
+    _unmapped = triage(["priority:P2", "area:nonesuch"], "Documentation")
+    chk("[#598] an unmapped type + an unmapped area derives NO role and is not ready",
+        (_unmapped["role"], _unmapped["ready"]), (None, False))
+    # WHO CAN WRITE WHAT THIS READS (AGENTS.md pre-flight 5). #598 turns a previously-constant
+    # input into one an issue AUTHOR influences: any author can pick the issue's type from the
+    # org's list. Org owners define the names, so an author cannot invent one — but it must not
+    # matter either way, because a trust-surface label makes the trust-plane lane UNCONDITIONAL
+    # (`_role` tests SEC_KEYWORDS first, before kind/UI/infra/type/area). Asserted over the whole
+    # type space the classifier can see — every ROLE_BY_TYPE key, plus untyped and an off-list
+    # name — so no type an author selects can route trust-plane work off the human-armed chain.
+    # The fixture is a DOCS issue about the WORKER, deliberately: `area:dispatch` alone could not
+    # discriminate, because AREA_ROLE_DEFAULT["dispatch"] is itself TRUST_PLANE_ROLE, so the row
+    # would read `impl` even with the SEC_KEYWORDS short-circuit deleted (a value-identical
+    # survivor, AGENTS.md pre-flight 4). With two areas whose defaults DISAGREE, the area map
+    # returns None and only the trust-surface lane can produce a role at all.
+    chk("[#598] NO issue type can move a trust-surface issue off the trust-plane lane",
+        {triage(["priority:P1", "area:docs", "area:worker"], _t)["role"]
+         for _t in list(ROLE_BY_TYPE) + ["", "Documentation", "  DOCS  ", None]},
+        {TRUST_PLANE_ROLE})
     # AMBIGUOUS area defaults -> no role at all (fail closed), never an arbitrary pick.
     chk("conflicting area defaults -> no role",
         triage(["priority:P2", "area:usage", "area:docs"], "")["role"], None)
@@ -1428,7 +1515,11 @@ def _self_test():
     # never declared it (exit 2 live, enrolled suite green). Derived from the workflow FILE so it
     # cannot drift back.
     triage_wf = os.path.join(root, ".github/workflows/triage-issue.yml")
-    argvs = workflow_argvs(triage_wf, "triage.py", {"REPO": "o/r", "NUM": "7"})
+    # `ISSUE_TYPE` is substituted with a type ROLE_BY_TYPE does NOT name (#598), so the replay below
+    # is an EXACT-MATCH assertion on what the workflow really passes: a step that goes back to the
+    # literal `--type task` — the defect #598 names — dispatches `"task"` and turns this row RED.
+    argvs = workflow_argvs(triage_wf, "triage.py",
+                           {"REPO": "o/r", "NUM": "7", "ISSUE_TYPE": "Documentation"})
     options = declared_options(build_parser())
     chk("[#595 f2] triage-issue.yml invokes scripts/triage.py at least once", len(argvs) >= 1, True)
     chk("[#595 f2] every flag triage-issue.yml passes is DECLARED by the parser",
@@ -1445,7 +1536,50 @@ def _self_test():
     finally:
         globals()["_apply_cli"] = real_apply_cli
     chk("[#595 f2] the workflow-shaped ARGV parses and reaches _apply_cli with its values",
-        (code, dispatched), (0, {"repo": "o/r", "number": "7", "type": "task"}))
+        (code, dispatched), (0, {"repo": "o/r", "number": "7", "type": "Documentation"}))
+    # [#598] ...and the value it forwards really comes from the EVENT PAYLOAD. The replay above
+    # substitutes `$ISSUE_TYPE` from a dict, so it would stay green for a workflow that passes an
+    # env var nothing ever defines — the argv would be `--type ""` live, and every issue would look
+    # untyped. Assert the binding in the YAML itself, exact-match, on the comment-stripped body.
+    chk("[#598] triage-issue.yml BINDS ISSUE_TYPE to the issue event's own type name",
+        f"ISSUE_TYPE: ${{{{ github.event.issue.type.name }}}}" in "\n".join(
+            line.strip() for line in open(triage_wf, encoding="utf-8").read().splitlines()
+            if not line.strip().startswith("#")), True)
+    # [#598] ...and `_apply_cli` FORWARDS it to the classifier. Every row above stubs `_apply_cli`
+    # out, so its own body is never executed by the replay (measured with `python3 -m trace --count
+    # --missing`: the whole function unexecuted) and a `triage(current, "task", …)` one layer down
+    # would have survived the entire suite — "the fix landed one layer short of the binding layer"
+    # (AGENTS.md pre-flight 11). So drive the REAL `_apply_cli` with `live_gh`/`repo_label_set`
+    # stubbed and spy on what the classifier is handed. The expected value is UN-normalized on
+    # purpose: this row asserts the FORWARD, and `triage()` owns the normalization.
+    forwarded = {}
+    fake_labels, fake_rev = {"priority:P2", "area:docs"}, [0]
+
+    def _fake_edit(add, remove):
+        fake_labels.update(add)
+        fake_labels.difference_update(remove)
+        fake_rev[0] += 1
+
+    real_triage, real_live_gh, real_label_set = triage, live_gh, repo_label_set
+    try:
+        globals()["live_gh"] = lambda repo, number, title="triage": (
+            lambda: (set(fake_labels), fake_rev[0]), lambda: set(fake_labels),
+            _fake_edit, lambda message: None)
+        globals()["repo_label_set"] = lambda repo: set(REAL) | {"role:docs"}
+        globals()["triage"] = lambda labels, issue_type=DEFAULT_ISSUE_TYPE, **kw: (
+            forwarded.update(type=issue_type) or real_triage(labels, issue_type, **kw))
+        apply_code = _apply_cli("o/r", "7", "Documentation")
+    finally:
+        globals()["triage"] = real_triage
+        globals()["live_gh"] = real_live_gh
+        globals()["repo_label_set"] = real_label_set
+    # Both halves matter: the type reaches the classifier UNCHANGED, and the label the applier
+    # actually wrote is the one that type derives. `area:docs` is the fixture that discriminates —
+    # with the pre-#598 literal `task` this lands `role:impl`.
+    chk("[#598] _apply_cli forwards --type through to the classifier, and writes the role it "
+        "derives",
+        (apply_code, forwarded, sorted(lb for lb in fake_labels if lb.startswith("role:"))),
+        (0, {"type": "Documentation"}, ["role:docs"]))
     # the pure (non---apply) CLI path also round-trips, --known-labels included.
     import contextlib
     import io
@@ -1934,7 +2068,11 @@ def build_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--labels", default="", help="comma-separated current labels")
-    ap.add_argument("--type", default="task")
+    # The issue's REAL GitHub type NAME (#598), passed verbatim by triage-issue.yml from
+    # `github.event.issue.type.name` and EMPTY when the issue has no type — which stays empty and
+    # derives the role from the area (#225). The default applies only when a caller omits the flag
+    # entirely (a hand-run), so it keeps that invocation behaving as it always did.
+    ap.add_argument("--type", default=DEFAULT_ISSUE_TYPE)
     ap.add_argument("--untrusted", action="store_true")
     ap.add_argument("--apply", action="store_true",
                     help="read + mutate the live issue FAIL-CLOSED (needs --repo/--number)")

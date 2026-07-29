@@ -205,7 +205,18 @@ def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage,
     if not untriaged and "status:ready" not in labels:
         return {"action": "skip", "reason": "not-retriageable"}
     try:
-        result = classify(labels, "task", trusted=True, known_labels=known_labels)
+        # #598: the issue's REAL type, not the literal `"task"` this used to pass. With the literal,
+        # `ROLE_BY_TYPE["task"]` always resolved, so this sweep could never reach the area-derived
+        # default (#225) that triage-issue.yml now reaches — and the two classifiers would have
+        # disagreed about any custom-typed issue, the promotion lane writing `role:impl` over the
+        # role the event-driven classifier derived. `_apply_cli` puts the LIVE type on the document;
+        # a document with no `type` key — every direct/self-test caller, and only those, since
+        # `snapshot()` deliberately carries none — is UNTYPED, which derives the role from the
+        # `area:*` exactly as triage-issue.yml now does for the same issue.
+        # PASSED RAW, on purpose: `triage()` normalizes, and a SECOND `normalize_issue_type()` call
+        # here would be a mutually-masking duplicate (AGENTS.md pre-flight 4) — idempotent, so
+        # deleting either copy alone would leave every row green and neither could be killed.
+        result = classify(labels, issue.get("type"), trusted=True, known_labels=known_labels)
     except Exception:
         return {"action": "skip", "reason": "classifier-failure"}
     add, remove = set(result["add"]), set(result["remove"])
@@ -442,8 +453,8 @@ def workflow_step_script(text, step_id):
 
 
 def read_live_body(repo, number):
-    """The issue's LIVE `{"body": str, "state": "OPEN"|"CLOSED"}`, through the shared bounded-retry
-    READ layer. RAISES on anything it cannot positively interpret.
+    """The issue's LIVE `{"body": str, "state": "OPEN"|"CLOSED", "type": str}`, through the shared
+    bounded-retry READ layer. RAISES on anything it cannot positively interpret.
 
     #605 review round 2 (a fail-OPEN race): `_apply_cli` refreshed only `labels` from the live
     read, while the `body` that decides the `<!-- orchestration:hold -->` park still came from the
@@ -465,12 +476,23 @@ def read_live_body(repo, number):
     the last decision input still coming from the pre-pagination board query, so a concurrently
     CLOSED issue could still receive promote/repair/repark label mutations. It rides the same read.
 
+    THE ISSUE TYPE RIDES IT TOO (#598), and for the SAME reason: `plan()` used to hand the
+    classifier the LITERAL `"task"`, so `ROLE_BY_TYPE["task"]` always resolved and this sweep could
+    never reach the area-derived role default (#225) that triage-issue.yml now can. Two classifiers
+    deriving different roles for the same issue is the failure this closes — the sweep's promotion
+    lane would have written `role:impl` over the `role:docs` the event-driven classifier derived.
+    It is read LIVE rather than taken from the board snapshot because the type is MUTABLE, and the
+    docstring below (`_apply_cli`) states as an invariant that no mutable snapshot field reaches a
+    decision. `issueType` is `null` for an issue with NO type — a real GitHub state, not drift, and
+    the one tolerated shape here; it yields `""`, which the classifier reads as untyped and derives
+    the role from the area (#225). An ABSENT key is schema drift and raises, exactly like `body`.
+
     A module-level function on purpose — the self-test substitutes the READ under it
     (`triage._gh_read`) so this function's own parsing and validation are the code under test, not
     a stub that replaces them (round-4 MAJOR: stubbing this function left `return ""` and a read of
     issue `1` both green)."""
     raw = static_triage._gh_read(                          # noqa: SLF001 — the one shared read layer
-        ["issue", "view", str(number), "-R", repo, "--json", "body,state"])
+        ["issue", "view", str(number), "-R", repo, "--json", "body,state,issueType"])
     try:
         document = json.loads(raw)
     except (TypeError, ValueError) as exc:
@@ -488,7 +510,25 @@ def read_live_body(repo, number):
     state = document.get("state")
     if not isinstance(state, str) or state.strip().upper() not in {"OPEN", "CLOSED"}:
         raise SweepError(f"issue #{number}: the live read carries no usable `state` ({state!r})")
-    return {"body": body, "state": state.strip().upper()}
+    # #598: `issueType` is `{"id":…, "name":"Bug", …}` for a typed issue and `null` for an untyped
+    # one. Same posture as `body`: an ABSENT key is schema drift and refuses, because a document
+    # that says nothing about the type cannot be read as "untyped" — that would silently re-derive
+    # the role from a value this run never actually observed.
+    if "issueType" not in document:
+        raise SweepError(f"issue #{number}: the live read carries no `issueType` key (schema "
+                         "drift) — the role derivation cannot be trusted from this document")
+    issue_type = document["issueType"]
+    if issue_type is None:
+        name = ""                    # GitHub renders an issue with NO type as JSON null
+    elif isinstance(issue_type, dict) and isinstance(issue_type.get("name"), str):
+        name = issue_type["name"]
+    else:
+        # A typed issue whose type we cannot NAME is drift, not "untyped": only the top-level
+        # `null` above is GitHub's untyped answer, and reading anything else as untyped would
+        # re-derive the role from a value this run never observed.
+        raise SweepError(f"issue #{number}: the live `issueType` is neither null nor an object "
+                         f"with a string `name` ({issue_type!r})")
+    return {"body": body, "state": state.strip().upper(), "type": name}
 
 
 def _apply_cli(repo, number, issue, maintainer, app_bot, permission, known_labels,
@@ -501,7 +541,7 @@ def _apply_cli(repo, number, issue, maintainer, app_bot, permission, known_label
     Reads go through gh_retry; the mutation is single-attempt + fail-loud.
 
     WHICH INPUTS ARE LIVE, stated exactly (#605 review round 4 corrected two words here). Labels,
-    body and open/closed state are re-read LIVE immediately before planning. The snapshot supplies
+    body, open/closed state and — since #598 — the issue TYPE are re-read LIVE. The snapshot supplies
     the issue NUMBER (immutable) and the AUTHOR login — the author DOES reach a decision (it is
     compared against the maintainer/app-bot for trust) but is immutable on GitHub, and a missing
     author reads as untrusted, so a stale copy cannot widen trust. Permission is read fresh per
@@ -524,6 +564,10 @@ def _apply_cli(repo, number, issue, maintainer, app_bot, permission, known_label
               f"orchestration hold cannot be honoured — refusing to act (fail closed): {exc}")
         return 1
     fresh["body"] = document["body"]
+    # #598: the ROLE derivation's other input. `snapshot()` deliberately does not carry a type, so
+    # this key exists only because the live read produced it — a stale board copy must never decide
+    # a role (see the invariant in this docstring).
+    fresh["type"] = document["type"]
     if document["state"] != "OPEN":
         # #605 review round 4 (MINOR): open/closed was the last eligibility input still taken from
         # the pre-pagination board query, so an issue closed during the sweep could still be
@@ -1116,7 +1160,7 @@ def _self_test():
     stale = {"author": {"login": "owner"}, "body": "", "labels": [{"name": "stale:snapshot"}]}
 
     def run_apply_argv(gh, stdin_doc=None, live_body="", body_error=None, live_document=None,
-                       live_state="OPEN", argv=None):
+                       live_state="OPEN", argv=None, live_type=None):
         """Drive main(apply_argv) end-to-end against a fake GitHub. Returns (exit code, spied).
 
         THE STUB BOUNDARY IS `triage._gh_read`, NOT `read_live_body` (#605 review round 4, MAJOR).
@@ -1128,7 +1172,8 @@ def _self_test():
         `live_body` is what the LIVE issue body read returns — distinct from the stdin snapshot's
         body, which is how the #605 round-2 fail-open hold race is exercised. `live_document`
         overrides the whole RAW response text (a malformed success). `body_error` makes the read
-        fail like the real `_gh_read` does, which must stop the write."""
+        fail like the real `_gh_read` does, which must stop the write. `live_type` is the LIVE
+        issue-type name (#598); `None` renders GitHub's untyped answer, a JSON `null` `issueType`."""
         seen = {}
         saved_plan = globals()["plan"]
         saved_read = static_triage._gh_read                # noqa: SLF001 — the seam under test
@@ -1140,6 +1185,7 @@ def _self_test():
                      allow_actions_bot_issues=False):
             seen.update(known_labels=known_labels, maintainer=maintainer, permission=permission,
                         labels=list(issue_doc.get("labels", ())), body=issue_doc.get("body"),
+                        type=issue_doc.get("type"),
                         allow_actions_bot_issues=allow_actions_bot_issues)
             return saved_plan(issue_doc, maintainer, app_bot, permission, classify, known_labels,
                               allow_actions_bot_issues)
@@ -1152,7 +1198,10 @@ def _self_test():
                 raise RuntimeError(f"gh {' '.join(args)} failed: {body_error}")
             if live_document is not None:
                 return live_document
-            return json.dumps({"body": live_body, "state": live_state})
+            return json.dumps({"body": live_body, "state": live_state,
+                               # GitHub renders an issue with no type as a JSON null `issueType`,
+                               # and a typed one as the object below (#598).
+                               "issueType": {"name": live_type} if live_type else None})
 
         try:
             globals()["plan"] = spy_plan
@@ -1442,9 +1491,10 @@ def _self_test():
     code, seen = run_apply_argv(probe, live_body=f"prose\n{HOLD_MARKER}\n")
     body_reads = [args for args in seen.get("reads", []) if args[:2] == ["issue", "view"]]
     checks.append(("[#605 r4 M1] the live body read really goes through the shared read layer, "
-                   "for THIS issue, asking for body+state",
+                   "for THIS issue, asking for body+state+issueType",
                    (code, probe.calls, body_reads)
-                   == (0, [], [["issue", "view", "7", "-R", "o/r", "--json", "body,state"]])))
+                   == (0, [], [["issue", "view", "7", "-R", "o/r",
+                                "--json", "body,state,issueType"]])))
     checks.append(("[#605 r4 M1] ...and its RESULT is what planning saw (not a constant)",
                    seen.get("body") == f"prose\n{HOLD_MARKER}\n"))
 
@@ -1454,14 +1504,27 @@ def _self_test():
     # nothing about the body at all and the write proceeded. Every shape below must now refuse; the
     # ONE tolerated shape (`"body": null`, how GitHub renders an empty body) is pinned separately so
     # the tolerance is a decision rather than a leftover.
+    # The three `[#598]` rows at the END ride the SAME posture for the TYPE half: a document that
+    # says nothing usable about the type cannot be read as "untyped", because that silently
+    # re-derives the role from a value this run never observed. Each of those three carries a
+    # WELL-FORMED body and state, so only the type half can refuse it — that is what stops them
+    # passing vacuously for the body/state reason the rows above them test. The body/state rows in
+    # turn gain a valid `issueType` so THEY keep failing for their own original reason.
     for shape_name, shape in (
-            ("key MISSING", '{"state": "OPEN"}'),
-            ("non-string body", '{"body": 123, "state": "OPEN"}'),
-            ("schema drift", '{"data": {"body": "' + HOLD_MARKER + '"}, "state": "OPEN"}'),
+            ("key MISSING", '{"state": "OPEN", "issueType": null}'),
+            ("non-string body", '{"body": 123, "state": "OPEN", "issueType": null}'),
+            ("schema drift", '{"data": {"body": "' + HOLD_MARKER
+             + '"}, "state": "OPEN", "issueType": null}'),
             ("not an object", '["' + HOLD_MARKER + '"]'),
             ("not JSON at all", 'Not Found'),
-            ("state MISSING", '{"body": ""}'),
-            ("alien state", '{"body": "", "state": "MERGED"}')):
+            ("state MISSING", '{"body": "", "issueType": null}'),
+            ("alien state", '{"body": "", "state": "MERGED", "issueType": null}'),
+            ("[#598] issueType key MISSING", '{"body": "", "state": "OPEN"}'),
+            ("[#598] scalar issueType", '{"body": "", "state": "OPEN", "issueType": "Bug"}'),
+            ("[#598] non-string issueType.name",
+             '{"body": "", "state": "OPEN", "issueType": {"name": 7}}'),
+            ("[#598] issueType object with NO name",
+             '{"body": "", "state": "OPEN", "issueType": {"id": 3}}')):
         malformed = FakeGh(start, known)
         code, seen = run_apply_argv(malformed, live_document=shape)
         checks.append((f"[#605 r4 M2] a malformed live read ({shape_name}) refuses to act, "
@@ -1469,10 +1532,45 @@ def _self_test():
                        (code, malformed.calls, malformed.labels == set(start))
                        == (1, [], True)))
     nulled = FakeGh(start, known)
-    code, seen = run_apply_argv(nulled, live_document='{"body": null, "state": "OPEN"}')
+    code, seen = run_apply_argv(
+        nulled, live_document='{"body": null, "state": "OPEN", "issueType": null}')
     checks.append(("[#605 r4 M2] an explicit JSON null body IS an empty body (the one tolerance)",
                    (code, seen.get("body"), roles_of(nulled.labels),
                     "status:ready" in nulled.labels) == (0, "", {"role:impl"}, True)))
+    # [#598] the mirror tolerance on the type half: `issueType: null` is GitHub's answer for an
+    # issue with NO type, so it must be accepted and read as untyped — not refused, and not
+    # rewritten into a type. Pinned separately so the tolerance stays a decision.
+    untyped = FakeGh(start, known)
+    code, seen = run_apply_argv(
+        untyped, live_document='{"body": "", "state": "OPEN", "issueType": null}')
+    checks.append(("[#598] a null issueType IS 'untyped' (the mirror tolerance), and it plans",
+                   (code, seen.get("type"), roles_of(untyped.labels)) == (0, "", {"role:impl"})))
+    typed = FakeGh(start, known)
+    code, seen = run_apply_argv(typed, live_type="Bug")
+    checks.append(("[#598] a TYPED issue's live type name reaches plan() verbatim (display case, "
+                   "un-normalized — the normalizer is triage.py's single definition)",
+                   (code, seen.get("type")) == (0, "Bug")))
+    # [#598] HEADLINE, end to end through main() -> _apply_cli -> read -> plan -> apply_decision:
+    # the live type CHANGES THE LABEL THIS SWEEP WRITES. `area:docs` is the fixture that can tell
+    # the lanes apart — its area default (`docs`) differs from `ROLE_BY_TYPE["bug"]` (`impl`) — and
+    # `area:dispatch` cannot, because SEC_KEYWORDS forces the trust-plane role whatever the type is.
+    # Both directions on the SAME start labels: with the pre-#598 hard-coded `"task"` the second row
+    # is what BOTH rows produced, so a revert turns the first RED, and a stub that ignores the read
+    # turns the second RED. This is also the row that pins the two classifiers into agreement —
+    # triage-issue.yml derives `role:docs` for exactly this untyped issue.
+    docs_start = {"priority:P2", "area:docs", "status:untriaged"}
+    docs_untyped = FakeGh(docs_start, known)
+    code, seen = run_apply_argv(docs_untyped)
+    checks.append(("[#598] an UNTYPED area:docs issue is promoted with the AREA-derived role:docs "
+                   "(pre-#598 this lane hard-coded `task` and wrote role:impl)",
+                   (code, roles_of(docs_untyped.labels), "status:ready" in docs_untyped.labels)
+                   == (0, {"role:docs"}, True)))
+    docs_typed = FakeGh(docs_start, known)
+    code, seen = run_apply_argv(docs_typed, live_type="Bug")
+    checks.append(("[#598] ...while a MAPPED live type still wins over the area default, so the "
+                   "area map widened the derivation rather than replacing it",
+                   (code, roles_of(docs_typed.labels), "status:ready" in docs_typed.labels)
+                   == (0, {"role:impl"}, True)))
     # [#605 review ROUND 4, MINOR] open/closed is no longer a stale input: it rides the same read.
     closed = FakeGh(start, known)
     code, seen = run_apply_argv(closed, live_state="CLOSED")
