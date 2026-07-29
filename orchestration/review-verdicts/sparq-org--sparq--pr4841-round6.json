@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4841,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d6da975631c437bedae641a9bef7ef42238bfa30",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "parseShapeRows deduplicates solely by `(targetClass, path)` and keeps the first SPARQL result row. Multiple node/property shapes may legally constrain the same class/path with different `sh:minCount`, `sh:class`, `sh:datatype`, or `sh:name`, and shapesQuery has no ordering that makes the retained row deterministic. A later required constraint can therefore be discarded and shown as optional; class/datatype metadata can likewise vary by engine/result order. This silently makes the shape-aware picker inaccurate despite the PR's claim that suggestions reflect what shapes declare. The existing test only duplicates an identical required constraint, so it cannot detect the failure.",
+    "file": "gui/app/src/lib/query-builder.ts",
+    "fix_hint": "Merge all rows for each `(targetClass, path)` deterministically instead of first-row-wins. At minimum OR `required`, preserve compatible class/datatype/name information with a documented deterministic conflict policy, and add a test where the first row is optional and a later duplicate has `minCount=1` (plus conflicting metadata if only one value can be represented). Alternatively retain separate constraints and merge them explicitly in mergeSuggestions.",
+    "severity": "major",
+    "title": "Duplicate SHACL constraints are discarded in arbitrary result order"
+   }
+  ],
+  "progress": null,
+  "summary": "The query-builder lowering and handoff are broadly well tested, but SHACL suggestion parsing is nondeterministic and can silently misrepresent constraints when multiple shapes describe the same target-class/path pair. This conflicts with the feature's central shape-aware honesty claim and needs correction before approval.",
+  "verdict": "request_changes"
+ }
+}
