@@ -1038,14 +1038,17 @@ def main(argv=None, runner=None, clock=None):
     marker scan depends on, or in the repairs-file read would have passed the whole suite and failed
     only in production.
 
-    `clock` is the SAME KIND of seam as `runner`, added for the same reason `_pinned_env` exists.
-    The self-test's repair fixture is merged at a FIXED instant (`REPAIR_DETAIL["merged_at"]`), and
-    `Sweeper` defaults to the wall clock — so every assertion routed through here silently inherited
-    the calendar. Inside `REPAIR_LOOKBACK_HOURS` of the fixture date they passed; a day later the
-    same code put every repair `repair-outside-lookback`, which turned the `--bot-slug` wiring row
-    RED and turned the three rows that expect NO write green for the wrong reason (nothing was swept
-    at all). A time-bomb in one direction and vacuity in the other, from one unstated input. Passing
-    `None` (every production call) keeps the wall clock."""
+    ⚠️ `clock` is the SECOND injected environment input, and the SAME KIND of seam as `runner` —
+    added for the same reason `_pinned_env` exists. The self-test's repair fixture is merged at a
+    FIXED instant (`REPAIR_DETAIL["merged_at"]`), and `Sweeper` defaults to the wall clock, so
+    every assertion routed through here silently inherited the calendar. That made them decaying
+    tests: inside `REPAIR_LOOKBACK_HOURS` of the fixture date they passed, and a day later the same
+    code put every repair `repair-outside-lookback` — which turned the `--bot-slug` wiring row RED
+    (reddening the required gate for every PR at a time nobody chose) and turned the three rows
+    that expect NO write VACUOUSLY green, for the wrong reason: nothing was swept at all. A
+    time-bomb in one direction and vacuity in the other, from one unstated input. Passing `None`
+    (every production call) keeps the real wall clock, so this parameter cannot change a live
+    sweep."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true",
                         help="run the in-file test suite and exit")
@@ -1780,6 +1783,22 @@ def _row(sweeper, index=0):
     return rows[index] if len(rows) > index else ""
 
 
+def _capturing(call):
+    """Run `call` with its OPERATOR-FACING OUTPUT captured -> that text. The census a `main()` tick
+    prints is the only place the tick's REASON is stated, so an assertion about why a sweep moved
+    nobody has to read it. Re-emitted in a `finally`, so the job log is unchanged and an escaping
+    exception (`SystemExit` from argparse) does not swallow what was printed before it."""
+    import contextlib
+    import io
+    buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buffer):
+            call()
+    finally:
+        print(buffer.getvalue(), end="")
+    return buffer.getvalue()
+
+
 def _run_total(chk, label, sweeper):
     """Run one tick, turning an ESCAPING exception into a NAMED red rather than an abort."""
     return _run_capturing(chk, label, sweeper)[0]
@@ -2221,11 +2240,20 @@ def _test_entry_point(chk):
     marker-authorship control rests on. Every assertion here runs with the ambient CI variables
     PINNED, because the defaults under test are read from them.
 
-    The CLOCK is pinned for the same reason and is the same class of bug: `_fixture`'s sweeper takes
-    `clock=lambda: NOW`, but `main()` built its own `Sweeper` with the WALL clock, so these rows read
-    an input nobody stated. See `main`'s docstring for what that cost. `pinned` is `NOW` — inside
-    `REPAIR_LOOKBACK_HOURS` of the fixture's merge — and `stale` is deliberately outside it; both
-    directions are asserted below so a `clock` that stops reaching `Sweeper` cannot go unnoticed."""
+    The CLOCK is pinned for the same reason and is the same class of bug: the wall clock is an
+    ambient input exactly like `$APP_SLUG`. `_fixture`'s sweeper takes `clock=lambda: NOW`, but
+    `main()` built its own `Sweeper` with the WALL clock, so these rows read an input nobody
+    stated — which made this section decay: once `REPAIR_LOOKBACK_HOURS` of real time had passed
+    the fixture repair went inert, the move assertion below went red on every PR, and the rows that
+    expect no write went vacuously green. See `main`'s docstring for what that cost.
+
+    EVERY instant below is handed in explicitly — none is inherited — and both directions of the
+    window are asserted, so a `clock` that stops reaching `Sweeper` cannot go unnoticed whichever
+    way it is broken. `pinned` is `NOW`, inside `REPAIR_LOOKBACK_HOURS` of the fixture's merge;
+    `stale` is one second past the end of that window, derived from the fixture's own merge time;
+    and the inline `aged` is one lookback past `NOW` and additionally asserts the tick SAYS WHY it
+    moved nobody (`skipped=repair-outside-lookback`) rather than merely writing nothing — an inert
+    sweep and a suppressed one are otherwise indistinguishable by `updated()` alone."""
     import tempfile
     repairs = json.dumps({"schema": 1, "repairs": [dict(REPAIR)]})
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
@@ -2263,6 +2291,20 @@ def _test_entry_point(chk):
             chk("entry point: ...and main() carries the CLOCK through too — one second past the "
                 "repair's lookback window the same board is inert and censused, not moved",
                 gh_stale.updated(), [])
+
+            # THE OTHER DIRECTION OF THE SAME SEAM, and the one that makes every "nothing moved"
+            # assertion in this section non-vacuous: the ONLY difference from the sweep above is
+            # the instant `main` is handed, so a `main` that ignored `clock` (or read the wall
+            # clock alongside it) would move #903 here and go red — no matter what day it is run.
+            aged = NOW + int(REPAIR_LOOKBACK_HOURS * 3600) + 60
+            gh_aged, _ = _fixture(comments={903: [spoof]})
+            aged_log = _capturing(lambda: _main_total(
+                chk, ["--repo", repo, "--repairs-file", path, "--bot-slug", BOT_SLUG,
+                      "--max-moves", "5", "--apply"], runner=gh_aged, clock=lambda: aged))
+            chk("entry point: main() HONOURS the clock it is handed — one lookback later the same "
+                "board moves nobody, AND SAYS WHY, so the assertions above are pinned to an "
+                "instant rather than inheriting the day the suite happens to run",
+                (gh_aged.updated(), "skipped=repair-outside-lookback" in aged_log), ([], True))
 
             gh2, _ = _fixture(comments={903: [{"body": MARKER.format(repair=917, head="a" * 40),
                                               "user": {"login": BOT_LOGIN}}]})
@@ -2329,6 +2371,13 @@ def _test_entry_point(chk):
             chk("entry point: and $APP_SLUG supplies --bot-slug, so OUR marker still suppresses — "
                 "the env default is wired to the same login the flag builds",
                 gh4.updated(), [])
+            gh5, _ = _fixture(comments={903: [{"body": MARKER.format(repair=917, head="a" * 40),
+                                              "user": {"login": "nobody"}}]})
+            main(["--repairs-file", path, "--apply"], runner=gh5, clock=lambda: NOW)
+            chk("entry point: ...and the CONTROL for that suppression — same env-supplied slug, a "
+                "marker by anyone else — still moves the PR, so the row above cannot pass merely "
+                "because this board sweeps nobody",
+                gh5.updated(), [903])
         with _pinned_env(APP_SLUG="bad slug; rm -rf /", GITHUB_REPOSITORY=repo):
             chk("entry point: a malformed $APP_SLUG is rejected exactly like a malformed flag",
                 _exit_code(lambda: main(["--repairs-file", path], runner=_fixture()[0],

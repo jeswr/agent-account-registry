@@ -8060,8 +8060,22 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     # the ladder, and PARK_ESCALATION_GENERATIONS consumed windows escalate
                     # to the QUESTION-class terminal whose needs:user write is veto-checked
                     # with an HONEST comment when suppressed.
+                    #
+                    # [registry #1075] The charge is worker_issue.budget_used — model attempts
+                    # PLUS pre-model trust refusals — not count_attempts. THIS call site is what
+                    # makes the refusal bound real: `status:parked` is DELIBERATELY not filtered
+                    # out of the deferred lane (dispatch.yml's deferred-retry-filter — the lane
+                    # IS the park's readmission hook), so CLAIM is the ONLY gate between a parked
+                    # issue and the `retry` flip that strips its park label. A refusal-only issue
+                    # recorded zero ATTEMPTS, so this arm never fired for it, and the worker-side
+                    # exhaustion + park it produced was undone by the very next tick — target
+                    # #834 was dispatched ~34 times in one day (~18% of the day's capacity) with
+                    # `claim=success` on 182/182 runs. Charging refusals HERE routes them into
+                    # the same ladder, so the park sticks and the runner is never allocated. The
+                    # two counters stay distinct underneath (cost/health still means "the model
+                    # ran"); budget_used is the only place they are summed.
                     comments = comments if comments is not None else _pr_comments(repo, number)
-                    used = worker_issue.count_attempts(comments, bot_login)
+                    used = worker_issue.budget_used(comments, bot_login)
                     if used >= resolved["max_attempts"]:
                         cutoff = _park_policy.readmission_cutoff(
                             repo, number, None, _issue_timeline_events,
@@ -8069,12 +8083,12 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                             on_unreadable=_park_policy.WINDOW_UNREADABLE)
                         windowed = used
                         if cutoff and cutoff != _park_policy.WINDOW_UNREADABLE:
-                            windowed = worker_issue.count_attempts_since(
+                            windowed = worker_issue.budget_used(
                                 comments, bot_login, cutoff)
                         if windowed < resolved["max_attempts"]:
                             print(f"readmission window open for {repo}#{number}: a human "
                                   f"unlabeled a park label at {cutoff}; the attempt budget "
-                                  f"charges {windowed} of {used} recorded attempt(s) — "
+                                  f"charges {windowed} of {used} recorded dispatch cycle(s) — "
                                   "allocation re-enabled")
                             # fall through: the allocator + the `retry` label flip run again.
                         else:
@@ -9387,7 +9401,10 @@ def _self_test():
             ATTEMPT_MARKER = "<!-- sparq-worker-attempt:v1 -->"
 
             @staticmethod
-            def count_attempts(_comments, _bot_login):
+            def budget_used(_comments, _bot_login, _since=None, _log=print):
+                # [registry #1075] The deferred-retry budget charge: attempts + pre-model
+                # refusals. This fixture spends none of either, so the budget arm is not the
+                # subject of these cases.
                 return 0
 
         class FakeWorkerPr:
@@ -23018,6 +23035,38 @@ def _deferred_issue_ladder_self_test():
     chk("[#797] dispatch-claim reaches park_ladder_decision through deferred_issue_ladder and "
         "NOWHERE else — the authority claim cannot be bypassed at the call site",
         strays, [])
+
+    # [registry #1075] THE REFUSAL CHARGE MUST REACH THIS LANE, or the whole bound is decorative.
+    # `status:parked` is DELIBERATELY not filtered out of the deferred-retry candidates
+    # (dispatch.yml's deferred-retry-filter — the lane IS the park's readmission hook), so this
+    # budget arm is the ONLY thing between a parked issue and the `retry` flip that strips its
+    # park label. An issue that only ever refuses PRE-MODEL records no ATTEMPT receipt, so an
+    # attempt-only charge left the arm unreachable for it: the worker-side exhaustion + park was
+    # undone by the very next tick, forever (target #834 — ~34 dispatches in one day, ~18% of the
+    # day's capacity, `claim=success` on 182/182 runs). Proved STRUCTURALLY over the parsed tree,
+    # because the behavioural fixtures above spend no budget at all and stay green either way:
+    # the dispatch loop must ask the budget question with `budget_used` (attempts + refusals) and
+    # must not reach the attempt-only counters, which are cost/health surfaces here.
+    dispatch_fn = next(node for node in ast.walk(tree)
+                       if isinstance(node, ast.FunctionDef) and node.name == "dispatch")
+    budget_calls = sorted(
+        node.func.attr for node in ast.walk(dispatch_fn)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name) and node.func.value.id == "worker_issue"
+        and (node.func.attr.startswith("count_") or node.func.attr == "budget_used"))
+    chk("[#1075] the deferred-retry budget arm charges DISPATCH CYCLES (worker_issue.budget_used "
+        "= attempts + pre-model refusals), never attempts alone — a count_attempts charge is "
+        "structurally unreachable for a refusal-only issue",
+        budget_calls, ["budget_used", "budget_used"])
+    # ...and the charge that arm now reads is genuinely non-zero for the refusal-only issue this
+    # closes: zero model attempts, a fully spent max_attempts=3 dispatch budget.
+    _wi = _load_module("registry_worker_issue",
+                       Path(__file__).resolve().with_name("worker-issue.py"))
+    _refusals = [{"user": {"login": "app[bot]"}, "created_at": f"2026-07-2{index}T00:00:00Z",
+                  "body": f"x {_wi.REFUSAL_MARKER} run=7{index}.1 -->"} for index in (1, 2, 3)]
+    chk("[#1075] (model attempts, dispatch cycles) for an issue that only ever refused pre-model",
+        (_wi.count_attempts(_refusals, "app[bot]"), _wi.budget_used(_refusals, "app[bot]")),
+        (0, 3))
 
 
 def _absorbing_park_leg_self_test():
