@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1224,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "64e9848a0c0faa6afd25e687252ba26ebf66209f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-1 toolchain defect is addressed. The sandbox now persists RUSTUP_HOME in its dedicated cache mount, materializes the target-selected toolchain from the mounted workspace before adding components, installs both rustfmt and clippy for that active toolchain, proves both commands resolve, and fails closed before any gate command if provisioning fails. The wiring covers all three cargo profiles and preserves the no-host-fallback containment boundary. The added assertions independently pin persistence, selection/add/proof ordering, unconditional in-container execution, and failure propagation; they are non-vacuous for the claimed behavior. I found no remaining blocker or major issue in the diff.",
+  "verdict": "approve"
+ }
+}
