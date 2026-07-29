@@ -2142,12 +2142,62 @@ def secret_env_write_verdict(text, secret_arg, where):
     return True, "ok"
 
 
-def _api(path):
+# TRANSIENT-READ MARKERS. A read that fails for one of these reasons tells us NOTHING about the
+# repository's settings — it means the guard could not look. Deliberately POSITIVE EVIDENCE ONLY:
+# anything not matched here keeps the historical verdict (a settings finding), so this can only
+# ever demote a failure the guard has proof was an availability problem. That polarity matters
+# because the residual class is the one that prints a maintainer action item, and inferring
+# "transient" from the ABSENCE of a marker would start suppressing real settings gaps.
+#
+# A 404 is deliberately NOT here: `environment dispatch-secrets is missing` IS the #101 condition.
+_TRANSIENT_READ_MARKERS = (
+    "rate limit",             # primary (installation budget) AND secondary — both clear by waiting
+    "abuse detection",
+    "temporarily blocked",
+    "retry-after",
+    "retry later",
+    "502 bad gateway", "503 service", "504 gateway", "bad gateway", "service unavailable",
+    "timed out", "timeout", "i/o timeout", "connection reset", "unexpected eof",
+    "connection refused", "no such host", "tls handshake",
+    "unexpected end of json input",
+)
+_TRANSIENT_STATUS = ("403", "429", "500", "502", "503", "504")
+_STATUS_RE = re.compile(r"HTTP[ :]*([1-5]\d\d)\b|\(HTTP ([1-5]\d\d)\)")
+
+
+def classify_read_failure(stderr):
+    """-> 'transient' | 'refusal'. Which class a failed `gh api` GET belongs to.
+
+    `transient` requires BOTH a throttle/availability marker AND a status that can carry one, so a
+    404 body that happens to contain the word "timeout" is still a refusal. Everything else is
+    `refusal`, which is what preserves today's behaviour for genuine settings gaps."""
+    text = (stderr or "").lower()
+    if not any(marker in text for marker in _TRANSIENT_READ_MARKERS):
+        return "refusal"
+    match = _STATUS_RE.search(stderr or "")
+    status = (match.group(1) or match.group(2)) if match else None
+    # A statusless failure carrying an availability marker (a dropped connection never gets a
+    # status line) is transient; a status we CAN read must be one of the throttle/5xx classes.
+    return "transient" if status is None or status in _TRANSIENT_STATUS else "refusal"
+
+
+def _api(path, transient_reads=None):
     """Read-only `gh api` GET. Returns the parsed JSON document, or None on any failure —
     sanitized: neither stderr nor the payload is ever echoed (GH_DEBUG=api can echo request
-    bodies; an error page is remote-controlled content)."""
+    bodies; an error page is remote-controlled content).
+
+    When `transient_reads` is given, a failure this function can PROVE was an availability problem
+    (a 403 throttle, a 429, a 5xx, a dropped connection) appends the endpoint to it. `main` uses
+    that to tell "the settings are wrong" apart from "I could not check the settings" — the two
+    were indistinguishable, so a budget outage printed a maintainer action item no human could act
+    on (issue #819's 06:19-06:32Z runs printed the #101 remediation having verified nothing)."""
     result = subprocess.run(["gh", "api", path], capture_output=True, text=True)
     if result.returncode != 0:
+        if (transient_reads is not None
+                and classify_read_failure(getattr(result, "stderr", "")) == "transient"):
+            # The PATH only. stderr is never surfaced: it can carry request bodies under
+            # GH_DEBUG=api, and an error page is remote-controlled content.
+            transient_reads.append(path)
         return None
     try:
         document = json.loads(result.stdout)
@@ -2176,26 +2226,55 @@ def main():
             f"{', '.join(offending)} — a modified workflow copy dispatched at ANY ref can read "
             "these; move them into the environment")
 
-    repo_doc = _api(f"repos/{repo}")
+    # Failures whose CAUSE was a read this guard could prove was an availability problem. They are
+    # still fail-closed failures — an unverified setting must never admit the secret-bearing jobs —
+    # but they are NOT evidence that any setting is wrong, so they must not print the maintainer
+    # action item. See classify_read_failure.
+    transient_reads = []
+    unverified = []
+
+    def _unverified(message):
+        """Record a failure caused by a read that did not complete. Attributed to the transient
+        class only when the read that produced it was PROVEN transient."""
+        failures.append(message)
+        if transient_reads:
+            unverified.append(message)
+
+    repo_doc = _api(f"repos/{repo}", transient_reads)
     default_branch = repo_doc.get("default_branch") if isinstance(repo_doc, dict) else None
     if not isinstance(default_branch, str) or not default_branch:
-        failures.append("cannot resolve the repository default branch (fail closed)")
+        _unverified("cannot resolve the repository default branch (fail closed)")
     else:
-        environment_doc = _api(f"repos/{repo}/environments/{ENVIRONMENT}")
+        environment_doc = _api(f"repos/{repo}/environments/{ENVIRONMENT}", transient_reads)
         if environment_doc is None:
-            failures.append(f"environment `{ENVIRONMENT}` is missing or unreadable")
+            _unverified(f"environment `{ENVIRONMENT}` is missing or unreadable")
         else:
             policies_doc = _api(
-                f"repos/{repo}/environments/{ENVIRONMENT}/deployment-branch-policies")
+                f"repos/{repo}/environments/{ENVIRONMENT}/deployment-branch-policies",
+                transient_reads)
             policy_ok, reason = branch_policy_verdict(
                 environment_doc, policies_doc, default_branch)
             if not policy_ok:
-                failures.append(f"environment `{ENVIRONMENT}`: {reason}")
+                _unverified(f"environment `{ENVIRONMENT}`: {reason}")
 
     if failures:
         for failure in failures:
             print(f"::error::secrets-guard: {failure}")
-        print(f"::error::{REMEDIATION}")
+        # THE REMEDIATION IS A CLAIM ABOUT THE SETTINGS, so it may only be printed when at least
+        # one failure is a claim about the settings. When EVERY failure traces to a read that did
+        # not complete, the guard has verified nothing and has no business generating a maintainer
+        # action item — an API outage that manufactures one costs a human a trip to a settings page
+        # that is already correct, and buries the real signal (#819).
+        if unverified and len(unverified) == len(failures):
+            print(f"::error::secrets-guard: TRANSIENT — {len(transient_reads)} GitHub read(s) "
+                  f"failed for an availability reason ({', '.join(sorted(set(transient_reads)))}), "
+                  "so the settings above are UNVERIFIED, not known-wrong. This is NOT a settings "
+                  "finding and NO maintainer action is implied: the guard fails closed until a "
+                  "tick completes the reads, and recovers on its own when they do. If the "
+                  "dispatcher is also failing in PLAN, this is the same request-budget "
+                  "exhaustion — see scripts/dispatch-tick-floor.py (#819).")
+        else:
+            print(f"::error::{REMEDIATION}")
         return 1
     print("secrets-guard: repo scope holds no secrets and the "
           f"`{ENVIRONMENT}` environment admits only `{default_branch}` — "
@@ -3576,10 +3655,10 @@ printf '5\n'
     import io
 
     class _Result:
-        def __init__(self, rc=0, stdout=""):
+        def __init__(self, rc=0, stdout="", stderr="SENTINEL-STDERR"):
             self.returncode = rc
             self.stdout = stdout
-            self.stderr = "SENTINEL-STDERR"
+            self.stderr = stderr
 
     calls = []
     responses = {}
@@ -3593,11 +3672,14 @@ printf '5\n'
     env_path = f"{repo_path}/environments/{ENVIRONMENT}"
     policies_path = f"{env_path}/deployment-branch-policies"
 
-    def run_main(all_secrets, docs, registry_repo=repo):
+    def run_main(all_secrets, docs, registry_repo=repo, stderr="SENTINEL-STDERR"):
+        """`stderr` is what a FAILED `gh api` wrote — the only evidence the guard has for telling
+        "the settings are wrong" apart from "I could not read the settings" (#819)."""
         calls.clear()
         responses.clear()
         for path, doc in docs.items():
-            responses[path] = _Result(0, json.dumps(doc)) if doc is not None else _Result(1)
+            responses[path] = (_Result(0, json.dumps(doc)) if doc is not None
+                               else _Result(1, stderr=stderr))
         os.environ["REGISTRY_REPO"] = registry_repo
         os.environ["ALL_SECRETS"] = all_secrets
         buffer = io.StringIO()
@@ -3639,8 +3721,51 @@ printf '5\n'
                           policies_path: good_policies})
         chk("flow: all-branches environment -> rc 1 (default-allow refused)",
             (rc_all, "All branches" in out_all), (1, True))
-        rc_branch, _out = run_main(empty_scope, {repo_path: None})
+        rc_branch, out_branch = run_main(empty_scope, {repo_path: None})
         chk("flow: unreadable default branch -> rc 1 (fail closed)", rc_branch, 1)
+        # ...and, with no PROOF the read was transient, it keeps the historical verdict. The
+        # classification can only ever DEMOTE on positive evidence; it never suppresses silently.
+        chk("flow: an UNCLASSIFIABLE read failure still prints the remediation (positive evidence "
+            "only — absence of a throttle marker is not proof of a throttle)",
+            "REQUIRED maintainer settings" in out_branch, True)
+
+        # ---- #819: an API outage must not manufacture a maintainer action item --------------
+        # The 06:19-06:32Z runs printed the #101 remediation having verified NOTHING: the first
+        # read 403'd on an exhausted request budget, so the environment and branch-policy checks
+        # never executed. Delete the `unverified` partition (or the `if`) and these go red.
+        budget_403 = ("gh: API rate limit exceeded for installation. (HTTP 403)")
+        for label, stderr in (("primary budget 403", budget_403),
+                              ("secondary rate limit 403",
+                               "gh: You have exceeded a secondary rate limit (HTTP 403)"),
+                              ("502 from the API", "gh: Bad Gateway (HTTP 502)"),
+                              ("dropped connection", "error connecting: unexpected EOF")):
+            rc_t, out_t = run_main(empty_scope, {repo_path: None}, stderr=stderr)
+            chk(f"#819 flow: a {label} fails CLOSED but is reported as TRANSIENT, with NO "
+                "maintainer action item",
+                (rc_t, "TRANSIENT" in out_t, "REQUIRED maintainer settings" in out_t,
+                 "UNVERIFIED, not known-wrong" in out_t), (1, True, False, True))
+        chk("#819 flow: ... and the transient report never echoes the raw stderr (it can carry "
+            "request bodies under GH_DEBUG=api)",
+            "rate limit exceeded for installation"
+            in run_main(empty_scope, {repo_path: None}, stderr=budget_403)[1], False)
+        # THE OTHER DIRECTION, which is what stops this becoming a suppression bug: a GENUINE
+        # settings gap found alongside a transient read must STILL print the remediation.
+        rc_mixed, out_mixed = run_main(leaked, {repo_path: None}, stderr=budget_403)
+        chk("#819 flow: a REAL settings finding alongside a transient read still prints the "
+            "remediation (the demotion applies only when EVERY failure is unverified)",
+            (rc_mixed, "REQUIRED maintainer settings" in out_mixed), (1, True))
+        # And the classifier itself, in both directions.
+        chk("#819 classify: a 404 is a REFUSAL, not a throttle (a missing environment IS the "
+            "#101 condition and must keep its remediation)",
+            classify_read_failure("gh: Not Found (HTTP 404)"), "refusal")
+        chk("#819 classify: a 404 whose body merely mentions a timeout is still a refusal",
+            classify_read_failure("gh: Not Found (HTTP 404) request timed out earlier"),
+            "refusal")
+        chk("#819 classify: the primary installation-budget 403 is transient",
+            classify_read_failure(budget_403), "transient")
+        chk("#819 classify: a permission 403 is NOT transient",
+            classify_read_failure("gh: Resource not accessible by integration (HTTP 403)"),
+            "refusal")
         rc_garbled, _out = run_main("SENTINEL {not json", verified_docs)
         chk("flow: malformed ALL_SECRETS -> rc 1 (fail closed)", rc_garbled, 1)
         rc_repo, _out = run_main(empty_scope, verified_docs, registry_repo="bad repo$name")

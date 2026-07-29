@@ -3769,6 +3769,13 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
             else:
                 exclude_signalled("a live per-PR review/fix lease holds the conflict repair")
             continue
+        # [#762] Resolved ONCE, here, and read by BOTH repair decisions below (the fix-KIND choice
+        # in the `review:changes` branch and the GAP-A/stranded pair further down). The red trigger
+        # and the stranded precondition must never disagree about which tier a head publishes, and
+        # two separate reads of two different fields is exactly how they would. Hoisted above the
+        # label branches so the fix lane can pick its kind from the same single resolution; it is a
+        # pure accessor over the snapshot, so evaluating it earlier changes nothing else.
+        repair = repair_gate_of(status, draft)
         # Explicit review labels are authoritative re-entry signals, independent of GitHub's
         # draft bit.  An orchestrator/human adjudication can relabel a formerly human-owned READY
         # worker PR back to review:changes/review:needs without creating a fresh round marker; the
@@ -3778,7 +3785,44 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
             if f"fix:{repo}#{number}" in live_keys:
                 exclude_signalled("a live per-PR fix lease already owns this PR")
                 continue                  # per-PR single-flight; re-emit after release/expiry
-            emit("needs-fix")
+            # THE FIX LANE PICKS ITS KIND FROM THE HEAD, NOT FROM THE LABEL.
+            #
+            # `review:changes` has TWO writers, and they mean different things. One is a review
+            # verdict (`request_changes` — findings a VERDICT fixer applies). The other is sparq's
+            # stuck-arm sweep, which applies the same label to route an arm it just RETRACTED
+            # because the aggregator had already concluded FAILURE (`rearm-sweeper` receipt
+            # `{"action":"route-fix","class":"gate-failed"}`, and its own comment says "it is routed
+            # to the fix lane"). One label, two causes — and this branch used to send both to the
+            # VERDICT fixer, which stage_verdict_for_fix seeds from the RECORDED verdict. On a
+            # stuck-arm route that recorded verdict is the `approve` that armed the PR in the first
+            # place, so the fixer is handed a diff with nothing to fix: it records `nochange`, the
+            # #560 hand-over retracts the reviewed-sha marker, the PR returns to the review lane,
+            # and the next round re-approves the IDENTICAL tree while the red aggregator sits
+            # untouched on the head. Nothing in that loop ever repairs CI, so every subsequent arm
+            # is retracted for the same reason, forever.
+            #
+            # Measured on sparq-org/sparq#4847 (2026-07-28..29, under this code): review rounds 4,
+            # 5 and 6 all returned `approve` on ONE unchanged head, with `nochange` fix rounds 3, 4
+            # and 5 between them and three promote -> arm -> `gate-failed` -> disarm -> redraft
+            # cycles, ~10 minutes each. The head's aggregator was a concluded FAILURE throughout.
+            #
+            # So: a concluded-FAILURE aggregator on the live head selects the CI kind. This is the
+            # SAME precedence GAP-B already applies one branch up ("conflict repair FIRST and alone
+            # — CI on a conflicted base is noise"), for the same reason: repair work on a head that
+            # cannot merge outranks a verdict fix, and the ci lane is the one seeded with the
+            # failing LEGS instead of with a verdict. It is a KIND choice inside one lane, not a
+            # lane change — `_review_item_lane` maps needs-fix and needs-ci-fix both to `fix`, so
+            # the per-PR fix-lease single-flight above still governs, unchanged.
+            #
+            # Deliberately NOT widened to `review:needs`: that path already falls through to GAP-A
+            # once its head is marker-bound (#761/#765), and re-ordering it would send a
+            # never-reviewed advanced head to a fixer before any reviewer had seen it.
+            if repair == "failure":
+                _bucket("repair:needs-ci-fix")
+                emit("needs-ci-fix", context=", ".join(status.get("failing_legs") or []),
+                     newly_reachable=status.get("gate") != "failure")
+            else:
+                emit("needs-fix")
             continue
         if "review:needs" in labels:
             # (review:parked no longer re-enters here: the one-predicate exclusion above
@@ -3829,11 +3873,11 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         # argument, and TIER-APPROPRIATE per repair_gate_of: a READY PR is still judged on the
         # strict name alone, so a stale draft-tier row can never defuse a valid arm.
         #
-        # [#762] The SAME accessor answers the GREEN half in the branch below, so it is resolved
-        # ONCE here: the red trigger and the stranded precondition must never disagree about which
-        # tier a head publishes, and two separate reads of two different fields is exactly how
-        # they would.
-        repair = repair_gate_of(status, draft)
+        # [#762] The SAME accessor answers the GREEN half in the branch below, and the fix-lane
+        # KIND choice above — one resolution, hoisted to `repair` before the label branches. The
+        # red trigger, the fix-lane kind and the stranded precondition must never disagree about
+        # which tier a head publishes, and separate reads of the same field are exactly how they
+        # would.
         if repair == "failure" and lease_free:
             _bucket("repair:needs-ci-fix")
             # NEWLY REACHABLE = the strict merge-required reading would NOT have seen this row,
@@ -10701,10 +10745,19 @@ def _self_test():
     assert "already_done = False" in _ad_src and "sparq-reviewed-sha" in _ad_src, _ad_src
     _spun = pull(41, "sparq-agent/issue-7-1-1", sha_a,
                  labels=[_worker_pr.FIX_LANE_PR_LABEL], body=_bound_body)
+    # The pre-defer admission is the FIX lane in EVERY CI posture — that is the spin #560 closes.
+    # The KIND inside that lane is chosen from the head, not from the label: a CONCLUDED-red
+    # aggregator selects `needs-ci-fix` (seeded with the failing LEGS) and every other posture
+    # selects `needs-fix` (seeded with the recorded VERDICT). Both are `fix`-lane states, so the
+    # ownership property this block exists to pin is untouched; naming the kind per posture keeps
+    # the assertion EXACT rather than relaxing it to a lane check, and the lane is asserted too.
+    _pre_defer_kind = {"green": "needs-fix", "red": "needs-ci-fix",
+                       "pending": "needs-fix", "unknown": "needs-fix"}
     for _ci, _status in _ci_states().items():
-        assert [item["state"] for item in enumerate_review_items(
-            repo, [_spun], provenance, [], issue_labels, now, pr_status=_status)] == \
-            ["needs-fix"], ("pre-defer lane", _ci)
+        _pre = [item["state"] for item in enumerate_review_items(
+            repo, [_spun], provenance, [], issue_labels, now, pr_status=_status)]
+        assert _pre == [_pre_defer_kind[_ci]], ("pre-defer lane", _ci, _pre)
+        assert _review_item_lane(_pre[0]) == "fix", ("pre-defer lane", _ci, _pre)
     for _reason in _worker_pr.FIX_LANE_DEFER_REASONS:
         _action = _worker_pr.fix_lane_defer_action({_worker_pr.FIX_LANE_PR_LABEL})
         _after = sorted(_worker_pr.fix_lane_defer_labels(
@@ -13524,6 +13577,84 @@ def _self_test():
     assert enumerate_review_items(
         repo, [starved], provenance, [], issue_labels, now,
         pr_status={41: status_of(sha_a, gate="missing", repair_gate="pending")}) == []
+    # ---- THE FIX LANE PICKS ITS KIND FROM THE HEAD, NOT FROM THE LABEL ----------------------
+    # `review:changes` has TWO writers that mean different things: a `request_changes` verdict,
+    # and sparq's stuck-arm sweep routing an arm it RETRACTED because the aggregator had already
+    # concluded FAILURE (`rearm-sweeper` receipt `{"action":"route-fix","class":"gate-failed"}`).
+    # Sending the second to the VERDICT fixer seeds it from the RECORDED verdict — which on that
+    # route is the `approve` that armed the PR — so the fixer has nothing to fix, records
+    # `nochange`, the #560 hand-over retracts the reviewed-sha marker, and the review lane
+    # re-approves the identical tree. Measured on sparq-org/sparq#4847 (2026-07-28..29): review
+    # rounds 4, 5 and 6 all `approve` on ONE unchanged head, `nochange` fix rounds 3, 4 and 5
+    # between them, three arm -> `gate-failed` -> disarm -> redraft cycles of ~10 minutes each,
+    # and a concluded-red aggregator on the head the entire time.
+    changes_red = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:changes"],
+                       body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+    # KNOWN POSITIVE — the live sparq#4847 / #5035 shape: a DRAFT carrying `review:changes` whose
+    # only aggregator row is a RED draft-tier one. Reverting this branch to a bare
+    # `emit("needs-fix")` reds this line, and the PR goes back to burning a verdict-fixer run per
+    # tick on a diff that has nothing to fix.
+    kind_red = enumerate_review_items(
+        repo, [changes_red], provenance, [], issue_labels, now,
+        pr_status={41: status_of(sha_a, gate="missing", repair_gate="failure",
+                                 legs=["workspace clippy"])})
+    assert [(item["state"], item["context"]) for item in kind_red] == [
+        ("needs-ci-fix", "workspace clippy")], kind_red
+    # ...and the FAILING LEGS reach the fixer. A ci-kind run is seeded with these instead of with
+    # a verdict, which is the whole point of choosing the kind: an empty context would dispatch a
+    # CI fixer that knows nothing about what is red.
+    assert kind_red[0]["context"] == "workspace clippy", kind_red
+    # ...and it is a KIND choice INSIDE one lane, never a lane change — so the per-PR fix-lease
+    # single-flight above still governs both kinds identically.
+    assert _review_item_lane(kind_red[0]["state"]) == _review_item_lane("needs-fix") == "fix"
+    # KNOWN NEGATIVE 1 — a genuine `request_changes` verdict on a GREEN head still reaches the
+    # VERDICT fixer, at BOTH green grades. If either of these ever reads `needs-ci-fix` the change
+    # has eaten the verdict lane and review findings would stop being applied.
+    for _green_grade in (GATE_GREEN_MERGE_REQUIRED, GATE_GREEN_DRAFT_TIER):
+        assert [item["state"] for item in enumerate_review_items(
+            repo, [changes_red], provenance, [], issue_labels, now,
+            pr_status={41: status_of(sha_a, gate="missing",
+                                     repair_gate=_green_grade)})] == ["needs-fix"], _green_grade
+    # KNOWN NEGATIVE 2 — THE UNFINISHED-DRAFT POPULATION, which is the flooding risk. On sparq
+    # 2026-07-29, 68 of 76 open drafts had never published an aggregator row at all: they were
+    # never promoted, so there is no evidence about them either way. `missing`/`pending`/`unknown`
+    # are not `failure`, so this change is INERT on every one of them — the discriminator is a
+    # CONCLUDED failure on the live head, never age, staleness or absence of evidence.
+    for _idle in ("missing", "pending", "unknown"):
+        assert [item["state"] for item in enumerate_review_items(
+            repo, [changes_red], provenance, [], issue_labels, now,
+            pr_status={41: status_of(sha_a, gate="missing",
+                                     repair_gate=_idle)})] == ["needs-fix"], _idle
+    # ...and with NO CI snapshot for the PR at all (unknown never acts).
+    assert [item["state"] for item in enumerate_review_items(
+        repo, [changes_red], provenance, [], issue_labels, now)] == ["needs-fix"]
+    # KNOWN NEGATIVE 3 — a STALE snapshot (its head_sha names a different commit) is discarded
+    # upstream, so the kind choice can never be made on evidence about another head.
+    assert [item["state"] for item in enumerate_review_items(
+        repo, [changes_red], provenance, [], issue_labels, now,
+        pr_status={41: status_of(sha_b, gate="missing", repair_gate="failure")})] == ["needs-fix"]
+    # KNOWN NEGATIVE 4 — the per-PR fix-lease single-flight is UNCHANGED by the kind choice: a
+    # live fix lease still excludes the PR from both kinds, so the new branch cannot double-
+    # dispatch a PR a fixer already owns.
+    assert enumerate_review_items(
+        repo, [changes_red], provenance,
+        [{"holder": f"fix:{repo}#41@run.1", "expires_at": now + 100, "package": "crate-a"}],
+        issue_labels, now,
+        pr_status={41: status_of(sha_a, gate="missing", repair_gate="failure")}) == []
+    # KNOWN NEGATIVE 5 — a CONFLICTING base still outranks BOTH kinds (GAP-B is unmoved): the
+    # rebase-first rule is not weakened by giving the fix lane a second kind.
+    assert [item["state"] for item in enumerate_review_items(
+        repo, [changes_red], provenance, [], issue_labels, now,
+        pr_status={41: status_of(sha_a, gate="missing", repair_gate="failure",
+                                 conflicting=True)})] == ["needs-rebase"]
+    # KNOWN NEGATIVE 6 — a human hold still wins outright. The stuck-arm route must never pull a
+    # human-owned PR into an autonomous repair run.
+    assert enumerate_review_items(
+        repo, [pull(41, "sparq-agent/issue-7-1-1", sha_a,
+                    labels=["review:changes", "review:needs-user"],
+                    body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")],
+        provenance, [], issue_labels, now,
+        pr_status={41: status_of(sha_a, gate="missing", repair_gate="failure")}) == []
     # ---- [issue #762] THE GREEN HALF: A RED DRAFT REACHES REPAIR, A GREEN ONE REACHES REVIEW --
     # THE HEADLINE. The full sparq draft shape — no merge-required context on the head at all,
     # only a green DRAFT-TIER aggregator — is the stranded posture, and it enumerates. Reverting

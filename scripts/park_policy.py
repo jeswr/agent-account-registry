@@ -1030,6 +1030,57 @@ def retirement_handback(issue_labels):
             "second reroute, which would loop")
 
 
+# --- THE THREE-STATE OWNERSHIP ANSWER --------------------------------------------------------
+#
+# `label_application_machine_owned` answers a BOOLEAN, and its False conflates two states with
+# different correct handling: "a human applied this" and "nobody can tell who applied this".
+# For the callers that only ask *may I clear it?* the conflation is right and deliberate — both
+# answers are "no". For a caller that must also decide *and is my not-clearing SILENT or LOUD?*
+# it is not: a hold nobody can attribute has no proven owner, so leaving it in place is a state
+# with no forward edge and must be reported, while a hold a human demonstrably applied has an
+# owner and is correctly quiet. Registry #1191 is that distinction going missing.
+LABEL_OWNER_HUMAN = "human"
+LABEL_OWNER_MACHINE = "machine"
+LABEL_OWNER_UNKNOWN = "unknown"
+
+
+def label_application_ownership(repo, number, label, fetch_events, is_human=None, log=print):
+    """Who applied the newest `labeled` event for THIS EXACT `label` on `repo#number`:
+    ``LABEL_OWNER_HUMAN``, ``LABEL_OWNER_MACHINE``, or ``LABEL_OWNER_UNKNOWN``.
+
+    UNKNOWN covers every ambiguity — an unreadable timeline, a malformed event shape, and the
+    case that matters most, a label with NO `labeled` event at all. Absence of evidence is
+    neither proof of machine ownership nor proof of human ownership.
+
+    `label_application_machine_owned` is the boolean projection of this walk (MACHINE, and
+    nothing else, is permission), so the two can never disagree about who applied a label."""
+    probe = _human_probe(is_human)
+    try:
+        events = fetch_events(repo, number)
+    except Exception as exc:  # noqa: BLE001 — an unreadable timeline proves nothing
+        log(f"label ownership unknown for {repo}#{number} {label!r} ({exc}); not clearable")
+        return LABEL_OWNER_UNKNOWN
+    newest, newest_human = None, False
+    try:
+        for created, kind, login, via_app in _event_rows(events, label):
+            if kind != "labeled":
+                continue
+            instant = parse_ts(created)
+            human = _is_proven_human(login, via_app, probe)
+            if newest is None or instant > newest:
+                newest, newest_human = instant, human
+            elif instant == newest and human:
+                newest_human = True     # an instant tie resolves toward HUMAN-owned
+    except Exception as exc:  # noqa: BLE001 — malformed shape proves nothing
+        log(f"label ownership unknown for {repo}#{number} {label!r} ({exc}); not clearable")
+        return LABEL_OWNER_UNKNOWN
+    if newest is None:
+        log(f"label ownership unknown for {repo}#{number} {label!r}: no `labeled` event exists, "
+            "so nothing proves a machine applied it; not clearable")
+        return LABEL_OWNER_UNKNOWN
+    return LABEL_OWNER_HUMAN if newest_human else LABEL_OWNER_MACHINE
+
+
 def label_application_machine_owned(repo, number, label, fetch_events, is_human=None, log=print):
     """Whether the newest `labeled` event for THIS EXACT `label` on `repo#number` was applied by
     something other than a proven human — i.e. whether an automated path may clear it.
@@ -1052,31 +1103,9 @@ def label_application_machine_owned(repo, number, label, fetch_events, is_human=
     `needs:maintainer` 2, `needs:upstream` 1, and `needs:external-audit` 1 — that last one is the
     sq-qhy4 external accredited-cryptographer audit gate, whose silent deletion is the worst
     single outcome available on this path."""
-    probe = _human_probe(is_human)
-    try:
-        events = fetch_events(repo, number)
-    except Exception as exc:  # noqa: BLE001 — an unreadable timeline proves nothing
-        log(f"label ownership unknown for {repo}#{number} {label!r} ({exc}); not clearable")
-        return False
-    newest, newest_human = None, False
-    try:
-        for created, kind, login, via_app in _event_rows(events, label):
-            if kind != "labeled":
-                continue
-            instant = parse_ts(created)
-            human = _is_proven_human(login, via_app, probe)
-            if newest is None or instant > newest:
-                newest, newest_human = instant, human
-            elif instant == newest and human:
-                newest_human = True     # an instant tie resolves toward HUMAN-owned
-    except Exception as exc:  # noqa: BLE001 — malformed shape proves nothing
-        log(f"label ownership unknown for {repo}#{number} {label!r} ({exc}); not clearable")
-        return False
-    if newest is None:
-        log(f"label ownership unknown for {repo}#{number} {label!r}: no `labeled` event exists, "
-            "so nothing proves a machine applied it; not clearable")
-        return False
-    return not newest_human
+    return label_application_ownership(
+        repo, number, label, fetch_events, is_human=is_human, log=log
+    ) == LABEL_OWNER_MACHINE
 
 
 def migration_residual_holds(pr_labels, issue_labels, clearing=()):
