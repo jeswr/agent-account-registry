@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1165,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4a2cfbc6ef8d5299d169116442170b202d56d1d0",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`fb_distinct` and `_cmd_decide` distinguish routes by `(repo, token)`, but `_supersede_fallback_alert` assumes that a distinct tuple means a distinct issue tracker. If `ALERT_REPO` equals `REGISTRY_REPO` while `ALERT_TOKEN` differs from the ambient fallback token, `_cmd_decide` enumerates the same repository twice. On a still-firing tick, `_upsert_alert` confirms/refreshes the issue through the primary credential, `fb_marker_open` is true from the second enumeration, and `_supersede_fallback_alert` finds and closes that exact same issue through the ambient credential. The run returns success with no open alert for a firing condition. This configuration is explicitly recognized elsewhere by the same-repo redaction logic, so it cannot safely be assumed absent.",
+    "file": "scripts/model-health.py",
+    "fix_hint": "Define tracker distinctness by normalized repository identity before enumerating or superseding fallback issues; token differences may affect retry capability but must not make one repository look like two trackers. Add an end-to-end test with `ALERT_REPO == REGISTRY_REPO`, distinct working primary/ambient tokens, an existing open marker, and a still-firing classification, asserting that the sole issue remains open and is not supersede-commented.",
+    "severity": "blocker",
+    "title": "Same-repository routes can close the only firing alert"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe reconciliation is unsafe for the supported same-repository configuration: route identity includes the token, so two credentials for the registry are treated as two repositories. A still-firing alert can therefore be refreshed and immediately closed as its own supposed fallback duplicate. The new tests cover distinct repositories only and do not expose this no-alert outcome.",
+  "verdict": "request_changes"
+ }
+}
