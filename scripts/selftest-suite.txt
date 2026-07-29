@@ -2,6 +2,7 @@ account-usage.py
 auto-mint-provenance.py
 backfill-provenance.py
 broker-refresh.py
+callsite-coverage.py
 chain_preference.py
 ci-latency-alert.py
 cross-resolver-agreement.py
