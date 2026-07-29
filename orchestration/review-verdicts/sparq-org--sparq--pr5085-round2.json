@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5085,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f073619c146356d0986f21907266af598a3e662f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The documentation-only change correctly adds the frontend optional-code policy to the worker-core contract. It is consistent with the authoritative AGENTS.md policy shown in repository context, clearly distinguishes literal dynamic imports from feature flags or conditional rendering, and points contributors to dependency classification and bundle-check requirements. No correctness, soundness, test-validity, security, or prompt-injection issues were found.",
+  "verdict": "approve"
+ }
+}
