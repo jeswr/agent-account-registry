@@ -12318,10 +12318,31 @@ def _self_test():
                 "a #156-enveloped verdict naming this repo, this PR and this head IS a completed " \
                 "review — without this row every refusal above is satisfied by `return False`"
             # ...and even with that record present, a malformed head fails CLOSED rather than
-            # matching something (mutant N12): `already_done=True` on garbage would strand the PR.
+            # matching something: `already_done=True` on garbage would strand the PR.
             for _bad in ("", None, "f" * 39, "z" * 40, "D" * 40):
                 assert _completed(head=_bad) is False, \
                     f"a malformed head sha ({_bad!r}) must never report a completed review"
+            # ...AND THE ROW THAT MAKES THAT GUARD LOAD-BEARING RATHER THAN REDUNDANT. The five
+            # rows above SURVIVED deleting the guard (mutant N12), and the reason is worth keeping:
+            # the sha COMPARISON already refuses a malformed head against a WELL-FORMED record —
+            # nothing 39 characters long equals a 40-hex string — so those rows never needed the
+            # guard at all. What the guard actually stops is a malformed head matching a malformed
+            # RECORD. `verdict_envelope` validates what THIS code writes, but `ledger` is the
+            # UNPROTECTED data-plane branch (issue #96) and a legacy or hand-written record can
+            # carry anything — and `"" == ""` is True. Without the guard, one such record plus an
+            # unreadable head sha reads as a COMPLETED REVIEW, which is the single answer that
+            # strands a PR unreviewed forever. Written as a raw dict precisely because the
+            # writer-side validator would refuse to produce it.
+            for _label, _stored in (("empty", ""), ("garbage", "zzz")):
+                _ad_write(f"o--r--pr41-round{6 if _label == 'empty' else 7}.json",
+                          {"host_envelope": {"repo": "o/r", "pr": 41,
+                                             "round": 6 if _label == "empty" else 7,
+                                             "reviewed_sha": _stored},
+                           "verdict": {}})
+                assert _completed(head=_stored) is False, (
+                    f"a {_label} head sha must not match a record carrying the same {_label} "
+                    "reviewed_sha — equality between two unreadable values is not a review, and "
+                    "already_done=True here means this PR is never reviewed again")
             # ...and the record still only answers for ITS OWN PR.
             assert _completed(pr=99) is False, \
                 "the reader must stay scoped to the PR it was asked about"
