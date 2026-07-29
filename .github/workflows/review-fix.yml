@@ -347,8 +347,16 @@ jobs:
           policy_enrol = importlib.util.module_from_spec(spec_enrol)
           spec_enrol.loader.exec_module(policy_enrol)
           with open(Path("registry", "policy", "repos.toml"), "rb") as handle:
-              enrolled_authors = policy_enrol.review_enrolment_authors(
-                  repo, tomllib.load(handle))
+              _enrol_policy_doc = tomllib.load(handle)
+          enrolled_authors = policy_enrol.review_enrolment_authors(repo, _enrol_policy_doc)
+          # [#1306] The master-protected narrowing of the SOURCE-ISSUE `needs:*` hold, from the
+          # SAME master policy row, for the SAME reason the enrolment list is read here: this
+          # step is the LAST leg, and it can refuse a run the dispatcher already claimed a
+          # reviewer account and a lease for. A dispatcher that admits a PR while this
+          # `raise SystemExit` still fires produces a claimed lease, a launched run and no
+          # review — the shape of a fix that is correct everywhere except where it executes.
+          nonhold_issue_labels = policy_enrol.review_loop_nonhold_issue_labels(
+              repo, _enrol_policy_doc)
           # THE #657 ADMISSION SEAM. Both facts — "may this PR's draft/head-ref/author shape gates
           # be waived?" and "does its provenance record admit?" — come from ONE shared function in
           # dispatch-claim.py, so no predicate lives in this `run:` script that a text probe would
@@ -380,8 +388,13 @@ jobs:
           })
           # A needs:*-parked SOURCE issue is human-owned: no autonomous review/fix/rebase may
           # run against its PR until the human clears the label (mirrors CLAIM admission).
-          if any(label.startswith("needs:") for label in issue_labels):
-              raise SystemExit("source issue is human-owned (needs:*)")
+          # [#1306] Through the ONE shared predicate, with the SAME master-protected narrowing —
+          # a local copy of the glob is exactly how this leg would keep refusing a population
+          # PLAN and CLAIM had both started admitting.
+          _source_holds = dispatch_claim.source_issue_holds(issue_labels, nonhold_issue_labels)
+          if _source_holds:
+              raise SystemExit(
+                  "source issue is human-owned (" + ", ".join(_source_holds) + ")")
           merged = set(labels) | set(issue_labels)
           # [OPUS-4.8] defect #3: the arm-side security classifier must be PER-TARGET. The builtin
           # keyword set (zk/mpc/crypto/auth/e2ee) did not cover the registry's own trust areas

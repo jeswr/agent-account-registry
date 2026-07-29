@@ -1303,10 +1303,19 @@ jobs:
               # Reading it from ledger would collapse both halves onto one authority and make
               # the pair pointless. Absent/empty => enrolment OFF => the shape gates stand.
               enrolled_authors = policy_mod.review_enrolment_authors(repo, policy_doc)
+              # [#1306] The MASTER-protected narrowing of the SOURCE-ISSUE `needs:*` hold, read
+              # from the same validated policy row. The review-loop legs each applied a PREFIX
+              # GLOB over a namespace whose ten members do not share one meaning: on sparq
+              # `needs:ec2` (87 open issues — a RESOURCE gate on running an implementation)
+              # outnumbers every human-question label together, and on the 2026-07-29T22:20Z tick
+              # 3 of the 3 worker drafts this leg refused for a source-issue hold were refused on
+              # `needs:ec2`, 0 on any human hold, each with a base review round still unspent.
+              # Absent/empty => the glob stands exactly as before.
+              nonhold_issue_labels = policy_mod.review_loop_nonhold_issue_labels(repo, policy_doc)
               review_items.extend(claim_mod.enumerate_review_items(
                   repo, pulls, provenance, leases, issue_labels, now, pr_status=pr_status,
                   exclusions=review_exclusions, enrolled_authors=enrolled_authors,
-                  census=review_census))
+                  census=review_census, nonhold_issue_labels=nonhold_issue_labels))
               # Armed-SHA-mismatch safety invariant (issue #42): CLAIM disarms these FIRST each
               # sweep, re-deriving every precondition live (matching SHAs are never disarmed).
               disarm_items.extend(claim_mod.enumerate_disarm_items(
@@ -1349,6 +1358,13 @@ jobs:
               repository["items"] = claim_mod.filter_busy_area_items(
                   claim_mod.filter_deferred_items(repository["items"], repo, leases, now),
                   repo, pulls, issue_labels, provenance, pr_status, leases, now,
+                  # [#1306] LINKAGE PARITY: the SAME narrowing the enumerator just used. This leg
+                  # decides whether a PR's crates are BUSY or FREED, from the same source-issue
+                  # hold — so a row the enumerator now emits must not simultaneously count as a
+                  # parked (and therefore freeable) occupant here. Ordered BEFORE the census
+                  # kwargs on purpose: `_census_code_to_comment`'s comment-trap mutant anchors on
+                  # the exact `starvation=starvation, census=partition_census)` tail.
+                  nonhold_issue_labels=nonhold_issue_labels,
                   starvation=starvation, census=partition_census)
               # BRACE-FREE by construction: GitHub's secret masker rewrites `{`/`}` to `***` in log
               # output, so a JSON dump of this census would arrive corrupted. Flat key=value only.

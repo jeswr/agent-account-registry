@@ -140,14 +140,57 @@ POLICY_FIELDS = {
 # reviewer side is a CONSTANT, never resolved by inverting the record's self-declared
 # `impl_provider` — for a self-authored PR that field is an assertion by the implementer about
 # itself, and inverting it yields a same-provider review that merely LOOKS cross-provider.
+# [OPUS-5] review_loop_nonhold_issue_labels (issue #1306): the MASTER-PROTECTED narrowing of the
+# review lane's SOURCE-ISSUE hold.
+#
+# Every review-loop leg (enumerate_review_items, CLAIM's live re-derivation, review-fix.yml's
+# resolve step) stands a PR down when its provenance-linked source issue carries ANY `needs:*`
+# label. That predicate was written for `needs:user` — groom's park marker and the terminal the
+# round-budget escalation applies — and its comment says so ("human-owned"). But it is a PREFIX
+# GLOB over a namespace whose members do NOT share that meaning. MEASURED on sparq 2026-07-29
+# over the fully-paginated open population (1785 open issues, 92 open PRs): the `needs:*`
+# namespace has TEN distinct members, and the two human-question ones (`needs:user` 36,
+# `needs:maintainer` 3) are outnumbered 87-to-39 by `needs:ec2` alone — a RESOURCE gate meaning
+# "the work item wants a dedicated benchmark box", which is a statement about running the
+# implementation, not a human question about the diff. Of the worker drafts the review lane
+# refused for a source-issue hold that tick, 3 of 3 were refused on `needs:ec2` and 0 on any
+# human hold; all three had spent only 2 of their 3 base review rounds.
+#
+# So: entries listed here are the `needs:*` labels that, on a SOURCE ISSUE, do NOT hold the
+# review loop. Everything else in the namespace keeps holding it. The default is EMPTY, i.e. the
+# prefix glob stands exactly as it did — a repo that lists nothing behaves identically.
+#
+# WHY THIS LIST AND NOT A HARDCODED HUMAN SET. Inverting the predicate (hold on a fixed
+# {needs:user, needs:maintainer} set) fails OPEN: a `needs:*` label minted tomorrow would stop
+# holding anything with no reviewed change anywhere. This direction fails CLOSED — an unknown
+# label still holds — and the SET that can ever be waived is a master-protected, gate-reviewed
+# edit rather than a per-issue label gesture. That is the same asymmetry
+# `review_enrolment_authors` above is built on.
+#
+# WHAT IT DOES NOT DO. It never waives a hold on the PR itself (HUMAN_HOLD_PR_LABELS —
+# `review:needs-user` / `needs:user`), the machine capacity parks (`review:parked` on the PR,
+# `status:parked` on the source issue), the round budget, the per-PR lease single-flight, the
+# fork gate, or the provenance-record admission. It DELETES NOTHING: a foreign `needs:*` stays on
+# the issue and keeps gating that issue out of the target's ready engine, so admitting the PR to
+# review can never re-dispatch the parked implementation work (dispatch-claim's issue-lane
+# predicates are untouched). `needs:user` itself is REFUSED as an entry — allowlisting the park
+# pair's own issue-side half would waive the terminal escalation, not narrow a glob.
 OPTIONAL_POLICY_FIELDS = {"require_usage", "usage_safety_margin", "max_review_rounds",
                           "review_queue_ttl_minutes", "cross_provider_fallback", "security_paths",
                           "trusted_bots", "allow_actions_bot_issues", "throughput", "readiness",
-                          "review_enrolment_authors"}
+                          "review_enrolment_authors", "review_loop_nonhold_issue_labels"}
 
 # A canonical GitHub USER login: ASCII alphanumeric with internal single hyphens, <= 39 chars.
 # Deliberately excludes the "[bot]" suffix — see the OPTIONAL_POLICY_FIELDS note above.
 GITHUB_LOGIN_RE = re.compile(r"[a-z0-9](?:-?[a-z0-9]){0,38}")
+
+# A canonical `needs:<suffix>` label name. Anchored on the `needs:` prefix on purpose: the field
+# narrows exactly the prefix glob the review-loop legs apply, so an entry that is not itself in
+# that namespace could only ever be dead text in a reviewed policy file.
+NEEDS_LABEL_RE = re.compile(r"needs:[a-z0-9](?:-?[a-z0-9]){0,38}")
+
+# The issue-side half of the human park pair. Never waivable — see the note above.
+NEVER_NONHOLD_ISSUE_LABEL = "needs:user"
 
 
 # Slots whose underlying account is dead and which must never appear in an account_pool again.
@@ -287,6 +330,33 @@ def _policy_row(target_repo, policy_doc):
         if len(set(authors)) != len(authors):
             raise PolicyError(
                 f"review_enrolment_authors for {target_repo!r} contains duplicates")
+    if "review_loop_nonhold_issue_labels" in row:
+        nonhold = row["review_loop_nonhold_issue_labels"]
+        # Same boundary-canonicalization argument as review_enrolment_authors: the consumer
+        # (dispatch-claim.source_issue_holds) compares label names EXACTLY as GitHub reports
+        # them, so " needs:EC2 " would read as a waiver in review and match nothing at the
+        # comparison site. A non-canonical entry is refused here, where a human is looking.
+        if not isinstance(nonhold, list) or any(not isinstance(n, str) for n in nonhold):
+            raise PolicyError(
+                f"review_loop_nonhold_issue_labels for {target_repo!r} must be a list of "
+                "label-name strings")
+        noncanonical = [n for n in nonhold if NEEDS_LABEL_RE.fullmatch(n) is None]
+        if noncanonical:
+            raise PolicyError(
+                f"review_loop_nonhold_issue_labels for {target_repo!r} contains non-canonical "
+                f"label(s) {noncanonical!r} — each entry must match {NEEDS_LABEL_RE.pattern} "
+                "exactly (this field narrows the `needs:*` prefix glob the review-loop legs "
+                "apply, so an entry outside that namespace could only be dead text)")
+        if NEVER_NONHOLD_ISSUE_LABEL in nonhold:
+            raise PolicyError(
+                f"review_loop_nonhold_issue_labels for {target_repo!r} names "
+                f"{NEVER_NONHOLD_ISSUE_LABEL!r} — that label is the ISSUE-SIDE HALF of the human "
+                "park pair the round-budget escalation applies (park_class=question). Listing it "
+                "would waive the terminal human hold, not narrow a namespace glob; the field "
+                "exists to release RESOURCE gates such as needs:ec2")
+        if len(set(nonhold)) != len(nonhold):
+            raise PolicyError(
+                f"review_loop_nonhold_issue_labels for {target_repo!r} contains duplicates")
     if "security_paths" in row:
         paths = row["security_paths"]
         if (not isinstance(paths, list)
@@ -311,6 +381,7 @@ def _policy_row(target_repo, policy_doc):
     normalized = dict(row)
     normalized.setdefault("allow_actions_bot_issues", False)
     normalized.setdefault("review_enrolment_authors", [])
+    normalized.setdefault("review_loop_nonhold_issue_labels", [])
     return normalized
 
 
@@ -326,6 +397,25 @@ def review_enrolment_authors(target_repo, policy_doc):
     as before. _policy_row has already refused a malformed or non-canonical list, so reaching
     here means every entry is a canonical login."""
     return frozenset(_policy_row(target_repo, policy_doc)["review_enrolment_authors"])
+
+
+def review_loop_nonhold_issue_labels(target_repo, policy_doc):
+    """The master-protected set of SOURCE-ISSUE `needs:*` labels that do NOT hold the review loop.
+
+    Read by the PLAN assemble step (handed to enumerate_review_items / filter_busy_area_items),
+    by CLAIM's live re-derivation, and by review-fix.yml's resolve step — the three legs that
+    each apply the `needs:*` prefix glob and must therefore agree on the SAME narrowing, or a
+    PR is enumerated by one leg and stood down by the next (issue #1306).
+
+    Deliberately NOT surfaced through resolve(): that output dict is compared field-by-field by
+    dispatch-claim._route_matches against the TARGET-side resolver, so adding a key there would
+    be a cross-repo contract change. This is a separate, registry-only read, exactly like
+    review_enrolment_authors.
+
+    Absent / empty => empty frozenset, i.e. the prefix glob stands exactly as before. _policy_row
+    has already refused a malformed entry, an entry outside the `needs:` namespace, and
+    `needs:user` itself, so reaching here means every entry is a waivable canonical label."""
+    return frozenset(_policy_row(target_repo, policy_doc)["review_loop_nonhold_issue_labels"])
 
 
 def _normalise_labels(role_or_labels):
