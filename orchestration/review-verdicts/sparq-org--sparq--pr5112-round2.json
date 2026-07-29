@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5112,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2b39553e487c59cce85788ce42d19a3fc3656144",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The comments now explicitly and accurately exclude tar-gzip from the fix instead of claiming `.tgz` support, while preserving the implemented ZIP inner-member-name behavior. The production path propagates `decoded.effectiveName` through the web-upload result and uses it consistently for both parser format selection and the displayed preview. The ZIP regression test is non-vacuous: its N-Quads fixture is invalid as Turtle and it verifies the resulting quad in the named graph, so it exercises the load-bearing format-selection behavior on the real browser upload/decompression path. The additional zstd test likewise verifies queryable imported data rather than merely checking for an absence of errors.",
+  "verdict": "approve"
+ }
+}
