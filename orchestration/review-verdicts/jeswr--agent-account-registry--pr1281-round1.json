@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1281,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "db468290fa04b0c30dcfb384e43b5eb4fc9c2a48",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe ready-repair mutation boundary now re-lists open pull requests per action immediately before the label write and re-applies both intended admission paths: authenticated worker linkage and provenance-backed enrolled-orchestrator admission. The change removes reliance on the stale pre-loop snapshot without weakening the separate terminal-reap guard. The added scenarios are non-vacuous and distinguish no-PR writes, a post-snapshot authenticated record-less worker suppression, rejection of an untrusted body-only link, and the enrolled-orchestrator disjunct with its allowlist argument. I found no correctness, fail-closed, security, or test-validity defect in the diff.",
+  "verdict": "approve"
+ }
+}
