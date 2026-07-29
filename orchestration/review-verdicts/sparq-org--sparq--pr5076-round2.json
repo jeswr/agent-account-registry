@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5076,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6a3c117195e43aeb4906adf4c3a0b28083c6e1de",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 9 still says the change \"does not rewrite the imported doc-comments,\" that roughly 70 stale citations remain, and that re-pointing them is tracked as follow-up. This diff does rewrite the cited Rust documentation and implementation comments to the namespaced RSS/PSS form and the new in-repo record. The stale paragraph therefore gives readers a false account of what remains unresolved and conflicts with \u00a71's citation discipline and `src/lib.rs`'s new description.",
+    "file": "research/lws-design-records.md",
+    "fix_hint": "Replace the stale bullet with an accurate limitation, such as noting that the original upstream ADR trees are still not copied verbatim and that the rewritten citations resolve through this reconstructed record. Do not claim the citation rewrite remains future work unless specific remaining citations are identified.",
+    "severity": "minor",
+    "title": "The limitations section contradicts the citation rewrite in this PR"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 1's major finding is resolved: `research/lws-design-records.md` now exists and supplies the promised source-path map and reconstructed sections. However, the merged record ends with a stale statement that this change does not rewrite the imported citations and that roughly 70 citations still need follow-up, while this same diff performs that rewrite across the crate. That makes the durable record internally inconsistent about the scope and completion state of the migration. The round is improving because the prior major issue is fixed and only a minor documentation inconsistency remains.",
+  "verdict": "request_changes"
+ }
+}
