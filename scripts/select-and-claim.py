@@ -3862,33 +3862,102 @@ def _self_test():
                   (True, False, 2))
     finally:
         subprocess.run = real_run
-    # THE CALL-SITE PIN, re-derived from the parsed source rather than asserted on one function:
-    # every ledger transaction that MINTS a TransientWriteBudget must hand it to its READ as well
-    # as its PUT. Deleting `, budget` from reclaim / claim / adopt / release turns this red and
-    # names the function that lost it.
+    # ---- ONE budget INSTANCE across both halves, not merely "a second argument" ---------------
+    # ARITY IS NOT IDENTITY (review round 1 of #1246). The first version of the pin below asserted
+    # only that `_read_ledger` received a second argument. Handing each call site a FRESH
+    # `TransientWriteBudget()` satisfies that — and a fresh budget per half is precisely the
+    # DOUBLED-ALLOWANCE defect this change exists to avoid: two half-budgets tolerate 2x the
+    # throttle the bound promises, and a transaction can outlive it. So both a RUNTIME row (the
+    # instance and its accumulated counter) and a STRUCTURAL row (one mint, threaded to both
+    # halves) are asserted, and each reds on the fresh-budget mutant on its own.
+    #
+    # RUNTIME: drive a real `release()` and record `id(budget)` at both halves plus the rejection
+    # counter as each half sees it. One id and a counter that CARRIES (0 at the read, 1 at the PUT
+    # after the read absorbed one) is the property; a fresh mint gives two ids and a counter that
+    # resets to 0.
+    identity_seen = []
+
+    def _identity_read(repo, budget=None):
+        identity_seen.append(("read", id(budget), None if budget is None else budget.rejections))
+        if budget is not None:
+            budget.rejections += 1            # one absorbed read rejection, carried into the PUT
+        return [dict(released)], "sha-identity"
+
+    def _identity_write(repo, leases, sha, message, budget=None):
+        identity_seen.append(("put", id(budget), None if budget is None else budget.rejections))
+        return True
+
+    saved_rl, saved_wl = globals()["_read_ledger"], globals()["_write_ledger"]
+    globals()["_read_ledger"] = _identity_read
+    globals()["_write_ledger"] = _identity_write
+    globals()["_pre_write_jitter"] = lambda: None
+    try:
+        identity_released = release("o/r", "b" * 32, now)
+    finally:
+        globals()["_read_ledger"], globals()["_write_ledger"] = saved_rl, saved_wl
+        globals()["_pre_write_jitter"] = real_jitter
+    check("[#1246] the READ and the PUT share ONE budget instance, whose count carries across",
+          (identity_released,
+           [half for half, _id, _n in identity_seen],
+           len({_id for _half, _id, _n in identity_seen}),
+           [n for _half, _id, n in identity_seen]),
+          (True, ["read", "put"], 1, [0, 1]))
+    # STRUCTURAL: re-derived from the parsed source, so it covers transactions this suite does not
+    # drive and any future one. Every ledger transaction MINTS EXACTLY ONE budget and threads THAT
+    # NAME to both its read and its PUT. Deleting `, budget` from a call site, or minting a second
+    # budget for either half, turns this red and NAMES the function that did it.
     import ast as _ast_pin
     with open(__file__, encoding="utf-8") as _src:
         _module_ast = _ast_pin.parse(_src.read())
+
+    def _budget_arg_name(call):
+        """The NAME handed to this call as its budget, or None when it is anything else (a fresh
+        `TransientWriteBudget()` mint is a Call, not a Name, so it can never satisfy this)."""
+        node = None
+        for keyword in call.keywords:
+            if keyword.arg == "budget":
+                node = keyword.value
+        if node is None and len(call.args) >= 2 and getattr(call.func, "id", "") == "_read_ledger":
+            node = call.args[1]
+        if node is None and len(call.args) >= 5 and getattr(call.func, "id", "") == "_write_ledger":
+            node = call.args[4]
+        return node.id if isinstance(node, _ast_pin.Name) else None
+
     _budget_fns = []
     # TOP-LEVEL functions only, and never this suite: `_self_test` mints budgets and calls
-    # `_read_ledger` directly BY DESIGN (three rows above), so including it would assert against
-    # the test rather than the production transactions. A new budgeted transaction that forgot the
-    # budget still appears here as its own named, False row.
+    # `_read_ledger` directly BY DESIGN (rows above), so including it would assert against the test
+    # rather than the production transactions. A new budgeted transaction that forgot the budget
+    # still appears here as its own named row.
     for _node in _module_ast.body:
         if not isinstance(_node, _ast_pin.FunctionDef) or _node.name == "_self_test":
             continue
-        _mints = any(isinstance(c, _ast_pin.Call)
-                     and getattr(c.func, "id", "") == "TransientWriteBudget"
-                     for c in _ast_pin.walk(_node))
+        # The name(s) bound by a `x = TransientWriteBudget(...)` assignment in this function.
+        _mint_names = set()
+        _mints = 0
+        for _sub in _ast_pin.walk(_node):
+            if isinstance(_sub, _ast_pin.Call) and getattr(_sub.func, "id", "") == "TransientWriteBudget":
+                _mints += 1
+            if isinstance(_sub, _ast_pin.Assign) and isinstance(_sub.value, _ast_pin.Call) \
+                    and getattr(_sub.value.func, "id", "") == "TransientWriteBudget":
+                _mint_names |= {t.id for t in _sub.targets if isinstance(t, _ast_pin.Name)}
         if not _mints:
             continue
-        _reads = [c for c in _ast_pin.walk(_node)
+        _calls = [c for c in _ast_pin.walk(_node)
                   if isinstance(c, _ast_pin.Call)
-                  and getattr(c.func, "id", "") == "_read_ledger"]
-        _budget_fns.append((_node.name, all(len(c.args) >= 2 for c in _reads), len(_reads)))
-    check("[#1246] every budgeted ledger transaction passes that budget to its READ",
+                  and getattr(c.func, "id", "") in ("_read_ledger", "_write_ledger")]
+        _threaded = {c.func.id: sorted({_budget_arg_name(c) for c in _calls if c.func.id == n})
+                     for n in ("_read_ledger", "_write_ledger") for c in _calls if c.func.id == n}
+        _budget_fns.append((
+            _node.name,
+            _mints,                                            # exactly one mint per transaction
+            sorted(_mint_names),                               # ...bound to one name
+            _threaded.get("_read_ledger") == sorted(_mint_names),   # ...threaded to the READ
+            _threaded.get("_write_ledger") == sorted(_mint_names),  # ...and to the PUT
+        ))
+    check("[#1246] every ledger transaction mints ONE budget and threads THAT name to read + PUT",
           sorted(_budget_fns),
-          [("adopt", True, 1), ("claim", True, 1), ("reclaim", True, 1), ("release", True, 1)])
+          [("adopt", 1, ["budget"], True, True), ("claim", 1, ["budget"], True, True),
+           ("reclaim", 1, ["budget"], True, True), ("release", 1, ["budget"], True, True)])
 
     # ---- CAS retry backoff schedule + typed PUT errors (issue #179) ----
     # Exponential, capped ceiling: dropping the exponent (linear) or the cap flips these red.
