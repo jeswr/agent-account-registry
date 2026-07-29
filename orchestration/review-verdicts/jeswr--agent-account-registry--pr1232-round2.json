@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1232,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a3b478a2b29b52bb08809f6e2a27f067221e26da",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 resolves both prior major findings. Accepted artifact markers are now bound to independently fetched provenance for the exact groom workflow, the repository default branch, and scheduled events; evidence is ordered by workflow-run creation rather than artifact upload time, with adversarial coverage for other workflows, branches, events, spoofed names, and late reruns. The live marker producer is also parsed and executed by the self-test, proving the exact one-to-one mapping from both mint-step outcomes to their owners and explicitly killing each owner-entry deletion mutant. The workflow seam, fail-closed read behavior, mutation return codes, authority ceiling, permissions, sparse inputs, and test enrollment are covered non-vacuously. No blocking correctness, soundness, test-validity, or security issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
