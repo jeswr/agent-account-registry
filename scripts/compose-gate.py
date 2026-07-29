@@ -697,6 +697,18 @@ def _self_test():
         annotation(classify("", ""))[:9], "::error::")
     chk("a FRESH state needs no annotation", annotation(classify(A, A)), "")
 
+    # ⚠️ THE RECEIPT'S `blocking=` FIELD AND THE EXIT CODE ARE TWO STATEMENTS OF ONE FACT, and a
+    # reader who greps the receipt must never be told something the exit code contradicts. They are
+    # computed from the same predicate today; this pins that they cannot drift apart tomorrow.
+    for _state in STATES:
+        _row = {"state": _state}
+        chk(f"receipt blocking= agrees with the exit code for {_state!r}",
+            (f"blocking={'true' if _state in BLOCKING_STATES else 'false'}" in receipt(_row),
+             (1 if _state in BLOCKING_STATES else 0)),
+            (True, 1 if _state in BLOCKING_STATES else 0))
+    chk("every state is either blocking or not — none is unclassified",
+        sorted(set(STATES)) == sorted(set(STATES) | set(BLOCKING_STATES)), True)
+
     # ---- the receipt must never let a small selection pass for a full one --------------------
     chk("the receipt prints the entry count so a vacuous selection is visible",
         "entries=0" in receipt(classify(A, B, 0, failures=[], entries=[])), True)
