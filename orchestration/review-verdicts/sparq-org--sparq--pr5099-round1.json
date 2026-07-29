@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 5099,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4928256adf4fed74e88922baaab14aa79f7be968",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "BuilderEdge documents that an optional edge brings the target node's own patterns with it, but serializeModel first emits every non-negated node's class and attributes at top level and later wraps only the edge triple in OPTIONAL. For `?person foaf:knows ?friend` with a typed/filtered target, rows with no matching friend are eliminated by the top-level target patterns, so the diagram's optional relationship has required semantics. The unit test named \u201cOPTIONAL wraps the edge\u201d actually locks in this incorrect output (`?friend a foaf:Person` outside OPTIONAL), making the test counterproductive.",
+    "file": "gui/app/src/lib/query-builder.ts",
+    "fix_hint": "Partition node patterns by edge scope. For an optional target, emit the edge and the target node's class/attribute/filter patterns together inside one OPTIONAL group, while ensuring each target is emitted exactly once and rejecting ambiguous graph shapes if v1 cannot scope them soundly. Update the relevant unit test to assert that an unmatched source row survives.",
+    "severity": "major",
+    "title": "OPTIONAL edges leave target-node constraints outside OPTIONAL"
+   },
+   {
+    "body": "projectedVariables includes projected attributes on a negated target, but validateModel detects negated projections by searching only for a node whose `node.variable` equals the projected name. A projected attribute such as `?blockedName` therefore appears in SELECT even though its only binding is inside FILTER NOT EXISTS, yielding an always-unbound projection and contradicting the UI/README claim that variables from the branch are not projectable. The existing test covers only the target node variable and misses this path.",
+    "file": "gui/app/src/lib/query-builder.ts",
+    "fix_hint": "Associate every projected node and attribute variable with its owning node, and reject projection when that owner is in negatedNodeIds. Also disable attribute projection controls for negated nodes or otherwise keep the UI consistent. Add a test with a projected attribute on the NOT EXISTS leaf and assert buildQuery is not runnable.",
+    "severity": "major",
+    "title": "Projected attributes inside NOT EXISTS are not rejected"
+   },
+   {
+    "body": "prefixWarning classifies an unknown prefix as only a warning, so buildQuery returns runnable=true while requiredPrefixLines cannot declare it. The emitted query is invalid SPARQL unless the user manually adds a PREFIX line. This directly contradicts the README's stated invariant that an undeclared prefix is an invalid diagram that cannot be run; the unit test explicitly asserts the opposite behavior.",
+    "file": "gui/app/src/lib/query-builder.ts",
+    "fix_hint": "Make unresolved prefixed names validation errors (or add an explicit prefix-declaration model/UI and serialize those declarations). Update the undeclared-prefix test to require runnable=false and keep best-effort SPARQL visible.",
+    "severity": "major",
+    "title": "Queries with undeclared prefixes are marked runnable"
+   }
+  ],
+  "progress": null,
+  "summary": "The builder has multiple result-correctness and honesty defects in its serializer/validation. In particular, OPTIONAL edges do not scope the target node's patterns as the public model contract claims, variables projected from negated attributes escape NOT EXISTS validation, and undeclared prefixes are knowingly treated as runnable even though the resulting query is invalid. The tests currently encode or miss these failures rather than protecting the advertised invariants.",
+  "verdict": "request_changes"
+ }
+}
