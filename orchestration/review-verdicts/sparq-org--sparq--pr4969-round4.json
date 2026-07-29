@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4969,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5b12d8c5edfce8caeb50e5634a46fe77704c5d2b",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is documentation-only and consistently presents the imported LWS server as experimental, default-ephemeral, and separate from the published crate estate. The reconstructed design record clearly distinguishes code-backed facts from unavailable upstream rationale, preserves the documented residual existence-disclosure caveat, and accurately describes the identity-host and verified-token-cache security boundaries. The matching README and usage skill updates avoid capability or durability overclaims. No correctness, soundness, test-validity, or security defect was found in the changed material.",
+  "verdict": "approve"
+ }
+}
