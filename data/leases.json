@@ -49,6 +49,16 @@
    "model": "opus5",
    "issued_at": 1785336709,
    "expires_at": 1785343009
+  },
+  {
+   "account": "dc2d751954080e13",
+   "claim_id": "e1be7b601c8743a992cccff0ff21577a",
+   "holder": "review:jeswr/agent-account-registry#1098@dispatch-30462465104.1",
+   "package": "worker",
+   "role": "review",
+   "model": "sol",
+   "issued_at": 1785336739,
+   "expires_at": 1785340939
   }
  ]
 }
