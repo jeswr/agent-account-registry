@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1066,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "aa4d80e8f22b2b1349cfc6d26a4876d01653c3a7",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`derives_labels()` still performs two independent existential searches over the whole assignment RHS: any `pull` name plus any string constant `\"labels\"`. Those tokens need not belong to the expression that supplies the assigned collection. For example, a valid RHS can use `pull.get(\"labels\") is not None` as the condition of a conditional expression while its normal value is a set built from `head.get(\"labels\")`. The three top-level stand-down guards then consume the wrong labels, but the anchor and literal scan remain green. KP7 and KP8 do not exercise this: they remove or relocate the PR-derived syntax instead of retaining it as a same-RHS decoy.",
+    "file": "scripts/park_policy.py",
+    "fix_hint": "Recognize a structurally bound data flow from the PR payload's `labels` field to the iterable that produces the assigned `labels` collection, permitting only explicitly supported normalization around that value, or behaviorally execute the extracted admission logic with independently controlled `pull` and `head` payloads. Add a valid, non-crashing same-RHS mutant that retains `pull.get(\"labels\")` only as a condition/decoy while the assigned collection comes from `head`; require a normal FAIL with the pristine total check count preserved.",
+    "severity": "major",
+    "title": "Same-RHS PR-label decoy still satisfies the provenance anchor"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 5 still does not close the round-4 provenance escape. `derives_labels()` is unchanged: it accepts any `labels = <RHS>` whose AST contains a `pull` name somewhere and a string literal `\"labels\"` somewhere, without proving that the value assigned to `labels` is produced from `pull.get(\"labels\")`. The newly shown KP7/KP8 cases remove or move the genuine read; none retains it as a decoy in the same RHS while selecting labels from another object. Consequently a valid conditional expression can mention `pull.get(\"labels\")` only in its condition and assign normalized `head` labels to the name consumed by every guard. The seam scanner then reports all expected literals although the workflow admits a PR based on the wrong label collection. The prior major finding remains materially unchanged at the same severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
