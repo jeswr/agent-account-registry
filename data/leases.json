@@ -12,16 +12,6 @@
   },
   {
    "account": "9e13ea21abf27e68",
-   "claim_id": "69eb08a5b7b24a75b829a875f5ea71a6",
-   "holder": "fix:jeswr/agent-account-registry#1111@dispatch-30420004425.1",
-   "package": "review-loop",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785296601,
-   "expires_at": 1785302901
-  },
-  {
-   "account": "9e13ea21abf27e68",
    "claim_id": "0d5ea9ac1b384e14a3eabc9746dbeac4",
    "holder": "fix:sparq-org/sparq#4866@dispatch-30420447837.1",
    "package": "sparq-vectors",
