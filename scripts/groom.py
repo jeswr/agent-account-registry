@@ -206,8 +206,10 @@ AGE_UNPARK_MARKER = park_policy.GROOM_AGE_UNPARK_MARKER
 #
 # Declared HERE rather than in park_policy, unlike the two markers above: this one has no reader
 # in another checkout root — groom writes it and groom reads it back, for dedupe only. It must
-# CONTAIN neither receipt marker, or age_receipts would read a correction as a grant and
-# age_park_generation would count one as a park; the self-test asserts both directions.
+# CONTAIN neither receipt marker: age_receipts would read a correction carrying the GRANT marker
+# as a grant, and since [registry #1292] age_park_generation counts exactly those, a correction
+# would SPEND one of the AGE_UNPARK_MAX automatic re-admissions the machine never made. The
+# self-test asserts both directions on the real rendered body.
 AGE_UNPARK_STALL_MARKER = "<!-- registry-groom-unpark-stalled:v1"
 _AGE_RECEIPT = re.compile(
     r"cause=(?P<cause>[a-z-]{1,40}) head=(?P<head>[0-9a-f]{40}) gen=(?P<gen>[1-9][0-9]{0,3}) -->"
@@ -263,19 +265,54 @@ def age_receipts(comments: list[dict[str, Any]], marker: str, bot_login: str
 
 
 def age_park_generation(comments: list[dict[str, Any]], bot_login: str) -> int:
-    """The generation a NEW age-park would occupy: one past every park receipt already on record,
-    CLAMPED at AGE_UNPARK_MAX + 1.
+    """The re-admission generation a NEW age-park would occupy: one past every automatic
+    RE-ADMISSION already GRANTED on this PR, CLAMPED at AGE_UNPARK_MAX + 1.
 
-    Counts MARKERS, not well-formed records — a malformed receipt still consumed a generation,
-    exactly as park_policy's `auto_marker_count` counts markers rather than parsed records.
+    [registry #1292] IT COUNTS GRANTS, NOT PARKS — and that is the whole point. AGE_UNPARK_MAX
+    says what it bounds in its own name and comment: "at most this many AUTOMATIC RE-ADMISSIONS
+    may ever be granted to one PR". age_park_label spends that budget, escalating to the
+    human-owned `needs:user` at generation > AGE_UNPARK_MAX. Until this change the counter
+    summed AGE_PARK_MARKER receipts — how many times the sweep had PARKED, which is a different
+    quantity and, on the live population, an unrelated one.
 
-    The clamp is what makes the terminal terminal. Without it every further sweep of an already
-    escalated PR mints a HIGHER generation, whose fingerprint no earlier receipt can match, so the
-    escalation comment is re-posted on every tick — forever, on a PR already handed to a human.
-    Escalated is an ABSORBING state: the generation stops at AGE_UNPARK_MAX + 1, the receipt stops
-    changing, and the dedupe holds. (The head SHA remains in the fingerprint, so genuinely NEW work
-    pushed after an escalation does re-state it once — one comment per head, the same bound
-    park_policy's park fingerprints use.)"""
+    WHY THAT WAS AN ABSORBING STATE, AND WHY IT WAS SELF-DRIVEN. The park receipt embeds
+    `gen={generation}`, and the hand-off's comment dedupe searches for that exact receipt string.
+    With the generation derived from the park count, the string a new park mints is BY
+    CONSTRUCTION one that has never been written, so the dedupe could never fire; the comment was
+    re-posted; posting it bumped the PR's `updated_at`; and `stale_worker_pr_reason` re-derives
+    staleness from `updated_at`, so the sweep's own comment guaranteed the next threshold
+    crossing. Three crossings — no push, no review, no re-admission, nothing but the clock the
+    sweep wound itself — reached generation 3 and applied `needs:user`, which
+    park_policy.capacity_park_admission refuses to auto-re-admit and
+    dispatch-claim.enumerate_review_items excludes. The machine retired its own PRs into the one
+    class no machine re-enters, on evidence it manufactured.
+
+    MEASURED, live open PRs 2026-07-29: all 16 age-park escalations then standing had reached
+    generation 3 with ZERO un-park grants on record and the SAME head SHA across all three
+    generations. Not one had been re-admitted even once; not one had moved. Those 16 were 15 of
+    the 18 human-terminal holds applied that day. The escalation comment already SAID so — #769
+    made its prose honest ("the machine granted NO automatic re-admission on this PR") without
+    making its arithmetic honest, so the sweep printed an accurate description of its own defect
+    on every PR it absorbed.
+
+    Counting grants makes all three of the cap's claims true at once: the escalation happens
+    only after the machine really did re-admit the PR AGE_UNPARK_MAX times and it really did come
+    back, the receipt fingerprint stops moving while nothing is granted (so the dedupe becomes
+    load-bearing and the self-wound clock stops), and a park nobody re-admitted stays in the
+    MACHINE class, where age_park_cause_recovered can still prove its cause recovered and let it
+    out. Grants are bounded and consume-once (age_unpark_state keys them on the whole
+    (cause, head, gen) triple), so the ladder still terminates.
+
+    Counts MARKERS, not well-formed records — a malformed grant receipt still consumed the
+    re-admission it recorded, exactly as park_policy's `auto_marker_count` counts markers rather
+    than parsed records, so a corrupt comment can never buy an extra one.
+
+    The clamp stays. It is no longer what stops the escalation comment repeating (a stable
+    generation does that now), but it still pins the terminal: once the budget is spent the
+    generation cannot climb further, so the receipt stops changing and the dedupe holds. (The
+    head SHA remains in the fingerprint, so genuinely NEW work pushed after an escalation does
+    re-state it once — one comment per head, the same bound park_policy's park fingerprints
+    use.)"""
     if not bot_login:
         return 1
     return min(
@@ -283,7 +320,7 @@ def age_park_generation(comments: list[dict[str, Any]], bot_login: str) -> int:
         1 + sum(
             1 for comment in comments
             if comment["user"]["login"].casefold() == bot_login.casefold()
-            and AGE_PARK_MARKER in comment["body"]
+            and AGE_UNPARK_MARKER in comment["body"]
         ),
     )
 
@@ -6898,10 +6935,10 @@ def _self_test() -> int:
         finally:
             AGE_PARK_CAUSES[BAD_MERGE_STATES["dirty"]] = _saved_dirty
 
-        # (A3) THE CAP, at the only place it is enforced. Two park receipts already on record means
-        # this park is generation 3 — past AGE_UNPARK_MAX — so the machine has already granted every
-        # automatic re-admission it may, and the disposition becomes ESCALATION to the human class.
-        # Raise AGE_UNPARK_MAX (or drop the generation comparison) and this reds.
+        # (A3) THE CAP, at the only place it is enforced — and, since [registry #1292], WHAT IT
+        # COUNTS. AGE_UNPARK_MAX bounds AUTOMATIC RE-ADMISSIONS, so the generation that spends it
+        # is one past every GRANT on record. Two PARK receipts are not two re-admissions; on the
+        # live population they were not even one.
         def _park_receipt_comment(gen: int, number: int = 31, cause: str = "merge-dirty") -> dict:
             # Faithful to what the hand-off actually posts — STALE_PR_MARKER INCLUDED. A
             # fixture that omitted it would let a dedupe reverted to the once-ever marker pass.
@@ -6909,32 +6946,103 @@ def _self_test() -> int:
                     "body": f"> 🤖 SPARQ agent\n\n{STALE_PR_MARKER}\n{AGE_PARK_MARKER} "
                             f"cause={cause} head={number:040x} gen={gen} -->"}
 
+        def _grant_receipt_comment(gen: int, number: int = 31, cause: str = "merge-dirty") -> dict:
+            """An un-park GRANT receipt: the machine PROVED this park's cause recovered and spent
+            one of its AGE_UNPARK_MAX automatic re-admissions on it. This — not a park comment —
+            is what the cap counts."""
+            return {"user": {"login": "app[bot]"},
+                    "body": f"{AGE_UNPARK_MARKER} cause={cause} head={number:040x} gen={gen} -->"}
+
+        # (A3a) [#1292] THE ABSORBING PARK, AND THE SELF-WOUND CLOCK THAT DROVE IT. This fixture
+        # is the dominant live shape, reproduced exactly: repeated PARK receipts at an UNCHANGED
+        # head and ZERO un-park receipts — the machine re-parked its own PR and never once
+        # re-admitted it. MEASURED on the live open-PR population 2026-07-29: all 16 standing
+        # age-park escalations had precisely this shape (same head across all three generations,
+        # zero grants), and they were 15 of the 18 human-terminal holds applied that day.
+        #
+        # Counting PARKS made the escalation self-driving. The receipt embeds `gen=`, so a
+        # park-derived generation minted a receipt string `already_commented` could never match;
+        # the comment was re-posted; the post bumped `updated_at`; stale_worker_pr_reason reads
+        # `updated_at`, so the sweep guaranteed its own next threshold crossing. Three crossings
+        # of a clock the sweep wound itself reached generation 3 and applied `needs:user` — which
+        # park_policy.capacity_park_admission refuses to auto-re-admit and
+        # dispatch-claim.enumerate_review_items excludes. There is no machine path out of that.
+        #
+        # BOTH halves are asserted, because both are load-bearing and they fail independently:
+        # the CLASS stays MACHINE (so age_park_cause_recovered can still let this PR out), and
+        # NOTHING is re-commented (so `updated_at` does not move and the clock stops re-arming).
+        # Revert age_park_generation to counting AGE_PARK_MARKER and every element reds.
         terminal_sweep_env["pages"] = {
             "/repos/owner/repo/issues/31/comments": [
                 _park_receipt_comment(1), _park_receipt_comment(2)]}
-        capped_log, _e, _r = _sweep_with_refusals({}, pulls=(_stale_worker_pr(31),))
-        # [#769] THE ESCALATION MUST NOT CLAIM GRANTS THAT WERE NEVER MADE. This fixture is the
-        # dominant live shape: two PARK receipts, ZERO un-park receipts. The cap counts park
-        # GENERATIONS, and a generation is consumed by every re-park however the label was
-        # cleared — so generation 3 does NOT imply the machine granted two re-admissions, and the
-        # first version of this comment asserted flatly that it did. A maintainer told the machine
-        # already tried twice goes looking for a flapping cause; the durable record says nobody
-        # tried at all, and what actually wants explaining is what kept clearing the park.
-        # BOTH DIRECTIONS are asserted, here and immediately below, because a wording that is
-        # honest for one grant count and false for the other is the defect itself.
+        uncredited_log, _e, _r = _sweep_with_refusals({}, pulls=(_stale_worker_pr(31),))
         check(
-            "[#769] re-admission is CAPPED: an age park past AGE_UNPARK_MAX escalates to "
-            "needs:user, and with NO grants on record the comment says the machine granted NONE "
-            "— it never claims re-admissions it did not make",
+            "[#1292] a park the machine NEVER re-admitted does not spend the re-admission cap: "
+            "repeated parks at an unchanged head keep the MACHINE class, never needs:user, and "
+            "re-post NO comment — so the sweep stops bumping updated_at and re-arming its own "
+            "staleness clock",
+            (
+                _park_bodies(),
+                _comment_bodies(),
+                any("age-park generation" in body for body in _comment_bodies()),
+                "labels=needs:user" in uncredited_log,
+            ),
+            ([{"labels": ["review:parked"]}], [], False, False),
+        )
+        # (A3b) ...and once the machine label is already live the whole tick is a NO-OP. This is
+        # the steady state the fix converges to: the cause has not recovered, nothing was granted,
+        # nothing changed — so the sweep writes nothing at all, forever, instead of counting its
+        # own silence toward a human question.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/31/comments": [
+                _park_receipt_comment(1), _park_receipt_comment(2)]}
+        quiet_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=({**_stale_worker_pr(31), "labels": [{"name": "review:parked"}]},))
+        check(
+            "[#1292] an un-recovered, never-re-admitted park is a total NO-OP on every "
+            "subsequent tick (no label, no comment) — the ladder cannot advance on its own",
+            (terminal_sweep_env["writes"], _comment_bodies(), "stale_prs=0" in quiet_log),
+            ([], [], True),
+        )
+        # (A3c) THE CAP STILL BITES — on the quantity it names. AGE_UNPARK_MAX grants really
+        # spent, and the PR back in the same state, IS a flap and IS a human question. Raise
+        # AGE_UNPARK_MAX (or drop the generation comparison in age_park_label) and this reds.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/31/comments": [
+                _park_receipt_comment(1), _grant_receipt_comment(1),
+                _park_receipt_comment(2), _grant_receipt_comment(2)]}
+        capped_log, _e, _r = _sweep_with_refusals({}, pulls=(_stale_worker_pr(31),))
+        check(
+            "[#1292] re-admission is CAPPED on GRANTS: AGE_UNPARK_MAX automatic re-admissions "
+            "actually granted, and the PR back again, escalates to needs:user",
             (
                 _park_bodies(),
                 any("age-park generation 3" in body for body in _comment_bodies()),
+                any("the machine granted 2 automatic re-admission(s)" in body
+                    for body in _comment_bodies()),
                 any("the machine granted NO automatic re-admission on this PR"
                     in body for body in _comment_bodies()),
-                any("the machine already granted" in body for body in _comment_bodies()),
-                any("automatic re-admission(s)" in body for body in _comment_bodies()),
             ),
-            ([{"labels": ["needs:user"]}], True, True, False, False),
+            ([{"labels": ["needs:user"]}], True, True, False),
+        )
+        # (A3d) THE ESCALATION PROSE CAN NO LONGER LIE. `flap`'s zero-grant branch tells the
+        # maintainer "the machine granted NO automatic re-admission on this PR" — true when it was
+        # written, and the thing that made #769 stop at the prose instead of the arithmetic. With
+        # the cap counting grants, an over-cap generation PROVES AGE_UNPARK_MAX grants are on
+        # record, so that branch is unreachable for any mapped cause. Asserted over the real
+        # function rather than by reading the source: a generation past the cap and a grant count
+        # below it must be an impossible pair.
+        _over_cap = [comment for gen in range(1, AGE_UNPARK_MAX + 2)
+                     for comment in (_park_receipt_comment(gen), _grant_receipt_comment(gen))]
+        check(
+            "[#1292] over-cap generation PROVES the grants it is about to claim — the "
+            "'granted NO automatic re-admission' escalation is unreachable for a mapped cause",
+            [(age_park_generation(comments, "app[bot]"),
+              len(age_receipts(comments, AGE_UNPARK_MARKER, "app[bot]")))
+             for comments in (_over_cap[:index] for index in range(len(_over_cap) + 1))
+             if age_park_generation(comments, "app[bot]") > AGE_UNPARK_MAX
+             and len(age_receipts(comments, AGE_UNPARK_MARKER, "app[bot]")) < AGE_UNPARK_MAX],
+            [],
         )
         # ... and the SAME escalation with two REAL grants on record states the count it can
         # prove, and names the flap. Swap the two branches and one of these two checks reds.
@@ -6959,15 +7067,39 @@ def _self_test() -> int:
             ),
             (True, True, False),
         )
+        # ... and the SAME escalation with two REAL grants on record states the count it can
+        # prove, and names the flap. Swap the two branches and one of these two checks reds.
         terminal_sweep_env["pages"] = {
-            "/repos/owner/repo/issues/31/comments": [
-                _park_receipt_comment(1), _park_receipt_comment(2)]}
-        capped_log, _e, _r = _sweep_with_refusals({}, pulls=(_stale_worker_pr(31),))
+            "/repos/owner/repo/issues/32/comments": [
+                _park_receipt_comment(1, 32), _park_receipt_comment(2, 32),
+                {"user": {"login": "app[bot]"},
+                 "body": f"{AGE_UNPARK_MARKER} cause=merge-dirty head={32:040x} gen=1 -->"},
+                {"user": {"login": "app[bot]"},
+                 "body": f"{AGE_UNPARK_MARKER} cause=merge-dirty head={32:040x} gen=2 -->"}]}
+        granted_log, _e, _r = _sweep_with_refusals({}, pulls=(_stale_worker_pr(32),))
+        check(
+            "[#769] ...and when the machine DID grant re-admissions, the escalation states the "
+            "count the receipts prove and names the flap",
+            (
+                any("the machine granted 2 automatic re-admission(s)" in body
+                    for body in _comment_bodies()),
+                any("a repeated failure — not a timeout" in body
+                    for body in _comment_bodies()),
+                any("granted NO automatic re-admission" in body
+                    for body in _comment_bodies()),
+            ),
+            (True, True, False),
+        )
         # The escalation is itself RECEIPTED, and that receipt is what makes it idempotent. Drop it
         # and `already_commented` can never match the body just written, so every subsequent sweep
-        # posts the same escalation again — comment spam on a PR already handed to a human, and a
-        # generation counter that climbs on its own. Replaying the tick with the escalation on
-        # record must write NOTHING.
+        # posts the same escalation again — comment spam on a PR already handed to a human.
+        # Replaying the tick with the escalation on record must write NOTHING. Driven from the
+        # GRANT-bearing fixture, which is the only shape that can reach the escalation at all.
+        _spent_cap = [_park_receipt_comment(1), _grant_receipt_comment(1),
+                      _park_receipt_comment(2), _grant_receipt_comment(2)]
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/31/comments": list(_spent_cap)}
+        capped_log, _e, _r = _sweep_with_refusals({}, pulls=(_stale_worker_pr(31),))
         escalation_receipt = f"{AGE_PARK_MARKER} cause=merge-dirty head={31:040x} gen=3 -->"
         check(
             "the over-cap ESCALATION is receipted too — both classes consume a generation, so both "
@@ -6977,7 +7109,7 @@ def _self_test() -> int:
         )
         terminal_sweep_env["pages"] = {
             "/repos/owner/repo/issues/31/comments": [
-                _park_receipt_comment(1), _park_receipt_comment(2),
+                *_spent_cap,
                 {"user": {"login": "app[bot]"},
                  "body": f"> 🤖 SPARQ agent\n\n{STALE_PR_MARKER}\n{escalation_receipt}"}]}
         replay_escalation_log, _e, _r = _sweep_with_refusals(
@@ -7862,11 +7994,17 @@ def _self_test() -> int:
 
         # (A5) A SECOND generation must be able to mint. The machine class dedupes on its own
         # receipt fingerprint; revert it to the once-ever STALE_PR_MARKER dedupe and generation 2
-        # is never recorded — so the cap in (A3) can never be reached and the escalation to the
+        # is never recorded — so the cap in (A3c) can never be reached and the escalation to the
         # human class becomes unreachable. The prior tick's receipt already carries
         # STALE_PR_MARKER, so only the fingerprint dedupe distinguishes the two.
+        #
+        # [#1292] The fixture now carries the GRANT that makes this a re-park after a genuine
+        # re-admission — which is what the check has always been named for. Its old fixture had a
+        # park receipt and no grant at all, so it asserted that a generation advances on a
+        # re-admission that never happened: the defect, pinned as the requirement.
         terminal_sweep_env["pages"] = {
-            "/repos/owner/repo/issues/31/comments": [_park_receipt_comment(1)]}
+            "/repos/owner/repo/issues/31/comments": [
+                _park_receipt_comment(1), _grant_receipt_comment(1)]}
         gen2_log, _e, _r = _sweep_with_refusals({}, pulls=(_stale_worker_pr(31),))
         check(
             "a RE-park after a re-admission mints a NEW generation receipt — without it the cap "
@@ -7931,13 +8069,22 @@ def _self_test() -> int:
             False,
         )
         # A malformed receipt still CONSUMES a generation — otherwise a corrupt comment buys an
-        # extra automatic re-admission (park_policy's auto_marker_count rule).
+        # extra automatic re-admission (park_policy's auto_marker_count rule). [#1292] The
+        # generation counts GRANTS, so it is the malformed GRANT that must still be counted; and
+        # the same malformed body on a PARK receipt must NOT advance it, or a corrupt park comment
+        # would spend a re-admission the machine never made.
         check(
-            "a MALFORMED park receipt still consumes a generation (it cannot buy an extra grant)",
-            age_park_generation(
-                [{"user": {"login": "app[bot]"}, "body": f"{AGE_PARK_MARKER} garbage -->"}],
-                "app[bot]"),
-            2,
+            "a MALFORMED un-park GRANT still consumes a re-admission (it cannot buy an extra "
+            "one) — and a malformed PARK receipt still buys nothing",
+            (
+                age_park_generation(
+                    [{"user": {"login": "app[bot]"}, "body": f"{AGE_UNPARK_MARKER} garbage -->"}],
+                    "app[bot]"),
+                age_park_generation(
+                    [{"user": {"login": "app[bot]"}, "body": f"{AGE_PARK_MARKER} garbage -->"}],
+                    "app[bot]"),
+            ),
+            (2, 1),
         )
         check(
             "a receipt authored by anyone but the bot proves nothing",
