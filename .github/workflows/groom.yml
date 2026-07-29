@@ -84,6 +84,61 @@ jobs:
           python3 scripts/select-and-claim.py --audit-catalog \
             --repo "$GITHUB_REPOSITORY" --policy-file policy/repos.toml
 
+      # [OPUS-5] BURNED-SLOT REPORT (issue #245). set-up-account takes atomic ownership of an
+      # account slot by creating `refs/acct-claims/acctNN` before the `gh secret set` upsert, and a
+      # run that fails AFTER claiming deliberately KEEPS its claim — releasing it would let a
+      # different credential overwrite an in-flight one. Burned slots are safe but INVISIBLE:
+      # nothing counted them, so a broker whose enrolments keep failing burns numbers with no
+      # signal at all. These two steps name them, every sweep.
+      #
+      # LEAST-EXPOSURE FILTER (audit-2026-07-17, the dispatch.yml `acct-secrets` pattern): only
+      # this tiny inline step ever sees `toJSON(secrets)`, and only NAMES leave it — the report
+      # process below never receives a secret value. Post-#101 the ACCTNN_TOKEN secrets live in the
+      # `dispatch-secrets` environment this job is bound to (and the repo scope is provably empty —
+      # dispatch.yml's secrets-guard), so the job's own secrets context IS the canonical inventory
+      # and no REGISTRY_SECRETS_PAT is introduced here.
+      #
+      # continue-on-error on BOTH steps, like the skew report above: a hygiene report must never
+      # abort the dead-lease release that follows it. A failed filter leaves this output EMPTY and
+      # the report then REFUSES (fail closed) rather than reporting every claimed slot as burned.
+      - name: Derive the ACCTNN_TOKEN secret-name inventory (names only)
+        id: acct-slots
+        continue-on-error: true
+        env:
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          # NAMES ONLY — no secret VALUE is ever read, printed or written out of this step.
+          names = sorted(
+              name for name in json.loads(os.environ["ALL_SECRETS"])
+              if re.fullmatch(r"ACCT[0-9]+_TOKEN", name)
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              # Compact single-line JSON — GITHUB_OUTPUT is line-based.
+              output.write(f"names={json.dumps(names, separators=(',', ':'))}\n")
+          print(f"derived {len(names)} ACCTNN_TOKEN secret name(s)")
+          PY
+
+      # REPORT-ONLY, and there is no gate mode: groom must never delete a claim ref, because
+      # deletion re-opens exactly the credential-overwrite race the claim exists to close. The
+      # ambient token suffices — claim refs and account issues are public on this repo — and the
+      # burned slots it names back no account, so no handle-privacy question arises (decision 22b).
+      - name: Report orphaned account-slot claim refs
+        continue-on-error: true
+        env:
+          REGISTRY_GH_TOKEN: ${{ github.token }}
+          ACCT_SECRET_NAMES: ${{ steps.acct-slots.outputs.names }}
+        run: |
+          set -euo pipefail
+          printf '::add-mask::%s\n' "$REGISTRY_GH_TOKEN"
+          python3 scripts/groom.py --report-orphan-claims \
+            --registry-repo "$GITHUB_REPOSITORY"
+
       # Per-owner target token mint (issue #168): policy enables targets under TWO distinct owners
       # (sparq-org, jeswr), so a SINGLE App token scoped to one owner 404s every read and fails
       # every write on the other owner's repo — aborting the sweep before dead leases are released.

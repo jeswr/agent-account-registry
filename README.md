@@ -337,6 +337,14 @@ slot is merely burned (safe), while reusing a number can silently overwrite a li
 (`gh secret set` is an upsert) or mint a duplicate issue title (GitHub does not enforce unique
 titles).
 
+**Burned slots are counted, never reclaimed (#245).** Because a failed enrolment keeps its claim,
+burned slots used to be invisible. Every `groom` sweep now prints an `ORPHAN-CLAIMS` line naming
+each `refs/acct-claims/acctNN` that has **no** `acctNN` issue and **no** `ACCTNN_TOKEN` secret, so a
+runaway broker shows up as a rising `burned=` count instead of silently eating numbers. It is
+REPORT-ONLY and deliberately has no cleanup mode: deleting a claim ref re-opens the overwrite race
+above. A slot that carries a secret but no issue is NOT reported — that is a stored credential
+whose enrolment died before registration, and it needs the account issue written, not a cleanup.
+
 ### Step 0 — obtain a DURABLE, NON-ROTATING token (do NOT use a subscription blob)
 
 - **Anthropic** (Claude models): run `claude setup-token` while logged into the target account. It
