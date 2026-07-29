@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1108,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9bf92088da3bd3646d59313cb3b7ea52af98a9d7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The parser defaults omitted `planned`, `dispatched`, and `defer_reasons` fields to 0/0/{}, while `quiet` requires only `summary is not None`. Consequently `{}`, `{\"planned\": 0}`, and even an empty JSON list all become `idle` when the claim outcome is success. That is absence of evidence, not the positive empty-frontier observation described by this change, and the resulting fleet idle record immediately recovers an open zero-dispatch alert. The new test checks `None` and `planned: None`, but misses the omitted-field path created by these defaults.",
+    "file": ".github/workflows/dispatch.yml",
+    "fix_hint": "Require the summary to be a mapping containing schema-valid, non-boolean integer `planned` and `dispatched` fields and a mapping `defer_reasons` field before allowing `quiet`; otherwise emit `none`. Add assertions using literal `{}`, an empty list, omitted `dispatched`/`defer_reasons`, and boolean numeric fields so each malformed/incomplete shape stays `none`.",
+    "severity": "major",
+    "title": "Incomplete summaries fabricate an idle observation"
+   }
+  ],
+  "progress": null,
+  "summary": "The new idle observation is not fail-closed at the workflow evidence boundary. A successfully parsed but incomplete summary is promoted to positive empty-frontier evidence and can close an open zero-dispatch alert even though the summary never established that the frontier was empty. The self-test covers a missing summary and an explicit null planned value, but not omitted fields or wrong JSON container shapes, so it does not catch this path.",
+  "verdict": "request_changes"
+ }
+}
