@@ -105,7 +105,7 @@ jobs:
       # identity source is the live API read of the PR, and granting log access here would blur two
       # attestation classes that must stay distinguishable.
     steps:
-      - name: Checkout private registry (pinned, no persisted token)
+      - name: Checkout registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false

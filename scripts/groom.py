@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# [GPT-5.6] REG-5 fail-closed maintenance sweep for the private-registry orchestrator.
+# [GPT-5.6] REG-5 fail-closed maintenance sweep for the registry orchestrator.
 """Reclaim dead worker leases and conservatively repair target orchestration state.
 
 The live path uses deliberately separate credentials: ``REGISTRY_GH_TOKEN`` may only update the
-private registry lease ledger and inspect registry Actions runs, while ``TARGET_GH_TOKENS`` is a
+registry lease ledger and inspect registry Actions runs, while ``TARGET_GH_TOKENS`` is a
 JSON ``{owner: token}`` map of per-owner target-scoped GitHub App tokens used for issue and
 pull-request reads/writes — one token per enabled-policy owner, so a target under a second owner is
 never read or written with the wrong owner's token (issue #168: a single sparq-org-scoped token

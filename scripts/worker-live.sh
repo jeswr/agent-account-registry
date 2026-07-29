@@ -3047,7 +3047,7 @@ PY
   # (fail closed: the central env copy stays un-rotated rather than being reported as rotated).
   local wb_gh_output
   if ! wb_gh_output=$(GH_TOKEN="$pat" "${WORKER_GH_BIN:-/usr/bin/gh}" secret set "$secret_ref" --repo "$registry_repo" --env dispatch-secrets < "$durable" 2>&1); then
-    die 'write-back to the account secret failed (env dispatch-secrets); see private registry logs'
+    die 'write-back to the account secret failed (env dispatch-secrets); see registry logs'
   fi
   write_output rotated true
   # The identifier-free line still confirms the write without naming the account secret reference.
