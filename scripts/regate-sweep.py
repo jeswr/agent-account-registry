@@ -1021,8 +1021,17 @@ def _require(path):
         return handle.read()
 
 
-def main(argv=None, runner=None):
+def main(argv=None, runner=None, clock=None):
     """The CLI entry point. `runner` exists so the self-test can exercise THIS function.
+
+    `clock` exists for the same reason, and for a defect the `runner` injection did not cover
+    [OPUS-5]. Every OTHER Sweeper in the suite is built with `clock=lambda: NOW`; this one was
+    built by `main()`, which passed no clock, so the entry-point assertions compared a fixture
+    `merged_at` against the REAL wall clock. `REPAIR_DETAIL`'s stamp is 24h + a few minutes before
+    the failure, so the row passed for exactly one day and then went red on EVERY branch at once —
+    a whole-repository merge lock authored by a test, at a time nobody chose. `None` keeps the
+    production default (Sweeper's own real clock), so this parameter cannot change what a live
+    sweep does.
 
     It was at 0% line coverage until a coverage run said so: the CLI-flag gate proves each flag is
     DECLARED, not that it is wired, so a typo in the slug validation, in the `[bot]` login the
@@ -1057,7 +1066,7 @@ def main(argv=None, runner=None):
     if args.bot_slug and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args.bot_slug):
         parser.error("--bot-slug must be a safe GitHub App slug")
     sweeper = Sweeper(args.repo, repairs, runner=runner, apply=args.apply, cap=args.max_moves,
-                      lookback_hours=args.lookback_hours,
+                      lookback_hours=args.lookback_hours, clock=clock,
                       bot_login=f"{args.bot_slug}[bot]" if args.bot_slug else "",
                       summary_path=os.environ.get("GITHUB_STEP_SUMMARY") or None)
     return sweeper.run()
@@ -2130,11 +2139,11 @@ def _test_live_sweep(chk):
         "cannot name", isinstance(_raises(sweeper13.run), RegateSweepError), True)
 
 
-def _main_total(chk, argv, runner=None):
+def _main_total(chk, argv, runner=None, clock=None):
     """`main()` with an escaping exception converted into a NAMED red rather than an abort. Four
     arming mutants died here by traceback instead of by their own observer until this existed."""
     try:
-        return main(argv, runner=runner)
+        return main(argv, runner=runner, clock=clock)
     except SystemExit:
         raise
     except BaseException as exc:                                          # noqa: BLE001
@@ -2197,7 +2206,7 @@ def _test_entry_point(chk):
             spoof = {"body": MARKER.format(repair=917, head="a" * 40), "user": {"login": "nobody"}}
             gh, _ = _fixture(comments={903: [spoof]})
             code = _main_total(chk, ["--repo", repo, "--repairs-file", path, "--bot-slug", BOT_SLUG,
-                         "--max-moves", "5", "--apply"], runner=gh)
+                         "--max-moves", "5", "--apply"], runner=gh, clock=lambda: NOW)
             chk("entry point: main() runs the sweep end to end and exits 0", code, 0)
             chk("entry point: main() wires --bot-slug through as `<slug>[bot]`, so a foreign marker "
                 "is ignored and the attributable PR is still moved", gh.updated(), [903])
@@ -2205,12 +2214,35 @@ def _test_entry_point(chk):
             gh2, _ = _fixture(comments={903: [{"body": MARKER.format(repair=917, head="a" * 40),
                                               "user": {"login": BOT_LOGIN}}]})
             _main_total(chk, ["--repo", repo, "--repairs-file", path, "--bot-slug", BOT_SLUG, "--apply"],
-                 runner=gh2)
+                 runner=gh2, clock=lambda: NOW)
             chk("entry point: and OUR OWN marker read through main() does suppress the move",
                 gh2.updated(), [])
 
+            # [OPUS-5] THE CLOCK IS WIRED, and this is why it has to be. Every other Sweeper in
+            # this suite is built with `clock=lambda: NOW`; the ones `main()` built were not, so
+            # every assertion above compared REPAIR_DETAIL's fixed `merged_at` against the REAL wall
+            # clock. That stamp is 24h + 3min before the lookback expires, so the block passed for
+            # exactly one day and then went red on EVERY branch simultaneously — a repository-wide
+            # merge lock authored by a test, firing at a time nobody chose and correlating with no
+            # change. A suite that cannot be re-run tomorrow and get the same answer is not a suite.
+            #
+            # This row is the guard on the wiring itself: same fixture, same argv, only the injected
+            # clock moved past the lookback. Drop `clock=clock` from main()'s Sweeper construction
+            # and the far-future call falls back to the real clock and sweeps [903] — red.
+            gh_now, _ = _fixture()
+            _main_total(chk, ["--repo", repo, "--repairs-file", path, "--bot-slug", BOT_SLUG,
+                              "--apply"], runner=gh_now, clock=lambda: NOW)
+            gh_expired, _ = _fixture()
+            _main_total(chk, ["--repo", repo, "--repairs-file", path, "--bot-slug", BOT_SLUG,
+                              "--apply"], runner=gh_expired,
+                        clock=lambda: NOW + int(REPAIR_LOOKBACK_HOURS * 3600) + 60)
+            chk("entry point: main() HONOURS the injected clock, so these assertions do not depend "
+                "on the wall clock (inside the lookback sweeps, past it does not)",
+                (gh_now.updated(), gh_expired.updated()), ([903], []))
+
             gh3, _ = _fixture()
-            _main_total(chk, ["--repo", repo, "--repairs-file", path], runner=gh3)
+            _main_total(chk, ["--repo", repo, "--repairs-file", path], runner=gh3,
+                 clock=lambda: NOW)
             chk("entry point: main() DEFAULTS to dry-run — --apply is opt-in, so a mis-wired "
                 "workflow cannot write", [c for c in gh3.calls if "--method" in c], [])
 
@@ -2221,13 +2253,14 @@ def _test_entry_point(chk):
                                                 "--max-moves", "-1"]),
                     ("neither --repo NOR $GITHUB_REPOSITORY", ["--repairs-file", path])):
                 chk(f"entry point: {label} exits 2 rather than sweeping",
-                    _exit_code(lambda a=argv: main(a, runner=_fixture()[0])), 2)
+                    _exit_code(lambda a=argv: main(a, runner=_fixture()[0],
+                                                   clock=lambda: NOW)), 2)
 
         # BOTH DIRECTIONS OF THE DEFAULT, each stating its environment instead of inheriting it.
         with _pinned_env(GITHUB_REPOSITORY=repo, APP_SLUG=BOT_SLUG):
             gh4, _ = _fixture(comments={903: [{"body": MARKER.format(repair=917, head="a" * 40),
                                               "user": {"login": BOT_LOGIN}}]})
-            code = main(["--repairs-file", path, "--apply"], runner=gh4)
+            code = main(["--repairs-file", path, "--apply"], runner=gh4, clock=lambda: NOW)
             chk("entry point: with $GITHUB_REPOSITORY set, --repo may be omitted and the sweep runs",
                 code, 0)
             chk("entry point: and $APP_SLUG supplies --bot-slug, so OUR marker still suppresses — "
@@ -2235,7 +2268,8 @@ def _test_entry_point(chk):
                 gh4.updated(), [])
         with _pinned_env(APP_SLUG="bad slug; rm -rf /", GITHUB_REPOSITORY=repo):
             chk("entry point: a malformed $APP_SLUG is rejected exactly like a malformed flag",
-                _exit_code(lambda: main(["--repairs-file", path], runner=_fixture()[0])), 2)
+                _exit_code(lambda: main(["--repairs-file", path], runner=_fixture()[0],
+                                        clock=lambda: NOW)), 2)
     finally:
         os.unlink(path)
 
