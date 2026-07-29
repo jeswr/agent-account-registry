@@ -247,6 +247,54 @@ def _read_json(path, default=None, required=False):
         raise DashboardError(f"cannot read JSON file: {path}") from exc
 
 
+def _load_gh_403():
+    """Load scripts/gh_403.py (same checkout) — THE 403 taxonomy (registry #1208). By PATH, not
+    `import gh_403`: `scripts/` is not a package. The `build` job takes a FULL checkout, so a
+    missing file means someone made it sparse and must be told, not silently degraded to the
+    unclassified message this replaces."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gh_403.py")
+    spec = importlib.util.spec_from_file_location("registry_gh_403_for_dashboard", path)
+    if spec is None or spec.loader is None:
+        raise DashboardError(
+            "cannot load scripts/gh_403.py — if the build job was made sparse, add "
+            "scripts/gh_403.py to its sparse-checkout list in dashboard.yml")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+gh_403 = _load_gh_403()
+
+_GH_DETAIL_LIMIT = 300
+_GH_TOKEN_SHAPE = re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,})\b")
+
+
+def _gh_failure_suffix(result):
+    """`: <class> — <masked stderr>` for a failed `gh` call, or "" when it said nothing.
+
+    WHY. Until now this raised a bare `public account issue query failed` — no exit code, no
+    status, no stderr. Measured 2026-07-28/29, dashboard.yml failed 10 times in the window and
+    NOT ONE of them is classifiable after the fact.
+
+    THE DEGRADED PATH, KNOWINGLY. `gh` stderr carries no response headers, so this uses
+    `classify_403_text` and — per that function's contract — must NOT claim to have read
+    `x-ratelimit-remaining`, because it has not. It also establishes the STATUS first, which the
+    classifier requires of its caller: without a `(HTTP 403)` marker an unrelated failure whose
+    message happens to say "retry later" would be labelled a rate limit."""
+    text = " ".join((result.stderr or "").split())
+    parts = [f"rc={result.returncode}"]
+    if "(HTTP 403)" in text or "HTTP 403" in text:
+        parts.append(gh_403.classify_403_text(text) + " (classified from gh stderr; no response "
+                     "headers on this path, so no rate-limit count was read)")
+    detail = _GH_TOKEN_SHAPE.sub("***", text)
+    if len(detail) > _GH_DETAIL_LIMIT:
+        detail = detail[:_GH_DETAIL_LIMIT] + "…"
+    if detail:
+        parts.append(detail)
+    return ": " + " — ".join(parts)
+
+
 def _fetch_issues(repo):
     if not repo or not re.fullmatch(
             r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", repo):
@@ -255,7 +303,7 @@ def _fetch_issues(repo):
         ["gh", "api", "--paginate", f"repos/{repo}/issues?state=open&per_page=100"],
         capture_output=True, text=True, timeout=90, check=False)
     if result.returncode != 0:
-        raise DashboardError("public account issue query failed")
+        raise DashboardError("public account issue query failed" + _gh_failure_suffix(result))
     return _issue_list_from_text(result.stdout)
 
 
@@ -2093,6 +2141,43 @@ def _self_test():
         good = got == want
         ok = ok and good
         print(f"  {'ok  ' if good else 'FAIL'} {name}: {got!r} (want {want!r})")
+
+    # ---- [#1303] THE FAILURE MESSAGE MUST NAME THE CAUSE. ----------------------------
+    # 10 dashboard failures on 2026-07-28/29, every one of them `public account issue query
+    # failed` with no exit code, no status and no stderr — unclassifiable after the fact.
+    class _Result:
+        def __init__(self, rc, stderr):
+            self.returncode, self.stderr, self.stdout = rc, stderr, ""
+
+    _budget = _gh_failure_suffix(_Result(
+        1, "gh: API rate limit exceeded for installation. (HTTP 403)"))
+    check("gh failure: an installation-budget 403 is named 'budget' and keeps the exit code",
+          ("budget" in _budget, "rc=1" in _budget,
+           "API rate limit exceeded for installation." in _budget), (True, True, True))
+    # THE CONTRACT of the headerless path: it must NOT claim a count it cannot have read.
+    check("gh failure: the degraded path does not claim to have read a rate-limit count",
+          "x-ratelimit-remaining=" in _budget, False)
+    _secondary = _gh_failure_suffix(_Result(
+        1, "gh: You have exceeded a secondary rate limit ... retry your request again later. "
+           "(HTTP 403)"))
+    check("gh failure: a secondary 403 is NOT called budget (the responses are opposite)",
+          ("secondary" in _secondary, "budget" in _secondary), (True, False))
+    _perm = _gh_failure_suffix(_Result(1, "gh: Resource not accessible by integration (HTTP 403)"))
+    check("gh failure: a permission 403 is the residual class", "permission" in _perm, True)
+    check("gh failure: the three classes are distinguishable (non-vacuity)",
+          len({_budget.split("—")[1], _secondary.split("—")[1], _perm.split("—")[1]}), 3)
+    # STATUS FIRST. classify_403_text answers "IF this is a 403, which one" — so a non-403 whose
+    # text happens to carry a marker must not be labelled a rate limit.
+    _not403 = _gh_failure_suffix(_Result(1, "gh: connection reset, please retry later"))
+    check("gh failure: a non-403 carrying a 403 marker word is NOT classified",
+          any(c in _not403 for c in ("budget", "secondary", "permission")), False)
+    check("gh failure: ...but its stderr still reaches the log",
+          "connection reset" in _not403, True)
+    _leak = _gh_failure_suffix(_Result(1, "bad token ghp_" + "B" * 40 + " (HTTP 403)"))
+    check("gh failure: a token-shaped string in stderr is masked",
+          ("ghp_" + "B" * 40 not in _leak, "***" in _leak), (True, True))
+    check("gh failure: the detail is bounded",
+          len(_gh_failure_suffix(_Result(1, "x" * 5000))) < _GH_DETAIL_LIMIT + 200, True)
 
     def _raises_dashboard(thunk):
         try:
