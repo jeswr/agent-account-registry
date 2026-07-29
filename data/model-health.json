@@ -1923,6 +1923,14 @@
    "model_alias": "sol",
    "exit_class": "success",
    "run_id": "30409705502.1"
+  },
+  {
+   "ts": 1785283334,
+   "provider": "openai",
+   "account": "dc2d751954080e13",
+   "model_alias": "sol",
+   "exit_class": "success",
+   "run_id": "30409755506.1"
   }
  ]
 }
