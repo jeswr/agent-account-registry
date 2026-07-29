@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4994,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1c132a91338695201b6c465d099142f8be1930a4",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`migration_owned` returns only bd-ids and requires exactly one marker-bearing issue for each id. If a legitimate pre-label issue is authenticated solely by its migration title and write-author contract, an unprivileged attacker can create a second issue with the same marker. The id is then omitted from `owned`; `_marker_index` treats both issues as unauthenticated, reports the bead missing, and makes `--verify` fail. Thus unauthenticated data can hold a correct legacy migration red. The added decoy-beside-real test does not exercise this path because `full` gives the legitimate issue `MIGRATION_LABEL`, which authenticates it independently.",
+    "file": "scripts/bd-to-issues.py",
+    "fix_hint": "Carry migration-owned provenance at issue granularity (for example authenticated `(bd-id, issue-number)` pairs or issue numbers), determined from the write-author/title contract, and let `_marker_index` authenticate only that exact issue while leaving duplicate unprivileged markers unauthenticated. Add a focused test with a legitimate pre-label, unlabeled, non-checkpointed issue plus an unprivileged duplicate marker; verification should remain clean and report only the decoy under `unauthenticated_markers`.",
+    "severity": "major",
+    "title": "A decoy can invalidate legitimate pre-label migration-owned provenance"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 found a new provenance-granularity flaw in the verification path. The migration-owned fallback is represented as a set of bd-ids, but its uniqueness test is computed across all marker-bearing issues. Consequently, an unprivileged user can add a duplicate marker for any legitimate pre-label migration issue; `migration_owned` then drops that bd-id entirely, `_marker_index` authenticates neither issue, and `--verify` fails a previously correct migration. This contradicts the stated property that an unauthenticated decoy cannot hold a correct migration red. The existing decoy-beside-real test covers only a label-authenticated real issue and therefore misses the legacy migration-owned channel. Because round 2 had no findings and this is new, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
