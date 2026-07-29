@@ -1890,18 +1890,64 @@ def _self_test():
            prefilled["max_concurrent_workers"] if isinstance(prefilled, dict) else prefilled,
            int(defaults_for(prefilled_provider or "anthropic")[2])),
           ("anthropic", 4, 4))
+    # `refuses` converts only a GrantError into a verdict; ANY other exception escapes it and takes
+    # the whole suite down mid-run — AGENTS.md item 4's FALSE KILL, where a mutant "dies" to a
+    # traceback while every later row silently never executes. Two of the guards below raise from
+    # INSIDE the extractor once deleted (TypeError on a non-text document, IndexError on `heads[0]`
+    # when nothing matched), so without this wrapper NEITHER is observed: MEASURED, deleting either
+    # one leaves this row never printed at all rather than red. A non-GrantError escape lands as
+    # False — a legible RED here — and the rest of the suite still runs.
+    def prefill_refuses(*args, needle=""):
+        try:
+            return refuses(issue_form_prefill, *args, needle=needle)
+        except Exception:                                          # noqa: BLE001 - see above
+            return False
+
     check("[#883] a renamed field, or a prefill deleted from it, fails the extraction LOUDLY",
-          (refuses(issue_form_prefill, account_form, "no-such-field", needle="found 0"),
+          (prefill_refuses(account_form, "no-such-field", needle="found 0"),
+           # ...and a DUPLICATED field is an ambiguity, never "the first one wins". This is the arm
+           # of the count guard a missing field cannot reach, and the one that fails WITHOUT
+           # raising, so it observes the guard itself rather than the traceback its absence causes.
+           prefill_refuses("- type: textarea\n  id: spec\n  attributes:\n"
+                           "    value: |\n      provider: anthropic\n"
+                           "- type: textarea\n  id: spec\n  attributes:\n"
+                           "    value: |\n      provider: openai\n", "spec", needle="found 2"),
            # ...and a field with no prefill refuses even when a LATER element has one: the scan is
            # scoped to the named field, so this can never assert against a neighbour's text.
-           refuses(issue_form_prefill, "- type: textarea\n  id: spec\n  attributes:\n"
-                   "    label: x\n- type: textarea\n  id: other\n  attributes:\n"
-                   "    value: |\n      provider: openai\n", "spec",
-                   needle="no block `value: |` prefill"),
-           refuses(issue_form_prefill, "- type: textarea\n  id: spec\n  attributes:\n"
-                   "    value: |\n- type: input\n", "spec", needle="EMPTY prefill"),
-           refuses(issue_form_prefill, None, "spec", needle="non-text document")),
-          (True, True, True, True))
+           prefill_refuses("- type: textarea\n  id: spec\n  attributes:\n"
+                           "    label: x\n- type: textarea\n  id: other\n  attributes:\n"
+                           "    value: |\n      provider: openai\n", "spec",
+                           needle="no block `value: |` prefill"),
+           # ...and an INLINE `value:` scalar is NOT a prefill — only a block `|` opener may be
+           # dedented as one. MEASURED: without this row, loosening the opener pattern to any
+           # `value:` swallows the following lines as a body and RETURNS text where the extractor
+           # must refuse, which is how a mis-scoped prefill would reach the assertions above.
+           prefill_refuses("- type: textarea\n  id: spec\n  attributes:\n"
+                           "    value: max_concurrent_workers: 1\n      trailing: kept\n"
+                           "- type: input\n", "spec", needle="no block `value: |` prefill"),
+           prefill_refuses("- type: textarea\n  id: spec\n  attributes:\n"
+                           "    value: |\n- type: input\n", "spec", needle="EMPTY prefill"),
+           prefill_refuses(None, "spec", needle="non-text document")),
+          (True, True, True, True, True, True))
+    # NON-VACUITY OF THAT WRAPPER. It is what turns a would-be traceback into a red, so a fail-open
+    # form of it (`return True` in either arm) would green all six elements above at once and cost
+    # nothing else. Both arms are therefore observed on inputs that must NOT read as a refusal: the
+    # real form under its real field id (which refuses nothing), and a non-string `field_id`, which
+    # raises TypeError out of `re.escape` — the one shipped input that reaches the except arm.
+    check("[#883] the refusal wrapper can return False (a fail-open form greens the row above)",
+          (prefill_refuses(account_form, "spec"), prefill_refuses(account_form, None)),
+          (False, False))
+    # ...and the body stops at the FIRST line back at the opener's OWN indent, so a sibling
+    # attribute written after `value: |` is never spliced into the record. Only an assertion on the
+    # extracted TEXT can see this: the shipped form happens to carry no sibling below its block, so
+    # every refusal row above stays green with the dedent stop loosened to `< indent` — and that
+    # mutant silently hands the rows above a prefill with a neighbouring key inside it.
+    check("[#883] the prefill stops at the field's next sibling, never splicing it in",
+          real_parser(issue_form_prefill,
+                      "- type: textarea\n  id: spec\n  attributes:\n"
+                      "    value: |\n      provider: anthropic\n"
+                      "    label: NOT part of the prefill\n- type: input\n", "spec"),
+          "provider: anthropic\n")
 
     # ------------------------------------------------------------------------------------------
     # [#263] A LABEL NAME IS DATA, NEVER SHELL — EXECUTED, not asserted in prose.
