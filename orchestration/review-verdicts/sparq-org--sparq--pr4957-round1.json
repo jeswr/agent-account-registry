@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4957,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "72ef1b57c074abb75dcffc45f16dfec224c46252",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`is_initialize` returns true when any batch element has method `initialize`, after which `route_post` dispatches the entire batch through `handle_message`. Thus a sessionless batch such as `[initialize, tools/call]` executes the tool call before a session has been minted. An `initialize` notification combined with another request can also mint a session even though the standalone-notification test says it must not. The existing batch test uses only `initialize` plus `notifications/initialized`, so it does not exercise this boundary.",
+    "file": "crates/sparq-mcp/src/http/mod.rs",
+    "fix_hint": "Parse and validate the top-level message before dispatch. Without a session, accept only a valid initialize request (or define and enforce a narrowly valid initialization batch); reject a batch containing any non-initialization request before calling `handle_message`. Mint a session only when a response to an initialize request is actually present. Add tests for `[initialize, tools/call]`, `[initialize-notification, ping]`, and malformed/multiple initialize entries, asserting that non-initialize handlers are not invoked.",
+    "severity": "major",
+    "title": "A mixed batch bypasses the pre-session lifecycle boundary"
+   },
+   {
+    "body": "`serve_http` spawns a new OS thread for every accepted socket with no bound. A peer can open many connections and drip or omit request bytes; each consumes a thread for up to the 30-second read timeout. `max_sessions` is irrelevant because these connections never initialize, so the documented DoS hedging does not cover the dominant pre-session resource. On a network-exposed listener this permits straightforward thread/memory exhaustion.",
+    "file": "crates/sparq-mcp/src/http/mod.rs",
+    "fix_hint": "Add a configurable, enforced cap on active connections/workers before spawning, returning or closing promptly when full, or use a bounded worker pool/nonblocking loop. Ensure permits are released on every exit path. Add a real-socket test that holds the configured number of incomplete requests open and verifies an additional connection is refused/closed without spawning unbounded work.",
+    "severity": "major",
+    "title": "Unbounded connection threads defeat the transport's DoS ceiling"
+   }
+  ],
+  "progress": null,
+  "summary": "The opt-in transport is well documented and has useful route, socket, SSE, and session tests, but two load-bearing boundaries are not enforced. Sessionless batch admission is based on whether any element names `initialize`, so unrelated calls in the same batch execute before a session exists; the tests cover only a benign mixed batch. In addition, the one-thread-per-accepted-connection design has no connection/thread ceiling, so the advertised session cap does not prevent trivial resource exhaustion by incomplete connections. These are major correctness/security issues for a remotely reachable HTTP transport.",
+  "verdict": "request_changes"
+ }
+}
