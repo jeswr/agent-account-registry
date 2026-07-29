@@ -27,6 +27,7 @@ import json
 import os
 from pathlib import Path
 import random
+import fnmatch
 import re
 import subprocess
 import sys
@@ -6155,6 +6156,55 @@ def _self_test():
         {"user": {"login": bot}, "body": f"x {MARKER_KINDS['nochange']} round=2 run=13.1 -->"},
         {"user": {"login": bot}, "body": f"x {MARKER_KINDS['missed']} round=2 run=14.1 -->"},
     ]
+    # ---- [registry #1288] the review ATTEMPT store ------------------------------------------
+    # The path IS the idempotency key AND the round index, so losing the round component would
+    # collapse every attempt onto one file and silently un-bound the crash loop (mutant M24).
+    check("the round claim path carries the round",
+          round_claim_path("o/r", 41, 2), "data/review-round--o--r--pr41--r2.json")
+    check("...and distinct rounds are distinct files",
+          round_claim_path("o/r", 41, 2) != round_claim_path("o/r", 41, 3), True)
+    check("...and it stays a single `data/` segment ending .json, so the ledger data-only "
+          "allowlist already admits it without a new file KIND",
+          bool(re.fullmatch(r"data/[^/]+\.json", round_claim_path("o/r", 41, 7))), True)
+    check("the glob matches this PR's claims and only this PR's",
+          (fnmatch.fnmatch("review-round--o--r--pr41--r3.json", round_claim_glob("o/r", 41)),
+           fnmatch.fnmatch("review-round--o--r--pr410--r3.json", round_claim_glob("o/r", 41))),
+          (True, False))
+
+    def _claim_raises(**over):
+        args = {"registry_repo": "reg/istry", "target_repo": "o/r", "pr_number": 41,
+                "round_n": 1, "head_sha": "a" * 40, "run_key": "9.1", **over}
+        try:
+            record_round_claim(**args)
+        except WorkerPrError as exc:
+            return str(exc)
+        return None
+
+    # FAIL CLOSED on the head sha: the claim binds the head it was charged for, and a claim that
+    # will accept anything is a claim that cannot be audited (mutant M23).
+    for _why, _bad in (("empty", ""), ("none", None), ("short", "a" * 39),
+                       ("non-hex", "z" * 40), ("uppercase", "A" * 40)):
+        check(f"a {_why} head sha is refused before anything is written",
+              "40-hex" in (_claim_raises(head_sha=_bad) or ""), True)
+    for _why, _bad in (("zero", 0), ("negative", -1), ("boolean", True), ("float", 1.0)):
+        check(f"a {_why} round is refused", "positive integer" in (_claim_raises(round_n=_bad) or ""),
+              True)
+    # The run key is VOLATILE: a re-run of the same claim must be idempotent, not a loud failure
+    # (mutant M25). Asserted at the call, by inspecting what the writer is told.
+    _put_calls = []
+    _saved_put = globals()["_registry_put_file"]
+    try:
+        globals()["_registry_put_file"] = lambda *a, **k: _put_calls.append((a, k)) or True
+        record_round_claim("reg/istry", "o/r", 41, 2, "b" * 40, "77.1")
+    finally:
+        globals()["_registry_put_file"] = _saved_put
+    check("the claim is written create-only to the ledger path for its round",
+          _put_calls[0][0][1], "data/review-round--o--r--pr41--r2.json")
+    check("...with `claimed_at_run` marked VOLATILE, so a re-run is idempotent not a hard failure",
+          "claimed_at_run" in _put_calls[0][1]["volatile_fields"], True)
+    check("...and the document binds the head sha it charged",
+          _put_calls[0][0][2]["head_sha_at_claim"], "b" * 40)
+
     check("rounds count bot-only markers", count_rounds(comments, bot), 2)
     check("non-bot marker is ignored", count_rounds(comments, "mallory[bot]"), 0)
     check("nochange runs per round", len(marker_runs(comments, bot, "nochange", 2)), 2)
