@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4994,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2b7e9d6eba91b6ce79cba9c250f435bf344a01d1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_marker_index` accepts a marker from every issue body and `verify_migration` then uses any unique match as the authoritative bd-id mapping. Issue bodies are forgeable by unprivileged users; this file's existing resume path explicitly authenticates mappings with `bd-migration`, checkpoint provenance, or a trusted author/title contract. A decoy can therefore satisfy a missing mapping (and, if its body contains the expected edge text, make an incomplete migration verify clean), or create a duplicate that permanently fails verification. Merely saying verification must see duplicates does not make an untrusted marker authoritative.",
+    "file": "scripts/bd-to-issues.py",
+    "fix_hint": "Build the authoritative verification map from migration-owned provenance (at minimum the authenticated migration label, with the established legacy/checkpoint rules as needed), while reporting unauthenticated marker collisions separately. Add a test where an unprivileged/unlabelled decoy is the sole marker and prove it cannot make verification succeed.",
+    "severity": "major",
+    "title": "Verification treats unauthenticated bd-id markers as migrated issues"
+   },
+   {
+    "body": "`_marker_present(body, \"Blocked-by: #2\")` returns true for `Blocked-by: #20` (and similarly for parent markers), so the verifier can report a clean migration while the dependent points at a different blocker. The new wrong-target test uses `#9999` versus `#2640`, which does not exercise this prefix collision. Sharing the predicate with the writer makes behavior consistent but does not make it correct.",
+    "file": "scripts/bd-to-issues.py",
+    "fix_hint": "Match a complete marker line/token with an issue-number boundary, such as an escaped regex anchored to line boundaries or `(?![0-9])`, and use that exact predicate in both writer and verifier. Add tests for expected `#2` with bodies containing `#20`, `#21`, and the exact `#2` marker.",
+    "severity": "major",
+    "title": "Substring matching accepts an edge to the wrong issue number"
+   }
+  ],
+  "progress": null,
+  "summary": "The new verifier can both trust attacker-controlled issue markers and accept a dependency marker for the wrong issue number. Those flaws undermine its core promise of reliably reconciling the completed migration. The added self-tests cover duplicates and a clearly different target, but not either adversarial/proximity case.",
+  "verdict": "request_changes"
+ }
+}
