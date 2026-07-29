@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1165,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e9b33f7c45a02e479ccc12737d63401a848c326b",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_supersede_fallback_alert` calls `_gh([\"issue\", \"comment\", ...])` without checking `returncode`, then unconditionally prints success and returns `True`. If the close succeeds but the comment fails, `decide` exits green even though the promised still-firing supersede explanation was never delivered. The next tick cannot repair this partial transition because `_find_marker_issue(..., \"open\")` no longer sees the closed issue and returns the already-reconciled success path. The new assertions inspect only comments that the fake successfully appends; the fake has no non-crashing comment-failure mode, so this failure remains untested.",
+    "file": "scripts/model-health.py",
+    "fix_hint": "Make close-plus-explanation a confirmed, retryable transition whose incomplete state remains discoverable after close success and comment failure. Add a fake comment failure that returns nonzero without crashing, assert the run does not certify success, then prove a later tick completes the missing explanation without false recovery wording or a second alert.",
+    "severity": "major",
+    "title": "Supersede still succeeds when its required explanation is not delivered"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-4 major remains unchanged. `_supersede_fallback_alert` still ignores the return code from `gh issue comment`, prints success, and returns `True` after only the close is confirmed. A non-crashing comment failure therefore certifies an incomplete close-plus-explanation transition, and later ticks cannot repair it because the helper searches only open issues. The expanded tests record successful comments but the fake still cannot fail a comment, so they do not exercise the prior finding. Progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
