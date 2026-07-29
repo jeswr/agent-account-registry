@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1098,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "57cdda3f3cb322118762235938977a43fd929561",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 remains sound. The durable budget consistently counts model attempts plus bot-authored pre-model refusal receipts at both the worker and deferred-claim allocation gates, while preserving attempt-only cost, health, void, and approval-staleness semantics. Readmission windows apply to both receipt classes and fail toward charging on missing or malformed time evidence. The refusal recorder is run-key idempotent and exports its post-charge exhaustion state; the workflow gives that non-empty result precedence while retaining the pre-charge budget result when the refusal step is skipped, so the terminal refusal reaches the existing parked convergence path. The workflow gate charges only a claimed, live, in-budget dispatch whose trust step actually failed. The expanded tests exercise receipt authorship, counter separation, void isolation, readmission, recorder outputs, final-state shell execution, claim-side consumption, and targeted non-crashing workflow mutations. The regate entry-point tests now pin both sides of the time window and include a positive authorship control, removing the ambient-clock and no-write vacuity. I found no correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
