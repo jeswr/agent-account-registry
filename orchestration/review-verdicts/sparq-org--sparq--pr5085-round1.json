@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5085,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f073619c146356d0986f21907266af598a3e662f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The documentation-only change correctly propagates the repository's existing frontend optional-code policy into the worker-core contract. Its requirements are consistent with AGENTS.md and the referenced frontend-design skill, and both referenced paths exist. No correctness, soundness, test-validity, or security issues were found.",
+  "verdict": "approve"
+ }
+}
