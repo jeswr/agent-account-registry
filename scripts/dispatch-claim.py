@@ -12267,6 +12267,64 @@ def _self_test():
                 _blind += 1                              # nothing charged where the reader looks
             assert _blind == 25, \
                 "a reader blind to the attempt store must be shown NOT to terminate (control row)"
+        # (1d) [registry #1288] THE OTHER DELIVERY-LAYER READER: `already_done` off the ledger.
+        # It replaces an AUTHOR-EDITABLE gate input (the `sparq-reviewed-sha` PR-body marker), and
+        # `claim` consumes it to skip a dispatch — so every failure direction below is the
+        # difference between "one redundant resolve+claim pair" and "this PR is never reviewed
+        # again". It must therefore bind the EXACT head, the EXACT PR, and refuse to conclude from
+        # anything it cannot read.
+        with tempfile.TemporaryDirectory() as _ad_root:
+            _ad_dir = Path(_ad_root) / _bound_wp.VERDICT_DIR
+            _ad_dir.mkdir(parents=True)
+            _ad_head = "d" * 40
+            _ad_other = "e" * 40
+
+            def _ad_write(name, document):
+                (_ad_dir / name).write_text(json.dumps(document), encoding="utf-8")
+
+            def _ad_env(**over):
+                return _bound_wp.verdict_envelope(
+                    over.get("repo", "o/r"), over.get("pr", 41), over.get("round", 1),
+                    over.get("sha", _ad_head), {"verdict": "approve"})
+
+            def _completed(head=_ad_head, pr=41):
+                return ledger_review_completed(_ad_root, "", _bound_wp, "o/r", pr, head)
+
+            assert _completed() is False, "an empty ledger cannot report a completed review"
+            # A record for ANOTHER PR must never answer for this one (mutant N16). Written under
+            # that PR's own name, which is exactly what a too-wide glob would sweep up.
+            _ad_write("o--r--pr42-round1.json", _ad_env(pr=42))
+            assert _completed() is False, \
+                "another PR's verdict record must not read as THIS PR's completed review"
+            # A record for THIS PR bound to a DIFFERENT head is not this head's review (mutant
+            # N11). This is the whole point of the #156 envelope: the head moved, so the review
+            # that exists describes code that is no longer live.
+            _ad_write("o--r--pr41-round1.json", _ad_env(sha=_ad_other))
+            assert _completed() is False, \
+                "a verdict bound to a DIFFERENT head must not report THIS head as reviewed — " \
+                "binding nothing is how a PR gets skipped forever on an unreviewed tree"
+            # A legacy pre-#156 BARE document carries no envelope and therefore no sha binding.
+            # It cannot answer the question, so it must not be allowed to.
+            _ad_write("o--r--pr41-round2.json", {"verdict": "approve"})
+            assert _completed() is False, \
+                "an unbound legacy record must contribute NOTHING, never a completion"
+            # ...and unreadable bytes are a read failure, not a completion.
+            (_ad_dir / "o--r--pr41-round3.json").write_text("{not json", encoding="utf-8")
+            assert _completed() is False, "a malformed record must not read as a completion"
+            # NON-VACUITY: the reader must be able to say YES, or every row above passes for the
+            # trivial reason. The bound record for THIS PR at THIS head is what makes it True.
+            _ad_write("o--r--pr41-round4.json", _ad_env(round=4))
+            assert _completed() is True, \
+                "a #156-enveloped verdict naming this repo, this PR and this head IS a completed " \
+                "review — without this row every refusal above is satisfied by `return False`"
+            # ...and even with that record present, a malformed head fails CLOSED rather than
+            # matching something (mutant N12): `already_done=True` on garbage would strand the PR.
+            for _bad in ("", None, "f" * 39, "z" * 40, "D" * 40):
+                assert _completed(head=_bad) is False, \
+                    f"a malformed head sha ({_bad!r}) must never report a completed review"
+            # ...and the record still only answers for ITS OWN PR.
+            assert _completed(pr=99) is False, \
+                "the reader must stay scoped to the PR it was asked about"
         # (1b) ...AND IT WORKS ON THE SHAPE THE POPULATION ACTUALLY HAS: NON-DRAFT with NO
         # review:* label at all. This is the row that separates "the shape gates are waived" from
         # "the PR is reviewable" — RE-DERIVED on sparq 2026-07-27 (paginated open-PR listing,
@@ -12969,7 +13027,18 @@ def _self_test():
             ("any bot-suffixed author is accepted, not this exact App",
              _rf_live.replace(
                  '              if os.environ["PR_AUTHOR"] != login:',
-                 '              if not os.environ["PR_AUTHOR"].endswith("[bot]"):'))):
+                 '              if not os.environ["PR_AUTHOR"].endswith("[bot]"):')),
+            # [registry #1288] The row that makes the probe's HUMAN-stranger fact load-bearing
+            # rather than redundant. Every escalation above is also caught by the foreign-App-bot
+            # fact, so deleting the human-stranger fact from the probe SURVIVED (mutant N13).
+            # This mutant admits a human stranger while still refusing bot ones, so it is caught
+            # by that fact ALONE — and a human login is precisely the shape the enrolled class
+            # has, i.e. the shape an attacker would copy.
+            ("only BOT strangers are refused, so any human login reaches the model with a token",
+             _rf_live.replace(
+                 '              if os.environ["PR_AUTHOR"] != login:',
+                 '              if (os.environ["PR_AUTHOR"] != login\n'
+                 '                      and os.environ["PR_AUTHOR"].endswith("[bot]")):'))):
         assert _escalation != _rf_live, _why
         assert review_fix_identity_admits_orchestrator_class(source=_escalation) is False, \
             (f"an identity gate that admits a STRANGER must read False even though it also admits "
@@ -15511,6 +15580,140 @@ def _self_test():
                         "enrolling the class is not self-approval")
                 print("  ok   [#657 enable] ...and the enrolled class can never reach an "
                       "automatic arm: the approve hands off to a human and ready_and_arm raises")
+
+                # (ix) [registry #1288] MUTATION SURVIVOR M22, CLOSED AT THE CALL SITE. The
+                #      routing that decides WHICH round counter binds this class —
+                #      `if orchestrator_admitted: rounds = count_ledger_rounds(...)` in
+                #      _dispatch_review_items — is the wiring that makes the whole attempt store
+                #      load-bearing, and replacing it with `if False:` SURVIVED the previous
+                #      battery. The store's own crash-loop proof could not see it: that proof
+                #      drives the reader and the budget predicate directly, so it stays green
+                #      while nothing routes the class to them.
+                #
+                #      The class has NO round-marker comments — it has no target writes at all —
+                #      so `count_rounds` over comments returns 0 for it FOREVER. Unrouted, every
+                #      dispatch is round 1, the budget never exhausts, and the crash loop is
+                #      unbounded: the exact defect the store exists to prevent, one layer above
+                #      where the store was tested.
+                #
+                #      Driven END TO END through the production `_dispatch_review_items`, with the
+                #      difference observable in the one place that matters — whether a reviewer
+                #      LAUNCHES — and two-sided so neither mutation direction survives.
+                _m22_data = Path(wiring_ledger_root) / "data"
+                _m22_data.mkdir(parents=True, exist_ok=True)
+                _m22_max = 3           # == run_items' default policy max_review_rounds
+                _m22_charged = [
+                    _m22_data / wiring_worker_pr.round_claim_path(repo, 41, _round).split("/", 1)[1]
+                    for _round in range(1, _m22_max + 1)]
+
+                def _m22_run(item, *, record):
+                    record_file.write_text(json.dumps(record), encoding="utf-8")
+                    fake.update(pull=dict(_orch_pull) if record is _orch_record
+                                else live_pull(draft=True, labels=("review:needs",)))
+                    launch_runs.clear()
+                    buffer = io.StringIO()
+                    with contextlib.redirect_stdout(buffer):
+                        launched, _ = run_items(
+                            [item], allocator=LaunchingAllocator(), routing=strand_routing,
+                            enrolled_authors=("jeswr",))
+                    # The budget stop does not `print` — it drives worker-pr.py `needs-user`
+                    # through the helper. Asserting on the ARGV rather than on a log line is what
+                    # separates "did not launch" from "did not launch FOR THIS REASON": the class
+                    # also re-drafts a ready PR before dispatch, so a bare `launched == 0` would
+                    # be satisfied by that entirely different stand-down.
+                    parks = [args for _script, args in helper_calls
+                             if args and args[0] == "needs-user"]
+                    return launched, parks, buffer.getvalue()
+
+                _worker_item = dict(ci_item, state="needs-review", context="")
+                # (a) BASELINE, no attempts charged: the enrolled class dispatches. Without this
+                #     row (b) could pass because the class never dispatches at all.
+                _m22_zero, _m22_zero_parks, _m22_zero_log = _m22_run(
+                    _orch_item, record=_orch_record)
+                assert _m22_zero == 1 and _m22_zero_parks == [], (
+                    _m22_zero, _m22_zero_parks, _m22_zero_log)
+                # (b) THE RED ROW. Same PR, same record, same absence of round-marker comments —
+                #     only the LEDGER now carries max_review_rounds charged attempts. The budget
+                #     must see them and stop dispatching. With the routing removed this reads 0
+                #     rounds and launches, exactly as (a) did.
+                for _path in _m22_charged:
+                    _path.write_text("{}", encoding="utf-8")
+                _m22_full, _m22_full_parks, _m22_full_log = _m22_run(
+                    _orch_item, record=_orch_record)
+                assert _m22_full == 0, (
+                    "the enrolled class must be budget-bounded by the LEDGER attempt store: "
+                    f"{_m22_max} charged attempts and it still launched a reviewer, so the "
+                    "orchestrator_admitted -> count_ledger_rounds routing at the dispatch call "
+                    f"site is not wired ({_m22_full_log!r})")
+                assert len(_m22_full_parks) == 1, (_m22_full_parks, _m22_full_log)
+                _m22_park = _m22_full_parks[0]
+                assert f"budget is exhausted at {_m22_max} round(s)" in \
+                    _m22_park[_m22_park.index("--reason") + 1], _m22_park
+                assert _m22_park[_m22_park.index("--park-cause") + 1] == "budget", _m22_park
+                # (c) THE CONTROL, so (b) cannot pass for the wrong reason. The WORKER class, with
+                #     the identical files on the ledger and the identical absence of comments,
+                #     still launches — because its rounds come from PR comments and the ledger
+                #     store is none of its business. This is the row that reds if the routing is
+                #     widened to `if True:` (everyone reads the ledger), which would silently
+                #     re-budget the entire worker lane off a store nothing charges for it.
+                _m22_worker, _m22_worker_parks, _m22_worker_log = _m22_run(
+                    _worker_item, record=provenance[41])
+                assert _m22_worker == 1 and _m22_worker_parks == [], (
+                    "the WORKER class must NOT be budgeted from the ledger attempt store — its "
+                    "rounds are the PR round markers, and reading the ledger for it would charge "
+                    f"it for attempts nothing ever recorded ({_m22_worker_log!r})")
+                for _path in _m22_charged:
+                    _path.unlink()
+                # (x) [registry #1288] THE ADMISSION RULE IS AN IDENTITY *CLASS*, NOT A SECOND
+                #     HARDCODED LOGIN — proved by execution, because the whole #657 defect was a
+                #     gate written against ONE specific identity (`author-not-app-bot`). A fleet
+                #     machine account is coming; if admitting it required a code change, this
+                #     change would have rebuilt the same defect one identity over.
+                #
+                #     Two DIFFERENT enrolled logins both dispatch, a third does not, and the only
+                #     thing that differs between them is the contents of the master-protected
+                #     `review_enrolment_authors` list — i.e. configuration. The rule keys on the
+                #     PR AUTHOR against that list and never on `actor.type`, so it does not
+                #     inherit "a `User` actor does not establish a human": `User` is not treated
+                #     as evidence of anything here.
+                _class_members = ("jeswr", "sparq-fleet-agent")
+                _class_results = []
+                for _login in (*_class_members, "some-unenrolled-login"):
+                    record_file.write_text(json.dumps(_orch_record), encoding="utf-8")
+                    fake.update(pull=dict(_orch_pull, user={"login": _login, "type": "User"}))
+                    launch_runs.clear()
+                    _buf = io.StringIO()
+                    with contextlib.redirect_stdout(_buf):
+                        _n, _ = run_items([_orch_item], allocator=LaunchingAllocator(),
+                                          routing=strand_routing,
+                                          enrolled_authors=_class_members)
+                    _class_results.append((_login, _n, _buf.getvalue()))
+                assert [(login, n) for login, n, _log in _class_results] == [
+                    ("jeswr", 1), ("sparq-fleet-agent", 1), ("some-unenrolled-login", 0)], (
+                    "the review-lane admission rule must be a CONFIGURED CLASS: every login in "
+                    "`review_enrolment_authors` is admitted and nothing else is, so adding a "
+                    "legitimate machine author is a policy edit rather than a code change. "
+                    f"got {[(login, n) for login, n, _log in _class_results]}")
+                # ...and the unenrolled login is refused by the PRE-#657 SHAPE PAIR, not by some
+                # new predicate. `claim_review_pr_admission` waives `HEAD_REF_RE` and the
+                # exact-App-author gate TOGETHER, and only for an admitted PR — so an unenrolled
+                # one meets whichever comes first (the head ref, on this ordinary branch) with the
+                # other still standing behind it. Weakening one leg would weaken the pair, so the
+                # assertion names the pair rather than a single line.
+                assert ("head is not a same-repo worker branch" in _class_results[2][2]
+                        or "PR author is not the App bot" in _class_results[2][2]), \
+                    _class_results[2][2]
+                print("  ok   [#1288] the admission rule is an identity CLASS: TWO different "
+                      "enrolled logins both reach dispatch and an unenrolled one is refused by "
+                      "the pre-#657 reason — so enrolling a fleet machine account is a "
+                      "`review_enrolment_authors` edit, not a code change")
+                record_file.write_text(json.dumps(_orch_record), encoding="utf-8")
+
+                print("  ok   [#1288] M22 CLOSED at the dispatch call site: with max_review_rounds "
+                      "attempts on the LEDGER the enrolled class stops dispatching (it launches "
+                      "with none, and the worker class — same files, same empty comments — still "
+                      "launches), so neither deleting nor widening the ledger-rounds routing "
+                      "survives")
                 record_file.write_text(json.dumps(provenance[41]), encoding="utf-8")
                 print("  ok   #657 CLAIM leg (real dispatch loop): an enrolled orchestrator PR "
                       "passes the shape gates, an unenrolled one is refused by the PRE-FEATURE "
@@ -23233,6 +23436,163 @@ def _identity_refusal_seam_violations(document):
     return sorted(out)
 
 
+# [registry #1288] The LEDGER-ACCOUNTING seam. The token drop moved two facts the review lane
+# depends on out of the target and onto the registry's own ledger — the round ATTEMPT (which bounds
+# a deterministic crash loop) and `already_done` (which bounds redundant dispatch). Both now live
+# in workflow `run:` scripts, and a workflow script is where this repo keeps measuring vacuity: a
+# battery over the change found FOUR survivors here at once (N7-N10), every one of them a YAML
+# edit no python test could see. These pins are equality on parsed nodes and EXECUTION of the
+# workflow's own code — never containment on its source.
+_LEDGER_SEAM_CHARGE_IF = (
+    "${{ inputs.mode == 'review' && needs.resolve.outputs.self_attested == 'true' "
+    "&& (steps.adopt.outputs.acquired || steps.claim.outputs.acquired) == 'true' }}")
+_LEDGER_SEAM_CHECKOUT_TOKEN = (
+    "${{ steps.app-token-review.outputs.token || steps.app-token-fix.outputs.token "
+    "|| github.token }}")
+_LEDGER_SEAM_CONFIRM_ANCHOR = r"(?m)^[ \t]*spec = importlib\.util\.spec_from_file_location\($"
+_LEDGER_SEAM_CONFIRM_END = r"(?m)^[ \t]*print\(f\"review attempt charge confirmed"
+_LEDGER_SEAM_DONE_ANCHOR = r"(?m)^[ \t]*if mode == \"review\" and self_attested:$"
+_LEDGER_SEAM_DONE_END = r"(?m)^[ \t]*issue_data = json\.loads\("
+
+
+def _ledger_seam_exec(block, *, charged_rounds=(), verdicts=(), namespace):
+    """Run one extracted workflow block against a REAL registry+ledger checkout layout.
+
+    The blocks under test resolve `Path("registry", "scripts", "worker-pr.py")` and
+    `Path("ledger")` relative to the runner's workspace, so a temp workspace with those two
+    directories is what makes them executable at all — and executing them is the only thing that
+    can tell a live statement from a dead one."""
+    here = Path(__file__).resolve().parent
+    with tempfile.TemporaryDirectory() as workspace:
+        root = Path(workspace)
+        (root / "registry").mkdir()
+        # SYMLINKED, not copied: worker-pr.py imports its siblings (ledger_retry) at load time,
+        # so the block must see the REAL scripts directory — and a copy of one file would make
+        # this harness prove a property of a tree the runner never has.
+        os.symlink(here, root / "registry" / "scripts")
+        data = root / "ledger" / "data"
+        data.mkdir(parents=True)
+        worker_pr = _probe_worker_pr()
+        for repo, number, round_n in charged_rounds:
+            (root / "ledger" / worker_pr.round_claim_path(repo, number, round_n)).write_text(
+                "{}", encoding="utf-8")
+        vdir = root / "ledger" / worker_pr.VERDICT_DIR
+        vdir.mkdir(parents=True)
+        for repo, number, round_n, sha in verdicts:
+            (vdir / Path(worker_pr.verdict_path(repo, number, round_n)).name).write_text(
+                json.dumps(worker_pr.verdict_envelope(repo, number, round_n, sha, {})),
+                encoding="utf-8")
+        saved = os.getcwd()
+        os.chdir(root)
+        try:
+            exec(compile(block, "<review-fix.yml ledger seam>", "exec"),   # noqa: S102
+                 namespace)
+            return None
+        except SystemExit as exc:
+            return f"SystemExit: {exc}"
+        finally:
+            os.chdir(saved)
+
+
+def _ledger_seam_violations(document, source=None):
+    """Every way the #1288 ledger accounting can be silently disabled, as NAMED violations."""
+    out = []
+    jobs = (document or {}).get("jobs") if isinstance(document, dict) else None
+    if not isinstance(jobs, dict):
+        return ["review-fix.yml exposes no jobs mapping"]
+
+    # (1) The CHARGE must be wired into the `claim` job — the only job that is pre-model, holds
+    #     contents:write on the registry, and executes no target code (mutant N8).
+    claim_steps = (jobs.get("claim") or {}).get("steps")
+    charge = next((s for s in (claim_steps if isinstance(claim_steps, list) else [])
+                   if isinstance(s, dict) and isinstance(s.get("run"), str)
+                   and "round-claim" in s["run"]), None)
+    if charge is None:
+        out.append("jobs.claim has no step invoking `worker-pr.py round-claim` — the "
+                   "self-attested class's review attempts are never charged, so its round budget "
+                   "never exhausts and a deterministic crash loop is unbounded")
+    elif charge.get("if") != _LEDGER_SEAM_CHARGE_IF:
+        out.append(f"jobs.claim's round-claim step `if:` must be EXACTLY "
+                   f"{_LEDGER_SEAM_CHARGE_IF!r} (found {charge.get('if')!r}) — inverting or "
+                   "widening it either stops charging the class or charges a class whose rounds "
+                   "are counted from PR comments instead")
+
+    # (2) The tokenless target CHECKOUT must keep its registry-token fallback (mutant N9): with
+    #     no App token minted for the class, dropping it leaves the checkout with no token at all.
+    run_steps = (jobs.get("run") or {}).get("steps")
+    checkout = next((s for s in (run_steps if isinstance(run_steps, list) else [])
+                     if isinstance(s, dict) and (s.get("with") or {}).get("path") == "target"),
+                    None)
+    if checkout is None:
+        out.append("jobs.run has no step checking the target out at path `target`")
+    elif (checkout.get("with") or {}).get("token") != _LEDGER_SEAM_CHECKOUT_TOKEN:
+        out.append(f"the target checkout `token:` must be EXACTLY "
+                   f"{_LEDGER_SEAM_CHECKOUT_TOKEN!r} (found "
+                   f"{(checkout.get('with') or {}).get('token')!r}) — the self-attested class "
+                   "mints no App token, so without the registry-token fallback its checkout has "
+                   "no token at all")
+
+    # (3) The pre-model CHARGE CONFIRMATION must actually REFUSE an uncharged round (mutant N7),
+    #     proved by running the workflow's own block both ways.
+    try:
+        confirm = _review_fix_step_python(
+            _LEDGER_SEAM_CONFIRM_ANCHOR, _LEDGER_SEAM_CONFIRM_END,
+            "pre-model attempt-charge confirmation", job="run", source=source)
+        env = {"TARGET_REPO": "o/r", "PR_NUMBER": "41", "REVIEW_ROUND": "2"}
+        missing = _ledger_seam_exec(
+            confirm, charged_rounds=(),
+            namespace={"importlib": importlib, "os": types.SimpleNamespace(environ=env),
+                       "Path": Path})
+        present = _ledger_seam_exec(
+            confirm, charged_rounds=(("o/r", 41, 2),),
+            namespace={"importlib": importlib, "os": types.SimpleNamespace(environ=env),
+                       "Path": Path})
+    except Exception as exc:      # noqa: BLE001 — an unrunnable seam proves nothing
+        out.append(f"the pre-model charge confirmation could not be executed ({exc!r}) — "
+                   "treated as broken")
+    else:
+        if missing is None:
+            out.append("the pre-model step does NOT refuse an UNCHARGED round — a reviewer can "
+                       "launch with its round unaccounted for, which is the unbounded crash loop "
+                       "the attempt store exists to prevent")
+        if present is not None:
+            out.append(f"the pre-model step refuses a round that IS charged ({present}) — the "
+                       "lane would never review this class at all")
+
+    # (4) `already_done` for the class must be re-derived from the LEDGER, not from the
+    #     author-editable PR body (mutant N10) — again by running the workflow's own block.
+    try:
+        done = _review_fix_step_python(
+            _LEDGER_SEAM_DONE_ANCHOR, _LEDGER_SEAM_DONE_END,
+            "self-attested already_done re-derivation", job="resolve", source=source)
+        head = "a" * 40
+        results = {}
+        for label, verdicts in (("bound", (("o/r", 41, 1, head),)), ("none", ())):
+            space = {"importlib": importlib, "Path": Path, "dispatch_claim": sys.modules[__name__],
+                     "mode": "review", "self_attested": True, "repo": "o/r",
+                     "pull": {"number": 41}, "head_sha": head,
+                     # The PR-BODY answer, deliberately the OPPOSITE of the ledger's, so a block
+                     # that quietly kept reading the body is indistinguishable from one that does
+                     # not only if it never runs. It runs.
+                     "already_done": (label == "none"), "print": lambda *_a, **_k: None}
+            error = _ledger_seam_exec(done, verdicts=verdicts, namespace=space)
+            results[label] = (error, space.get("already_done"))
+    except Exception as exc:      # noqa: BLE001
+        out.append(f"the self-attested already_done re-derivation could not be executed "
+                   f"({exc!r}) — treated as broken")
+    else:
+        if results["bound"] != (None, True):
+            out.append(f"a LEDGER verdict record bound to the live head does not make "
+                       f"already_done True (got {results['bound']!r}) — the class re-reviews a "
+                       "head it already reviewed, burning a reviewer slot per tick")
+        if results["none"] != (None, False):
+            out.append(f"already_done for the self-attested class is NOT re-derived from the "
+                       f"ledger (got {results['none']!r}) — it fell through to the "
+                       "`sparq-reviewed-sha` marker in the PR BODY, which for this class is "
+                       "written by the pull request's own author")
+    return sorted(out)
+
+
 def _identity_refusal_seam_self_test():
     import yaml  # self-test-only, same lazy import as _workflow_step_python
     import ast
@@ -23242,6 +23602,56 @@ def _identity_refusal_seam_self_test():
     live = yaml.safe_load(text)
     assert _identity_refusal_seam_violations(live) == [], \
         _identity_refusal_seam_violations(live)
+
+    # ---- [registry #1288] THE LEDGER-ACCOUNTING SEAM, on the live workflow, and VALIDATED
+    # AGAINST KNOWN POSITIVES FIRST. A mutation battery over this change found four survivors in
+    # one pass (N7-N10), all of them YAML edits: the charge that never fires, the checkout that
+    # loses its only token, the pre-model confirmation that stops refusing, and `already_done`
+    # falling back to the PR body the class's own author writes. A checker that has never
+    # reported any of them has not been shown to be able to, so each is injected and required to
+    # be NAMED before the clean report on the live file is trusted.
+    for _why, _needle, _broken in (
+            ("the claim-job charge never fires for the class", "round-claim step `if:`",
+             text.replace(
+                 "        if: ${{ inputs.mode == 'review' && needs.resolve.outputs.self_attested "
+                 "== 'true' && (steps.adopt.outputs.acquired || steps.claim.outputs.acquired) "
+                 "== 'true' }}",
+                 "        if: ${{ inputs.mode == 'review' && needs.resolve.outputs.self_attested "
+                 "!= 'true' && (steps.adopt.outputs.acquired || steps.claim.outputs.acquired) "
+                 "== 'true' }}")),
+            ("the tokenless checkout loses its registry-token fallback", "target checkout",
+             text.replace(
+                 "          token: ${{ steps.app-token-review.outputs.token || "
+                 "steps.app-token-fix.outputs.token || github.token }}",
+                 "          token: ${{ steps.app-token-review.outputs.token || "
+                 "steps.app-token-fix.outputs.token }}")),
+            ("the pre-model charge confirmation stops refusing", "does NOT refuse an UNCHARGED",
+             text.replace("          if not charged.is_file():", "          if False:")),
+            ("the already_done re-derivation is deleted outright", "could not be executed",
+             text.replace('          if mode == "review" and self_attested:',
+                          "          if False:")),
+            # The PLAUSIBLE wrong version, and the one a reviewer would most likely wave through:
+            # keep the ledger read, but OR it with the PR-body marker. The class's own author can
+            # then still set `already_done` to True from the pull request body and suppress its
+            # own review — which is exactly the property this move exists to remove.
+            ("already_done is OR'd with the author-editable PR body",
+             "NOT re-derived from the",
+             text.replace(
+                 "              already_done = dispatch_claim.ledger_review_completed(",
+                 "              already_done = already_done or "
+                 "dispatch_claim.ledger_review_completed("))):
+        assert _broken != text, _why
+        _found = _ledger_seam_violations(yaml.safe_load(_broken), source=_broken)
+        assert any(_needle in item for item in _found), (
+            f"the ledger-seam checker FAILED ITS KNOWN POSITIVE ({_why}): expected a violation "
+            f"naming {_needle!r}, got {_found!r} — a clean report from it would prove nothing")
+    _ledger_violations = _ledger_seam_violations(live)
+    assert _ledger_violations == [], _ledger_violations
+    print("  ok   #1288 the LEDGER-accounting seam is intact — the charge is wired into `claim` "
+          "(pre-model, no target code), the tokenless checkout keeps a token, the pre-model step "
+          "REFUSES an uncharged round, and already_done is re-derived from the ledger rather "
+          "than the PR body — each pinned by equality or by executing the workflow's own block, "
+          "and each shown to RED on an injected known positive first")
 
     # ---- (0) [registry #979 round-2 finding 1] THE METHODOLOGY CLAIM, CHECKED RATHER THAN
     # ASSERTED. Round 1's comment said "never a substring containment" while two pins were exactly

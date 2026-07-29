@@ -6247,6 +6247,32 @@ def _self_test():
           "claimed_at_run" in _put_calls[0][1]["volatile_fields"], True)
     check("...and the document binds the head sha it charged",
           _put_calls[0][0][2]["head_sha_at_claim"], "b" * 40)
+    # [registry #1288] ...AND THE CLI LEG ACTUALLY CHARGES (mutant N15). `charge_round_claim` is
+    # the thin wrapper the `claim` job invokes, and a thin wrapper whose one job is to call the
+    # writer is exactly the shape that survives every test of the writer beneath it. Asserted at
+    # the CALL, the same idiom as the volatile-fields row above.
+    _cli_calls = []
+    _saved_record = globals()["record_round_claim"]
+    try:
+        globals()["record_round_claim"] = lambda *a: _cli_calls.append(a) or True
+        charge_round_claim("reg/istry", "o/r", 41, 2, "c" * 40, "78.1")
+    finally:
+        globals()["record_round_claim"] = _saved_record
+    check("the round-claim CLI leg CHARGES — it invokes the writer with its own arguments",
+          _cli_calls, [("reg/istry", "o/r", 41, 2, "c" * 40, "78.1")])
+    # [registry #1288] THE VERDICT GLOB IS PR-SCOPED (mutant N16). It answers "has any round ever
+    # produced a verdict for THIS pull request?", so a glob that also matches a NEIGHBOUR's
+    # records would let one PR's completed review read as another's — and `already_done` skipping
+    # a review is a silent non-delivery, which is this whole issue.
+    check("the verdict glob matches this PR's records at any round",
+          [fnmatch.fnmatch(name, verdict_glob("o/r", 41)) for name in
+           ("o--r--pr41-round1.json", "o--r--pr41-round7.json")], [True, True])
+    check("...and matches NO other PR's, and no other repo's",
+          [fnmatch.fnmatch(name, verdict_glob("o/r", 41)) for name in
+           ("o--r--pr410-round1.json", "o--r--pr4-round1.json",
+            "other--repo--pr41-round1.json")], [False, False, False])
+    check("...and it agrees with verdict_path, which is the thing readers actually resolve",
+          fnmatch.fnmatch(Path(verdict_path("o/r", 41, 3)).name, verdict_glob("o/r", 41)), True)
 
     check("rounds count bot-only markers", count_rounds(comments, bot), 2)
     check("non-bot marker is ignored", count_rounds(comments, "mallory[bot]"), 0)
