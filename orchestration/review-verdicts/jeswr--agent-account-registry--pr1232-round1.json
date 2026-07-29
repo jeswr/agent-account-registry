@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1232,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "50ae3a68d9807293773493bf7ab61136e7483e80",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`read_ticks` lists `/repos/{repo}/actions/artifacts`, and `tick_records` authenticates a marker only by its user-controlled artifact name plus a numeric workflow-run id. It never verifies that the artifact belongs to `groom.yml`, ran on the default branch, or used an allowed event. Any other workflow/run able to upload an artifact in this repository can therefore publish `groom-mint-tick.ok-jeswr` to reset and close a real alert, or publish skip markers to fabricate one. Ordering by artifact `created_at` also lets a rerun of an older groom run supersede newer scheduled evidence. Artifact-name grammar is not provenance.",
+    "file": "scripts/groom-mint-alert.py",
+    "fix_hint": "Bind every accepted marker to trusted run provenance: fetch or query the associated workflow run and require the exact groom workflow identity/path, default-branch head SHA/ref, and allowed event; define ordering by the intended groom tick/run rather than artifact upload time. Add adversarial tests for a same-name artifact from another workflow/branch and for a late rerun of an old tick.",
+    "severity": "major",
+    "title": "Repository-wide artifact names are accepted without provenance validation"
+   },
+   {
+    "body": "The shell loop is the only producer mapping from the two mint outcomes to owner tokens, but `_test_workflow_seam` never asserts its two `entry` literals or executes that mapping. Deleting `\"jeswr=${JESWR_MINT_OUTCOME:-}\"` leaves the current checks green: both outcome expressions remain in `env`, both classifier words remain in the generic loop body, and the round-trip test constructs synthetic names from `MINT_STEP_IDS` rather than the workflow's emitted name. Live markers would then omit `jeswr`; `skip_streaks` treats omission as streak 0, and an existing jeswr alert is auto-closed as recovered. This is a vacuous producer/consumer seam for the marquee claim.",
+    "file": ".github/workflows/groom.yml",
+    "fix_hint": "Parse or execute the live marker producer and assert an exact one-to-one mapping from every `MINT_STEP_IDS` owner/outcome variable to the emitted entries. Treat an owner missing from a reached tick as unknown/fail-closed unless an independently validated policy/workflow change explicitly retires it. Add a mutant test that deletes each owner entry and must fail.",
+    "severity": "major",
+    "title": "Dropping one owner from the marker is interpreted as recovery"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe watchdog has two fail-open evidence problems. It accepts repository-wide artifacts without proving they came from the groom workflow/default branch, and its producer seam test does not prove that every mint owner is actually emitted into the marker. Either can make a real credential gap appear recovered or can fabricate a streak.",
+  "verdict": "request_changes"
+ }
+}
