@@ -75,6 +75,8 @@ SKIP_OWNERSHIP = {
     # Conflicting, and somebody else's move.
     "hard-exclusion-label": OWNER_ELSEWHERE,        # a PROVEN human — checked, no longer assumed
     "two-head-exhausted-stands": OWNER_ELSEWHERE,   # the human the escalation already asked
+    "stuck-park-already-delivered": OWNER_ELSEWHERE,  # our own live park, cause-gated
+    "park-suppressed-human-unpark": OWNER_ELSEWHERE,  # the human who un-parked it
     "stuck-park-stands": OWNER_ELSEWHERE,           # a cause-gated machine park
     "awaiting-author-grace": OWNER_ELSEWHERE,       # the author, bounded by --stuck-grace-hours
     "dependabot-already-requested": OWNER_ELSEWHERE,
@@ -240,19 +242,34 @@ STUCK_RECEIPT_RE = re.compile(
 )
 
 
-def _is_human_maintainer(api, repo, login):
+def _is_human_maintainer(api, repo, login, on_failure=None):
     """The strict maintainer probe for the unpark veto (park-policy hygiene finding; the
     worker-issue._is_human_maintainer pattern): repo collaborator permission in
     park_policy.HUMAN_MAINTAINER_PERMISSIONS. Probe-call FAILURE counts as NOT a maintainer
     and emits the shared distinct ::warning:: diagnostic (park_policy.probe_maintainer,
-    round-3 Opus finding); a genuine not-a-maintainer permission stays quiet."""
+    round-3 Opus finding); a genuine not-a-maintainer permission stays quiet.
+
+    `on_failure` is called once per failed probe. `probe_maintainer` deliberately collapses
+    "probe broke" into the same False as "genuinely not a maintainer", which is the right fail
+    direction for a VETO — an unverifiable actor mints nothing. It is the WRONG direction for an
+    ADMISSION: a 403 on the collaborator endpoint would report a maintainer's own hold as
+    machine-applied and rebase under them. Callers that admit on the answer pass this and
+    downgrade the result to UNKNOWN (registry #1191 review, secondary finding 2)."""
     def read_permission(probe_login):
         payload = api.request("GET", f"/repos/{repo}/collaborators/{probe_login}/permission")
         if not isinstance(payload, dict):
             raise ResolverError("collaborator permission payload is malformed")
         return payload.get("permission")
 
-    return _park_policy.probe_maintainer(repo, login, read_permission)
+    def probe(probe_login):
+        try:
+            return read_permission(probe_login)
+        except Exception:
+            if on_failure is not None:
+                on_failure(probe_login)
+            raise
+
+    return _park_policy.probe_maintainer(repo, login, probe)
 
 
 def load_target_repositories(policy_file, registry_repo):
@@ -357,6 +374,11 @@ class GitHubAPI:
 
     def comments(self, repo, number):
         return self.paginated(f"/repos/{repo}/issues/{number}/comments")
+
+    def issue(self, repo, number):
+        """The source ISSUE, for its live label set only. Read on the hold-ownership path so the
+        issue can be checked across every hard-exclusion label rather than only the PR's own."""
+        return self.request("GET", f"/repos/{repo}/issues/{number}")
 
     def timeline(self, repo, number):
         return self.paginated(f"/repos/{repo}/issues/{number}/timeline")
@@ -1086,6 +1108,9 @@ class ConflictResolver:
         # describes: a skip before this flag is set is out-of-population by construction, and no
         # call site has to remember to say so.
         self._in_population = False
+        # The machine-applied hard-exclusion holds released for the PR being processed. Read by
+        # the grace-window exit, which must COMPLETE the class conversion it starts.
+        self._released_holds = []
 
     def _record(self, kind, repo, number, detail=""):
         self.actions.append((kind, repo, number, detail))
@@ -1237,6 +1262,30 @@ class ConflictResolver:
         head = str((pr.get("head") or {}).get("sha", ""))
         if SAFE_SHA.fullmatch(head) is None:
             raise ResolverError(f"PR head SHA is malformed for {repo}#{number}")
+        # ALREADY DELIVERED (registry #1191 review, blocking 1). The two-distinct-head exit got
+        # this guard and this one did not, and the asymmetry rebuilt #1191 inside a new counter:
+        # `_apply_park_label` -> `_count_exit` ran unconditionally, so a PR whose park was already
+        # written scored `escalated` on EVERY tick forever. MEASURED over 8 simulated ticks on the
+        # live stranded shape: from tick 4 the only write was a no-op label add GitHub discards,
+        # and the run still returned `acted` / green — i.e. VERDICT_INERT could never fire on this
+        # repository again. The alarm this PR exists to add would have muted itself permanently.
+        #
+        # The CONVERSION CLAUSE is the other half. A delivered park whose released human-class
+        # holds are still live is the interrupted state of the demotion below, not a finished one,
+        # so it falls through and converges rather than skipping — the same marker-without-label
+        # reasoning the two-head exit uses, applied to a label PAIR.
+        park_state, grant_state = stuck_unpark_state(comments, self.bot_login)
+        if (park_state is not None and grant_state is None
+                and stuck_park_label(park_state["gen"]) in _label_names(pr)):
+            # Converge the demotion FIRST — never re-mint. Falling through to the write path
+            # instead would recompute `generation` from the receipts already on record and burn a
+            # fresh generation for what is pure convergence, which is the runaway this guard
+            # exists to stop.
+            self._demote_holds(repo, number, pr, stuck_park_label(park_state["gen"]))
+            self._skip(repo, number,
+                       f"grace-window park already delivered at generation {park_state['gen']}",
+                       "stuck-park-already-delivered")
+            return
         generation = stuck_park_generation(comments, self.bot_login)
         park_label = stuck_park_label(generation)
         receipt = stuck_receipt(STUCK_PARK_MARKER, head, generation)
@@ -1244,9 +1293,15 @@ class ConflictResolver:
                 repo, number, park_label,
                 lambda r, n: self.api.timeline(r, n),
                 is_human=lambda login: _is_human_maintainer(self.api, repo, login)):
+            # NOT an exit, and no longer counted as one. A human un-parked this PR, so they own
+            # it — which is a SKIP with a named owner, exactly like the two-head stand-down. The
+            # previous `_count_exit` here was the second unguarded mute path: it scored work every
+            # tick while writing nothing at all.
             self._record(f"{park_label}-suppressed", repo, number,
                          "sticky human unpark (or unreadable timeline)")
-            self._count_exit(EXIT_STUCK_GRACE, park_label)
+            self._skip(repo, number,
+                       "grace-window park suppressed by a sticky human unpark",
+                       "park-suppressed-human-unpark")
             return
         bodies = _comment_bodies(_self_authored_comments(comments, self.bot_login))
         # A MACHINE park dedupes on its own receipt FINGERPRINT, not on "any escalation comment
@@ -1265,7 +1320,49 @@ class ConflictResolver:
                 # already granted N re-admissions when the record shows none sends them hunting a
                 # flap that never happened (registry #769, same finding).
                 grants=len(stuck_receipts(comments, self.bot_login, STUCK_UNPARK_MARKER))))
-        self._apply_park_label(repo, number, park_label, EXIT_STUCK_GRACE, conflicts)
+        if self._apply_park_label(repo, number, park_label, EXIT_STUCK_GRACE, conflicts):
+            # PARK FIRST, THEN DEMOTE — the interruption residue must be BOTH labels, never
+            # neither. Both-labels is a PR still held that the next tick converges; neither is a
+            # PR this program silently un-held.
+            self._demote_holds(repo, number, pr, park_label)
+
+    def _demote_holds(self, repo, number, pr, park_label):
+        """COMPLETE the class conversion: drop the machine-applied human-class holds this sweep
+        released, now that a machine-owned park is live in their place.
+
+        THE SECOND BLOCKING FINDING (registry #1191 review). Writing `review:parked` while leaving
+        the machine-applied `needs:user` in place is not a conversion, it is an ADDITION — and
+        `_stuck_park_phase` stands down entirely whenever `park_policy.human_owned_holds` matches,
+        so the machine exit was dead from tick 1. Every subsequent tick then re-escalated, the
+        receipts reached generation 3 inside ~40 minutes on the `1,21,41` cron, and
+        reconcile-conflict-park reads generation > STUCK_UNPARK_MAX as `budget-exhausted` — a
+        HUMAN TERMINAL that outranks even a fully recovered cause. Seven PRs the live census calls
+        exit-reachable today would have become permanently human-terminal. A change that moves
+        work from "refused early" to "refused forever" is a net loss against master.
+
+        SCOPED TO THE LABELS THAT ACTUALLY BLOCK THE EXIT. Only holds this sweep proved
+        machine-applied AND that `human_owned_holds` matches are dropped — so `trust-surface` and
+        `trust:untrusted` survive untouched. They do not block the machine exit, and removing a
+        trust classification is a different decision than un-doing a machine's own mis-park.
+
+        Never fires for the human class: past STUCK_UNPARK_MAX the park label IS `needs:user`, and
+        demoting there would delete the hold just written."""
+        if park_label != MACHINE_PARK_LABEL:
+            return []
+        pending = self._demotable_holds(pr)
+        for label in pending:
+            if self.apply:
+                self.api.remove_label(repo, number, label)
+            self._record("hold-demoted", repo, number,
+                         f"{label} was machine-applied and is replaced by {MACHINE_PARK_LABEL}")
+        return pending
+
+    def _demotable_holds(self, pr):
+        """The released machine-applied holds still live on `pr` that would veto the machine
+        exit — i.e. the intersection of what this sweep released with `human_owned_holds`."""
+        live = _label_names(pr)
+        return [label for label in _park_policy.human_owned_holds(self._released_holds)
+                if label in live]
 
     def _clear_stuck_park(self, repo, number):
         if self.apply:
@@ -1382,18 +1479,48 @@ class ConflictResolver:
         no such label proves nothing about the PR's. So the issue is consulted only when the PR
         already said machine, and any human application on any surface wins.
 
+        ⚠️ WHAT "PROVEN HUMAN" ACTUALLY PROVES, stated plainly because the answer is weaker than
+        the name (registry #1191 review). The probe is repo collaborator permission, and the
+        maintainer account it resolves to is ALSO used by the fleet as a PAT. Measured on the
+        live registry: all three holds this predicate calls human are, in fact, agent-applied
+        through that account. So this separates "acted through the maintainer account" from
+        "acted through a bot App identity" — NOT person from machine. The direction is
+        conservative (it over-preserves, and every unprovable case also over-preserves), so it is
+        safe; it is not, however, the distinction the words suggest, and `correctly-idle` staying
+        green rests on it. Weakening the predicate to "fix" this would trade a safe imprecision
+        for an unsafe one.
+
+        THE ISSUE IS READ ACROSS ALL HARD-EXCLUSION LABELS, not just this one. Live case: #601
+        carries a bot-applied `review:needs-user` while its source issue #583 carries a
+        maintainer-applied `trust-surface` — a same-label-only check reads that as unheld and
+        rebases under it.
+
         The tie/fail directions live in park_policy.label_application_ownership and are shared
         with groom, dispatch-claim and both reconcilers rather than restated here."""
+        probe_broke = []
+
         def probe(_repo, target):
             return self.api.timeline(_repo, target)
 
         def is_human(login):
-            return _is_human_maintainer(self.api, repo, login)
+            return _is_human_maintainer(self.api, repo, login,
+                                        on_failure=lambda who: probe_broke.append(who))
+
+        def settle(state):
+            # A FAILED MAINTAINER PROBE CANNOT ANSWER "machine". `probe_maintainer` collapses a
+            # broken probe into not-human, which would turn a maintainer's own hold into an
+            # admission. Anything unproven downgrades to UNKNOWN — which keeps the hold AND is
+            # loud, rather than keeping it silently.
+            if state == _park_policy.LABEL_OWNER_MACHINE and probe_broke:
+                print(f"::warning::conflict-resolver could not verify the actor(s) who applied "
+                      f"holds on {repo}#{number}; the hold stands", file=sys.stderr)
+                return _park_policy.LABEL_OWNER_UNKNOWN
+            return state
 
         state = _park_policy.label_application_ownership(
             repo, number, label, probe, is_human=is_human)
         if state != _park_policy.LABEL_OWNER_MACHINE:
-            return state
+            return settle(state)
         try:
             issues = sorted(self._groom_linked_issues(detail))
         except Exception as exc:  # noqa: BLE001 — an unreadable linkage proves nothing
@@ -1403,12 +1530,24 @@ class ConflictResolver:
         for issue in issues:
             if issue == number:
                 continue
-            if _park_policy.label_application_ownership(
-                    repo, issue, label, probe,
-                    is_human=is_human) == _park_policy.LABEL_OWNER_HUMAN:
-                print(f"HOLD {repo}#{number}: {label!r} is human-owned via source issue #{issue}")
-                return _park_policy.LABEL_OWNER_HUMAN
-        return _park_policy.LABEL_OWNER_MACHINE
+            try:
+                issue_labels = _label_names(self.api.issue(repo, issue))
+            except Exception as exc:  # noqa: BLE001 — an unreadable issue proves nothing
+                # NOT "machine". The issue is the surface that can only ever ESCALATE the answer,
+                # so failing to read it is failing to check the one place a human hold could be
+                # hiding — the exact shape of a silent release (review finding, secondary 1).
+                print(f"::warning::conflict-resolver could not read source issue "
+                      f"{repo}#{issue} for {repo}#{number} ({exc}); the hold stands",
+                      file=sys.stderr)
+                return _park_policy.LABEL_OWNER_UNKNOWN
+            for candidate in sorted(issue_labels & HARD_EXCLUDE_LABELS):
+                if _park_policy.label_application_ownership(
+                        repo, issue, candidate, probe,
+                        is_human=is_human) == _park_policy.LABEL_OWNER_HUMAN:
+                    print(f"HOLD {repo}#{number}: {candidate!r} is human-owned via source "
+                          f"issue #{issue}")
+                    return _park_policy.LABEL_OWNER_HUMAN
+        return settle(_park_policy.LABEL_OWNER_MACHINE)
 
     def _groom_linked_issues(self, detail):
         return _groom().linked_issue_numbers(detail)
@@ -1426,6 +1565,7 @@ class ConflictResolver:
 
     def _process_pr(self, repo, default_branch, listed_pr):
         self._in_population = False
+        self._released_holds = []
         number = listed_pr.get("number")
         if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
             self._skip(repo, "unknown", "invalid PR number in listing", "invalid-pr-number")
@@ -1482,6 +1622,7 @@ class ConflictResolver:
                               "human or a machine, so the exclusion stands with no owner")
                 return
             self.current.held_released += 1
+            self._released_holds = list(holds)
             self._record("hold-released", repo, number,
                          f"machine-applied hold(s) {', '.join(holds)} do not exclude")
         head = detail.get("head") or {}
@@ -1761,9 +1902,13 @@ def _self_test():
         }
 
     class FakeAPI:
-        def __init__(self, pulls, sequences=None, timelines=None, now=base_now):
+        def __init__(self, pulls, sequences=None, timelines=None, now=base_now, issues=None):
             self.tokens = {"example": "test-token"}
             self.now = now
+            # Source ISSUES, by number, for their live label set. `issue_labels=None` means the
+            # issue read RAISES — the unreadable-source-issue path, which must never read as
+            # machine-owned (review finding, secondary 1).
+            self.issue_rows = dict(issues or {})
             self.prs = {pr["number"]: deepcopy(pr) for pr in pulls}
             self.sequences = {number: [deepcopy(value) for value in values]
                               for number, values in (sequences or {}).items()}
@@ -1805,6 +1950,13 @@ def _self_test():
 
         def comments(self, _repo, number):
             return deepcopy(self.comment_rows[number])
+
+        def issue(self, _repo, number):
+            if number in self.issue_rows and self.issue_rows[number] is None:
+                raise ResolverError(f"issue {number} is unreadable")
+            return {"number": number,
+                    "labels": [{"name": name}
+                               for name in self.issue_rows.get(number, ())]}
 
         def timeline(self, _repo, number):
             return deepcopy(self.timelines.get(number, []))
@@ -1964,10 +2116,14 @@ def _self_test():
     # this row goes red: the PR is rebased under the person holding it.
     issue_held = pull(12, "1" * 40, labels=("needs:user",))
     issue_held["body"] = "> 🤖 SPARQ agent\n\nCloses #4242"
+    # #1191 review, secondary finding: the issue is read across EVERY hard-exclusion label, not
+    # only the PR's own. The live miss this closes is #601 — a bot-applied `review:needs-user` on
+    # the PR whose source issue #583 carries a maintainer-applied `trust-surface`. So the issue
+    # here holds a DIFFERENT label from the PR's, and a same-label-only check rebases under it.
     issue_api = FakeAPI([issue_held], timelines={
         12: labelled_by(bot_login, "needs:user"),
-        4242: labelled_by("jeswr", "needs:user"),
-    })
+        4242: labelled_by("jeswr", "trust-surface"),
+    }, issues={4242: ("trust-surface",)})
     issue_rebaser = FakeRebaser()
     issue_resolver = ConflictResolver(
         issue_api, snapshot, claim, [repo], bot_login, True, 5, issue_rebaser)
@@ -1975,8 +2131,9 @@ def _self_test():
         issue_rc = issue_resolver.run()
     issue_row = issue_resolver.census[0]
     check(
-        "[#1191] a bot-applied hold on the PR is still HUMAN-owned when a person applied the same "
-        "label to the SOURCE ISSUE — the issue may escalate the answer, never rescue it",
+        "[#1191] a bot-applied hold on the PR is still HUMAN-owned when a person applied a "
+        "DIFFERENT hard-exclusion label to the SOURCE ISSUE — the issue may escalate the answer, "
+        "never rescue it",
         (issue_rebaser.calls, issue_rc, issue_row["held_human"], issue_row["held_released"],
          issue_row["skipped"].get("hard-exclusion-label")),
         ([], 0, 1, 0, 1),
@@ -1985,8 +2142,8 @@ def _self_test():
     # issue blocks: same PR, same linkage, the issue's label applied by the BOT. Now it rebases.
     issue_bot_api = FakeAPI([issue_held], timelines={
         12: labelled_by(bot_login, "needs:user"),
-        4242: labelled_by(bot_login, "needs:user"),
-    })
+        4242: labelled_by(bot_login, "trust-surface"),
+    }, issues={4242: ("trust-surface",)})
     issue_bot_rebaser = FakeRebaser()
     with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
         ConflictResolver(issue_bot_api, snapshot, claim, [repo], bot_login, True, 5,
@@ -2730,19 +2887,206 @@ def _self_test():
         veto_bodies = _comment_bodies(veto_api.comment_rows[86])
         return (sum(STUCK_PARK_MARKER in body for body in veto_bodies),
                 veto_api.labels_added,
-                (rows[0]["exit_stuck_grace"], rows[0]["parked_machine"]))
+                (rows[0]["exit_stuck_grace"], rows[0]["parked_machine"]),
+                # The SECOND tick is what the verdict has to survive: a sweep that wrote nothing
+                # must not score as work on it (#1191 review, blocking 1).
+                _aggregate_census([rows[1]])["verdict"],
+                rows[1]["skipped"])
 
     check(
         "[EXIT stuck-grace] a human un-park VETOES the machine park BEFORE the comment: no "
-        "receipt is minted, no generation is spent, and a second tick adds nothing",
+        "receipt is minted, no generation is spent, and the suppressed tick is a NAMED SKIP that "
+        "scores no exit and no work",
         stuck_veto_ticks({86: stuck_veto_timeline}),
-        (0, [], (1, 1)),
+        (0, [], (0, 0), VERDICT_IDLE, {"park-suppressed-human-unpark": 1}),
     )
     check(
         "[EXIT stuck-grace] ...PAIRED CONTROL: with no human un-park the SAME two ticks mint "
-        "EXACTLY ONE receipt — so the check above is not passing because nothing ever posts",
+        "EXACTLY ONE receipt, and tick two stands down on the CAUSE-GATED machine exit rather "
+        "than re-escalating — so the check above is not passing because nothing ever posts",
         stuck_veto_ticks({}),
-        (1, [(86, MACHINE_PARK_LABEL)], (1, 1)),
+        (1, [(86, MACHINE_PARK_LABEL)], (1, 1), VERDICT_IDLE, {"stuck-park-stands": 1}),
+    )
+
+    # (k5) THE LIVE STRANDED SHAPE, OVER MANY TICKS (#1191 review, both blocking findings).
+    #
+    # A single tick cannot express either defect, and that is exactly how they got in: the first
+    # cut of this PR passed 89 single-tick rows while (a) scoring `escalated` on EVERY tick forever
+    # — muting its own INERT verdict permanently — and (b) writing `review:parked` while leaving
+    # the machine-applied `needs:user` live, which stands `_stuck_park_phase` down via
+    # `human_owned_holds` and drives the receipts to generation 3 (past STUCK_UNPARK_MAX) within
+    # three ticks, where reconcile-conflict-park reads them as `budget-exhausted` — a HUMAN
+    # TERMINAL that outranks a fully recovered cause. Measured on the live census, that would have
+    # stranded the 7 PRs it calls exit-reachable today.
+    #
+    # So this drives EIGHT consecutive sweeps against ONE persistent state, with the author
+    # pushing at tick 4, and asserts the whole trajectory rather than any single tick.
+    def stranded_ticks(ticks=8, push_at=4, labels=("needs:user",), issue_rows=None):
+        pr_row = pull(90, "a" * 40, labels=labels)
+        api9 = FakeAPI([pr_row], timelines={90: [
+            {"event": "labeled", "label": {"name": name}, "actor": {"login": bot_login},
+             "created_at": iso(base_now)} for name in labels]}, issues=issue_rows)
+        api9.comment_rows[90] = [attempt_comment("a" * 40, iso(base_now))]
+        reb9 = FakeRebaser("conflict")
+        trace = []
+        for tick in range(1, ticks + 1):
+            if tick == push_at:
+                api9.set_head(90, "c" * 40)
+            sweep = ConflictResolver(api9, snapshot, claim, [repo], bot_login, True, 5, reb9,
+                                     stuck_grace_hours=grace,
+                                     clock=lambda: base_now + 1000 * 3600.0)
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                sweep.run()
+            row = _aggregate_census(sweep.census)
+            trace.append((row["escalated"], row["verdict"]))
+        return (trace, sorted(_label_names(api9.prs[90])),
+                stuck_park_generation(api9.comment_rows[90], bot_login), len(reb9.calls),
+                [event for event in api9.events if event[1] in ("add-label", "remove-label")])
+
+    trace, final_labels, final_gen, rebases, _events = stranded_ticks()
+    check(
+        "[#1191] EIGHT TICKS on the live stranded shape: escalation happens on the tick it is "
+        "EARNED and never again — a sweep that re-asserts a delivered park scores "
+        "`correctly-idle`, so the INERT verdict can still fire",
+        [trace[index] for index in (0, 1, 2, 4, 7)],
+        [(1, VERDICT_ACTED), (0, VERDICT_IDLE), (0, VERDICT_IDLE),
+         (0, VERDICT_IDLE), (0, VERDICT_IDLE)],
+    )
+    check(
+        "[#1191] ...and the CLASS CONVERSION completes: `needs:user` is gone, the generation "
+        "never runs past STUCK_UNPARK_MAX into reconcile's `budget-exhausted` terminal, and the "
+        "recovered cause bought a REAL rebase of the pushed head",
+        (final_gen <= STUCK_UNPARK_MAX, rebases, trace[3]),
+        (True, 1, (1, VERDICT_ACTED)),
+    )
+    # The demotion's own row, asserted on the LABEL SET a downstream consumer actually reads:
+    # `human_owned_holds` must be EMPTY, because that predicate — not the label name — is what
+    # stands `_stuck_park_phase` down and what reconcile keys its refusal on. Delete the
+    # `_demote_holds` call after `_apply_park_label` and this goes red.
+    _t, mid_labels, _g, _r, mid_events = stranded_ticks(ticks=2, push_at=99)
+    check(
+        "[#1191] parking in the MACHINE class DEMOTES the machine-applied human-class hold it "
+        "replaces — the exit-blocking predicate, not merely the label, is cleared",
+        (mid_labels, _park_policy.human_owned_holds(mid_labels), mid_events),
+        ([MACHINE_PARK_LABEL], [],
+         # PARK FIRST, THEN DEMOTE. The residue of an interruption must be BOTH labels — a PR
+         # still held, which the next tick converges — never NEITHER, which is this program
+         # silently un-holding a PR. Swap the two writes and this row goes red on the order.
+         [(90, "add-label", MACHINE_PARK_LABEL), (90, "remove-label", HUMAN_PARK_LABEL)]),
+    )
+    # ...SCOPED. `trust-surface` is machine-applied and released, but it does not block the
+    # machine exit and dropping a trust classification is a different decision. Widen
+    # `_demotable_holds` past `human_owned_holds` and this row goes red.
+    _t2, trust_labels, _g2, _r2, _e2 = stranded_ticks(
+        ticks=2, push_at=99, labels=("needs:user", "trust-surface"))
+    check(
+        "[#1191] ...and ONLY those: a released `trust-surface` survives the demotion untouched",
+        trust_labels,
+        sorted([MACHINE_PARK_LABEL, "trust-surface"]),
+    )
+
+    # (k5b) THE INTERRUPTED DEMOTION — the one reachable state where `_escalate_stuck` sees its own
+    # park already delivered. MEASURED: with the demotion working, `_stuck_park_phase` answers
+    # "stands" on tick two and the already-delivered guard is never reached, so deleting that
+    # guard left the whole suite green — the headline fix of the review round with no red row.
+    #
+    # Both labels live is precisely the residue of a crash between the park write and the demote
+    # write, so this is the state the ordering above is CHOSEN to produce. The guard must converge
+    # it — finish the demotion, spend no generation, mint no second park — because falling through
+    # instead recomputes `generation` from the receipts on record and burns one for what is pure
+    # convergence. That is the runaway to generation 3 that reconcile reads as `budget-exhausted`.
+    def interrupted_demotion():
+        pr_row = pull(91, "a" * 40, labels=("needs:user", MACHINE_PARK_LABEL))
+        api10 = FakeAPI([pr_row], timelines={91: [
+            {"event": "labeled", "label": {"name": name}, "actor": {"login": bot_login},
+             "created_at": iso(base_now)} for name in ("needs:user", MACHINE_PARK_LABEL)]})
+        api10.comment_rows[91] = [
+            attempt_comment("a" * 40, iso(base_now)),
+            {"body": f"park\n{stuck_receipt(STUCK_PARK_MARKER, 'a' * 40, 1)}",
+             "user": {"login": bot_login}, "created_at": iso(base_now)},
+        ]
+        sweep = ConflictResolver(api10, snapshot, claim, [repo], bot_login, True, 5,
+                                 FakeRebaser("conflict"), stuck_grace_hours=grace,
+                                 clock=lambda: base_now + 1000 * 3600.0)
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            sweep.run()
+        row = sweep.census[0]
+        return (sorted(_label_names(api10.prs[91])), row["escalated"],
+                stuck_park_generation(api10.comment_rows[91], bot_login),
+                row["skipped"].get("stuck-park-already-delivered"),
+                _aggregate_census(sweep.census)["verdict"])
+
+    check(
+        "[#1191] a park interrupted BETWEEN its two writes converges on the next tick: the "
+        "demotion finishes, no generation is spent, no second park is minted, and the tick "
+        "scores `correctly-idle`",
+        interrupted_demotion(),
+        ([MACHINE_PARK_LABEL], 0, 2, 1, VERDICT_IDLE),
+    )
+
+    # (k5c) THE HUMAN CLASS IS NEVER DEMOTED. Past STUCK_UNPARK_MAX the park label IS `needs:user`
+    # — the same label the release identified as machine-applied — so an unscoped demotion would
+    # delete the hold it had just written and leave the PR held by nothing at all. Drop the
+    # `park_label != MACHINE_PARK_LABEL` guard in `_demote_holds` and this row goes red.
+    def over_cap_park():
+        pr_row = pull(92, "a" * 40, labels=("needs:user",))
+        api11 = FakeAPI([pr_row], timelines={92: labelled_by(bot_login, "needs:user")})
+        api11.comment_rows[92] = [attempt_comment("a" * 40, iso(base_now))] + [
+            {"body": f"park gen {gen}\n{stuck_receipt(STUCK_PARK_MARKER, 'z' * 40, gen)}",
+             "user": {"login": bot_login}, "created_at": iso(base_now)}
+            for gen in range(1, STUCK_UNPARK_MAX + 1)
+        ]
+        sweep = ConflictResolver(api11, snapshot, claim, [repo], bot_login, True, 5,
+                                 FakeRebaser("conflict"), stuck_grace_hours=grace,
+                                 clock=lambda: base_now + 1000 * 3600.0)
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            sweep.run()
+        return (sorted(_label_names(api11.prs[92])), sweep.census[0]["parked_human"],
+                api11.labels_removed)
+
+    check(
+        "[#1191] an OVER-CAP park writes the human terminal and demotes NOTHING — the PR is never "
+        "left holding no hold at all",
+        over_cap_park(),
+        ([HUMAN_PARK_LABEL], 1, []),
+    )
+
+    # (k6) THE TWO SILENT-RELEASE PATHS the first cut left open (#1191 review, secondary 1 and 2).
+    # Both ended in a rebase under a hold, at rc=0. The fail-closed rule was right; these two
+    # paths escaped it because each produced a MACHINE answer out of a FAILED read.
+    unreadable_issue = pull(16, "1" * 40, labels=("needs:user",))
+    unreadable_issue["body"] = "Closes #4343"
+    ui_api = FakeAPI([unreadable_issue], timelines={16: labelled_by(bot_login, "needs:user")},
+                     issues={4343: None})       # the issue read RAISES
+    ui_reb = FakeRebaser()
+    ui_res = ConflictResolver(ui_api, snapshot, claim, [repo], bot_login, True, 5, ui_reb)
+    with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+        ui_rc = ui_res.run()
+    check(
+        "[#1191] an UNREADABLE source issue is not permission: the PR reads machine-applied, the "
+        "one surface that could still hold it cannot be read, so the hold stands and reds the run",
+        (ui_reb.calls, ui_rc, ui_res.census[0]["skipped"].get("hold-ownership-unreadable"),
+         ui_res.census[0]["no_exit"]),
+        ([], 1, 1, 1),
+    )
+
+    class BrokenProbeAPI(FakeAPI):
+        def request(self, method, url, body=None):
+            if method == "GET" and "/collaborators/" in url:
+                raise ResolverError("collaborator probe unavailable (403)")
+            return super().request(method, url, body)
+
+    bp_api = BrokenProbeAPI([pull(17, "1" * 40, labels=("needs:user",))],
+                            timelines={17: labelled_by("jeswr", "needs:user")})
+    bp_reb = FakeRebaser()
+    bp_res = ConflictResolver(bp_api, snapshot, claim, [repo], bot_login, True, 5, bp_reb)
+    with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+        bp_rc = bp_res.run()
+    check(
+        "[#1191] a FAILED maintainer probe cannot answer `machine`: the hold here IS the "
+        "maintainer's, and a 403 on the collaborator endpoint must not rebase under them",
+        (bp_reb.calls, bp_rc, bp_res.census[0]["skipped"].get("hold-ownership-unreadable")),
+        ([], 1, 1),
     )
 
     # (k4) THE MACHINE EXIT IS REAL, AND IT IS CAUSE-GATED. A relabelled hold with no exit is
