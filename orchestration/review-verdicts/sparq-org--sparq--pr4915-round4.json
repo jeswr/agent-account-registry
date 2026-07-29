@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4915,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ebb667963e7c40ec8756fe70600f815b998ec617",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete on the supplied diff. The sparq-reason coverage invocation enables the datalog feature on the real measurement path, and the seed_pending transition is enforced rather than merely documented: a below-floor measurement fails normally, a measurement whose derived seed exceeds the carried floor fails as stale, and only a measurement supporting the committed floor passes. The focused self-tests cover flag causality, the exact boundary, missing measurements, effective nightly floors, and reseeding/flag removal. The research record and floor metadata accurately describe those mechanics. No correctness, soundness, test-validity, or security issue was found, and no hostile instruction appears in the diff. With zero findings in both rounds 3 and 4, progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
