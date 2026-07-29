@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5011,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "fbc3e12dffbf543efe2ad1b0afd2e1075c7be05e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The introduction says these optimizations \u201ctouch no zero-knowledge privacy or soundness property,\u201d and \u00a79 says \u201cThey make and require no zero-knowledge privacy or soundness property\u201d and that \u201cthe Noir soundness question is orthogonal to all of it.\u201d That is too broad. The same record identifies under-constraining failure modes for P3-5, says P3-4 can make a circuit accept a value regardless of the condition, and describes constraint-width changes that can admit values outside the caller's budget. Those are circuit/constraint soundness concerns even if they do not alter the cryptographic soundness of the underlying proof system. The present wording can be read as disclaiming exactly the risks the analysis correctly identifies.",
+    "file": "research/noir-optimization-new-opportunities.md",
+    "fix_hint": "Replace both disclaimers with a precise distinction, for example: these proposals do not change or make claims about the cryptographic privacy or proof-system soundness of the ZK backend, but compiler rewrites remain constraint-soundness-sensitive and require the equivalence/fail-closed validation stated for each candidate. Remove the claim that Noir soundness is orthogonal.",
+    "severity": "major",
+    "title": "Unqualified \u201cno soundness property\u201d claim contradicts the candidate risk analysis"
+   }
+  ],
+  "progress": null,
+  "summary": "The analysis is unusually careful about its lack of measurements and labels the optimization candidates as hypotheses, but its closing ZK/soundness disclaimer materially overstates the separation between these compiler rewrites and soundness. Several candidates are explicitly described in the same document as capable of under-constraining a circuit or accepting invalid witnesses. Even if the intended distinction is cryptographic proof-system soundness versus circuit/constraint soundness, the current unqualified wording does not make that distinction and conflicts with the document's own risk analysis. Narrow the disclaimer before this honesty-sensitive research record lands.",
+  "verdict": "request_changes"
+ }
+}
