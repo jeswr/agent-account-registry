@@ -2302,11 +2302,13 @@ def _deliver_alerts(actions, maintainer, fallback_open=frozenset()):
     on the public registry with the ambient token (issue #175). `fallback_open` is the set of
     (condition, provider) markers currently OPEN on the fallback route: the firing retry can
     CREATE an alert there, so a RECOVERY whose marker was seen on the fallback is delivered on
-    BOTH routes and counts as delivered only when each route it targets confirms (review #340).
-    Beyond that explicit binding, recoveries never fall back cross-repo — "no open issue" on a
-    repository whose marker was never seen is a no-op that cannot confirm a close (review round
-    2). Returns the actions still undelivered (empty == all delivered) so the caller can exit
-    nonzero — an unusable alert token must fail the run, never silently drop the alert."""
+    BOTH routes and counts as delivered only when each route it targets confirms (review #340),
+    and a STILL-FIRING action whose marker is open there has its fallback copy closed as superseded
+    once the primary copy is confirmed (issue #344). Beyond that explicit binding, recoveries never
+    fall back cross-repo — "no open issue" on a repository whose marker was never seen is a no-op
+    that cannot confirm a close (review round 2). Returns the actions still undelivered (empty ==
+    all delivered) so the caller can exit nonzero — an unusable alert token must fail the run,
+    never silently drop the alert."""
     repo, token = _alert_target()
     fb_repo, fb_token = _registry_fallback()
     fb_distinct = (repo, token) != (fb_repo, fb_token) and bool(fb_token)
@@ -2332,6 +2334,8 @@ def _deliver_alerts(actions, maintainer, fallback_open=frozenset()):
     undelivered = []
     for action in actions:
         delivered = _upsert_alert(action, repo, token, maintainer, redact=primary_redact)
+        fb_marker_open = (fb_distinct
+                          and (action["condition"], action["provider"]) in fallback_open)
         if action["fire"]:
             # Primary failed while FIRING: retry on the registry with the ambient token. Never
             # re-run the identical route (no value). The registry retry is PUBLIC -> redacted.
@@ -2339,7 +2343,15 @@ def _deliver_alerts(actions, maintainer, fallback_open=frozenset()):
                 print(f"::warning::model-health: {action['condition']}/{action['provider']} alert "
                       "delivery failed on the private route — retrying on the registry")
                 delivered = _upsert_alert(action, fb_repo, fb_token, maintainer, redact=True)
-        elif fb_distinct and (action["condition"], action["provider"]) in fallback_open:
+            elif fb_marker_open:
+                # Issue #344: the primary was transiently unusable, the #175 retry opened the alert
+                # on the fallback, and the primary has since RECOVERED — the branch above did not
+                # run, so this tick's primary copy is CONFIRMED and the fallback copy is now a
+                # second, untended open issue for one firing condition that only the eventual
+                # recovery would close. Reconcile it away, and require the reconciliation to confirm
+                # (a duplicate that cannot be closed is retried next tick, not silently left open).
+                delivered = _supersede_fallback_alert(action, fb_repo, fb_token)
+        elif fb_marker_open:
             # The marker was SEEN open on the fallback repo (a prior firing retry created it):
             # close it there too, and require BOTH routes to confirm — a steady no-op on the
             # primary says nothing about the issue that lives on the fallback (review #340). The
@@ -2483,6 +2495,56 @@ def _upsert_alert(action, repo, token, maintainer, redact=False):
               "(will retry next tick without commenting)")
         return False
     # Steady no-alert with no open issue: nothing to deliver.
+    return True
+
+
+def _supersede_fallback_alert(action, repo, token):
+    """Close the FALLBACK copy of a STILL-FIRING alert whose canonical copy the primary route has
+    just confirmed (issue #344), so one condition never shows two open issues.
+
+    The #175 firing retry CREATES the alert on the public fallback while the primary route is
+    unusable. Once the primary recovers, every later firing tick creates/refreshes the primary copy
+    while the fallback copy sits open and untended until the eventual recovery (#340) closes both.
+    Refreshing it there instead would buy nothing: the public body is a pure function of
+    (condition, provider, maintainer) — render_body(redact=True) suppresses every varying field —
+    so a "refresh" rewrites identical text and still leaves two open copies. The duplicate is
+    therefore CLOSED as superseded, with a comment that says exactly that and never claims
+    recovery; if the primary route fails again, _upsert_alert's flap path REOPENS this same issue.
+
+    CALLED ONLY WITH THE PRIMARY DELIVERY CONFIRMED (the failed-primary case takes the #175 retry
+    branch instead): closing the fallback copy while no primary copy is known to exist would leave
+    a firing condition with NO open alert anywhere.
+
+    Returns True iff the desired state is confirmed — the close landed, or nothing was open there
+    (already reconciled). FAIL-CLOSED like every other route write: an unreadable tracker or a
+    failed close returns False, so the caller reports the action undelivered and the run exits
+    nonzero, and the next tick retries rather than leaving the duplicate open unnoticed."""
+    marker = _marker(action["condition"], action["provider"])
+    try:
+        num = _find_marker_issue(repo, token, marker, "open")
+    except HealthError as exc:
+        print(f"::warning::model-health: cannot read the {action['condition']} alert tracker on "
+              f"the fallback route ({exc}) — duplicate left open (will retry next tick)")
+        return False
+    if num is None:
+        # Nothing open on the fallback (already superseded, or closed between the enumeration and
+        # now): the desired one-open-copy state already holds.
+        return True
+    if _gh(["issue", "close", str(num), "-R", repo], token).returncode != 0:
+        print(f"::warning::model-health: closing the superseded duplicate {action['condition']} "
+              "alert on the registry FAILED (will retry next tick without commenting)")
+        return False
+    # Comment only after a CONFIRMED close (same discipline as the recovery path) — and never with
+    # the recovery wording: this condition is STILL FIRING, it is only tracked elsewhere now. The
+    # text carries no count, reset, handle or repository name, so it is safe on the public route.
+    _gh(["issue", "comment", str(num), "-R", repo, "--body",
+         "↪️ **Superseded — not recovered.** This alert was filed here because the primary alert "
+         "route was unusable when it fired. The condition is still firing and is tracked on the "
+         "primary route again, so this duplicate copy is auto-closed to leave exactly one open "
+         "alert. It reopens here automatically if the primary route becomes unusable again."],
+        token)
+    print(f"model-health: {action['condition']}/{action['provider']} is tracked on the primary "
+          "route again — closed the superseded duplicate on the registry")
     return True
 
 
@@ -5214,10 +5276,16 @@ def _test_fallback_orphan(chk):
 
     Issue #292 pins the OTHER half of that conjunction, which nothing here discriminated: with the
     marker open on BOTH routes, a CONFIRMED fallback close must not mask a FAILED primary one.
-    Dropping the `and delivered` in _deliver_alerts survived the whole suite until phase 3."""
+    Dropping the `and delivered` in _deliver_alerts survived the whole suite until phase 3.
+
+    Phase 5 (issue #344) pins the FIRING half: once the primary route recovers, a still-firing
+    condition must not leave its fallback copy open alongside the refreshed primary one. It runs
+    through _cmd_decide, so dropping `fallback_open` at the delivery call site — the only place the
+    fallback's markers are enumerated — goes red too."""
     import argparse as _ap
     import types
     global _gh, GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune, read_ledger
+    global classify_records
     real_gh = _gh
     real = (GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune, read_ledger)
     saved = {k: os.environ.get(k) for k in
@@ -5227,6 +5295,8 @@ def _test_fallback_orphan(chk):
     seq = {"n": 100}
     bad_tokens = {"priv"}          # phase 1: the private token is unusable
     fail_close = {"repos": set()}  # repos whose `issue close` fails, PER ROUTE (#292)
+    fail_list = {"repos": set()}   # repos whose `issue list` fails (unreadable tracker, #344)
+    comments = {priv_repo: [], reg_repo: []}  # posted comment bodies, per route (#344)
 
     def state_gh(args, token, capture=False):
         repo = args[args.index("-R") + 1] if "-R" in args else None
@@ -5241,6 +5311,8 @@ def _test_fallback_orphan(chk):
                                          stdout=json.dumps({"private": True}), stderr="")
         verb, issues = args[1], repos[repo]
         if verb == "list":
+            if repo in fail_list["repos"]:
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="")
             state = args[args.index("--state") + 1]
             out = [{"number": n, "body": i["body"]}
                    for n, i in sorted(issues.items()) if i["state"] == state]
@@ -5258,6 +5330,8 @@ def _test_fallback_orphan(chk):
             issues[num]["body"] = args[args.index("--body") + 1]
         elif verb == "reopen":
             issues[num]["state"] = "open"
+        elif verb == "comment":
+            comments[repo].append(args[args.index("--body") + 1])
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
     def reg_states():
@@ -5322,6 +5396,66 @@ def _test_fallback_orphan(chk):
         fail_close["repos"] = set()
         chk("fallback-orphan: the next tick closes the surviving private issue and exits 0",
             (_cmd_decide(ns), priv_states()), (0, ["closed"]))
+
+        # phase 5 (issue #344): the FIRING half of the same route binding. Both issues are closed
+        # again; force a firing classification and drive the transient-primary sequence through
+        # _cmd_decide, which is the only caller that enumerates the fallback's open markers.
+        real_classify = classify_records
+        classify_records = lambda records, fleet, now, open_alerts=(): [dict(fire)]
+        try:
+            # primary unusable -> the #175 retry REOPENS the fallback copy, nothing on the primary.
+            bad_tokens.add("priv")
+            chk("#344: the firing retry reopens the fallback copy while the primary is unusable",
+                (_cmd_decide(ns), reg_states(), priv_states()), (0, ["open"], ["closed"]))
+            # The primary RECOVERS while the condition keeps firing. Red direction first: a
+            # supersede that cannot close fails the run and leaves the duplicate open for the next
+            # tick, rather than certifying a pair of open copies green.
+            bad_tokens.clear()
+            fail_close["repos"] = {reg_repo}
+            chk("#344: a FAILED fallback supersede is undelivered and the duplicate stays open",
+                (_cmd_decide(ns), reg_states(), priv_states()), (1, ["open"], ["open"]))
+            fail_close["repos"] = set()
+            mark = len(comments[reg_repo])
+            chk("#344: the still-firing fallback duplicate is CLOSED once the primary confirms",
+                (_cmd_decide(ns), reg_states(), priv_states()), (0, ["closed"], ["open"]))
+            # ...and that close is explained as a supersede, never as a recovery: the condition is
+            # still firing, so the recovery wording would post a false all-clear on a public repo.
+            posted = comments[reg_repo][mark:]
+            chk("#344: the supersede comment says superseded + still firing, never 'Recovered'",
+                [("superseded" in c.lower() and "still firing" in c.lower()
+                  and "Recovered" not in c) for c in posted], [True])
+            # Idempotent: with the duplicate gone the fallback is left alone on later firing ticks
+            # (a repeated supersede would re-comment on a closed issue every tick).
+            mark = len(comments[reg_repo])
+            chk("#344: the reconciled duplicate is not re-closed or re-commented next tick",
+                (_cmd_decide(ns), reg_states(), len(comments[reg_repo]) - mark),
+                (0, ["closed"], 0))
+
+            # The two directions a decide-driven tick cannot reach: the fallback's markers are
+            # enumerated ONCE per tick, so the supersede always writes against a set that may
+            # already be stale. Drive them by handing _deliver_alerts the marker directly.
+            marker_key = (fire["condition"], fire["provider"])
+            # (i) the duplicate is already gone (closed between the enumeration and the write):
+            #     the one-open-copy state holds, so the firing action stays DELIVERED and nothing
+            #     is commented onto the closed issue.
+            mark = len(comments[reg_repo])
+            chk("#344: a fallback marker no longer open is a confirmed no-op, not a failure",
+                (_deliver_alerts([dict(fire)], "m", {marker_key}), reg_states(),
+                 len(comments[reg_repo]) - mark), ([], ["closed"], 0))
+            # (ii) fail-closed: an UNREADABLE fallback tracker is never 'already reconciled' — the
+            #      duplicate may well be open there, so the action is undelivered and retried.
+            fail_list["repos"] = {reg_repo}
+            chk("#344: an unreadable fallback tracker leaves the firing action undelivered",
+                len(_deliver_alerts([dict(fire)], "m", {marker_key})), 1)
+            fail_list["repos"] = set()
+        finally:
+            classify_records = real_classify
+        # What the supersede DELIVERS INTO: with the real classifier back and the records still
+        # aged out, the surviving primary copy earns its ordinary recovery and the superseded
+        # fallback copy is neither reopened nor re-closed.
+        chk("#344: after a supersede the recovery closes the primary copy and the fallback "
+            "duplicate stays closed",
+            (_cmd_decide(ns), priv_states(), reg_states()), (0, ["closed"], ["closed"]))
     finally:
         _gh = real_gh
         (GitHubAPI, _enabled_provider_accounts, annotate_provider_status,
