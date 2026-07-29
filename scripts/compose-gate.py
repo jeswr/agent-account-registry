@@ -95,6 +95,7 @@
 
 Usage:
   compose-gate.py --base-ref <branch> [--full] [--suite <manifest>]   # grade; exit 1 iff BROKEN
+                                                                      # or UNPROVABLE
   compose-gate.py --self-test
 """
 import argparse
@@ -204,6 +205,14 @@ def overlap_entries(enrolled, pr_paths, base_paths, prefix="scripts/"):
         if path.startswith(prefix):
             touched.add(path[len(prefix):])
     return sorted(entry for entry in (enrolled or []) if entry in touched)
+
+
+def select_entries(enrolled, pr_paths, base_paths, full=False):
+    """PURE: which enrolled entries will this run grade?
+
+    Split out so `--full` is a TESTED path rather than a documented one: an escape hatch nothing
+    exercises is an escape hatch nobody can rely on."""
+    return sorted(enrolled or []) if full else overlap_entries(enrolled, pr_paths, base_paths)
 
 
 def classify(graded_base, live_tip, merge_rc=None, conflicted=(), failures=(), entries=(),
@@ -422,8 +431,7 @@ def compose(base_ref, cwd, full=False, manifest=SUITE_MANIFEST, git=_git, run_su
                            check=False)[1].splitlines()
             base_paths = git(["diff", "--name-only", merge_base, live_tip], cwd,
                              check=False)[1].splitlines()
-            chosen = (sorted(enrolled) if full
-                      else overlap_entries(enrolled, pr_paths, base_paths))
+            chosen = select_entries(enrolled, pr_paths, base_paths, full)
             # ⚠️ An absent runner in the COMPOSED tree must not read as "the suite passed" — that is
             # the same usage-error-as-test-result confusion, in the direction that greens the gate.
             if chosen and not runner_available(tree):
@@ -711,6 +719,13 @@ def _self_test():
     chk("a path outside scripts/ selects nothing",
         overlap_entries(enrolled, ["data/README.md"], []), [])
     chk("an unenrolled script is not invented", overlap_entries(enrolled, ["scripts/nope.py"], []), [])
+    # `--full` is an escape hatch, so it is pinned rather than merely documented.
+    chk("--full selects EVERY enrolled entry regardless of what either side touched",
+        select_entries(enrolled, [], [], full=True), sorted(enrolled))
+    chk("...and without it the overlap still governs",
+        select_entries(enrolled, ["scripts/groom.py"], [], full=False), ["groom.py"])
+    chk("--full on an empty manifest still selects nothing (no invention)",
+        select_entries([], ["scripts/groom.py"], [], full=True), [])
     chk("a non-enrolled prefix collision is not selected",
         overlap_entries(enrolled, ["scripts/sub/dispatch-claim.py"], []), [])
 
