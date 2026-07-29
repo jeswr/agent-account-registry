@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5035,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "db2fefc31852553673bbdb744af75f53d5ce5888",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly replaces count-only query-result checks with result-form-specific, engine-independent value comparisons. SELECT preserves bag semantics, ORDER BY is compared modulo legal tie permutations, non-total LIMIT/OFFSET cases remain explicitly cardinality-only, projected headers are checked before classification, blank nodes use table/graph isomorphism, and ASK/graph results can no longer fall through the count path. The added mutation and end-to-end tests exercise the load-bearing paths rather than mocks, including same-cardinality wrong values, multiplicity, ordering ties, window totality from headers, header-only defects, blank-node relabelling, ASK booleans, and count-preserving CONSTRUCT corruption. The documented current generator restrictions keep the text-level form/order extraction and total-tiebreaker policy sound for the generated query surface.",
+  "verdict": "approve"
+ }
+}
