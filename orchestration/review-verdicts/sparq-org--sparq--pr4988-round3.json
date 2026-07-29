@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4988,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0f617d42fd1bd759156da089578dfbff3d6221b3",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`stub_with_timeout` creates `sparq-oracle-stub-<pid>-<counter>.py` directly in the shared temp directory using `fs::write`, then executes that path with Python. The symlink regression test similarly creates predictable `sparq-oracle-victim-<pid>.txt` with `fs::write`. Another local user can pre-create either path as a symlink: the test runner will overwrite the link target, and the stub case can additionally execute attacker-controlled contents if the target is replaced between writing and spawning. Thus the production fix moves the prior vulnerability out of `Scratch` but leaves the same unsafe pattern in code run by `cargo test`.",
+    "file": "crates/sparq-bench/src/oracle.rs",
+    "fix_hint": "Create stub scripts and the victim inside private `tempfile::TempDir` instances (owner-only), or use `NamedTempFile`/atomic `create_new(true)` handles and execute via the securely created path. Avoid all PID/counter-derived files directly under the shared temp directory. Keep the planted paths predictable only as inert symlinks used to challenge production `Scratch`; place the victim and executable stub in private temporary directories.",
+    "severity": "major",
+    "title": "Test helpers retain predictable shared-temp symlink vulnerabilities"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The production scratch-path vulnerability from round 2 is fixed with an owner-only tempfile directory, and the new test exercises that production invariant. However, the test infrastructure itself introduces the same predictable-path/symlink class in `stub_with_timeout` and in the symlink regression test's victim setup. A local user can pre-create those PID/counter-derived paths: the test then follows the link with `fs::write`, potentially overwriting a file writable by the test runner; for the Python stub path, this can also substitute attacker-controlled code that the test immediately executes. Because a new major security finding remains, changes are requested and progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
