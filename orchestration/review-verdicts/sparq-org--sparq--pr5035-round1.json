@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5035,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b827308fc62430a560a570a652a7fa6ba26455c4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`compare_select` builds `projected` with `bound_vars(&sparq, &oxi)`, i.e. only variables bound in the returned rows after LIMIT/OFFSET. A projected variable that distinguishes tied candidate rows may happen to be unbound in every surviving row, so it disappears from this set. The code can then treat an ORDER BY covering only the remaining variables as total and value-compare a window whose row choice is actually implementation-dependent. For example, candidate rows tied on `?a` can differ by projected `?o`; if the selected row(s) have `?o` unbound, `ORDER BY ?a LIMIT ...` is incorrectly considered total even though another conforming engine may select tied rows with a bound/different `?o`. The current test only uses returned rows where every distinguishing variable remains bound, so it does not exercise this case.",
+    "file": "crates/sparq-bench/src/fuzz.rs",
+    "fix_hint": "Determine coverage from the SELECT projection/header, not from bound pairs in the post-window result. Preserve each engine's result variables alongside its solutions (including projected-but-unbound variables), require compatible headers, and require the modeled sort key to cover their union before treating a window as deterministic. Add a regression with tied pre-window rows where a projected discriminator is unbound in the surviving row but bound/different in another tied candidate; it must yield `SkippedRowChoice`.",
+    "severity": "major",
+    "title": "Window totality is inferred from already-sliced bindings"
+   }
+  ],
+  "progress": null,
+  "summary": "The value-level wiring is substantially stronger and the mutation tests cover many important failure modes, but the LIMIT/OFFSET safety decision is unsound because it infers the projected-variable set from rows after the window has already been applied. This can classify a partial order as total and compare an implementation-dependent row choice as though it were determined.",
+  "verdict": "request_changes"
+ }
+}
