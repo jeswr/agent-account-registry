@@ -96,7 +96,11 @@
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Sweep</th><th>Result</th><th>Dispatched</th><th>Deferred</th></tr></thead>
+            <thead><tr><th>Sweep</th><th>Result</th><th>Dispatched</th><th>Deferred</th>
+              <!-- Issue #323: per-lane tick counts. p/l/d/e = planned / launched / deferred /
+                   errored, so a stalled review or fix lane — or a failed safety disarm, which
+                   consumes no lease and never shows up in "Dispatched" — is visible here. -->
+              <th title="Per lane: planned / launched / deferred / errored">Lanes</th></tr></thead>
             <tbody id="outcomes"></tbody>
           </table>
         </div>

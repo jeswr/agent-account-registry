@@ -1,5 +1,6 @@
 account-usage.py
 adjudicate-stuck.py
+auto-mint-provenance.py
 backfill-provenance.py
 broker-refresh.py
 chain_preference.py

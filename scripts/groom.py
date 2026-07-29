@@ -97,7 +97,19 @@ HOLDER = re.compile(
     r"(?P<repo>[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)"
     r"#(?P<issue>[1-9][0-9]*)@(?P<run>[^\r\n]+)"
 )
-WORKER_RUN_NAME = re.compile(r"worker claim=(?P<claim>[0-9a-f]{32}|self)")
+# WORKFLOW SEAM (#1130): this parses a string ANOTHER file renders — worker.yml's `run-name:`,
+# `worker <target_repo> claim=<id>`. The target segment was added for the throughput-metrics
+# collector (scripts/metrics.py reads the same shape) and this pattern did not follow, so
+# `.fullmatch` matched NO real worker run title: every claim read as uncorrelated, the walk in
+# _correlate_claim_runs never took its early return, and classify_lease lost the exact run
+# evidence it exists to use. The target segment is OPTIONAL because the walk pages back through
+# up to WORKER_RUN_PAGE_CEILING x 100 runs of history, which reaches runs named before that
+# change; the claim id is the correlation key either way. _self_test renders worker.yml's OWN
+# run-name and asserts this matches it, so the next run-name edit reds instead of silently
+# disabling the correlation.
+WORKER_RUN_NAME = re.compile(
+    r"worker (?:(?P<target>\S+) )?claim=(?P<claim>[0-9a-f]{32}|self)"
+)
 # Cross-provider review/fix repair leases (dispatch-claim prefixes `review:` / `fix:`) carry no
 # target-issue holder; they are TTL-managed by groom-leases. Groom must SKIP them, never
 # issue-map them, and never fail the whole sweep on their holder shape (live incident
@@ -3338,6 +3350,106 @@ def _self_test() -> int:
         "live",
     )
 
+    # ---- YAML seam: WORKER_RUN_NAME vs the title worker.yml actually renders (issue #1130) ----
+    # A regex over a string another file produces drifts silently the moment that file changes:
+    # `${{ inputs.target_repo }}` was added to worker.yml's run-name and this pattern did not
+    # follow, so the claim->run correlation matched nothing for months while the fixture-based
+    # checks below (which rendered their OWN title) stayed green. Render worker.yml's own
+    # `run-name:` and require a match. A missing/unparsable workflow raises — fail closed, never
+    # a skipped check.
+    _run_name_path = (
+        Path(__file__).resolve().parents[1] / ".github" / "workflows" / "worker.yml"
+    )
+    assert _run_name_path.is_file(), (
+        f"worker.yml not found for run-name sync check: {_run_name_path}"
+    )
+    _run_name_m = re.search(
+        r"(?m)^run-name:[ \t]*(?P<value>[^\r\n]+?)[ \t]*$",
+        _run_name_path.read_text(encoding="utf-8"),
+    )
+    assert _run_name_m, "worker.yml has no top-level run-name:"
+    # Sample renderings for the expressions worker.yml interpolates. An expression NOT in this
+    # table renders to a sentinel that fails every assertion below, so a new or renamed
+    # expression reds the seam rather than quietly rendering to nothing.
+    _WF_UNRENDERED = "<<unrendered-expression>>"
+    _WF_SAMPLE = {
+        "inputs.target_repo": "sparq-org/sparq",
+        "inputs.claim_id || 'self'": "e" * 32,
+    }
+    _rendered = re.sub(
+        r"\$\{\{\s*(.*?)\s*\}\}",
+        lambda m: _WF_SAMPLE.get(m.group(1), _WF_UNRENDERED),
+        _run_name_m.group("value"),
+    )
+    check(
+        "[#1130] every worker.yml run-name expression has a known rendering",
+        _WF_UNRENDERED in _rendered,
+        False,
+    )
+    check(
+        "[#1130] the render is not vacuous — every sample value reached the title",
+        sorted(v for v in _WF_SAMPLE.values() if v in _rendered),
+        sorted(_WF_SAMPLE.values()),
+    )
+
+    def _matched_claim(title: str) -> str | None:
+        # None-safe: a regression here must report a readable FAIL, not abort the whole suite.
+        match = WORKER_RUN_NAME.fullmatch(title)
+        return match.group("claim") if match else None
+
+    _seam = WORKER_RUN_NAME.fullmatch(_rendered)
+    check(
+        "[#1130] WORKER_RUN_NAME fullmatches worker.yml's OWN rendered run-name",
+        _seam is not None and _seam.group("claim") == "e" * 32,
+        True,
+    )
+    # Second anchor: display_title values measured off the live runs API (#1130). Independent of
+    # the render above, so a run-name edit that is mirrored into BOTH still has to face reality.
+    for _measured, _claim in (
+        ("worker jeswr/agent-account-registry claim=f45ca53d124d4127b9279a7998e3303d",
+         "f45ca53d124d4127b9279a7998e3303d"),
+        ("worker sparq-org/sparq claim=e84718f205574e3fa4a1724912625e64",
+         "e84718f205574e3fa4a1724912625e64"),
+    ):
+        _m = WORKER_RUN_NAME.fullmatch(_measured)
+        check(
+            f"[#1130] live worker run title correlates: {_measured}",
+            _m is not None and _m.group("claim") == _claim,
+            True,
+        )
+    check(
+        "MUTATION: the target-less pattern matches NO live worker title (the #1130 defect)",
+        re.compile(r"worker claim=(?P<claim>[0-9a-f]{32}|self)").fullmatch(
+            "worker sparq-org/sparq claim=" + "f" * 32),
+        None,
+    )
+    check(
+        "[#1130] a pre-change (target-less) history title still correlates",
+        _matched_claim("worker claim=" + "a" * 32),
+        "a" * 32,
+    )
+    check(
+        "a self-dispatch run is matched but carries no claim",
+        _matched_claim("worker sparq-org/sparq claim=self"),
+        "self",
+    )
+    # The widened pattern must still be a PARSE, not a wildcard: a malformed claim id, a trailing
+    # suffix, or another lane's run must never correlate to a lease.
+    for _reject in (
+        "worker sparq-org/sparq claim=not-a-claim-id",
+        "worker sparq-org/sparq claim=" + "A" * 32,          # hex is lower-case only
+        "worker sparq-org/sparq claim=" + "a" * 31,
+        "worker sparq-org/sparq claim=" + "a" * 32 + " [resume]",
+        "worker sparq-org/sparq owner/other claim=" + "a" * 32,
+        "review-fix review sparq-org/sparq claim=" + "a" * 32,
+        "not-worker sparq-org/sparq claim=" + "a" * 32,
+    ):
+        check(
+            f"a non-worker-claim title never correlates: {_reject}",
+            WORKER_RUN_NAME.fullmatch(_reject),
+            None,
+        )
+
     # ---- _correlate_claim_runs: page the worker-run history, never just newest-100 (issue #173) ----
     # A dispatcher-held live lease whose worker run has aged off page 1 must still be correlated;
     # reading only the newest page would classify it dead on its timeout and reset a live worker.
@@ -3345,8 +3457,11 @@ def _self_test() -> int:
         return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
 
     def _worker_run(claim: str, created: int, status: str = "in_progress") -> dict[str, Any]:
+        # The REAL title shape worker.yml renders (#1130) — the target repo sits between the lane
+        # name and `claim=`. This fixture carried the target-less shape, which is why every
+        # correlation check below stayed green while the live correlation matched nothing.
         return {"status": status, "created_at": _iso(created),
-                "display_title": f"worker claim={claim}"}
+                "display_title": f"worker sparq-org/sparq claim={claim}"}
 
     # Fillers newer than the live lease's issuance, filling page 1 exactly (100) so the walk must
     # continue; none of them is the target claim.
