@@ -263,13 +263,38 @@ function renderRepositoryAgents(activity, activeAgents) {
   table.hidden = false;
 }
 
+// Issue #323: the per-lane decomposition of one dispatch tick (worker/review/fix/disarm ×
+// planned/launched/deferred/error), as emitted by dispatch-claim and carried through
+// dashboard-gen's `_dispatch_lane_rows`. All four counts render UNCONDITIONALLY, including zeroes:
+// a lane whose numbers vanish when they go quiet is exactly the row an operator interrogates after
+// a stall. The red/amber tone is `lane.state`, decided once in the generator — this function
+// renders the verdict and never recomputes it, so there is no second copy of the stall rule here.
+function laneCell(lanes) {
+  const cell = node("td", "lane-cell");
+  if (!Array.isArray(lanes) || !lanes.length) {
+    cell.textContent = "—";
+    return cell;
+  }
+  for (const lane of lanes) {
+    const state = LANE_STATES.has(lane.state) ? lane.state : "unknown";
+    const chip = node("span", "lane-light");
+    chip.append(node("span", `lane-dot ${state}`));
+    chip.append(node("strong", "", String(lane.lane)));
+    chip.append(document.createTextNode(
+      ` ${num(lane.planned, 0)}p ${num(lane.launched, 0)}l ` +
+      `${num(lane.deferred, 0)}d ${num(lane.error, 0)}e`));
+    cell.append(chip);
+  }
+  return cell;
+}
+
 function renderOutcomes(outcomes) {
   const body = byId("outcomes");
   body.replaceChildren();
   if (!outcomes.length) {
     const row = node("tr");
     const cell = node("td", "", "No dispatch history is available.");
-    cell.colSpan = 4;
+    cell.colSpan = 5;
     row.append(cell);
     body.append(row);
     return;
@@ -283,6 +308,7 @@ function renderOutcomes(outcomes) {
       node("td", "", `${relative(outcome.at)} · ${utc(outcome.at)}`), resultCell,
       node("td", "", outcome.dispatched === null ? "—" : String(outcome.dispatched)),
       node("td", "", outcome.deferred === null ? "—" : String(outcome.deferred)),
+      laneCell(outcome.lanes),
     );
     body.append(row);
   }
