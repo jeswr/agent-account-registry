@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5052,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d8a3123959365b69c74a2cc25f60f54081842358",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly keeps Solid support opt-in, negotiates before authorization lookup, routes both N-Triples and Turtle through the same gated triple extraction, and uses the oxttl serializer rather than relabeling N-Triples. The tests cover the real tool path, syntax round-tripping, default compatibility, unsupported representations, non-disclosure, and refusal of binary writes. The public tool documentation and agent skill are updated consistently. No correctness, soundness, security, or vacuity defect requiring changes was found. Targeted tests could not be executed in this checkout because cargo is unavailable, so this verdict is based on diff and source inspection.",
+  "verdict": "approve"
+ }
+}
