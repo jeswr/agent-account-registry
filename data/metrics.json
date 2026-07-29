@@ -1,9 +1,9 @@
 {
-  "generated_at": "2026-07-29T22:00:30Z",
+  "generated_at": "2026-07-29T22:02:45Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 1783,
+      "issues_open": 1784,
       "issues_ready": 364,
       "issues_closed_1h": 2,
       "issues_closed_24h": 49,
@@ -16,7 +16,7 @@
       "review_changes_backlog": 13,
       "needs_user_parked": 29,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 7,
+      "review_lane_runs_1h": 8,
       "worker_attempts_1h": 2,
       "worker_success_rate_1h": 1.0,
       "pr_open_rate": 2.0,
