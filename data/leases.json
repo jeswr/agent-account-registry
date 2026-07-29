@@ -42,16 +42,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "6ff73b9b460b4c20a64b7506e86bf629",
-   "holder": "review:sparq-org/sparq#5089@dispatch-30454089416.1",
-   "package": "sparq-reason",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785330510,
-   "expires_at": 1785334710
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "02004083fef747fca3bdec76c8377dc8",
    "holder": "review:jeswr/agent-account-registry#1093@dispatch-30454089416.1",
    "package": "workflows",
