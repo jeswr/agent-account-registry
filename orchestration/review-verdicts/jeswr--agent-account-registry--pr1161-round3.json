@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1161,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "24d2c3c72afb0e757798802bdb997bbb6042090d",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 resolves the prior major finding. Both live workflows now run an unconditional credential purge after the rotation write-back and before either target-controlled rustup or cargo gate step. The purge removes the isolated HOME and all host-side `.credential-*`/selection artifacts, re-scans for residue, and exits nonzero if removal is incomplete; because the later target steps use ordinary `if:` conditions, that failure prevents them from running. The tests are materially non-vacuous: they demonstrate discovery through RUNNER_TEMP before purge and absence afterward, cover both residue regions, exercise moved-late and deleted workflow mutants, pin `always()` and terminal failure behavior, and prove an unremovable readable credential fails closed. Step-output routing also avoids restoring the former job-wide pointers while retaining the write-back tamper baseline. No reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
