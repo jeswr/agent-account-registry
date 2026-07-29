@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5058,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8b53877620295e2974bab58f1fd96d6c963a7fe2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The diff only corrects and narrows documentation claims. The store comment now accurately describes the existing owned merge path as copying and merge-interleaving rather than re-sorting. DataChunk round-trip wording correctly distinguishes content/order preservation from Rust type-level equality for generic AsRef<[Id]> inputs. The select_decoded documentation no longer falsely calls the entire selection loop branchless, while retaining the supported claim that its contiguous f64 comparison is auto-vectorisable. The public skill is updated consistently, including a precise distinction between structured query-result equality and byte equality for serialised entry points. No executable behavior, security boundary, feature gating, or test logic changes, and no hostile instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
