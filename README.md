@@ -39,10 +39,23 @@ tier:
   weekly_limit: "..."        # human note of the plan's weekly cap
   five_hour_limit: "..."     # the rolling 5h window cap
 reset_schedule: "..."        # when the windows reset (per-account; they differ)
-max_concurrent_workers: 1    # how many workers may run on this account at once
+max_concurrent_workers: 4    # how many workers may run on this account at once
+                             # PER-PROVIDER default: openai 12, anthropic 4 — see below
 secret_ref: ACCT_<HANDLE>_TOKEN   # the NAME of the GitHub secret holding this account's token
 notes: "..."
 ```
+
+**`max_concurrent_workers` is per-provider — never hand-write `1`.** The maintainer-stated plan
+parallelism is **openai 12, anthropic 4** ([#278](https://github.com/jeswr/agent-account-registry/issues/278));
+the `set-up-account` broker derives it from the provider alone, so a brokered account of either kind
+already lands at its provider's value. The field is a **per-account operator restriction, not a
+safety floor** — global capacity is bounded by the lease ledger and by `policy/repos.toml`'s
+`max_concurrent`, so narrowing one account only narrows that account. Minting `1` by hand reproduces
+the fleet-capacity defect #278 fixed: `choose_account`'s cap gate then refuses every further claim
+against an account that has spare capacity. Note the two different fallbacks in
+`select-and-claim._parse_account`: an **absent** key defaults to **4**, but a **present, non-numeric**
+value (including an empty one) silently becomes **1** rather than raising — so either omit the key or
+give it a plain integer.
 
 The **token value** for each account is stored ONLY as a secret in this repo's
 **`dispatch-secrets` environment**, named by `secret_ref` — never at repository/organization
@@ -457,7 +470,7 @@ harness: claude
 credential_format: claude-oauth-token
 email: "<the account login email — a setup-token CANNOT introspect it (403 on /api/oauth/profile); fill from the account you logged in as>"
 models: [opus5, fable, opus, sonnet, haiku]
-max_concurrent_workers: 1
+max_concurrent_workers: 4
 secret_ref: ACCT05_TOKEN
 notes: "claude setup-token (long-lived, non-rotating). [your-marker]"'
 printf '%s\n' "$body" | python3 scripts/select-and-claim.py \
@@ -466,7 +479,13 @@ gh issue create -R jeswr/agent-account-registry --title "acct05" --label account
 ```
 For an **OpenAI** account: `provider: openai`, `harness: codex`, `credential_format: codex-auth-json`,
 `models: [sol, luna, terra]` (the FULL codex alias set — `select-and-claim.py` gates on exact alias
-membership, so a `terra`-only record would defer every sol/luna claim), `secret_ref: ACCTNN_TOKEN`.
+membership, so a `terra`-only record would defer every sol/luna claim), `secret_ref: ACCTNN_TOKEN`,
+`max_concurrent_workers: 12`.
+
+The `4` / `12` above are the **per-provider defaults the broker mints** (#278) — a hand-created
+account must carry its provider's value or it lands at a cap the brokered account beside it does not
+have. Lower it deliberately only to restrict *this one* account; it is not a safety floor (see
+[One issue per account](#one-issue-per-account)).
 
 ### Step 4 — label the issue (REQUIRED — no label ⇒ not `available` ⇒ never selected)
 
