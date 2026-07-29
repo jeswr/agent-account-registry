@@ -18,6 +18,7 @@ gh_retry.py
 grant-account.py
 grant-scope-audit.py
 groom-alert.py
+groom-mint-alert.py
 groom.py
 latch-watchdog.py
 lease_schema.py
