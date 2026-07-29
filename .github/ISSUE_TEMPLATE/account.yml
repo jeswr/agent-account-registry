@@ -7,7 +7,18 @@ body:
     id: spec
     attributes:
       label: Account spec (YAML)
-      description: No secrets here — the token lives only in the secret named by secret_ref.
+      description: >-
+        No secrets here — the token lives only in the secret named by secret_ref.
+        The prefill below is an ANTHROPIC account; for an OPENAI one replace its first four lines
+        with `provider: openai`, `harness: codex`, `models: [sol, luna, terra]` (the FULL codex
+        alias set — a partial list defers every claim for the missing aliases),
+        `credential_format: codex-auth-json`, and set `max_concurrent_workers: 12`.
+        `max_concurrent_workers` is PER-PROVIDER — anthropic 4, openai 12 (#278) — and these are
+        the same values the set-up-account broker mints. Never hand-write 1: it is not a safety
+        floor (global capacity is bounded by the lease ledger and policy/repos.toml's
+        max_concurrent), it only refuses further claims against an account that still has spare
+        capacity. Give the field a plain integer with NO trailing comment — a non-numeric value
+        parses silently as 1.
       value: |
         provider: anthropic
         harness: claude
@@ -17,7 +28,7 @@ body:
           weekly_limit: ""
           five_hour_limit: ""
         reset_schedule: ""
-        max_concurrent_workers: 1
+        max_concurrent_workers: 4
         secret_ref: ACCT_HANDLE_TOKEN
         notes: ""
     validations:

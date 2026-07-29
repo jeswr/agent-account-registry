@@ -59,9 +59,20 @@ golden fixture; collector authors: build against it, not this prose). Root shape
 group optional. Validation is FAIL-CLOSED: an absent file hides the panel; a present document
 with the wrong `schema` fails the dashboard build LOUD; malformed rows inside a well-formed
 document are dropped (the model-health tolerance) — EXCEPT privacy violations, which are
-always fatal (decision 22): a `flow.leases[].label` that is not the 8-hex HMAC-salted account
-label raises, trigger `evidence` links are pinned to `https://github.com/`, and the existing
+always fatal (decision 22): a `flow.leases[].label` that is not the salted account fingerprint
+raises, trigger `evidence` links are pinned to `https://github.com/`, and the existing
 `_assert_private` raw-handle sweep runs over the finished document.
+
+**The label is the CANONICAL account fingerprint — `sha256(handle + ":" + salt)[:16]`, 16 lowercase
+hex (locked decision 22a; issue #375).** It is the same value `model-health.account_hash` /
+`worker-pr.account_hash` produce and the same one `data/leases.json`, the provenance records and
+the model-health ledger already carry, so a collector reuses that helper rather than deriving a
+second identity format. Until issue #375 this seam validated an 8-hex shape no producer in this
+repo emits, which meant the canonical fingerprint every other surface uses would have failed the
+dashboard build while a truncated half of it passed as "salted". Tightening it was safe in this
+order only because the collector has not landed: there is no producer to break, and the shape it
+must be built against is now the canonical one. An 8-hex label is now FATAL, not a second accepted
+format.
 
 **`flow.leases` rows are DEPRECATED — send `flow.lease_utilization_1h` instead (issues #374,
 #841).** Issue #374 stopped the per-account rows being PUBLISHED: a `{label, provider,

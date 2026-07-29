@@ -1,4 +1,5 @@
 account-usage.py
+auto-mint-provenance.py
 backfill-provenance.py
 broker-refresh.py
 chain_preference.py
@@ -12,10 +13,12 @@ dispatch-plan.py
 dispatch-secrets-guard.py
 dispatch-stall-alert.py
 dispatch-tick-floor.py
+gh_403.py
 gh_retry.py
 grant-account.py
 grant-scope-audit.py
 groom-alert.py
+groom-mint-alert.py
 groom.py
 latch-watchdog.py
 lease_schema.py
@@ -32,6 +35,7 @@ pat-validity.py
 plan-alert.py
 plan-snapshot.py
 policy-resolve.py
+pr-body-ref.py
 ready-issues.py
 reconcile-conflict-park.py
 reconcile-park-misescalation.py
@@ -39,6 +43,7 @@ regate-sweep.py
 resolve-conflicts.py
 retriage.py
 route-resolve.py
+run_name_grammar.py
 select-and-claim.py
 triage-stock-alert.py
 triage.py

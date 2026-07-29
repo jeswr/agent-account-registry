@@ -328,7 +328,7 @@ FIX_TTL = _lease_ttl("fix")         # 10+10+60+10+15 = 105m (was 60m — exactly
 #
 # The numbers carry review-fix.yml's own stated rationale: the static codex slot count for each
 # lane (codex being usage-exempt is what makes an unprobed static bound sound for it at all). The
-# live account records that back them are in the PRIVATE registry, so this file cannot re-derive
+# live account records that back them are in the registry, so this file cannot re-derive
 # them — which is exactly why they need pinning rather than re-computation. They are NOT
 # interchangeable with the dispatcher's model: never reintroduce them as `max_holder_concurrent`
 # on the dispatcher's claim — `_self_test` asserts that stays None, and setting it would revert
@@ -1671,6 +1671,110 @@ def _pull_inactivity_decision(pull, status=_NO_PR_DETAIL):
     return True, "detail"
 
 
+# ---------------------------------------------------------------------------------------------
+# NON-RESERVING (CROSS-CUTTING) PARTITIONS — THE ONE PLACE THIS IS DECLARED.
+#
+# [OPUS-5 2026-07-28] The OCCUPANCY half of sparq-org/sparq#4928, on THIS repository's leg
+# (tracking issue sparq-org/sparq#4929). These partitions still ROUTE work and are still valid
+# candidate keys — `item_partition` is untouched, so a plan row declaring `area:ci` is derived,
+# leased, routed and counted exactly as before. They simply do not OCCUPY: an open worker PR
+# holding one of them no longer defers a plan row that declares it.
+#
+# WHY THIS EXISTS SEPARATELY FROM #4928. There are TWO occupancy legs and #4928 moves only the
+# first. sparq's `_reserving_packages` decides which rows PLAN OFFERS; `busy_packages_of_pulls`
+# below decides which of those CLAIM will actually launch, at the assemble filter AND again at the
+# claim-time live re-check. MEASURED through the production predicate, on a snapshot that
+# reproduces dispatch run 30405421829's `claim-census` lines BYTE-IDENTICALLY: with #4928 applied
+# PLAN's sparq frontier goes 4 -> 6, and this leg then re-deferred BOTH added rows —
+# `deferred=2 reason.crate-conflict=2 area.ci=1 area.docs=1`. #4928 alone is necessary and not
+# sufficient; without this the two extra rows are planned and never launch.
+#
+# THE MEASURED BASIS, re-derived here rather than inherited from #4928's prose — over the exact
+# population THIS leg reads (the BUSY occupancy rows it computes, i.e. open same-repo worker PRs
+# that are not provably-inert parked drafts), counting holder PAIRS that share >= 1 changed file:
+#
+#     reserved area   busy holders   pairs   sharing >=1 file
+#     ci                    6          15        0   (  0.0%)  -> exempt (and the MOST-held key)
+#     docs                  5          10        0   (  0.0%)  -> exempt (second most-held)
+#     deps                  1           0        -            -> NOT exempt
+#
+# and over the wider `area:`-LABELLED open-PR population on the same snapshot, which is the
+# population #4928 measured and is the one that bounds the risk as PRs un-park:
+#
+#     area:ci      30 holders, 435 pairs,  40 colliding (  9.2%)  -> exempt
+#     area:docs    36 holders, 630 pairs,  30 colliding (  4.8%)  -> exempt
+#     area:deps     7 holders,  21 pairs,  21 colliding (100.0%)  -> NOT exempt, every pair
+#                                                                    collides on `Cargo.lock`
+#     crate areas                                       ( 57.1%)  -> NOT exempt
+#                                        (sparq research/crate-region-parallelism.md §4)
+#
+# EVERY PAIR COUNT IS nCr OVER THE HOLDERS, with no exclusions. The first version of this table
+# read `ci` 10 and 406 pairs, because the counter dropped any PR whose changed-file list came back
+# EMPTY — conflating a failed read with a genuinely empty PR. sparq#4182 is genuinely empty
+# (`changed_files: 0`), it intersects nothing, and it is a real non-colliding participant: it
+# belongs in the denominator. Restoring it gives 15 and 435, which is exactly C(6,2) and C(30,2).
+# A read that FAILS would still be excluded, and would be named.
+#
+# HONESTY NOTE ON THOSE NUMBERS: #4928's table reads 5% for `ci` and 3% for `docs`; the
+# re-measurement above reads 9.2% and 4.8% on a later board. The numbers are NOT identical and the
+# larger pair is the one recorded here. The CONCLUSION is unchanged and is an order-of-magnitude
+# argument, not a threshold one: `ci`/`docs` collide at single-digit percent while `deps` collides
+# at 100% and crate areas at 57.1%.
+#
+# DIRECTION-SAFETY, stated precisely. `busy_packages_of_pulls` only ever UNIONS areas onto a PR's
+# own labels, and this narrowing is applied at the END of that union — AFTER every fail-closed
+# branch has run. So a PR whose blast radius is unknown still reserves `__global__` (which can
+# never be exempted, see `non_reserving_partitions`), and the exemption can only ever REMOVE atoms
+# from the busy set. It cannot promote a narrow reservation to a wide one.
+#
+# FAIL-SAFE DIRECTION: `non_reserving_partitions()` validates this declaration and returns the
+# EMPTY set — today's fully-reserving behaviour — for anything malformed, INCLUDING a set that is
+# only PARTLY malformed. Never the reverse.
+NON_RESERVING_PARTITIONS = frozenset({"ci", "docs"})
+
+
+def non_reserving_partitions(declared=None):
+    """`NON_RESERVING_PARTITIONS`, VALIDATED. Anything malformed degrades to RESERVING.
+
+    A wrong answer here is asymmetric: too SMALL a set costs dispatch width (today's behaviour,
+    which the fleet has been running for weeks), while too LARGE a set silently un-serialises real
+    work. So the WHOLE declaration is voided by a single bad entry rather than partially honoured
+    — a partial exemption is the shape where half the reviewers' attention has been spent proving
+    the safe half and the unsafe half rides along.
+
+    Each entry must be a single ATOM of the partition algebra, decided by `package_areas` itself
+    rather than by a second copy of its parsing rules: an entry is admissible iff it names exactly
+    itself. That closes `__global__` (which `package_areas` reads as the UNIVERSAL set, i.e. None)
+    and every composite/degenerate key BY CONSTRUCTION — exempting the universal partition would
+    be "fail toward exempt everything", which is precisely the outcome this must not have."""
+    raw = NON_RESERVING_PARTITIONS if declared is None else declared
+    if isinstance(raw, str) or not isinstance(raw, (set, frozenset, list, tuple)):
+        return frozenset()
+    names = set()
+    for name in raw:
+        if not isinstance(name, str):
+            return frozenset()
+        atom = name.strip()
+        # `package_areas` is THE reader of what a key names. `frozenset({atom})` is the only
+        # answer an exemptible atom can give: `None` (universal / unreadable / empty) and any
+        # multi-atom composite both fail it, so `__global__` can never enter this set.
+        if package_areas(atom) != frozenset({atom}):
+            return frozenset()
+        names.add(atom)
+    return frozenset(names)
+
+
+def reserving_areas(areas, exempt=None):
+    """The subset of an occupant's area set that actually RESERVES, as opposed to merely routing.
+
+    PURE, and a strict NARROWING of its input — the direction argument in
+    `NON_RESERVING_PARTITIONS` rests on that and on nothing else. `__global__` survives by
+    construction (it can never be a member of the validated exemption set), so there is no
+    special case here to delete: the guard lives at the one place that decides membership."""
+    exempt = non_reserving_partitions() if exempt is None else exempt
+    return frozenset(area for area in areas if area not in exempt)
+
+
 def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None,
                            parked_pr_labels=None, occupancy=None):
     """PURE busy-area union for the PLAN conflict partition (registry issue #27): every open
@@ -1709,9 +1813,12 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
     signal was the inversion.
 
     IT IS A NO-OP WHERE THAT EVIDENCE DOES NOT EXIST, without a per-target flag: a target with no
-    deriver produces no PR `area:` labels (MEASURED on this repository: 40 of 40 open PRs declare
-    none, ready-issues._pr_reserving_packages), so every unprovenanced PR there still takes
-    `__global__` exactly as before. The rule reads the target's own attestation instead of a
+    deriver produces no PR `area:` labels (MEASURED on this repository 2026-07-29: 40 of 41 open
+    PRs declare none, ready-issues._pr_reserving_packages — the single exception is a HAND-applied
+    `area:` label, not a derived one, so the "no deriver here" premise is intact; the figure was
+    40 of 40 when written), so every unprovenanced PR there still takes `__global__` as before.
+    The same 40-of-40 figure is quoted in `scripts/ready-issues.py` (x2), `scripts/dispatch-plan.py`
+    and `.github/workflows/dispatch.yml` and is stale there by the same one row. The rule reads the target's own attestation instead of a
     config switch that could drift from it.
 
     WHY THIS BRANCH. It invents a reservation the PLAN leg never made. PLAN runs the TARGET's
@@ -1845,6 +1952,32 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
                 occupancy.append(("parked-free", number, frozenset(areas), reason, inactive,
                                   cause))
             continue                      # provably inert human-parked PR — frees its crates
+        # [OPUS-5 2026-07-28] THE ONE APPLICATION POINT of the cross-cutting exemption, and it is
+        # deliberately HERE rather than at the two call sites. `filter_busy_area_items` (assemble)
+        # and `revalidate_items_against_live_pulls` (claim-time live re-check) BOTH derive their
+        # busy union from this function and from nothing else, so applying it once here covers
+        # both by construction — and the alternative, a copy at each call site, is exactly the
+        # "one-sided widening" this file's own doctrine (`item_partition`, `packages_conflict`)
+        # exists to prevent: a fix applied at assemble while the claim re-check still reserves is
+        # INERT, because the live re-check runs last and defers the row anyway. Both legs are
+        # pinned END-TO-END and INDEPENDENTLY in the self-test.
+        #
+        # AFTER every fail-closed branch above, never before, and the direction matters in exactly
+        # the opposite way to how an earlier draft of this comment stated it. Those branches decide
+        # on the UN-narrowed `areas`. A PR that declares only `area:ci` and has no admissible
+        # provenance record therefore takes the `elif areas and GLOBAL_PACKAGE not in areas` branch
+        # — `missing-provenance-narrowed`, its own labels bounding it — and, once narrowed here,
+        # reserves NOTHING. Narrowing FIRST would empty `areas` before that `elif` is evaluated,
+        # dropping the very same PR into the `else`: `missing-provenance`, reserving `__global__`,
+        # i.e. ONE cross-cutting PR stalling the entire fleet. That is a WIDENING dressed as a
+        # narrowing and the one way this change could fail open, which is why the ordering is
+        # pinned by an executed assertion (`[#4929] ... applied AFTER every fail-closed branch`)
+        # and by mutant M13 rather than by this paragraph.
+        #
+        # The occupancy ROW carries the narrowed set too, so `busy` stays exactly the union of the
+        # busy rows' packages — the invariant `partition_defer_attribution` reads when it says an
+        # unmatched reservation means the caller passed disagreeing inputs.
+        reserved = reserving_areas(areas)
         if isinstance(occupancy, list):
             # [registry #677] The 5th element is `inactive` — the SAME _pull_inactivity_decision
             # bit the parked-free carve-out above turns on, carried out to the caller instead of
@@ -1855,9 +1988,9 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
             # [registry #772] The 6th element is the reservation CAUSE (GLOBAL_RESERVATION_CAUSES).
             # Same mint-vs-adopt doctrine as the 5th: decided at the branch that made the
             # decision, carried out, never recomputed downstream.
-            occupancy.append(("busy", number, frozenset(areas),
+            occupancy.append(("busy", number, reserved,
                               reason if parked else "not-parked", inactive, cause))
-        busy |= areas
+        busy |= reserved
     return busy
 
 
@@ -1916,6 +2049,18 @@ def partition_defer_attribution(package, busy, occupancy):
     ticks — the attribution has to be a function of the board, not of the fetch."""
     if not busy:
         return None
+    def _reserves_something(packages):
+        """[OPUS-5 2026-07-28] An occupant that reserves NOTHING is not a blocker of anything.
+
+        Before the cross-cutting exemption every BUSY occupancy row held at least one atom (the
+        fail-closed branches guarantee `__global__` when nothing else is known), so the two
+        cross-cutting branches below could name the lowest-numbered busy row unconditionally.
+        A PR whose whole declared footprint is `ci`/`docs` now reserves the EMPTY set, and naming
+        it as the holder would print `held area X reserved by pr#N` for an N that holds no such
+        thing — the exact misattribution registry #758 exists to remove, reintroduced one branch
+        over. This is a strict no-op on any board with no exempt-only occupant, because every
+        busy row's packages are a subset of the `busy` union it was folded into."""
+        return bool(set(packages) & set(busy))
     def holder_of(predicate):
         """The lowest-numbered BUSY occupant satisfying `predicate`, with its park state and the
         packages it actually reserves."""
@@ -1953,7 +2098,7 @@ def partition_defer_attribution(package, busy, occupancy):
         # reserved on this board. `& busy` guards an occupancy row carrying a package the busy
         # union does not; `sorted(...)[0]` keeps it a deterministic function of the board rather
         # than of the fetch, exactly like the lowest-PR rule.
-        holder, state, packages = holder_of(lambda _packages: True)
+        holder, state, packages = holder_of(_reserves_something)
         held = sorted(set(packages) & set(busy)) or sorted(busy)
         return ("cross-cutting-item", held[0], holder, state)
     # A genuine overlap. The row's key names a SET of areas and `busy` is the union of the atoms
@@ -1971,7 +2116,7 @@ def partition_defer_attribution(package, busy, occupancy):
     # cross-cutting branch above instead, which is what the key actually means.
     own = package_areas(package)
     if own is None:
-        holder, state, packages = holder_of(lambda _packages: True)
+        holder, state, packages = holder_of(_reserves_something)
         held = sorted(set(packages) & set(busy)) or sorted(busy)
         return ("cross-cutting-item", held[0], holder, state)
     contended = sorted(own & set(busy))
@@ -3624,6 +3769,13 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
             else:
                 exclude_signalled("a live per-PR review/fix lease holds the conflict repair")
             continue
+        # [#762] Resolved ONCE, here, and read by BOTH repair decisions below (the fix-KIND choice
+        # in the `review:changes` branch and the GAP-A/stranded pair further down). The red trigger
+        # and the stranded precondition must never disagree about which tier a head publishes, and
+        # two separate reads of two different fields is exactly how they would. Hoisted above the
+        # label branches so the fix lane can pick its kind from the same single resolution; it is a
+        # pure accessor over the snapshot, so evaluating it earlier changes nothing else.
+        repair = repair_gate_of(status, draft)
         # Explicit review labels are authoritative re-entry signals, independent of GitHub's
         # draft bit.  An orchestrator/human adjudication can relabel a formerly human-owned READY
         # worker PR back to review:changes/review:needs without creating a fresh round marker; the
@@ -3633,7 +3785,44 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
             if f"fix:{repo}#{number}" in live_keys:
                 exclude_signalled("a live per-PR fix lease already owns this PR")
                 continue                  # per-PR single-flight; re-emit after release/expiry
-            emit("needs-fix")
+            # THE FIX LANE PICKS ITS KIND FROM THE HEAD, NOT FROM THE LABEL.
+            #
+            # `review:changes` has TWO writers, and they mean different things. One is a review
+            # verdict (`request_changes` — findings a VERDICT fixer applies). The other is sparq's
+            # stuck-arm sweep, which applies the same label to route an arm it just RETRACTED
+            # because the aggregator had already concluded FAILURE (`rearm-sweeper` receipt
+            # `{"action":"route-fix","class":"gate-failed"}`, and its own comment says "it is routed
+            # to the fix lane"). One label, two causes — and this branch used to send both to the
+            # VERDICT fixer, which stage_verdict_for_fix seeds from the RECORDED verdict. On a
+            # stuck-arm route that recorded verdict is the `approve` that armed the PR in the first
+            # place, so the fixer is handed a diff with nothing to fix: it records `nochange`, the
+            # #560 hand-over retracts the reviewed-sha marker, the PR returns to the review lane,
+            # and the next round re-approves the IDENTICAL tree while the red aggregator sits
+            # untouched on the head. Nothing in that loop ever repairs CI, so every subsequent arm
+            # is retracted for the same reason, forever.
+            #
+            # Measured on sparq-org/sparq#4847 (2026-07-28..29, under this code): review rounds 4,
+            # 5 and 6 all returned `approve` on ONE unchanged head, with `nochange` fix rounds 3, 4
+            # and 5 between them and three promote -> arm -> `gate-failed` -> disarm -> redraft
+            # cycles, ~10 minutes each. The head's aggregator was a concluded FAILURE throughout.
+            #
+            # So: a concluded-FAILURE aggregator on the live head selects the CI kind. This is the
+            # SAME precedence GAP-B already applies one branch up ("conflict repair FIRST and alone
+            # — CI on a conflicted base is noise"), for the same reason: repair work on a head that
+            # cannot merge outranks a verdict fix, and the ci lane is the one seeded with the
+            # failing LEGS instead of with a verdict. It is a KIND choice inside one lane, not a
+            # lane change — `_review_item_lane` maps needs-fix and needs-ci-fix both to `fix`, so
+            # the per-PR fix-lease single-flight above still governs, unchanged.
+            #
+            # Deliberately NOT widened to `review:needs`: that path already falls through to GAP-A
+            # once its head is marker-bound (#761/#765), and re-ordering it would send a
+            # never-reviewed advanced head to a fixer before any reviewer had seen it.
+            if repair == "failure":
+                _bucket("repair:needs-ci-fix")
+                emit("needs-ci-fix", context=", ".join(status.get("failing_legs") or []),
+                     newly_reachable=status.get("gate") != "failure")
+            else:
+                emit("needs-fix")
             continue
         if "review:needs" in labels:
             # (review:parked no longer re-enters here: the one-predicate exclusion above
@@ -3684,11 +3873,11 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         # argument, and TIER-APPROPRIATE per repair_gate_of: a READY PR is still judged on the
         # strict name alone, so a stale draft-tier row can never defuse a valid arm.
         #
-        # [#762] The SAME accessor answers the GREEN half in the branch below, so it is resolved
-        # ONCE here: the red trigger and the stranded precondition must never disagree about which
-        # tier a head publishes, and two separate reads of two different fields is exactly how
-        # they would.
-        repair = repair_gate_of(status, draft)
+        # [#762] The SAME accessor answers the GREEN half in the branch below, and the fix-lane
+        # KIND choice above — one resolution, hoisted to `repair` before the label branches. The
+        # red trigger, the fix-lane kind and the stranded precondition must never disagree about
+        # which tier a head publishes, and separate reads of the same field are exactly how they
+        # would.
         if repair == "failure" and lease_free:
             _bucket("repair:needs-ci-fix")
             # NEWLY REACHABLE = the strict merge-required reading would NOT have seen this row,
@@ -8276,7 +8465,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 defer_reasons, lanes=lanes, ledger_root=ledger_root,
                 fix_dispatch=fix_dispatch,
                 # [#657] The MASTER-protected half of orchestrator-PR admission, read from the
-                # SAME policy document `_policy_row` validated above (the private registry
+                # SAME policy document `_policy_row` validated above (the registry
                 # checkout, never the unprotected `ledger` one — collapsing both halves onto one
                 # authority is exactly what makes the pair pointless). Absent/empty => enrolment
                 # OFF => CLAIM's shape gates stand. CLAIM re-derives the waiver itself rather than
@@ -10573,10 +10762,19 @@ def _self_test():
     assert "already_done = False" in _ad_src and "sparq-reviewed-sha" in _ad_src, _ad_src
     _spun = pull(41, "sparq-agent/issue-7-1-1", sha_a,
                  labels=[_worker_pr.FIX_LANE_PR_LABEL], body=_bound_body)
+    # The pre-defer admission is the FIX lane in EVERY CI posture — that is the spin #560 closes.
+    # The KIND inside that lane is chosen from the head, not from the label: a CONCLUDED-red
+    # aggregator selects `needs-ci-fix` (seeded with the failing LEGS) and every other posture
+    # selects `needs-fix` (seeded with the recorded VERDICT). Both are `fix`-lane states, so the
+    # ownership property this block exists to pin is untouched; naming the kind per posture keeps
+    # the assertion EXACT rather than relaxing it to a lane check, and the lane is asserted too.
+    _pre_defer_kind = {"green": "needs-fix", "red": "needs-ci-fix",
+                       "pending": "needs-fix", "unknown": "needs-fix"}
     for _ci, _status in _ci_states().items():
-        assert [item["state"] for item in enumerate_review_items(
-            repo, [_spun], provenance, [], issue_labels, now, pr_status=_status)] == \
-            ["needs-fix"], ("pre-defer lane", _ci)
+        _pre = [item["state"] for item in enumerate_review_items(
+            repo, [_spun], provenance, [], issue_labels, now, pr_status=_status)]
+        assert _pre == [_pre_defer_kind[_ci]], ("pre-defer lane", _ci, _pre)
+        assert _review_item_lane(_pre[0]) == "fix", ("pre-defer lane", _ci, _pre)
     for _reason in _worker_pr.FIX_LANE_DEFER_REASONS:
         _action = _worker_pr.fix_lane_defer_action({_worker_pr.FIX_LANE_PR_LABEL})
         _after = sorted(_worker_pr.fix_lane_defer_labels(
@@ -13396,6 +13594,84 @@ def _self_test():
     assert enumerate_review_items(
         repo, [starved], provenance, [], issue_labels, now,
         pr_status={41: status_of(sha_a, gate="missing", repair_gate="pending")}) == []
+    # ---- THE FIX LANE PICKS ITS KIND FROM THE HEAD, NOT FROM THE LABEL ----------------------
+    # `review:changes` has TWO writers that mean different things: a `request_changes` verdict,
+    # and sparq's stuck-arm sweep routing an arm it RETRACTED because the aggregator had already
+    # concluded FAILURE (`rearm-sweeper` receipt `{"action":"route-fix","class":"gate-failed"}`).
+    # Sending the second to the VERDICT fixer seeds it from the RECORDED verdict — which on that
+    # route is the `approve` that armed the PR — so the fixer has nothing to fix, records
+    # `nochange`, the #560 hand-over retracts the reviewed-sha marker, and the review lane
+    # re-approves the identical tree. Measured on sparq-org/sparq#4847 (2026-07-28..29): review
+    # rounds 4, 5 and 6 all `approve` on ONE unchanged head, `nochange` fix rounds 3, 4 and 5
+    # between them, three arm -> `gate-failed` -> disarm -> redraft cycles of ~10 minutes each,
+    # and a concluded-red aggregator on the head the entire time.
+    changes_red = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:changes"],
+                       body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+    # KNOWN POSITIVE — the live sparq#4847 / #5035 shape: a DRAFT carrying `review:changes` whose
+    # only aggregator row is a RED draft-tier one. Reverting this branch to a bare
+    # `emit("needs-fix")` reds this line, and the PR goes back to burning a verdict-fixer run per
+    # tick on a diff that has nothing to fix.
+    kind_red = enumerate_review_items(
+        repo, [changes_red], provenance, [], issue_labels, now,
+        pr_status={41: status_of(sha_a, gate="missing", repair_gate="failure",
+                                 legs=["workspace clippy"])})
+    assert [(item["state"], item["context"]) for item in kind_red] == [
+        ("needs-ci-fix", "workspace clippy")], kind_red
+    # ...and the FAILING LEGS reach the fixer. A ci-kind run is seeded with these instead of with
+    # a verdict, which is the whole point of choosing the kind: an empty context would dispatch a
+    # CI fixer that knows nothing about what is red.
+    assert kind_red[0]["context"] == "workspace clippy", kind_red
+    # ...and it is a KIND choice INSIDE one lane, never a lane change — so the per-PR fix-lease
+    # single-flight above still governs both kinds identically.
+    assert _review_item_lane(kind_red[0]["state"]) == _review_item_lane("needs-fix") == "fix"
+    # KNOWN NEGATIVE 1 — a genuine `request_changes` verdict on a GREEN head still reaches the
+    # VERDICT fixer, at BOTH green grades. If either of these ever reads `needs-ci-fix` the change
+    # has eaten the verdict lane and review findings would stop being applied.
+    for _green_grade in (GATE_GREEN_MERGE_REQUIRED, GATE_GREEN_DRAFT_TIER):
+        assert [item["state"] for item in enumerate_review_items(
+            repo, [changes_red], provenance, [], issue_labels, now,
+            pr_status={41: status_of(sha_a, gate="missing",
+                                     repair_gate=_green_grade)})] == ["needs-fix"], _green_grade
+    # KNOWN NEGATIVE 2 — THE UNFINISHED-DRAFT POPULATION, which is the flooding risk. On sparq
+    # 2026-07-29, 68 of 76 open drafts had never published an aggregator row at all: they were
+    # never promoted, so there is no evidence about them either way. `missing`/`pending`/`unknown`
+    # are not `failure`, so this change is INERT on every one of them — the discriminator is a
+    # CONCLUDED failure on the live head, never age, staleness or absence of evidence.
+    for _idle in ("missing", "pending", "unknown"):
+        assert [item["state"] for item in enumerate_review_items(
+            repo, [changes_red], provenance, [], issue_labels, now,
+            pr_status={41: status_of(sha_a, gate="missing",
+                                     repair_gate=_idle)})] == ["needs-fix"], _idle
+    # ...and with NO CI snapshot for the PR at all (unknown never acts).
+    assert [item["state"] for item in enumerate_review_items(
+        repo, [changes_red], provenance, [], issue_labels, now)] == ["needs-fix"]
+    # KNOWN NEGATIVE 3 — a STALE snapshot (its head_sha names a different commit) is discarded
+    # upstream, so the kind choice can never be made on evidence about another head.
+    assert [item["state"] for item in enumerate_review_items(
+        repo, [changes_red], provenance, [], issue_labels, now,
+        pr_status={41: status_of(sha_b, gate="missing", repair_gate="failure")})] == ["needs-fix"]
+    # KNOWN NEGATIVE 4 — the per-PR fix-lease single-flight is UNCHANGED by the kind choice: a
+    # live fix lease still excludes the PR from both kinds, so the new branch cannot double-
+    # dispatch a PR a fixer already owns.
+    assert enumerate_review_items(
+        repo, [changes_red], provenance,
+        [{"holder": f"fix:{repo}#41@run.1", "expires_at": now + 100, "package": "crate-a"}],
+        issue_labels, now,
+        pr_status={41: status_of(sha_a, gate="missing", repair_gate="failure")}) == []
+    # KNOWN NEGATIVE 5 — a CONFLICTING base still outranks BOTH kinds (GAP-B is unmoved): the
+    # rebase-first rule is not weakened by giving the fix lane a second kind.
+    assert [item["state"] for item in enumerate_review_items(
+        repo, [changes_red], provenance, [], issue_labels, now,
+        pr_status={41: status_of(sha_a, gate="missing", repair_gate="failure",
+                                 conflicting=True)})] == ["needs-rebase"]
+    # KNOWN NEGATIVE 6 — a human hold still wins outright. The stuck-arm route must never pull a
+    # human-owned PR into an autonomous repair run.
+    assert enumerate_review_items(
+        repo, [pull(41, "sparq-agent/issue-7-1-1", sha_a,
+                    labels=["review:changes", "review:needs-user"],
+                    body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")],
+        provenance, [], issue_labels, now,
+        pr_status={41: status_of(sha_a, gate="missing", repair_gate="failure")}) == []
     # ---- [issue #762] THE GREEN HALF: A RED DRAFT REACHES REPAIR, A GREEN ONE REACHES REVIEW --
     # THE HEADLINE. The full sparq draft shape — no merge-required context on the head at all,
     # only a green DRAFT-TIER aggregator — is the stranded posture, and it enumerates. Reverting
@@ -16475,8 +16751,9 @@ agent = "impl"
     # histogram carries the plan-snapshot degradation -> degraded zero-dispatch, NOT a quiet `none`
     assert tick_state({"planned": 0, "dispatched": 0,
                        "defer_reasons": {"snapshot-skip:check-runs-overflow": 1}}) == "zero"
-    # a genuinely empty/quiet frontier (no histogram at all) still records nothing
-    assert tick_state({"planned": 0, "dispatched": 0, "defer_reasons": {}}) == "none"
+    # a genuinely empty/quiet frontier (no histogram at all) is NOT the degraded class — since
+    # issue #341 it is its own `idle` observation, asserted in full below
+    assert tick_state({"planned": 0, "dispatched": 0, "defer_reasons": {}}) != "zero"
     # the pre-existing classes are unchanged by the degraded rescue
     assert tick_state({"planned": 3, "dispatched": 0,
                        "defer_reasons": {"existing-pr": 3}}) == "zero"
@@ -16486,6 +16763,119 @@ agent = "impl"
     # (degraded requires dispatched == 0), else every healthy tick with a single defer flips red
     assert tick_state({"planned": 3, "dispatched": 1,
                        "defer_reasons": {"existing-pr": 2}}) == "ok"
+
+    # ---- Issue #341: a completed tick over an EMPTY ready frontier is POSITIVE evidence, and
+    # records the fleet `idle` class so an open zero-dispatch alert recovers at once instead of
+    # waiting out the 48 h health window. The whole value of the class is that it is an
+    # OBSERVATION, so every shape that is merely an ABSENCE of information must stay `none` (which
+    # records nothing at all). ----
+    assert tick_state({"planned": 0, "dispatched": 0, "defer_reasons": {}}) == "idle"
+    # ...but only when the claim step itself SUCCEEDED. A failed claim that already wrote its
+    # early planned==0 summary is not an observation of an empty frontier; recording `idle` there
+    # would recover the alert off the back of the failure that caused it.
+    assert tick_state({"planned": 0, "dispatched": 0, "defer_reasons": {}}, "failure") == "none"
+    # ...and neither a missing summary on a non-failing claim nor an unusable `planned` may be
+    # promoted to an observation (the fail-closed fallback, reachable when the summary write lost
+    # a disk error or the schema drifts).
+    assert tick_state(None, "success") == "none"
+    assert tick_state({"planned": None, "dispatched": 0, "defer_reasons": {}}) == "none"
+    # ...and — the round-1 review defect — neither may an INCOMPLETE summary. The parser defaults
+    # above fill an absent planned/dispatched/defer_reasons with 0/0/{}, which is the right
+    # conservative reading for the zero/degraded classes but is an ABSENCE of information, so
+    # `idle` must not be assembled out of them. Each shape below reached `idle` before the fix and
+    # would have recovered an open zero-dispatch alert off a summary that observed nothing.
+    assert tick_state({}) == "none"
+    assert tick_state([]) == "none"                      # valid JSON, not a summary mapping
+    assert tick_state({"planned": 0}) == "none"          # dispatched + histogram omitted
+    assert tick_state({"planned": 0, "dispatched": 0}) == "none"       # histogram omitted
+    assert tick_state({"planned": 0, "defer_reasons": {}}) == "none"   # dispatched omitted
+    assert tick_state({"dispatched": 0, "defer_reasons": {}}) == "none"  # planned omitted
+    # a non-mapping histogram is a schema violation, not an empty one (`reasons` sanitises it to
+    # {} for the degraded read; that sanitised value may not become positive evidence here)
+    assert tick_state({"planned": 0, "dispatched": 0, "defer_reasons": "nope"}) == "none"
+    assert tick_state({"planned": 0, "dispatched": 0, "defer_reasons": []}) == "none"
+    # `bool` is an `int` subclass, so a plain isinstance(..., int) count check reads
+    # `planned: false` as a count of zero. It is a schema violation and observes nothing.
+    assert tick_state({"planned": False, "dispatched": False, "defer_reasons": {}}) == "none"
+    assert tick_state({"planned": 0, "dispatched": False, "defer_reasons": {}}) == "none"
+    assert tick_state({"planned": False, "dispatched": 0, "defer_reasons": {}}) == "none"
+    # ...while the counts the real writer emits are still read as the counts they are. Drive the
+    # PRODUCER, not a hand-written literal: requiring the exact field names above means a rename in
+    # _write_dispatch_summary would make `idle` unreachable in production — silently, and
+    # fail-closed, so no alarm — while every literal-fed assertion here stayed green. This is the
+    # one assertion whose input comes from the same place the workflow reads it (pre-flight 2c).
+    with tempfile.TemporaryDirectory() as _quiet_dir:
+        _quiet_prior = os.environ.get("DISPATCH_SUMMARY_FILE")
+        os.environ["DISPATCH_SUMMARY_FILE"] = os.path.join(_quiet_dir, "summary.json")
+        try:
+            _write_dispatch_summary(0, 0, Counter(), _new_lane_counts())
+            with open(os.environ["DISPATCH_SUMMARY_FILE"], encoding="utf-8") as _qh:
+                _quiet_summary = json.load(_qh)
+        finally:
+            if _quiet_prior is None:
+                del os.environ["DISPATCH_SUMMARY_FILE"]
+            else:
+                os.environ["DISPATCH_SUMMARY_FILE"] = _quiet_prior
+    assert tick_state(_quiet_summary) == "idle", _quiet_summary
+    # ...and the SAME real summary with one planned item is not quiet — so the assertion above is
+    # pinning the empty frontier, not merely "any summary the writer produces".
+    assert tick_state(dict(_quiet_summary, planned=1)) == "zero"
+    # ...and an empty frontier does NOT mask a lane stall: the safety-disarm failure still wins,
+    # because `zero` is evaluated first. Reordering the chain would let a dead disarm lane report
+    # itself healthy on every quiet tick.
+    assert tick_state({"planned": 0, "dispatched": 0, "defer_reasons": {},
+                       "lanes": {"disarm": {"planned": 1, "launched": 0, "error": 1}}}) == "zero"
+
+    # ---- ...and the SHELL half of the same seam, which no assertion above can see: the `case`
+    # that turns each state into a model-health record. Pinned as the EXACT, WHOLE command each arm
+    # runs — line-continuations rejoined, comments dropped — never a substring or a flag search.
+    # Substring/flag-set pinning would miss the two mutants that matter most here, and both are
+    # live footguns rather than hypotheticals: wrapping the recorder in an `if` (it then vanishes
+    # on exactly the quiet tick it exists for — the #938 shape) and appending `|| true` (which
+    # swallows the deliberately-nonzero exit a dropped record must fail on). Re-pointing `idle` at
+    # `success` — the variant that would fabricate fleet-health evidence for the aged-out park
+    # exit — deleting an arm, or handing one the wrong --provider all fail here too. ----
+    _state_case = re.search(r'\n *case "\$state" in\n(.*?)\n *esac', workflow, re.DOTALL)
+    assert _state_case, "dispatch.yml lost the tick-state record dispatcher"
+    _record_arms, _arm = {}, None
+    for _line in _state_case.group(1).splitlines():
+        _stripped = _line.strip()
+        if not _stripped or _stripped.startswith("#") or _stripped == ";;":
+            continue
+        _label = re.match(r"^([a-z]+)\)$", _stripped)
+        if _label:
+            _arm = _label.group(1)
+            _record_arms[_arm] = [""]
+            continue
+        if _arm is None:
+            continue
+        _continues = _stripped.endswith("\\")
+        _record_arms[_arm][-1] += ((" " if _record_arms[_arm][-1] else "")
+                                   + (_stripped[:-1].strip() if _continues else _stripped))
+        if not _continues:
+            _record_arms[_arm].append("")
+    _record_arms = {_k: [_c for _c in _v if _c] for _k, _v in _record_arms.items()}
+
+    def _record_cmd(exit_class):
+        return ('python3 registry/scripts/model-health.py record --provider fleet '
+                f'--exit-class {exit_class} '
+                '--run-id "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"')
+
+    assert _record_arms == {"zero": [_record_cmd("zero-dispatch")],
+                            "abort": [_record_cmd("claim-abort")],
+                            "ok": [_record_cmd("success")],
+                            "idle": [_record_cmd("idle")]}, _record_arms
+    # EVERY state the classification block can emit is either recorded or is the deliberate
+    # record-nothing fallback — nothing may fall between the two. A new state token added above
+    # with no arm below (or an arm for `none`, which would record an absence of information as an
+    # observation) reds here instead of silently dropping the tick's health signal.
+    _emitted_states = {tick_state(*case) for case in (
+        ({"planned": 0, "dispatched": 0, "defer_reasons": {"snapshot-skip:x": 1}},),
+        ({"planned": 0, "dispatched": 0, "defer_reasons": {}},),
+        ({"planned": 3, "dispatched": 2, "defer_reasons": {}},),
+        (None, "failure"),
+        (None, "success"))}
+    assert _emitted_states == set(_record_arms) | {"none"}, (_emitted_states, set(_record_arms))
 
     # ---- [issue #111, round 2] PLAN's trusted() author filter, exec'd from dispatch.yml itself
     # (not a re-implemented copy) so these pin the workflow's REAL advisory behavior. Two pinned
@@ -17173,6 +17563,233 @@ agent = "impl"
             (reason, claim_output.getvalue())
     print("  ok   registry-758 (e): every declared defer reason has an asserted printed line at "
           "BOTH legs, and the two legs classify the same board identically")
+
+    # ==== [OPUS-5 2026-07-28] CROSS-CUTTING PARTITIONS ROUTE WORK WITHOUT OCCUPYING IT ==========
+    # The OCCUPANCY half of sparq-org/sparq#4928 on THIS leg (sparq-org/sparq#4929). Every check
+    # runs END-TO-END through a production entry point — `filter_busy_area_items` (assemble) and
+    # `revalidate_items_against_live_pulls` (claim-time live re-check) — and the two legs are
+    # asserted SEPARATELY rather than through one shared helper call, because the failure this
+    # exists to prevent is a fix that lands at ONE leg: the live re-check runs LAST, so an
+    # exemption applied only at assemble is inert, and an assertion that inspected
+    # `reserving_areas`' shape would stay green with the call site deleted.
+    #
+    # MEASURED, on a snapshot that reproduces dispatch run 30405421829's claim-census lines
+    # byte-identically: with sparq#4928 applied, PLAN offers 2 more rows (`area:ci` #2606 and
+    # `area:docs` #2725) and this leg re-deferred BOTH — `deferred=2 reason.crate-conflict=2
+    # area.ci=1 area.docs=1` — against `deferred=0 kept=7` with this change.
+    def xcut_pr(number, labels=("review:needs",)):
+        return pull(number, f"sparq-agent/issue-{number}-1-1", sha_a, labels=list(labels))
+
+    def xcut_row(number, package, labels=None):
+        return {"number": number, "package": package, "deferred": False,
+                "labels": [f"area:{package}"] if labels is None else list(labels)}
+
+    xcut_labels = {90: ["area:ci", "role:impl"], 91: ["area:docs", "role:impl"],
+                   92: ["area:deps", "role:impl"], 93: ["area:crate-b", "role:impl"]}
+    xcut_prov = {**busy_prov, 90: busy_record(90, 90), 91: busy_record(91, 91),
+                 92: busy_record(92, 92), 93: busy_record(93, 93)}
+
+    def both_legs(rows, holders):
+        """(assemble kept, claim dispatchable, assemble census, claim census, claim log). The two
+        legs are DRIVEN separately and reported separately so a caller can assert on each."""
+        a_census = {}
+        with contextlib.redirect_stdout(io.StringIO()):
+            a_kept = filter_busy_area_items(rows, repo, holders, xcut_labels, xcut_prov,
+                                            leases=[], now=now, census=a_census)
+        live = [dict(holder, auto_merge=None, draft=False) for holder in holders]
+        c_census, c_out = {}, io.StringIO()
+        with contextlib.redirect_stdout(c_out):
+            c_ok = revalidate_items_against_live_pulls(rows, repo, [live], xcut_labels, xcut_prov,
+                                                       leases=[], now=now, census=c_census)
+        return ([item["number"] for item in a_kept], sorted(c_ok), a_census, c_census,
+                c_out.getvalue())
+
+    # -- THE HEADLINE, at EACH leg independently -------------------------------------------------
+    for area, holder in (("ci", 90), ("docs", 91)):
+        a_kept, c_ok, a_census, c_census, _log = both_legs(
+            [xcut_row(70, area)], [xcut_pr(holder)])
+        assert a_kept == [70], (area, a_kept)
+        assert c_ok == [70], (area, c_ok)
+        # ...and NEITHER leg counted a drop. `kept` is sealed at both legs, so a leg that kept the
+        # row but recorded a phantom defer (or vice versa) reds here rather than looking healthy.
+        for census in (a_census, c_census):
+            assert census["total"] == 0 and census["kept"] == 1, (area, census)
+            assert sum(census["by_reason"].values()) == 0, (area, census)
+    print("  ok   [#4929] a PR holding `ci`/`docs` no longer defers a row declaring it — at the "
+          "assemble leg AND at the claim-time live re-check, asserted separately")
+
+    # The RELEASED KEY SET, exactly. One occupant declaring all four areas: the two cross-cutting
+    # keys drop out of the reservation and NOTHING else does. A mutant that widens the exemption
+    # shows up here as a missing key, and one that empties it as two extra keys.
+    xcut_wide = xcut_pr(94, ("area:ci", "area:docs", "area:deps", "area:crate-b", "review:needs"))
+    assert busy_packages_of_pulls(repo, [xcut_wide], {}, {}) == {"deps", "crate-b"}, \
+        busy_packages_of_pulls(repo, [xcut_wide], {}, {})
+    assert reserving_areas({"ci", "docs", "deps", "crate-b"}) == {"deps", "crate-b"}
+    print("  ok   [#4929] the released key set is EXACTLY {ci, docs} — measured as the reserved "
+          "set an all-four-area occupant loses")
+
+    # EXACT PARTITION ATOM, NEVER A PREFIX — and this is the one place the two repositories'
+    # declarations deliberately DIFFER, so it is pinned rather than left to be inferred.
+    #
+    # sparq#4928 exempts on `partition_path(key)[0]`, so `ci-fragments` travels with `ci`. It has
+    # to: sparq's `keys_conflict` is longest-ancestor containment, so `ci-fragments` CONFLICTS with
+    # `ci`, and exempting one without the other would leave `ci-fragments` reserving a partition
+    # `ci` itself does not. Here `packages_conflict` is flat set INTERSECTION over `,`-separated
+    # atoms — `ci-fragments` and `ci` never conflict in the first place — so no such incoherence
+    # exists and a prefix rule would buy nothing while silently exempting every FUTURE `ci-*` /
+    # `docs-*` key on the strength of a measurement taken on neither. That is the "too LARGE a
+    # set" direction `non_reserving_partitions` voids the whole declaration to avoid.
+    #
+    # `area:ci-fragments` is a LIVE sparq label (0 open PR holders and 0 open issue holders on the
+    # measured snapshot, so this is currently inert either way — which is precisely why it needs an
+    # assertion and not a comment: a prefix mutant passed 265/265 before this line existed).
+    assert reserving_areas({"ci-fragments"}) == {"ci-fragments"}
+    assert reserving_areas({"ci-fragments", "ci", "docs-site"}) == {"ci-fragments", "docs-site"}
+    assert non_reserving_partitions({"ci-fragments"}) == frozenset({"ci-fragments"})
+    # ...END-TO-END, at both legs, and PAIRED with the `ci` case on the same board so the
+    # assertion cannot be satisfied by an exemption that has simply stopped working.
+    xcut_prefix_labels = {97: ["area:ci-fragments", "role:impl"]}
+    xcut_prefix_prov = {**xcut_prov, 97: busy_record(97, 97)}
+    prefix_census = {}
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert filter_busy_area_items(
+            [xcut_row(70, "ci-fragments")], repo, [xcut_pr(97)], xcut_prefix_labels,
+            xcut_prefix_prov, leases=[], now=now, census=prefix_census) == []
+        assert revalidate_items_against_live_pulls(
+            [xcut_row(70, "ci-fragments")], repo,
+            [[dict(xcut_pr(97), auto_merge=None, draft=False)]], xcut_prefix_labels,
+            xcut_prefix_prov, leases=[], now=now) == set()
+    assert prefix_census["by_reason"]["crate-conflict"] == 1, prefix_census
+    a_kept, c_ok, _a, _c, _log = both_legs([xcut_row(70, "ci")], [xcut_pr(90)])
+    assert a_kept == [70] and c_ok == [70], (a_kept, c_ok)
+    print("  ok   [#4929] the exemption matches an EXACT partition atom, never a prefix: "
+          "`ci-fragments` STILL reserves at both legs while `ci` does not")
+
+    # THE ORDERING that makes this a narrowing and not a widening, pinned. An UNPROVENANCED PR
+    # whose only declared area is `ci` must reserve NOTHING. Applying the exemption BEFORE the
+    # fail-closed branches would empty its area set, drop it into the `missing-provenance` else
+    # branch and reserve `__global__` — one cross-cutting PR stalling the entire fleet, i.e. this
+    # change making the measured problem strictly WORSE. And its CAUSE must still be the narrowed
+    # one, so `unprovenanced_narrowed_holders` keeps counting it: narrowing a reservation must
+    # never uncount the population whose provenance record is still missing (sparq#4821).
+    xcut_unprov = xcut_pr(96, ("area:ci", "review:needs"))
+    xcut_unprov_occ = []
+    assert busy_packages_of_pulls(repo, [xcut_unprov], {}, {},
+                                  occupancy=xcut_unprov_occ) == frozenset()
+    assert unprovenanced_narrowed_holders(xcut_unprov_occ) == [96], xcut_unprov_occ
+    print("  ok   [#4929] the exemption is applied AFTER every fail-closed branch — a `ci`-only "
+          "unprovenanced PR reserves nothing (not `__global__`) and is still counted as narrowed")
+
+    # -- THE SAFETY HALF: what must STILL reserve, at both legs ----------------------------------
+    # `deps`: MEASURED 21 of 21 open holder pairs share a changed file, every one of them
+    # `Cargo.lock`. `crate-b` stands for the crate areas at 57.1%. Widening the exemption to
+    # either is the mutation these two lines exist to kill.
+    for area, holder in (("deps", 92), ("crate-b", 93)):
+        a_kept, c_ok, a_census, c_census, _log = both_legs(
+            [xcut_row(70, area)], [xcut_pr(holder)])
+        assert a_kept == [] and c_ok == [], (area, a_kept, c_ok)
+        for census in (a_census, c_census):
+            assert census["by_reason"]["crate-conflict"] == 1, (area, census)
+    # `__global__` is NEVER exemptable, including end-to-end: an occupant whose blast radius is
+    # unknown (no provenance record, no declared area) still serialises a `ci` row.
+    xcut_global_holder = pull(95, "sparq-agent/issue-95-1-1", sha_a, labels=["review:needs"])
+    a_kept, c_ok, a_census, c_census, _log = both_legs(
+        [xcut_row(70, "ci")], [xcut_global_holder])
+    assert a_kept == [] and c_ok == [], (a_kept, c_ok)
+    assert a_census["by_reason"]["global-reservation"] == 1, a_census
+    assert c_census["by_held_area"] == {GLOBAL_PACKAGE: 1}, c_census
+    print("  ok   [#4929] `deps`, the crate areas and `__global__` STILL reserve at both legs — "
+          "the exemption is exactly two keys wide")
+
+    # THE RESIDUAL SERIALISATION, and it is what bounds the risk of this change: only the OPEN-PR
+    # occupancy stops reserving `ci`/`docs`. The cross-lane LEASE partition is untouched at both
+    # legs, so two impl RUNS still cannot hold `ci` at once — what is released is the much longer
+    # tail in which a PR sits open in review holding the key for hours after its run finished.
+    xcut_lease = [{"package": "ci", "holder": f"{repo}#999@x", "expires_at": now + 3600,
+                   "claim_id": "c" * 32, "account_h": "ab" * 8}]
+    xcut_lease_census = {}
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert filter_busy_area_items([xcut_row(70, "ci")], repo, [], xcut_labels, xcut_prov,
+                                      leases=xcut_lease, now=now,
+                                      census=xcut_lease_census) == []
+        assert revalidate_items_against_live_pulls(
+            [xcut_row(70, "ci")], repo, [[]], xcut_labels, xcut_prov,
+            leases=xcut_lease, now=now) == set()
+    assert xcut_lease_census["by_reason"]["sibling-lease"] == 1, xcut_lease_census
+    print("  ok   [#4929] a LIVE sibling lease on `ci` still defers a `ci` row at both legs — the "
+          "exemption releases open-PR occupancy only, never the cross-lane lease partition")
+
+    # -- THE FAIL-SAFE, both directions ----------------------------------------------------------
+    # A malformed declaration voids the WHOLE set to today's fully-reserving behaviour, and a
+    # PARTIALLY malformed one does NOT yield a partial exemption — `{"ci", "__global__"}` must
+    # not quietly exempt `ci`. Without the honoured case at the end, a fail-safe that voided
+    # everything unconditionally would look perfect here.
+    _xcut_declared = NON_RESERVING_PARTITIONS
+    try:
+        for broken in (None, "ci", 7, {"ci": True}, {"ci", 7}, ["ci", ""], [" "],
+                       {GLOBAL_PACKAGE}, {"ci", GLOBAL_PACKAGE}, {"ci,docs"}, {"ci", "a,b"}):
+            # Read through the PRODUCTION call shape (no argument), because that is the only one
+            # the application point uses — and `None` is not expressible as an explicit argument
+            # there, it means "read the declaration".
+            globals()["NON_RESERVING_PARTITIONS"] = broken
+            assert non_reserving_partitions() == frozenset(), broken
+            a_kept, c_ok, _a, _c, _log = both_legs([xcut_row(70, "ci")], [xcut_pr(90)])
+            assert a_kept == [] and c_ok == [], (broken, a_kept, c_ok)
+        # ...and a WELL-FORMED declaration is honoured, at both legs. `docs` is deliberately NOT
+        # in this one: the honoured case must prove the set is READ, not merely non-empty.
+        globals()["NON_RESERVING_PARTITIONS"] = frozenset({"ci"})
+        assert non_reserving_partitions() == frozenset({"ci"})
+        a_kept, c_ok, _a, _c, _log = both_legs([xcut_row(70, "ci")], [xcut_pr(90)])
+        assert a_kept == [70] and c_ok == [70], (a_kept, c_ok)
+        a_kept, c_ok, _a, _c, _log = both_legs([xcut_row(70, "docs")], [xcut_pr(91)])
+        assert a_kept == [] and c_ok == [], (a_kept, c_ok)
+    finally:
+        globals()["NON_RESERVING_PARTITIONS"] = _xcut_declared
+    assert non_reserving_partitions() == frozenset({"ci", "docs"}), non_reserving_partitions()
+    print("  ok   [#4929] a malformed — or PARTLY malformed — exemption voids the WHOLE set to "
+          "today's behaviour, and a well-formed one is honoured key-by-key")
+
+    # -- SCOPE: the CANDIDATE side is untouched --------------------------------------------------
+    # A `ci` row is still keyed `ci`, still a `single-area` reservation, and still counted as a
+    # kept single-area row. The exemption is the OCCUPANCY half only: if it leaked onto the
+    # candidate side a `ci` row would stop reserving `ci` for its OWN tick and two workers could
+    # be launched onto it at once.
+    # NO `package` KEY on these rows, deliberately. The first draft of this assertion used
+    # `xcut_row(70, "ci")`, which carries `package="ci"` — and `item_partition` falls back to that
+    # field when the label derivation yields nothing, so the row was rescued by the fallback and
+    # the assertion held even with the exemption spliced INTO `item_partition`. MEASURED: that
+    # mutant SURVIVED the first sweep. The oracle, not the mutant, was wrong.
+    assert item_partition({"number": 70, "labels": ["area:ci"]}) == "ci"
+    assert item_partition({"number": 70, "labels": ["area:docs"]}) == "docs"
+    assert item_partition({"number": 70, "labels": ["area:ci", "area:deps"]}) == "ci,deps"
+    # ...and END-TO-END, where the leak is a REFUSAL and not just a different string: a `ci` row
+    # and a `deps` occupant do not intersect, so the row is kept. Under the leak the row's own key
+    # collapses to `__global__` and it is deferred against every live reservation.
+    a_kept, c_ok, _a, _c, _log = both_legs(
+        [{"number": 70, "labels": ["area:ci"], "deferred": False}], [xcut_pr(92)])
+    assert a_kept == [70] and c_ok == [70], (a_kept, c_ok)
+    assert reservation_class("ci") == "single-area" and reservation_class("docs") == "single-area"
+    _a_kept, _c_ok, a_census, c_census, _log = both_legs([xcut_row(70, "ci")], [xcut_pr(90)])
+    for census in (a_census, c_census):
+        assert census["by_reservation"]["single-area"] == {"kept": 1, "deferred": 0}, census
+        assert census["by_reservation"]["global"] == {"kept": 0, "deferred": 0}, census
+    print("  ok   [#4929] SCOPE: `item_partition` / the reservation classes are unchanged — the "
+          "exemption never reaches the candidate side")
+
+    # -- ATTRIBUTION: an occupant that reserves NOTHING is never named as a holder ---------------
+    # pr#90 reserves only `ci`, i.e. nothing, and is the LOWEST-numbered busy row. Before the
+    # `_reserves_something` guard the cross-cutting branch named it and printed `held area deps
+    # reserved by pr#90` — an area it does not hold. The #758 invariant is that the reported
+    # held area is genuinely reserved BY THE NAMED HOLDER.
+    xcut_attr_rows = [xcut_row(70, GLOBAL_PACKAGE, labels=[])]
+    _a_kept, _c_ok, _a, c_census, attr_log = both_legs(
+        xcut_attr_rows, [xcut_pr(90), xcut_pr(92)])
+    assert ("claim-revalidation defer #70 [cross-cutting-item]: row crate __global__; "
+            "held area deps reserved by pr#92") in attr_log, attr_log
+    assert c_census["by_holder"] == {"92": 1}, c_census
+    assert c_census["by_held_area"] == {"deps": 1}, c_census
+    print("  ok   [#4929] an occupant whose whole footprint is exempt reserves nothing and is "
+          "never reported as the holder of an area it does not hold")
 
     # ==== [OPUS-5] A MULTI-AREA ITEM RESERVES ITS AREAS, NOT THE WORLD ==========================
     # The defect: `plan_package` sent 0 OR >=2 areas to `__global__`, so "touches A and B" meant
@@ -18121,8 +18738,11 @@ agent = "impl"
         print("  ok   legacy-migration: an unprovable park is DEFERRED, never converted into a "
               "state it could not leave")
 
-        # ONE-SHOT: the reason marker it wrote makes the PR no longer legacy.
-        posted, converted = migrate_sweep([budget_body, budget_body
+        # ONE-SHOT: the reason marker it wrote makes the PR no longer legacy. The marker sits on
+        # its OWN LINE, byte-for-byte as `legacy_migration_body` emits it (`"...changed.\n\n" +
+        # marker`) — since registry #1096 the receipt parser is line-anchored, so a marker glued
+        # onto the end of a prose line is ECHOED text and deliberately not a receipt.
+        posted, converted = migrate_sweep([budget_body, budget_body + "\n\n"
                                            + _park_policy.park_reason_marker("budget")])
         assert (posted, converted) == ([], []), (posted, converted)
         print("  ok   legacy-migration: a PR that already carries a reason marker is never "
@@ -18841,8 +19461,10 @@ agent = "impl"
             healthy_window, comments=age_comments + [bot_at(ladder_body, 3000)],
             timeline=park_at(old))
         assert tied == (0, [], []), tied
-        # A park-REASON receipt (the legacy migration / the starvation park) closes it too.
-        reason_body = f"x {_park_policy.park_reason_marker(STARVATION_PARK_CAUSE)}"
+        # A park-REASON receipt (the legacy migration / the starvation park) closes it too. On its
+        # own line, as both of those writers emit it — registry #1096 line-anchored the parser, so
+        # a marker trailing prose on one line is echoed text rather than an assertion.
+        reason_body = f"x\n\n{_park_policy.park_reason_marker(STARVATION_PARK_CAUSE)}"
         assert readmit_sweep(healthy_window,
                              comments=age_comments + [bot_at(reason_body, 2000)],
                              timeline=park_at(old))[0] == 1

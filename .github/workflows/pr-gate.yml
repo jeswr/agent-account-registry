@@ -89,11 +89,18 @@ jobs:
             || { echo "::error::$pin: ACTIONLINT_VERSION missing, duplicated or malformed"; exit 1; }
           sha256=$(pin_value ACTIONLINT_TARBALL_SHA256_LINUX_AMD64 '[0-9a-f]{64}') \
             || { echo "::error::$pin: ACTIONLINT_TARBALL_SHA256_LINUX_AMD64 missing, duplicated or malformed"; exit 1; }
+          bin_sha256=$(pin_value ACTIONLINT_BIN_SHA256_LINUX_AMD64 '[0-9a-f]{64}') \
+            || { echo "::error::$pin: ACTIONLINT_BIN_SHA256_LINUX_AMD64 missing, duplicated or malformed"; exit 1; }
           curl -fsSL --retry 3 -o /tmp/actionlint.tar.gz \
             "https://github.com/rhysd/actionlint/releases/download/v${ver}/actionlint_${ver}_linux_amd64.tar.gz"
           echo "${sha256}  /tmp/actionlint.tar.gz" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/actionlint-bin"
           tar -C "$RUNNER_TEMP/actionlint-bin" -xzf /tmp/actionlint.tar.gz actionlint
+          # [issue #849] BOTH digests, as scripts/worker-live.sh's _fetch_pinned_actionlint_unpack
+          # already does: a verified tarball does not prove a correct EXTRACTED binary (partial
+          # extraction, tar quirk). Verified BEFORE $GITHUB_PATH, so a mismatch kills the gate here
+          # rather than putting an unverified binary on PATH for the lint step to execute.
+          echo "${bin_sha256}  $RUNNER_TEMP/actionlint-bin/actionlint" | sha256sum -c -
           echo "$RUNNER_TEMP/actionlint-bin" >> "$GITHUB_PATH"
 
       - name: Run the full registry self-test suite (sandboxed — no self-test may reach the real gh)

@@ -413,6 +413,11 @@ class Watchdog:
         return env
 
     def _default_read(self, args, token):
+        # `run_gh` executes `["gh", *args]` -- it prepends the binary ITSELF. So every argv handed
+        # to gh_read starts at the SUBCOMMAND ("api", ...), never at "gh". Passing "gh" too runs
+        # `gh gh api ...` -> `unknown command "gh" for "gh"` -> rc=1 on every read, which is
+        # exactly how this tool failed 16/16 runs (#1137). The write seam is the opposite: it
+        # execs the argv verbatim, so `_default_write` argvs DO carry "gh". Block (r) pins both.
         result = _load_gh_retry().run_gh(list(args), env=self._env(token))
         return result.returncode, result.stdout or ""
 
@@ -425,7 +430,7 @@ class Watchdog:
         owner, name = repo.split("/", 1)
         records, cursor = [], None
         while True:
-            args = ["gh", "api", "graphql", "-f", "query=" + OPEN_PR_QUERY,
+            args = ["api", "graphql", "-f", "query=" + OPEN_PR_QUERY,
                     "-F", "owner=" + owner, "-F", "name=" + name]
             if cursor:
                 args += ["-F", "cursor=" + cursor]
@@ -462,7 +467,7 @@ class Watchdog:
     def fetch_gate(self, pr, token):
         """The required check at the EXACT head sha. A force-push leaves a real pass latched to a
         superseded head, so this is queried per-commit and never read off the PR rollup."""
-        args = ["gh", "api", "repos/%s/commits/%s/check-runs?check_name=%s&per_page=100"
+        args = ["api", "repos/%s/commits/%s/check-runs?check_name=%s&per_page=100"
                 % (pr["repo"], pr["head_sha"], self.required_check)]
         code, out = self.gh_read(args, token)
         if code != 0:
@@ -490,7 +495,7 @@ class Watchdog:
         anyone, so the author is filtered by exact login equality against the actor the workflow
         minted -- a marker is only evidence when we know who wrote it. Logins are globally unique
         and unforgeable, which is what makes the equality sound."""
-        args = ["gh", "api", "repos/%s/issues/%d/comments?per_page=100"
+        args = ["api", "repos/%s/issues/%d/comments?per_page=100"
                 % (pr["repo"], pr["number"]), "--paginate"]
         code, out = self.gh_read(args, token)
         if code != 0:
@@ -1375,6 +1380,116 @@ def _self_test():
     chk("no mutation call site carries a label flag, so no human-terminal label can be written",
         sorted({flag for argv in write_argvs for flag in argv
                 if flag in ("--add-label", "--remove-label", "--edit", "--label")}), [])
+
+    # -- (r) THE PRODUCTION READ PATH, driven end to end. ---------------------------------------
+    # Every block above injects `gh_read=fake.read`, so `_default_read` -- the ONLY read path a
+    # live run takes -- had ZERO line coverage and nothing anywhere asserted the argv this tool
+    # actually executes. #1137: all three read builders prepended "gh" to an argv that
+    # `gh_retry.run_gh` already prefixes with "gh", so production ran `gh gh api …`, every read
+    # returned rc=1, and all 16 runs since launch concluded `failure` -- each one seconds after
+    # printing "latch-watchdog self-test PASSED". So this block injects NOTHING at the watchdog
+    # seam: it stubs the process boundary underneath the real gh_retry and reads back the argv.
+    real_run = subprocess.run
+    spawned = []
+
+    def _stub_response(cmd):
+        """The process boundary, stubbed BELOW gh_retry: gh's own argv reaches here verbatim."""
+        joined = " ".join(str(part) for part in cmd)
+        body = prs_json if "query=" in joined else (
+            gate_json if "check-runs" in joined else "[]")
+        return subprocess.CompletedProcess(cmd, 0, stdout=body, stderr="")
+
+    def _record_spawn(cmd, **kwargs):
+        spawned.append(list(cmd))
+        return _stub_response(cmd)
+
+    live = Watchdog(apply_changes=False, grace_seconds=DEFAULT_GRACE_SECONDS,
+                    required_check="gate", deny_labels=DEFAULT_DENY_LABELS,
+                    require_label="review:pass", max_actions_per_head=2, max_actions_per_run=5,
+                    marker_actor="sparq-bot[bot]", clock=lambda: 0.0)
+    # The reads are caught and NAMED rather than allowed to propagate: with the #1137 argv,
+    # `run_gh` now raises on the doubled binary, and a traceback out of the last block would
+    # abort the suite -- which records as a crash, not as a kill, and prints no row at all
+    # (AGENTS.md pre-flight 4, "crash-after-partial-run"). Every row below still runs.
+    live_prs, live_gate, live_markers, read_error = [{}], {}, None, None
+    try:
+        subprocess.run = _record_spawn
+        try:
+            live_prs = live.list_open_prs("sparq-org/latch-watchdog-fixture-repo", "t")
+            live_gate = live.fetch_gate(live_prs[0], "t")
+            live_markers = live.fetch_markers(live_prs[0], "t")
+        except Exception as exc:
+            read_error = "%s: %s" % (type(exc).__name__, exc)
+    finally:
+        subprocess.run = real_run
+    chk("READ PATH: the production read path completes without raising", read_error, None)
+    # THE ROW #1137 WOULD HAVE REDDED. Not "an argv was built" -- the argv the OS was handed.
+    # With the shipped bug this reads [['gh','gh'], ['gh','gh'], ['gh','gh']].
+    chk("READ PATH: `gh` is prepended by gh_retry, so every executed read starts `gh api` -- "
+        "exactly one binary token",
+        [cmd[:2] for cmd in spawned], [["gh", "api"]] * 3)
+    # The same invariant read through gh_retry's OWN parser, which is what decides retry scope:
+    # the doubled form parsed as verb ("gh","api") -- outside the admit-list -- so the reads also
+    # silently lost their retries and logged a refusal naming `api` as admitted.
+    shapes = [_load_gh_retry().gh_request_shape(cmd[1:])["verb"] for cmd in spawned]
+    chk("READ PATH: every read parses as the `api` verb under gh_retry's own scope parser",
+        shapes, [("api",)] * 3)
+    # ANTI-VACUITY: all three readers really ran, hit three distinct endpoints, and returned
+    # PARSED data. A stub that spawned nothing, or a reader that raised, cannot satisfy this.
+    chk("READ PATH: all three production readers executed, against three distinct endpoints",
+        (len(spawned), sorted({("graphql" if "graphql" in cmd else
+                                "check-runs" if any("check-runs" in p for p in cmd) else
+                                "comments") for cmd in spawned})),
+        (3, ["check-runs", "comments", "graphql"]))
+    chk("READ PATH: the responses parse into the records the predicate consumes",
+        ((live_prs[0] or {}).get("number"), (live_prs[0] or {}).get("head_sha"),
+         (live_gate or {}).get("total"), live_markers),
+        (999000617, "cd0ca3f", 1, (0, None)))
+    # ...AND WHAT THE FIX DELIVERS INTO. Correct argv is only worth anything because the census
+    # depends on it: the shipped tool emitted `CENSUS-TOTAL {"considered":0,"errors":2}` on all 16
+    # runs, i.e. it never reached `classify` at all. Same production seam, now driven through the
+    # whole `run()` -- so a break anywhere in the read chain shows up as the operator-visible
+    # number rather than as an argv detail.
+    def _stub_spawn(cmd, **kwargs):
+        return _stub_response(cmd)
+
+    swept = Watchdog(apply_changes=False, grace_seconds=DEFAULT_GRACE_SECONDS,
+                     required_check="gate", deny_labels=DEFAULT_DENY_LABELS,
+                     require_label="review:pass", max_actions_per_head=2, max_actions_per_run=5,
+                     marker_actor="sparq-bot[bot]",
+                     clock=lambda: parse_iso("2026-07-28T08:46:00Z"))
+    try:
+        subprocess.run = _stub_spawn
+        swept_rc = swept.run(["sparq-org/latch-watchdog-fixture-repo"], {"sparq-org": "t"}, 0)
+    finally:
+        subprocess.run = real_run
+    swept_row = swept.census[0] if swept.census else {}
+    chk("READ PATH: a dry-run sweep through the PRODUCTION seam CONSIDERS the dead latch and "
+        "records no errors -- the measured 16/16 failure was considered=0 errors=2",
+        (swept_rc, swept_row.get("considered"), swept_row.get("errors"),
+         swept_row.get("skipped"), swept.errors), (0, 1, 0, {"dry-run": 1}, []))
+    # STATIC, so a read call site added tomorrow and never exercised cannot re-introduce this.
+    # Paired with its own control: the WRITE builders legitimately carry "gh" (they exec the argv
+    # verbatim via `_default_write`), and asserting the scan still SEES that shape is what proves
+    # the scan can fail at all.
+    def _leading_gh_argvs(fn_names):
+        found = []
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.FunctionDef) and node.name in fn_names):
+                continue
+            for inner in ast.walk(node):
+                if not (isinstance(inner, ast.List) and inner.elts):
+                    continue
+                head = inner.elts[0]
+                if isinstance(head, ast.Constant) and head.value == "gh":
+                    found.append("%s:%d" % (node.name, inner.lineno))
+        return sorted(found)
+
+    chk("READ PATH: no reader builds an argv beginning with the binary gh_retry prepends",
+        _leading_gh_argvs({"list_open_prs", "fetch_gate", "fetch_markers"}), [])
+    chk("READ PATH CONTROL: the same scan DOES see the write builders, which exec their argv "
+        "verbatim and so must carry `gh` -- the scan can fail",
+        len(_leading_gh_argvs({"post_marker", "disarm", "rearm"})), 3)
 
     print("latch-watchdog self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
