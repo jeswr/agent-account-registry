@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5150,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "34ae933bb1e36373c09a34d2e16d704ee12f4f9c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The advisory lane is internally consistent: jscpd is exactly version-pinned, its threshold failure is intentionally contained, missing/invalid and vacuous reports are explicitly identified rather than presented as clean results, and the JSON summary separates markdown-class findings from fenced-code formats. The configuration scope and reachable nested-target exclusion match the workflow documentation, while the advisory registry limits any future promotion to the exact fenced-code half. No correctness, soundness, test-validity, or security defect requiring changes was found in the diff.",
+  "verdict": "approve"
+ }
+}
