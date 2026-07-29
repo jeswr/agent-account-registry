@@ -1096,10 +1096,21 @@ jobs:
         env:
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
           EXPECTED_HARNESS: ${{ steps.selected.outputs.harness }}
+          # [issue #232] The prepared paths arrive as STEP OUTPUTS now, not as job-wide $GITHUB_ENV.
+          PREPARED_HOME: ${{ steps.prepare.outputs.home }}
+          PREPARED_CREDENTIAL: ${{ steps.prepare.outputs.credential_path }}
         run: |
           set -euo pipefail
-          [[ "$HOME" == "$WORKER_ROOT/home" ]]
+          [[ "$PREPARED_HOME" == "$WORKER_ROOT/home" ]]
+          [[ "$PREPARED_CREDENTIAL" == "$PREPARED_HOME/"* ]]
+          [[ -f "$PREPARED_CREDENTIAL" && ! -L "$PREPARED_CREDENTIAL" ]]
           [[ -x "$WORKER_ROOT/cli/node_modules/.bin/$EXPECTED_HARNESS" ]]
+          # [issue #232] ...and NOTHING naming the account or pointing at its credential leaked into
+          # the job environment, where every later step — including the target-controlled gate on a
+          # live run — would inherit it. This assertion is what makes a re-broadening of worker-prep's
+          # exports a red dry run rather than a silent reopening of the exposure window.
+          [[ -z "${WORKER_ACCOUNT:-}" && -z "${WORKER_CREDENTIAL_PATH:-}" \
+             && -z "${WORKER_CREDENTIAL_BASELINE:-}" && "$HOME" != "$WORKER_ROOT"* ]]
           printf 'DRY-RUN complete: policy, target token, checkout, and worker-prep passed.\n'
           printf 'No lease was claimed, no model was run, and no pull request was opened.\n'
 
@@ -1133,6 +1144,14 @@ jobs:
           WORKER_PROVIDER_MODEL: ${{ steps.selected.outputs.provider_model }}
           WORKER_AGENT: ${{ needs.resolve.outputs.agent }}
           WORKER_PACKAGES: ${{ needs.resolve.outputs.packages }}
+          # [issue #232] The account credential reaches the harness HERE and only here (plus the
+          # write-back below). It used to arrive through worker-prep's job-wide $GITHUB_ENV export,
+          # which left the path — and the isolated HOME holding it — readable by every later step,
+          # the target-controlled gate included. The harness metadata comes from the account
+          # SELECTION step (its single source), the path from prepare's step output.
+          WORKER_HARNESS: ${{ steps.selected.outputs.harness }}
+          WORKER_CREDENTIAL_FORMAT: ${{ steps.selected.outputs.credential_format }}
+          WORKER_CREDENTIAL_PATH: ${{ steps.prepare.outputs.credential_path }}
         run: bash ../registry/scripts/worker-live.sh model
 
       # Model-access health (registry #32): capture the sanitized exit CLASS so the separate
@@ -1271,9 +1290,40 @@ jobs:
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
           WORKER_ACCOUNT: ${{ steps.selected.outputs.account }}
           WORKER_SECRET_REF: ${{ steps.selected.outputs.secret_ref }}
+          # [issue #232] The mount-containment inputs (issue #134's tamper check: the mounted
+          # credential must come back byte-identical to what prepare materialized) reach the
+          # write-back as STEP-LEVEL env, no longer through job-wide $GITHUB_ENV. Both are EMPTY
+          # when prepare aborted before materializing the mount — exactly what they were in that
+          # case before, so write_back's rescued no-mount path (#614) is unchanged. This is `env:`,
+          # never the `if:`: gating this compensating step on a prepare output is precisely the
+          # unreachability defect dispatch-secrets-guard refuses.
+          WORKER_CREDENTIAL_PATH: ${{ steps.prepare.outputs.credential_path }}
+          WORKER_CREDENTIAL_BASELINE: ${{ steps.prepare.outputs.credential_baseline }}
           REGISTRY_REPO: ${{ github.repository }}
           REGISTRY_SECRETS_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
         run: bash registry/scripts/worker-live.sh write-back
+
+      # [issue #232 review r2] THE CREDENTIAL FILES, not just the pointers. Keeping
+      # WORKER_CREDENTIAL_PATH and the isolated HOME out of the job-wide $GITHUB_ENV (above) stops
+      # any later step being HANDED the credential; it does not stop one FINDING it. GitHub supplies
+      # $RUNNER_TEMP to every step unconditionally, WORKER_ROOT is `$RUNNER_TEMP/registry-worker`,
+      # and the two steps below run TARGET-CONTROLLED code as this same runner user — rustup honours
+      # the target's own `rust-toolchain.toml`, and the gate executes its build scripts and tests. A
+      # mode-600 file owned by that user is readable to it. So the tree goes NOW, while every step
+      # that has run so far is host-authored.
+      #
+      # It must sit after the write-back (which reads the rotation baseline and the mounted
+      # credential to make #134's containment assertion) and before the toolchain step. `always()`,
+      # never a success guard: the window this closes is widest on the runs that FAILED, and a purge
+      # skipped by a failed model step is a purge that was not there. A purge that cannot remove the
+      # material exits nonzero, and the gate's own `if:` carries an implicit `success()`, so the
+      # target's code never runs on a runner that still holds the account credential.
+      - name: Purge the account credential tree before any target-controlled code
+        id: purge
+        if: ${{ always() }}
+        env:
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+        run: bash registry/scripts/worker-live.sh purge-credentials
 
       - name: Ensure a Rust toolchain for the crate-scoped gate
         # [OPUS-4.8] The gate runs `cargo clippy/test` directly on the runner; a stock ubuntu-latest may

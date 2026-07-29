@@ -381,11 +381,11 @@ whose enrolment died before registration, and it needs the account issue written
   - **The write-back is reachable from the pre-flight's FAILURE path.** The exchange consumes the
     one-time-use grant early inside the credential-prepare step, so the write-back step is keyed to
     `always()` plus the account selection — never to that step succeeding. Any later failure in
-    prepare (the no-leak assertion, the tamper baseline, the pinned CLI install, the `$GITHUB_ENV`
+    prepare (the no-leak assertion, the tamper baseline, the pinned CLI install, the step-output
     export) would otherwise discard a grant the provider had already rotated, leaving the account
     permanently unable to authenticate. `worker-prep.sh` writes the durable material, the credential
     format, and the rotation marker at the moment the rotation happens, so a write-back reached with
-    no mount and no exported environment still knows what to persist and how to validate it;
+    no mount and no exported paths still knows what to persist and how to validate it;
     `dispatch-secrets-guard.rotation_writeback_reachable_verdict` asserts that reachability in both
     worker lanes, and the obligation is **universal, not existential**: the step's `if:` must evaluate
     TRUE on every path where a rotation may already have happened, and may reference only facts settled
@@ -416,6 +416,26 @@ whose enrolment died before registration, and it needs the account issue written
     `::error::` line for `credential-remint-required` must not assert the grant "is dead": the class
     covers both a provider-confirmed dead grant and an indeterminate outcome whose fate is unknown and
     which was deliberately not re-sent.
+  - **The credential never becomes job-wide environment.** `worker-prep.sh` emits the isolated `HOME`,
+    the materialized credential path and its rotation baseline as **step outputs**, not as
+    `$GITHUB_ENV` (#232). Each lane then routes them by hand to the only steps that need them — the
+    model/review/fix run and the rotation write-back — so the policy gate, which executes the target's
+    own build scripts and tests on that runner, never inherits a pointer to the account credential,
+    the raw account handle, or a `HOME` the model itself could write. `worker-live.sh`'s self-test
+    asserts the routing on both live workflows and that a successful prepare writes **nothing** to
+    `$GITHUB_ENV`.
+  - **...and the credential FILES leave the runner before any target-controlled code runs.** Routing
+    decides which steps are *handed* the path; it does not decide which steps can *find* it. GitHub
+    supplies `$RUNNER_TEMP` to every step unconditionally, the credential is materialized under
+    `$RUNNER_TEMP/registry-worker`, and the gate's build scripts run as the runner user that owns
+    that mode-600 file — so both lanes call `worker-live.sh purge-credentials` in an `always()` step
+    ordered after the rotation write-back and **before** the rustup pin and the gate. It removes the
+    isolated `HOME` and every host-side credential artifact, then re-scans for residue and **dies**
+    if anything survived, so the gate's implicit `success()` keeps the target's code off a runner
+    that still holds the credential. Non-vacuous both ways: the self-test reads a real prepared tree
+    through a gate-shaped reader that has only `$RUNNER_TEMP` (it finds the credential before the
+    purge and nothing after), pins the purge/toolchain/gate ordering on both live workflows against
+    a moved-late and a deleted mutant, and proves an un-removable credential fails the step closed.
 - On this work box, pre-provisioned Anthropic setup-tokens already exist as files
   `~/.claude-acctN-token` (one per account). Read the file; do not echo it.
 
