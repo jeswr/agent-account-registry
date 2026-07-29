@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "efb4eb2781de6958",
-   "claim_id": "b8fe33a3eaf14b3da717aa9cd544d364",
-   "holder": "fix:sparq-org/sparq#5076@dispatch-30475283373.1",
-   "package": "docs",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785346298,
-   "expires_at": 1785352598
-  },
-  {
-   "account": "efb4eb2781de6958",
    "claim_id": "d15c850875ec4cd08bbb475e7762bfb3",
    "holder": "jeswr/agent-account-registry#291@30475802004.1",
    "package": "groom",
