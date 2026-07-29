@@ -31,16 +31,6 @@
    "expires_at": 1785321944
   },
   {
-   "account": "dc2d751954080e13",
-   "claim_id": "476c715ff2b34d55858302ce41a9bf68",
-   "holder": "fix:sparq-org/sparq#5024@dispatch-30437442883.1",
-   "package": "docs",
-   "role": "fix",
-   "model": "sol",
-   "issued_at": 1785315654,
-   "expires_at": 1785321954
-  },
-  {
    "account": "efb4eb2781de6958",
    "claim_id": "12c987927ede4ee68502302a83eb8cc2",
    "holder": "fix:jeswr/agent-account-registry#1205@dispatch-30437442883.1",
