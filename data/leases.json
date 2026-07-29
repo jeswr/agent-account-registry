@@ -1,16 +1,6 @@
 {
  "leases": [
   {
-   "account": "dc2d751954080e13",
-   "claim_id": "5927dbf6c6c4456391e71bb8528023ba",
-   "holder": "review:jeswr/agent-account-registry#1093@dispatch-30406715612.1",
-   "package": "workflows",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785280799,
-   "expires_at": 1785284999
-  },
-  {
    "account": "9e13ea21abf27e68",
    "claim_id": "1cd8e07c2adb4d48b9f86b6b3770c8b7",
    "holder": "sparq-org/sparq#2746@30407902070.1",
@@ -39,16 +29,6 @@
    "model": "opus5",
    "issued_at": 1785283109,
    "expires_at": 1785289409
-  },
-  {
-   "account": "51bde6688e140866",
-   "claim_id": "59a8b14762e549c1ac9cf1b8e9401e20",
-   "holder": "jeswr/agent-account-registry#1088@30409737031.1",
-   "package": "groom",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785283203,
-   "expires_at": 1785285903
   },
   {
    "account": "51bde6688e140866",
