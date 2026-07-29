@@ -31,12 +31,65 @@ from urllib.request import Request, urlopen
 
 
 API_ROOT = "https://api.github.com"
+# THE HOLDS THIS PROGRAM STANDS OFF FROM — but only when a HUMAN applied them (registry #1191).
+#
+# `needs:user` appears on BOTH edges of this program: `_escalate_two_head` WRITES it, and this set
+# EXCLUDES it. Read as a bare label set that is a closed loop — the resolver fails to converge on a
+# PR, applies the human terminal, and thereby permanently removes that PR from its own candidate
+# population. MEASURED on the live registry 2026-07-29: 17 of 17 conflicting open PRs were dropped
+# at that one predicate, 14 of them holding a hold whose newest application was made by
+# `sparq-orchestrator[bot]`, i.e. by this estate rather than by a person; production ran
+# `attempted:0` with `no_exit:0` and exit code 0 in 100 of 100 sampled runs.
+#
+# The exclusion is NOT the defect and is not deleted: a person who applies one of these is
+# mid-decision, and a machine that rebases under them is fighting them. What is deleted is the
+# assumption that the LABEL identifies the actor. Ownership is now READ from the timeline, per
+# label, across the PR and its source issue (`_hold_ownership`), and only a proven human holds.
 HARD_EXCLUDE_LABELS = {
     "needs:user",
     "review:needs-user",
     "needs:design",
     "trust-surface",
     "trust:untrusted",
+}
+# --- WHO OWNS THE FORWARD EDGE OF A SKIPPED PR ------------------------------------------------
+#
+# The second, deeper half of #1191: 114 consecutive runs reported `success` while attempting zero
+# work, because a run that EXCLUDED EVERY CANDIDATE is byte-identical, in both exit code and
+# summary line, to a run that had NOTHING TO DO. A lane that cannot tell those apart re-grows this
+# defect wherever the next exclusion is added.
+#
+# So every skip key is classified by WHO advances that PR next, and the classification is total —
+# `_skip` treats an unclassified key as UNOWNED and says so. That default direction is the whole
+# point: under a blacklist a newly added skip reason is silently benign, under this whitelist it is
+# loud until somebody names its owner.
+OWNER_OUT_OF_POPULATION = "out-of-population"   # not a conflicting PR; nothing to own
+OWNER_ELSEWHERE = "owned"                       # a person, another lane, or a bounded timer owns it
+OWNER_NONE = "unowned"                          # nothing will advance this PR; the run did nothing
+SKIP_OWNERSHIP = {
+    # Never entered the conflicting population.
+    "invalid-pr-number": OWNER_OUT_OF_POPULATION,
+    "mergeability-computing": OWNER_OUT_OF_POPULATION,
+    "not-conflicting": OWNER_OUT_OF_POPULATION,
+    "no-owner-token": OWNER_OUT_OF_POPULATION,
+    # Conflicting, and somebody else's move.
+    "hard-exclusion-label": OWNER_ELSEWHERE,        # a PROVEN human — checked, no longer assumed
+    "two-head-exhausted-stands": OWNER_ELSEWHERE,   # the human the escalation already asked
+    "stuck-park-stands": OWNER_ELSEWHERE,           # a cause-gated machine park
+    "awaiting-author-grace": OWNER_ELSEWHERE,       # the author, bounded by --stuck-grace-hours
+    "dependabot-already-requested": OWNER_ELSEWHERE,
+    "review-lane-owned": OWNER_ELSEWHERE,
+    "fork-pr": OWNER_ELSEWHERE,                     # out of scope by construction
+    "non-default-base": OWNER_ELSEWHERE,            # out of scope by construction
+    "rebase-cap-reached": OWNER_ELSEWHERE,          # the next run, and the cap is in the census
+    # Conflicting, and nobody's move.
+    "hold-ownership-unreadable": OWNER_NONE,
+    "attempt-timestamp-unusable": OWNER_NONE,
+    "rebase-no-op": OWNER_NONE,
+    # `_handle_conflict`'s pre-existing dead arm (documented at its site). Unreachable by
+    # construction today, and classified UNOWNED precisely so that if some future change makes it
+    # reachable the run says so instead of absorbing it.
+    "duplicate-attempt-this-run": OWNER_NONE,
 }
 DEPENDABOT_LOGIN = "dependabot[bot]"
 DEPENDABOT_MARKER = "<!-- conflict-resolver head={head} -->"
@@ -143,8 +196,29 @@ def _load_helper(name, filename):
     if spec is None or spec.loader is None:
         raise ResolverError(f"cannot load registry helper {filename}")
     module = importlib.util.module_from_spec(spec)
+    # Registered BEFORE execution: `@dataclass` resolves its own module through `sys.modules` at
+    # class-creation time, so a helper defining one raises AttributeError under a loader that
+    # only registers afterwards (groom.py does; measured).
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+_GROOM_MODULE = None
+
+
+def _groom():
+    """Cached groom.py — IMPORTED for `linked_issue_numbers`, never re-implemented here.
+
+    The hold-ownership decision spans a PR *and its source issue*, so this program has to answer
+    "which issue?" — the same question groom answers for its own park hand-off. Two spellings of
+    PR→issue linkage drift silently in the anti-conservative direction: a resolver that fails to
+    find the issue reads only the PR, misses a human hold living on the issue, and rebases under
+    the person it was written to stand off from. One regex pair, one owner."""
+    global _GROOM_MODULE
+    if _GROOM_MODULE is None:
+        _GROOM_MODULE = _load_helper("registry_groom_conflict_resolver", "groom.py")
+    return _GROOM_MODULE
 
 
 # Shared park-label policy: the terminal needs:user write consults the sticky human-unpark
@@ -859,6 +933,15 @@ class RepoCensus:
     stuck_readmitted: int = 0
     stuck_park_stands: int = 0
     awaiting_author: int = 0
+    # --- THE HOLD-OWNERSHIP SPLIT (#1191) -----------------------------------------------------
+    # `held_human` is the population this program is CORRECT to leave alone; `held_released` is
+    # the population it used to leave alone by mistake. Reporting only their sum is what made an
+    # entirely self-inflicted exclusion indistinguishable from an entirely human one.
+    held_human: int = 0
+    held_released: int = 0
+    # Conflicting PRs skipped into a state whose forward edge belongs to NOBODY (SKIP_OWNERSHIP).
+    # The term that turns "attempted nothing" from a fact into a verdict.
+    unowned: int = 0
     no_exit: int = 0
     errors: int = 0
     skipped: dict = field(default_factory=dict)
@@ -884,6 +967,9 @@ class RepoCensus:
             "stuck_readmitted": self.stuck_readmitted,
             "stuck_park_stands": self.stuck_park_stands,
             "awaiting_author": self.awaiting_author,
+            "held_human": self.held_human,
+            "held_released": self.held_released,
+            "unowned": self.unowned,
             "no_exit": self.no_exit,
             "errors": self.errors,
             "skipped": dict(sorted(self.skipped.items())),
@@ -896,7 +982,8 @@ def _aggregate_census(rows):
         for key in ("considered", "conflicting", "conflicting_draft", "conflicting_ready",
                     "selected", "attempted", "resolved", "escalated", "exit_two_head",
                     "exit_stuck_grace", "parked_machine", "parked_human", "stuck_readmitted",
-                    "stuck_park_stands", "awaiting_author", "no_exit", "errors")
+                    "stuck_park_stands", "awaiting_author", "held_human", "held_released",
+                    "unowned", "no_exit", "errors")
     }
     skipped = {}
     for row in rows:
@@ -904,7 +991,37 @@ def _aggregate_census(rows):
             skipped[key] = skipped.get(key, 0) + count
     total["repos"] = len(rows)
     total["skipped"] = dict(sorted(skipped.items()))
+    total["verdict"] = run_verdict(total)
     return total
+
+
+# --- THE THREE-WAY RUN VERDICT (registry #1191) -----------------------------------------------
+VERDICT_ACTED = "acted"
+VERDICT_IDLE = "correctly-idle"
+VERDICT_INERT = "INERT"
+# The dimensions that constitute DOING SOMETHING. `selected` is included because the dependabot
+# path consumes budget and posts without ever touching `attempted`; `stuck_readmitted` because
+# clearing a park is forward motion even when no rebase followed it in the same run.
+WORK_DIMENSIONS = ("attempted", "resolved", "escalated", "selected", "stuck_readmitted")
+
+
+def run_verdict(total):
+    """PURE. ``acted`` / ``correctly-idle`` / ``INERT`` from an aggregated census.
+
+    This is the assertion #1191 is actually about. `attempted:0` is not by itself a fault — a
+    sweep with no conflicting PRs, or one where every conflicting PR is genuinely held by a named
+    owner, is doing exactly its job and must stay green, or the alarm gets muted and stops being
+    read. The fault is `attempted:0` reached by EXCLUDING EVERYTHING: work done is zero AND at
+    least one conflicting PR was dropped into a state whose forward edge belongs to nobody.
+
+    The two terms are independent on purpose. Work alone cannot express it (a run that escalated
+    one PR and silently swallowed thirty scores as work). Unowned alone cannot express it either
+    (a run that repaired five PRs and left one unowned is a partial success, and the existing
+    per-PR `no_exit` alarm already owns that case). Only the conjunction says "this run's entire
+    output was exclusion", which is the state that ran 114 times reporting success."""
+    if any(total.get(key, 0) for key in WORK_DIMENSIONS):
+        return VERDICT_ACTED
+    return VERDICT_INERT if total.get("unowned", 0) > 0 else VERDICT_IDLE
 
 
 def render_census_summary(rows, total):
@@ -912,11 +1029,16 @@ def render_census_summary(rows, total):
     lines = [
         "### conflict-resolver census",
         "",
+        f"**verdict: `{total.get('verdict', run_verdict(total))}`** — "
+        f"{total['conflicting']} conflicting PR(s) seen, "
+        f"{total['attempted']} attempted, {total['unowned']} left with no owner.",
+        "",
         "| repo | considered | conflicting (ready/draft) | attempted | resolved | escalated "
         "| exit: 2-head | exit: stuck-grace | park: machine | park: human | re-admitted "
-        "| park stands | awaiting author | no exit | errors |",
+        "| park stands | awaiting author | held: human | held: released | unowned | no exit "
+        "| errors |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
-        "| ---: | ---: | ---: |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in [*rows, {**total, "repo": f"**all {total['repos']} repo(s)**"}]:
         lines.append(
@@ -926,7 +1048,8 @@ def render_census_summary(rows, total):
             f"{row['exit_two_head']} | {row['exit_stuck_grace']} | "
             f"{row['parked_machine']} | {row['parked_human']} | "
             f"{row['stuck_readmitted']} | {row['stuck_park_stands']} | "
-            f"{row['awaiting_author']} | {row['no_exit']} | {row['errors']} |"
+            f"{row['awaiting_author']} | {row['held_human']} | {row['held_released']} | "
+            f"{row['unowned']} | {row['no_exit']} | {row['errors']} |"
         )
     if total["skipped"]:
         lines += ["", "Skip reasons:", ""]
@@ -958,6 +1081,11 @@ class ConflictResolver:
         self.budget_used = 0
         self.census = []
         self.current = RepoCensus("")
+        # Whether the PR being processed right now has already been counted into the CONFLICTING
+        # population. Read by `_skip` so ownership accounting cannot drift from the population it
+        # describes: a skip before this flag is set is out-of-population by construction, and no
+        # call site has to remember to say so.
+        self._in_population = False
 
     def _record(self, kind, repo, number, detail=""):
         self.actions.append((kind, repo, number, detail))
@@ -965,8 +1093,21 @@ class ConflictResolver:
         print(f"{mode} {repo}#{number}: {kind}{(': ' + detail) if detail else ''}")
 
     def _skip(self, repo, number, reason, key=None):
-        self.current.skip(key or reason)
+        key = key or reason
+        self.current.skip(key)
         print(f"SKIP {repo}#{number}: {reason}")
+        if not self._in_population:
+            return
+        owner = SKIP_OWNERSHIP.get(key)
+        if owner is None:
+            # A skip reason nobody classified. It is counted as UNOWNED and announced, because the
+            # alternative default — assume somebody owns it — is exactly how 35 excluded PRs a
+            # tick stayed invisible to an alarm written to catch them.
+            print(f"::warning::conflict-resolver skip reason {key!r} has no entry in "
+                  "SKIP_OWNERSHIP; counting it as unowned", file=sys.stderr)
+            owner = OWNER_NONE
+        if owner == OWNER_NONE:
+            self.current.unowned += 1
 
     def _error(self, target, exc):
         cause = str(exc) or type(exc).__name__
@@ -1050,7 +1191,25 @@ class ConflictResolver:
         about it changes here."""
         number = pr["number"]
         bodies = _comment_bodies(_self_authored_comments(comments, self.bot_login))
-        if not any(ESCALATION_MARKER in body for body in bodies):
+        escalated_already = any(ESCALATION_MARKER in body for body in bodies)
+        if escalated_already and HUMAN_PARK_LABEL in _label_names(pr):
+            # ALREADY DELIVERED — not work, and it must not read as work (registry #1191).
+            #
+            # The hold-ownership split re-admits a PR this program itself parked, so a genuinely
+            # exhausted one arrives here on EVERY tick. Re-posting is deduped and re-labelling is
+            # a no-op, so the writes were already harmless; what is not harmless is counting an
+            # unchanged PR as an escalation, because `escalated` is a WORK dimension and two such
+            # PRs would score every future run as `acted` and permanently mute the INERT verdict.
+            # A run whose entire output is re-asserting yesterday's escalations did nothing.
+            #
+            # The conjunction is load-bearing in the other direction too: marker-without-label is
+            # the interrupted-mutation state the ordering below exists to converge, so it is NOT
+            # caught here and still falls through to re-apply the label.
+            self._skip(repo, number,
+                       "two-distinct-head exhaustion already escalated and held",
+                       "two-head-exhausted-stands")
+            return
+        if not escalated_already:
             self._post(repo, number, escalation_body(
                 EXIT_TWO_HEAD, conflicts, len(attempt_heads(comments, self.bot_login)),
                 HUMAN_PARK_LABEL, receipt=ESCALATION_MARKER))
@@ -1206,7 +1365,67 @@ class ConflictResolver:
             synthetic = comments + [{"body": marker, "user": {"login": self.bot_login}}]
             self._escalate_two_head(repo, pr, synthetic, conflicts)
 
+    def _hold_ownership(self, repo, number, detail, label):
+        """Who owns `label` on this PR: ``"human"``, ``"machine"`` or ``"unknown"``.
+
+        THE EDGE THAT WAS CUT (registry #1191). The old predicate read the label NAME and inferred
+        an actor from it. `_escalate_two_head` writes `needs:user`, so this program's own failures
+        became indistinguishable from a person's decision, and every one of them permanently
+        removed a PR from the population this program exists to drain. Measured on the live
+        registry: 14 of 17 excluded conflicting PRs were held by a label the estate's own bot had
+        applied, three by a person.
+
+        TWO SURFACES, ASYMMETRIC AUTHORITY. The PR's own timeline must positively prove MACHINE
+        ownership — human, absent, or unreadable all keep the hold. The source issue can only
+        ESCALATE that answer to human, never rescue it to machine: a question a person asked on
+        the issue is not answered by a bot re-labelling the PR a second later, and an issue with
+        no such label proves nothing about the PR's. So the issue is consulted only when the PR
+        already said machine, and any human application on any surface wins.
+
+        The tie/fail directions live in park_policy.label_application_ownership and are shared
+        with groom, dispatch-claim and both reconcilers rather than restated here."""
+        def probe(_repo, target):
+            return self.api.timeline(_repo, target)
+
+        def is_human(login):
+            return _is_human_maintainer(self.api, repo, login)
+
+        state = _park_policy.label_application_ownership(
+            repo, number, label, probe, is_human=is_human)
+        if state != _park_policy.LABEL_OWNER_MACHINE:
+            return state
+        try:
+            issues = sorted(self._groom_linked_issues(detail))
+        except Exception as exc:  # noqa: BLE001 — an unreadable linkage proves nothing
+            print(f"::warning::conflict-resolver could not read the source-issue linkage for "
+                  f"{repo}#{number} ({exc}); the hold stands", file=sys.stderr)
+            return _park_policy.LABEL_OWNER_UNKNOWN
+        for issue in issues:
+            if issue == number:
+                continue
+            if _park_policy.label_application_ownership(
+                    repo, issue, label, probe,
+                    is_human=is_human) == _park_policy.LABEL_OWNER_HUMAN:
+                print(f"HOLD {repo}#{number}: {label!r} is human-owned via source issue #{issue}")
+                return _park_policy.LABEL_OWNER_HUMAN
+        return _park_policy.LABEL_OWNER_MACHINE
+
+    def _groom_linked_issues(self, detail):
+        return _groom().linked_issue_numbers(detail)
+
+    def _classify_holds(self, repo, number, detail, holds):
+        """``(human_holds, unreadable_holds)`` for the live hard-exclusion labels on this PR."""
+        human, unreadable = [], []
+        for label in holds:
+            state = self._hold_ownership(repo, number, detail, label)
+            if state == _park_policy.LABEL_OWNER_HUMAN:
+                human.append(label)
+            elif state != _park_policy.LABEL_OWNER_MACHINE:
+                unreadable.append(label)
+        return human, unreadable
+
     def _process_pr(self, repo, default_branch, listed_pr):
+        self._in_population = False
         number = listed_pr.get("number")
         if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
             self._skip(repo, "unknown", "invalid PR number in listing", "invalid-pr-number")
@@ -1231,6 +1450,7 @@ class ConflictResolver:
                 self._skip(repo, number, "base is not conflicting", "not-conflicting")
             return
         self.current.conflicting += 1
+        self._in_population = True
         if detail.get("draft") is True:
             self.current.conflicting_draft += 1
         if stuck_status == "stands":
@@ -1242,9 +1462,28 @@ class ConflictResolver:
         labels = _label_names(detail)
         holds = sorted(labels & HARD_EXCLUDE_LABELS)
         if holds:
-            self._skip(repo, number, f"hard exclusion label(s): {', '.join(holds)}",
-                       "hard-exclusion-label")
-            return
+            human, unreadable = self._classify_holds(repo, number, detail, holds)
+            if human:
+                self.current.held_human += 1
+                self._skip(repo, number,
+                           f"human-applied hold(s): {', '.join(human)}", "hard-exclusion-label")
+                return
+            if unreadable:
+                # FAIL CLOSED, AND LOUD. Not proving a machine applied the hold is not permission
+                # to rebase under it — but it is also not an exit, so it is counted as one of the
+                # states this run could neither repair nor escalate. That combination is exactly
+                # what was missing: the old code took the safe action and reported it as success.
+                self.current.held_human += 1
+                self._skip(repo, number,
+                           f"hold ownership unreadable: {', '.join(unreadable)}",
+                           "hold-ownership-unreadable")
+                self._no_exit(repo, number,
+                              f"the hold(s) {', '.join(unreadable)} cannot be attributed to a "
+                              "human or a machine, so the exclusion stands with no owner")
+                return
+            self.current.held_released += 1
+            self._record("hold-released", repo, number,
+                         f"machine-applied hold(s) {', '.join(holds)} do not exclude")
         head = detail.get("head") or {}
         base = detail.get("base") or {}
         head_repo = (head.get("repo") or {}).get("full_name")
@@ -1327,11 +1566,19 @@ class ConflictResolver:
                        f"is {self.stuck_grace_hours}h",
                        "awaiting-author-grace")
             return
-        if len(heads) >= 2:
-            self._escalate_two_head(
-                repo, detail, comments, prior_conflicting_files(comments, self.bot_login)
-            )
-            return
+        # NO ESCALATION ON A HEAD THIS PROGRAM HAS NEVER TRIED (registry #1191).
+        #
+        # Reaching here means `head_sha not in heads` — the author has PUSHED SINCE the last
+        # recorded attempt. The removed branch escalated anyway whenever two historical heads
+        # existed, so "two distinct heads once failed to converge" became a permanent refusal to
+        # try a third, however fresh, and the exhaustion the escalation asserts was never
+        # re-tested. It also made the resulting hold unreleasable in principle:
+        # reconcile-conflict-park refuses `two-head-exhaustion` precisely because a released PR
+        # would return straight here and be re-parked without an attempt.
+        #
+        # The escalation is not deleted — `_handle_conflict` still fires it, one line later,
+        # AFTER this head has actually been rebased and actually conflicted. The exit now
+        # asserts something that was measured in this run rather than inherited from an old one.
         if self.budget_used >= self.max_rebases:
             self._skip(repo, number,
                        f"per-run mechanical rebase cap ({self.max_rebases}) reached",
@@ -1435,7 +1682,24 @@ class ConflictResolver:
                 f"conflicting PR(s) were seen across {total['repos']} repository/ies",
                 file=sys.stderr,
             )
-        return 1 if (self.errors or total["no_exit"] > self.no_exit_threshold) else 0
+        # THE INERTNESS ALARM (registry #1191). Distinct from the per-PR no-exit alarm above, and
+        # necessarily so: this one is about the RUN. It is the assertion that 114 consecutive
+        # green runs could not make, and its whole value is that `attempted:0` no longer has one
+        # rendering — the verdict says which of the three things a zero-attempt run was.
+        verdict = total["verdict"]
+        print(f"VERDICT {verdict}")
+        if verdict == VERDICT_INERT:
+            print(
+                f"::error::conflict-resolver is INERT: it attempted, escalated and repaired "
+                f"NOTHING while {total['conflicting']} conflicting pull request(s) were seen "
+                f"({total['conflicting_ready']} ready + {total['conflicting_draft']} draft) and "
+                f"{total['unowned']} of them were skipped into a state no person, lane or timer "
+                f"owns. Skip reasons: {json.dumps(total['skipped'], sort_keys=True)}",
+                file=sys.stderr,
+            )
+        return 1 if (self.errors
+                     or total["no_exit"] > self.no_exit_threshold
+                     or verdict == VERDICT_INERT) else 0
 
 
 def _self_test():
@@ -1602,6 +1866,17 @@ def _self_test():
 
     # (a) Every hard hold and a fork are rejected before the rebaser. Removing any
     # exclusion makes this call list non-empty.
+    #
+    # #1191 SPLIT THIS ROW IN THREE, and the reason is the reason this block existed at all: the
+    # old fixture gave these PRs NO timeline, so it proved "a label named `needs:user` excludes"
+    # and was silent on WHO applied it. That silence is the defect — the estate's own bot applied
+    # 14 of the 17 live holds. The label events below are therefore load-bearing fixture data, not
+    # decoration: `jeswr` is the fixture's only repo admin, so a human application is exactly one
+    # that names him, and (a2)/(a3) drive the other two ownership classes.
+    def labelled_by(login, label, at=None):
+        return [{"event": "labeled", "label": {"name": label},
+                 "actor": {"login": login}, "created_at": iso(at if at is not None else base_now)}]
+
     excluded = [
         pull(1, "1" * 40, labels=("needs:user",)),
         pull(2, "2" * 40, labels=("trust-surface",)),
@@ -1610,11 +1885,163 @@ def _self_test():
         pull(5, "5" * 40, labels=("needs:design",)),
         pull(6, "6" * 40, labels=("trust:untrusted",)),
     ]
-    api = FakeAPI(excluded)
+    api = FakeAPI(excluded, timelines={
+        1: labelled_by("jeswr", "needs:user"),
+        2: labelled_by("jeswr", "trust-surface"),
+        4: labelled_by("jeswr", "review:needs-user"),
+        5: labelled_by("jeswr", "needs:design"),
+        6: labelled_by("jeswr", "trust:untrusted"),
+    })
     rebaser = FakeRebaser()
     resolver = ConflictResolver(api, snapshot, claim, [repo], bot_login, True, 5, rebaser)
-    resolver.run()
-    check("hard labels and fork are never rebased", rebaser.calls, [])
+    excluded_rc = resolver.run()
+    excluded_row = resolver.census[0]
+    check(
+        "HUMAN-applied hard labels and a fork are never rebased — and the run stays GREEN, "
+        "because every one of them has a named owner",
+        (rebaser.calls, excluded_rc, excluded_row["held_human"], excluded_row["held_released"],
+         excluded_row["unowned"], excluded_row["no_exit"],
+         _aggregate_census(resolver.census)["verdict"]),
+        ([], 0, 5, 0, 0, 0, VERDICT_IDLE),
+    )
+
+    # (a2) THE EDGE THAT WAS CUT (#1191). The SAME six PRs, with the SAME labels, applied by the
+    # SAME bot this program runs as — and now every one of them is a candidate. This is the
+    # marquee claim of the change, so it is asserted on the rebaser call list (what the program
+    # actually DID), not on a census counter. Restore the label-name-only predicate in
+    # `_process_pr` — `if holds: skip` — and this row goes red with an empty call list.
+    machine_api = FakeAPI(excluded, timelines={
+        1: labelled_by(bot_login, "needs:user"),
+        2: labelled_by(bot_login, "trust-surface"),
+        4: labelled_by(bot_login, "review:needs-user"),
+        5: labelled_by(bot_login, "needs:design"),
+        6: labelled_by(bot_login, "trust:untrusted"),
+    })
+    machine_rebaser = FakeRebaser()
+    machine_resolver = ConflictResolver(
+        machine_api, snapshot, claim, [repo], bot_login, True, 5, machine_rebaser)
+    with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+        machine_rc = machine_resolver.run()
+    machine_row = machine_resolver.census[0]
+    check(
+        "[#1191] the SAME hard labels applied by THIS PROGRAM'S OWN BOT do not exclude: all five "
+        "are rebased, and the fork — which no timeline can re-classify — still is not",
+        (sorted(number for _r, number, _h in machine_rebaser.calls), machine_rc,
+         machine_row["held_human"], machine_row["held_released"],
+         machine_row["skipped"].get("hard-exclusion-label"),
+         machine_row["skipped"].get("fork-pr"),
+         _aggregate_census(machine_resolver.census)["verdict"]),
+        ([1, 2, 4, 5, 6], 0, 0, 5, None, 1, VERDICT_ACTED),
+    )
+
+    # (a3) THE THIRD STATE, and the one the boolean `label_application_machine_owned` cannot
+    # express. A hold NOBODY can attribute — no `labeled` event, or an unreadable timeline — keeps
+    # the PR excluded (the safe action, unchanged) but is NOT silent: it has no proven owner, so
+    # it is a no-exit and the run goes RED. This is the exact combination that was missing for 114
+    # runs — the safe action reported as success. Make `_classify_holds` treat UNKNOWN as human
+    # (drop the `unreadable` arm) and this row goes red on rc, `unowned` and `no_exit` together.
+    unknown_api = FakeAPI([pull(11, "1" * 40, labels=("needs:user",))])   # no timeline at all
+    unknown_rebaser = FakeRebaser()
+    unknown_resolver = ConflictResolver(
+        unknown_api, snapshot, claim, [repo], bot_login, True, 5, unknown_rebaser)
+    with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+        unknown_rc = unknown_resolver.run()
+    unknown_row = unknown_resolver.census[0]
+    check(
+        "[#1191] a hold that can be attributed to NEITHER a human NOR a machine keeps the PR "
+        "excluded AND reds the run: fail-closed, but never silent",
+        (unknown_rebaser.calls, unknown_rc, unknown_api.labels_added,
+         unknown_row["skipped"].get("hold-ownership-unreadable"),
+         unknown_row["unowned"], unknown_row["no_exit"],
+         _aggregate_census(unknown_resolver.census)["verdict"]),
+        ([], 1, [], 1, 1, 1, VERDICT_INERT),
+    )
+
+    # (a4) THE OTHER SURFACE. The PR's own `needs:user` is bot-applied — machine-owned, and (a2)
+    # says that alone is admission — but a PROVEN HUMAN applied the same label to the SOURCE ISSUE
+    # the PR body closes. A question a person asked on the issue is not answered by a bot
+    # re-labelling the PR, so the hold stands. Drop the source-issue leg of `_hold_ownership` and
+    # this row goes red: the PR is rebased under the person holding it.
+    issue_held = pull(12, "1" * 40, labels=("needs:user",))
+    issue_held["body"] = "> 🤖 SPARQ agent\n\nCloses #4242"
+    issue_api = FakeAPI([issue_held], timelines={
+        12: labelled_by(bot_login, "needs:user"),
+        4242: labelled_by("jeswr", "needs:user"),
+    })
+    issue_rebaser = FakeRebaser()
+    issue_resolver = ConflictResolver(
+        issue_api, snapshot, claim, [repo], bot_login, True, 5, issue_rebaser)
+    with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+        issue_rc = issue_resolver.run()
+    issue_row = issue_resolver.census[0]
+    check(
+        "[#1191] a bot-applied hold on the PR is still HUMAN-owned when a person applied the same "
+        "label to the SOURCE ISSUE — the issue may escalate the answer, never rescue it",
+        (issue_rebaser.calls, issue_rc, issue_row["held_human"], issue_row["held_released"],
+         issue_row["skipped"].get("hard-exclusion-label")),
+        ([], 0, 1, 0, 1),
+    )
+    # ...and the CONTROL, which is what stops (a4) passing for the trivial reason that any linked
+    # issue blocks: same PR, same linkage, the issue's label applied by the BOT. Now it rebases.
+    issue_bot_api = FakeAPI([issue_held], timelines={
+        12: labelled_by(bot_login, "needs:user"),
+        4242: labelled_by(bot_login, "needs:user"),
+    })
+    issue_bot_rebaser = FakeRebaser()
+    with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+        ConflictResolver(issue_bot_api, snapshot, claim, [repo], bot_login, True, 5,
+                         issue_bot_rebaser).run()
+    check(
+        "[#1191] ...control: the same linked issue held by the BOT does not block the rebase, so "
+        "(a4) is about the ACTOR and not merely about having a linked issue",
+        [number for _r, number, _h in issue_bot_rebaser.calls],
+        [12],
+    )
+
+    # (a5) THE INSTANT TIE, newly load-bearing. `park_policy.label_application_ownership` resolves
+    # a same-second human/machine tie toward HUMAN-owned, and until #1191 nothing in this repo
+    # exercised that arm — MEASURED: deleting it left BOTH this suite and park_policy's own suite
+    # fully green. It stopped being a nicety when this program began ADMITTING on the answer:
+    # timestamps here are whole seconds, the live escalation pattern writes a label within one
+    # second of an attempt, and a tie that resolved toward machine would rebase under a person who
+    # labelled in that same second. Re-point the human event's actor at `bot_login` to see the row
+    # move; delete the tie rule in park_policy and it goes red.
+    tie_api = FakeAPI([pull(14, "1" * 40, labels=("needs:user",))], timelines={
+        14: labelled_by(bot_login, "needs:user") + labelled_by("jeswr", "needs:user"),
+    })
+    tie_rebaser = FakeRebaser()
+    tie_resolver = ConflictResolver(
+        tie_api, snapshot, claim, [repo], bot_login, True, 5, tie_rebaser)
+    with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+        tie_resolver.run()
+    check(
+        "[#1191] a human and the bot applying the hold in the SAME SECOND resolves to "
+        "HUMAN-owned — the tie never rebases under the person",
+        (tie_rebaser.calls, tie_resolver.census[0]["held_human"],
+         tie_resolver.census[0]["held_released"]),
+        ([], 1, 0),
+    )
+
+    # (a6) THE INERT VERDICT REDS THE RUN ON ITS OWN. MEASURED, and it is the survivor that made
+    # this row exist: removing `or verdict == VERDICT_INERT` from `run()`'s return expression left
+    # the whole suite green, because every reachable unowned skip today ALSO fires the per-PR
+    # `_no_exit` alarm and that alarm was carrying the exit code. The two alarms answer different
+    # questions and the run-level one has to stand up unassisted — a skip reason added later with
+    # no owner does NOT fire `_no_exit`. So this drives exactly that: a conflicting PR whose skip
+    # key is absent from the taxonomy, `no_exit == 0`, and the run red anyway.
+    lonely = ConflictResolver(FakeAPI([pull(15, "1" * 40, head_repo="fork/repo")]),
+                              snapshot, claim, [repo], bot_login, True, 5, FakeRebaser())
+    with patch.dict(SKIP_OWNERSHIP,
+                    {key: value for key, value in SKIP_OWNERSHIP.items() if key != "fork-pr"},
+                    clear=True):
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            lonely_rc = lonely.run()
+    check(
+        "[#1191] the INERT verdict reds the run BY ITSELF, with no per-PR no-exit alarm firing",
+        (lonely_rc, lonely.census[0]["no_exit"], lonely.census[0]["unowned"],
+         _aggregate_census(lonely.census)["verdict"]),
+        (1, 0, 1, VERDICT_INERT),
+    )
 
     worker = pull(
         7, "7" * 40, author=bot_login, ref="sparq-agent/issue-7-1-1"
@@ -2096,11 +2523,49 @@ def _self_test():
         seeded_two_head_sweep(84, "2" * 40),
         ([(84, HUMAN_PARK_LABEL)], 1, 0, 0, (1, 0, 0, 1)),
     )
+    # THE MARQUEE ROW OF #1191's SECOND EDGE, and it is an INVERSION: this same call previously
+    # asserted `0` rebaser calls — a NEW head escalating on two OLD heads' evidence. A push the
+    # program never tried is not exhaustion, and asserting it made the resulting `needs:user`
+    # unreleasable in principle (reconcile-conflict-park refuses `two-head-exhaustion` because a
+    # released PR came straight back here). The escalation still fires — one line later, from
+    # `_handle_conflict`, on evidence this run measured. Restore the deleted `if len(heads) >= 2`
+    # block in `_process_pr` and this row goes red on the rebase count.
     check(
-        "[EXIT two-distinct-heads] CALL SITE `head not in heads`: a NEW head with two failed "
-        "heads on record escalates to the HUMAN terminal without spending another rebase",
+        "[#1191 EXIT two-distinct-heads] CALL SITE `head not in heads`: a NEW head is REBASED "
+        "first even with two failed heads on record, and escalates only on ITS OWN conflict",
         seeded_two_head_sweep(85, "3" * 40),
-        ([(85, HUMAN_PARK_LABEL)], 1, 0, 0, (1, 0, 0, 1)),
+        ([(85, HUMAN_PARK_LABEL)], 1, 0, 1, (1, 0, 0, 1)),
+    )
+    # ...and the same PR one tick later: the escalation is ALREADY delivered and the human
+    # terminal is live, so re-asserting it is not work. Delete the `escalated_already and
+    # HUMAN_PARK_LABEL in _label_names(pr)` guard in `_escalate_two_head` and this row goes red
+    # on both the exit counters and the verdict — an unchanged PR would score the run as `acted`
+    # and mute the INERT alarm forever.
+    def two_head_stands_sweep():
+        api2 = FakeAPI([pull(185, "2" * 40, labels=(HUMAN_PARK_LABEL,))], now=base_now)
+        api2.comment_rows[185] = [
+            seeded_attempt(1, "1" * 40), seeded_attempt(2, "2" * 40),
+            {"body": f"{ESCALATION_MARKER}\nalready asked", "user": {"login": bot_login},
+             "created_at": iso(base_now)},
+        ]
+        api2.timelines[185] = [{"event": "labeled", "label": {"name": HUMAN_PARK_LABEL},
+                                "actor": {"login": bot_login}, "created_at": iso(base_now)}]
+        reb2 = FakeRebaser("conflict")
+        sweep = ConflictResolver(api2, snapshot, claim, [repo], bot_login, True, 5, reb2,
+                                 stuck_grace_hours=grace,
+                                 clock=lambda: base_now + 1000 * 3600.0)
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            rc = sweep.run()
+        row = sweep.census[0]
+        return (rc, api2.labels_added, len(reb2.calls), row["escalated"],
+                row["skipped"].get("two-head-exhausted-stands"),
+                _aggregate_census(sweep.census)["verdict"])
+
+    check(
+        "[#1191] a two-head exhaustion ALREADY escalated and ALREADY held is re-affirmed as "
+        "NOTHING: no write, no `escalated`, and the run scores `correctly-idle`, NEVER `acted`",
+        two_head_stands_sweep(),
+        (0, [], 0, 0, 1, VERDICT_IDLE),
     )
 
     # (k3) THE BODY MATCHES THE EXIT — both directions (Fix 2). ONE hard-coded body served both
@@ -2475,6 +2940,13 @@ def _self_test():
     # so this asserts the SECOND one, which is the only one a later PR could accidentally remove.
     held_by_human = parked_pr_api()
     held_by_human.prs[83].setdefault("labels", []).append({"name": HUMAN_PARK_LABEL})
+    # #1191: the hold is now HUMAN-owned by EVIDENCE, not by spelling. `jeswr` is the fixture's
+    # only repo admin, so this is the one actor whose application the strict maintainer probe
+    # confirms. Re-point this event at `bot_login` and the hold is released instead.
+    held_by_human.timelines[83] = [
+        {"event": "labeled", "label": {"name": HUMAN_PARK_LABEL},
+         "actor": {"login": "jeswr"}, "created_at": iso(base_now)},
+    ]
     held_by_human.set_head(83, "e" * 40)             # its cause HAS recovered — and it stays put
     human_rc, human_sweep, held_by_human = exit_sweep(held_by_human, elapsed_hours=1000.0)
     check(
@@ -2613,6 +3085,13 @@ def _self_test():
     ]
     mixed[4]["mergeable"] = True
     mixed_api = FakeAPI(mixed, now=base_now)
+    # #1191: PR 101 is held because a PROVEN HUMAN applied the label, which is the only shape that
+    # still excludes. Without this event the same PR is `hold-ownership-unreadable` — counted,
+    # no-exit, and red — so this is also the row that pins which of the two the fixture means.
+    mixed_api.timelines[101] = [
+        {"event": "labeled", "label": {"name": "needs:user"},
+         "actor": {"login": "jeswr"}, "created_at": iso(base_now)},
+    ]
     summary_dir = Path(tempfile.mkdtemp(prefix="conflict-resolver-self-test-"))
     summary_file = summary_dir / "step-summary.md"
     mixed_resolver = ConflictResolver(
@@ -2630,8 +3109,9 @@ def _self_test():
         (mixed_rc, mixed_row["considered"], mixed_row["conflicting"],
          mixed_row["conflicting_draft"], mixed_row["conflicting_ready"],
          mixed_row["attempted"], mixed_row["resolved"],
-         sum(mixed_row["skipped"].values()) + mixed_row["resolved"]),
-        (0, 5, 4, 1, 3, 1, 1, 5),
+         sum(mixed_row["skipped"].values()) + mixed_row["resolved"],
+         mixed_row["held_human"], mixed_row["held_released"], mixed_row["unowned"]),
+        (0, 5, 4, 1, 3, 1, 1, 5, 1, 0, 0),
     )
     check(
         "a no-op sweep is machine-distinguishable from an effective one",
@@ -2641,8 +3121,14 @@ def _self_test():
     check(
         "the census reaches the job step summary",
         ("### conflict-resolver census" in summary_text
-         and "| awaiting author | no exit |" in summary_text
+         and "| held: human | held: released | unowned | no exit |" in summary_text
          and "rebase-cap-reached" in summary_text), True,
+    )
+    check(
+        "[#1191] the operator-facing summary leads with the VERDICT, not with a bare count",
+        (f"**verdict: `{VERDICT_ACTED}`**" in summary_text,
+         "left with no owner." in summary_text),
+        (True, True),
     )
     # (n2) THE PER-EXIT CENSUS ROW. The two exits being indistinguishable in the output is why a
     # timeout was reported as exhausted iteration for as long as it was: every run printed
@@ -2668,6 +3154,119 @@ def _self_test():
           row["parked_machine"] + row["parked_human"] == row["escalated"])
          for row in exits_seen + [mixed_row, _aggregate_census(mixed_resolver.census)]],
         [(True, True)] * 4,
+    )
+
+    # (n3) THE VERDICT ITSELF (#1191), as a truth table over the pure function — because the thing
+    # that ran 114 times was not a wrong number, it was a run with no verdict at all. Each row
+    # pins one boundary, and the two IDLE rows are the ones that keep this alarm READABLE: an
+    # alarm that fires on every quiet sweep gets muted, and a muted alarm is the state we started
+    # in wearing a different name.
+    def total(**kw):
+        row = {"considered": 0, "conflicting": 0, "conflicting_draft": 0, "conflicting_ready": 0,
+               "selected": 0, "attempted": 0, "resolved": 0, "escalated": 0, "exit_two_head": 0,
+               "exit_stuck_grace": 0, "parked_machine": 0, "parked_human": 0,
+               "stuck_readmitted": 0, "stuck_park_stands": 0, "awaiting_author": 0,
+               "held_human": 0, "held_released": 0, "unowned": 0, "no_exit": 0, "errors": 0}
+        row.update(kw)
+        return row
+
+    check(
+        "[#1191] the run verdict: work is `acted`, an owned population is `correctly-idle`, and "
+        "ONLY zero-work-with-an-unowned-population is INERT",
+        [run_verdict(total()),                                       # nothing open at all
+         run_verdict(total(conflicting=39, held_human=39)),          # all 39 owned by people
+         run_verdict(total(conflicting=39, unowned=39)),             # THE 07-29 PRODUCTION SHAPE
+         run_verdict(total(conflicting=39, unowned=38, attempted=1)),
+         run_verdict(total(conflicting=39, unowned=38, escalated=1)),
+         run_verdict(total(conflicting=39, unowned=38, resolved=1)),
+         run_verdict(total(conflicting=39, unowned=38, selected=1)),
+         run_verdict(total(conflicting=39, unowned=38, stuck_readmitted=1))],
+        [VERDICT_IDLE, VERDICT_IDLE, VERDICT_INERT] + [VERDICT_ACTED] * 5,
+    )
+    # ...and the aggregate carries it, so the machine-readable CENSUS-TOTAL line an operator or a
+    # later script greps is the same answer the exit code was computed from.
+    check(
+        "[#1191] the verdict travels in CENSUS-TOTAL, not only in the exit code",
+        (_aggregate_census([{**total(conflicting=1, unowned=1), "repo": "x", "skipped": {}}]
+                           )["verdict"],
+         "VERDICT " + VERDICT_INERT in
+         "\n".join(line for line in stdout.getvalue().splitlines()) or
+         "VERDICT " + VERDICT_ACTED in stdout.getvalue()),
+        (VERDICT_INERT, True),
+    )
+
+    # (n4) THE TAXONOMY IS TOTAL, checked against the SOURCE rather than against a hand-list.
+    #
+    # The whole mechanism rests on `SKIP_OWNERSHIP` naming an owner for every skip this program
+    # can emit; a key missing from it is a conflicting PR whose disposal nobody classified. A
+    # hand-maintained list of expected keys would rot in exactly the direction that hurts, so the
+    # call sites are read out of this file's own AST — `self._skip(..., key)` and
+    # `self.current.skip(key)` — and every literal must be classified. Add a `_skip` with a new
+    # key and this row goes red naming it.
+    def skip_keys_in_source():
+        tree = ast.parse(Path(__file__).resolve().read_text(encoding="utf-8"))
+        # PRUNED, not filtered by name. `_self_test` is full of deliberately bogus keys and
+        # `_skip` itself contains the forwarding `self.current.skip(key)` whose argument is a
+        # variable by construction — scanning either turns this guard into noise it would then be
+        # "fixed" by loosening. Everything else in the file is in scope.
+        pruned = {id(node) for parent in ast.walk(tree)
+                  if isinstance(parent, ast.FunctionDef) and parent.name in ("_self_test", "_skip")
+                  for node in ast.walk(parent)}
+        keys, unpinned = set(), []
+        for node in ast.walk(tree):
+            if id(node) in pruned:
+                continue
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr == "_skip":
+                arg = next((kw.value for kw in node.keywords if kw.arg == "key"), None)
+                if arg is None and len(node.args) >= 4:
+                    arg = node.args[3]
+                if arg is None and len(node.args) == 3:
+                    arg = node.args[2]        # reason doubles as the key
+            elif node.func.attr == "skip" and isinstance(node.func.value, ast.Attribute) \
+                    and node.func.value.attr == "current":
+                arg = node.args[0] if node.args else None
+            else:
+                continue
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                keys.add(arg.value)
+            else:
+                unpinned.append(ast.unparse(node)[:80])
+        return keys, unpinned
+
+    source_keys, unpinned_keys = skip_keys_in_source()
+    check(
+        "[#1191] every skip key this program can emit has a named owner in SKIP_OWNERSHIP, and "
+        "none is computed rather than literal",
+        (sorted(source_keys - set(SKIP_OWNERSHIP)), unpinned_keys,
+         sorted(set(SKIP_OWNERSHIP) - source_keys)),
+        ([], [], []),
+    )
+    # ...and the DEFAULT DIRECTION for one that slips through anyway. An unclassified key is
+    # counted as UNOWNED and announced, never quietly assumed benign — that assumption is the
+    # whole shape of this defect. Flip the `owner = OWNER_NONE` default to OWNER_ELSEWHERE and
+    # this row goes red on both the counter and the warning.
+    rogue = ConflictResolver(FakeAPI([]), snapshot, claim, [repo], bot_login, False, 5,
+                             FakeRebaser())
+    rogue._in_population = True
+    rogue_err = StringIO()
+    with redirect_stdout(StringIO()), redirect_stderr(rogue_err):
+        rogue._skip(repo, 1, "a reason nobody classified", "not-in-the-taxonomy")
+    check(
+        "[#1191] an UNCLASSIFIED skip reason counts as unowned and says so",
+        (rogue.current.unowned, "has no entry in SKIP_OWNERSHIP" in rogue_err.getvalue()),
+        (1, True),
+    )
+    # ...and the population gate: the same key OUTSIDE the conflicting population is silent, so
+    # `not-conflicting` on 99 healthy PRs a tick cannot manufacture an alarm.
+    quiet = ConflictResolver(FakeAPI([]), snapshot, claim, [repo], bot_login, False, 5,
+                             FakeRebaser())
+    with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+        quiet._skip(repo, 1, "not conflicting", "not-in-the-taxonomy")
+    check(
+        "[#1191] ...but only inside the conflicting population",
+        quiet.current.unowned, 0,
     )
 
     # (o) THE YAML SEAM. Every uncaught mutant in this repo's measured mutation runs lived in a
