@@ -1,176 +1,6 @@
 {
  "records": [
   {
-   "ts": 1785261662,
-   "provider": "fleet",
-   "account": "5f5b2dc3fb8e231b",
-   "model_alias": "",
-   "exit_class": "success",
-   "run_id": "30385003757.1"
-  },
-  {
-   "ts": 1785261714,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30385406034.1"
-  },
-  {
-   "ts": 1785261748,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30385454521.1"
-  },
-  {
-   "ts": 1785261779,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30385423846.1"
-  },
-  {
-   "ts": 1785261779,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30385508532.1"
-  },
-  {
-   "ts": 1785261786,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30385464592.1"
-  },
-  {
-   "ts": 1785262011,
-   "provider": "anthropic",
-   "account": "9e13ea21abf27e68",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "30384522845.1"
-  },
-  {
-   "ts": 1785262018,
-   "provider": "anthropic",
-   "account": "9e13ea21abf27e68",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "30384508733.1"
-  },
-  {
-   "ts": 1785262433,
-   "provider": "fleet",
-   "account": "5f5b2dc3fb8e231b",
-   "model_alias": "",
-   "exit_class": "success",
-   "run_id": "30386005714.1"
-  },
-  {
-   "ts": 1785262568,
-   "provider": "anthropic",
-   "account": "9e13ea21abf27e68",
-   "model_alias": "opus5",
-   "exit_class": "no_change",
-   "run_id": "30386407029.1",
-   "input_tokens": 2583,
-   "output_tokens": 5063,
-   "wall_seconds": 101,
-   "issue": 3139,
-   "why_no_diff": "other"
-  },
-  {
-   "ts": 1785262589,
-   "provider": "anthropic",
-   "account": "efb4eb2781de6958",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "30384381246.1"
-  },
-  {
-   "ts": 1785262615,
-   "provider": "anthropic",
-   "account": "efb4eb2781de6958",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "30384397198.1"
-  },
-  {
-   "ts": 1785262657,
-   "provider": "anthropic",
-   "account": "51bde6688e140866",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "30385444371.1"
-  },
-  {
-   "ts": 1785262659,
-   "provider": "anthropic",
-   "account": "51bde6688e140866",
-   "model_alias": "opus5",
-   "exit_class": "no_change",
-   "run_id": "30386484671.1",
-   "input_tokens": 2674,
-   "output_tokens": 8717,
-   "wall_seconds": 132,
-   "issue": 298,
-   "why_no_diff": "blocked_on_decision"
-  },
-  {
-   "ts": 1785262666,
-   "provider": "anthropic",
-   "account": "efb4eb2781de6958",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "30385353836.1"
-  },
-  {
-   "ts": 1785262739,
-   "provider": "anthropic",
-   "account": "9e13ea21abf27e68",
-   "model_alias": "opus5",
-   "exit_class": "unknown",
-   "run_id": "30384516240.1"
-  },
-  {
-   "ts": 1785262771,
-   "provider": "anthropic",
-   "account": "51bde6688e140866",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "30385433476.1"
-  },
-  {
-   "ts": 1785262829,
-   "provider": "anthropic",
-   "account": "51bde6688e140866",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "30386453265.1"
-  },
-  {
-   "ts": 1785262866,
-   "provider": "anthropic",
-   "account": "9e13ea21abf27e68",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "30386444457.1"
-  },
-  {
-   "ts": 1785262909,
-   "provider": "anthropic",
-   "account": "efb4eb2781de6958",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "30381612822.1"
-  },
-  {
    "ts": 1785263057,
    "provider": "fleet",
    "account": "5f5b2dc3fb8e231b",
@@ -1867,6 +1697,14 @@
    "model_alias": "",
    "exit_class": "zero-dispatch",
    "run_id": "30412213968.1"
+  },
+  {
+   "ts": 1785288112,
+   "provider": "fleet",
+   "account": "5f5b2dc3fb8e231b",
+   "model_alias": "",
+   "exit_class": "zero-dispatch",
+   "run_id": "30413528905.1"
   }
  ]
 }
