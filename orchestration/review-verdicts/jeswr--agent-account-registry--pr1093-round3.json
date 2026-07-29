@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1093,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b0e253809e9229bf262111a0a4481f8e32598e67",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 remains approved. The issue-event path binds the real issue type through a quoted environment variable, while retriage reads the mutable type live alongside body and state and rejects absent or malformed schema. Explicit GitHub `null` remains the narrowly accepted untyped representation. Normalization is centralized at the classifier boundary, and mapped type precedence, area fallback, and the trust-surface override are preserved. The tests cover the workflow binding, CLI forwarding, live-read forwarding, malformed and untyped documents, typed-versus-untyped label outcomes, and trust-surface precedence with independently discriminating fixtures. The additional regate-sweep clock seam is passed into the real Sweeper, with pinned live and stale directions plus a census assertion preventing the dry-run no-write check from passing through inertness. No blocker, major, minor, or nit finding is supported by the diff, and no reviewer-directed instruction appears in it.",
+  "verdict": "approve"
+ }
+}
