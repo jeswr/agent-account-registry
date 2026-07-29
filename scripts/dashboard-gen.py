@@ -53,10 +53,15 @@ DISPATCH_LANE_CAP = 12
 # healthy lane that simply is not there. Both must be "unknown", never a selectively complete tick.
 DISPATCH_FIX_LINE_RE = re.compile(r"^\S+\s+fix-dispatch: ")
 DISPATCH_LANE_END_RE = re.compile(r"^\S+\s+defer attribution:")
-# The lanes dispatch-claim's DISPATCH_LANES prints on EVERY tick, and so the minimum a rendered
-# block must carry. This is a floor, not a pin: an ADDED lane still reaches the page unread-ahead
-# (the name comes from the log), while a MISSING one — the stalled review or failed disarm this
-# feature exists to expose — refuses the whole block instead of publishing the survivors.
+# The lanes dispatch-claim's DISPATCH_LANES prints on EVERY tick, in THIS order (it iterates that
+# tuple), and so the minimum a rendered block must carry. This is a floor on the SET and a pin on
+# the ORDER of these four: an ADDED lane still reaches the page unread-ahead (the name comes from
+# the log) wherever it sits in the block, while a MISSING one — the stalled review or failed disarm
+# this feature exists to expose — refuses the whole block instead of publishing the survivors, and
+# so does a block whose four required rows arrive in an order the dispatcher cannot emit. Should
+# dispatch-claim ever reorder its own DISPATCH_LANES, ticks read `—` until this tuple is matched to
+# it: unknown, which is the safe direction, rather than a block of unclear provenance published as
+# the dispatcher's own.
 DISPATCH_REQUIRED_LANES = ("worker", "review", "fix", "disarm")
 
 # Agent-run observability (issue #246). The collector persists a snapshot of cache-effectiveness /
@@ -1000,7 +1005,9 @@ def _dispatch_lane_rows(log_text):
     The block is validated as a WHOLE, and a partial one is refused rather than trimmed (review
     round 1): the rows must be CONTIGUOUS between the `fix-dispatch:` header and the
     `defer attribution:` terminator, each must parse, none may repeat, DISPATCH_REQUIRED_LANES must
-    all be present, and the block may not exceed DISPATCH_LANE_CAP rows. Publishing the survivors of
+    all be present IN THAT ORDER (review round 2 — the dispatcher iterates one fixed tuple, so a
+    complete-but-permuted block is one it could not have printed; unknown lanes are exempt and may
+    sit anywhere), and the block may not exceed DISPATCH_LANE_CAP rows. Publishing the survivors of
     a truncated or malformed block renders the vanished lane as absent rather than unknown — which
     is exactly how a stalled review/fix lane or a failed disarm would disappear from the one cell
     built to show it — so every one of those shapes returns None and the page shows `—`. Trailing
@@ -1017,7 +1024,12 @@ def _dispatch_lane_rows(log_text):
     rows = {}
     for line in lines[1:]:
         if DISPATCH_LANE_END_RE.match(line):
-            if any(lane not in rows for lane in DISPATCH_REQUIRED_LANES):
+            # Presence AND order in one comparison: `rows` keeps the block's own order, so the
+            # required lanes read out of it — extra lanes dropped, they are exempt — must be the
+            # authoritative tuple exactly. A short list is a missing lane, a permuted one is a
+            # block the dispatcher's single loop cannot have printed; both are unknown.
+            if [lane for lane in rows if lane in DISPATCH_REQUIRED_LANES] != list(
+                    DISPATCH_REQUIRED_LANES):
                 return None
             return list(rows.values())
         match = DISPATCH_LANE_RE.match(line)
@@ -1843,6 +1855,28 @@ def _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measur
               worker_row, review_row, fix_row, disarm_row,
               "2025-01-01Z lane audit: planned=3 launched=3 deferred=0 error=0", terminator))),
           ["worker", "review", "fix", "disarm", "audit"])
+    # --- ...and the required four are ORDERED (review round 2). dispatch-claim iterates ONE fixed
+    # tuple, so a complete, contiguous, terminated block whose four required rows are permuted is a
+    # block it cannot have printed — provenance the membership/duplicate/cap checks all wave
+    # through. Both permutations are written LITERALLY, in an order no rotation of the shipped
+    # tuple produces, so neither this input nor its expectation moves if DISPATCH_REQUIRED_LANES is
+    # edited (pre-flight item 2(b)/(c)).
+    check("[#323] a COMPLETE block whose required lanes arrive out of the dispatcher's emission "
+          "order publishes nothing — every lane present is not evidence the dispatcher printed it",
+          (_dispatch_lane_rows(block(worker_row, fix_row, review_row, disarm_row, terminator)),
+           _dispatch_lane_rows(block(disarm_row, review_row, fix_row, worker_row, terminator))),
+          (None, None))
+    # The exemption is what keeps that order rule from being a pin on the whole block: an unknown
+    # lane may sit ANYWHERE, including between two required rows, and publishes in its own place.
+    # Without this row, refusing every block whose lane list is not exactly the required tuple —
+    # which would silently drop a future lane off the page — stays green.
+    check("[#323] an unknown extra lane INTERLEAVED among the required rows still publishes, in "
+          "the position the dispatcher printed it",
+          lane_names(_dispatch_lane_rows(block(
+              worker_row, review_row,
+              "2025-01-01Z lane audit: planned=3 launched=3 deferred=0 error=0",
+              fix_row, disarm_row, terminator))),
+          ["worker", "review", "audit", "fix", "disarm"])
     # 12 and 13 are LITERAL here. Deriving either from DISPATCH_LANE_CAP would make the row
     # vacuous — raising the constant would raise the input and the expectation together and stay
     # green, which is the #941 shape AGENTS.md pre-flight item 2(c) names.
