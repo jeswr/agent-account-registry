@@ -24,7 +24,30 @@ name: pr-gate
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # `edited` and `converted_to_draft` are here for the advisory step below (#1115), and only for
+    # it: the two facts that step diagnoses — the closing references in the TITLE/BODY, and
+    # DRAFTNESS — are the only inputs to this job that change without the head sha changing, so
+    # without these two activity types the note is delivered once at `opened` and then goes stale
+    # against the very edit it asks the author to make. Concretely: a pull that opens with one
+    # valid reference and later edits it away, or adds a second, is never warned; a ready pull
+    # converted BACK to a draft never gets the draft explanation (`ready_for_review` only covers
+    # the other direction); and an author who repairs a warned body gets no clean run to confirm
+    # it, leaving the warning as the last word.
+    #
+    # THE COST, STATED. Each added type is a full `gate` run at an UNCHANGED head, so this trades
+    # runner time for the advisory being true whenever it is displayed. It is bounded: nothing in
+    # this repository edits a pull body or title in code (the lanes write COMMENTS and LABELS), and
+    # `converted_to_draft` fires on the arm lane's fail-closed `gh pr ready --undo` restore, which
+    # is per-arm-failure, not per-tick. NOT a correctness change either way — `gate` is required and
+    # sha-bound, so an extra run at the same head can only re-derive the same verdict, and the
+    # concurrency group below already resolves the ready/undo churn pair the same way it resolves a
+    # push burst (cancel the older run; `_live_repair_gate` is newest-run-wins, so a cancelled twin
+    # cannot decide a head whose real run is newer).
+    #
+    # Membership is PINNED by `pr-body-ref.py --self-test`'s workflow-seam assertion, as an exact
+    # set: dropping either of these two silently restores the stale-advisory hole, and adding a
+    # type nobody argued for is equally a change to what this required gate runs on.
+    types: [opened, synchronize, reopened, ready_for_review, edited, converted_to_draft]
 
 permissions:
   contents: read

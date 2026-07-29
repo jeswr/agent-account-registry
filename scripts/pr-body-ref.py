@@ -67,6 +67,13 @@
 # see and fix in one edit, and NOTHING TOLD THEM. `check` is that telling: pr-gate already runs on
 # every pull, so the note lands on the object that is wrong, while it is being written.
 #
+# IT RUNS WHENEVER THE FACTS IT READS CHANGE, which is not the same as "on every push". The two
+# inputs it diagnoses — the closing references in the title/body, and draftness — move WITHOUT the
+# head sha moving, so pr-gate.yml subscribes to `edited` and `converted_to_draft` as well (see the
+# note on its `on:` block). Both the invocation and that exact activity-type set are pinned by
+# `advisory_workflow_seam_report` below: a `check` that is perfect and never invoked, or invoked
+# only at `opened`, delivers a note that is stale against the very edit it asked for.
+#
 # IT IS ADVISORY AND IT IS SOUND — it warns only where the reader is GUARANTEED to refuse.
 # `closing_references` computes `declared = resolved & raw_refs` and `all_refs = seen ⊇ raw_refs`,
 # so over the RAW text alone, with no renderer and no network:
@@ -428,6 +435,90 @@ def _cmd_check(args, *, enrolled=None):
         _annotate("notice", f"pr-body-ref check did not run ({type(exc).__name__}); it is advisory "
                             "and auto-mint-provenance remains the authority")
     return 0
+
+
+# ---- THE DELIVERY SEAM (pr-gate.yml), PyYAML-parsed ---------------------------------------------
+# A `check` that is perfect and never invoked delivers NOTHING, and every assertion above it stays
+# green while it delivers nothing: deleting the workflow step, disabling it with `if: false`,
+# repointing it at `compose`, dropping `--event-path`, or dropping either of the two activity types
+# the advisory needs to stay true are all invisible to a test that calls `_cmd_check` directly.
+# So the workflow is read as a PARSED DOCUMENT — same construction, and for the same measured
+# reason, as `mint-provenance.mint_workflow_seam_report`: an `if: false` is valid YAML, lints clean,
+# and survives every grep. The `run:` body is COMMENT-STRIPPED before any token is read, because a
+# wiring assertion that a comment can satisfy is not a wiring assertion.
+def _workflow_document(name="pr-gate.yml"):
+    """The parsed live workflow. RAISES if it is missing or unparseable — a seam check that cannot
+    read its own workflow must fail the gate, never degrade to "nothing to assert"."""
+    import yaml
+
+    path = SCRIPTS_DIR.parent / ".github" / "workflows" / name
+    assert path.is_file(), f"{name} not found for the delivery-seam check: {path}"
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def _run_argv(run):
+    """The `python3 …` invocation in a comment-stripped `run:` body, as SHELL TOKENS.
+
+    Tokenised rather than substring-matched (AGENTS.md pre-flight item 6): `--event-path` dropped,
+    `--repo "$GITHUB_EVENT_PATH"`, or the two flags' values transposed all satisfy a containment
+    check on the same text and all change this list. Line continuations are folded first so the
+    invocation is one argv regardless of how it is wrapped."""
+    import shlex
+
+    try:
+        tokens = shlex.split(str(run).replace("\\\n", " "))
+    except ValueError:                                 # an unbalanced quote is not an invocation
+        return ()
+    for i, token in enumerate(tokens):
+        if token == "python3" and tokens[i + 1:i + 2] == ["scripts/pr-body-ref.py"]:
+            return tuple(tokens[i:])
+    return ()
+
+
+def advisory_workflow_seam_report(workflow=None):
+    """Structural findings about the LIVE pr-gate.yml, each asserted — and each MUTATED — by
+    `--self-test`. `workflow` is injectable so the mutant table can run over a copy of the real
+    document rather than over a hand-written stand-in that could agree with a broken file."""
+    workflow = _workflow_document() if workflow is None else workflow
+    strip = _load_sibling_module("registry_dispatch_claim",
+                                 "dispatch-claim.py")._strip_script_comments
+    # PyYAML parses a bare `on:` key as the boolean True.
+    triggers = workflow.get("on") if "on" in workflow else workflow.get(True)
+    types = (((triggers or {}).get("pull_request") or {}).get("types"))
+    # From the `gate` job SPECIFICALLY — that is the job the ruleset requires and the only one that
+    # runs on every pull. A step moved to some other job is not delivered and must read as absent.
+    steps = [s for s in ((workflow.get("jobs") or {}).get("gate") or {}).get("steps") or []
+             if isinstance(s, dict)]
+    invoking = [s for s in steps if "scripts/pr-body-ref.py" in strip(str(s.get("run") or ""))]
+    # ANY `if:` counts as disabled, deliberately, rather than only a literal `false`: this step is
+    # unconditional by design, an expression cannot be evaluated offline, and `x && false` is the
+    # measured shape (sparq #4743) that satisfies a "not literally false" reading while killing the
+    # step. Adding a condition here therefore reds this seam and has to be argued for.
+    enabled = [s for s in invoking if "if" not in s]
+    # `enabled[0]` only when there is EXACTLY one: two enabled steps leave `step` None and empty the
+    # argv findings, so "one call site" is a claim the mutant table can kill rather than an
+    # assumption that silently picks the first of several.
+    step = enabled[0] if len(enabled) == 1 else None
+    argv = _run_argv(strip(str((step or {}).get("run") or "")))
+    return {
+        "trigger_types": tuple(sorted(types)) if isinstance(types, list) else None,
+        # Both counts, because they fail differently: `invoking` going to 0 is a deletion, and
+        # `enabled` falling below it is a step that is still in the file and no longer runs.
+        "invoking_steps": len(invoking),
+        "enabled_steps": len(enabled),
+        "step_conditions": tuple(str(s.get("if")) for s in invoking if "if" in s),
+        # The ONE `continue-on-error` in this required job. Asserted by VALUE, not presence: a
+        # `false` here would let an import-time failure red the gate for every pull in the repo,
+        # which is the exact failure the key exists to prevent.
+        "continue_on_error": (step or {}).get("continue-on-error"),
+        "argv": argv,
+        "subcommand": argv[2] if len(argv) > 2 else None,
+        "flags": tuple(sorted(t for t in argv if t.startswith("--"))),
+        # Flag -> the token that FOLLOWS it. Adjacency, not membership: `--event-path --repo x y`
+        # carries both flags and binds neither.
+        "flag_values": {t: (argv[i + 1] if i + 1 < len(argv) else None)
+                        for i, t in enumerate(argv) if t.startswith("--")},
+    }
 
 
 def _gh_json(args):
@@ -852,6 +943,172 @@ def _self_test():  # noqa: C901 — a flat sequence of assertions, deliberately 
         _annotate("warning", "one\ntwo   three\n::error::four")
     chk("INJECTION a multi-line message collapses to ONE annotation line",
         flattened.getvalue(), "::warning::one two three ::error::four\n")
+
+    # ---- THE DELIVERY SEAM: pr-gate.yml actually invokes this, on the events it needs -----------
+    # Everything above drives `_cmd_check` in-process, so ALL of it stays green while the feature
+    # delivers nothing — the step deleted, `if: false`d, repointed at `compose`, stripped of a flag,
+    # or subscribed to events that never fire when the facts it diagnoses change. The production
+    # call site is read here, from the PARSED document, with the same mutant discipline
+    # `mint-provenance` applies to its own workflow (AGENTS.md pre-flight item 6: exact-match and
+    # adjacency, never containment).
+    import copy
+
+    live_workflow = _workflow_document()
+    seam = advisory_workflow_seam_report(live_workflow)
+
+    # EXACT membership, as a set. Containment would pass while `edited` was missing, which is the
+    # whole defect this pins; a superset would pass while some unargued third population started
+    # re-running the required gate. The expected value is written HERE as a literal rather than
+    # read back from the workflow (pre-flight item 2b — an expectation sourced from the code under
+    # test cannot fail).
+    chk("SEAM pr-gate subscribes to EXACTLY the activity types the advisory needs",
+        seam["trigger_types"], ("converted_to_draft", "edited", "opened", "ready_for_review",
+                                "reopened", "synchronize"))
+    chk("SEAM exactly ONE enabled step in the required `gate` job invokes this script",
+        (seam["invoking_steps"], seam["enabled_steps"], seam["step_conditions"]), (1, 1, ()))
+    chk("SEAM ...and it is the one step that cannot red the gate (`continue-on-error: true`)",
+        seam["continue_on_error"], True)
+    # The whole argv, in order: this pins the subcommand, both flag names, both flag VALUES and the
+    # adjacency of each name to its value in a single exact comparison. The values are the runner's
+    # own environment variables, never a `${{ }}` expansion of author-controlled text.
+    chk("SEAM the invocation is `check` with both flags bound to the runner's env, in order",
+        seam["argv"], ("python3", "scripts/pr-body-ref.py", "check",
+                       "--event-path", "$GITHUB_EVENT_PATH",
+                       "--repo", "$GITHUB_REPOSITORY"))
+    # ...and those spellings are ones THIS file's parser accepts. A flag renamed on one side of the
+    # seam only (`--event-path` -> `--event_path`) leaves both halves individually correct and the
+    # required gate red on every pull; argparse's refusal is a SystemExit, caught here so a
+    # mismatch reds one row instead of aborting the suite below it (pre-flight item 4).
+    # NOT a duplicate of pr-gate's repo-wide "every workflow-passed CLI flag is declared" step
+    # (PR #595 finding 2): that one is an AST scan of flag NAMES and says nothing about the
+    # SUBCOMMAND they sit under, so `compose --event-path …` satisfies it and exits 2 here.
+    parsed_out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(parsed_out), contextlib.redirect_stderr(io.StringIO()):
+            accepted = main(list(seam["argv"][2:]) + ["--policy", "/nonexistent"])
+    except SystemExit as exc:
+        accepted = f"argparse REJECTED the workflow's own argv ({exc.code})"
+    chk("SEAM ...and this CLI accepts the exact argv the workflow passes", accepted, 0)
+
+    # ---- the seam MUTANT TABLE ------------------------------------------------------------------
+    # The happy path above proves the report can read a correct workflow, not that it would notice a
+    # neutered one. Each row is a real way this step or these triggers could be lost; each must flip
+    # a NAMED finding. DELETE and DISABLE are taken separately (pre-flight item 3), and the
+    # comment-only mutant is included because it is the one an unstripped fragment check cannot see.
+    def gate_steps(doc):
+        return doc["jobs"]["gate"]["steps"]
+
+    def advisory_step(doc):
+        return next(s for s in gate_steps(doc)
+                    if "scripts/pr-body-ref.py" in str(s.get("run") or ""))
+
+    def seam_mutant(edit):
+        """The report for one mutated copy of the LIVE document.
+
+        A mutant that cannot be APPLIED — its anchor moved, its fragment is no longer unique — is
+        not a kill and must not abort the rows below it (AGENTS.md pre-flight item 4,
+        crash-after-partial-run: a mutant run's total check count has to match the pristine run's).
+        So the failure is returned as a VALUE that reds its own row and leaves every later row
+        running, instead of a traceback that silently deletes them."""
+        doc = copy.deepcopy(live_workflow)
+        try:
+            edit(doc)
+            return advisory_workflow_seam_report(doc)
+        except Exception as exc:                       # noqa: BLE001 — see the docstring
+            return dict.fromkeys(seam, f"MUTANT NOT APPLIED — {type(exc).__name__}: {exc}")
+
+    def comment_out_line(doc, fragment):
+        step = advisory_step(doc)
+        lines = str(step["run"]).splitlines()
+        hits = [i for i, line in enumerate(lines) if fragment in line]
+        assert hits, f"seam mutant fragment not present: {fragment!r}"
+        for i in hits:
+            lines[i] = "# " + lines[i].lstrip()
+        step["run"] = "\n".join(lines) + "\n"
+
+    def replace_in_run(doc, old, new):
+        step = advisory_step(doc)
+        text = str(step["run"])
+        assert text.count(old) == 1, f"seam mutant fragment not unique: {old!r}"
+        step["run"] = text.replace(old, new)
+
+    def wf_pull_request(doc):
+        return (doc.get("on") if "on" in doc else doc.get(True))["pull_request"]
+
+    def drop_type(name):
+        return lambda d: wf_pull_request(d)["types"].remove(name)
+
+    def move_out_of_gate(doc):
+        """Not a deletion: the step, its flags and its `continue-on-error` all survive verbatim —
+        in a job the ruleset does not require and that no pull is obliged to run."""
+        step = advisory_step(doc)
+        gate_steps(doc).remove(step)
+        doc["jobs"]["advisory-elsewhere"] = {"runs-on": "ubuntu-latest", "steps": [step]}
+
+    BOUND = '--event-path "$GITHUB_EVENT_PATH" --repo "$GITHUB_REPOSITORY"'
+    for name, edit, key, want in (
+            ("the advisory step is DELETED",
+             lambda d: gate_steps(d).remove(advisory_step(d)), "enabled_steps", 0),
+            ("the advisory step is neutered with if: false",
+             lambda d: advisory_step(d).update(**{"if": "false"}), "enabled_steps", 0),
+            ("...and the disabling condition is NAMED, not merely counted",
+             lambda d: advisory_step(d).update(**{"if": "false"}), "step_conditions", ("false",)),
+            ("the step is moved out of the REQUIRED `gate` job",
+             move_out_of_gate, "enabled_steps", 0),
+            ("a SECOND enabled advisory step appears (so `exactly one` is a real claim)",
+             lambda d: gate_steps(d).append(copy.deepcopy(advisory_step(d))), "enabled_steps", 2),
+            ("continue-on-error is DROPPED — an import error would then red every pull's gate",
+             lambda d: advisory_step(d).pop("continue-on-error"), "continue_on_error", None),
+            ("continue-on-error is flipped to false",
+             lambda d: advisory_step(d).update(**{"continue-on-error": False}),
+             "continue_on_error", False),
+            # COMMENT-ONLY: the invocation is still in the file, byte for byte, as prose.
+            ("the invocation survives only as a COMMENT",
+             lambda d: comment_out_line(d, "python3 scripts/pr-body-ref.py"), "enabled_steps", 0),
+            ("the step is repointed at another subcommand",
+             lambda d: replace_in_run(d, "pr-body-ref.py check", "pr-body-ref.py compose"),
+             "subcommand", "compose"),
+            ("--event-path is dropped (the check would then read no event at all)",
+             lambda d: replace_in_run(d, '--event-path "$GITHUB_EVENT_PATH" ', ""),
+             "flags", ("--repo",)),
+            ("the two flag VALUES are transposed — membership alone cannot see this",
+             lambda d: replace_in_run(
+                 d, BOUND, '--event-path "$GITHUB_REPOSITORY" --repo "$GITHUB_EVENT_PATH"'),
+             "flag_values", {"--event-path": "$GITHUB_REPOSITORY",
+                             "--repo": "$GITHUB_EVENT_PATH"}),
+            ("flag/value ADJACENCY is broken while both flags and both values survive",
+             lambda d: replace_in_run(
+                 d, BOUND, '--event-path --repo "$GITHUB_EVENT_PATH" "$GITHUB_REPOSITORY"'),
+             "flag_values", {"--event-path": "--repo", "--repo": "$GITHUB_EVENT_PATH"}),
+            ("`edited` is dropped — the body advisory would go stale against the repairing edit",
+             drop_type("edited"), "trigger_types",
+             ("converted_to_draft", "opened", "ready_for_review", "reopened", "synchronize")),
+            ("`converted_to_draft` is dropped — a re-drafted pull never gets the draft note",
+             drop_type("converted_to_draft"), "trigger_types",
+             ("edited", "opened", "ready_for_review", "reopened", "synchronize")),
+            # DELETING the whole key is a different mutant from dropping a member: it silently
+            # substitutes GitHub's default set, so both `edited` and `converted_to_draft` vanish
+            # while the workflow still lints clean and still runs on most pulls.
+            ("the `types:` key is deleted entirely (GitHub's default set silently substitutes)",
+             lambda d: wf_pull_request(d).pop("types"), "trigger_types", None)):
+        chk(f"SEAM MUTANT {name}", seam_mutant(edit)[key], want)
+    # The adjacency mutant leaves flag MEMBERSHIP untouched, which is the point of pinning both.
+    chk("SEAM MUTANT ...and that adjacency break is INVISIBLE to flag membership",
+        seam_mutant(lambda d: replace_in_run(
+            d, BOUND, '--event-path --repo "$GITHUB_EVENT_PATH" "$GITHUB_REPOSITORY"'))["flags"],
+        seam["flags"])
+    # VACUITY GUARD on the mutant harness itself: if `_strip_script_comments` ever stopped
+    # stripping, the comment-only mutant above would still report 0 enabled steps for the WRONG
+    # reason (the fragment moved onto a `#` line the finder never consulted). Drive the stripper on
+    # the real step body and require the invocation to be gone.
+    # An unbalanced quote is not an invocation. Driven directly because no mutant above produces
+    # one, so without this row the tokeniser's refusal path is code that has never executed.
+    chk("SEAM an unparseable `run:` body yields NO argv rather than a partial one",
+        _run_argv('python3 scripts/pr-body-ref.py check --repo "unterminated'), ())
+    chk("SEAM the comment-only mutant works by STRIPPING, not by luck",
+        _run_argv(_load_sibling_module("registry_dispatch_claim",
+                                       "dispatch-claim.py")._strip_script_comments(
+            "# python3 scripts/pr-body-ref.py check --event-path x --repo y\n")), ())
 
     # ---- The grammar is IMPORTED, not copied ----------------------------------------------------
     # If this ever fails, someone has re-declared the regex locally and the two will drift.
