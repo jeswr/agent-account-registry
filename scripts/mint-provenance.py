@@ -602,6 +602,49 @@ def _delivery_hint(pull, source_labels, hold_labels, park_label):
             "labels and state as the enumerator reads them")
 
 
+def review_run_refusal(identity_admits):
+    """Why the review RUN this record would dispatch cannot reach a reviewer at all, or None.
+
+    THE THIRD LAST MILE, and the one the first two cannot see. `admissible_by_the_review_lane`
+    proves the RECORD is admissible; `delivery_refusal` proves the ENUMERATOR emits a review item.
+    Both are true today for the orchestrator class, and the class still receives NO review — the
+    dispatched run dies in review-fix.yml's `run` job, at a target-App identity gate that admits
+    only pull requests authored by the registry App bot. MEASURED end to end on the enrolled repo:
+    the first orchestrator-class mint in the registry's history reached CLAIM and resolve green and
+    then failed with `pull request author is not the registry App bot`.
+
+    ENUMERABILITY IS NOT DELIVERABILITY. That distinction is the whole content of this function,
+    and it is the same lesson `delivery_refusal` learned one layer up: a predicate that stops at
+    the consumer it happens to know about writes records whose only effect is a terminal park.
+
+    THE POLARITY IS DELIBERATE, and it differs from `delivery_refusal`'s. That one is documented as
+    permissive in exactly one direction so no input can make minting impossible. This one CAN
+    refuse the whole class at once, on purpose: the identity gate refuses the whole class at once,
+    by construction rather than by snapshot (an enrolled author is never a `[bot]` login, so it can
+    never equal the App bot's), so a per-PR refusal would be the lie. Refusing costs nothing that
+    is not already lost — nothing is written and the pull request stays exactly as it is — while
+    minting anyway spends a runner, a claim and an account lease to reach a park.
+
+    FAIL CLOSED on an unreadable probe, matching `delivery_refusal`'s own exception contract: a
+    seam that cannot be read is not proof that a reviewer would start.
+
+    SELF-REMOVING. `identity_admits` re-derives its answer from the workflow on every call, so the
+    day the identity gate admits the class this refusal disappears with no code change here."""
+    try:
+        admitted = identity_admits()
+    except Exception as exc:                            # noqa: BLE001 — any probe failure refuses
+        return (f"the review lane's target-App identity gate could not be read ({exc}), so it "
+                "cannot be shown that a reviewer would ever start")
+    if admitted is True:
+        return None
+    return ("the review run would be refused before any reviewer starts — review-fix.yml's "
+            "target-App identity gate admits only pull requests authored by the registry App bot, "
+            "and this class is authored by an enrolled human login by construction. Widening that "
+            "gate is a maintainer security decision, because it governs the job that mints a "
+            "target-scoped App token; until it lands, a record here buys one terminal park instead "
+            "of a review")
+
+
 # ---- I/O ---------------------------------------------------------------------------------------
 def _run_gh(args, *, check=True):
     result = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
@@ -634,7 +677,7 @@ def effective_record_body(probe, ledger_ref):
 def mint(repo, pr_number, issue_number, impl_alias, registry_repo, routing, enrolled_authors,
          *, apply_changes=False, allow_global_partition=False, env=None,
          read_pull=None, read_issue=None, read_record=None, write_record=None,
-         modules=None, log=print):
+         identity_admits=None, modules=None, log=print):
     """Read everything, decide once, and write at most one record. Returns the MintDecision.
 
     Every reader/writer is injectable so `--self-test` drives this exact orchestration — the call
@@ -704,6 +747,17 @@ def mint(repo, pr_number, issue_number, impl_alias, registry_repo, routing, enro
         park_label=dispatch_claim.MACHINE_PARK_PR_LABEL)
     if delivery_error:
         reason = (f"the record this run would write would deliver NO review ({delivery_error}); "
+                  "refusing to write a record nothing acts on")
+        log(f"REFUSE {repo}#{pr_number}: {reason}")
+        return MintDecision(ACTION_REFUSE, reason, None)
+    # ...and the THIRD last mile. The two checks above prove the record is admissible and that the
+    # ENUMERATOR emits an item; neither can see the review-fix.yml `run` job, which refuses this
+    # whole class at its target-App identity gate. Refused on the DRY RUN too, for the same reason
+    # the delivery gate is: the operator should learn it from the cheap gesture.
+    run_error = review_run_refusal(
+        identity_admits or dispatch_claim.review_fix_identity_admits_orchestrator_class)
+    if run_error:
+        reason = (f"the record this run would write would deliver NO review ({run_error}); "
                   "refusing to write a record nothing acts on")
         log(f"REFUSE {repo}#{pr_number}: {reason}")
         return MintDecision(ACTION_REFUSE, reason, None)
@@ -1256,8 +1310,16 @@ def _self_test():                                                       # noqa: 
     good_env = _Env({"GITHUB_RUN_ID": "555", "GITHUB_RUN_ATTEMPT": "1", "PROVENANCE_SALT": "s"})
     modules = (worker_pr, dispatch_claim, lease_schema)
 
+    # The identity gate refuses this whole class TODAY (review_run_refusal), so every row below
+    # that is about some OTHER predicate injects an admitting probe — otherwise each of them would
+    # pass for the new reason and stop testing what it names. The live probe, and both of its
+    # failure directions, are driven by their own rows further down.
+    def _identity_admits():
+        return True
+
     def run_mint(*, apply_changes=False, env=None, record=None, allow_global=False,
-                 pull_over=None, issue_over=None, record_reader=None):
+                 pull_over=None, issue_over=None, record_reader=None,
+                 identity_admits=_identity_admits):
         written = []
         decision = mint(repo, 41, 7, "opus5", "reg/istry", routing, enrolled,
                         apply_changes=apply_changes, allow_global_partition=allow_global,
@@ -1266,6 +1328,7 @@ def _self_test():                                                       # noqa: 
                         read_issue=lambda: issue(**(issue_over or {})),
                         read_record=record_reader or (lambda: record),
                         write_record=lambda: written.append("put"),
+                        identity_admits=identity_admits,
                         modules=modules, log=lambda *_a, **_k: None)
         return decision, written
 
@@ -1385,6 +1448,55 @@ def _self_test():                                                       # noqa: 
                                                         {"name": "status:parked"}]})
     check("a machine-parked SOURCE ISSUE is refused before the record check even needs to run",
           decision.action, ACTION_REFUSE)
+
+    # ---- THE THIRD LAST MILE: enumerability is NOT deliverability ------------------------------
+    # THE MEASURED DEFECT: the first orchestrator-class mint in the registry's history passed both
+    # checks above and still delivered no review — the dispatched run died in review-fix.yml's
+    # `run` job at the target-App identity gate ("pull request author is not the registry App
+    # bot"). Both gates above answer about the RECORD and the ENUMERATOR; neither can see the run.
+    check("the run gate PASSES when the identity probe admits the class",
+          review_run_refusal(lambda: True), None)
+    rejects("...and REFUSES when it does not, naming the gate that refuses",
+            "target-App identity gate", lambda: review_run_refusal(lambda: False))
+    rejects("...and names whose decision would unblock it, not a fake operator action",
+            "maintainer security decision", lambda: review_run_refusal(lambda: False))
+    # FAIL-CLOSED, matching delivery_refusal's own exception contract: a seam that cannot be read
+    # is not proof that a reviewer would start.
+    def _exploding_identity():
+        raise RuntimeError("review-fix.yml could not be parsed")
+
+    rejects("an identity probe that RAISES is a refusal, never a pass", "could not be read",
+            lambda: review_run_refusal(_exploding_identity))
+    # ...and ONLY True admits. A probe that returns None, "" or a truthy non-True value must never
+    # read as admission — `if admitted is True` is what makes that so, and this is what reds if it
+    # is loosened to a bare truthiness test.
+    for _label, _answer in (("None", None), ("empty string", ""), ("0", 0), ("1", 1),
+                            ("'yes'", "yes"), ("[]", []), ("a truthy object", MintError("x"))):
+        check(f"a non-True probe answer ({_label}) is a refusal",
+              review_run_refusal(lambda v=_answer: v) is not None, True)
+    # THE KNOWN NEGATIVE, BY EXECUTION against the REAL workflow file. The live gate refuses this
+    # class today, so the live mint must refuse too. This row goes RED the day the identity gate is
+    # widened — which is exactly the day this whole refusal should disappear.
+    check("the LIVE identity gate does not admit the orchestrator class",
+          dispatch_claim.review_fix_identity_admits_orchestrator_class(), False)
+    # AND IT IS WIRED, driven by the LIVE probe rather than an injected one: a run-gate predicate
+    # nothing calls is the vacuity shape this repo keeps measuring.
+    decision, written = run_mint(apply_changes=True, identity_admits=None)
+    check("mint() REFUSES on the live identity gate and writes NOTHING",
+          (decision.action, written), (ACTION_REFUSE, []))
+    check("...naming the run, not the record and not the enumerator",
+          "target-App identity gate" in decision.reason, True)
+    # ...and BOTH upstream gates passed on this very PR, which is precisely why neither could catch
+    # it. Without these two rows the refusal above could be any of the three gates firing.
+    check("...while the record itself was admissible",
+          admissible_by_the_review_lane(minted.document, 41,
+                                        dispatch_claim.provenance_admission_error), None)
+    check("...and the enumerator WOULD have emitted a review item for it", delivers(), None)
+    # The refusal text is posted VERBATIM onto a pull request by auto-mint's `mint-refused`
+    # comment, so it must carry no `#N`: a rendered reference is a live payload that a later
+    # derivation can read back as a binding (the reason REASON_HINTS carries no literal numbers).
+    check("the refusal text names no issue number, so pasting it back binds nothing",
+          re.search(r"#\d", review_run_refusal(lambda: False)), None)
 
     # THE SOURCE-LABEL CHANNEL, asserted at the CALL SITE (mutation round 1: `issue_label_names`
     # returning [] killed nothing, because every label state the enumerator excludes on is already

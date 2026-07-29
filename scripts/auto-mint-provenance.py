@@ -1813,6 +1813,19 @@ def _self_test():                                                       # noqa: 
 
     mint_provenance = _load_mint_provenance()
 
+    # ---- THE SWEEP IS WIRED TO THE THIRD LAST MILE (mint_provenance.review_run_refusal) --------
+    # The shared writer refuses this whole class today, because review-fix.yml's `run` job rejects
+    # any PR this App did not author and every enrolled author is a human login by construction.
+    # ASSERTED FIRST, unpatched, so the sweep's own composition is proven to carry that refusal —
+    # then stood down for the rest of the suite, because every row below is about some OTHER
+    # predicate and would otherwise pass for this reason and stop testing what it names.
+    _live_run_refusal = mint_provenance.review_run_refusal(
+        mint_provenance._load_dispatch_claim().review_fix_identity_admits_orchestrator_class)
+    check("the shared writer refuses the class on the live identity gate",
+          isinstance(_live_run_refusal, str) and "target-App identity gate" in _live_run_refusal,
+          True)
+    mint_provenance.review_run_refusal = lambda _probe: None
+
     # ---- THE RENDERED ORACLE, AND THE INSTRUMENT THAT MEASURES IT -----------------------------
     # ROUND 6 REDESIGN. Rounds 3-5 stripped quoted markdown constructs from the SOURCE and were
     # found permissive three times running, always in the minting direction, because the strip was

@@ -9101,6 +9101,85 @@ def review_fix_admits_orchestrator_class(source=None):
             and review_only is None)
 
 
+# The TARGET-APP IDENTITY gate inside review-fix.yml's `run` job — the SIXTH #657 consumer, and
+# the one downstream of every predicate `enrolment_enable_error` can currently see. Line-anchored
+# on the refusal helper the block defines for itself, so the extraction executes the workflow's
+# real predicates rather than a copy of them.
+_RF_IDENTITY_ANCHOR = r"(?m)^[ \t]*def refuse\(code\):$"
+_RF_IDENTITY_END = r"(?m)^[ \t]*print\(f\"target token verified"
+
+
+def review_fix_identity_admits_orchestrator_class(source=None):
+    """BEHAVIOURAL: does review-fix.yml's target-App IDENTITY gate admit the #657 class?
+
+    WHY THIS EXISTS. `enrolment_enable_error` models FOUR consumers. There is a fifth, and it is
+    the one that decides whether a reviewer ever starts: the `Verify target App identity and
+    default branch` step in the `run` job refuses any pull request whose author is not this App
+    bot (`author-not-app-bot`). MEASURED on the enrolled repo — the first orchestrator-class mint
+    in the registry's history (PR #961) ran PLAN -> CLAIM -> resolve green and died there:
+
+        REVIEW 30340804869: FAILED - 'pull request author is not the registry App bot'
+
+    The refusal is UNCONDITIONAL over the class, by construction rather than by snapshot:
+    `review_enrolment_authors` is the master-protected half of `admits_orchestrator_pr`, and
+    policy-resolve REFUSES a `[bot]` login in it — so an enrolled author can never equal the App
+    bot's login, and every member of the class fails this gate. Enumerability is therefore not
+    deliverability, which is exactly what `mint-provenance.review_run_refusal` consults this for.
+
+    TWO facts are demanded, and the second is the load-bearing one:
+
+      1. ADMITTED: the enrolled orchestrator author reaches the success path and binds
+         `bot_login`. This is False today and is the whole reason the class delivers no review.
+      2. STILL REFUSES A STRANGER: an arbitrary third-party author is refused even so. A widening
+         that admits the class by admitting EVERYONE is not a fix, it is the authority escalation
+         #570's author gate exists to prevent — so a probe that cannot see that difference must
+         never read True.
+
+    POSITIVE PROOF ONLY. Any extraction failure, exception or ambiguity reads False, which leaves
+    the mint refusing. This function is the SELF-REMOVING half of the interlock: it re-derives its
+    answer from the workflow on every call, so the day the identity gate is widened it flips True
+    by itself and nothing has to be remembered and deleted."""
+    try:
+        block = _review_fix_step_python(_RF_IDENTITY_ANCHOR, _RF_IDENTITY_END,
+                                        "target-App identity gate", job="run", source=source)
+        compiled = compile(block, "<review-fix.yml run identity>", "exec")
+    except Exception:            # noqa: BLE001 — an unreadable seam is NOT proof of wiring
+        return False
+
+    def _run(pr_author):
+        """Execute the workflow's own identity block. Returns the bound `bot_login`, or None when
+        it refused. A temp file stands in for GITHUB_OUTPUT so the block's real `refuse()` write
+        path executes rather than a stub of it."""
+        handle, path = tempfile.mkstemp(prefix="rf-identity-probe-")
+        os.close(handle)
+        try:
+            namespace = {
+                "os": types.SimpleNamespace(environ={
+                    "TARGET_REPO": PROBE_REPO, "PR_AUTHOR": pr_author, "GITHUB_OUTPUT": path}),
+                "re": re, "json": json, "sys": sys,
+                "repo": {"full_name": PROBE_REPO, "default_branch": "master"},
+                "user": {"login": PROBE_BOT_LOGIN, "id": 12345},
+            }
+            try:
+                exec(compiled, namespace)   # noqa: S102 — repository-owned workflow source
+            except SystemExit:
+                return None
+            except Exception:    # noqa: BLE001 — a block that crashes admits nothing provable
+                return None
+            with open(path, encoding="utf-8") as written:
+                for line in written:
+                    if line.startswith("bot_login="):
+                        return line.split("=", 1)[1].strip()
+            return None
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+
+    admits_class = _run(PROBE_ENROLLED_LOGIN) is not None
+    refuses_stranger = _run("some-unrelated-third-party") is None
+    return admits_class and refuses_stranger
+
+
 def _probe_worker_pr():
     """Load worker-pr.py for the #657 wiring probes. Separate from `dispatch()`'s own load so a
     probe can never mutate the dispatcher's module instance."""
@@ -12666,6 +12745,53 @@ def _self_test():
         ("a resolve step that swallows the record refusal for the ADMITTED class must read as "
          "unwired — this is the row that makes the probe's fail-closed term load-bearing rather "
          "than subsumed by default-off")
+    #      (iii-b) THE SIXTH CONSUMER — the target-App IDENTITY gate in the `run` job. Everything
+    #      above concerns `resolve`, which is why all four of enrolment_enable_error's facts read
+    #      True while the class receives no review at all: the run dies one job later. The probe is
+    #      validated in BOTH directions, because a constant-False guard is indistinguishable from a
+    #      working one on the live tree (the live answer is False, and that is the POINT).
+    assert review_fix_identity_admits_orchestrator_class() is False, \
+        ("the LIVE identity gate must read as NOT admitting the orchestrator class — it refuses "
+         "`author-not-app-bot` for every enrolled author by construction (policy-resolve refuses "
+         "a `[bot]` login in review_enrolment_authors, so an enrolled author can never equal the "
+         "App bot's login). If this ever reads True, mint-provenance.review_run_refusal stands "
+         "down by itself and the class starts minting again")
+    #      ...and it is NOT a constant: a gate widened to admit the enrolled class — and ONLY it —
+    #      flips the probe True. Without this row the assertion above is satisfied by `return
+    #      False`, which is exactly the vacuity that would silently keep minting disabled forever.
+    _rf_ident_widened = _rf_live.replace(
+        '          if os.environ["PR_AUTHOR"] != login:',
+        '          if os.environ["PR_AUTHOR"] not in (login, "probe-enrolled-login"):')
+    assert _rf_ident_widened != _rf_live
+    assert review_fix_identity_admits_orchestrator_class(source=_rf_ident_widened) is True, \
+        ("a gate widened to admit the enrolled orchestrator author must read True — otherwise the "
+         "probe is a constant and the mint refusal it drives can never be lifted")
+    #      ...and the LOAD-BEARING direction: a widening that admits the class by admitting
+    #      EVERYONE is an authority escalation, not a fix, and must still read False.
+    for _why, _escalation in (
+            ("the author test is deleted outright",
+             _rf_live.replace('          if os.environ["PR_AUTHOR"] != login:',
+                              '          if False:')),
+            ("the author test is made vacuous by comparing a value to itself",
+             _rf_live.replace('          if os.environ["PR_AUTHOR"] != login:',
+                              '          if os.environ["PR_AUTHOR"] != os.environ["PR_AUTHOR"]:')),
+            ("any bot-suffixed author is accepted, not this exact App",
+             _rf_live.replace('          if os.environ["PR_AUTHOR"] != login:',
+                              '          if not os.environ["PR_AUTHOR"].endswith("[bot]"):'))):
+        assert _escalation != _rf_live, _why
+        assert review_fix_identity_admits_orchestrator_class(source=_escalation) is False, \
+            (f"an identity gate that admits a STRANGER must read False even though it also admits "
+             f"the enrolled class ({_why}) — the probe exists to tell a scoped widening from an "
+             f"authority escalation, and #570's author gate is the only thing standing between a "
+             f"target-scoped App token and any pushable branch")
+    #      ...and the extraction fails CLOSED rather than guessing when the seam moves.
+    for _why, _broken in (("the workflow does not parse", "not: [valid yaml"),
+                          ("the anchor was renamed",
+                           _rf_live.replace("def refuse(code):", "def refuse_run(code):")),
+                          ("the end anchor was removed",
+                           _rf_live.replace('print(f"target token verified', 'print(f"verified'))):
+        assert review_fix_identity_admits_orchestrator_class(source=_broken) is False, \
+            f"an unreadable identity seam must read False ({_why}), never as wiring"
     #      (iv) the ARM probe requires BOTH refusals. A state machine that stops routing the class
     #      to the arm, while the arm itself would still accept it, is one deleted branch away from
     #      a merge on a self-attested record.

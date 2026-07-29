@@ -626,3 +626,98 @@ Half-A decision lands.
 whole population into a loop with no exit — one dispatch per PR per ~10-minute tick, each burning
 a claim, a runner and an account lease, forever. Landing this first makes auto-minting bounded: the
 worst case becomes one terminal, named park per PR.
+
+---
+
+## 11. Enumerability is not deliverability — the sixth consumer (Claude Opus 5, 2026-07-29)
+
+> 🤖 **SPARQ agent** — this section records a measurement that changes what "the #657 lane works"
+> means, and it deliberately does NOT take the decision it identifies. Read §11.4 before planning
+> any further work on this issue, including enrolling another repository.
+
+### 11.1 The measurement
+
+Every code blocker §8.3 named is gone, the allowlist is enabled for this repository (#916), and
+auto-minting is live (#937). Counted over the **whole** `origin/ledger` tree, 2026-07-29:
+
+| | count |
+|---|---|
+| provenance records on `ledger` | 625 |
+| …`orchestrator`-attested | **2** (this repo's PRs #961, #1155) |
+| review-verdict records on `ledger` | 1451 |
+| …belonging to an `orchestrator`-attested PR | **0** |
+
+**Two mints, zero reviews.** The lane is not slow or starved; it has never delivered once.
+
+### 11.2 Why — and why the interlock could not see it
+
+`enrolment_enable_error` models four consumers. There is a **sixth** (§10 found the fifth and fixed
+only its missing exit): the `Verify target App identity and default branch` step in review-fix.yml's
+**`run`** job. All four modelled facts concern `resolve`; this gate lives one job later, and refuses
+any pull request whose author is not this App bot. Measured end to end on #961:
+
+```
+PLAN   30339511626  enumerated
+CLAIM  30340312044  dispatched review round 1
+REVIEW 30340804869  FAILED — 'pull request author is not the registry App bot'
+```
+
+The refusal covers the class **by construction, not by snapshot**: `admits_orchestrator_pr` requires
+the author's login in `review_enrolment_authors`, and policy-resolve refuses a `[bot]` login there —
+so an enrolled author can *never* equal the App bot's login, and **every** member of the class fails
+this gate. No population change, no minting improvement and no enrolment can alter that.
+
+This is the same error §10.5 warned about one layer up, and it is worth naming as a class: **an
+admission proof is not a delivery proof.** `admissible_by_the_review_lane` proves the RECORD is
+admissible; `delivery_refusal` proves the ENUMERATOR emits an item; neither can see the run.
+
+### 11.3 What this PR lands — the third last mile
+
+`mint-provenance.review_run_refusal`, called by `mint()` after the other two, refuses to write a
+record when the review run it would dispatch cannot reach a reviewer. It consults
+`dispatch_claim.review_fix_identity_admits_orchestrator_class`, which **executes review-fix.yml's own
+identity block** (the idiom §7.3 established: a probe that stubs the predicate it measures measures
+the stub) and demands two facts — the enrolled class is admitted, **and a stranger is still
+refused**. A widening that admits the class by admitting everyone is the authority escalation #570's
+author gate exists to prevent, and reads False.
+
+Consequences, stated plainly:
+
+- The class **stops minting** and says why, once per PR, through auto-mint's existing
+  `mint-refused` comment. Today it mints and then buys one terminal `target-identity` park
+  (#979) — a runner, a claim and an account lease spent to reach a receipt.
+- Nothing else changes. Worker PRs mint through `worker-pr.py` and never reach this predicate.
+- It is **self-removing**: the probe re-derives its answer from the workflow on every call, so the
+  day the gate admits the class the refusal disappears with no edit here. The self-test row
+  asserting the live gate refuses is the row that goes red on that day, by design.
+
+A fifth wiring fact was **not** added to `enrolment_enable_error`, for the reason §10.5 gives: a
+fifth fact reading False would red the gate on every PR while the allowlist is enabled, which is an
+outage, not a signal. The refusal belongs where the cost is — at the write.
+
+### 11.4 The decision this does NOT take, and who owns it
+
+**Widening the identity gate is a maintainer security-posture decision.** §9.5 item 1 and §10.2 both
+say so and both decline it; this section declines it a third time rather than quietly settling it.
+The gate governs a job that mints a target-scoped App token (`contents: read`, `issues: write`,
+`pull-requests: write` in review mode) and then runs a model against target code. Two shapes exist:
+
+1. **Widen the author gate** for `mode == "review"` **and** the self-attested class only, keeping
+   the master-protected allowlist as the substitute author binding. Smallest diff; it accepts that
+   a token with target write scopes exists in a job running a model over a PR this App did not
+   author.
+2. **Remove the target App token from the review path for this class**, so the question does not
+   arise. The `run` job's own comment says the verdict record, label mutations, arming and
+   escalations all happen in the separate `outcome` job — so the review side may need materially
+   less authority than it currently mints. This is the narrower trust boundary and the better shape
+   if it holds, but it is a real change to the review path and must be measured, not assumed.
+
+**Until one of them lands, the honest statement of this lane's delivery is zero, and every further
+investment above this layer returns zero.** Two live consequences:
+
+- **#1115 / #1252** (the `no-issue-reference` and draft populations) is work *above* the binding
+  constraint. Taking the lane from "admits 1 of 17" to "admits 17 of 17" still delivers **0**
+  reviews. It is worth landing on its own merits; it is not worth landing as a #657 unblock.
+- **Enrolling `sparq-org/sparq`** — the denser population, and the ask that commissioned this
+  work — would, before this PR, have converted ~20 lane-invisible PRs into ~20 terminal parks. It
+  remains the right next step, *after* the decision above, not before it.
