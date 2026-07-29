@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5081,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d73e3e0b69910a402dbfab9bb881f8e4a9423daa",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "_instrumentation still accepts every non-None value without validating its JSON type or domain. Citation metrics therefore sum arbitrary values and can accept equal negative counts (for example emitted=-1 and resolved=-1 on every task produces fabricated=0 and honesty_ok=true), while abstention metrics use Python truthiness (so the string \"false\" is treated as an abstention). Such malformed host records can still yield honest=true and recommend_adopt=true, so required instrumentation is not yet a trustworthy measurement. The tests added in this diff check absence, but not malformed values.",
+    "file": "bench/pkg-dogfood/analyze_prov.py",
+    "fix_hint": "Validate before computing metrics: citations_emitted and citations_resolved must each be non-boolean, non-negative integers, with resolved <= emitted per record; abstained must be a JSON boolean. Add validation failures to blocked_reason so honest=false, and add end-to-end refusal tests for negative counts, resolved greater than emitted, boolean/float/string counts, and string/numeric abstained values.",
+    "severity": "major",
+    "title": "Instrumentation values remain unvalidated"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is stagnant: the round-3 major finding remains unresolved. The analyzer still treats every non-null instrumentation value as valid, allowing malformed external JSON to fabricate passing honesty metrics. The added tests continue to cover missing instrumentation but do not exercise invalid types or domains.",
+  "verdict": "request_changes"
+ }
+}
