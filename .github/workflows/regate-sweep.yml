@@ -13,11 +13,16 @@ name: regate-sweep
 on:
   workflow_dispatch:
   schedule:
-    # :09/:29/:49 — three ticks an hour, which is the TICKS_PER_HOUR the script's drain arithmetic
-    # is asserted against. The minutes are free of every other registry cron: conflict-resolver
-    # (1/21/41), dispatch (3/13/...), groom + retriage (7/22/37/52), metrics (11/26/41/56),
-    # curate (17/47) and dashboard + groom-leases (*/15).
-    - cron: '9,29,49 * * * *'
+    # Three ticks an hour, which is the TICKS_PER_HOUR the script's drain arithmetic is asserted
+    # against. These minutes must be free of every other registry cron; that is NOT restated here
+    # as a list, because the list went stale (#1046). It is DERIVED from the tree by
+    # ci-latency-alert.py's `schedule_minute_map` and asserted in regate-sweep.py's
+    # `_test_workflow_seam`, so repointing any lane in this directory reds the gate.
+    #
+    # These were :09/:29/:49 until the derivation was turned on and reported what the hand-copied
+    # list had never included: latch-watchdog runs :09/:19/:29/:39/:49/:59, i.e. this sweeper had
+    # been landing on top of it on ALL THREE ticks.
+    - cron: '4,24,44 * * * *'
 
 permissions: {}
 
@@ -46,14 +51,21 @@ jobs:
           path: registry
           persist-credentials: false
           sparse-checkout-cone-mode: false
-          # KEEP THIS LIST IN SYNC — REQUIRED_FILES in scripts/regate-sweep.py is asserted against
-          # this very block, so a trimmed checkout reds the gate instead of silently disabling the
-          # self-test's YAML-seam assertions.
+          # KEEP THIS LIST IN SYNC — REQUIRED_FILES + REQUIRED_DIRS in scripts/regate-sweep.py are
+          # asserted against this very block, so a trimmed checkout reds the gate instead of
+          # silently disabling the self-test's YAML-seam assertions.
+          #
+          # `.github/workflows` is an INPUT, not incidental: the cron-collision assertion DERIVES
+          # every other lane's minutes from the workflow files themselves (#1046), and with the
+          # directory dropped it would compare this cron against one lane and pass vacuously.
+          # ci-latency-alert.py owns that derivation, which is why it is checked out too.
           sparse-checkout: |
             scripts/regate-sweep.py
             orchestration/gate-repairs.json
             scripts/selftest-suite.txt
+            scripts/ci-latency-alert.py
             .github/workflows/regate-sweep.yml
+            .github/workflows
 
       - name: Set up Python (pinned)
         uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0

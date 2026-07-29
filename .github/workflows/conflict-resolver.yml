@@ -7,7 +7,8 @@ on:
   workflow_dispatch:
   schedule:
     # Explicit off-peak minutes mirror dispatch's throttling-resistant cron convention. The :01
-    # offset avoids dispatch (:03/:13/...) and groom (:07/:22/...) maintenance contention.
+    # offset avoids dispatch/groom maintenance contention; which minute belongs to which lane is
+    # DERIVED, not copied here (#1046 — ci-latency-alert.py's `schedule_minute_map`).
     - cron: '1,21,41 * * * *'
 
 permissions: {}

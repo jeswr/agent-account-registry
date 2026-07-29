@@ -9,7 +9,8 @@
 # dashboard build copies it to `site/metrics.json` in its sole Pages artifact, and the
 # `dashboard-publish` job below KICKS that build as soon as the snapshot exists so the published
 # copy tracks THIS workflow's cadence instead of the sum of both (#656 follow-up). The cron offset
-# still avoids same-minute ledger CAS contention with dashboard.yml (*/15) and groom.yml (7-59/15).
+# still avoids same-minute ledger CAS contention with the dashboard and groom lanes; their minutes
+# are DERIVED rather than restated here (#1046 — ci-latency-alert.py's `schedule_minute_map`).
 name: metrics
 
 on:

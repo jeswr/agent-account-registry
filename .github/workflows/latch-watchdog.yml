@@ -12,11 +12,12 @@ name: latch-watchdog
 on:
   workflow_dispatch:
   schedule:
-    # Every 10 minutes on minutes no other cron here uses: dispatch :03/:13/:23/:33/:43/:53,
-    # groom :07/:22/:37/:52, metrics :11/:26/:41/:56, retriage :07/:37, curate :17/:47,
-    # conflict-resolver :01/:21/:41, groom-leases + dashboard :00/:15/:30/:45. A 10-minute tick
-    # against a 900 s grace bounds worst-case detection at ~25 min, against stalls measured at
-    # 20 min and 11.35 h.
+    # Every 10 minutes, on minutes no other cron here uses. That claim is NOT re-enumerated as a
+    # list of the other lanes' minutes — this comment used to carry one, it went stale, and #1046
+    # replaced it with a derivation: ci-latency-alert.py's `schedule_minute_map` reads every
+    # workflow in this directory, and regate-sweep.py's `_test_workflow_seam` asserts against it.
+    # A 10-minute tick against a 900 s grace bounds worst-case detection at ~25 min, against
+    # stalls measured at 20 min and 11.35 h.
     - cron: '9,19,29,39,49,59 * * * *'
 
 permissions: {}
