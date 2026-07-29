@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5089,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7831cec1bdc62916ac91d275647814fd39751c62",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior findings. The manifest and module documentation now accurately describe the 17-case input as a hand-written differential corpus rather than the W3C entailment-conformance suite, explicitly limit the spike's question to equivalence with the shipping six-rule materializer, and add independent required/forbidden conclusions so equality is not the sole semantic oracle. The scale label is corrected from 84 to 64 leaf classes, matching 4 x 4 x 4. The new expectations exercise each of rdfs2/3/5/7/9/11, interactions, cycles, no-op/schema-only shapes, and positive and negative outcomes; closure equality is checked on the real compiled-rule and materializer paths before timing. The experimental rules remain feature-gated and do not alter the shipping path, meta-level divergences are candidly reported outside the asserted envelope, and performance output is clearly marked non-canonical. No correctness, soundness, test-validity, or security defect remains in the diff-scoped change.",
+  "verdict": "approve"
+ }
+}
