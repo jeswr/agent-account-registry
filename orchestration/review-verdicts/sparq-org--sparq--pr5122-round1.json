@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5122,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1af533937d5ae763aba78f5db3a3e978bc2c679c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The assertion `compare_select(&g, &store, multi).is_err()` requires the two engines to return opposite member orders for a raw multi-member GROUP_CONCAT. But the order is unspecified, not guaranteed to differ. Both engines can legitimately choose the same order, and that order may change with dependency versions, hash/iteration behavior, or implementation details. Thus a correct build can fail this test, while the load-bearing property is only that generated queries avoid comparing an order-sensitive raw multi-member concatenation.",
+    "file": "crates/sparq-bench/src/fuzz.rs",
+    "fix_hint": "Remove the assertion that the excluded query must disagree across engines. Keep the structural generator check that every emitted GROUP_CONCAT is singleton or wrapped in an order-invariant operation, and retain the positive cross-engine tests for those generated shapes. If a mutation guard is desired, test the structural classifier directly with a deliberately unsafe query rather than depending on incidental engine output order.",
+    "severity": "major",
+    "title": "GROUP_CONCAT test requires a nondeterministic cross-engine disagreement"
+   }
+  ],
+  "progress": null,
+  "summary": "The new typed-literal and result-form coverage is generally well targeted, and the tests meaningfully exercise ASK booleans, graph results, lexical recanonicalization, and datatype-family reachability. However, the GROUP_CONCAT test encodes an accidental current ordering difference between the two engines as a required failure. SPARQL leaves GROUP_CONCAT member order unspecified, so both engines may legitimately produce the same ordering on this fixture; a dependency update, iteration-order change, or platform difference can therefore fail the test even when both implementations and the generator restriction are correct. This is a major test-validity issue and should be fixed before approval.",
+  "verdict": "request_changes"
+ }
+}
