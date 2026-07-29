@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 5099,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a9087d37af57c73fd24cee38f068f4f47c2a4644",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "serializeModel emits nodePatterns for every non-negated node before emitting edges. For an optional edge, only the edge triple is wrapped in OPTIONAL; the target node's class, attributes, and filters remain required at group level. Thus an unmatched optional target removes the source row, contradicting BuilderEdge's documented semantics. The test `OPTIONAL wraps the edge` still explicitly expects the incorrect top-level `?friend a foaf:Person` pattern.",
+    "file": "gui/app/src/lib/query-builder.ts",
+    "fix_hint": "Emit the optional edge and the target node's own patterns in the same OPTIONAL group, with each target's patterns emitted exactly once. Reject graph shapes whose ownership/scope is ambiguous if v1 cannot serialize them soundly. Change the test to assert the target class/attributes are inside OPTIONAL and that an unmatched source row survives.",
+    "severity": "major",
+    "title": "OPTIONAL edges still leave target-node constraints outside OPTIONAL"
+   },
+   {
+    "body": "projectedVariables includes projected attributes on a negated target, but validateModel identifies an owner only with `model.nodes.find((n) => n.variable === name)`. An attribute variable such as `blockedName` has no matching node variable, so it remains in SELECT even though its binding exists only inside FILTER NOT EXISTS. The new test covers only projection of the target node variable, not an owned attribute.",
+    "file": "gui/app/src/lib/query-builder.ts",
+    "fix_hint": "Track projection ownership for both node and attribute variables and reject every projection whose owning node is in negatedNodeIds. Disable attribute projection controls for negated nodes as well. Add a test with a projected attribute on a NOT EXISTS leaf and assert buildQuery.runnable is false.",
+    "severity": "major",
+    "title": "Projected attributes inside NOT EXISTS still evade validation"
+   },
+   {
+    "body": "prefixWarning still returns severity `warning`, so buildQuery reports runnable=true although requiredPrefixLines cannot emit a declaration for the unknown prefix. The generated text is invalid as a standalone SPARQL query, contradicting the README's explicit promise that an undeclared prefix makes the diagram non-runnable. The test still locks in the contradictory runnable=true behavior.",
+    "file": "gui/app/src/lib/query-builder.ts",
+    "fix_hint": "Make unknown prefixed names validation errors unless the model gains an explicit prefix-declaration mechanism. Preserve best-effort SPARQL visibility, but set runnable=false. Update the undeclared-prefix test accordingly.",
+    "severity": "major",
+    "title": "Undeclared prefixes are still marked runnable"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 is stagnant: all three major correctness findings from round 1 remain in the submitted diff, and the tests still encode or omit the faulty behavior. OPTIONAL edge targets are still serialized at top level, projected attributes owned by NOT EXISTS targets still evade validation, and unknown prefixes are still warnings despite producing undeclared, non-runnable SPARQL.",
+  "verdict": "request_changes"
+ }
+}
