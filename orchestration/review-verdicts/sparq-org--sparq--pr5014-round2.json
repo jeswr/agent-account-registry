@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5014,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "be5697007acaf58eefe1cf19d5c681c47d3d3e6f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Nested conversion directly emits `NestedType::load(source, value)?` with no active-node/shape recursion guard. The schema explicitly supports recursive shape types by boxing them, but a self-referential shape and a cyclic data edge (for example, `ex:S sh:property [ sh:path ex:next; sh:node ex:S ]` and `ex:a ex:next ex:a`) repeatedly re-enters `S::load` until stack overflow. This is reachable through the public generated `Source` interface and contradicts the typed-error/no-panic model of the generator; cyclic RDF graphs are ordinary inputs.",
+    "file": "crates/sparq-wrapper-shacl/src/emit.rs",
+    "fix_hint": "Generate a cycle-aware loading path that tracks active `(shape, node)` pairs and fails closed with a typed `LoadError` when an owned tree cannot represent the cycle, while keeping the public convenience `load` entry point. Add a compiled generated-loader test using a self-referential shape and self-loop data, asserting a deterministic typed error rather than recursion/stack overflow.",
+    "severity": "major",
+    "title": "Recursive sh:node data can stack-overflow generated loaders"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The two prior numeric findings are substantively fixed: arbitrary-precision integer/decimal families remain lexical, bounded integer ranges are checked, and float/double lexical handling is separated and exercised by compiled generated code. However, the generated sh:node loader has no recursion guard. A recursive shape over cyclic conforming RDF data recursively calls the generated load method forever and can stack-overflow instead of returning a model or typed error. Because this is a newly identified major correctness and denial-of-service issue, progress is regressing under the required round-comparison scale.",
+  "verdict": "request_changes"
+ }
+}
