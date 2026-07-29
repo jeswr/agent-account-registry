@@ -1,0 +1,44 @@
+{
+ "host_envelope": {
+  "pr": 4942,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bbbc8a29c0445eccaa5f37f1a0b2a905a9e4a47c",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new reject is placed in maybeDecompressBytes, which is shared by BOTH entry points: maybeDecompressFile (web file upload) and fetchRdfDocument (the URL tab). The URL tab is persona-independent \u2014 import-drawer.tsx:496 renders `{tab === \"url\" && <UrlPane .../>}` with no `native` guard, and onImportUrl (import-drawer.tsx:353-357) calls fetchRdfDocument(target) unconditionally; only the FILE tab branches on `native` (lines 470/479).\n\nConsequence: in the Tauri desktop shell, importing https://host/data.nt.bz2 now throws 'Bzip2 archives are supported only by the desktop app.' \u2014 a message that is false in the context it is shown. It is also a capability regression: on main this path reached decompressDatasetBytes, whose 'bzip2' codec decodes via seek-bzip (packages/sparq-client/src/decompress.ts decodeBzip2), and both seek-bzip and buffer are still declared dependencies. The desktop FILE tab is unaffected (native loader), so the loss is confined to desktop URL imports \u2014 but it is real, and the wrong-persona wording contradicts the PR's own honesty goal.\n\nIf the underlying motivation is that in-browser bzip2 does not actually work, the same argument applies to the Tauri webview, and the message must then say so plainly rather than pointing at the desktop app.",
+    "file": "gui/app/src/lib/file-decompress.ts",
+    "fix_hint": "Make the gate persona-aware instead of unconditional. Either (a) give maybeDecompressBytes an options arg (e.g. `{ allowBzip2 }` or `{ nativeLoaderAvailable }`) that import-drawer passes from the same `native` flag it already uses at lines 470/479, rejecting only on web; or (b) keep the reject global but route the desktop URL fetch through the native loader for bzip2. Either way the thrown text must be true where it is displayed \u2014 e.g. 'Bzip2 archives cannot be decoded in the browser; use the desktop app.' on web, and no reject at all (or a different message) when running under Tauri. Add a unit test in file-decompress.test.ts that pins BOTH branches: bzip2 rejected with the allow-flag off, and decompression attempted with it on.",
+    "severity": "major",
+    "title": "bzip2 hard-reject fires on the DESKTOP persona's URL tab, telling a desktop user to use the desktop app"
+   },
+   {
+    "body": "Every other surface got a bzip2 caveat this round (WebFilePane text, drop hint, dialog Description, status-bar title, engine-context doc, README). UrlPane (import-drawer.tsx:973-999) was missed: it still says 'Fetch an RDF document, including a compressed archive, from a URL', with no indication that bzip2 is excluded.\n\nWorse, the FormatNote rendered just below passes `compressed={isCompressed(url)}`, and rdf-format.ts's COMPRESSION_EXTS still contains 'bz2'. So typing a .bz2 URL shows an affirmative 'compressed' affordance, and then the import hard-fails with the desktop-only error. That is the same silently-misleading pattern the file tab was cleaned up to remove.",
+    "file": "gui/app/src/components/workbench/import-drawer.tsx",
+    "fix_hint": "Update the UrlPane paragraph to match the WebFilePane wording (gzip/zip/zstd decoded in-tab; bzip2 and HDT desktop-only), and stop presenting .bz2/.tbz URLs as supported-compressed on the web persona \u2014 either exclude them from the isCompressed()-driven hint on web, or have FormatNote render an explicit 'bzip2 requires the desktop app' warning instead of the neutral compressed badge.",
+    "severity": "minor",
+    "title": "URL-tab copy and the compressed hint were not narrowed alongside the file-tab copy"
+   },
+   {
+    "body": "The test is titled '.zst upload is decoded before RDF format detection', but it cannot discriminate the format-detection half. guessFormat() calls stripCompression(), whose COMPRESSION_EXTS (gui/app/src/lib/rdf-format.ts:28) already contains 'zst' \u2014 so guessFormat('browser-upload.nt.zst') and guessFormat('browser-upload.nt') both return 'ntriples'. Reverting import-drawer.tsx:270 to guessFormat(file.name) leaves this test green. The payload is also N-Triples, which is a valid Turtle subset, so even a wrong 'turtle' guess would parse and the SELECT would still match.\n\nThe test is genuinely non-vacuous for what actually matters here \u2014 the zstd decode (undecompressed frame bytes would decode to mojibake and the ok banner would never appear) \u2014 so this is not a blocker. But round 3's recorded nit stands: no test goes red if the effectiveName plumbing regresses.",
+    "file": "gui/e2e-playwright/specs/browser-upload.web.spec.ts",
+    "fix_hint": "Use a member whose format is NOT reachable from the outer name and NOT Turtle-compatible: a STORED zip named bundle.zip whose single member is payload.nq containing a quad in a named graph (reuse the storedZip helper shape from file-decompress.test.ts). guessFormat('bundle.zip') is 'turtle' (zip is not in COMPRESSION_EXTS), Turtle rejects the 4th term, and asserting the quad lands with its graph preserved goes red the moment line 270 regresses. Rename the current test to say what it pins \u2014 e.g. '.zst upload is decompressed before parsing'.",
+    "severity": "minor",
+    "title": "The new e2e cannot fail on the effectiveName wiring it is named after (round-3 nit still open)"
+   },
+   {
+    "body": "The comment above WEB_RDF_ACCEPT now states 'Tar containers (.tgz/.tbz) are unsupported because decompression yields TAR rather than RDF'. Only .tbz is actually enforced (it is in the new bzip2 suffix list). .tgz is merely dropped from WEB_RDF_ACCEPT, which is only a file-picker filter: WebFilePane's handleDrop (import-drawer.tsx:684-714) passes every dropped File straight to readFilesWithDecompress with no accept check, and a user can pick 'All files' in the dialog. Such a .tgz still matches CODEC_EXTENSIONS.gzip in @sparq/client, gunzips to TAR bytes, and reaches the RDF parser as binary garbage with a confusing parse error \u2014 where .tbz gets an explicit (if wrongly-worded) message. Pre-existing behaviour, but the new comment now overstates it.",
+    "file": "gui/app/src/components/workbench/import-drawer.tsx",
+    "fix_hint": "Either reject .tgz/.tar.gz explicitly next to the bzip2 check in maybeDecompressBytes with an honest message ('tar archives are not supported \u2014 upload the RDF file directly'), or soften the comment to say .tgz is merely excluded from the picker filter rather than unsupported.",
+    "severity": "nit",
+    "title": "The new .tgz comment claims tar containers are unsupported, but nothing rejects them"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 4 adds a .zst e2e; I verified the fixture is spec-valid (descriptor 0x20 => single-segment, FCS at byte 5, raw last block (len<<3)|1) and that it is non-vacuous for the decode path: without decompression the frame decodes to mojibake and the import banner would be 'error'. The round-3 zip unit test and the doc narrowing also still hold up.\n\nHowever, tracing the bzip2 gate through the whole drawer surfaces a defect neither round 2 nor round 3 caught: the reject lives in the SHARED maybeDecompressBytes, and the URL tab is rendered on BOTH personas (import-drawer.tsx:496 has no `native` guard) with onImportUrl calling fetchRdfDocument unconditionally (line 355). So inside the Tauri desktop app, importing a .bz2 URL now fails with 'Bzip2 archives are supported only by the desktop app.' \u2014 self-contradictory, and a capability loss versus main, where decompressDatasetBytes decoded bzip2 via seek-bzip in the webview. That is exactly the honesty class this PR set out to fix, so I am blocking on it.\n\nSecondary: the URL surface was not narrowed with the rest of the copy (UrlPane still says 'including a compressed archive'; FormatNote's isCompressed() still counts .bz2, so a .bz2 URL renders a 'compressed' affordance and then hard-fails).\n\nOn progress: I am reporting 'regressing' per the literal scale (a new finding at a higher severity than round 3's single nit), but in fairness the major is NOT newly introduced by round 4 \u2014 the gate landed in round 3 and was missed then. The code did not get worse this round; the review got deeper. Round 3's nit also still stands: guessFormat already strips .zst (rdf-format.ts COMPRESSION_EXTS), so the new e2e's format assertion cannot go red if import-drawer.tsx:270 reverts to file.name.",
+  "verdict": "request_changes"
+ }
+}
