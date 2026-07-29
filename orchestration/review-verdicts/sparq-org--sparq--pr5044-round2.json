@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5044,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a125963a213af31a09558912aed94fcae5f595d5",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The documentation-only change remains correct and internally consistent. It clearly separates the noir_XPath face repository's v0.3.0 release from the v0.2.0 revision actually exercised by this repository's XPath differential lane; both the workflow and harness still pin v0.2.0. The audit dossier is updated consistently, makes no new privacy or soundness claim, and correctly treats a future pin bump as separate CI-validated work. No correctness, soundness, test-validity, or security issue was found.",
+  "verdict": "approve"
+ }
+}
