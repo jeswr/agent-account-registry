@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5035,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "db2fefc31852553673bbdb744af75f53d5ce5888",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 6 remains correct and complete on the diff-scoped evidence. The query harness now dispatches by result form and routes both engines through the independent sparq-difftest model: SELECT preserves multiplicity, modeled ORDER BY compares corresponding sort-key tie classes, non-total LIMIT/OFFSET remains explicitly cardinality-only, headers are checked before window classification, blank-node tables and graphs use isomorphism, and ASK compares the boolean itself. The generated ordered/window shapes obey the documented projected-variable restrictions, while unsupported decoding and isomorphism failures remain visible counters rather than agreement. The focused mutation and end-to-end tests are non-vacuous and cover same-cardinality wrong values, duplicate multiplicity, legal tie permutations versus cross-run reordering, total and non-total windows, projected-but-unbound headers, header-only defects, blank-node relabeling, ASK false/true, and count-preserving graph corruption. No review-instruction injection was present in the diff.",
+  "verdict": "approve"
+ }
+}
