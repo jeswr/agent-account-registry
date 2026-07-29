@@ -774,6 +774,72 @@ def _worker_runs(orch_repo, target, token, now):
 # =============================================================================================
 # ledger time-series I/O (CAS over the contents API, pinned to LEDGER_REF) — model-health pattern
 # =============================================================================================
+def _load_gh_403():
+    """Load scripts/gh_403.py (same checkout) — THE 403 taxonomy (registry #1208). By PATH, not
+    `import gh_403`: `scripts/` is not a package and the CWD a job runs from is not fixed.
+
+    The `metrics` job takes a FULL checkout, so this file is always beside us; a missing one is a
+    real regression (someone made the job sparse) and must say so rather than degrade to the
+    unclassified message this exists to replace."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gh_403.py")
+    spec = importlib.util.spec_from_file_location("registry_gh_403_for_metrics", path)
+    if spec is None or spec.loader is None:
+        raise MetricsError(
+            "cannot load scripts/gh_403.py — if this job was made sparse, add "
+            "scripts/gh_403.py to its sparse-checkout list in metrics.yml")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+gh_403 = _load_gh_403()
+
+# GitHub's own error envelope is a diagnostic, never resource content, but it is still bounded and
+# token-masked before it reaches a log: an unbounded echo of a response body is how a credential
+# ends up in an Actions log by accident.
+_ENVELOPE_LIMIT = 300
+_TOKEN_SHAPE = re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,})\b")
+
+
+def _failure_suffix(exc):
+    """`: <class> — <masked envelope>` for a failed call, or "" when nothing is readable.
+
+    WHY THIS EXISTS. Until now this client raised `GitHub API GET failed with HTTP 403` and
+    stopped — no body, no headers. Measured 2026-07-28/29, metrics.yml failed 9 times in the
+    window and every one of those failures was UNCLASSIFIABLE after the fact: a budget-exhausted
+    403 and a permission 403 are the same string, and the two need opposite responses (#1208).
+    Reading `x-ratelimit-remaining` off THIS response is also the only way to see the request
+    budget that actually binds — `GET /rate_limit` reports a different route partition and reads
+    healthy straight through an outage of this one (#796, re-measured #1303).
+
+    Never raises: a diagnostic that can fail replaces one lost cause with another (groom #647)."""
+    body = ""
+    try:
+        raw = exc.read()
+        body = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw or "")
+    except Exception:  # noqa: BLE001 — a diagnostic read must never mask the real failure
+        body = ""
+    headers = getattr(exc, "headers", None)
+    parts = []
+    if getattr(exc, "code", None) == 403:
+        parts.append(gh_403.classify_403(headers, body))
+        remaining = gh_403.int_header(headers, "x-ratelimit-remaining")
+        limit = gh_403.int_header(headers, "x-ratelimit-limit")
+        if remaining is not None:
+            parts.append(f"x-ratelimit-remaining={remaining}"
+                         + (f"/{limit}" if limit is not None else ""))
+        reset = gh_403.int_header(headers, "x-ratelimit-reset")
+        if reset is not None:
+            parts.append("resets at " + datetime.fromtimestamp(
+                reset, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    envelope = _TOKEN_SHAPE.sub("***", " ".join((body or "").split()))
+    if len(envelope) > _ENVELOPE_LIMIT:
+        envelope = envelope[:_ENVELOPE_LIMIT] + "…"
+    if envelope:
+        parts.append(envelope)
+    return (": " + " — ".join(parts)) if parts else ""
+
+
 class GitHubAPI:
     """Minimal contents API client (same shape as model-health.GitHubAPI). Local so the script has
     no cross-module import at CLI time; the token never enters a target-code job."""
@@ -808,7 +874,10 @@ class GitHubAPI:
                 return None
             if retry_conflict and exc.code in {409, 422}:
                 raise MetricsConflict("metrics ledger compare-and-swap conflict") from exc
-            raise MetricsError(f"GitHub API {method} failed with HTTP {exc.code}") from exc
+            raise MetricsError(
+                f"GitHub API {method} failed with HTTP {exc.code}"
+                + _failure_suffix(exc)
+            ) from exc
         except (URLError, TimeoutError) as exc:
             raise MetricsError("GitHub API request failed") from exc
         try:
@@ -1200,6 +1269,75 @@ def main():
 # =============================================================================================
 # self-tests (gh stubbed): metric computation, rate derivation, each alert rule, dedupe
 # =============================================================================================
+def _test_403_diagnosis(chk):
+    """[#1303] The failure message has to say WHICH 403 it met.
+
+    Nine metrics failures on 2026-07-28/29 were unclassifiable after the fact because this client
+    printed a bare status. The two 403s that matter need opposite responses — a budget 403 must
+    NOT be retried (the bucket has nothing to spend and the reset is up to an hour away), a
+    secondary one must be, after the wait it asks for — so a message that cannot tell them apart
+    cannot be acted on.
+    """
+    import io
+    from urllib.error import HTTPError
+
+    def err(code, headers, body):
+        return HTTPError("https://api.github.com/x", code, "err", headers,
+                         io.BytesIO(body.encode()))
+
+    # The MEASURED installation-budget shape: no Retry-After, remaining 0. Named the class the
+    # taxonomy names, and carrying the number that proves it.
+    budget = _failure_suffix(err(
+        403, {"x-ratelimit-remaining": "0", "x-ratelimit-limit": "5000",
+              "x-ratelimit-reset": "1785182238"},
+        '{"message":"API rate limit exceeded for installation."}'))
+    chk("403 diagnosis: an installation-budget 403 is named 'budget' and carries the count",
+        ("budget" in budget, "x-ratelimit-remaining=0/5000" in budget,
+         "API rate limit exceeded for installation." in budget), (True, True, True))
+    chk("403 diagnosis: ...and the reset stamp, which is the only thing that says WHEN to retry",
+        "resets at 2026-07-27T19:57:18Z" in budget, True)
+
+    secondary = _failure_suffix(err(
+        403, {"Retry-After": "30"},
+        '{"message":"You have exceeded a secondary rate limit."}'))
+    chk("403 diagnosis: a secondary 403 is NOT called budget (opposite response)",
+        ("secondary" in secondary, "budget" in secondary), (True, False))
+
+    permission = _failure_suffix(err(
+        403, {"x-ratelimit-remaining": "4931"},
+        '{"message":"Resource not accessible by integration"}'))
+    chk("403 diagnosis: a permission 403 is the residual class, never inferred from absence",
+        "permission" in permission, True)
+
+    # NON-VACUITY. All three must differ, or the classifier is decorative.
+    chk("403 diagnosis: the three classes really are distinguishable from each other",
+        len({budget.split("—")[0], secondary.split("—")[0], permission.split("—")[0]}), 3)
+
+    # A non-403 gets the envelope but no class: this file must not invent a taxonomy for 500s.
+    server = _failure_suffix(err(500, {}, '{"message":"Server Error"}'))
+    chk("403 diagnosis: a 500 carries its envelope and NO 403 class",
+        ("Server Error" in server,
+         any(c in server for c in ("budget", "secondary", "permission"))), (True, False))
+
+    # CREDENTIAL MASKING + BOUND. The envelope is echoed into an Actions log, so a token-shaped
+    # string in it must never survive, and a huge body must not flood the log.
+    leak = _failure_suffix(err(403, {}, '{"message":"bad ghp_' + "A" * 40 + '"}'))
+    chk("403 diagnosis: a token-shaped string in the envelope is masked",
+        ("ghp_" + "A" * 40 not in leak, "***" in leak), (True, True))
+    chk("403 diagnosis: the envelope is bounded",
+        len(_failure_suffix(err(403, {}, "x" * 5000))) < _ENVELOPE_LIMIT + 200, True)
+
+    # A diagnostic that raises would replace one lost cause with another (groom #647).
+    class _Unreadable(HTTPError):
+        def read(self, *_a, **_k):
+            raise OSError("stream already consumed")
+
+    chk("403 diagnosis: an unreadable body degrades, never raises",
+        isinstance(_failure_suffix(
+            _Unreadable("https://api.github.com/x", 403,
+                        "err", {"x-ratelimit-remaining": "0"}, None)), str), True)
+
+
 def _self_test():
     ok = True
 
@@ -1216,6 +1354,7 @@ def _self_test():
             for line in str(diag).splitlines():
                 print(f"       | {line}")
 
+    _test_403_diagnosis(chk)
     _test_metric_computation(chk)
     _test_rate_derivation(chk)
     _test_alert_rules(chk)
