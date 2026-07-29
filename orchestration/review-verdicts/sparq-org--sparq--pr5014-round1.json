@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5014,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "241ce48d787855f63b73acdc8d164c307bf95d74",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`kind_of` maps arbitrary-precision `xsd:integer` and derived types including `unsignedLong` to `ScalarKind::I64`. The emitted loader then parses only as Rust `i64`. This rejects valid conforming values such as `18446744073709551615`^^xsd:unsignedLong and integers outside the i64 range. Conversely, it accepts lexicals that parse as i64 but violate a derived datatype's value space, such as `-1`^^xsd:nonNegativeInteger. That contradicts the public claim that `sh:datatype` becomes a checked scalar and makes generated loaders disagree with SHACL datatype conformance.",
+    "file": "crates/sparq-wrapper-shacl/src/lower.rs",
+    "fix_hint": "Use datatype-specific conversion and range validation, with representations capable of each promised value space (or preserve the lexical form for datatypes that cannot be represented faithfully). Add generated-loader tests for the unsignedLong maximum, an integer outside i64, and a negative nonNegativeInteger; the first two must load and the last must fail.",
+    "severity": "major",
+    "title": "XSD integer datatypes are incorrectly collapsed to i64"
+   },
+   {
+    "body": "`decimal`, `float`, and `double` all lower to `f64`, although their lexical/value spaces differ. In particular, valid XSD double/float special values use `INF`, `-INF`, and `NaN`, while Rust's `f64::from_str` does not faithfully implement the XSD lexical mapping; decimal is arbitrary precision and excludes infinities/NaN. This can reject valid shaped data and loses exact decimal values while the API/documentation presents the result as a checked scalar.",
+    "file": "crates/sparq-wrapper-shacl/src/lower.rs",
+    "fix_hint": "Separate the datatype families. Implement XSD-compatible float/double lexical parsing (including special values) and use an exact decimal representation, or conservatively emit lexical `String` for decimal and any family that cannot be represented faithfully in the std-only output. Add compiled generated-loader tests covering INF/-INF/NaN and a high-precision decimal.",
+    "severity": "major",
+    "title": "XSD decimal, float, and double are conflated into one f64 parser"
+   }
+  ],
+  "progress": null,
+  "summary": "The lowering/emission pipeline is well structured and the end-to-end test exercises real generated code, but the numeric datatype mapping is not sound for several advertised XSD datatypes. It can reject conforming RDF values and can accept values outside the datatype's value space, so the generated loader is not a faithful checked-scalar representation as documented.",
+  "verdict": "request_changes"
+ }
+}
