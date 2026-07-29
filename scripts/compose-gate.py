@@ -165,7 +165,7 @@ def overlap_entries(enrolled, pr_paths, base_paths, prefix="scripts/"):
 
 
 def classify(graded_base, live_tip, merge_rc=None, conflicted=(), failures=(), entries=(),
-             preexisting=()):
+             preexisting=(), baseline_established=True):
     """PURE: the composition verdict.
 
     `graded_base` is the base tip the recorded verdict was computed against (HEAD^1 of the merge
@@ -181,7 +181,8 @@ def classify(graded_base, live_tip, merge_rc=None, conflicted=(), failures=(), e
     result = {"state": UNPROVABLE, "reason": "", "graded_base": graded_base or "",
               "live_tip": live_tip or "", "conflicted": list(conflicted or []),
               "failures": list(failures or []), "entries": list(entries or []),
-              "preexisting": list(preexisting or [])}
+              "preexisting": list(preexisting or []),
+              "baseline_established": bool(baseline_established)}
     if not SHA_RE.fullmatch(graded_base or ""):
         result["reason"] = ("the base tip this run's merge ref was composed from is unresolvable, "
                            "so which tree the verdict grades cannot be established")
@@ -232,6 +233,7 @@ def receipt(result, base_ref=""):
             f"entries={len(result.get('entries') or [])} "
             f"failures={len(result.get('failures') or [])} "
             f"preexisting={len(result.get('preexisting') or [])} "
+            f"baseline={'ok' if result.get('baseline_established', True) else 'unestablished'} "
             f"conflicts={len(result.get('conflicted') or [])} "
             f"blocking={'true' if result.get('state') in BLOCKING_STATES else 'false'}")
 
@@ -245,9 +247,18 @@ def annotation(result):
     reason = result.get("reason", "")
     if state == BROKEN:
         listed = ", ".join(sorted(result.get("failures") or []))
+        # ⚠️ If no baseline could be established, SAY SO in the same breath as the accusation. On a
+        # tree predating the sandboxed runner arm these failures cannot be shown to postdate the
+        # base move, and telling an author "the composition broke this" without that caveat is the
+        # same false attribution in the other direction.
+        caveat = ("" if result.get("baseline_established", True) else
+                  " ⚠️ NO BASELINE could be established — the tree this gate graded has no "
+                  "sandboxed runner arm, so these failures cannot be shown to POSTDATE the base "
+                  "move; they are attributed to the composition because an unverifiable excuse is "
+                  "not an excuse. Merging the base branch in produces a gradeable baseline.")
         return (f"::error::composition break — {reason}. Neither side need be wrong on its own: "
                 f"this is master and this PR disagreeing. Merge the base branch in and re-run "
-                f"{listed} locally.")
+                f"{listed} locally.{caveat}")
     if state == CONFLICT:
         paths = ", ".join(sorted(result.get("conflicted") or [])[:8]) or "unreported paths"
         return (f"::warning::textual conflict with the current base tip ({paths}) — {reason}. "
@@ -370,10 +381,12 @@ def compose(base_ref, cwd, full=False, manifest=SUITE_MANIFEST, git=_git, run_su
             failures = runner(tree, chosen)
             # ---- THE DIFFERENTIAL. A failure is only a COMPOSITION break if it PASSES on the tree
             # `pr-gate` already graded. Paid only on failure, and only for the entries that failed.
+            baseline_ok = runner_available(cwd)
             preexisting = _baseline_failures(cwd, failures, runner) if failures else []
             return classify(graded_base, live_tip, merge_rc,
                             failures=[e for e in failures if e not in preexisting],
-                            preexisting=preexisting, entries=chosen)
+                            preexisting=preexisting, entries=chosen,
+                            baseline_established=baseline_ok)
         finally:
             git(["worktree", "remove", "--force", tree], cwd, check=False)
 
@@ -531,6 +544,14 @@ def _self_test():
         classify(A, B, 0, failures=["new.py"], preexisting=["old.py"])["state"], BROKEN)
     chk("the BROKEN reason names the differential, not merely 'fails'",
         "PASS on the graded tree" in classify(A, B, 0, failures=["n.py"])["reason"], True)
+    chk("an unestablished baseline is stated in the receipt, never silent",
+        "baseline=unestablished" in receipt(classify(A, B, 0, failures=["x"],
+                                                    baseline_established=False)), True)
+    chk("...and the accusation itself carries the caveat",
+        "NO BASELINE" in annotation(classify(A, B, 0, failures=["x"],
+                                             baseline_established=False)), True)
+    chk("...while an established baseline adds no caveat",
+        "NO BASELINE" in annotation(classify(A, B, 0, failures=["x"])), False)
     chk("the receipt reports both populations separately",
         ("failures=1" in receipt(classify(A, B, 0, failures=["a"], preexisting=["b", "c"])),
          "preexisting=2" in receipt(classify(A, B, 0, failures=["a"], preexisting=["b", "c"]))),
