@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4967,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3d771b79de8fc38ddf6822e4a0e1106e82b88614",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The pull_request and push path filters enumerate the four workflow files individually. If a fifth `.claude/workflows/*.js` file is added, that PR does not match any of these workflow paths, so `routing-self-tests` does not run and `test_every_workflow_is_linked_from_agents_md`, the schema checks, parsing check, and model-dispatch checks never inspect it. The test's `test_every_workflow_script_is_a_path_trigger` cannot catch this because the test itself is not triggered by the unlisted new file. Thus the advertised invariant over every workflow is not durable and a new unlinked, unschema'd, or invalid workflow can merge without this gate.",
+    "file": ".github/workflows/routing-self-tests.yml",
+    "fix_hint": "Use a path pattern covering the directory, such as `.claude/workflows/*.js`, in both pull_request and push filters, and update the gate-wiring assertion to require that pattern on both triggers. This makes newly added workflow files trigger the suite before the suite enumerates them.",
+    "severity": "major",
+    "title": "New workflow files can bypass the new contract gate"
+   }
+  ],
+  "progress": null,
+  "summary": "The new structural suite covers the currently known workflow scripts, but its own CI trigger does not cover future workflow scripts. This leaves the durability and schema guarantees bypassable in exactly the add-a-new-workflow case the suite claims to enforce.",
+  "verdict": "request_changes"
+ }
+}
