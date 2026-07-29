@@ -632,7 +632,17 @@ def prose_text(title, body, render_markdown):
         for document in (title, body))
 
 
-def closing_references(title, body, render_markdown):
+def derivation_texts(title, body, render_markdown):
+    """The TWO texts the derivation cross-checks: `(raw, prose)`.
+
+    ONE render per document per pull request, and the reason the derivation is built around this
+    pair rather than around `(title, body)`: the grammar half and the advisory-mention half both
+    read the prose, and computing it twice would double an already-network-bound step for no
+    answer that can differ. --self-test asserts the count at the sweep's own call site."""
+    return raw_text(title, body), prose_text(title, body, render_markdown)
+
+
+def closing_references(raw, prose):
     """Every same-repository closing reference, split into what may BIND and what counts for
     AMBIGUITY. Raises `RenderUnavailable` / `UnknownRenderedElement`; both are refusals upstream.
 
@@ -656,9 +666,7 @@ def closing_references(title, body, render_markdown):
     It also keeps the shared writer's own precondition true by construction: `declared ⊆ raw_refs`,
     so anything derived here is a textual `#N` in the title or body and therefore satisfies
     `mint-provenance.references_issue`."""
-    raw = raw_text(title, body)
     raw_refs = {int(match.group(1)) for match in CLOSING_REF_RE.finditer(raw)}
-    prose = prose_text(title, body, render_markdown)
     live, seen = set(), set(raw_refs)
     for match in CLOSING_REF_RE.finditer(prose):
         number = int(match.group(1))
@@ -670,16 +678,15 @@ def closing_references(title, body, render_markdown):
 
 def closing_issue_candidates(title, body, render_markdown):
     """The DISTINCT, sorted set of same-repository issue numbers this PR DECLARES it closes."""
-    return closing_references(title, body, render_markdown).declared
+    return closing_references(*derivation_texts(title, body, render_markdown)).declared
 
 
-def mentioned_issue_numbers(title, body, render_markdown):
+def mentioned_issue_numbers(prose):
     """ADVISORY: every same-repository `#N` the PR mentions, sorted, capped. Never a candidate.
 
     Reads the same RENDERED PROSE the grammar's binding half does, so the hint never advertises a
     number that only exists inside a code block the author pasted."""
-    text = prose_text(title, body, render_markdown)
-    return sorted({int(number) for number in MENTION_RE.findall(text)})[:MAX_ADVISORY_MENTIONS]
+    return sorted({int(number) for number in MENTION_RE.findall(prose)})[:MAX_ADVISORY_MENTIONS]
 
 
 def candidate_refusal(candidates, mentions=(), all_references=None):
@@ -746,8 +753,8 @@ def derive_issue_number(pull, read_issue, render_markdown):
         return DerivedIssue(None, REASON_ISSUE_UNREADABLE,
                             "the pull request payload is malformed", None)
     try:
-        references = closing_references(pull.get("title"), pull.get("body"), render_markdown)
-        mentions = mentioned_issue_numbers(pull.get("title"), pull.get("body"), render_markdown)
+        raw, prose = derivation_texts(pull.get("title"), pull.get("body"), render_markdown)
+        references, mentions = closing_references(raw, prose), mentioned_issue_numbers(prose)
     except UnknownRenderedElement as exc:
         return DerivedIssue(None, REASON_BODY_NOT_UNDERSTOOD, str(exc), None)
     except Exception as exc:                              # noqa: BLE001 — no render, no derivation
@@ -1510,6 +1517,14 @@ def _self_test():                                                       # noqa: 
           (oracle.get("context"), oracle.get("issue")), (ORACLE_CONTEXT_REPO, ORACLE_ISSUE))
     check("...and the corpus labels are distinct, so no row silently shadows another",
           len({row[0] for row in RENDERED_ORACLE_CORPUS}), len(RENDERED_ORACLE_CORPUS))
+    # HARNESS INTEGRITY, asserted rather than assumed. A frozen renderer that answered "" for a
+    # document it does not have would make every "this shape refuses" row below pass for the WRONG
+    # reason — the derivation would be reading an empty document, not understanding the shape and
+    # declining. It must RAISE, and the raise must not be `RenderUnavailable`, which the production
+    # path would swallow into a refusal.
+    missing = total(lambda: frozen("a document that is deliberately not in the fixture"))
+    check("HARNESS — a document with no frozen render RAISES rather than answering empty",
+          missing, ("RAISED", "SweepError"))
 
     oracle_binds = {}
     for label, title, body, expect_bind in RENDERED_ORACLE_CORPUS:
@@ -1660,12 +1675,21 @@ def _self_test():                                                       # noqa: 
           bool(SENTENCE_BREAK_RE.search(
               rendered_prose_text("<p>this does not close anything</p>"
                                   "<pre>x</pre><p>Closes #7</p>"))), True)
+    # BOTH EDGES of a block boundary, and the fixture that can tell them apart. A VOID block element
+    # has no end tag, so only the OPENING separator exists for it — and without that separator the
+    # two sides SPLICE into a declaration nobody wrote, which is the mint direction. MEASURED: with
+    # only a closing-edge separator this row is the sole one in the suite that reds.
+    check("a block boundary separates on the OPENING edge too, so a void block cannot splice a "
+          "keyword onto a number across it",
+          bool(CLOSING_REF_RE.search(rendered_prose_text("Fixes<hr>#7"))), False)
+    check("...and the same two halves DO bind when the author really wrote them adjacent",
+          bool(CLOSING_REF_RE.search(rendered_prose_text("<p>Fixes #7</p>"))), True)
 
     # ---- THE TWO-DERIVATION AGREEMENT RULE ------------------------------------------------------
     # `declared` is the INTERSECTION of the rendered prose and the raw source; `all_refs` is their
     # UNION. Each half is asserted with a shape only that half catches.
     def refs(title, body, render):
-        return total(lambda: closing_references(title, body, render))
+        return total(lambda: closing_references(*derivation_texts(title, body, render)))
 
     quoted_only = refs("t", "Closes #7", lambda _t: "<pre>Closes #7</pre>")
     check("PROSE HALF — a reference the RENDERER puts in code drops out of the binding set",
@@ -1709,7 +1733,8 @@ def _self_test():                                                       # noqa: 
     # Driven through the REAL derivation on a rendered paragraph, because the suppressor now reads
     # the prose text and nothing else.
     def para(text):
-        return total(lambda: closing_references("t", text, lambda _t: f"<p>{text}</p>"))
+        return total(lambda: closing_references(
+            *derivation_texts("t", text, lambda _t: f"<p>{text}</p>")))
 
     for phrase in ("does not close", "doesn't close", "will not fix", "won't fix",
                    "never closes", "cannot close", "no longer closes", "unable to close",
@@ -1735,18 +1760,21 @@ def _self_test():                                                       # noqa: 
 
     # ---- the ADVISORY mention list (rendered prose only; never a candidate) --------------------
     def mentions_of(text):
-        return total(lambda: mentioned_issue_numbers("", text, lambda _t: f"<p>{text}</p>"))
+        return total(lambda: mentioned_issue_numbers(
+            derivation_texts("", text, lambda _t: f"<p>{text}</p>")[1]))
 
     check("mentions are collected for the hint", mentions_of("see #8 and #7"), [7, 8])
     check("...cross-repository mentions are not this repo's numbers",
           mentions_of("sparq-org/sparq#4329"), [])
     check("...and the hint is capped",
-          len(total(lambda: mentioned_issue_numbers(
-              "", "x", lambda _t: "<p>" + " ".join(f"#{n}" for n in range(1, 20)) + "</p>"))),
+          len(total(lambda: mentioned_issue_numbers(derivation_texts(
+              "", "x", lambda _t: "<p>" + " ".join(f"#{n}" for n in range(1, 20))
+              + "</p>")[1]))),
           MAX_ADVISORY_MENTIONS)
     check("...and the mention list reads the same RENDERED PROSE the grammar's binding half does",
-          total(lambda: mentioned_issue_numbers(
-              "t", "x", lambda _t: "<p><code>#1234</code></p><blockquote>#999</blockquote>")), [])
+          total(lambda: mentioned_issue_numbers(derivation_texts(
+              "t", "x",
+              lambda _t: "<p><code>#1234</code></p><blockquote>#999</blockquote>")[1])), [])
     # THE CONTROL that keeps the hint advisory: a body full of mentions and NO closing keyword
     # still derives NOTHING, and still refuses under the SAME reason as a body with no `#` at all.
     def mentions_only(text):
@@ -1888,6 +1916,17 @@ def _self_test():                                                       # noqa: 
           "never the binding derivation",
           (derive("Closes #7", render=lambda _t: "").number,
            derive("Closes #7", render=lambda _t: "").reason), (None, REASON_NO_REFERENCE))
+    # ARG 5 (prose): the ADVISORY hint reads the rendered prose, not the raw source, THROUGH the
+    # production derivation. Asserting it on `mentioned_issue_numbers` alone leaves the wiring
+    # unobserved — MEASURED, pointing the call at `raw` survived the whole suite — and the cost is
+    # a public comment telling an author to use a number that only exists in a code block they
+    # pasted. The body mentions #1234 in the SOURCE and #8 in the RENDERING.
+    quoted_hint = derive("`#1234` see #8",
+                         render=lambda _t: "<p><code>#1234</code> see #8</p>")
+    check("ARG 5 (prose): the advisory hint names only the numbers GitHub renders as live text",
+          (quoted_hint.reason, "#8" in (quoted_hint.message or ""),
+           "#1234" in (quoted_hint.message or "")),
+          (REASON_NO_REFERENCE, True, False))
 
     check("a malformed pull payload refuses rather than raising",
           total(lambda: derive_issue_number(None, lambda n: issue(),
@@ -1927,7 +1966,7 @@ def _self_test():                                                       # noqa: 
     hostile = ORACLE_HOSTILE_PASSTHROUGH
     for reason in PR_REFUSAL_REASONS:
         rendered = refusal_comment_body(reason, hostile)
-        refs = total(lambda r=rendered: closing_references("", r, frozen))
+        refs = total(lambda r=rendered: closing_references(*derivation_texts("", r, frozen)))
         # `declared` is what could BIND, and it must be empty. `all_refs` is deliberately NOT
         # empty: the raw half of the intersection still SEES the hostile numbers, which is what
         # makes a pasted-back comment an AMBIGUOUS refusal rather than a quiet no-op. Asserting
@@ -2163,6 +2202,25 @@ def _self_test():                                                       # noqa: 
           {"models": {AUTO_IMPL_ALIAS: {"provider": "anthropic"}}})
     check("...and the derived issue number, not the PR's own",
           total(lambda: (rec.handed[0]["number"], rec.handed[0]["issue_number"])), (41, 7))
+    # WHAT THE RENDERER WAS HANDED. `POST /markdown`'s `context` is what makes GitHub mark a
+    # reference it RESOLVED with the `issue-link` class, and that class is the ONLY thing telling a
+    # resolved reference apart from an author-written `<a>`. A hard-coded repository here would
+    # render a SECOND enrolled target's bodies against the wrong numbering — invisible today
+    # because there is one target, which is exactly why it needs a target whose name differs.
+    other = _Recorder([pull(number=41, body="Closes #7")])
+    run_row(other, annotate_repo="x/y", targets=(("x/y", ("jeswr",)),))
+    check("...and the sweep renders each target's documents IN THAT TARGET's context",
+          sorted({repo for repo, _text in other.rendered}), ["x/y"])
+    check("...rendering the TITLE and the BODY as two separate documents, never concatenated, and "
+          "each EXACTLY ONCE — the grammar half and the mention half read one shared rendering",
+          sorted(text for _repo, text in other.rendered), ["Closes #7", "fix: something"])
+    # ...and a PR that can never bind still pays for its rendering, deliberately: the advisory hint
+    # in a `no-issue-reference` comment names the numbers the author DID mention, and that list is
+    # read from the rendered prose so it cannot advertise a number out of a pasted code block.
+    hintless = _Recorder([pull(number=41, body="mentions #8 but declares nothing")])
+    run_row(hintless)
+    check("...and a PR with no closing reference at all is still rendered, so its hint is honest",
+          len(hintless.rendered), 2)
 
     # IDEMPOTENCE: a second tick over the record the first one wrote is a NO-OP.
     rec2 = _Recorder(clean, records={41: json.dumps({"pr_number": 41})})
@@ -2579,6 +2637,12 @@ def _self_test():                                                       # noqa: 
     check("...and the readers are the ones _gh_readers built for THIS registry",
           fwd(ran, "gh_readers_repo", "read_routing", "post_comment"),
           ("o/r", "reader-routing", "reader-post"))
+    # ...INCLUDING the renderer. `sweep()` takes it keyword-only, so dropping it here is a
+    # TypeError in production — but the harness's `sweep` stand-in takes `**kwargs`, which is
+    # exactly the shape that lets a dropped keyword go unobserved. MEASURED: deleting this
+    # forwarding survived the whole suite before this row existed.
+    check("...and the RENDERER, without which there is no derivation at all",
+          fwd(ran, "render_markdown"), "reader-render")
     check("...and the population comes from the master-protected enrolment authority",
           fwd(ran, "targets"), [("o/r", ("jeswr",))])
     check("...and a clean run returns 0", fwd(ran, "returned"), 0)
