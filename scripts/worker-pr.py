@@ -4774,6 +4774,88 @@ ARM_DECLINE_MARKER_PREFIX = "<!-- sparq-arm-declined:v1 sha="
 # the arm at ONE head. One. The receipt above IS the counter (durable, SHA-bound, bot-authored),
 # so no new state is introduced and a crash cannot lose the count.
 ARM_DECLINE_MAX_PER_HEAD = 1
+# ---- registry #853: AN ABSENT CHECK IS NOT A PASSING ONE -------------------------------------
+# A CONFLICTING (`DIRTY`) pull request has no merge ref, so GitHub creates NO `pull_request`
+# workflow run for it at all — `pr-gate.yml` simply never runs, on any head pushed while the
+# conflict stands. Observed directly on #826: round-2 heads got no `gate` run until master was
+# merged in and the conflict cleared. The hazard is that the failure mode is not a RED check, it
+# is an ABSENT one: every surface that answers "is anything wrong with CI here?" by looking for a
+# failing row answers "no" — and this estate has already been bitten by the identical shape
+# (sparq's `ci_summary_gate._PASSING` counts `skipped` as passing, so a job that never ran does
+# not block).
+#
+# WHAT IS *NOT* DONE HERE, deliberately, because it is the tempting wrong fix: `pr-gate.yml` is
+# NOT moved onto the head ref. Merge-ref CI is the default precisely because head-ref CI grades a
+# tree that will never exist; swapping them would trade an absent signal for a misleading one.
+#
+# AND NO DECISION DIRECTION CHANGES. `arm_gate_decision` still arms on `missing` — the two block
+# comments above measure why (a `pending`/`missing` aggregator is held safely by the latch itself,
+# which cannot fire without the merge-required `gate` context, and refusing on it rebuilds the
+# #326/#334 clean-status regression and the 25.3%-pending stall). What was missing is not a
+# refusal, it is a RECORD: the arm read the grade, acted on it, and wrote it down nowhere on the
+# admitted path, so "this verdict is bound to a head `pr-gate` never evaluated" was unrecoverable
+# from the run log. Silence now costs an annotation.
+#
+# The two literals below are spelled LOCALLY, for the reason `_GATE_FRESH` is: these feed a pure
+# decision path that must not take a lazy module load. Both are asserted against dispatch-claim's
+# own values by --self-test, so a drift shows up as a red check rather than as a class that
+# silently matches nothing (which is the direction that would make `absent` unreachable and hand
+# every absence back to the residual class).
+_GATE_ABSENT = "missing"
+# The ONLY two grades that prove a green aggregator (dispatch-claim.TIER_REACHABLE_GREEN, sorted).
+# The bare admission spelling "success" is deliberately ABSENT from this tuple: repair_gate_
+# conclusion grades every green, so a value carrying it is forged or pre-#762, and grading it
+# `green` here would be exactly the ungraded-green conflation #762 spent ten days separating.
+_ARM_CI_GREEN_GRADES = ("green:draft-tier", "green:merge-required")
+ARM_CI_GREEN = "green"        # the aggregator ran and passed
+ARM_CI_RED = "red"            # the aggregator ran and concluded a non-pass
+ARM_CI_ABSENT = "absent"      # NO aggregator run exists at this head — #853, the silent class
+ARM_CI_UNPROVEN = "unproven"  # a reading exists but proves neither direction (pending/unknown/...)
+ARM_CI_ABSENT_PREFIX = "arm-ci-absent:"
+
+
+def arm_ci_evidence(repair_gate):
+    """PURE: the CI-evidence CLASS at the reviewed head, named so that ABSENCE cannot be read as
+    a pass (registry #853).
+
+    Exactly one of ARM_CI_GREEN / ARM_CI_RED / ARM_CI_ABSENT / ARM_CI_UNPROVEN, over
+    `repair_gate_conclusion`'s vocabulary. This is a REPORTING classifier — it decides nothing;
+    `arm_gate_decision` and `arm_freshness_decision` remain the only arm predicates — but it is
+    the one place the four cases are named apart, and the point of the change is that `absent` is
+    a case at all instead of falling into the same bucket as a green.
+
+    Fail-closed in the only direction that matters: anything this function does not RECOGNISE as
+    one of the two graded greens is `unproven`, never `green` — including "" (the grade was never
+    read), the bare "success" spelling, and any hostile/garbage value."""
+    if repair_gate in _ARM_CI_GREEN_GRADES:
+        return ARM_CI_GREEN
+    # "failure" is `arm_gate_decision`'s own trigger literal; --self-test pins the two agree over
+    # the whole vocabulary, so a drift in either spelling reds rather than silently reclassifying.
+    if repair_gate == "failure":
+        return ARM_CI_RED
+    if repair_gate == _GATE_ABSENT:
+        return ARM_CI_ABSENT
+    return ARM_CI_UNPROVEN
+
+
+def arm_ci_absent_alarm(repo, pr_number, reviewed_sha, repair_gate):
+    """PURE: the ::warning:: annotation an ABSENT aggregator has to have emitted FOR it, or "".
+
+    A check that never ran cannot report itself. So the arm reports it: one workflow annotation,
+    on EVERY arm attempt at a head with no aggregator run — admitted, deferred or re-admitted
+    alike — naming the PR and the head, so an absent gate is as visible in the run log as a red
+    one. Emitted unconditionally rather than only on the admitted path, because "the arm was
+    refused for some other reason" is not a record that CI never ran."""
+    if arm_ci_evidence(repair_gate) != ARM_CI_ABSENT:
+        return ""
+    return (f"::warning::{ARM_CI_ABSENT_PREFIX} {repo}#{pr_number} at {reviewed_sha[:12]} has NO "
+            "aggregator check-run at all — this head was never evaluated by `pr-gate`, so there "
+            "is no green here and no red either. The commonest cause is a CONFLICTING pull "
+            "request (registry #853): GitHub computes no merge ref for a DIRTY PR, so its "
+            "`pull_request` workflows do not run on any head pushed while the conflict stands; a "
+            "degraded Actions is the other. Absence is NOT a pass — any review verdict bound to "
+            "this commit is weaker than a verdict on a gated head, and the merge latch cannot "
+            "fire without the required `gate` context either way.")
 
 
 def _dispatch_claim():
@@ -4924,7 +5006,8 @@ def arm_freshness_decision(freshness):
     return "" if state == _GATE_FRESH else ARM_DECLINE_GATE_STALE
 
 
-def arm_freshness_census_row(repo, pr_number, reviewed_sha, freshness, refused, readmitted=False):
+def arm_freshness_census_row(repo, pr_number, reviewed_sha, freshness, refused, readmitted=False,
+                             gate=""):
     """PURE: the ONE census line emitted for EVERY arm attempt that reaches the freshness read —
     admitted, refused, or re-admitted. A per-stage success rate cannot express a missing edge, so
     this is a POPULATION row: every arm attempt produces exactly one, and `refused=` partitions
@@ -4939,13 +5022,22 @@ def arm_freshness_census_row(repo, pr_number, reviewed_sha, freshness, refused, 
     is both stale and sitting on a concluded-red aggregator exits through the #892 decline (the
     stronger statement) and still reports `refused=true` here, because the staleness count must
     not silently shrink whenever a second guard happens to agree; the #892 receipt records the
-    other half. Counting `verdict=stale` rows answers the same question without the overlap."""
+    other half. Counting `verdict=stale` rows answers the same question without the overlap.
+
+    [registry #853] `gate=` is the aggregator GRADE the arm read at this head and `ci=` is its
+    evidence class, carried on the SAME row rather than a second one so the population stays one
+    line per arm attempt. They are what makes an arm at a head `pr-gate` never ran on
+    (`gate=missing ci=absent`) countable — and distinguishable from one at a head whose gate
+    passed (`ci=green`) — on the ADMITTED path too, where nothing previously recorded the grade
+    at all. A caller that has no grade in scope passes none and gets `gate=unread ci=unproven`:
+    the absence of a reading is never rendered as a green."""
     state = freshness.get("state") if isinstance(freshness, dict) else None
     gap = freshness.get("gap_seconds") if isinstance(freshness, dict) else None
     run_base = (freshness.get("run_base_sha") or "") if isinstance(freshness, dict) else ""
     tip = (freshness.get("base_tip_sha") or "") if isinstance(freshness, dict) else ""
     return (f"{ARM_FRESHNESS_CENSUS_PREFIX} repo={repo} pr={pr_number} "
-            f"head={reviewed_sha[:12]} verdict={state or 'unprovable'} "
+            f"head={reviewed_sha[:12]} gate={gate or 'unread'} ci={arm_ci_evidence(gate)} "
+            f"verdict={state or 'unprovable'} "
             f"gap_seconds={'none' if gap is None else gap} "
             f"gate_base={run_base[:12] or 'none'} base_tip={tip[:12] or 'none'} "
             f"siblings={(freshness.get('sibling_state') if isinstance(freshness, dict) else None) or 'unread'} "
@@ -4980,16 +5072,29 @@ def arm_freshness_report(repo, pr_numbers, log=print):
     READ-ONLY BY CONSTRUCTION: it resolves, it reports, it exits non-zero. It never latches,
     never labels, and never writes to the head branch — an orchestrator-class PR must not buy
     write access to its own branch, and the remedy (moving the head) is the caller's call.
-    Returns the exit code: 1 if any PR is refused, 0 only if every one is provably fresh."""
+    Returns the exit code: 1 if any PR is refused, 0 only if every one is provably fresh.
+
+    [registry #853] It also resolves and reports the aggregator GRADE, because this is the
+    surface a HUMAN arm decision reads and "is CI green?" is the question it is asked. A
+    conflicting PR publishes no `gate` run at all, so a report that only graded freshness would
+    answer that question with silence on exactly the population that has no CI. The grade is
+    read tier-appropriately for the PR's LIVE draft state through dispatch-claim's own walk (the
+    same containment `_live_arm_gate` cites), and it decides nothing here — the refusal is still
+    `arm_freshness_decision`'s alone."""
     rows = []
     for pr_number in pr_numbers:
         live = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
         head = str((live.get("head") or {}).get("sha", "")) if isinstance(live, dict) else ""
         base_ref = str((live.get("base") or {}).get("ref", "")) if isinstance(live, dict) else ""
         draft = bool(live.get("draft")) if isinstance(live, dict) else True
+        gate = _dispatch_claim()._live_repair_gate(repo, head, draft)
         freshness = _dispatch_claim().live_gate_freshness(repo, head, base_ref, draft, pr_number)
         refused = bool(arm_freshness_decision(freshness))
-        log(arm_freshness_census_row(repo, pr_number, head, freshness, refused=refused))
+        log(arm_freshness_census_row(repo, pr_number, head, freshness, refused=refused,
+                                     gate=gate))
+        alarm = arm_ci_absent_alarm(repo, pr_number, head, gate)
+        if alarm:
+            log(alarm)
         if refused:
             log(f"  REFUSE arming {repo}#{pr_number}: {freshness.get('reason', '')}. "
                 "`gh run rerun` cannot clear this — it re-tests the same tree; move the head "
@@ -5309,7 +5414,16 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
             marker_prefix=ARM_STALE_MARKER_PREFIX)
         print(arm_freshness_census_row(repo, pr_number, reviewed_sha, gate_evidence,
                                        refused=bool(stale) and not stale_readmitted,
-                                       readmitted=stale_readmitted))
+                                       readmitted=stale_readmitted, gate=arm_gate))
+        # [registry #853] THE ABSENT-CHECK ANNOTATION. Placed HERE — after the census row and
+        # above all three exits (staleness deferral, gate-red deferral, and the arm itself) — so
+        # every arm attempt at an ungated head emits it. Moving it below any `return` would make
+        # it report only the subset of absences that happened to arm, which is the same
+        # partial-population defect the census row above exists to avoid. `arm_gate` is the grade
+        # read at the REVIEWED sha, which is the commit the verdict binds and the latch names.
+        absent_alarm = arm_ci_absent_alarm(repo, pr_number, reviewed_sha, arm_gate)
+        if absent_alarm:
+            print(absent_alarm)
         if stale_readmitted:
             stale = ""
             print(f"arm RE-ADMITTED at {reviewed_sha[:12]}: this head's arm was already deferred "
@@ -11206,7 +11320,8 @@ def _self_test():
               (False, ARM_DECLINE_GATE_STALE, True, True))
         check("...and a verdict carrying NO sibling reading censuses `unread`, never `clear`",
               arm_freshness_census_row("o/r", 41, "b" * 40, {"state": "fresh"}, refused=False),
-              f"{ARM_FRESHNESS_CENSUS_PREFIX} repo=o/r pr=41 head=bbbbbbbbbbbb verdict=fresh "
+              f"{ARM_FRESHNESS_CENSUS_PREFIX} repo=o/r pr=41 head=bbbbbbbbbbbb gate=unread "
+              "ci=unproven verdict=fresh "
               "gap_seconds=none gate_base=none base_tip=none siblings=unread refused=false "
               "readmitted=false")
         # NO DEADLOCK. Both operands of the freshness test are FROZEN, so a refusal stands until
@@ -11321,6 +11436,107 @@ def _self_test():
         # unreachable and it admits everything.
         check("worker-pr's _GATE_FRESH matches dispatch-claim's GATE_FRESH",
               (_GATE_FRESH, _dispatch_claim().GATE_FRESH), ("fresh", "fresh"))
+        # ---- [registry #853] AN ABSENT AGGREGATOR IS NOT A GREEN ONE -------------------------
+        # THE RED TEST THE ISSUE ASKS FOR, stated as the issue states it: a head with no
+        # `pr-gate` run must not satisfy the thing that means "CI is green". Asserted at BOTH
+        # ends — the grade dispatch-claim actually produces for a head with zero aggregator rows,
+        # and this module's classification of it — so neither half can drift into agreement with
+        # a wrong answer. Note (b): the expected values here are local literals, never read back
+        # out of the code under test.
+        _dc853 = _dispatch_claim()
+        check("[#853] a head with ZERO aggregator check-runs grades ABSENT, and absent is not "
+              "any green",
+              (_dc853.repair_gate_conclusion([]),
+               _dc853.repair_gate_conclusion([]) in _dc853.TIER_REACHABLE_GREEN,
+               arm_ci_evidence(_dc853.repair_gate_conclusion([])),
+               arm_ci_evidence(_dc853.repair_gate_conclusion([])) == ARM_CI_GREEN),
+              ("missing", False, "absent", False))
+        # The two locally-spelled literals against dispatch-claim's own. Drift in the GREEN tuple
+        # is the dangerous direction — an unreachable literal would classify a real green as
+        # `unproven`, and (worse, if the tuple ever grew) a non-green as `green`.
+        check("[#853] worker-pr's local grade literals match dispatch-claim's",
+              (_GATE_ABSENT, sorted(_ARM_CI_GREEN_GRADES),
+               sorted(_dc853.TIER_REACHABLE_GREEN)),
+              ("missing", ["green:draft-tier", "green:merge-required"],
+               ["green:draft-tier", "green:merge-required"]))
+        # THE FULL TABLE. Every value repair_gate_conclusion can return, plus the shapes that are
+        # not in its vocabulary at all. `"success"` — the bare ADMISSION spelling #762 refuses
+        # — is `unproven`, NOT green: grading it green is exactly the ungraded-green conflation
+        # the role split exists to stop, and a mutant adding it to _ARM_CI_GREEN_GRADES reds here.
+        check("[#853] arm_ci_evidence classifies the whole vocabulary, green ONLY on a graded "
+              "green",
+              {str(g): arm_ci_evidence(g) for g in (
+                  "green:merge-required", "green:draft-tier", "failure", "missing", "pending",
+                  "unknown", "success", "", None, [], {"state": "green"})},
+              {"green:merge-required": ARM_CI_GREEN, "green:draft-tier": ARM_CI_GREEN,
+               "failure": ARM_CI_RED, "missing": ARM_CI_ABSENT, "pending": ARM_CI_UNPROVEN,
+               "unknown": ARM_CI_UNPROVEN, "success": ARM_CI_UNPROVEN, "": ARM_CI_UNPROVEN,
+               str(None): ARM_CI_UNPROVEN, str([]): ARM_CI_UNPROVEN,
+               str({"state": "green"}): ARM_CI_UNPROVEN})
+        # COHERENCE with the decision that actually declines. `red` and `ARM_DECLINE_GATE_RED`
+        # must partition the SAME grade — the two spell "failure" independently, so a drift in
+        # either literal would leave the census calling a declined arm `unproven`.
+        check("[#853] the `red` class is exactly the grade arm_gate_decision declines on",
+              [g for g in ("green:merge-required", "green:draft-tier", "failure", "missing",
+                           "pending", "unknown", "success", "")
+               if (arm_ci_evidence(g) == ARM_CI_RED)
+               != bool(arm_gate_decision(g) == ARM_DECLINE_GATE_RED)],
+              [])
+        # THE CALL SITE. The checks above can only pin the functions' own arguments (the P12
+        # blind spot); these pin that `ready_and_arm` feeds the census the AGGREGATOR GRADE it
+        # read at the reviewed sha, and that the annotation is emitted above every exit. Wiring
+        # `ci=` from the freshness state instead of the grade, or dropping the alarm, reds them.
+        run_raa(benign_diff=True, arm_gate=_GATE_ABSENT)
+        check("[#853] an arm at a head `pr-gate` NEVER RAN on is censused `gate=missing "
+              "ci=absent` and raises the annotation the absent check cannot raise itself",
+              (f"gate={_GATE_ABSENT} ci={ARM_CI_ABSENT}" in raa_prints[-1],
+               f"::warning::{ARM_CI_ABSENT_PREFIX}" in raa_prints[-1],
+               "ci=green" in raa_prints[-1]),
+              (True, True, False))
+        check("...and the arm still PROCEEDS — this change records the absence, it does not "
+              "refuse on it (the #892/#940 fail-open measurements are unchanged)",
+              (bool(raa_latches()), raa_outputs.get("armed"),
+               raa_outputs.get("arm_declined")),
+              (True, True, None))
+        # THE CONTROL, and the load-bearing half: without it the two checks above pass on a row
+        # that says `absent` for every arm. A GREEN head must census `ci=green` and emit NO
+        # annotation, so an alarm hard-wired to fire (or a classifier collapsed to one class)
+        # reds here rather than passing quietly.
+        run_raa(benign_diff=True, arm_gate="green:merge-required")
+        check("[#853] CONTROL: a head whose gate PASSED censuses `ci=green` and raises NO "
+              "absent-CI annotation",
+              (f"gate=green:merge-required ci={ARM_CI_GREEN}" in raa_prints[-1],
+               ARM_CI_ABSENT_PREFIX in raa_prints[-1], "ci=absent" in raa_prints[-1]),
+              (True, False, False))
+        # ...and the third class: a CONCLUDED RED is `red`, not `absent`. A classifier that
+        # answered `absent` for everything non-green would satisfy both checks above.
+        run_raa(benign_diff=True, arm_gate="failure")
+        check("[#853] CONTROL: a concluded-red gate censuses `ci=red`, and still declines",
+              (f"gate=failure ci={ARM_CI_RED}" in raa_prints[-1],
+               ARM_CI_ABSENT_PREFIX in raa_prints[-1],
+               raa_outputs.get("arm_declined")),
+              (True, False, ARM_DECLINE_GATE_RED))
+        # ABOVE EVERY EXIT. An absent gate on a head whose arm is DEFERRED (here: the #940
+        # staleness exit, which returns before the arm) must still emit the annotation —
+        # otherwise the record would cover only the absences that happened to arm, which is the
+        # partial-population defect the census row itself exists to avoid.
+        run_raa(benign_diff=True, arm_gate=_GATE_ABSENT, arm_freshness=stale_752)
+        check("[#853] a DEFERRED arm at an ungated head still censuses and annotates the absence",
+              (f"ci={ARM_CI_ABSENT}" in raa_prints[-1],
+               f"::warning::{ARM_CI_ABSENT_PREFIX}" in raa_prints[-1],
+               raa_outputs.get("arm_declined"), bool(raa_latches())),
+              (True, True, ARM_DECLINE_GATE_STALE, False))
+        # The annotation names the PR and the head it is about — an alarm that cannot be tied to
+        # an object is not a record. Pure, so the exact text is pinned once.
+        check("[#853] the annotation names the repo, the PR and the head, and says absence is "
+              "not a pass",
+              (arm_ci_absent_alarm("o/r", 41, "b" * 40, _GATE_ABSENT).startswith(
+                  f"::warning::{ARM_CI_ABSENT_PREFIX} o/r#41 at bbbbbbbbbbbb "),
+               "Absence is NOT a pass" in arm_ci_absent_alarm("o/r", 41, "b" * 40, _GATE_ABSENT),
+               arm_ci_absent_alarm("o/r", 41, "b" * 40, "green:merge-required"),
+               arm_ci_absent_alarm("o/r", 41, "b" * 40, "failure"),
+               arm_ci_absent_alarm("o/r", 41, "b" * 40, "pending")),
+              (True, True, "", "", ""))
         # The staleness decline rides the SAME `bind_reviewed_sha` output the YAML seam above
         # already admits — asserted as a COMPOSITION, because the seam report and the decline
         # were written in different PRs and nothing else makes them meet.
@@ -11338,7 +11554,7 @@ def _self_test():
               arm_freshness_summary([{"pr": 900, "refused": False, "gap_seconds": 3600}]),
               f"{ARM_FRESHNESS_CENSUS_PREFIX} attempted=1 refused_stale=0 "
               "refused_prs=none age_gaps_seconds=none")
-        report_lines, report_gh, report_dc = [], [], []
+        report_lines, report_gh, report_dc, report_grades = [], [], [], []
         real_dc = globals()["_dispatch_claim"]
         real_gh = globals()["_gh_json"]
         try:
@@ -11350,7 +11566,12 @@ def _self_test():
                     report_dc.append((repo, head, base, draft, pr))
                     or (stale_752 if pr == 752 else {"state": "fresh", "gap_seconds": 3600,
                                                      "run_base_sha": "e" * 40,
-                                                     "base_tip_sha": "e" * 40})))
+                                                     "base_tip_sha": "e" * 40})),
+                # [#853] the grade read, at the same seam. 752 has a gate; 900 is the ungated
+                # (conflicting-PR) head this report must not leave silent.
+                _live_repair_gate=lambda repo, head, draft: (
+                    report_grades.append((repo, head, draft))
+                    or ("green:merge-required" if len(report_grades) == 1 else _GATE_ABSENT)))
             rc = arm_freshness_report("o/r", [752, 900], log=report_lines.append)
         finally:
             globals()["_dispatch_claim"] = real_dc
@@ -11368,6 +11589,18 @@ def _self_test():
               (["repos/o/r/pulls/752", "repos/o/r/pulls/900"],
                [("o/r", "f" * 40, "master", False, 752),
                 ("o/r", "f" * 40, "master", False, 900)]))
+        # [#853] THE BY-HAND ARM SURFACE. This report is where a human asks "is CI green?", so a
+        # PR whose head has NO gate run must read differently here from one whose gate passed —
+        # and the ungated one must ALSO carry the annotation, because it is the row for which no
+        # check will ever report anything. Both directions in one assertion: dropping the grade
+        # read collapses BOTH rows to `ci=unproven` and reds the first element.
+        check("[#853] the by-hand arm report grades each head, and the UNGATED one is "
+              "distinguishable from the passing one and annotated",
+              (sum(1 for line in report_lines if f"ci={ARM_CI_GREEN}" in line),
+               sum(1 for line in report_lines if f"ci={ARM_CI_ABSENT}" in line),
+               sum(1 for line in report_lines if ARM_CI_ABSENT_PREFIX in line),
+               report_grades),
+              (1, 1, 1, [("o/r", "f" * 40, False), ("o/r", "f" * 40, False)]))
         check("...and it is READ-ONLY: an all-fresh tick exits 0 and mutates nothing",
               (arm_freshness_report("o/r", [], log=lambda _line: None), raa_latches()),
               (0, []))

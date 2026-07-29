@@ -84,6 +84,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -104,8 +105,13 @@ MAINTAINER_HANDLE = os.environ.get("MAINTAINER_HANDLE", "jeswr")
 REQUIRED_FILES = (
     "scripts/ci-latency-alert.py",
     ".github/workflows/groom.yml",
+    # M3's floor is DERIVED from this file's `worker_timeout_minutes` (see EXEC_FLOOR_SECONDS).
+    # Without it in the checkout the derivation assertion would be unreachable on the live
+    # path while staying green in pr-gate — the exact silent divergence #1140 was about.
+    "policy/repos.toml",
 )
 GROOM_WORKFLOW = ".github/workflows/groom.yml"
+POLICY_FILE = "policy/repos.toml"
 WORKFLOWS_DIR = ".github/workflows"
 
 
@@ -229,12 +235,36 @@ CRON_DELIVERY_FLOOR = 0.60
 # deployment, where it is the LARGEST multiple that still detects the real 2026-07-27
 # 17.33h outlier (K=2.5 misses it).
 EXEC_OVERRUN_MULTIPLE = 2.0
-# 6h is GitHub's hosted-runner per-job ceiling, so a RUN alive past it has outlived any
-# single job's maximum possible life. It also makes M3 immune to this repo's BIMODAL
-# dispatch durations (a within-floor no-op tick concludes success in ~30s while a real tick
-# runs minutes): both modes are far below the floor, so the floor governs and the p90's
-# position between the modes never matters.
-EXEC_FLOOR_SECONDS = 6 * 60 * 60
+# THE FLOOR IS DERIVED FROM POLICY, NOT FROM GitHub's per-JOB ceiling. It used to be 6h —
+# GitHub's hosted-runner limit for a single job — and that made M3 INERT on this repo
+# (#1140). MEASURED: the LONGEST RUN THIS REPOSITORY HAS EVER PRODUCED is 91.5 min
+# (worker.yml, n=500, p90 31.6 min; the next-longest lane, review-fix.yml, maxes at
+# 37.6 min), and `policy/repos.toml` kills the longest lane's agent job at
+# `worker_timeout_minutes = 90`. A threshold 3.9x above the observed maximum, on lanes
+# policy terminates far below it, is not conservative — it is unreachable BY CONSTRUCTION,
+# and an alarm that cannot fire is indistinguishable from no alarm at all.
+#
+# So the floor tracks the thing that actually bounds a run here: 1.5x the LONGEST
+# `worker_timeout_minutes` any target configures in policy/repos.toml (90 -> 135 min). That
+# is above every run this repo has produced, so it cannot cry wolf, and below what a genuine
+# hang reaches, so it can fire. The 0.5 of headroom is the overhang measured directly: 91.5
+# min of RUN against a 90-min agent-job timeout is the resolve/gate/publish jobs either side
+# of the timed-out one.
+#
+# The floor still governs this repo's BIMODAL dispatch durations exactly as the 6h value did
+# (a within-floor no-op tick concludes in ~30s while a real tick runs minutes): 2x either
+# mode is far below 135 min, so the p90's position between the modes never matters.
+#
+# THE LINK TO POLICY IS ENFORCED, NOT ASSERTED IN PROSE: the self-test parses
+# policy/repos.toml and reds if this constant stops equalling the derivation, so raising the
+# policy timeout forces this constant up in the SAME PR. Silent divergence from the data is
+# the precise defect 6h had — a constant nobody ever compared to a measurement.
+EXEC_FLOOR_TIMEOUT_MULTIPLE = 1.5
+# MEASURED 2026-07-29 over this repo's completed-run history, all lanes. Held as a constant
+# so the "does the floor clear reality" assertion pins against a MEASUREMENT instead of
+# against the floor it is checking.
+LONGEST_OBSERVED_RUN_SECONDS = 91.5 * 60
+EXEC_FLOOR_SECONDS = 135 * 60
 BASELINE_SAMPLE = 100
 BASELINE_MIN_N = 5
 RUNS_PAGE_CAP = 10
@@ -440,6 +470,35 @@ def find_cron_deficits(lanes: list[dict], now: dt.datetime,
         else:
             bump("delivering")
     return findings, census
+
+
+def max_worker_timeout_minutes(text: str) -> int:
+    """The LARGEST `worker_timeout_minutes` any target configures in policy/repos.toml.
+
+    The maximum, not this repo's own entry: every target's workers run as runs of THIS
+    repository's `worker.yml`, so the longest-lived run this repo can legitimately produce is
+    bounded by the most generous timeout in the file (90, sparq), not by the registry's own
+    30.
+
+    A line-anchored regex rather than a TOML parse: this script models nothing else in that
+    file and the value is a flat integer. The anchor is LOAD-BEARING — repos.toml DOCUMENTS
+    the key in a comment (`#   worker_timeout_minutes = positive integer`), so an unanchored
+    match would read the documentation as if it were policy.
+
+    A file carrying no assignment at all RAISES. Refusing to derive is the fail-closed
+    answer; defaulting to a number nobody measured is how the unreachable 6h floor shipped.
+    """
+    found = re.findall(r"^[ \t]*worker_timeout_minutes[ \t]*=[ \t]*([0-9]+)", text,
+                       flags=re.MULTILINE)
+    if not found:
+        raise AlarmError("policy carries no worker_timeout_minutes: refusing to guess an "
+                         "execution-overrun floor")
+    return max(int(value) for value in found)
+
+
+def exec_floor_for(timeout_minutes: float) -> int:
+    """M3's floor for a repo whose longest-lived job is killed at `timeout_minutes`."""
+    return int(EXEC_FLOOR_TIMEOUT_MULTIPLE * timeout_minutes * 60)
 
 
 def find_execution_overruns(live_runs: list[dict], baselines: dict, now: dt.datetime,
@@ -825,9 +884,51 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     chk("CRON_GRACE_MINUTES is 15", CRON_GRACE_MINUTES == 15)
     chk("EXEC_OVERRUN_MULTIPLE is inside the band that still catches the 2.08x outlier",
         1.25 <= EXEC_OVERRUN_MULTIPLE <= 2.0)
-    chk("EXEC_FLOOR_SECONDS is GitHub's 6h hosted-runner job ceiling",
-        EXEC_FLOOR_SECONDS == 6 * 60 * 60)
+    # THE FLOOR HAS TO CLEAR REALITY FROM BOTH SIDES: above the longest run this repo has
+    # ever produced (or it cries wolf) and below what a run can actually reach (or it is
+    # INERT, which is what 6h was — #1140). Both bounds are written as literals that do not
+    # derive from EXEC_FLOOR_SECONDS, so moving the constant reds them.
+    chk("EXEC_FLOOR_SECONDS clears the longest run this repo has ever produced (91.5 min)",
+        EXEC_FLOOR_SECONDS > LONGEST_OBSERVED_RUN_SECONDS)
+    chk("EXEC_FLOOR_SECONDS is REACHABLE — strictly below the retired 6h job ceiling that "
+        "no run of this repo could ever cross", EXEC_FLOOR_SECONDS < 6 * 60 * 60)
+    chk("EXEC_FLOOR_SECONDS is 8100s (135 min)", EXEC_FLOOR_SECONDS == 8100)
+    chk("LONGEST_OBSERVED_RUN_SECONDS is the measured 91.5-min maximum",
+        LONGEST_OBSERVED_RUN_SECONDS == 5490)
+    chk("EXEC_FLOOR_TIMEOUT_MULTIPLE leaves headroom over the timeout itself, and not so "
+        "much that the floor stops being reachable",
+        1.25 <= EXEC_FLOOR_TIMEOUT_MULTIPLE <= 2.0)
+    chk("floor derivation: 1.5x a 90-minute policy timeout is 135 minutes",
+        exec_floor_for(90) == 135 * 60)
+    chk("floor derivation TRACKS the timeout rather than pinning one value",
+        exec_floor_for(180) == 270 * 60 and exec_floor_for(30) == 45 * 60)
     chk("BASELINE_MIN_N is 5", BASELINE_MIN_N == 5)
+
+    # --- the policy parse the floor derives from ---------------------------------------
+    # Hermetic fixtures, so these pin the PARSER; the seam block below pins the parser
+    # against the real policy/repos.toml and the shipped constant against its output.
+    _pol = ('[repos."o/a"]\nworker_timeout_minutes = 30\n'
+            '[repos."o/b"]\n  worker_timeout_minutes = 90   # inline comment\n')
+    chk("policy parse takes the MAX timeout across targets (this repo runs every target's "
+        "workers)", max_worker_timeout_minutes(_pol) == 90)
+    # ANCHOR ANTI-VACUITY: repos.toml documents the key in a comment. Without `^[ \t]*` the
+    # parser reads the DOCUMENTATION, which here would return 600 instead of 45.
+    chk("policy parse ignores a COMMENTED occurrence of the key",
+        max_worker_timeout_minutes(
+            "#   worker_timeout_minutes = 600\nworker_timeout_minutes = 45\n") == 45)
+    try:
+        max_worker_timeout_minutes('[repos."o/a"]\nmax_concurrent = 4\n')
+        chk("a policy with no timeout must FAIL CLOSED, never default", False)
+    except AlarmError:
+        pass
+    except Exception:
+        # Deleting the guard leaves `max([])` raising a bare ValueError, which would abort
+        # this suite mid-run and record as a kill while every row below it never executed.
+        # Naming the wrong-exception case keeps that mutant a FAIL ROW instead of a crash.
+        chk("a policy with no timeout raises AlarmError, not a bare crash", False)
+    chk("policy/repos.toml is a REQUIRED_FILE, so the derivation seam is reachable on the "
+        "watchdog's SPARSE live checkout and not only in pr-gate's full one",
+        POLICY_FILE in REQUIRED_FILES)
 
     # --- cron expansion, canary-validated against hand-computed answers ---
     chk("cron */10 over 6h == 36", expected_firings("*/10 * * * *", H6, NOW) == 36)
@@ -976,10 +1077,34 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     # BELOW, which nothing did before.
     chk("M3 is quiet at 9h against an 8h p90 — pins the multiple from BELOW",
         not find_execution_overruns([_run_obj(age_min=9 * 60, now=NOW)], big, NOW)[0])
-    chk("M3 is quiet at 5h with no baseline — pins the 6h floor from BELOW",
-        not find_execution_overruns([_run_obj(age_min=5 * 60, now=NOW)], {}, NOW)[0])
-    chk("M3 raises at 7h with no baseline — pins the 6h floor from ABOVE",
-        len(find_execution_overruns([_run_obj(age_min=7 * 60, now=NOW)], {}, NOW)[0]) == 1)
+    chk("M3 is quiet at 134 min with no baseline — pins the 135-min floor from BELOW",
+        not find_execution_overruns([_run_obj(age_min=134, now=NOW)], {}, NOW)[0])
+    chk("M3 raises at 136 min with no baseline — pins the 135-min floor from ABOVE",
+        len(find_execution_overruns([_run_obj(age_min=136, now=NOW)], {}, NOW)[0]) == 1)
+    # --- #1140: THE FLOOR MUST BE REACHABLE, ON THE REAL LANE ------------------------
+    # The test the issue is built on: take the LONGEST RUN THE REPO HAS ACTUALLY PRODUCED
+    # (91.5 min on worker.yml, p90 31.6 min over n=500) and check the threshold sits above
+    # it AND that a run which genuinely hangs crosses it. Under the retired 6h floor the
+    # second half was impossible — policy kills that lane's agent job at 90 min, so no run
+    # could ever reach 360 min and M3 could not fire on any lane, ever.
+    # `workflow_dispatch` because that is worker.yml's ONLY trigger — the baseline is keyed
+    # on (workflow, event), so a fixture naming an event the lane cannot emit would be
+    # testing a cell that never exists in production.
+    worker_lane = {(".github/workflows/worker.yml", "workflow_dispatch"):
+                   {"p90": 31.6 * 60, "n": 500}}
+
+    def _worker_run(age_min):
+        return _run_obj(path=".github/workflows/worker.yml", event="workflow_dispatch",
+                        age_min=age_min, now=NOW)
+
+    chk("M3 is quiet at the longest run worker.yml has ever produced (91.5 min against its "
+        "own measured p90) — the no-false-positive half",
+        not find_execution_overruns([_worker_run(92)], worker_lane, NOW)[0])
+    chk("M3 RAISES on a 3h worker.yml run — reachable now, structurally impossible at 6h",
+        len(find_execution_overruns([_worker_run(180)], worker_lane, NOW)[0]) == 1)
+    chk("the worker.yml fixture is not vacuous: 2x its measured p90 (63 min) is BELOW the "
+        "floor, so the floor is what governs that lane",
+        EXEC_OVERRUN_MULTIPLE * 31.6 * 60 < EXEC_FLOOR_SECONDS)
     # THE `updated_at` SUBSTITUTION. A live run's `updated_at` tracks the present moment,
     # so `started = run.get("updated_at") or run_started_at` collapses every age to ~0 and
     # M3 never fires again. It survived the first battery only because the fixture was a
@@ -1167,6 +1292,22 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
         # unreachable on the live path, which is worse than failing here.
         chk(f"seam: REQUIRED_FILES present (missing: {missing})", False)
     else:
+        # THE POLICY SEAM. EXEC_FLOOR_SECONDS claims to be 1.5x the longest configured
+        # `worker_timeout_minutes`; this is the only thing that keeps that claim true. Raise
+        # the timeout in policy/repos.toml without raising the floor and this reds — which is
+        # exactly what did NOT happen while the floor sat at a hand-picked 6h (#1140).
+        _policy_timeout = max_worker_timeout_minutes(
+            (root / POLICY_FILE).read_text(encoding="utf-8"))
+        chk(f"seam: the M3 floor equals 1.5x policy's longest worker_timeout_minutes "
+            f"(policy says {_policy_timeout} min => "
+            f"{exec_floor_for(_policy_timeout) // 60} min)",
+            EXEC_FLOOR_SECONDS == exec_floor_for(_policy_timeout))
+        # ANTI-VACUITY for the parser against the REAL file: a regex that matched nothing
+        # would raise above, but one that matched the wrong line could return anything, so
+        # pin the value the live policy actually carries.
+        chk("seam: policy/repos.toml's longest worker timeout is still the measured 90 min "
+            "(if policy moved it, re-measure the longest run and re-derive the floor)",
+            _policy_timeout == 90)
         wf = yaml.safe_load((root / GROOM_WORKFLOW).read_text())
         jobs = wf.get("jobs", {})
         chk("seam: groom.yml hosts a `ci-latency` job", "ci-latency" in jobs)

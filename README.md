@@ -39,10 +39,23 @@ tier:
   weekly_limit: "..."        # human note of the plan's weekly cap
   five_hour_limit: "..."     # the rolling 5h window cap
 reset_schedule: "..."        # when the windows reset (per-account; they differ)
-max_concurrent_workers: 1    # how many workers may run on this account at once
+max_concurrent_workers: 4    # how many workers may run on this account at once
+                             # PER-PROVIDER default: openai 12, anthropic 4 — see below
 secret_ref: ACCT_<HANDLE>_TOKEN   # the NAME of the GitHub secret holding this account's token
 notes: "..."
 ```
+
+**`max_concurrent_workers` is per-provider — never hand-write `1`.** The maintainer-stated plan
+parallelism is **openai 12, anthropic 4** ([#278](https://github.com/jeswr/agent-account-registry/issues/278));
+the `set-up-account` broker derives it from the provider alone, so a brokered account of either kind
+already lands at its provider's value. The field is a **per-account operator restriction, not a
+safety floor** — global capacity is bounded by the lease ledger and by `policy/repos.toml`'s
+`max_concurrent`, so narrowing one account only narrows that account. Minting `1` by hand reproduces
+the fleet-capacity defect #278 fixed: `choose_account`'s cap gate then refuses every further claim
+against an account that has spare capacity. Note the two different fallbacks in
+`select-and-claim._parse_account`: an **absent** key defaults to **4**, but a **present, non-numeric**
+value (including an empty one) silently becomes **1** rather than raising — so either omit the key or
+give it a plain integer.
 
 The **token value** for each account is stored ONLY as a secret in this repo's
 **`dispatch-secrets` environment**, named by `secret_ref` — never at repository/organization
@@ -72,8 +85,28 @@ cache-affinity-preferred) has a free slot, append a lease with a **unique `claim
 then `PUT` the file with the read SHA. A concurrent writer changed the SHA → the `PUT` is rejected
 (409) → retry. Because every codebase CAS-updates the **same** ledger, capacity is enforced globally
 without reaction counting. **Release** and **heartbeat** are keyed by the unique `claim_id`
-(idempotent). The groomer **reclaims** leases past `expires_at` (a dead/cancelled worker frees its
-slot automatically — no receipt-guessing).
+(idempotent). The groomer (`groom-leases`, every 15 min) **reclaims** leases past `expires_at`, so a
+dead/cancelled worker frees its slot automatically — no receipt-guessing.
+
+That reclaim is **not blind** (issue #35). A lease whose holder records a still-**active** worker /
+review-fix run has its `expires_at` **renewed** instead, and renewed *before* it lapses rather than
+after, so a legitimately long run — the worker lease's TTL covers only the agent job, while the
+publish and review-prep jobs that follow it have their own timeouts — never has its slot handed to
+a second worker mid-run. It has to move `expires_at` rather than merely keep the row, because every
+duplicate-suppression consumer (`reclaim_expired`, `partition_available`, dispatch's
+`_live_holder_keys` / `sibling_lease_conflict`) reads *that field*, not the row's presence. A
+dead/absent run, a run outside the two lease-holding workflows, a holder with no run id (the
+TTL-managed `review:`/`fix:` repair leases), and any lease older than the **6-hour renewal ceiling**
+are all still reclaimed — the ceiling is what stops a run wedged in `in_progress` from trading the
+double-dispatch for a permanent capacity leak.
+
+When the Actions API does not answer at all (403/5xx/garbage body), the ownership decision is
+**deferred to the next tick — and the row is held on a short 30-minute grace deadline** while it
+waits. Deferring by leaving the expired row untouched would defer *nothing*: by the paragraph above
+an expired row suppresses nothing, so one transient probe failure would hand the account and the
+holder key straight to the next dispatcher while the original run may still be writing. The grace
+is shorter than a proven-live renewal, keeps the row inside its lead window so every tick re-probes
+it, and never outruns the same 6-hour ceiling — a probe that never recovers still cannot pin a slot.
 
 ### The `package` partition has ONE canonical derivation (and one pinned copy)
 
@@ -99,6 +132,32 @@ as the old string comparison did. Every enforcement site decides with that one p
 (PLAN assemble), `revalidate_items_against_live_pulls` (CLAIM live re-check) and
 `sibling_lease_conflict` (the cross-lane ledger view) — because a widening applied at one site and
 not another plans work the next one refuses, every tick.
+
+#### Two partitions **route** work without **occupying** it
+
+`ci` and `docs` are cross-cutting: an open worker PR that touches them is almost never in conflict
+with another one. They stay valid candidate keys — a row declaring `area:ci` is derived, leased,
+routed and counted exactly as before — but an **occupant** holding one no longer defers a row that
+declares it. The declaration, its measured basis and its fail-safe live in ONE place,
+`dispatch-claim.NON_RESERVING_PARTITIONS`, and nothing else in the file knows the names.
+
+Measured over the busy-occupancy population this leg actually reads, counting holder **pairs** that
+share at least one changed file: `ci` 0/15 pairs and `docs` 0/10 (and over the wider `area:`-labelled
+open-PR population, 40/435 = 9.2% and 30/630 = 4.8%) — against **`deps` 21/21 = 100%**, every pair on
+`Cargo.lock`, and 57.1% for the crate areas. `deps` and the crate areas therefore still reserve, and
+`__global__` can never be exempted: `non_reserving_partitions()` validates the declaration through
+`package_areas` itself and voids the **whole** set — never a part of it — for anything malformed,
+degrading to today's fully-reserving behaviour.
+
+The exemption matches an **exact partition atom, never a prefix**: `ci-fragments` is a separate atom
+that never conflicts with `ci` under `packages_conflict`, so it keeps reserving. sparq#4928 does the
+opposite for a reason that does not apply here — its `keys_conflict` is longest-ancestor containment,
+where `ci-fragments` *does* conflict with `ci`.
+
+This is the occupancy half of sparq-org/sparq#4928, which does the same thing to the **other**
+occupancy leg (the target's own readiness engine, which decides what PLAN *offers*). Both are
+needed: measured on a live snapshot, #4928 alone widened PLAN's sparq frontier from 4 rows to 6 and
+this leg then re-deferred both added rows.
 
 That reduction is **`lease_schema.plan_package`**. Precisely:
 
@@ -291,6 +350,14 @@ slot is merely burned (safe), while reusing a number can silently overwrite a li
 (`gh secret set` is an upsert) or mint a duplicate issue title (GitHub does not enforce unique
 titles).
 
+**Burned slots are counted, never reclaimed (#245).** Because a failed enrolment keeps its claim,
+burned slots used to be invisible. Every `groom` sweep now prints an `ORPHAN-CLAIMS` line naming
+each `refs/acct-claims/acctNN` that has **no** `acctNN` issue and **no** `ACCTNN_TOKEN` secret, so a
+runaway broker shows up as a rising `burned=` count instead of silently eating numbers. It is
+REPORT-ONLY and deliberately has no cleanup mode: deleting a claim ref re-opens the overwrite race
+above. A slot that carries a secret but no issue is NOT reported — that is a stored credential
+whose enrolment died before registration, and it needs the account issue written, not a cleanup.
+
 ### Step 0 — obtain a DURABLE, NON-ROTATING token (do NOT use a subscription blob)
 
 - **Anthropic** (Claude models): run `claude setup-token` while logged into the target account. It
@@ -403,7 +470,7 @@ harness: claude
 credential_format: claude-oauth-token
 email: "<the account login email — a setup-token CANNOT introspect it (403 on /api/oauth/profile); fill from the account you logged in as>"
 models: [opus5, fable, opus, sonnet, haiku]
-max_concurrent_workers: 1
+max_concurrent_workers: 4
 secret_ref: ACCT05_TOKEN
 notes: "claude setup-token (long-lived, non-rotating). [your-marker]"'
 printf '%s\n' "$body" | python3 scripts/select-and-claim.py \
@@ -412,7 +479,13 @@ gh issue create -R jeswr/agent-account-registry --title "acct05" --label account
 ```
 For an **OpenAI** account: `provider: openai`, `harness: codex`, `credential_format: codex-auth-json`,
 `models: [sol, luna, terra]` (the FULL codex alias set — `select-and-claim.py` gates on exact alias
-membership, so a `terra`-only record would defer every sol/luna claim), `secret_ref: ACCTNN_TOKEN`.
+membership, so a `terra`-only record would defer every sol/luna claim), `secret_ref: ACCTNN_TOKEN`,
+`max_concurrent_workers: 12`.
+
+The `4` / `12` above are the **per-provider defaults the broker mints** (#278) — a hand-created
+account must carry its provider's value or it lands at a cap the brokered account beside it does not
+have. Lower it deliberately only to restrict *this one* account; it is not a safety floor (see
+[One issue per account](#one-issue-per-account)).
 
 ### Step 4 — label the issue (REQUIRED — no label ⇒ not `available` ⇒ never selected)
 

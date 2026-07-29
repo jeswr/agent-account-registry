@@ -25,8 +25,11 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  # An explicit permissions block zeroes every grant not listed — checkout of the probe script
-  # on this private repo needs contents:read or the job dies before the probe runs.
+  # An explicit permissions block zeroes every grant not listed, so the checkout of the probe
+  # script has to name contents:read here. This repo is PUBLIC (README line 1), so today an
+  # anonymous clone would succeed on its own — the grant is declared rather than relied on from
+  # visibility, so the job keeps working if the repo is ever flipped private instead of dying
+  # before the probe runs.
   contents: read
   issues: write   # rolling alert upsert only
   # The consecutive-unknown streak (issue #207) is persisted in a repository variable — the
