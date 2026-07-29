@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4957,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3628276d6f647aeb4218484568328b2369db7077",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`classify_pre_session` checks only `method` and non-null `id`, while `route_post` mints whenever `handle_message` returns any response. For example, `{\"jsonrpc\":5,\"id\":1,\"method\":\"initialize\",\"params\":{}}` is classified as `Handshake`; JSON-RPC request deserialization then returns an error response because `jsonrpc` is not a string, but the transport still creates a session and attaches `mcp-session-id`. The comment and public documentation promise that only a successful initialize mints a session.",
+    "file": "crates/sparq-mcp/src/http/mod.rs",
+    "fix_hint": "Mint only when dispatch reports a successful initialize result, preferably via a typed dispatch outcome rather than inspecting serialized JSON. Add a regression test using an initialize-shaped request that produces a JSON-RPC error; assert there is no session header, `session_count() == 0`, and no later request can use a would-be session.",
+    "severity": "major",
+    "title": "Failed initialize requests still mint live sessions"
+   },
+   {
+    "body": "`read_request` retains every header, but `lookup(\"content-length\")` selects only the first occurrence. A request with conflicting Content-Length fields is therefore framed according to the first value even though an intermediary may reject, combine, or select another value. Closing the backend connection does not eliminate the proxy/backend framing disagreement, and this contradicts the parser's stated refuse-rather-than-guess invariant.",
+    "file": "crates/sparq-mcp/src/http/wire.rs",
+    "fix_hint": "Collect all Content-Length occurrences before reading the body and reject duplicates (or accept only when every strictly parsed value is identical). Reject comma-joined and malformed forms. Add focused parser tests for conflicting duplicates and duplicate-equal fields to pin the policy.",
+    "severity": "major",
+    "title": "Conflicting duplicate Content-Length headers are still accepted"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant: both round-4 major findings remain in the PR head. Pre-session classification still admits an initialize-shaped object without validating the JSON-RPC fields that the dispatcher deserializes, and route_post still mints a session for any returned reply, including an error reply. The HTTP parser also still selects the first Content-Length occurrence and accepts duplicate/conflicting values, preserving a request-framing ambiguity. Neither load-bearing regression test requested in round 4 is present.",
+  "verdict": "request_changes"
+ }
+}
