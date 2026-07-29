@@ -140,7 +140,7 @@ POLICY_FIELDS = {
 # reviewer side is a CONSTANT, never resolved by inverting the record's self-declared
 # `impl_provider` — for a self-authored PR that field is an assertion by the implementer about
 # itself, and inverting it yields a same-provider review that merely LOOKS cross-provider.
-# [OPUS-5] review_loop_nonhold_issue_labels (issue #1306): the MASTER-PROTECTED narrowing of the
+# [OPUS-5] review_loop_nonhold_issue_labels (issue #1311): the MASTER-PROTECTED narrowing of the
 # review lane's SOURCE-ISSUE hold.
 #
 # Every review-loop leg (enumerate_review_items, CLAIM's live re-derivation, review-fix.yml's
@@ -405,7 +405,7 @@ def review_loop_nonhold_issue_labels(target_repo, policy_doc):
     Read by the PLAN assemble step (handed to enumerate_review_items / filter_busy_area_items),
     by CLAIM's live re-derivation, and by review-fix.yml's resolve step — the three legs that
     each apply the `needs:*` prefix glob and must therefore agree on the SAME narrowing, or a
-    PR is enumerated by one leg and stood down by the next (issue #1306).
+    PR is enumerated by one leg and stood down by the next (issue #1311).
 
     Deliberately NOT surfaced through resolve(): that output dict is compared field-by-field by
     dispatch-claim._route_matches against the TARGET-side resolver, so adding a key there would
