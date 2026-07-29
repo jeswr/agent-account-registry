@@ -2533,7 +2533,12 @@ def main():
         # for every PR it never reached — turning one failed tick into a cold cache for the
         # next one.
         store.prune()
-        save_conditional_store(args.etag_store, store)
+        if not save_conditional_store(args.etag_store, store):
+            # LOUD, but NOT fatal — the tick's real work is already done. The workflow's upload
+            # step is `if-no-files-found: warn` for the same reason; between this annotation and
+            # the next tick's hit rate, a store that stopped publishing cannot go unnoticed.
+            print("::warning::plan-snapshot: could not write the conditional-read store — the "
+                  "next tick will sweep unconditionally (this costs budget, not correctness)")
     except BudgetExhausted as exc:
         # A distinct, annotated exit: this is not "a read failed", it is "the dispatcher is
         # running hotter than its request budget allows", and it needs a different fix from

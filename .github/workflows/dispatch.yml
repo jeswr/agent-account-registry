@@ -270,7 +270,15 @@ jobs:
         with:
           name: dispatch-etags
           path: ${{ runner.temp }}/etag-store/etags.json
-          if-no-files-found: error
+          # `warn`, NOT `error`. This is an OPTIMISATION, and it must never be able to kill the
+          # tick it optimises: a disk-full runner that could not write the store would otherwise
+          # fail PLAN and dispatch nothing. The opposite trap — the store silently stopping and
+          # the mechanism degrading to 0% with everything green — is covered on two independent
+          # channels instead: plan-snapshot.py emits an explicit `::warning::` when the write
+          # fails, and its per-tick "SNAPSHOT conditional reads: N of M ... billable" line reports
+          # the realised hit rate, which goes to zero on the very next tick.
+          if-no-files-found: warn
+          # One tick is 10 minutes; a day is ample, and it bounds what accumulates.
           retention-days: 1
 
       # Extract the policy-controlled trusted-bot allowlist (issue #111) from the registry policy
