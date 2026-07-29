@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4998,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5a7baaa1ddcbbd94ce776c739ee2e0cce7e4b1cd",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The opt-in CLI feature correctly forwards sparq-reason/datalog without changing default features, dispatches datalog profiles before the monotone profile parser, fails closed when the feature or rules path is absent, and preserves input facts while materializing the deduplicated closure. The end-to-end tests exercise the built binary on the real reason and query paths, including aggregation, filtering, negation-as-failure, output serialization, unstratifiable programs, unsafe rules, missing rule files, and feature-off behavior. Documentation and feature-matrix coverage are updated consistently. No correctness, soundness, security, or vacuous-test issue is apparent in the diff-scoped evidence.",
+  "verdict": "approve"
+ }
+}
