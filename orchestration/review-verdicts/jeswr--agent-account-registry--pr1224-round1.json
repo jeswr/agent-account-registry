@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1224,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "79a337688ed3d2b39ed1fb3455bc89d1661325c7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The removed host step ran `rustup component add clippy rustfmt` from the target working directory, after rustup had selected/materialized any `rust-toolchain.toml` override. This Dockerfile instead adds the components while building an empty-context image, so it adds them only to the image's default 1.88.0 toolchain. At runtime, a target that pins another channel causes rustup to install/select that toolchain, but `cargo fmt` and `cargo clippy` are then unavailable unless the target happened to list those components itself. All three cargo profiles invoke fmt and/or clippy, so a legitimate pinned workspace can now fail for missing components. The new tests validate the docker argv and wrapper call sites but never exercise a non-default pinned toolchain, despite the comments explicitly claiming that pin materialization is preserved.",
+    "file": "containers/worker-gate.Dockerfile",
+    "fix_hint": "Provision `rustfmt` and `clippy` for the active target-selected toolchain inside the sandbox after mounting `/workspace` and before running gate commands (still with no host fallback), or otherwise make the image support the selected override. Add a non-vacuous test using a toolchain different from the image default that proves both `cargo fmt` and `cargo clippy` are available.",
+    "severity": "major",
+    "title": "Pinned target toolchains do not receive clippy and rustfmt"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe containment direction is sound, but the replacement does not preserve the existing Rust-toolchain semantics for repositories that pin a toolchain. The image installs clippy/rustfmt only for its default 1.88 toolchain; a target pin is resolved later at container runtime, where those components are not provisioned. This can make valid pinned workspaces fail before their policy gate runs. The self-tests exercise only argv/source structure and therefore do not catch this advertised behavior.",
+  "verdict": "request_changes"
+ }
+}
