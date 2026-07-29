@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5081,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d73e3e0b69910a402dbfab9bb881f8e4a9423daa",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "_instrumentation accepts every non-None value. Citation metrics then sum arbitrary values and accept equal negative counts (for example emitted=-1 and resolved=-1 on every task yields fabricated=0 and honesty_ok=true), while abstention metrics use Python truthiness (for example the JSON string \"false\" is treated as an abstention). With otherwise winning outcomes and token costs, such invalid host records can remain honest=true and recommend_adopt=true, contradicting the claim that required instrumentation makes the honesty metrics measured rather than defaulted. The current tests cover missing fields but no malformed values.",
+    "file": "bench/pkg-dogfood/analyze_prov.py",
+    "fix_hint": "Validate instrumentation before computing metrics: require citations_emitted and citations_resolved to be non-boolean non-negative integers with resolved <= emitted for every record, and require abstained to be a JSON boolean. Add each validation failure to blocked_reason so honest=false, and add end-to-end refusal tests for negative counts, resolved greater than emitted, numeric/string counts, and string/numeric abstained values.",
+    "severity": "major",
+    "title": "Instrumentation presence is checked, but its type and domain are not validated"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-2 completeness fix remains intact and the named refusal-path tests pass, but the analyzer still treats unvalidated instrumentation values as trustworthy measurements. Because these runtime JSON artifacts are external inputs, malformed but present citation counts or abstention flags can satisfy the honesty gate and produce recommend_adopt=true. This is a new major soundness finding relative to round 2's clean review, so progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
