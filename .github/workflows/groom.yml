@@ -31,7 +31,7 @@ jobs:
       contents: write     # CAS data/leases.json + read data/model-health.json (both on the `ledger` branch)
       issues: write       # upsert/close the model-access health alert issues (model-health decide)
     steps:
-      - name: Checkout private registry (pinned, no persisted token)
+      - name: Checkout registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false

@@ -200,7 +200,7 @@ jobs:
               output.write(f"target_name={name}\n")
           PY
 
-      - name: Checkout private registry (pinned, no persisted token)
+      - name: Checkout registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           path: registry
@@ -335,7 +335,7 @@ jobs:
           dispatch_claim = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(dispatch_claim)
           # [OPUS-5 #657] The MASTER-protected half of orchestrator-PR admission, read from the
-          # private `registry` checkout (master) — NEVER from the `registry-ledger` checkout the
+          # `registry` checkout (master) — NEVER from the `registry-ledger` checkout the
           # provenance record came from. Records live on ledger precisely because master's
           # required gate rejects direct PUTs, so the record half is a low-authority per-PR
           # gesture and this list is the reviewed half that bounds which logins it can ever name;
@@ -606,7 +606,7 @@ jobs:
       credential_format: ${{ steps.adopt.outputs.credential_format || steps.claim.outputs.credential_format }}
       secret_ref: ${{ steps.adopt.outputs.secret_ref || steps.claim.outputs.secret_ref }}
     steps:
-      - name: Checkout private registry (pinned, no persisted token)
+      - name: Checkout registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           path: registry
@@ -900,7 +900,7 @@ jobs:
       # still counts toward backoff/outage thresholds.
       outcome_attempt: ${{ steps.exit-class.outputs.outcome_attempt }}
     steps:
-      - name: Checkout private registry (pinned, no persisted token)
+      - name: Checkout registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           path: registry
@@ -1476,7 +1476,7 @@ jobs:
       contents: write   # write: record the validated verdict in the registry (github.token)
       issues: write     # write: ops-alert upsert in the registry on needs-user escalation
     steps:
-      - name: Checkout private registry (pinned, no persisted token)
+      - name: Checkout registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           path: registry
@@ -1808,7 +1808,7 @@ jobs:
       contents: read
       issues: write   # write: ops-alert upsert in the registry
     steps:
-      - name: Checkout private registry (pinned, no persisted token)
+      - name: Checkout registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           path: registry
@@ -1867,7 +1867,7 @@ jobs:
     permissions:
       contents: write   # CAS-append data/model-health.json (on the `ledger` branch) via github.token
     steps:
-      - name: Checkout private registry (pinned, no persisted token)
+      - name: Checkout registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           path: registry
@@ -1913,7 +1913,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout private registry (pinned, no persisted token)
+      - name: Checkout registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           path: registry

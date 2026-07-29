@@ -4,7 +4,7 @@
 # claims). Pure allocation logic is unit-tested; GitHub CAS I/O wraps it.
 """select-and-claim — allocate a model-account worker slot as a LEASE.
 
-The ledger is a single JSON file `data/leases.json` in this private registry:
+The ledger is a single JSON file `data/leases.json` in this registry:
     {"leases": [{"account","claim_id","holder","package","role","model","issued_at","expires_at"}, ...]}
 
 ``account`` is the canonical salted 16-hex fingerprint, never the catalog handle.

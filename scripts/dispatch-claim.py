@@ -328,7 +328,7 @@ FIX_TTL = _lease_ttl("fix")         # 10+10+60+10+15 = 105m (was 60m — exactly
 #
 # The numbers carry review-fix.yml's own stated rationale: the static codex slot count for each
 # lane (codex being usage-exempt is what makes an unprobed static bound sound for it at all). The
-# live account records that back them are in the PRIVATE registry, so this file cannot re-derive
+# live account records that back them are in the registry, so this file cannot re-derive
 # them — which is exactly why they need pinning rather than re-computation. They are NOT
 # interchangeable with the dispatcher's model: never reintroduce them as `max_holder_concurrent`
 # on the dispatcher's claim — `_self_test` asserts that stays None, and setting it would revert
@@ -8407,7 +8407,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 defer_reasons, lanes=lanes, ledger_root=ledger_root,
                 fix_dispatch=fix_dispatch,
                 # [#657] The MASTER-protected half of orchestrator-PR admission, read from the
-                # SAME policy document `_policy_row` validated above (the private registry
+                # SAME policy document `_policy_row` validated above (the registry
                 # checkout, never the unprotected `ledger` one — collapsing both halves onto one
                 # authority is exactly what makes the pair pointless). Absent/empty => enrolment
                 # OFF => CLAIM's shape gates stand. CLAIM re-derives the waiver itself rather than

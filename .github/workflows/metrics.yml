@@ -35,7 +35,7 @@ jobs:
       issues: write       # upsert/close the deduped throughput-alert issue(s)
       pull-requests: read # authoritative PR lists + immutable-window event searches
     steps:
-      - name: Checkout private registry (pinned, no persisted token)
+      - name: Checkout registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
