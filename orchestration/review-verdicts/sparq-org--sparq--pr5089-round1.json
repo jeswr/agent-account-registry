@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5089,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "01234d2c00c0d32b3e84f0cc1f362eece3362878",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The manifest and module docs say this spike asserts closure equivalence on the entailment-conformance fixtures, but `conformance_corpus()` constructs only 17 bespoke documents and compares the two implementations to each other. It does not load the repository's RDFS entailment fixtures or validate either path against expected positive and negative outcomes. Two implementations can therefore agree on these selected shapes while sharing an error or diverging on an unrepresented conformance case. Since this equivalence is the load-bearing semantic gate before reporting the replacement verdict, the current evidence is incomplete.",
+    "file": "crates/sparq-reason/examples/rdfs_n3_spike.rs",
+    "fix_hint": "Drive section A from the actual RDFS entailment-conformance fixture set (or a checked-in, traceable extraction of it), evaluate its expected positive and negative conclusions, and then compare the full closures for cases within the explicitly documented materializer subset. Keep the focused interaction and scale cases as supplemental coverage. If the real suite cannot be consumed here, rename the corpus and all manifest/module claims to accurately describe it as a smoke corpus, and do not present it as the Phase-4 conformance gate.",
+    "severity": "major",
+    "title": "Synthetic positive examples do not implement the claimed entailment-conformance gate"
+   },
+   {
+    "body": "The label says `84 leaf classes`, but `schema_abox_facts(4, 4, 4, ...)` creates 4\u00d74\u00d74 = 64 leaf classes. This makes the reported benchmark shape inaccurate.",
+    "file": "crates/sparq-reason/examples/rdfs_n3_spike.rs",
+    "fix_hint": "Change the label to `64 leaf classes`, or change the generator arguments to produce the intended count and update the description consistently.",
+    "severity": "minor",
+    "title": "Schema+ABox scale label reports the wrong leaf-class count"
+   }
+  ],
+  "progress": null,
+  "summary": "The spike is candid about the known meta-level divergence and keeps the experimental path feature-gated, but its central conformance claim is not supported by the implemented corpus. The new example labels a small, hand-authored set of 17 positive shapes as the entailment-conformance corpus, while it neither loads the repository's conformance fixtures nor checks expected entailments/non-entailments. Consequently the hard equality assertions establish agreement only on selected examples and cannot serve as the advertised Phase-4 semantic gate. I could not execute the example because cargo is unavailable in this checkout environment.",
+  "verdict": "request_changes"
+ }
+}
