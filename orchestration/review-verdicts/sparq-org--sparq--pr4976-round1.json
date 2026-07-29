@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4976,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "361ac3668eebbb2934148c9c159d7cf7459f2006",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The added text says a sensitive feature appearing in no test:true leg will fail the gate. However, scripts/feature-matrix-tiers.py stores feature_has_test_leg and sensitive_features using only the feature string, not (crate, feature). Cargo feature names are crate-local, so a test:true leg for feature F in crate A can incorrectly satisfy a sensitive F in crate B. This permits exactly the silent coverage gap that the newly graduated documentation claims is prevented.",
+    "file": "AGENTS.md",
+    "fix_hint": "Change enforcement to key both sensitivity and test-leg coverage by (crate, feature), and add a regression test with two fragments for different crates sharing a feature name where only the unrelated crate has test:true. Then retain the graduation claim once that test proves the guard fails for the uncovered crate-local feature.",
+    "severity": "major",
+    "title": "Mechanized no-test-gap claim is false across crates with same-named features"
+   }
+  ],
+  "progress": null,
+  "summary": "The graduation documentation overstates the sq-vya1 guard as fully mechanized. The implementation tracks test coverage by bare Cargo feature name across all crates, so an unrelated test:true leg in one crate can satisfy a sensitive feature of the same name in another crate. Until enforcement is keyed by crate and feature (with a collision regression test), the new authoritative claims are not sound.",
+  "verdict": "request_changes"
+ }
+}
