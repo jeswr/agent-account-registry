@@ -441,8 +441,8 @@ def compose(base_ref, cwd, full=False, manifest=SUITE_MANIFEST, git=_git, run_su
                                     "it (unlike a staleness refusal, which it cannot)"))
             # ---- THE DIFFERENTIAL. A failure is only a COMPOSITION break if it PASSES on the tree
             # `pr-gate` already graded. Paid only on failure, and only for the entries that failed.
-            baseline_ok = runner_available(cwd)
-            preexisting = _baseline_failures(cwd, failures, runner) if failures else []
+            preexisting, baseline_ok = (_baseline_failures(cwd, failures, runner) if failures
+                                        else ([], True))
             return classify(graded_base, live_tip, merge_rc,
                             failures=[e for e in failures if e not in preexisting],
                             preexisting=preexisting, entries=chosen,
@@ -480,22 +480,23 @@ def _baseline_failures(cwd, entries, runner, manifest=SUITE_MANIFEST):
     if not runner_available(cwd):
         print("== baseline UNAVAILABLE: the graded tree has no sandboxed run-selftest arm, so no "
               "failure can be shown pre-existing — attributing all of them to the composition ==")
-        return []
+        return [], False
     try:  # noqa: SIM105 — the manifest read below is the second unestablishable-baseline case
         with open(os.path.join(cwd, manifest), encoding="utf-8") as handle:
             enrolled = set(suite_entries(handle.read()))
     except OSError:
-        return []          # no graded manifest -> nothing can be PROVEN pre-existing -> fail closed
+        return [], False   # no graded manifest -> nothing can be PROVEN pre-existing -> fail closed
     testable = [e for e in entries
                 if e in enrolled and os.path.exists(os.path.join(cwd, "scripts", e))]
     if not testable:
-        return []
+        return [], len(testable) == len(entries)
     print(f"== baseline: re-running {len(testable)} failing entr(y/ies) on the GRADED tree ==")
     baseline_failures, ungradeable = runner(cwd, testable, "baseline")
     # ⚠️ THE THIRD UNESTABLISHABLE-BASELINE CASE, and the one that reads as a verdict. An entry whose
     # baseline run hit a HARNESS fault has no baseline — it is not "failing here too". Excusing it
     # is exactly the fail-open this whole function exists to prevent, one layer deeper.
-    return [entry for entry in baseline_failures if entry not in ungradeable]
+    established = not ungradeable and len(testable) == len(entries)
+    return [entry for entry in baseline_failures if entry not in ungradeable], established
 
 
 def harness_fault(output):
@@ -777,32 +778,36 @@ def _self_test():
         def faulting(_cwd, entries, _label="x"):
             return list(entries), list(entries)      # every entry faulted, so none is a verdict
         chk("a baseline whose harness FAULTS excuses nothing (the review finding)",
-            _baseline_failures(_bt, ["enrolled.py"], faulting), [])
+            _baseline_failures(_bt, ["enrolled.py"], faulting), ([], False))
+        chk("...and reports the baseline as NOT established, so the receipt cannot say baseline=ok",
+            _baseline_failures(_bt, ["enrolled.py"], faulting)[1], False)
 
         # ⚠️ THE MEASURED FAIL-OPEN. #756's graded tree has a worker-live.sh with no run-selftest
         # arm; invoking it exits 1 with a USAGE error, which as a bare exit code is
         # indistinguishable from a failing test. Read as a baseline it excused every composition
         # failure and the check blocked NOTHING — on exactly the stale PRs it targets.
         chk("a graded tree with NO run-selftest arm excuses NOTHING (the measured fail-open)",
-            _baseline_failures(_bt, ["enrolled.py"], every), [])
+            _baseline_failures(_bt, ["enrolled.py"], every), ([], False))
         chk("...and runner_available says why", runner_available(_bt), False)
         with open(os.path.join(_bt, RUNNER_SCRIPT), "w", encoding="utf-8") as handle:
             handle.write("case $1 in\n  run-selftest)\n    :\n    ;;\nesac\n")
         chk("...while a tree that DOES implement the arm is usable as a baseline",
             runner_available(_bt), True)
         chk("an enrolled+present entry that fails on the graded tree IS pre-existing",
-            _baseline_failures(_bt, ["enrolled.py"], every), ["enrolled.py"])
+            _baseline_failures(_bt, ["enrolled.py"], every), (["enrolled.py"], True))
         chk("an entry master ADDED (absent from the graded tree) is NOT excused",
-            _baseline_failures(_bt, ["added-by-master.py"], every), [])
+            _baseline_failures(_bt, ["added-by-master.py"], every), ([], False))
         chk("an entry present but NOT enrolled in the graded tree is NOT excused",
-            _baseline_failures(_bt, ["unenrolled.py"], every), [])
-        chk("a mixed set only excuses the one with a real baseline",
-            _baseline_failures(_bt, ["enrolled.py", "added-by-master.py"], every), ["enrolled.py"])
+            _baseline_failures(_bt, ["unenrolled.py"], every), ([], False))
+        chk("a mixed set only excuses the one with a real baseline, and is NOT established",
+            _baseline_failures(_bt, ["enrolled.py", "added-by-master.py"], every),
+            (["enrolled.py"], False))
         chk("an entry that PASSES on the graded tree is not pre-existing either",
-            _baseline_failures(_bt, ["enrolled.py"], lambda _c, _e, _l="x": ([], [])), [])
+            _baseline_failures(_bt, ["enrolled.py"], lambda _c, _e, _l="x": ([], [])),
+            ([], True))
     chk("an unreadable graded manifest excuses NOTHING (fail closed)",
         _baseline_failures(os.path.join(tempfile.gettempdir(), "compose-gate-nonexistent"),
-                           ["x.py"], lambda _c, e, _l="x": (list(e), [])), [])
+                           ["x.py"], lambda _c, e, _l="x": (list(e), [])), ([], False))
 
     # ---- THE WORKFLOW SEAM, mutation-tested. Each mutant leaves a step that LOOKS wired. ----
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
