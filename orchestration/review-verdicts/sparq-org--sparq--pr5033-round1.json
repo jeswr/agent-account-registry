@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5033,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3f7a021d888f61bddf385a4aca00b81ff64804f0",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The retention-aware offset resolution is coherent and complete for the documented restart-after-retention scope. TRIM_HORIZON now starts at ChangeLog::first_seq(), anchored iterators reject only when their resolved start precedes that horizon, and LATEST remains tied to next_seq. The HTTP mapping to 410 is fail-closed and does not expose raw caller input. The end-to-end test performs a real segment trim, reopens the server on the trimmed log, verifies retained replay, verifies a below-horizon anchor returns 410 without records, checks the exact boundary, and confirms LATEST behavior; the focused unit tests cover the same resolution rules and overflow saturation. Documentation accurately discloses the cached-horizon limitation for out-of-band retention while the server is running.",
+  "verdict": "approve"
+ }
+}
