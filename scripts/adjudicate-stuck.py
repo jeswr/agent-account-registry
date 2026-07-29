@@ -53,10 +53,29 @@ whole park-receipt family reads (`worker-pr.auto_readmission_marker`), so the re
 DRY-RUN IS THE DEFAULT. `--apply` is required to write anything. Every write is RECEIPT-FIRST:
 the audit comment is the authorisation for the label writes, so a crash after it leaves an
 explained PR rather than a silently-moved one.
+
+THE SWEEP'S OWN FAILURE IS NEVER A QUIET TICK. A control whose only failure signal is a census
+it prints itself must not be able to print a HEALTHY census when it did nothing, so the exit
+status carries three distinct facts and `main()` is driven by `--self-test` end to end:
+  - a malformed/unreadable POPULATION payload is not an empty backlog. The `--paginate --slurp`
+    shape is validated in full (`_flatten_pages`) and a `null`/non-list/non-object anywhere in it
+    EXITS NONZERO after emitting the census, instead of flattening to `rows = []` and reporting a
+    zero backlog that is indistinguishable from a drained one;
+  - a failed WRITE exits nonzero, always. Every mutation goes through `_gh_write`, so a write
+    failure is a distinct exception class rather than one more read-side deferral: the audit
+    comment has already authorised the transaction, so a write that does not land leaves an
+    explained-but-unmoved PR that the next tick REFUSES as already adjudicated. That state must
+    page a human, not report `APPLIED: 0 returned`;
+  - operational ERRORS are counted apart from policy REFUSALS in the census, and a tick in which
+    EVERY eligible PR errored exits nonzero — the sweep was inoperative, not quiet.
+One bad PR still never stops the sweep: a single row's read failure defers that row to the next
+tick and the rest of the population is still adjudicated.
 """
 import argparse
+import contextlib
 import datetime
 import importlib.util
+import io
 import json
 import os
 import re
@@ -339,6 +358,13 @@ def audit_body(disposition, cause, detail, episode, readmit_marker=None, reason_
     return head + tail
 
 
+class WriteFailed(RuntimeError):
+    """A MUTATION did not land. Distinct from every read failure because the audit comment has
+    already authorised the transaction by the time any label moves: a write that fails leaves an
+    explained-but-unmoved PR which the NEXT tick refuses as already-adjudicated, so it is the one
+    outcome that must never be filed as a per-PR deferral and reported in a green run."""
+
+
 def _gh(args, check=True):
     result = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
     if check and result.returncode != 0:
@@ -346,21 +372,51 @@ def _gh(args, check=True):
     return result
 
 
+def _gh_write(args):
+    """EVERY mutation goes through here, so the sweep's exit status can tell a failed write from a
+    failed read. `--self-test` asserts that no `-X` call in the production half bypasses it."""
+    try:
+        return _gh(args)
+    except Exception as exc:  # noqa: BLE001 — re-raised, classified
+        raise WriteFailed(str(exc)) from exc
+
+
 def _gh_json(args):
     return json.loads(_gh(args).stdout or "null")
 
 
-def _paginated(repo, number, kind):
-    pages = _gh_json(["api", "--paginate", "--slurp",
-                      f"repos/{repo}/issues/{number}/{kind}?per_page=100"])
+def _flatten_pages(pages, what):
+    """The rows of a `gh api --paginate --slurp` response — a LIST of page LISTS of OBJECTS —
+    validated in full, raising on anything that is not exactly that.
+
+    This is the one shape reader for every paginated read in the module, population included,
+    because the failure it prevents is the sweep's worst: a `null` (empty stdout), an error
+    object, or a page of scalars silently flattening to zero rows, which a caller cannot tell
+    apart from a drained backlog. A malformed payload is NOT evidence of an empty result set.
+
+    A zero-PAGE response is passed through as zero rows and is not an error: `--slurp` collects
+    one array per HTTP response and an empty collection still returns one empty page, so `[]`
+    only appears where gh itself returned nothing to slurp — and the callers that matter
+    (population, and `main`'s all-rows-errored guard) already treat "no rows" as a fact they must
+    report rather than a success they may assume."""
     if not isinstance(pages, list):
-        raise RuntimeError(f"malformed {kind} payload for {repo}#{number}")
+        raise RuntimeError(
+            f"malformed {what} payload: {type(pages).__name__}, not a --slurp list of pages")
     out = []
     for page in pages:
         if not isinstance(page, list):
-            raise RuntimeError(f"malformed {kind} page for {repo}#{number}")
-        out.extend(page)
+            raise RuntimeError(f"malformed {what} page: {type(page).__name__}, not a list of rows")
+        for row in page:
+            if not isinstance(row, dict):
+                raise RuntimeError(f"malformed {what} row: {type(row).__name__}, not an object")
+            out.append(row)
     return out
+
+
+def _paginated(repo, number, kind):
+    return _flatten_pages(_gh_json(["api", "--paginate", "--slurp",
+                                    f"repos/{repo}/issues/{number}/{kind}?per_page=100"]),
+                          f"{kind} for {repo}#{number}")
 
 
 def _now():
@@ -445,24 +501,24 @@ def _sweep_one(args, worker_pr, row, applied):
                       if "readmit-window" in plan else None)
     # RECEIPT FIRST: the audit comment authorises the label writes below, so a crash after it
     # leaves an explained PR rather than a silently-moved one.
-    _gh(["api", "-X", "POST", f"repos/{args.repo}/issues/{number}/comments",
-         "-f", "body=" + audit_body(disposition, cause, detail, episode, readmit_marker,
-                                    reason_marker, lane=worker_pr.FIX_LANE_PR_LABEL)])
+    _gh_write(["api", "-X", "POST", f"repos/{args.repo}/issues/{number}/comments",
+               "-f", "body=" + audit_body(disposition, cause, detail, episode, readmit_marker,
+                                          reason_marker, lane=worker_pr.FIX_LANE_PR_LABEL)])
     if "drop-human-hold" not in plan:
         return (disposition, cause, detail)   # no label write, ever — the park is untouched
-    _gh(["api", "-X", "DELETE", f"repos/{args.repo}/issues/{number}/labels/"
-         + urllib.parse.quote(park_policy.HUMAN_PR_PARK_LABEL, safe="")])
-    _gh(["api", "-X", "POST", f"repos/{args.repo}/issues/{number}/labels",
-         "-f", f"labels[]={worker_pr.FIX_LANE_PR_LABEL}"])
+    _gh_write(["api", "-X", "DELETE", f"repos/{args.repo}/issues/{number}/labels/"
+               + urllib.parse.quote(park_policy.HUMAN_PR_PARK_LABEL, safe="")])
+    _gh_write(["api", "-X", "POST", f"repos/{args.repo}/issues/{number}/labels",
+               "-f", f"labels[]={worker_pr.FIX_LANE_PR_LABEL}"])
     # The ISSUE half, ONLY on the machine-ownership proof taken above — a re-admission behind an
     # unprovable `needs:user` was already REFUSED, so this branch never runs unprovably. It is
     # REMOVED rather than converted to a machine park: the PR is re-entering flow, which is the
     # state an un-parked source issue is already in.
     if ("clear-machine-issue-hold" in plan and issue_hold_machine_owned
             and park_policy.HUMAN_PARK_LABEL in set(issue_labels)):
-        _gh(["api", "-X", "DELETE",
-             f"repos/{args.repo}/issues/{issue_number}/labels/"
-             + urllib.parse.quote(park_policy.HUMAN_PARK_LABEL, safe="")])
+        _gh_write(["api", "-X", "DELETE",
+                   f"repos/{args.repo}/issues/{issue_number}/labels/"
+                   + urllib.parse.quote(park_policy.HUMAN_PARK_LABEL, safe="")])
     return (disposition, cause, detail)
 
 
@@ -483,21 +539,32 @@ def main(argv=None):
         parser.error("--repo and --bot-login are required outside --self-test")
 
     worker_pr = _load("registry_worker_pr", "worker-pr.py")
-    held = _gh_json(["api", f"repos/{args.repo}/issues?state=open"
-                     f"&labels={urllib.parse.quote(park_policy.HUMAN_PR_PARK_LABEL)}"
-                     "&per_page=100", "--paginate", "--slurp"])
-    rows = [row for page in (held if isinstance(held, list) else []) if isinstance(page, list)
-            for row in page if isinstance(row, dict) and row.get("pull_request")]
+    census = {RETURN_TO_LOOP: [], GENUINELY_HUMAN: [], "refused": [], "errors": []}
+    try:
+        rows = _population(args)
+    except Exception as exc:  # noqa: BLE001 — a population read that failed is not an empty one
+        print(f"POPULATION READ FAILED for {args.repo}: {exc}")
+        census["errors"].append((0, str(exc)[:140]))
+        _emit_census(census, args.apply)
+        print("::error::the park population could not be read, so this tick knows NOTHING about "
+              "the backlog — a malformed payload is not a drained terminal")
+        return 1
     print(f"{len(rows)} open PR(s) on {park_policy.HUMAN_PR_PARK_LABEL} in {args.repo}")
-    census = {RETURN_TO_LOOP: [], GENUINELY_HUMAN: [], "refused": []}
+    write_failed = []
     for row in sorted(rows, key=lambda row: row.get("number") or 0):
-        number = row["number"]
+        number = row.get("number")
         try:
             disposition, cause, detail = _sweep_one(
                 args, worker_pr, row, len(census[RETURN_TO_LOOP]) + len(census[GENUINELY_HUMAN]))
+        except WriteFailed as exc:
+            # NOT a deferral: the audit comment above it already authorised this transaction.
+            print(f"  #{number}: WRITE FAILED — {exc}")
+            census["errors"].append((number, f"write failed: {str(exc)[:120]}"))
+            write_failed.append(number)
+            continue
         except Exception as exc:  # noqa: BLE001 — one bad PR never stops the sweep
-            print(f"  #{number}: SKIP — {exc}")
-            census["refused"].append((number, str(exc)[:140]))
+            print(f"  #{number}: ERROR — {exc}")
+            census["errors"].append((number, str(exc)[:140]))
             continue
         if not disposition:
             print(f"  #{number}: REFUSED — {detail}")
@@ -505,14 +572,46 @@ def main(argv=None):
             continue
         print(f"  #{number}: {disposition.upper()} [{cause}] — {detail}")
         census[disposition].append((number, cause))
-    print(f"\n{'APPLIED' if args.apply else 'DRY RUN'}: "
+    _emit_census(census, args.apply)
+    # THE EXIT STATUS. A census this process prints itself is not a signal unless the process can
+    # also fail, so the two conditions under which the sweep DELIVERED NOTHING are nonzero.
+    if write_failed:
+        print(f"::error::{len(write_failed)} PR(s) {write_failed} carry an audit comment whose "
+              "transaction did not complete — the next tick will refuse them as already "
+              "adjudicated, so this needs a human, not a green run")
+        return 1
+    if rows and len(census["errors"]) == len(rows):
+        print(f"::error::all {len(rows)} eligible PR(s) errored — this sweep was inoperative, "
+              "which is not the same as a quiet tick")
+        return 1
+    return 0
+
+
+def _population(args):
+    """Every open PR on the human terminal, from a STRICTLY validated page shape (`_flatten_pages`
+    raises rather than letting a malformed payload read as a drained backlog). Rows that are not
+    pull requests are the label's issue half and are not this sweep's population."""
+    held = _gh_json(["api", f"repos/{args.repo}/issues?state=open"
+                     f"&labels={urllib.parse.quote(park_policy.HUMAN_PR_PARK_LABEL)}"
+                     "&per_page=100", "--paginate", "--slurp"])
+    return [row for row in _flatten_pages(held, f"{args.repo} park population")
+            if row.get("pull_request")]
+
+
+def _emit_census(census, apply):
+    """ALWAYS emit, including the all-zero row and the ERROR row — the quiet tick is exactly the
+    one an operator interrogates, and an operational error is reported apart from a policy refusal
+    so "nothing was eligible" can never be read off a run that could not read anything."""
+    print(f"\n{'APPLIED' if apply else 'DRY RUN'}: "
           f"{len(census[RETURN_TO_LOOP])} returned to the loop, "
           f"{len(census[GENUINELY_HUMAN])} genuinely human, "
-          f"{len(census['refused'])} refused")
+          f"{len(census['refused'])} refused, "
+          f"{len(census['errors'])} errored")
     for disposition in DISPOSITIONS:
         for number, cause in census[disposition]:
             print(f"  #{number} {disposition} ({cause})")
-    return 0
+    for number, detail in census["errors"]:
+        print(f"  #{number} ERROR ({detail})")
 
 
 def _self_test():
@@ -729,16 +828,217 @@ def _self_test():
             ("ep isode", RETURN_TO_LOOP, "budget"))],
           [True, True, True])
 
+    # ---- THE PAGE-SHAPE READER: A MALFORMED PAYLOAD IS NOT AN EMPTY RESULT SET. --------------
+    check("the ONE --slurp shape reader flattens a well-formed response, and REFUSES every "
+          "malformed one rather than yielding the zero rows a caller reads as 'nothing to do'",
+          [_flatten_pages([[{"a": 1}], [{"b": 2}]], "t"), _flatten_pages([[]], "t")]
+          + [_raises(lambda payload=payload: _flatten_pages(payload, "t"), RuntimeError)
+             for payload in (None, "[]", {"message": "Bad credentials"}, 7,
+                             [None], [{"a": 1}], [[1]], [[{"a": 1}], "page"])],
+          [[{"a": 1}, {"b": 2}], []] + [True] * 8)
+    check("every MUTATION in the production half goes through the write wrapper, so a write that "
+          "did not land can never be filed as a read-side per-PR deferral",
+          sorted(set(re.findall(r'(_gh\w*)\(\["api", "-X"', _production_source()))),
+          ["_gh_write"])
+
+    # ---- THE ENTRY POINT. main()'s EXIT STATUS IS THE SWEEP'S ONLY ENFORCED SIGNAL. ----------
+    # These drive the REAL main() — and with it _population, _sweep_one's write half, _gh_write
+    # and _emit_census — with `gh` stubbed at the process boundary. Before them, every line of
+    # that half had NEVER executed under test (AGENTS.md pre-flight §1), which is precisely where
+    # a fabricating bug survives: a census this module prints about itself is not an alarm unless
+    # the process can also fail.
+    bot = "adjudicator[bot]"
+    # LITERAL, not park_policy.HUMAN_PR_PARK_LABEL: a repoint of the terminal must surface here as
+    # a red row rather than follow the fixture silently (AGENTS.md pre-flight §2c).
+    terminal = "review:needs-user"
+    argv = ["--repo", "o/r", "--bot-login", bot, "--maintainer", "human-owner"]
+
+    quiet = _run_main(argv, {"issues?state=open": [[]]})
+    check("an EMPTY population is a REAL quiet tick: exit 0, with the all-zero census still "
+          "emitted (the row an operator interrogates)",
+          (quiet[0], "0 returned to the loop, 0 genuinely human, 0 refused, 0 errored"
+           in quiet[1]),
+          (0, True))
+    malformed = {"null (gh printed nothing at all)": None,
+                 "an error object instead of pages": {"message": "Bad credentials"},
+                 "a JSON string": "[]",
+                 "a page that is not a list": [{"number": 1}],
+                 "a null page": [None],
+                 "a row that is not an object": [[7]]}
+    broken = {name: _run_main(argv, {"issues?state=open": payload})
+              for name, payload in malformed.items()}
+    check("a MALFORMED population payload EXITS NONZERO instead of flattening to an empty "
+          "backlog — every shape a failing API/schema can hand back",
+          {name: run[0] for name, run in broken.items()},
+          {name: 1 for name in malformed})
+    check("...and still emits the census and a named error, so the failure is legible in the run "
+          "log rather than only in the status",
+          sorted({("POPULATION READ FAILED" in run[1], "0 refused, 1 errored" in run[1],
+                   "::error::" in run[1], run[2] == []) for run in broken.values()}),
+          [(True, True, True, True)])
+
+    pr_row = {"url": "https://api.github.com/repos/o/r/pulls/12"}
+    two = [[{"number": 11, "labels": [{"name": terminal}], "pull_request": pr_row},
+            {"number": 12, "labels": [{"name": terminal}], "pull_request": pr_row}]]
+    boom = RuntimeError("gh api failed: 502 Bad Gateway")
+    unreadable = {"issues/11/comments": boom, "issues/12/comments": boom}
+    check("a tick in which EVERY eligible PR errored EXITS NONZERO — a sweep that delivered "
+          "nothing is not a quiet tick, and the workflow's per-invocation counter cannot see it",
+          _run_main(argv, {"issues?state=open": two, **unreadable})[0], 1)
+    partial = _run_main(argv, {"issues?state=open": two, "issues/11/comments": boom,
+                               "issues/12/comments": [[]], "issues/12/timeline": [[]],
+                               "pulls/12": {"head": {"sha": "", "ref": "x"}, "draft": False}})
+    check("...but ONE bad PR still never stops the sweep: a PARTIAL failure stays exit 0, and "
+          "the operational error is counted APART from the policy refusal it is not",
+          (partial[0], "0 genuinely human, 1 refused, 1 errored" in partial[1]), (0, True))
+
+    def parked(number, issue, body, sha):
+        """The four reads one parked worker draft answers, as `gh api` would print them."""
+        return {f"issues/{number}/comments": [[{"user": {"login": bot}, "body": body}]],
+                f"issues/{number}/timeline": [[{"event": "labeled", "label": {"name": terminal},
+                                                "created_at": "2026-07-20T00:00:00Z",
+                                                "actor": {"login": bot},
+                                                "performed_via_github_app": {"slug": "app"}}]],
+                f"pulls/{number}": {"head": {"sha": sha, "ref": f"sparq-agent/issue-{issue}-3"},
+                                    "draft": True},
+                f"issues/{issue}": {"labels": []}}
+
+    # BOTH write halves in ONE tick: #12 is a capacity park (the full re-entry transaction) and
+    # #13 a legacy prose-only question park (the audit comment ALONE). Two rows is also what makes
+    # the lost-write exit measurable AT ALL — with a single row `errors == rows`, so the
+    # all-errored guard would return 1 for an unrelated reason and mask it (AGENTS.md §4's
+    # mutually-masking pair; measured: three write-side mutants survived on a one-row fixture).
+    # ...plus #14, the label's ISSUE half: the same query returns it, and it is not a pull request
+    # to adjudicate. It carries no stubbed reads, so a population that stopped filtering it would
+    # surface as an ERROR row in the census below rather than as silence.
+    both = {"issues?state=open": [[{"number": n, "labels": [{"name": terminal}],
+                                    "pull_request": pr_row} for n in (12, 13)]
+                                  + [{"number": 14, "labels": [{"name": terminal}]}]],
+            **parked(12, 77, "the round budget ran out "
+                     + park_policy.park_reason_marker("budget"), "b" * 40),
+            **parked(13, 78, "this branch no longer descends from the worker-opened commit",
+                     "c" * 40)}
+    applied = _run_main(argv + ["--apply"], both)
+    check("both write halves, RECEIPT-FIRST and nothing beyond: the capacity park gets its audit "
+          "comment, THEN the hold drop, THEN the fix lane — and the question park gets its audit "
+          "comment and NO label write, on either half",
+          (applied[0], _endpoints(applied[2]),
+           "1 returned to the loop, 1 genuinely human, 0 refused, 0 errored" in applied[1]),
+          (0, [("POST", "issues/12/comments"),
+               ("DELETE", "issues/12/labels/review%3Aneeds-user"),
+               ("POST", "issues/12/labels"),
+               ("POST", "issues/13/comments")], True))
+    dry = _run_main(argv, both)
+    check("...and WITHOUT --apply the same population writes NOTHING AT ALL (the flag's value, "
+          "not its presence), while still reporting both dispositions",
+          (dry[0], dry[2], "1 returned to the loop, 1 genuinely human" in dry[1]), (0, [], True))
+    failed = {target: _run_main(argv + ["--apply"], both, write_fails=(target,))
+              for target in ("12/comments", "DELETE", "13/comments")}
+    check("a write that does NOT land EXITS NONZERO and stops that PR's transaction where it "
+          "failed — while the OTHER PR of the same tick is adjudicated normally, so the status "
+          "can come from nothing but the lost write",
+          {target: (run[0], len(run[2])) for target, run in failed.items()},
+          {"12/comments": (1, 2), "DELETE": (1, 3), "13/comments": (1, 4)})
+    check("...and the half-written transaction is filed as an ERROR — NAMED, with the PR number, "
+          "never as the disposition it did not complete, while the PR that DID complete counts",
+          {target: ("WRITE FAILED" in run[1], "1 errored" in run[1], "::error::" in run[1],
+                    "1 returned to the loop" in run[1], "1 genuinely human" in run[1],
+                    sorted(re.findall(r"#(\d+) ERROR \(", run[1])))
+           for target, run in failed.items()},
+          {"12/comments": (True, True, True, False, True, ["12"]),
+           "DELETE": (True, True, True, False, True, ["12"]),
+           "13/comments": (True, True, True, True, False, ["13"])})
+
+    # ---- THE YAML SEAM. The exit status above is only a signal if the CRON reads it. -----------
+    workflow = _workflow_source()
+    increments = [n for n, line in enumerate(workflow) if line.strip() == "swept=$((swept + 1))"]
+    check("the cron counts a repo as SWEPT only inside the SUCCESS branch of the invocation — an "
+          "increment that merely records that python3 ran cannot tell a failed sweep, an "
+          "unreadable population or a lost write from a drained backlog",
+          (len(increments), [workflow[n - 1].strip() for n in increments]), (1, ["then"]))
+    check("...and both final guards are live: the run fails when NO repo was swept and when ANY "
+          "repo's sweep failed",
+          sorted(var for var in ("$failed", "$swept")
+                 if any(var in line and "exit 1" in line for line in workflow)),
+          ["$failed", "$swept"])
+
     print("adjudicate-stuck self-test " + ("PASSED" if ok else "FAILED"))
     return 0 if ok else 1
 
 
-def _raises(thunk):
+def _raises(thunk, kind=ValueError):
+    """True only when `thunk` raises EXACTLY `kind`. A DIFFERENT exception is malformedness, not
+    the guard firing, so it returns False — which reds THIS row and lets the rest of the suite
+    run, instead of aborting it and recording the 15 checks below as neither passed nor failed
+    (measured: an inert shape guard scored 43 of 58 checks, AGENTS.md pre-flight §4)."""
     try:
         thunk()
-    except ValueError:
+    except kind:
         return True
+    except Exception:  # noqa: BLE001 — a different failure is a RED row, never a kill
+        return False
     return False
+
+
+def _workflow_source():
+    """The cron that runs this sweep, as lines — or NO lines when it cannot be read, so a missing
+    workflow fails the seam checks closed instead of vacuously satisfying them. Read as text, not
+    parsed: the worker container has no YAML module, and the seam under test is the shell step."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        ".github", "workflows", "adjudicate-stuck.yml")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().splitlines()
+    except OSError:
+        return []
+
+
+def _endpoints(writes):
+    """(method, path-below-the-repo) for each write a stubbed run attempted, in order."""
+    return [(method, path.split("/", 3)[-1]) for method, path in writes]
+
+
+def _run_main(argv, reads, write_fails=()):
+    """Drive the REAL `main()` offline — no gh process, no network, no token.
+
+    `reads` maps a distinctive endpoint substring to the payload `gh api` would print, or to an
+    Exception INSTANCE to raise in its place; `write_fails` names substrings of the endpoint (or
+    the HTTP method) whose mutation must fail. Returns (exit status, stdout, writes attempted),
+    so one check can pin the status, the census text and the receipt-first write ORDER together.
+
+    The stub replaces `_gh`/`_gh_json` at the PROCESS boundary rather than the functions under
+    test, so `_gh_write`, `_flatten_pages`, `_population`, `_sweep_one` and `_emit_census` are the
+    shipped ones."""
+    writes = []
+
+    def endpoint(call):
+        return next((arg for arg in call if arg.startswith("repos/")), "")
+
+    def fake_gh_json(call):
+        path = endpoint(call)
+        for key, payload in reads.items():
+            if key in path:
+                if isinstance(payload, Exception):
+                    raise payload
+                return payload
+        raise AssertionError(f"unstubbed read {path!r}")
+
+    def fake_gh(call, check=True):
+        method, path = (call[2] if len(call) > 2 else ""), endpoint(call)
+        writes.append((method, path))
+        if any(fail in path or fail == method for fail in write_fails):
+            raise RuntimeError(f"gh api failed: 502 Bad Gateway on {path}")
+        return None
+
+    saved = {name: globals()[name] for name in ("_gh", "_gh_json")}
+    out = io.StringIO()
+    try:
+        globals()["_gh"], globals()["_gh_json"] = fake_gh, fake_gh_json
+        with contextlib.redirect_stdout(out):
+            status = main(argv)
+    finally:
+        globals().update(saved)
+    return status, out.getvalue(), writes
 
 
 def _production_source():

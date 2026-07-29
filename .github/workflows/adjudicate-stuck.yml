@@ -109,6 +109,7 @@ jobs:
           set -euo pipefail
           python3 scripts/adjudicate-stuck.py --self-test
           swept=0
+          failed=""
           for owner in sparq-org jeswr; do
             case "$owner" in
               sparq-org)
@@ -127,14 +128,26 @@ jobs:
             for name in "${repos[@]}"; do
               [[ -n "$name" ]] || continue
               echo "== ${owner}/${name} =="
-              GH_TOKEN="$token" python3 scripts/adjudicate-stuck.py \
+              # `swept` counts repos the sweep actually COMPLETED, not invocations: the script
+              # exits nonzero when it could not read the population, when a write did not land,
+              # or when every eligible PR errored, and a counter incremented merely because
+              # python3 ran cannot tell any of those apart from a drained backlog. The failure is
+              # RECORDED rather than fatal here so one broken repo never skips the sweep of the
+              # rest; the run still fails below.
+              if GH_TOKEN="$token" python3 scripts/adjudicate-stuck.py \
                 --repo "${owner}/${name}" \
                 --bot-login "${slug}[bot]" \
                 --limit 5 \
                 --apply
-              swept=$((swept + 1))
+              then
+                swept=$((swept + 1))
+              else
+                echo "::error::the adjudication sweep FAILED for ${owner}/${name}"
+                failed="${failed} ${owner}/${name}"
+              fi
             done
           done
           # A sweep that swept nothing is a silent outage, not a quiet tick: every enabled owner
           # failing to mint looks identical to "the backlog is empty" in the run list.
           [[ "$swept" -gt 0 ]] || { echo '::error::no enabled target repo was swept'; exit 1; }
+          [[ -z "$failed" ]] || { echo "::error::sweep failed on:${failed}"; exit 1; }
