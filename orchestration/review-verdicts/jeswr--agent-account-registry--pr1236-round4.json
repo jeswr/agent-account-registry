@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1236,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "adc6d1cc9f58577a9adf8ad429a012af35ce72d1",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 remains approval-worthy. The live workflow preserves the exact unconditional two-line reporter seam, supplies the head SHA and base branch through `env`, and retains the default merge-ref checkout with full history. The implementation validates both event operands, verifies the checked-out merge commit's parent shape and composed head, reads the tested base from the first parent, resolves the live remote-tracking tip, and fails closed to a loud `unprovable` report whenever attribution cannot be established. Stale, fresh, and unprovable receipts, annotations, summaries, CLI behavior, checkout requirements, and shell-level inertness are exercised with non-vacuous assertions, and the script is enrolled in the gate's self-test manifest. No diff-embedded reviewer-directed instruction was detected.",
+  "verdict": "approve"
+ }
+}
