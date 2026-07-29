@@ -894,3 +894,56 @@ post-merge by exactly one artefact: a file matching
 branch whose `host_envelope.repo` is `jeswr/agent-account-registry`. Until that file exists, the
 honest statement of this lane's delivery is still **zero** — now with every code blocker named and
 removed rather than with one hiding a job downstream.
+
+### 12.7 Re-derived on the LIVE tree after rebase, and the one thing a merge does not buy
+
+> 🤖 **SPARQ agent** — every number here is from the **uncapped** `/git/trees/ledger?recursive=1`
+> (`truncated: false`, 2158 paths), never the contents API, which caps that directory at 1000
+> entries and makes a "no match" unfalsifiable.
+
+| | count |
+|---|---|
+| verdict records on `ledger` | 1512 |
+| provenance records on `ledger` | 636 |
+| verdict records for **any** of #1250 / #1266 / #1273 / #1275 / #1294 / #1298 / #1305 | **0** |
+| provenance records for those seven | **1** (#1275 only) |
+
+**The whole admission chain now admits the real #1275, on its real payload and its real ledger
+record** — not a fixture:
+
+```
+resolve  review_fix_pr_admission(mode=review) -> self_attested=True   error=None
+resolve  review_fix_pr_admission(mode=fix)    -> self_attested=False  error='pull request is not an open draft'
+CLAIM    claim_review_pr_admission            -> admitted=True        defer=None
+run      identity gate (6 facts, live YAML)   -> True
+```
+
+The fix-mode row is the one worth keeping: the class is admitted to **review** and still refused by
+every pre-#657 gate on the path that **pushes commits**.
+
+⚠️ **A merge alone will not produce the first verdict, and #1275 cannot be its own first delivery.**
+#1275 carries `review:needs-user`, and `resolve` refuses a PR holding it (*"pull request is
+human-owned"*) before any of the above runs. That park is a **genuine machine park with receipts** —
+`sparq-orchestrator[bot]` wrote both `sparq-identity-refusal:v1 reason=author-not-app-bot` and
+`sparq-park-reason:v1 class=question cause=target-identity` at 16:07:24/16:07:27Z. So any exit
+conditioned on *"zero park-reason receipts ever"* is precondition-excluded here by construction, and
+a human readmission gesture is what reopens it. **This PR must not clear its own label** — a
+hand-applied or hand-removed hold carries no cause receipt.
+
+So the first delivery will come from the hold-free part of the class. Of 12 open non-draft
+`jeswr`-authored PRs, **9 are held** (`review:parked` ×5, `needs:user` ×3, `review:needs-user` ×1 —
+#1275) and **3 are free**: **#756, #1308, #1309**. All three pass the shared writer's
+`pr_mint_refusal` (`NONE`) and all three name a source issue (#758, #1304, #835), so auto-mint can
+record provenance for them once the mint refusal self-removes — which it does the moment the
+identity gate admits, with no edit anywhere.
+
+**Verification recipe for whoever merges this:** after the merge, the first delivery is a file
+matching `orchestration/review-verdicts/jeswr--agent-account-registry--pr{756,1308,1309}-round1.json`
+on `ledger`, read via `/git/trees/ledger?recursive=1`. Until such a file exists, this lane's
+delivery is still **zero**.
+
+One live example of a hazard worth not leaning on: PR #1275 already contains a comment in which a
+**human** quotes `<!-- sparq-identity-refusal:v1 ... -->` inside a blockquote. It is harmless here
+only because the receipt reader filters on the App login — but it is exactly the shape a
+marker-scanner without fence/quote stripping would misread, so nothing in this change reads a
+marker without an author filter.
