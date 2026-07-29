@@ -9,56 +9,6 @@
    "model": "opus5",
    "issued_at": 1785358350,
    "expires_at": 1785364650
-  },
-  {
-   "account": "efb4eb2781de6958",
-   "claim_id": "6722240d60274286bfdbad75d819720e",
-   "holder": "fix:sparq-org/sparq#4957@dispatch-30489806551.1",
-   "package": "sparq-mcp",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785358371,
-   "expires_at": 1785364671
-  },
-  {
-   "account": "efb4eb2781de6958",
-   "claim_id": "ee305bec667f49218409c20e3fb71f56",
-   "holder": "fix:sparq-org/sparq#5049@dispatch-30489806551.1",
-   "package": "docs",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785358381,
-   "expires_at": 1785364681
-  },
-  {
-   "account": "efb4eb2781de6958",
-   "claim_id": "e44b245ba3724001a7e032b8ace26842",
-   "holder": "fix:sparq-org/sparq#5126@dispatch-30489806551.1",
-   "package": "ci",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785358394,
-   "expires_at": 1785364694
-  },
-  {
-   "account": "9e13ea21abf27e68",
-   "claim_id": "070fb5a1aa9d4c0ebaad5d4e442172fe",
-   "holder": "review:sparq-org/sparq#5130@dispatch-30489806551.1",
-   "package": "gui",
-   "role": "review",
-   "model": "opus5",
-   "issued_at": 1785358401,
-   "expires_at": 1785362601
-  },
-  {
-   "account": "dc2d751954080e13",
-   "claim_id": "258974442d4844b9a89f4043e74ffe8d",
-   "holder": "review:sparq-org/sparq#5132@dispatch-30489806551.1",
-   "package": "ci",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785358408,
-   "expires_at": 1785362608
   }
  ]
 }
