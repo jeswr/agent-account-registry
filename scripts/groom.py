@@ -2957,10 +2957,13 @@ def _plan_actions(
             # parking the source issue (`needs:user`) would strip that PR from dispatch's review
             # loop (any source `needs:*` is terminal there), so exhaustion never defers while an
             # ADMITTED attempt is open. Admission is `_admitted_review_prs` — the review loop's
-            # own identity + registry-provenance checks — NEVER the loose `links` map below: an
+            # own identity + registry-provenance checks — never the weaker `links` map below: an
             # arbitrary PR whose body says `Fixes #N` (or a fork with a worker-shaped head) must
-            # not hold an exhausted issue out of `needs:user` (review round 1). This guard must
-            # run FIRST so a successful last attempt is not mis-parked.
+            # not hold an exhausted issue out of `needs:user` (review round 1). Since #172 `links`
+            # is no longer LOOSE either (it applies the same identity gate and ignores body
+            # references); the remaining difference is the provenance RECORD, which this park
+            # requires and the repair suppression below deliberately does not — see #279 there.
+            # This guard must run FIRST so a successful last attempt is not mis-parked.
             if (
                 used >= limits[repo].max_attempts
                 and key not in live_by_issue
@@ -2977,6 +2980,16 @@ def _plan_actions(
             # already in the review lane. It is a NO-OP for the worker class by construction —
             # `_admitted_review_prs`' worker branch is `_current_links`' identity gate plus a
             # record, so every worker issue in `admitted` is already a `links` key (asserted).
+            #
+            # Issue #279 asked whether this direction should ALSO demand the record — i.e. treat a
+            # record-less link as weak enough to suppress only orphan repair. It must not. The
+            # availability hole #279 describes ("any PR saying `Fixes #N` delays repair forever")
+            # was closed by #172: `links` is the worker-PR identity gate, so an outsider cannot
+            # enter this map at all. Dropping a record-less but AUTHENTICATED worker PR out of the
+            # suppression would re-ready an issue the App is demonstrably working right now
+            # whenever its provenance record has not yet reached the read branch — trading a
+            # bounded availability delay for a duplicate dispatch. Suppression stays identity-keyed
+            # here and record-keyed at the park above, and both are re-asked at the write boundary.
             if key in live_by_issue or number in links or number in admitted[repo]:
                 continue
             stale = (
@@ -3242,20 +3255,11 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         if lease["claim_id"] not in dead_claims
         and not is_repair_holder(lease["holder"])
     }
+    # This listing is the reap guard's fresh view ONLY. The ready-repair "is this issue already
+    # being worked?" question is NOT answered from it (issue #279): it is a pre-LOOP snapshot,
+    # already stale by the time a later action reaches its write, so that question is re-asked
+    # per action at the write boundary below — exactly as the defer branch does.
     current_pulls = {repo: _pulls(api, repo) for repo, api in groomable.items()}
-    current_links = {
-        repo: _current_links(repo, repo_pulls, bot_login)
-        for repo, repo_pulls in current_pulls.items()
-    }
-    # [registry #835] The class-aware half of the same "is this issue already being worked?"
-    # question, re-derived at the mutation boundary from the SAME fresh listing (no extra API
-    # read — the admission is a local record lookup). Without it a PLAN->boundary window in
-    # which an enrolled orchestrator PR opens still re-readies its source issue.
-    current_admitted = {
-        repo: _admitted_review_prs(repo, repo_pulls, bot_login, ledger_root=ledger_root,
-                                   enrolled_authors=limits[repo].enrolled_authors)
-        for repo, repo_pulls in current_pulls.items()
-    }
     # #509 mutation-boundary guard for label/orphan reaping.  A claim selected from the earlier
     # target snapshots is released only if a fresh issue read still says terminal/absent and the
     # fresh pull listing still has no worker PR for it.  An unpark or newly opened PR wins the
@@ -3336,10 +3340,6 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                         f"SKIP issue {action.repo}#{action.number}: status changed under grooming"
                     )
                     continue
-                elif (action.number in current_links[action.repo]
-                        or action.number in current_admitted[action.repo]):
-                    print(f"SKIP issue {action.repo}#{action.number}: an open PR appeared")
-                    continue
                 elif (
                     (action.reason.startswith("stale") or orphan_repair)
                     and now
@@ -3353,6 +3353,38 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                         f"SKIP issue {action.repo}#{action.number}: activity refreshed its threshold"
                     )
                     continue
+                else:
+                    # Mutation-boundary revalidation of "is this issue already being worked?"
+                    # (issue #279), the ready-side mirror of the defer branch's re-read below:
+                    # re-read the target's open PRs NOW rather than trusting the pre-loop
+                    # snapshot, which is already stale by the time a later action in this loop
+                    # reaches its write. A worker (or [#835] enrolled orchestrator) PR that
+                    # opened after planning must suppress the status:ready write, or the
+                    # dispatcher sends a second worker onto work that already has an open PR.
+                    # Placed LAST, so it is the closest read to the write the API permits and
+                    # costs a listing only for an action that is otherwise about to mutate.
+                    #
+                    # The predicate is UNCHANGED — worker linkage (`_current_links`) OR the
+                    # class-aware admission — and is deliberately NOT narrowed to the admitted
+                    # set (issue #279's open question). `_current_links` is no longer loose:
+                    # since #172 it applies the full worker-PR IDENTITY gate and ignores
+                    # `Fixes #N` body references entirely, so no outsider PR can hold this
+                    # issue out of repair. What it does NOT require is a provenance RECORD, and
+                    # requiring one here would be a regression, not a hardening: an in-flight
+                    # worker whose record has not yet landed on the read branch would be
+                    # re-readied and double-dispatched. Suppressing a repair write is the
+                    # conservative direction; granting dispatch is not.
+                    boundary_pulls = _pulls(api, action.repo)
+                    if action.number in _current_links(
+                        action.repo, boundary_pulls, bot_login
+                    ) or action.number in _admitted_review_prs(
+                        action.repo, boundary_pulls, bot_login, ledger_root=ledger_root,
+                        enrolled_authors=limits[action.repo].enrolled_authors,
+                    ):
+                        print(
+                            f"SKIP issue {action.repo}#{action.number}: an open PR appeared"
+                        )
+                        continue
             else:
                 current_comments = (
                     _comments(api, action.repo, action.number)
@@ -5700,7 +5732,10 @@ def _self_test() -> int:
         "(not a literal), at all FOUR call sites",
         sorted(_sweep_enrol),
         sorted([("_admitted_review_prs", "limits[repo].enrolled_authors"),          # planning
-                ("_admitted_review_prs", "limits[repo].enrolled_authors"),          # boundary links
+                # Issue #279: the ready-repair boundary re-derives this PER ACTION from a fresh
+                # listing, so it is keyed on `action.repo` like the defer boundary — the pre-loop
+                # per-repo snapshot it replaced is gone.
+                ("_admitted_review_prs", "limits[action.repo].enrolled_authors"),   # ready boundary
                 ("_admitted_review_prs", "limits[action.repo].enrolled_authors"),   # defer boundary
                 ("_live_issue_admission", "limits[action.repo].enrolled_authors")]))
 
@@ -8101,7 +8136,10 @@ def _self_test() -> int:
             if path == "/repos/owner/repo/pulls?state=open":
                 sweep_env["pull_reads"] += 1
                 if sweep_env["pull_reads"] >= sweep_env["pr_visible_from"]:
-                    return [sweep_env["worker_pull"]]
+                    # Which PR "appears" is a scenario knob (issue #279): the default is the
+                    # admitted worker PR, and the ready-repair cases below substitute a loose
+                    # `Fixes #8` PR and an enrolled orchestrator PR.
+                    return [sweep_env.get("appearing_pull") or sweep_env["worker_pull"]]
                 return []
             return sweep_env["pages"].get(path, [])
 
@@ -8136,8 +8174,11 @@ def _self_test() -> int:
         "body": WORKER_PR_MARKER + "\n\nFixes #8",
     }
 
-    def _sweep_scenario(pr_visible_from: int) -> tuple[int, int, int, int]:
-        sweep_env.update(pull_reads=0, pr_visible_from=pr_visible_from, writes=[])
+    def _sweep_scenario(
+        pr_visible_from: int, appearing_pull: dict[str, Any] | None = None
+    ) -> tuple[int, int, int, int]:
+        sweep_env.update(pull_reads=0, pr_visible_from=pr_visible_from, writes=[],
+                         appearing_pull=appearing_pull)
         return run_sweep(argparse.Namespace(
             registry_repo="owner/registry",
             policy_file="unused-policy",
@@ -8297,6 +8338,103 @@ def _self_test() -> int:
                 "issue #174: a missing ledger REF skips the terminal park AND raises an ALERT",
                 (summary_e[2], sweep_env["writes"], "ALERT" in alert_buf.getvalue()),
                 (0, [], True),
+            )
+            # ---- issue #279: the READY-repair side of the same mutation boundary ----------------
+            # The defer branch above re-reads open PRs immediately before its write; the ready
+            # branch used to answer the same "is this issue already being worked?" question from
+            # the PRE-LOOP snapshot, which is already stale by the time a later action reaches its
+            # write. Wrong in the DANGEROUS direction: the missed PR means groom writes
+            # status:ready and the dispatcher sends a second worker onto work that already has an
+            # open PR. One attempt comment (budget 2) turns the SAME fixture issue into the stale
+            # in-progress repair, so these scenarios differ from the defer ones by that alone.
+            sweep_env["pages"]["/repos/owner/repo/issues/8/comments"] = [
+                {"user": {"login": "app[bot]"}, "body": ATTEMPT_MARKER + " run=1 -->"},
+            ]
+            ready_writes = (
+                ("POST", "/repos/owner/repo/issues/8/labels"),
+                ("DELETE", "/repos/owner/repo/issues/8/labels/status%3Ain-progress"),
+            )
+
+            def _ready_landed(summary: tuple[int, int, int, int]) -> tuple[Any, ...]:
+                return (summary[1],
+                        all(write in sweep_env["writes"] for write in ready_writes))
+
+            # (F) No PR ever appears: the repair MUST land. This is what makes (G) non-vacuous —
+            # an over-broad guard that suppressed every ready write would red HERE.
+            check(
+                "#279 ready repair: with no open PR the status:ready repair still lands",
+                _ready_landed(_sweep_scenario(pr_visible_from=10**6)),
+                (1, True),
+            )
+            # (G) The worker PR is first visible to the boundary re-read (#3): NO write may land.
+            # Reverting the ready branch to the pre-loop snapshot reds this — the snapshot (#2)
+            # never saw the PR — and so does deleting the guard.
+            summary_g = _sweep_scenario(pr_visible_from=3)
+            check(
+                "MUTATION #279: a worker PR opening after the pre-loop snapshot suppresses the "
+                "status:ready WRITE",
+                (summary_g[1], sweep_env["writes"]),
+                (0, []),
+            )
+            check(
+                "#279: the ready branch actually RE-READ open PRs at the write boundary",
+                sweep_env["pull_reads"] >= 3,
+                True,
+            )
+            # (H) The availability direction #279 asked about: an arbitrary open PR whose body
+            # says `Fixes #8` must NOT delay the repair. The boundary check keys on the worker-PR
+            # identity gate (#172), not on body references, so the repair lands. Reverting
+            # `_current_links` to loose linkage reds this.
+            loose_pull = {
+                "number": 96,
+                "updated_at": datetime.fromtimestamp(
+                    sweep_now - 30, timezone.utc).isoformat(),
+                "head": {"ref": "feature/anything", "repo": {"full_name": "owner/repo"}},
+                "user": {"login": "drive-by-contributor"},
+                "body": "a helpful drive-by\n\nFixes #8",
+            }
+            check(
+                "#279: an arbitrary open PR whose body says `Fixes #8` cannot hold the issue out "
+                "of ready repair",
+                _ready_landed(
+                    _sweep_scenario(pr_visible_from=3, appearing_pull=loose_pull)),
+                (1, True),
+            )
+            # (I) The CLASS-AWARE half of the boundary predicate is live too ([registry #835]):
+            # an enrolled orchestrator PR is not worker-shaped, so only `_admitted_review_prs`
+            # can see it. Enrolment is the discriminator — the identical PR with the default
+            # empty allowlist suppresses nothing.
+            sweep_orch_pull = {
+                **orch_pull,
+                "number": 95,
+                "updated_at": datetime.fromtimestamp(
+                    sweep_now - 30, timezone.utc).isoformat(),
+            }
+            (sweep_record_dir / "owner--repo--pr95.json").write_text(
+                json.dumps(dict(orch_review.orchestrator_probe_record(95), issue=8)),
+                encoding="utf-8",
+            )
+            check(
+                "#279 control: with the default EMPTY allowlist an orchestrator PR suppresses "
+                "nothing and the repair lands",
+                _ready_landed(
+                    _sweep_scenario(pr_visible_from=3, appearing_pull=sweep_orch_pull)),
+                (1, True),
+            )
+            globals()["load_limits"] = lambda *_a, **_k: {"owner/repo": Limits(
+                worker_timeout_minutes=10, max_attempts=2,
+                enrolled_authors=orch_enrolled)}
+            try:
+                summary_i = _sweep_scenario(
+                    pr_visible_from=3, appearing_pull=sweep_orch_pull)
+            finally:
+                globals()["load_limits"] = sweep_patched["load_limits"]
+            check(
+                "[#835] MUTATION #279: an ENROLLED orchestrator PR opening after the snapshot "
+                "also suppresses the status:ready write (dropping the admitted disjunct, or its "
+                "enrolled_authors argument, reds this)",
+                (summary_i[1], sweep_env["writes"]),
+                (0, []),
             )
     finally:
         os.chdir(sweep_prior_cwd)
