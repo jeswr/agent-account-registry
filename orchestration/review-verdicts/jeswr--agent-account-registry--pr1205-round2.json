@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1205,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "015a6a162b05094313fe18748607f95884ca1711",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`strip_quoted_contexts` treats any line beginning with three backticks or tildes as a fence toggle. Markdown permits up to three leading spaces before a fence, which this regex misses entirely. It also requires a closing fence to use the same character and at least the opening run length, while this implementation toggles on either delimiter and any run of at least three. For example, an opening ` ```` ` followed by a ` ``` ` line does not close the Markdown fence, but this function toggles out of `fenced` state and will trust a subsequent whole-line park marker even though it is still rendered as fenced/echoed text. Thus the reader-side claim that fenced text carries no authority is false, and the tests cover only the simplest three-backtick form.",
+    "file": "scripts/park_policy.py",
+    "fix_hint": "Parse fenced blocks with Markdown-compatible boundaries: allow 0-3 leading spaces, record the opening delimiter character and run length, and close only on the same character with a run at least as long (plus permitted trailing whitespace). Add adversarial tests for indented fences, four-backtick fences containing a three-backtick line, and mismatched backtick/tilde delimiters; each must leave a following marker inside the still-open block untrusted while preserving a genuine marker after a valid close.",
+    "severity": "major",
+    "title": "Fence stripping can parse receipts that remain inside Markdown code fences"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe writer-side choke point closes the demonstrated resolve-conflicts sink, and the new whole-line requirement is useful defense in depth. However, the quoted-context parser does not implement Markdown fenced-block boundaries soundly. It can resume receipt parsing while Markdown still renders text as quoted code, contradicting the security invariant this change claims and leaving the reader-side protection bypassable. Because this is a trust-bearing receipt parser and the change explicitly relies on the reader half to protect against writers that have not been sanitized, this requires correction before approval.",
+  "verdict": "request_changes"
+ }
+}
