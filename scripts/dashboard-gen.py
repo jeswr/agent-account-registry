@@ -70,7 +70,7 @@ DISPATCH_REQUIRED_LANES = ("worker", "review", "fix", "disarm")
 # _normalize_observability() validates it FAIL-CLOSED here before it may reach the public
 # data.json (rendered by the dashboard's Observability panels; absent file => hidden panel).
 # Decision 22: no raw account handles anywhere on the public surface — observability lease rows
-# must already carry the collector's 8-hex salted label (OBS_SALTED_LABEL_RE below); anything else
+# must already carry the collector's salted label (OBS_SALTED_LABEL_RE below); anything else
 # dies loudly, and _assert_private additionally backstops every known raw handle over the finished
 # document. Issue #374 additionally stops the SALTED per-account rows being published at all — see
 # the fleet-composition block below — but the label validation stays, because a raw handle reaching
@@ -79,7 +79,17 @@ DISPATCH_REQUIRED_LANES = ("worker", "review", "fix", "disarm")
 # longer REQUIRES the per-account rows either — `flow.lease_utilization_1h` may be sent already
 # aggregated, and a collector that does so writes no per-account row array to a public branch.
 OBS_SCHEMA = "registry-observability/v1"
-OBS_SALTED_LABEL_RE = re.compile(r"[0-9a-f]{8}")
+# Issue #375: the salted label is the CANONICAL account fingerprint — sha256(handle:salt)[:16],
+# locked decision 22a, the one shape model-health.account_hash / worker-pr.account_hash produce and
+# lease_schema.ACCOUNT / groom.SAFE_ACCOUNT_HASH / select-and-claim.ACCOUNT_FINGERPRINT_RE already
+# validate. This read `[0-9a-f]{8}` — a second, shorter fingerprint format that no producer in this
+# repo can emit, so a collector handing over the fingerprint every other surface uses would have
+# failed the build. Tightening it here is safe in exactly this order because the collector has not
+# landed yet (dashboard.yml: the snapshot is OPTIONAL until it does, and the panel stays hidden) —
+# there is no producer to break, and the shape it must be built against is now the canonical one.
+# The self-test pins this against model-health.account_hash's real output, not against a literal,
+# so the two cannot drift apart again.
+OBS_SALTED_LABEL_RE = re.compile(r"[0-9a-f]{16}")
 OBS_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:+-]{0,63}")
 OBS_QUEUE_CLASS_RE = re.compile(r"[1-4][a-z]?")   # the #243 queue classes (1, 2, 2a..2d, 3, 4)
 OBS_HISTOGRAM_KEY_RE = re.compile(r"\d{1,2}\+?")
@@ -1379,10 +1389,12 @@ def _obs_lease_aggregate(value):
 
 def _obs_flow(flow):
     """Queue depth/age per class, fleet-wide lease utilization, review rounds, park rates,
-    arm→merge latency, target-CI congestion. A lease row whose label is not the 8-hex salted shape
-    is a raw account identity reaching the collector output — a decision-22 privacy incident,
-    fatal — and since issue #374 the rows themselves are aggregated away rather than republished
-    (issue #841: and since the rows sit on a PUBLIC branch, they need not be sent at all)."""
+    arm→merge latency, target-CI congestion. A lease row whose label is not the canonical 16-hex
+    salted account fingerprint (issue #375) is a raw account identity reaching the collector
+    output — or a second identity format nothing else here speaks — a decision-22 privacy
+    incident, fatal — and since issue #374 the rows themselves are aggregated away rather than
+    republished (issue #841: and since the rows sit on a PUBLIC branch, they need not be sent at
+    all)."""
     if not isinstance(flow, dict):
         return None
     queue = []
@@ -3668,11 +3680,11 @@ const degraded = (node) =>
         "flow": {"queue": [{"class": "2a", "depth": 1, "oldest_age_minutes": 12.34},
                            {"class": "4", "depth": 9, "oldest_age_minutes": 3},
                            {"class": "9z", "depth": 1}],
-                 "leases": [{"label": "ab12cd34", "provider": "anthropic",
+                 "leases": [{"label": "ab12cd340a5f9e71", "provider": "anthropic",
                              "utilization_1h": 0.8},
-                            {"label": "ef56ab78", "provider": "anthropic",
+                            {"label": "ef56ab78b3c2d104", "provider": "anthropic",
                              "utilization_1h": 0.4},
-                            {"label": "cd90ef12", "provider": "openai"}],
+                            {"label": "cd90ef1276a8b535", "provider": "openai"}],
                  "review_rounds": {"mean": 1.44444, "max": 3, "budget_exhausted_1h": 0},
                  "parks_1h": {"needs_user": 2, "needs_orchestrator": 1},
                  "arm_to_merge_minutes_24h": {"p50": 18, "p90": 55.5, "samples": 9},
@@ -3719,14 +3731,37 @@ const degraded = (node) =>
         "thresholds": {"workflow_failure_rate": 0.5, "defer_reason_hourly": 4,
                        "queue_age_clamp_minutes": 10, "merge_stall_minutes": 90},
     }
+
+    class ObsRefusal(dict):
+        """A FATAL `_normalize_observability` refusal rendered as a value instead of an exception.
+
+        The rows below hand this seam whole documents and then subscript the result, so a refusal
+        raised out of any one of them aborts every check after it — the crash-after-partial-run
+        shape (AGENTS.md, AUTHOR pre-flight item 4), which records as a kill while the rest of the
+        suite never ran. It measured as exactly that here: narrowing OBS_SALTED_LABEL_RE back to
+        the pre-#375 8-hex width took the run from 214 checks to 181 with no named row. A dict, so
+        subscript chains keep working (any missing key yields the refusal itself), carrying the
+        message and equal to nothing any row expects — one named red row, suite intact.
+        Rows that assert a refusal IS raised keep their own try/except and do not use this.
+        """
+
+        def __missing__(self, _key):
+            return self
+
+    def obs_normalized(document):
+        try:
+            return _normalize_observability(document)
+        except DashboardError as error:
+            return ObsRefusal(refused=str(error))
+
     check("observability golden normalization (bad rows dropped, top-N sorted, links pinned)",
-          _normalize_observability(obs_fixture), obs_expected)
+          obs_normalized(obs_fixture), obs_expected)
     check("absent observability snapshot stays hidden (None)",
           _normalize_observability(None), None)
     overflow = copy.deepcopy(obs_fixture)
     overflow["flow"]["review_rounds"]["mean"] = 1e309       # JSON 1e309 decodes to +Infinity
     overflow["thresholds"]["workflow_failure_rate"] = 1e309
-    overflow_normalized = _normalize_observability(overflow)
+    overflow_normalized = obs_normalized(overflow)
     check("non-finite review-round mean is rejected, never published",
           overflow_normalized["flow"]["review_rounds"]["mean"], None)
     check("non-finite threshold is dropped, never published",
@@ -3755,18 +3790,42 @@ const degraded = (node) =>
     def obs_leases(rows):
         fixture = copy.deepcopy(obs_fixture)
         fixture["flow"]["leases"] = rows
-        return _normalize_observability(fixture)["flow"]
+        return obs_normalized(fixture)["flow"]
 
-    one_lease = obs_leases([{"label": "ab12cd34", "provider": "anthropic",
+    one_lease = obs_leases([{"label": "ab12cd340a5f9e71", "provider": "anthropic",
                              "utilization_1h": 0.5}])
-    four_leases = obs_leases([{"label": f"ab12cd3{index}", "provider": "anthropic",
+    four_leases = obs_leases([{"label": f"ab12cd340a5f9e7{index}", "provider": "anthropic",
                                "utilization_1h": 0.5} for index in range(4)])
     check("[#374] lease rows of different fleet sizes normalize to the same published flow",
           (one_lease, one_lease == four_leases,
-           "ab12cd34" in json.dumps(one_lease)),
+           "ab12cd340a5f9e71" in json.dumps(one_lease)),
           (four_leases, True, False))
     check("[#374] no reported lease utilization publishes nothing rather than a zero",
           obs_leases([])["lease_utilization_1h"], None)
+    # ---- [#375] the salted label IS the canonical account fingerprint, sha256(handle:salt)[:16]
+    # (locked decision 22a). Pre-#375 this seam validated an 8-hex shape that NOTHING in this repo
+    # produces, so a collector handing over the same fingerprint model-health / worker-pr / the
+    # lease ledger all carry would have failed the build, while a truncated half of one was waved
+    # through as "salted". The accept row derives its label from the canonical implementation
+    # rather than from a literal, so a shortening on EITHER side of the wire turns it red.
+    canonical_label = _model_health_module().account_hash("acct-obs-375", "fixture-salt")
+    canonical_flow = obs_leases([{"label": canonical_label, "provider": "anthropic",
+                                  "utilization_1h": 0.5}])
+    check("[#375] the CANONICAL salted fingerprint (model-health.account_hash) is the accepted "
+          "lease label, and its row is really consumed rather than merely tolerated",
+          (len(canonical_label), canonical_flow["lease_utilization_1h"]),
+          (16, {"mean": 0.5, "max": 0.5}))
+    # ...and the pre-#375 8-hex format is now fatal rather than a second accepted identity shape.
+    # Widening the pattern back to `{8}` kills the row above; widening it to `{8,16}`/`{8,}` — the
+    # tempting "accept both" — is what these rows exist to kill, so they assert REJECTION.
+    for case, bad_label in (("the pre-#375 8-hex format", "ab12cd34"),
+                            ("the canonical fingerprint truncated to 8 hex", canonical_label[:8]),
+                            ("a 15-hex near-miss", canonical_label[:15]),
+                            ("a 17-hex overrun", canonical_label + "0")):
+        mis_shaped = copy.deepcopy(obs_fixture)
+        mis_shaped["flow"]["leases"][0]["label"] = bad_label
+        check(f"[#375] {case} is a fatal decision-22 violation, never a second accepted format",
+              _raises_dashboard(lambda: _normalize_observability(mis_shaped)), True)
     # ---- [#841] the ROW-FREE collector contract. #374 stopped this build PUBLISHING the rows; it
     # did not stop them EXISTING at data/observability.json on the public `ledger` branch. So the
     # aggregate is accepted directly and a collector need write no per-account rows anywhere.
@@ -3774,7 +3833,7 @@ const degraded = (node) =>
         fixture = copy.deepcopy(obs_fixture)
         fixture["flow"].pop("leases", None)          # the collector sends NO per-account rows
         fixture["flow"]["lease_utilization_1h"] = aggregate
-        return _normalize_observability(fixture)["flow"]["lease_utilization_1h"]
+        return obs_normalized(fixture)["flow"]["lease_utilization_1h"]
 
     check("[#841] a collector that sends NO lease rows still publishes the aggregate it computed",
           obs_flow_without_rows({"mean": 0.31, "max": 0.77}), {"mean": 0.31, "max": 0.77})
@@ -3784,22 +3843,22 @@ const degraded = (node) =>
     both = copy.deepcopy(obs_fixture)
     both["flow"]["lease_utilization_1h"] = {"mean": 0.99, "max": 0.99}
     check("[#841] lease ROWS outrank a collector-supplied aggregate (no silent override)",
-          _normalize_observability(both)["flow"]["lease_utilization_1h"],
+          obs_normalized(both)["flow"]["lease_utilization_1h"],
           {"mean": 0.6, "max": 0.8})
     # ...and precedence keys on the legacy KEY, not on a row happening to parse. Rows that are
     # present but report no usable utilization published null pre-#841 and must still publish null:
     # make the fallback conditional on `lease_utilizations` instead and these become {0.99, 0.99},
     # i.e. the new key overriding a legacy source that was sent.
     for case, rows in (
-        ("no utilization field", [{"label": "ab12cd34", "provider": "anthropic"}]),
-        ("malformed utilization", [{"label": "ab12cd34", "provider": "anthropic",
+        ("no utilization field", [{"label": "ab12cd340a5f9e71", "provider": "anthropic"}]),
+        ("malformed utilization", [{"label": "ab12cd340a5f9e71", "provider": "anthropic",
                                     "utilization_1h": "busy"}]),
         ("zero rows", []),
     ):
         unparseable = copy.deepcopy(both)
         unparseable["flow"]["leases"] = rows
         check(f"[#841] legacy rows with {case} keep their pre-#841 null, aggregate or not",
-              _normalize_observability(unparseable)["flow"]["lease_utilization_1h"], None)
+              obs_normalized(unparseable)["flow"]["lease_utilization_1h"], None)
     # ...and sending the aggregate is NOT a way around the decision-22 check on the rows that ARE
     # present. Make the label check conditional on the rows being used and this normalizes happily.
     both_raw = copy.deepcopy(both)
@@ -3821,8 +3880,11 @@ const degraded = (node) =>
     ):
         check(f"[#841] {case} collector aggregate is dropped, never published",
               obs_flow_without_rows(aggregate), None)
-    with_observability = build_dashboard(
-        issues, leases, usage, history, None, now, "fixture-salt", observability=obs_fixture)
+    try:
+        with_observability = build_dashboard(
+            issues, leases, usage, history, None, now, "fixture-salt", observability=obs_fixture)
+    except DashboardError as error:                 # same crash-after-partial-run guard as above
+        with_observability = ObsRefusal(refused=str(error))
     check("build_dashboard publishes the normalized observability key",
           with_observability.get("observability"), obs_expected)
     check("no observability input leaves data.json without the key (panel hidden)",
