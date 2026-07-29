@@ -773,7 +773,7 @@ def well_formed_reason_records(reason_records):
 
 
 def park_is_receiptless(reason_records):
-    """[registry #1310] True when NOT ONE well-formed bot park-reason receipt exists for this PR.
+    """[registry #1309] True when NOT ONE well-formed bot park-reason receipt exists for this PR.
 
     THE POPULATION THIS NAMES, and why it needed a name. human_park_capacity_proof refuses on two
     materially different states and returns the same answer for both:
@@ -1229,7 +1229,7 @@ PARK_REFUSAL_TICK_DEFERRED = "tick-deferred"        # AUTO_READMISSION_PER_TICK_
 # with different remedies costs (the `no-evidence` note in #835's review), so the second one gets
 # its own code rather than the nearest existing one.
 PARK_REFUSAL_FOREIGN_EPISODE = "foreign-episode"    # another mechanism's cause-gated park
-# [registry #1310] The RECEIPT-LESS park's one-shot void exit is already SPENT. Human-terminal, and
+# [registry #1309] The RECEIPT-LESS park's one-shot void exit is already SPENT. Human-terminal, and
 # for the same structural reason `cap` is: the exit exists once per PR, a second receipt-less park on
 # a PR that already used it is not a machine accident twice over, and a hand-applied hold that keeps
 # recurring is a genuine human question. Distinguished from `cap` because the two counters are
@@ -1271,7 +1271,7 @@ PARK_REFUSAL_CODES = frozenset({
 PARK_ADMIT_CODES = {"auto-mint": "admitted-auto-mint",
                     "auto-receipt": "admitted-auto-receipt",
                     "human": "admitted-human-gesture",
-                    # [registry #1310] the receipt-less VOID exit, counted APART from the
+                    # [registry #1309] the receipt-less VOID exit, counted APART from the
                     # cause-recovery admissions on purpose: these two admissions rest on entirely
                     # different proofs (a recovered cause vs a park that never recorded one), and a
                     # census that merged them could not answer "how many parks did we clear WITHOUT
@@ -1372,7 +1372,7 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
                       receipt-then-label is recoverable — the "auto-receipt" branch above
                       converges it — while label-then-receipt would erase the re-admission from
                       every proof surface and re-strand the PR).
-    - "void-receipt"— [registry #1310] a well-formed bot-authored RECEIPT-LESS VOID receipt is
+    - "void-receipt"— [registry #1309] a well-formed bot-authored RECEIPT-LESS VOID receipt is
                       already newer than every park application: this PR's receipt-less park was
                       ALREADY voided and the receipt is the durable gesture. Idempotent, and NOT
                       optional — the void is one-shot, so without this branch a crash between the
@@ -1407,7 +1407,7 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
     `self_id_rows` (self_identified_machine_comments), `void_receipts`
     (receiptless_void_records — [{"key", "at"}]), `void_marker_count`
     (receiptless_void_marker_count, defaulting to len(void_receipts)) and `void_offered` are the
-    RECEIPT-LESS VOID exit's inputs. Their defaults are the pre-#1310 behaviour EXACTLY: with no
+    RECEIPT-LESS VOID exit's inputs. Their defaults are the pre-#1309 behaviour EXACTLY: with no
     self-ID rows the provenance proof fails closed and a receipt-less human-applied park refuses
     with the same code and the same detail string it refused with before, and with
     `void_offered=False` nothing can be minted at all. That is deliberate — but it also means a
@@ -1459,7 +1459,7 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
             None, None, PARK_REFUSAL_HUMAN_APPLIED,
             "the latest park application is the HUMAN-owned terminal "
             f"({'/'.join(human_park_labels) or 'unattributable'}) — only a human clears it")
-    # [registry #1310] THE VOID'S IDEMPOTENT CONVERGENCE, and its POSITION is the load-bearing part.
+    # [registry #1309] THE VOID'S IDEMPOTENT CONVERGENCE, and its POSITION is the load-bearing part.
     #
     # It sits here — above every gate that can refuse a receipt-less park, and in particular above
     # the one-shot RECEIPTLESS_VOID_MAX check — because the void is ONE-SHOT. A crash between the
@@ -1494,7 +1494,7 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
                 "void-receipt", {"key": live_void_key, "at": canonical_ts(receipt["at"])}, None,
                 f"this receipt-less park was already voided at {canonical_ts(receipt['at'])} "
                 f"(void evidence {live_void_key!r}); no new budget consumed")
-    # [registry #1310] Set iff the RECEIPT-LESS VOID exit is earned. The decision is TAKEN in the
+    # [registry #1309] Set iff the RECEIPT-LESS VOID exit is earned. The decision is TAKEN in the
     # human-applied branch below (that is where the population dies today) but RETURNED after the
     # auto-receipt convergence and the AUTO_READMISSION_MAX cap, so the void inherits every one of
     # those gates instead of routing around them. It does not SPEND the capacity cap — the two
@@ -1511,7 +1511,7 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
         # human_park_capacity_proof.
         proven, why = human_park_capacity_proof(reason_records)
         if not proven:
-            # [registry #1310] SPLIT ON WHY THE PROOF FAILED, because the two states have different
+            # [registry #1309] SPLIT ON WHY THE PROOF FAILED, because the two states have different
             # remedies and one of them had no remedy at all.
             #
             # An OFF-CLASS receipt STANDS => unchanged, byte for byte. The machine did classify this
@@ -1521,7 +1521,7 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
             # NO receipt exists at all => the receipt-less class. Handled below, and note the fail
             # direction: EVERY refusal in this sub-branch returns the SAME code and the SAME detail
             # string the unconditional refusal returned before, so an ambiguous receipt-less park is
-            # indistinguishable from the pre-#1310 answer. Only a POSITIVELY PROVEN machine
+            # indistinguishable from the pre-#1309 answer. Only a POSITIVELY PROVEN machine
             # provenance changes any outcome.
             if not park_is_receiptless(reason_records):
                 return _answer(None, None, PARK_REFUSAL_HUMAN_APPLIED_UNCLASSIFIED,
@@ -1609,7 +1609,7 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
         return _answer(None, None, PARK_REFUSAL_CAP,
                        f"automatic-readmission cap reached ({minted}/"
                        f"{AUTO_READMISSION_MAX})")
-    # [registry #1310] THE VOID MINT, returned HERE rather than at the point of decision so it
+    # [registry #1309] THE VOID MINT, returned HERE rather than at the point of decision so it
     # inherits — not routes around — every gate between: the live human-owned hold, the unreadable
     # timeline, the human-owned terminal, an already-standing automatic re-admission, and the
     # AUTO_READMISSION_MAX flap cap immediately above. The void does not SPEND that cap (separate
@@ -2345,7 +2345,7 @@ def reclassify_legacy_park(comments, bot_login, stale_marker=None, log=print):
     return (cause, park_class, f"legacy prose classifies this park as {cause!r} ({park_class})")
 
 
-# --- [registry #1310] THE RECEIPT-LESS PARK CLASS, AND ITS ONE-SHOT VOID EXIT -----------------
+# --- [registry #1309] THE RECEIPT-LESS PARK CLASS, AND ITS ONE-SHOT VOID EXIT -----------------
 #
 # THE DEFECT. Every OTHER `review:parked` episode in this tree belongs to a class whose exit some
 # sweep owns: a capacity park exits on its own cause recovering (capacity_park_admission), an age
@@ -4129,7 +4129,7 @@ def _self_test():
            attempt(lambda: human_park_capacity_proof(
                (receipt("injection"), receipt("budget")))[0])], [False, False])
 
-    # ---- (e5) [registry #1310] THE RECEIPT-LESS PARK CLASS AND ITS ONE-SHOT VOID EXIT ---------
+    # ---- (e5) [registry #1309] THE RECEIPT-LESS PARK CLASS AND ITS ONE-SHOT VOID EXIT ---------
     #
     # THE POPULATION, measured on sparq-org/sparq 2026-07-29 over the paginated LIST endpoint (44
     # rows — not a round number, so not a cap — and every receipt count cross-checked against raw
@@ -4180,9 +4180,9 @@ def _self_test():
               and f"review:parked at {receiptless_park_at}" in line for line in logs), True)
     # FAIL CLOSED, and this is the row that keeps `User`-is-not-decisive honest in BOTH directions:
     # absent a POSITIVE machine signal the park keeps the human terminal it has today, with the
-    # pre-#1310 code and the pre-#1310 detail string, byte for byte.
+    # pre-#1309 code and the pre-#1309 detail string, byte for byte.
     unproven_census = []
-    check("(e5) FAIL CLOSED: with NO self-ID the answer is the pre-#1310 refusal, byte for byte",
+    check("(e5) FAIL CLOSED: with NO self-ID the answer is the pre-#1309 refusal, byte for byte",
           void_admit(self_id_rows=(), auto_evidence=post_park_evidence, census=unproven_census),
           (None, None, "a human applied the machine soft hold, but no bot park-reason receipt "
                        "exists, so nothing ever classified this park as capacity — a human "

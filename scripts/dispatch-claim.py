@@ -5588,12 +5588,12 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
                 # reconcile-park-misescalation.py is hand-run under a maintainer token and its
                 # markers are authored by that maintainer, not by the App.
                 attestations=_park_policy.reconcile_attestations(comments),
-                # [registry #1310] THE RECEIPT-LESS VOID EXIT's inputs, all four from the SAME
+                # [registry #1309] THE RECEIPT-LESS VOID EXIT's inputs, all four from the SAME
                 # comments page already read. `void_offered=True` marks THIS call as the minting
                 # one: the read-only CLAIM proof gate below omits it and can therefore only
                 # CONVERGE an already-receipted void, never grant one.
                 #
-                # Every one of these has a default that reproduces the pre-#1310 behaviour exactly,
+                # Every one of these has a default that reproduces the pre-#1309 behaviour exactly,
                 # which makes a forgotten argument SILENT rather than loud — so the wiring is
                 # AST-asserted in this file's own self-test. Three fixes on this repo were correct,
                 # tested and structurally unable to execute; one measured +17 locally and +0 in
@@ -6550,7 +6550,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                         # minting sweep must never disagree about whether a park is admissible.
                         reason_records=_park_policy.park_reason_records(comments, bot_login),
                         attestations=_park_policy.reconcile_attestations(comments),
-                        # [registry #1310] `void_offered` is deliberately NOT passed: this gate is
+                        # [registry #1309] `void_offered` is deliberately NOT passed: this gate is
                         # READ-ONLY and must never mint a void. What it DOES need is the
                         # convergence — a void the sweep has already receipted must be visible
                         # here, or the machine's own re-admission would be invisible to the gate
@@ -20914,9 +20914,9 @@ def _starvation_sweep_self_test():
     print("  ok   [G5] the sweep is WIRED to the census (AST-asserted: census= keyword + one "
           "emitter, immune to a comment that merely names it)")
 
-    # [registry #1310] THE RECEIPT-LESS VOID WIRING, on the PARSED TREE for the same measured reason
+    # [registry #1309] THE RECEIPT-LESS VOID WIRING, on the PARSED TREE for the same measured reason
     # as the census above. Every one of these four arguments has a default that reproduces the
-    # pre-#1310 behaviour EXACTLY, which is the right fail direction but makes a forgotten argument
+    # pre-#1309 behaviour EXACTLY, which is the right fail direction but makes a forgotten argument
     # SILENT: the sweep would keep passing its self-test, keep logging "park stands", and clear
     # nothing. That is precisely the shape of a fix measured at +17 locally and +0 in production.
     _void_kwargs = {"self_id_rows", "void_receipts", "void_marker_count", "void_offered"}
@@ -20952,7 +20952,7 @@ def _starvation_sweep_self_test():
                    and node.func.id in {"post_comment", "clear_labels"}]
     assert _void_calls[:2] == ["post_comment", "clear_labels"], \
         f"the void mint must be RECEIPT-FIRST (post_comment before clear_labels); got {_void_calls}"
-    print("  ok   [#1310] the receipt-less VOID is WIRED (AST-asserted: all four keywords, "
+    print("  ok   [#1309] the receipt-less VOID is WIRED (AST-asserted: all four keywords, "
           "void_offered=True as a LITERAL, and the mint is receipt-first)")
 
     # RECEIPT-FIRST: a crash between the two leaves an explained PR with no label, never a
