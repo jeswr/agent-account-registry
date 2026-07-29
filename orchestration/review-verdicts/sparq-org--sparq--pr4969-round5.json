@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4969,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5b12d8c5edfce8caeb50e5634a46fe77704c5d2b",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 5 finds no correctness, soundness, test-validity, or security defect. The documentation consistently keeps sparq-lws-core experimental, unpublished, default-ephemeral, and distinct from the production TypeScript server. Security-sensitive statements are appropriately bounded: the identity-host design preserves the unconditional LDP refusal for the reserved namespace; the public-read shortcut excludes credential- and DPoP-bearing requests; existence non-disclosure retains its explicit residual WAC caveat; and the verified-token cache description states that fresh DPoP proofs are reverified while cached token validation remains expiry- and freshness-bounded. The design record clearly labels reconstructed rationale and unavailable upstream material instead of presenting either as verified history. Findings remain empty as in round 4, so progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
