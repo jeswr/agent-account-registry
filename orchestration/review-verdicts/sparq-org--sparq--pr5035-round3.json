@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5035,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5f797cf5f703455d84fa2b45ad0688a7bb041c5e",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2's major finding is resolved. `result_vars` now compares the two result-header variable sets before window classification or row/value comparison and returns a mismatch naming the one-sided variables. The new `a_header_only_projection_difference_is_a_mismatch` mutation regression keeps row maps identical while dropping projected-but-unbound `?o` from one header, exercises multiset, ordered, and windowed paths in both operand directions, and requires each to fail with the header-specific diagnostic. The existing window-totality regression continues to show that agreed headers, rather than sliced bound pairs, drive total-order classification. No new correctness, soundness, test-validity, or security defect is evident in the round-3 diff.",
+  "verdict": "approve"
+ }
+}
