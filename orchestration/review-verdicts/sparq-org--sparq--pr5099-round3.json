@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 5099,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2c3a98083c4a74041f6d24f9cf6fd1762557f965",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "renderIri angle-brackets any text that is neither absolute nor a prefixed name, while validateModel checks only empty predicates and unknown prefixes. For example, a custom predicate `bad predicate` becomes `<bad predicate>`, which is not a valid SPARQL IRIREF, yet buildQuery reports runnable=true. This contradicts the new guarantee that invalid generated SPARQL is visible but cannot run.",
+    "file": "gui/app/src/lib/query-builder.ts",
+    "fix_hint": "Validate every class, attribute predicate, edge predicate/alternative, and IRI-valued filter as either a valid absolute IRI/IRIREF, `a` where allowed, or a supported prefixed name. Treat malformed terms as errors. Add a buildQuery test using whitespace or another forbidden IRIREF character and assert runnable=false.",
+    "severity": "major",
+    "title": "Malformed IRI text is serialized into invalid but runnable SPARQL"
+   },
+   {
+    "body": "renderValue maps every boolean string other than case-insensitive `true` to `false`; the test explicitly expects `no` to become `false`. Thus a filter whose visible value is `no` runs with a different value than the user entered, violating the no-hidden-rewriting claim instead of reporting invalid input.",
+    "file": "gui/app/src/lib/query-builder.ts",
+    "fix_hint": "Accept only the SPARQL boolean lexical forms the UI intends to support (at minimum true/false, case-insensitively if documented), add a validation error for anything else, and preserve best-effort text without silently substituting false. Change the `no` test to assert buildQuery is non-runnable.",
+    "severity": "major",
+    "title": "Invalid boolean input is silently changed to false"
+   },
+   {
+    "body": "validateModel never verifies that groupBy entries are valid variables currently bound by a non-negated node/attribute. The UI stores groupBy names as strings and node/attribute rename or deletion does not update them. Without aggregates, the stale GROUP BY produces only a warning, so renaming grouped `?person` to `?human` can serialize `SELECT ?human ... GROUP BY ?person` and remain runnable, changing result cardinality relative to the canvas.",
+    "file": "gui/app/src/lib/query-builder.ts",
+    "fix_hint": "Validate every GROUP BY entry against currently in-scope bound variables and make stale/invalid entries errors (or normalize result-shape references atomically on rename/delete). Add a real state-transition-style unit test that groups a variable, renames or removes its owner, and asserts buildQuery.runnable is false until the stale grouping is repaired.",
+    "severity": "major",
+    "title": "Stale GROUP BY variables can remain runnable after model edits"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 fixes all three prior major findings: OPTIONAL target patterns are now scoped inside the OPTIONAL, projection ownership includes attributes of negated nodes, and unknown prefixes block execution. However, the review is regressing under the required scale because three new major correctness findings remain. Arbitrary malformed IRI text can still produce invalid runnable SPARQL; boolean input is silently rewritten to false; and GROUP BY state is not validated against current model variables, so routine rename/delete operations can leave a runnable query whose grouping no longer represents the canvas.",
+  "verdict": "request_changes"
+ }
+}
