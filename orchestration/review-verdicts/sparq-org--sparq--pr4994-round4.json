@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4994,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1c132a91338695201b6c465d099142f8be1930a4",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`migration_owned` still represents provenance as a set of bd-ids and requires exactly one marker-bearing issue for an id. If a legitimate pre-label issue is authenticated by its migration title and write-author contract, an unprivileged attacker can add a second issue with the same marker. `migration_owned` then omits the id, and `_marker_index` authenticates neither issue, causing `missing_issues` and a failed `--verify`. The added decoy-beside-real test is not a regression test for this path because `full` gives the legitimate issue `MIGRATION_LABEL`, independently authenticating it.",
+    "file": "scripts/bd-to-issues.py",
+    "fix_hint": "Represent migration-owned provenance at issue granularity, such as authenticated `(bd-id, issue-number)` pairs, and have `_marker_index` authenticate only that exact legacy issue. Add a focused test containing an unlabeled, non-checkpointed issue with the valid migration title/write-author provenance plus an unprivileged duplicate marker; verification must remain clean while reporting only the duplicate under `unauthenticated_markers`.",
+    "severity": "major",
+    "title": "A decoy still invalidates legitimate pre-label migration-owned provenance"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is stagnant: the round-3 provenance-granularity defect remains unchanged. `migration_owned` still returns only bd-ids and rejects an id whenever any second marker-bearing issue exists, while `_marker_index` authenticates legacy issues via `bid in owned`. An unprivileged duplicate marker therefore removes the legitimate pre-label issue's only authentication channel and makes an otherwise correct migration fail verification. The new tests still cover a decoy beside a label-authenticated issue, not a legitimate unlabeled migration-owned issue beside a decoy.",
+  "verdict": "request_changes"
+ }
+}
