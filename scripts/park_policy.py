@@ -1236,6 +1236,13 @@ PARK_REFUSAL_FOREIGN_EPISODE = "foreign-episode"    # another mechanism's cause-
 # separate on purpose (see RECEIPTLESS_VOID_MAX) and an operator who sees this code needs to know
 # WHICH budget is gone.
 PARK_REFUSAL_RECEIPTLESS_SPENT = "receiptless-spent"
+# [registry #1309, review round 1 finding B1] The void is EARNED but cannot be WRITTEN cleanly: the
+# PR's `review:*` namespace is ambiguous independently of the park, so no strip leaves a determinate
+# state (see receiptless_void_label_plan). HUMAN-TERMINAL, and honestly so — nothing in this tree
+# de-ambiguates a split review namespace, and worker-pr's issue-#138 rule resolves one toward the
+# human terminal, so a later tick cannot clear this. Its own code because the remedy is specific and
+# small: a human picks the one review state that PR should be in.
+PARK_REFUSAL_RECEIPTLESS_AMBIGUOUS = "receiptless-ambiguous"
 
 # Which refusals a later tick can clear WITHOUT a human. The split is the whole point of the
 # taxonomy, so it is data, not a predicate scattered across callers.
@@ -1254,7 +1261,7 @@ PARK_REFUSAL_RECEIPTLESS_SPENT = "receiptless-spent"
 PARK_REFUSAL_HUMAN_TERMINAL = frozenset({
     PARK_REFUSAL_HUMAN_HOLD, PARK_REFUSAL_HUMAN_APPLIED, PARK_REFUSAL_CAP,
     PARK_REFUSAL_HUMAN_APPLIED_UNCLASSIFIED, PARK_REFUSAL_HUMAN_APPLIED_UNBOUND,
-    PARK_REFUSAL_RECEIPTLESS_SPENT,
+    PARK_REFUSAL_RECEIPTLESS_SPENT, PARK_REFUSAL_RECEIPTLESS_AMBIGUOUS,
 })
 PARK_REFUSAL_CODES = frozenset({
     PARK_REFUSAL_HUMAN_HOLD, PARK_REFUSAL_HUMAN_APPLIED, PARK_REFUSAL_CAP,
@@ -1264,6 +1271,7 @@ PARK_REFUSAL_CODES = frozenset({
     PARK_REFUSAL_EVIDENCE_STALE, PARK_REFUSAL_NOT_OFFERED,
     PARK_REFUSAL_READ_FAILED, PARK_REFUSAL_TICK_DEFERRED,
     PARK_REFUSAL_FOREIGN_EPISODE, PARK_REFUSAL_RECEIPTLESS_SPENT,
+    PARK_REFUSAL_RECEIPTLESS_AMBIGUOUS,
 })
 
 # The ADMITTING actions and the human-gesture action are not refusals; they are recorded in
@@ -1406,7 +1414,9 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
 
     `self_id_rows` (self_identified_machine_comments), `void_receipts`
     (receiptless_void_records — [{"key", "at"}]), `void_marker_count`
-    (receiptless_void_marker_count, defaulting to len(void_receipts)) and `void_offered` are the
+    (receiptless_void_marker_count, defaulting to len(void_receipts)), `void_offered`, and
+    `pr_review_labels` (the PR's OWN live label set, from which receiptless_void_label_plan takes
+    the `review:` namespace) are the
     RECEIPT-LESS VOID exit's inputs. Their defaults are the pre-#1309 behaviour EXACTLY: with no
     self-ID rows the provenance proof fails closed and a receipt-less human-applied park refuses
     with the same code and the same detail string it refused with before, and with
@@ -1534,6 +1544,13 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
                 # genuinely be a human's, so it keeps the human terminal it has today.
                 return _answer(None, None, PARK_REFUSAL_HUMAN_APPLIED_UNCLASSIFIED,
                                f"a human applied the machine soft hold, but {why}")
+            # [B1] WHAT THE VOID WOULD WRITE, decided BEFORE the budget is spent. A void that
+            # cannot be written deterministically must never be minted: burning the one-shot exit
+            # to move a PR into a stricter hold is worse than leaving it parked.
+            void_plan, plan_detail = receiptless_void_label_plan(pr_review_labels)
+            if void_plan is None:
+                return _answer(None, None, PARK_REFUSAL_RECEIPTLESS_AMBIGUOUS,
+                               f"the void is earned but cannot be written cleanly: {plan_detail}")
             if not void_offered:
                 # A read-only proof gate evaluated a mintable state without being asked to mint.
                 # EXIT-REACHABLE, and truthfully so: the minting sweep clears it on a later tick.
@@ -2510,6 +2527,85 @@ def machine_operated_park_proof(self_id_rows, parked_at, previous_parked_at, par
     return (False, ("no SPARQ-agent self-identification by the actor that applied this park sits "
                     f"within {window_seconds}s of it — a User-applied hold is NOT assumed to be "
                     "machine-made, so the park stands"), None)
+
+
+# --- [registry #1309, review round 1 finding B1] WHAT THE VOID IS ALLOWED TO WRITE -------------
+#
+# THE DEFECT THIS CLOSES, and it was worse than the one the void exists to fix. The first cut
+# cleared the park through the SAME `clear_labels` the capacity path uses — `worker-pr review-state
+# set --state needs`. But set_review_state's issue-#138 ambiguity rule CONVERGES to the HUMAN-owned
+# `review:needs-user` whenever MORE THAN ONE `review:*` label is live, and a hand-applied
+# `review:parked` was added ALONGSIDE the PR's existing review state rather than replacing it.
+#
+# Measured against the live label sets of the 8 candidate PRs: 5 of them (#3641 #4207 #4212 #4222
+# #4318) carry >=2 live `review:*` labels, so the void would have converged them to
+# `review:needs-user` — a hold `human_owned_holds` refuses forever and issue #138 blocks every
+# automated transition away from — WITH THE ONE-SHOT VOID ALREADY SPENT. That is not "frees
+# nothing"; it is actively worse than doing nothing, because it burns the only exit these PRs have
+# in order to move them into a STRICTER hold. Every self-test stubbed the label writer, so nothing
+# could have caught it.
+#
+# THE FIX IS TO WRITE LESS, NOT MORE. The true inverse of a hand-applied park is to REMOVE THAT ONE
+# LABEL and touch nothing else — which restores the exact review state the PR was in before the
+# park (`review:changes` for four of them; the fix lane, which is where they were). Forcing
+# `review:needs` instead would ERASE a real `review:changes` and re-run a review where a fix was
+# owed, i.e. it would assert a destination the machine has no basis for. So:
+#
+#   - residual namespace EMPTY  -> strip the park AND stamp `review:needs`, which is unambiguous by
+#     construction (a single write into an empty namespace cannot trip the ambiguity rule);
+#   - residual namespace exactly ONE label -> strip the park ONLY; the PR is back in its pre-park
+#     state and no state was invented;
+#   - residual namespace TWO OR MORE -> REFUSE. The ambiguity exists independently of the park
+#     (#3641 carries review:needs AND review:changes), so no strip can leave a clean state and
+#     anything written would eventually converge to the human terminal anyway. It is censused as its
+#     own human-terminal code rather than swept into a generic refusal.
+RECEIPTLESS_VOID_PLAN_STRIP = "strip-only"
+RECEIPTLESS_VOID_PLAN_STRIP_AND_NEEDS = "strip-and-needs"
+RECEIPTLESS_VOID_PLANS = (RECEIPTLESS_VOID_PLAN_STRIP, RECEIPTLESS_VOID_PLAN_STRIP_AND_NEEDS)
+
+
+def receiptless_void_label_plan(pr_review_labels):
+    """(plan, detail) — the ONLY label write a receipt-less void may perform, or (None, why) when
+    it cannot be performed deterministically. Every ambiguity refuses.
+
+    THE REVIEW NAMESPACE IS TAKEN BY PREFIX (`review:`), deliberately NOT by intersecting a closed
+    label list. worker-pr's `_live_review_labels` intersects with its own `REVIEW_LABELS`, so a
+    `review:something-new` it does not know about is invisible to it but VISIBLE here. That
+    disagreement is one-directional and it is the safe direction: this predicate counts MORE labels,
+    so it refuses MORE often. A closed list copied here could silently disagree with the writer's,
+    which is the one direction that would let an ambiguous namespace through.
+
+    ONE SPELLING, TWO READERS: capacity_park_admission consults this before spending the one-shot
+    budget, and worker-pr's `void_receiptless_park` re-derives it from a FRESH read immediately
+    before writing. Both call THIS function — a hand-copied second rule at the writer is exactly how
+    the gate and the write come to disagree about what is deterministic."""
+    if isinstance(pr_review_labels, str) or not isinstance(
+            pr_review_labels, (set, frozenset, list, tuple)):
+        return None, "the live PR label set is unreadable, so no write can be proven deterministic"
+    if any(not isinstance(name, str) for name in pr_review_labels):
+        return None, "the live PR label set is malformed, so no write can be proven deterministic"
+    review = {name for name in pr_review_labels if name.startswith("review:")}
+    if MACHINE_PARK_PR_LABEL not in review:
+        return None, (f"no live {MACHINE_PARK_PR_LABEL} to strip — this void has no subject on the "
+                      "PR surface")
+    if HUMAN_PR_PARK_LABEL in review:
+        # Belt and braces: human_owned_holds already refuses this upstream. A second, independent
+        # refusal here means the WRITER cannot be talked into erasing a human terminal even if it is
+        # ever called from somewhere that skipped that gate.
+        return None, (f"{HUMAN_PR_PARK_LABEL} is live — a human terminal is never cleared by a "
+                      "machine void")
+    residual = sorted(review - {MACHINE_PARK_PR_LABEL})
+    if not residual:
+        return RECEIPTLESS_VOID_PLAN_STRIP_AND_NEEDS, (
+            f"the park is the ONLY live review:* label, so stripping it and stamping "
+            f"review:needs is unambiguous by construction")
+    if len(residual) == 1:
+        return RECEIPTLESS_VOID_PLAN_STRIP, (
+            f"stripping the park alone restores this PR's pre-park review state ({residual[0]}); "
+            "no review state is invented")
+    return None, (f"the review:* namespace is ambiguous independently of the park ({'/'.join(residual)}"
+                  ") — no strip can leave a clean state, and any stamp would converge to the human "
+                  "terminal (worker-pr issue #138)")
 
 
 def receiptless_void_key(parked_at):

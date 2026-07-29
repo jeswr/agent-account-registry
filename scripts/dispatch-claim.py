@@ -5340,7 +5340,7 @@ def _migrate_legacy_park(repo, number, issue_number, comments, labels, bot_login
 def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_login, script_dir,
                             worker_pr, evidence_probe, comments_fn=None, timeline_fn=None,
                             post_comment=None, clear_labels=None, log=print,
-                            migration_provable=False, convert_labels=None, *,
+                            migration_provable=False, convert_labels=None, void_labels=None, *,
                             enrolled_authors):
     """AUTOMATIC re-admission of MACHINE capacity parks whose starvation cause has demonstrably
     cleared (registry #614) — the sweep that closes the structural stall: a MACHINE-owned park
@@ -5405,6 +5405,26 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
                 _run_target_helper(script_dir, repo, "worker-issue.py", [
                     "status", "--repo", repo, "--issue", str(issue_number),
                     "--status", "parked"])
+    if void_labels is None:
+        def void_labels(pr_number, issue_number, plan):
+            # [registry #1309, review round 1 finding B1] The VOID's label write is NOT
+            # `clear_labels`. That helper transitions through worker-pr's `review-state set --state
+            # needs`, whose issue-#138 ambiguity rule CONVERGES a split `review:*` namespace to the
+            # HUMAN-owned `review:needs-user` — and a hand-applied park sits ALONGSIDE the PR's
+            # existing review state, so the namespace is routinely split (5 of the 8 live
+            # candidates). Voiding through it would have burned each PR's one-shot exit to move it
+            # into a STRICTER hold: worse than doing nothing.
+            #
+            # `void_receiptless_park` removes THAT ONE LABEL and re-derives the plan from a FRESH
+            # read via the same park_policy predicate the admission used; it exits non-zero rather
+            # than improvising if the plan moved, and this sweep reports that as a NON-event.
+            _run_target_helper(script_dir, repo, "worker-pr.py", [
+                "review-state", "void-receiptless", "--repo", repo, "--pr", str(pr_number),
+                "--expect-plan", str(plan)])
+            if issue_number:
+                _run_target_helper(script_dir, repo, "worker-issue.py", [
+                    "status", "--repo", repo, "--issue", str(issue_number),
+                    "--status", "readmitted"])
     if clear_labels is None:
         def clear_labels(pr_number, issue_number):
             # The SAME label writes a human readmission gesture triggers on the CLAIM path:
@@ -5601,28 +5621,48 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
                 self_id_rows=_park_policy.self_identified_machine_comments(comments),
                 void_receipts=_park_policy.receiptless_void_records(comments, bot_login, log=log),
                 void_marker_count=_park_policy.receiptless_void_marker_count(comments, bot_login),
-                void_offered=True)
-            if action == "void-mint":
-                # RECEIPT FIRST, then the labels — the ordering every park writer here uses, and it
-                # matters more for a ONE-SHOT exit than for a capped one: dying after the receipt is
-                # converged by the "void-receipt" branch on a later tick, whereas dying after the
-                # label would spend the only void this PR will ever get and leave no public record
-                # of why the park was cleared.
-                # The one clock read on this path. `capacity_park_admission` is deliberately
-                # clock-free — every other instant it reasons about is read from GitHub — so the
-                # GRANT instant is stamped here, in the same UTC idiom the rest of this file uses.
-                post_comment(repo, number, _park_policy.receiptless_void_comment(
-                    evidence, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    pr_number=number))
-                clear_labels(number, issue_number)
+                void_offered=True,
+                # [#1309 B1] The PR's OWN live label set. receiptless_void_label_plan takes the
+                # `review:` namespace from it and REFUSES a void whose label write could not be
+                # deterministic — which is what stops the one-shot exit being spent to move a PR
+                # into a stricter hold. `labels` is the live set this sweep already read.
+                pr_review_labels=sorted(labels))
+            if action in ("void-mint", "void-receipt"):
+                if action == "void-mint":
+                    # RECEIPT FIRST, then the labels — the ordering every park writer here uses,
+                    # and it matters more for a ONE-SHOT exit than for a capped one: dying after
+                    # the receipt is converged by the "void-receipt" branch on a later tick,
+                    # whereas dying after the label would spend the only void this PR will ever get
+                    # and leave no public record of why the park was cleared.
+                    # The one clock read on this path. `capacity_park_admission` is deliberately
+                    # clock-free — every other instant it reasons about is read from GitHub — so
+                    # the GRANT instant is stamped here, in the same UTC idiom this file uses.
+                    post_comment(repo, number, _park_policy.receiptless_void_comment(
+                        evidence, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        pr_number=number))
+                # [#1309 B1] The write is REPORTED, never assumed. void_receiptless_park exits
+                # non-zero when the live plan is no longer deterministic, and a refusal must NOT
+                # count as a re-admission: a census that counts intent rather than effect is how it
+                # comes to read healthy over an untouched population. Its own inner try, so the
+                # per-PR handler above cannot file this as an unreadable PR.
+                try:
+                    void_labels(number, issue_number, evidence.get("plan"))
+                except (DispatchError, worker_pr.WorkerPrError) as void_exc:
+                    log(f"::warning::void-receiptless {repo}#{number}: the receipt stands but the "
+                        f"label write did NOT land ({void_exc}); the park is UNCHANGED and this is "
+                        "not counted as a re-admission — the void receipt converges the write on a "
+                        "later tick")
+                    _park_policy.park_census_record(
+                        park_census, repo, number,
+                        _park_policy.PARK_REFUSAL_RECEIPTLESS_AMBIGUOUS,
+                        f"the void label write did not land ({void_exc})")
+                    continue
                 readmitted += 1
-                log(f"void-receiptless {repo}#{number}: a receipt-less machine park was voided for "
-                    f"want of a receipt — {detail}")
-            elif action == "void-receipt":
-                clear_labels(number, issue_number)
-                readmitted += 1
-                log(f"void-receiptless {repo}#{number}: converging an already-receipted "
-                    f"receipt-less void — {detail}")
+                log(f"void-receiptless {repo}#{number}: "
+                    + ("a receipt-less machine park was voided for want of a receipt"
+                       if action == "void-mint"
+                       else "converging an already-receipted receipt-less void")
+                    + f" (plan={evidence.get('plan')!r}) — {detail}")
             elif action == "auto-mint":
                 # RECEIPT FIRST, then the labels (see the docstring).
                 post_comment(repo, number, worker_pr.auto_readmission_receipt(
@@ -6561,7 +6601,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                         void_receipts=_park_policy.receiptless_void_records(
                             comments, bot_login),
                         void_marker_count=_park_policy.receiptless_void_marker_count(
-                            comments, bot_login))
+                            comments, bot_login),
+                        pr_review_labels=sorted(labels))
                 if not park_action:
                     print(f"defer review {repo}#{number}: machine capacity park stands "
                           f"(durable receipts/label; {park_detail})")
