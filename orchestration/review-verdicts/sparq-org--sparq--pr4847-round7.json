@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4847,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bc24dbaab4865d89a21ea87de1a98a36c4c58a71",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 7 finds no correctness, soundness, test-validity, or security defect. The diagnostic remains confined to the failed-parse path, preserves and returns the rejected SPARQL byte-for-byte, and cannot affect execution. The bounded hint count and candidate count, deterministic edit-distance ranking, lexical-context skipping, deduplication, and keyword-table drift guard are coherent with the documented behavior. The public error-contract tests exercise the real canary path, verify non-application, cover failures without hints, and reproduce the Unicode/escaped/dotted prefixed-name regressions from earlier rounds. Documentation accurately frames the feature as an unmeasured, optional diagnostic rather than a repair or efficacy claim. With round 6 also having no findings, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
