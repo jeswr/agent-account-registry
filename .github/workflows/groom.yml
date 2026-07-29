@@ -183,12 +183,83 @@ jobs:
           permission-issues: write
           permission-pull-requests: write
 
+      # [OPUS-5] PER-OWNER MINT-OUTCOME MARKER (issue #269). The two mints above are
+      # continue-on-error and that is right — one owner's credential gap must never abort the sweep
+      # before dead leases are released. But it also means a PERMANENT gap (the App install removed
+      # from an owner, its key rotated out, a policy repo the install does not grant) presents as a
+      # GREEN tick forever, while groom.py defers that owner's ENTIRE issue/PR repair on every one
+      # of them and says so only in a log line nobody reads. These two steps are the only cross-run
+      # record of that; the `mint-gap` watchdog job below reads the artifact NAMES — never their
+      # contents, so no download and no token — and pages once an owner has been skipped on
+      # SKIP_STREAK_THRESHOLD consecutive ticks.
+      #
+      # THE NAME IS THE WHOLE SIGNAL, and its grammar is asserted from BOTH sides
+      # (scripts/groom-mint-alert.py's TICK_MARKER_PREFIX/MARKER_OK/MARKER_SKIP against this very
+      # step, by its --self-test):
+      #     groom-mint-tick ( .ok-<owner> | .skip-<owner> )*
+      # A GitHub login is [A-Za-z0-9-]+, so `.` cannot occur inside one and separates
+      # unambiguously. Recording the `.ok-` side too is what makes RECOVERY observable: an owner
+      # that mints again — or that this workflow stops minting for at all — stops appearing in any
+      # skip set, which is the close signal. Owner logins are not secret: policy/repos.toml is
+      # public, the resolve step above already tees them into this log, and groom.py prints the
+      # same skip line. Nothing token-derived is readable here — the name keys on
+      # `steps.<mint>.outcome`, NEVER on `.outputs.token`.
+      #
+      # DELIBERATELY NO `if:`. The default success() guard IS the "this tick reached the mint
+      # stage" predicate: both mints are continue-on-error so they cannot suppress this step, while
+      # a failure in an earlier non-continue-on-error step (the ledger data-only invariant sweep,
+      # the per-owner repo resolve) does — and a tick that never attempted a mint is not evidence
+      # of a mint gap. `if: always()` here would turn every ledger-invariant failure into a false
+      # "both owners skipped" tick. continue-on-error, though, is on BOTH steps and matters as
+      # much: this is an observability aid standing in front of the only crash-recovery path in
+      # the system, and it must never be the reason dead leases go unreleased.
+      - name: Name this tick's per-owner mint-outcome marker
+        id: mint-marker
+        continue-on-error: true
+        env:
+          SPARQ_MINT_OUTCOME: ${{ steps.target-token-sparq.outcome }}
+          JESWR_MINT_OUTCOME: ${{ steps.target-token-jeswr.outcome }}
+        run: |
+          set -euo pipefail
+          name=groom-mint-tick
+          for entry in "sparq-org=${SPARQ_MINT_OUTCOME:-}" "jeswr=${JESWR_MINT_OUTCOME:-}"; do
+            owner="${entry%%=*}"
+            outcome="${entry#*=}"
+            if [[ "$outcome" == "success" ]]; then
+              name="$name.ok-$owner"
+            else
+              name="$name.skip-$owner"
+            fi
+          done
+          echo "name=$name" | tee -a "$GITHUB_OUTPUT"
+
+          date -u +%Y-%m-%dT%H:%M:%SZ > "$RUNNER_TEMP/groom-mint-tick.txt"
+
+      # The `if:` guard is the one case the naming step cannot cover: if IT failed (it is
+      # continue-on-error), the name is empty and an unnamed upload would fail noisily for no
+      # signal. A tick with no marker is simply not counted — the watchdog reads a missing tick as
+      # absent evidence, never as a skipped owner, so a dropped marker delays a page and can never
+      # fabricate one.
+      - name: Upload this tick's mint-outcome marker (pinned)
+        id: mint-marker-upload
+        if: ${{ steps.mint-marker.outputs.name != '' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.mint-marker.outputs.name }}
+          path: ${{ runner.temp }}/groom-mint-tick.txt
+          if-no-files-found: error
+          # One day is ~96 ticks at this cron — far more history than the streak threshold can
+          # consume, and the self-test asserts that relationship rather than trusting the number.
+          retention-days: 1
+
       # The {owner: token} JSON map is assembled INSIDE this step from the mint outputs (review
       # round 1): the assembled secret map never transits GITHUB_OUTPUT, and a mint that reported
       # success without delivering a token fails LOUD here instead of silently deferring every
       # target repair on every run. Failed/skipped mints stay absent from the map — that owner's
       # grooming defers loudly inside groom.py, never a wrong-owner token.
       - name: Sweep dead leases, stale issues, exhausted attempts, and stale PRs
+        id: sweep
         env:
           REGISTRY_GH_TOKEN: ${{ github.token }}
           # Per-owner target App tokens (issue #168): groom.py resolves the token for each target
@@ -528,6 +599,96 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           MAINTAINER_HANDLE: jeswr
         run: python3 registry/scripts/ci-latency-alert.py
+
+  # [OPUS-5] WATCH THE CREDENTIALS (issue #269). A DEFER THAT NEVER ENDS IS AN OUTAGE WEARING A
+  # GREEN CHECK. The issue #168 fix made each per-owner target-token mint continue-on-error, so a
+  # missing install on one owner only defers that owner's issue/PR repair — correct, fail-closed,
+  # and completely invisible: the job succeeds, every step is green, and the only evidence is
+  # groom.py's `skip target grooming for <owner>/<repo>` log line. `groom-alert` cannot see it (it
+  # keys on the groom job RESULT, which is `success`), so a removed install would stop the registry
+  # self-grooming half its target surface indefinitely with nothing to page on.
+  #
+  # This job closes that hole with the same posture dispatch-stall uses one job above: alarm on the
+  # CONDITION, not on the run. It reads ONE artifacts listing, derives a per-owner consecutive-skip
+  # streak from the marker NAMES the `groom` job uploads (no download, no token, no secret), and
+  # upserts one rolling `ops-alert` per owner past the threshold, auto-closing on the first tick
+  # that mints again.
+  #
+  # NO `needs:` and NO `if:`, on purpose and asserted by scripts/groom-mint-alert.py's self-test —
+  # a watchdog suppressed by the failure of the sweep it shares a workflow file with is not a
+  # watchdog. The stated cost of that choice: this job runs CONCURRENTLY with `groom`, so the
+  # current tick's marker may not be uploaded yet and detection can lag by one tick (~15 min
+  # against a credential gap that no longer recovers on its own). It holds contents:read +
+  # actions:read + issues:write — no arming, no merging, no label writes of any kind.
+  mint-gap:
+    name: WATCHDOG (can groom still mint a target token for every owner?)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # SECRET-EXFIL GUARD (issue #101): reads ALERT_TOKEN/ALERT_REPO, so it is bound to the
+    # default-branch-only `dispatch-secrets` environment where those secrets live, exactly like
+    # `groom`, `groom-alert`, `metrics-stale`, `dispatch-stall` and `ci-latency`.
+    environment: dispatch-secrets
+    # Repair authority, never admission authority. Pinned by the self-test.
+    permissions:
+      actions: read   # list this repo's artifacts (the only signal)
+      contents: read  # the sparse checkout below
+      issues: write   # upsert/close the rolling per-owner ops-alert issues
+    steps:
+      # KEEP THIS LIST IN SYNC — REQUIRED_FILES in scripts/groom-mint-alert.py is asserted against
+      # this very block, in both directions, so a trimmed checkout reds instead of making the
+      # YAML-seam assertions silently unreachable on the live path. groom.yml is an INPUT, not
+      # incidental: the artifact-name grammar and the streak threshold are both contracts against
+      # it, and the self-test reds if either side drifts.
+      - name: Check out ONLY the watchdog's inputs (pinned, sparse, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/groom-mint-alert.py
+            .github/workflows/groom.yml
+          sparse-checkout-cone-mode: false
+
+      # PyYAML backs the workflow-parse assertions (regex-over-YAML is how five permissive
+      # misparses got into the secrets guard). Probe first so the runner image's own copy is used
+      # when present; the install path is version + sha256 locked to the identical pins pr-gate,
+      # dispatch-stall and ci-latency use.
+      - name: Ensure PyYAML for the watchdog's workflow-parse assertions
+        run: |
+          set -euo pipefail
+          if python3 -c 'import yaml' 2>/dev/null; then
+            echo "PyYAML already present; no install needed"
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/mint-gap-requirements.txt" <<'REQ'
+          pyyaml==6.0.2 \
+              --hash=sha256:80bab7bfc629882493af4aa31a4cfa43a4c57c83813253626916b8c7ada83476 \
+              --hash=sha256:1f71ea527786de97d1a0cc0eacd1defc0985dcf6b3f17bb77dcfc8c34bec4dc5
+          REQ
+          python3 -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary=:all: -r "$RUNNER_TEMP/mint-gap-requirements.txt"
+          python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
+
+      # A detector is never trusted to watch anything before it has proved itself on this tick's
+      # code, so the self-test runs FIRST and is NOT continue-on-error.
+      - name: Self-test the mint-gap watchdog (hermetic fixtures)
+        run: python3 registry/scripts/groom-mint-alert.py --self-test
+
+      - name: Alert maintainer if an owner's target-token mint keeps failing
+        id: mint-gap
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MAINTAINER_HANDLE: jeswr
+          # Privacy routing (locked decision 22c, issue #39). The body carries only an OWNER LOGIN
+          # (public in policy/repos.toml and already in this run log), two counts and two run links
+          # — no provider account handle, no ledger content, no byte of any remote payload — so the
+          # registry-repo fallback is safe.
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+        run: python3 registry/scripts/groom-mint-alert.py
 
   groom-alert:
     name: ALERT (hard GROOM-job failure)
