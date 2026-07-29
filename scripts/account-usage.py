@@ -25,7 +25,9 @@
 # Claude-Code-shaped fable probe whose 7d_oi headroom gates fable-model routing specifically. If that probe
 # is rejected or returns no 7d_oi headers, the account is fail-closed for FABLE only (its 5h/7d base signal
 # from the haiku probe still governs non-fable routing).
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -400,6 +402,15 @@ def _usable_secret_refs(secrets):
 # --- tier-limit persistence (capacity model, 2026-07-17 measurement) ------------------------------
 LIMIT_KEYS = ("5h_limit", "7d_limit", "fable_7d_oi_limit")
 
+# The two diagnostics this lane emits, as named constants. They are the strings the self-test's
+# loudness rows assert against, and a message and its assertion that are two separate literals
+# drift apart in the permissive direction exactly once and then stay there.
+SCHEMA_REJECT_WARNING = "::warning::account-usage: account-record write rejected by schema guard"
+WRITE_FAILURE_WARNING = (
+    "::warning::account-usage: one or more tier-limit writes failed (gh error, or a concurrent "
+    "catalog edit landed inside the write window — the prior revision is recoverable from the "
+    "issue's edit history) — capacity model may be stale for those accounts")
+
 
 def _limits_line(entry):
     """The single `limits:` front-matter line for an account issue, or None when the probe exposed
@@ -499,7 +510,7 @@ def _persist_one(number, handle, line, registry_repo, run, schema_errors):
         # schema before `gh issue edit --body` can persist it. This catches both a malformed live
         # record and any corruption introduced by this merge. Keep the annotation handle-free.
         if schema_errors(handle, new_body):
-            print("::warning::account-usage: account-record write rejected by schema guard")
+            print(SCHEMA_REJECT_WARNING)
             return False
         edit = run(["gh", "issue", "edit", str(number), "-R", registry_repo, "--body", new_body],
                    capture_output=True, text=True, timeout=60, check=False)
@@ -548,8 +559,14 @@ def persist_limits(usage_path, run=None):
     if not isinstance(usage, dict):
         print("account-usage: usage snapshot is not a map; tier-limit persistence skipped")
         return 0
-    listing = run(["gh", "issue", "list", "-R", registry_repo, "--state", "open", "--limit", "500",
-                   "--json", "number,title"],
+    # [OPUS-5] Same page bound + same truncation posture as the catalog read this lane writes back
+    # to (select-and-claim.ACCOUNT_CATALOG_LIST_LIMIT, registry #1131). The bound is IMPORTED, not
+    # re-declared: two hand-maintained copies is exactly how one lane silently keeps reading a
+    # truncated catalog after the other is fixed. Account issues are the OLDEST open issues, so a
+    # filled page silently drops precisely the records this lane exists to update.
+    catalog_limit = account_catalog.ACCOUNT_CATALOG_LIST_LIMIT
+    listing = run(["gh", "issue", "list", "-R", registry_repo, "--state", "open",
+                   "--limit", str(catalog_limit), "--json", "number,title"],
                   capture_output=True, text=True, timeout=60, check=False)
     if listing.returncode != 0:
         # PROPAGATE (issue #198): the old code swallowed a failed catalog read and still printed
@@ -562,6 +579,12 @@ def persist_limits(usage_path, run=None):
         print("::warning::account-usage: account catalog read unparseable; tier-limit persistence "
               "skipped")
         return 1
+    if isinstance(issues, list) and len(issues) >= catalog_limit:
+        # A filled page cannot be proven complete; writing tier limits from a listing that may have
+        # dropped the oldest (= the account) records would silently skip exactly those accounts.
+        print("::warning::account-usage: account catalog listing filled its page bound and may be "
+              "TRUNCATED; refusing tier-limit writes")
+        return 1
     failures = 0
     for issue in issues:
         handle = str(issue.get("title", "")).strip()
@@ -573,10 +596,7 @@ def persist_limits(usage_path, run=None):
             failures += 1
     if failures:
         # No count (locked decision 22b) — only that at least one write did not land.
-        print("::warning::account-usage: one or more tier-limit writes failed (gh error, or a "
-              "concurrent catalog edit landed inside the write window — the prior revision is "
-              "recoverable from the issue's edit history) — capacity model may be stale for "
-              "those accounts")
+        print(WRITE_FAILURE_WARNING)
         return 1
     print("account-usage: tier-limit lines refreshed")
     return 0
@@ -610,6 +630,27 @@ def main():
     # legitimately needs no token, and refusing there would degrade a healthy steady state. Today the
     # catalog is anthropic-majority by construction, so this condition is always true in production;
     # it exists so the guard cannot become a false alarm if that ever changes.
+    # [OPUS-5] EMPTY-CATALOG GATE (2026-07-29 fleet outage, registry #1131). This MUST precede the
+    # materialization proof gate below, because that gate's population is `accounts` — over an EMPTY
+    # catalog `any(...)` is False, the proof is VACUOUS, the loop emits nothing, and this script
+    # exits 0 having "measured" a fleet of zero accounts. The workflow then records
+    # `outcome=ok detail=probe-succeeded` next to an empty snapshot, usage-alert's sidecar check
+    # reads MEASURED, and dispatch's `_load_usage` collapses `{}` to None -> every `require_usage`
+    # repo holds fail-closed. That is a TOTAL fleet stall wearing a green probe.
+    #
+    # A registry with zero readable account records is never a legitimate steady state for this
+    # probe: it is a catalog read that lost the fleet (truncated listing, parse boundary dropping
+    # every record, wrong repo). Exit NONZERO so the outcome sidecar says the measurement did NOT
+    # happen and usage-alert raises the wholesale banner WITH a cause. This does not change what
+    # dispatch does — it already holds — it stops the hold from being indistinguishable from a
+    # healthy tick. No counts, no handles (locked decision 22b).
+    if not accounts:
+        print("::error::account-usage: the account catalog read yielded NO account records — "
+              "refusing to emit a usage snapshot (an empty catalog is an unread fleet, never a "
+              "measured one with no capacity)", file=sys.stderr)
+        json.dump({}, sys.stdout)
+        return 1
+
     if any(not _is_exempt_provider(account.get("provider")) for account in accounts) \
             and not _usable_secret_refs(secrets):
         # No counts, no names (locked decision 22b) — the condition, not the fleet.
@@ -669,14 +710,113 @@ def main():
     return 0
 
 
-def _self_test():
+# --- [OPUS-5] SELF-TEST ANNOTATION CONTAINMENT ----------------------------------------------------
+# A `::warning::`/`::error::`/`::notice::` line on stdout or stderr is not a log line — it is a
+# GitHub workflow COMMAND, and the runner turns it into an annotation on the job. dispatch.yml runs
+# `account-usage.py --self-test` as a preflight INSIDE the live CLAIM job (dispatch.yml, the
+# usage-probe step), so every fixture that drives a diagnostic on purpose publishes that diagnostic
+# as a real annotation about the live fleet.
+#
+# THIS FILE ALREADY KNEW THE RULE and applied it per-site: `_load_backoffs_captured` captures the
+# malformed-ledger fixtures' stderr precisely so "a self-test run never emits a real workflow
+# annotation" (see the comment above it). The `persist_limits` fixtures below print to STDOUT and
+# were never covered, so the rule held on one stream and not the other.
+#
+# MEASURED on the live estate, 2026-07-29: a CLAIM job carried 16 annotations, of which 8 came from
+# this self-test — the single most frequent annotation on the job was the fixture-driven
+# "capacity model may be stale for those accounts", emitted on every executed dispatch tick while
+# the real `--persist-limits` step in the same job reported success. An operator (or an agent)
+# reading the job cannot tell that annotation from a live capacity-model outage, and one such
+# investigation was spent on it.
+#
+# The fix is NOT to silence the diagnostic: the live path still prints it, and the rows below now
+# ASSERT its loudness. The fix is to stop the FIXTURE from reaching the workflow's annotation
+# stream, and to make the containment an INVARIANT rather than a convention that the next writer
+# has to remember — `_run_self_test_contained` proxies both real streams and `_self_test` reds if
+# anything got through, so a future uncaptured fixture fails the gate instead of quietly rejoining
+# the noise.
+WORKFLOW_COMMAND_RE = re.compile(r"^::(?:error|warning|notice)::")
+
+
+def workflow_commands(text):
+    """PURE: the workflow-command LINES in a captured stream, in order. Line-anchored — a
+    `::warning::` quoted mid-line is prose, not a command the runner would act on."""
+    return [line for line in (text or "").splitlines() if WORKFLOW_COMMAND_RE.match(line)]
+
+
+class _AnnotationEscapeRecorder:
+    """Write-through text-stream proxy that RECORDS every workflow-command line reaching the real
+    stream.
+
+    Bytes are forwarded VERBATIM and the return value of the underlying `write` is preserved, so
+    installing this changes nothing an operator sees — a genuine escape stays readable in the log
+    (it is a real defect and hiding it would be the same mistake in the other direction). Only the
+    recording is new. Line assembly is buffered because `print` writes the text and the newline as
+    two separate calls, so a per-call match would never see a complete line.
+
+    Unknown attributes delegate to the wrapped stream, so `flush`/`fileno`/`isatty` and a
+    `subprocess(stdout=sys.stdout)` hand-off all behave exactly as before.
+    """
+
+    def __init__(self, stream, escaped):
+        self._stream = stream
+        self._escaped = escaped
+        self._residue = ""
+
+    def write(self, text):
+        written = self._stream.write(text)
+        self._residue += text
+        while "\n" in self._residue:
+            line, _, self._residue = self._residue.partition("\n")
+            if WORKFLOW_COMMAND_RE.match(line):
+                self._escaped.append(line)
+        return written
+
+    def __getattr__(self, name):
+        return getattr(self.__dict__["_stream"], name)
+
+
+def _run_self_test_contained():
+    """Run the self-test with both real streams proxied, and hand the escape list to `_self_test`.
+
+    `_self_test` REQUIRES the list (its containment row compares against `[]`, and the default
+    `None` can never equal it), so deleting this wiring reds the suite at runtime instead of
+    silently disarming the recorder — a source-level pin would be needed otherwise, because a
+    detector that is never installed records nothing and reds nothing.
+
+    The verdict itself is reported through `chk`'s ordinary vocabulary and the exit status, never
+    as a `::error::` — a containment failure that manufactured an annotation of its own would be
+    self-defeating.
+    """
+    escaped = []
+    saved_out, saved_err = sys.stdout, sys.stderr
+    sys.stdout = _AnnotationEscapeRecorder(saved_out, escaped)
+    sys.stderr = _AnnotationEscapeRecorder(saved_err, escaped)
+    try:
+        status = _self_test(escaped=escaped)
+    finally:
+        sys.stdout, sys.stderr = saved_out, saved_err
+    # Printed on the RESTORED stream, and carrying the status, so the verdict survives a proxy that
+    # stops forwarding: that mutant destroys the display channel every other row reports through,
+    # including its own, and would otherwise fail the suite with nothing on screen to read.
+    print("account-usage self-test containment:",
+          "clean" if not escaped else f"{len(escaped)} fixture annotation(s) ESCAPED",
+          f"(status {status})")
+    return status
+
+
+def _self_test(escaped=None):
     ok = True
 
     def chk(n, got, want):
         nonlocal ok
         good = got == want
         ok = ok and good
-        print(f"  {'ok  ' if good else 'FAIL'} {n}: {got} (want {want})")
+        # Continuation lines are INDENTED, losslessly. A row whose value carries a captured
+        # diagnostic would otherwise put `::warning::` at column 0 of a continuation line and the
+        # REPORT would emit the very annotation the fixture was captured to contain. (Found by the
+        # containment row below, on its first run — which is the row doing its job.)
+        print(f"  {'ok  ' if good else 'FAIL'} {n}: {got} (want {want})".replace("\n", "\n    "))
 
     # secret_ref allow-list: only worker-account token names are dereferenced (audit-2026-07-17)
     for ref, want in (("ACCT01_TOKEN", True), ("ACCT2CSS_TOKEN", True), ("ACCT99_TOKEN", True),
@@ -839,8 +979,6 @@ def _self_test():
     #   preservation path deleted. Only the ABSOLUTE ceiling can still evict, so that is the regime
     #   the guard is exercised in — and prune's ceiling ::warning:: is captured, exactly like the
     #   intentional failures below, so a self-test run never emits a real workflow annotation.
-    import contextlib
-    import io
     flood_hit = dict(ledger_record, reset_hint="in 5 hours")
     other = mh.account_hash("acct01", "s3cret")
     flood = [{"ts": test_now + 100 + i // 8, "provider": "anthropic", "account": other,
@@ -1024,6 +1162,16 @@ def _self_test():
         fh.close()
         return fh.name
 
+    # `persist_limits` reports through STDOUT workflow commands, and every failure fixture below
+    # drives one on purpose. Captured for the same reason `_load_backoffs_captured` captures the
+    # ledger fixtures' stderr — and, like it, capturing is what lets the loudness be ASSERTED
+    # rather than merely hidden.
+    def _persist_captured(*args, **kwargs):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = persist_limits(*args, **kwargs)
+        return rc, buf.getvalue()
+
     saved_repo = os.environ.get("REGISTRY_REPO")
     os.environ["REGISTRY_REPO"] = "o/r"
     limits_usage = {"acct01": {"5h_limit": "100", "7d_limit": "700"}}
@@ -1045,8 +1193,11 @@ def _self_test():
     merged = _upsert_limits_line(fresh, limits_line)[0]
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
                            "view": {"7": [(fresh, 0), (merged, 1)]}})
-    rc = persist_limits(upath, run=run)
+    rc, out = _persist_captured(upath, run=run)
     chk("persist: success returns 0", rc, 0)
+    chk("persist: a landed write reports success and emits NO workflow command",
+        (out.strip(), workflow_commands(out)),
+        ("account-usage: tier-limit lines refreshed", []))
     chk("persist: merges limits onto the FRESH body (no stale overwrite)",
         (len(edits), "provider: openai" in edits[0][1], limits_line in edits[0][1]),
         (1, True, True))
@@ -1054,13 +1205,15 @@ def _self_test():
     #   (ii) idempotent no-op: the live body already carries the exact line -> zero edits, still 0
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
                            "view": {"7": [(valid_anthropic + limits_line + "\n", 0)]}})
-    chk("persist: idempotent live body writes nothing", (persist_limits(upath, run=run), edits),
-        (0, []))
+    chk("persist: idempotent live body writes nothing",
+        (_persist_captured(upath, run=run)[0], edits), (0, []))
 
     #   (iii) a failed bulk catalog read is PROPAGATED (was swallowed with a false 'refreshed')
     run, edits = _fake_gh({"list": (1, "")})
-    chk("persist: list failure propagates (rc=1, no edits)", (persist_limits(upath, run=run), edits),
-        (1, []))
+    rc, out = _persist_captured(upath, run=run)
+    chk("persist: list failure propagates (rc=1, no edits)", (rc, edits), (1, []))
+    chk("persist: list failure is LOUD (::warning::)", workflow_commands(out),
+        ["::warning::account-usage: account catalog read failed; tier-limit persistence skipped"])
 
     #   (iv) an `issue edit` failure is PROPAGATED as a non-zero return, BEFORE the confirm read.
     #   The confirm view is queued to MATCH new_body, so swallowing the edit returncode would
@@ -1070,13 +1223,16 @@ def _self_test():
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
                            "view": {"7": [(edit_body0, 0), (edit_merged, 1)]},
                            "edit": {"7": [1]}})
-    chk("persist: edit failure propagates (rc=1, no confirm swallow)",
-        (persist_limits(upath, run=run), len(edits)), (1, 1))
+    rc, out = _persist_captured(upath, run=run)
+    chk("persist: edit failure propagates (rc=1, no confirm swallow)", (rc, len(edits)), (1, 1))
+    chk("persist: a failed write is LOUD, and says the capacity model may be stale",
+        [line for line in workflow_commands(out) if "capacity model may be stale" in line],
+        [WRITE_FAILURE_WARNING])
 
     #   (v) a failed re-read (view rc!=0) is PROPAGATED, not treated as an empty body
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
                            "view": {"7": [None]}})
-    chk("persist: view failure propagates (rc=1)", persist_limits(upath, run=run), 1)
+    chk("persist: view failure propagates (rc=1)", _persist_captured(upath, run=run)[0], 1)
 
     #   (vi) retry-merges-on-change: a concurrent writer lands strictly AFTER our edit (their body
     #   is live, edit count shows exactly ours + theirs — nothing lost); the merge is re-applied
@@ -1086,7 +1242,7 @@ def _self_test():
     merged2 = _upsert_limits_line(clob, limits_line)[0]
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
                            "view": {"7": [(body0, 0), (clob, 2), (clob, 2), (merged2, 3)]}})
-    rc = persist_limits(upath, run=run)
+    rc = _persist_captured(upath, run=run)[0]
     chk("persist: retries the merge after a concurrent clobber, then succeeds",
         (rc, len(edits), "notes: touched-by-other" in edits[-1][1], limits_line in edits[-1][1]),
         (0, 2, True, True))
@@ -1099,7 +1255,7 @@ def _self_test():
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
                            "view": {"7": revert_seq}})
     chk("persist: exhausted retries propagate as failure, bounded edit attempts",
-        (persist_limits(upath, run=run), len(edits)), (1, PERSIST_ATTEMPTS))
+        (_persist_captured(upath, run=run)[0], len(edits)), (1, PERSIST_ATTEMPTS))
 
     #   (ix) THE losing interleaving (#198 review round 2): a concurrent metadata edit lands
     #   BETWEEN our fresh read and our unconditional write, so our write replaces it and the
@@ -1109,15 +1265,16 @@ def _self_test():
     #   left to change and launder the loss into a false 'refreshed'.
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
                            "view": {"7": [(fresh, 0), (merged, 2)]}})
+    rc, out = _persist_captured(upath, run=run)
     chk("persist: writer clobbered inside the read->write window fails loudly (no silent loss)",
-        (persist_limits(upath, run=run), len(edits)), (1, 1))
+        (rc, len(edits), workflow_commands(out)), (1, 1, [WRITE_FAILURE_WARNING]))
 
     #   (x) a confirm that counts OUR edit as the only one but shows a non-matching body is an
     #   inconsistent read — fail closed, no retry
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
                            "view": {"7": [(fresh, 0), (fresh, 1)]}})
     chk("persist: single-edit confirm with mismatched body fails closed",
-        (persist_limits(upath, run=run), len(edits)), (1, 1))
+        (_persist_captured(upath, run=run)[0], len(edits)), (1, 1))
 
     #   (xi) WRITE GUARD (#521): a selected account whose live replacement body is missing a
     #   required schema field is rejected BEFORE `gh issue edit`; no corrupt record is persisted.
@@ -1128,14 +1285,17 @@ def _self_test():
                     "credential_format: codex-auth-json\n")
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
                            "view": {"7": [(invalid_body, 0)]}})
-    chk("persist: schema-invalid account body is rejected before write",
-        (persist_limits(upath, run=run), len(edits)), (1, 0))
+    rc, out = _persist_captured(upath, run=run)
+    chk("persist: schema-invalid account body is rejected before write", (rc, len(edits)), (1, 0))
+    chk("persist: the schema-guard rejection is LOUD, and names no handle",
+        (workflow_commands(out), "acct01" in out),
+        ([SCHEMA_REJECT_WARNING, WRITE_FAILURE_WARNING], False))
 
     #   (viii) a non-dict usage snapshot is handled (no probed limits) without touching the catalog
     lpath = _usage_file(["not", "a", "map"])
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}]))})
-    chk("persist: non-map usage snapshot skips cleanly", (persist_limits(lpath, run=run), edits),
-        (0, []))
+    chk("persist: non-map usage snapshot skips cleanly",
+        (_persist_captured(lpath, run=run)[0], edits), (0, []))
     os.unlink(lpath)
     os.unlink(upath)
     if saved_repo is None:
@@ -1144,6 +1304,35 @@ def _self_test():
         os.environ["REGISTRY_REPO"] = saved_repo
 
     ok = _self_test_ledgergate(chk) and ok
+
+    # --- annotation containment ------------------------------------------------------------------
+    #   the line-anchored selector: a workflow command is only a command at column 0.
+    chk("workflow_commands selects command lines only",
+        workflow_commands("plain\n::warning::w\n  ::warning::indented\n"
+                          "see ::error::x inline\n::notice::n\n::debug::d"),
+        ["::warning::w", "::notice::n"])
+    #   the recorder: forwards VERBATIM (a real escape must stay readable) and records the commands.
+    sink = io.StringIO()
+    seen = []
+    proxy = _AnnotationEscapeRecorder(sink, seen)
+    print("ordinary", file=proxy)
+    print(WRITE_FAILURE_WARNING, file=proxy)
+    proxy.write("::error::split")          # a command spanning two writes is still one line
+    proxy.write(" tail\n")
+    proxy.write("::warning::unterminated")  # no newline yet -> not a line yet
+    chk("recorder forwards bytes verbatim",
+        sink.getvalue(),
+        f"ordinary\n{WRITE_FAILURE_WARNING}\n::error::split tail\n::warning::unterminated")
+    chk("recorder records exactly the completed command lines",
+        seen, [WRITE_FAILURE_WARNING, "::error::split tail"])
+    chk("recorder delegates unknown attributes to the wrapped stream",
+        proxy.getvalue() == sink.getvalue(), True)
+    #   THE INVARIANT. `escaped` is supplied only by `_run_self_test_contained`; the default None
+    #   can never equal [], so deleting that wiring reds this row instead of disarming the recorder
+    #   silently. A non-empty list names every fixture diagnostic that reached the live job log.
+    chk("[containment] the entrypoint installed the recorder AND no fixture annotation reached "
+        "the real workflow log", escaped, [])
+
     print("account-usage self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -1299,6 +1488,27 @@ def _self_test_ledgergate(chk):
     sub("[#639] the refusal names the condition and leaks no token/handle/count",
         [token for token in ("redacted", "ACCT01_TOKEN", "acctexempt", "1 ")
          if token in run_main(subset="empty-value")[2]], [])
+
+    # ---- [OPUS-5] EMPTY-CATALOG GATE (registry #1131, the 2026-07-29 fleet outage) ----------------
+    # The materialization proof gate above is SCOPED to `any(non-exempt account)`. Over an EMPTY
+    # catalog that population does not exist, so the proof is VACUOUS, the loop emits nothing, and
+    # pre-fix main() returned (0, {}, no ::error::). The workflow then recorded
+    # `outcome=ok detail=probe-succeeded` beside an empty snapshot, usage-alert's sidecar read
+    # MEASURED, and dispatch's `_load_usage` collapsed {} to None -> every `require_usage` repo held
+    # fail-closed for hours with nothing anywhere saying the fleet had never been read.
+    # This is the same shape as the #639 ordering defect one layer out: the guard that proves
+    # measurement happened cannot be conditioned on a population the failure ERASES.
+    empty_catalog_code, empty_catalog_snapshot, empty_catalog_err = run_main(accounts=())
+    sub("[#1131] an EMPTY account catalog exits NONZERO with an empty map and a loud cause",
+        (empty_catalog_code, empty_catalog_snapshot, "::error::" in empty_catalog_err),
+        (1, {}, True))
+    sub("[#1131] the empty-catalog refusal leaks no handle/token/count",
+        [token for token in ("acct01", "acctexempt", "ACCT01_TOKEN", "redacted", "0 accounts")
+         if token in empty_catalog_err], [])
+    # NEGATIVE CONTROL: the gate is not a blanket refusal — a populated catalog still measures and
+    # still exits 0, so this cannot pass merely by making the probe always fail.
+    sub("[#1131] a POPULATED catalog is unaffected by the empty-catalog gate",
+        (run_main()[0], sorted(run_main()[1])), (0, ["acct01", "acctexempt"]))
     # ...and that empty map is what MAKES the outage detection fire. Asserted through the real
     # consumer, so "empty map" is not merely asserted to be empty but shown to be actionable.
     alerts = _load_sibling(script_dir, "usage-alert.py", "registry_usage_alert")
@@ -1596,7 +1806,7 @@ def _self_test_ledgergate(chk):
 
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
-        sys.exit(_self_test())
+        sys.exit(_run_self_test_contained())
     if "--persist-limits" in sys.argv:
         index = sys.argv.index("--persist-limits")
         sys.exit(persist_limits(sys.argv[index + 1]))

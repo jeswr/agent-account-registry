@@ -100,6 +100,25 @@ def is_transient(error_text):
     return gh_retry.is_transient_stderr(error_text)
 
 
+def is_retryable_read(error_text):
+    """Classify a FAILED ledger READ (the contents GET), not a PUT.
+
+    Delegates to `gh_retry.classify_read_failure` (registry #748) rather than to `is_transient`
+    above, because the two directions cost different things and the ledger READ has the read-side
+    asymmetry #748 is about: retrying a genuinely permanent failure costs a few bounded jittered
+    GETs to reach the same loud error, while NOT retrying a transient one costs the whole
+    transaction — and for `release()` that means a scarce account lease STRANDED for the rest of
+    its TTL. Refusal statuses (401 / 404 / non-throttle 403) and gh usage errors are still FATAL on
+    the first attempt; a throttle-403, a 429/5xx, and an unrecoverable status are retryable.
+
+    MEASURED 2026-07-27..29 on jeswr/agent-account-registry: 23 worker runs published their pull
+    request and then failed `release` with a bare "lease ledger read failed", stranding 23.1
+    account-hours. Every one of them was the READ half of a CAS transaction whose WRITE half has
+    been throttle-hardened since issue #558.
+    """
+    return gh_retry.is_retryable_read_stderr(error_text, gh_retry.failure_status(error_text))
+
+
 def retry_after_seconds(error_text):
     """The server's requested wait (capped) parsed out of a gh error, or None when it sent none.
 
@@ -121,6 +140,21 @@ def _self_test():
         ("rate limit transient", is_transient("HTTP 403: secondary rate limit"), True),
         ("auth 403 permanent", is_transient("HTTP 403: bad credentials"), False),
         ("server transient", is_transient("HTTP 503: unavailable"), True),
+        # ---- the READ half of a ledger transaction (registry #1246) ----
+        # Pointing is_retryable_read at is_transient instead of classify_read_failure turns the
+        # last two of these red: the conservative WRITE classifier answers False for a statusless
+        # failure and for an unrecoverable status, which is exactly the direction #748 rejected
+        # for reads.
+        ("read: primary rate-limit 403 retryable",
+         is_retryable_read("gh: API rate limit exceeded for installation. (HTTP 403)"), True),
+        ("read: permission 403 FATAL",
+         is_retryable_read("gh: Resource not accessible by integration (HTTP 403)"), False),
+        ("read: 404 FATAL (the caller owns the missing-branch decision)",
+         is_retryable_read("gh: Not Found (HTTP 404)"), False),
+        ("read: gh usage error FATAL", is_retryable_read("unknown flag: --nope"), False),
+        ("read: 502 retryable", is_retryable_read("gh: Bad Gateway (HTTP 502)"), True),
+        ("read: a statusless failure retries (read-side default)",
+         is_retryable_read("error connecting to api.github.com"), True),
         ("bounded exponential", [backoff_ceiling(i) for i in range(1, 7)],
          [0.5, 1.0, 2.0, 4.0, 8.0, 8.0]),
         # ---- issue #558: the write-burst throttle classes the lease writer now retries ----

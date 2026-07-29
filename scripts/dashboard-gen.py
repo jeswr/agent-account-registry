@@ -33,6 +33,36 @@ DISPATCH_COMPLETE_RE = re.compile(
     r"^\S+\s+dispatcher complete:\s+(\d+) worker/review/fix run\(s\) launched", re.MULTILINE)
 DISPATCHED_RE = re.compile(r"^\S+\s+dispatched\s", re.MULTILINE)
 DEFERRED_RE = re.compile(r"^\S+\s+defer(?:red)?\s", re.MULTILINE)
+# Per-lane tick counts (issues #108/#323). dispatch-claim.py prints one
+# `lane <name>: planned=N launched=N deferred=N error=N` line per lane immediately after
+# `dispatcher complete:`, from the same counters it writes into the dispatch-summary.json the
+# tick-health recorder reads — that summary is a runner-temp file the dashboard build never sees,
+# so the RUN LOG is the only place these counts are reachable from here. The lane NAME is read from
+# the log rather than pinned to a list, exactly as _obs_lane_rows does for the collector's lanes: a
+# lane added to dispatch-claim's DISPATCH_LANES appears on the page with no change here. Counts are
+# digit-bounded and the name must be a safe token.
+DISPATCH_LANE_RE = re.compile(
+    r"^\S+\s+lane (?P<lane>[A-Za-z0-9][A-Za-z0-9_.-]{0,31}): "
+    r"planned=(?P<planned>\d{1,6}) launched=(?P<launched>\d{1,6}) "
+    r"deferred=(?P<deferred>\d{1,6}) error=(?P<error>\d{1,6})\s*$", re.MULTILINE)
+DISPATCH_LANE_CAP = 12
+# The block dispatch-claim prints is BOUNDED on both sides — `dispatcher complete:`, the
+# `fix-dispatch:` fan-out line, one lane line per DISPATCH_LANES, then `defer attribution:` — and
+# `_dispatch_lane_rows` validates it as a WHOLE against these two anchors plus the lanes below.
+# A tick truncated mid-block has no terminator; a lane row omitted from a rendered tick reads as a
+# healthy lane that simply is not there. Both must be "unknown", never a selectively complete tick.
+DISPATCH_FIX_LINE_RE = re.compile(r"^\S+\s+fix-dispatch: ")
+DISPATCH_LANE_END_RE = re.compile(r"^\S+\s+defer attribution:")
+# The lanes dispatch-claim's DISPATCH_LANES prints on EVERY tick, in THIS order (it iterates that
+# tuple), and so the minimum a rendered block must carry. This is a floor on the SET and a pin on
+# the ORDER of these four: an ADDED lane still reaches the page unread-ahead (the name comes from
+# the log) wherever it sits in the block, while a MISSING one — the stalled review or failed disarm
+# this feature exists to expose — refuses the whole block instead of publishing the survivors, and
+# so does a block whose four required rows arrive in an order the dispatcher cannot emit. Should
+# dispatch-claim ever reorder its own DISPATCH_LANES, ticks read `—` until this tuple is matched to
+# it: unknown, which is the safe direction, rather than a block of unclear provenance published as
+# the dispatcher's own.
+DISPATCH_REQUIRED_LANES = ("worker", "review", "fix", "disarm")
 
 # Agent-run observability (issue #246). The collector persists a snapshot of cache-effectiveness /
 # per-lane run-health / flow metrics + auto-fixer trigger fires on the ledger data-plane branch
@@ -40,7 +70,7 @@ DEFERRED_RE = re.compile(r"^\S+\s+defer(?:red)?\s", re.MULTILINE)
 # _normalize_observability() validates it FAIL-CLOSED here before it may reach the public
 # data.json (rendered by the dashboard's Observability panels; absent file => hidden panel).
 # Decision 22: no raw account handles anywhere on the public surface — observability lease rows
-# must already carry the collector's 8-hex salted label (OBS_SALTED_LABEL_RE below); anything else
+# must already carry the collector's salted label (OBS_SALTED_LABEL_RE below); anything else
 # dies loudly, and _assert_private additionally backstops every known raw handle over the finished
 # document. Issue #374 additionally stops the SALTED per-account rows being published at all — see
 # the fleet-composition block below — but the label validation stays, because a raw handle reaching
@@ -49,7 +79,17 @@ DEFERRED_RE = re.compile(r"^\S+\s+defer(?:red)?\s", re.MULTILINE)
 # longer REQUIRES the per-account rows either — `flow.lease_utilization_1h` may be sent already
 # aggregated, and a collector that does so writes no per-account row array to a public branch.
 OBS_SCHEMA = "registry-observability/v1"
-OBS_SALTED_LABEL_RE = re.compile(r"[0-9a-f]{8}")
+# Issue #375: the salted label is the CANONICAL account fingerprint — sha256(handle:salt)[:16],
+# locked decision 22a, the one shape model-health.account_hash / worker-pr.account_hash produce and
+# lease_schema.ACCOUNT / groom.SAFE_ACCOUNT_HASH / select-and-claim.ACCOUNT_FINGERPRINT_RE already
+# validate. This read `[0-9a-f]{8}` — a second, shorter fingerprint format that no producer in this
+# repo can emit, so a collector handing over the fingerprint every other surface uses would have
+# failed the build. Tightening it here is safe in exactly this order because the collector has not
+# landed yet (dashboard.yml: the snapshot is OPTIONAL until it does, and the panel stays hidden) —
+# there is no producer to break, and the shape it must be built against is now the canonical one.
+# The self-test pins this against model-health.account_hash's real output, not against a literal,
+# so the two cannot drift apart again.
+OBS_SALTED_LABEL_RE = re.compile(r"[0-9a-f]{16}")
 OBS_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:+-]{0,63}")
 OBS_QUEUE_CLASS_RE = re.compile(r"[1-4][a-z]?")   # the #243 queue classes (1, 2, 2a..2d, 3, 4)
 OBS_HISTOGRAM_KEY_RE = re.compile(r"\d{1,2}\+?")
@@ -943,11 +983,85 @@ def _probe_outcome(document, now):
     }
 
 
+def _dispatch_lane_state(planned, launched, error):
+    """The DISPLAY tone for one lane's tick: ok | idle | stalled (the vocabulary the page's
+    existing `.lane-dot` states already use).
+
+    Deliberately WIDER than the ALERTING predicate, which lives in the tick-health step of
+    `.github/workflows/dispatch.yml` and is the authority — it pages on a `disarm` error, or on a
+    review/fix lane that planned work, launched nothing AND hit hard errors. Both of those are
+    strict subsets of `error > 0 or (planned > 0 and launched == 0)`, so every lane the alert fires
+    on is shown red here, and a lane merely held by capacity contention (planned, launched some,
+    deferred the rest) still reads `ok`. The containment direction is the safety property: widening
+    this can only over-report, narrowing it could hide a lane the alert is paging on, so it must
+    never be tightened toward the workflow's predicate (the self-test pins the containment)."""
+    if error > 0 or (planned > 0 and launched == 0):
+        return "stalled"
+    return "idle" if planned == 0 else "ok"
+
+
+def _dispatch_lane_rows(log_text):
+    """Per-lane tick counts (issues #108/#323) for ONE dispatch run, or None when the run printed
+    none (a claim that aborted before the dispatcher finished, or a pre-#108 run).
+
+    Read ONLY from the block after the LAST `dispatcher complete:` line. dispatch-claim prints the
+    lane block immediately after that line, so the block is the dispatcher's own trusted output —
+    while everything before it is a whole run's log, into which target-controlled text (an issue
+    title, a rejected plan row) is echoed. Every line of a raw Actions log carries a timestamp
+    prefix, so `^\\S+\\s+` alone does not make a line the dispatcher's; anchoring to the block is
+    what stops an echoed string from FABRICATING a lane row (AGENTS.md pre-flight item 5: who can
+    write the thing this reads?). No complete line => no lanes, rather than a scan of the log.
+
+    The block is validated as a WHOLE, and a partial one is refused rather than trimmed (review
+    round 1): the rows must be CONTIGUOUS between the `fix-dispatch:` header and the
+    `defer attribution:` terminator, each must parse, none may repeat, DISPATCH_REQUIRED_LANES must
+    all be present IN THAT ORDER (review round 2 — the dispatcher iterates one fixed tuple, so a
+    complete-but-permuted block is one it could not have printed; unknown lanes are exempt and may
+    sit anywhere), and the block may not exceed DISPATCH_LANE_CAP rows. Publishing the survivors of
+    a truncated or malformed block renders the vanished lane as absent rather than unknown — which
+    is exactly how a stalled review/fix lane or a failed disarm would disappear from the one cell
+    built to show it — so every one of those shapes returns None and the page shows `—`. Trailing
+    output cannot reach the rows either: the scan STOPS at the terminator, so a lane line echoed
+    after the block cannot overwrite the dispatcher's own count for that lane."""
+    complete = list(DISPATCH_COMPLETE_RE.finditer(log_text))
+    if not complete:
+        return None
+    # `[1:]` drops the remainder of the completion line itself; last block wins, matching the
+    # `complete[-1]` rule above for a log that carries more than one dispatcher run.
+    lines = log_text[complete[-1].end():].splitlines()[1:]
+    if not lines or not DISPATCH_FIX_LINE_RE.match(lines[0]):
+        return None
+    rows = {}
+    for line in lines[1:]:
+        if DISPATCH_LANE_END_RE.match(line):
+            # Presence AND order in one comparison: `rows` keeps the block's own order, so the
+            # required lanes read out of it — extra lanes dropped, they are exempt — must be the
+            # authoritative tuple exactly. A short list is a missing lane, a permuted one is a
+            # block the dispatcher's single loop cannot have printed; both are unknown.
+            if [lane for lane in rows if lane in DISPATCH_REQUIRED_LANES] != list(
+                    DISPATCH_REQUIRED_LANES):
+                return None
+            return list(rows.values())
+        match = DISPATCH_LANE_RE.match(line)
+        if match is None or match.group("lane") in rows or len(rows) >= DISPATCH_LANE_CAP:
+            return None
+        planned, launched, error = (int(match.group(key))
+                                    for key in ("planned", "launched", "error"))
+        # `deferred` is READ from the line, not re-derived: dispatch-claim derives it there
+        # (planned-launched-error, clamped) and re-deriving it here would republish this build's
+        # arithmetic as if it were the dispatcher's count.
+        rows[match.group("lane")] = {
+            "lane": match.group("lane"), "planned": planned, "launched": launched,
+            "deferred": int(match.group("deferred")), "error": error,
+            "state": _dispatch_lane_state(planned, launched, error)}
+    return None   # ran off the end of the log: the block was truncated, so nothing is known
+
+
 def _parse_dispatch_log(log_text):
     complete = DISPATCH_COMPLETE_RE.findall(log_text)
     dispatched = int(complete[-1]) if complete else len(DISPATCHED_RE.findall(log_text))
     deferred = len(DEFERRED_RE.findall(log_text))
-    return dispatched, deferred
+    return dispatched, deferred, _dispatch_lane_rows(log_text)
 
 
 def _run_log_counts(repo, run_id):
@@ -955,17 +1069,17 @@ def _run_log_counts(repo, run_id):
         ["gh", "api", f"repos/{repo}/actions/runs/{run_id}/logs"],
         capture_output=True, timeout=60, check=False)
     if result.returncode != 0:
-        return None, None
+        return None, None, None
     try:
         with zipfile.ZipFile(io.BytesIO(result.stdout)) as archive:
             names = [name for name in archive.namelist()
                      if "/" in name and "Strictly validate" in name and name.endswith(".txt")]
             if not names:
-                return None, None
+                return None, None, None
             log_text = "\n".join(
                 archive.read(name).decode("utf-8", errors="replace") for name in names)
     except (OSError, zipfile.BadZipFile):
-        return None, None
+        return None, None, None
     return _parse_dispatch_log(log_text)
 
 
@@ -983,14 +1097,19 @@ def _fetch_dispatch_history(repo, count):
     for run in runs[:count]:
         if not isinstance(run, dict):
             continue
-        dispatched, deferred = (None, None)
+        dispatched, deferred, lanes = (None, None, None)
         if run.get("status") == "completed" and isinstance(run.get("id"), int):
-            dispatched, deferred = _run_log_counts(repo, run["id"])
+            dispatched, deferred, lanes = _run_log_counts(repo, run["id"])
         history.append({
             "at": _utc_iso(run.get("run_started_at") or run.get("created_at")),
             "conclusion": str(run.get("conclusion") or run.get("status") or "unknown")[:24],
             "dispatched": dispatched,
             "deferred": deferred,
+            # Issue #323: the per-lane breakdown (or None for a run that printed none), so a
+            # persistently stalled review/fix lane — or a failed safety disarm, which consumes no
+            # lease and is therefore invisible in `dispatched` — is legible on the ops page and not
+            # only inside the model-health alert.
+            "lanes": lanes,
         })
     return history
 
@@ -1270,10 +1389,12 @@ def _obs_lease_aggregate(value):
 
 def _obs_flow(flow):
     """Queue depth/age per class, fleet-wide lease utilization, review rounds, park rates,
-    arm→merge latency, target-CI congestion. A lease row whose label is not the 8-hex salted shape
-    is a raw account identity reaching the collector output — a decision-22 privacy incident,
-    fatal — and since issue #374 the rows themselves are aggregated away rather than republished
-    (issue #841: and since the rows sit on a PUBLIC branch, they need not be sent at all)."""
+    arm→merge latency, target-CI congestion. A lease row whose label is not the canonical 16-hex
+    salted account fingerprint (issue #375) is a raw account identity reaching the collector
+    output — or a second identity format nothing else here speaks — a decision-22 privacy
+    incident, fatal — and since issue #374 the rows themselves are aggregated away rather than
+    republished (issue #841: and since the rows sit on a PUBLIC branch, they need not be sent at
+    all)."""
     if not isinstance(flow, dict):
         return None
     queue = []
@@ -1568,6 +1689,402 @@ def _optional_usage_path(cli_path):
     return next((path for path in candidates if path and Path(path).is_file()), None)
 
 
+_LANE_PAGE_HARNESS = r"""
+const fs = require("fs");
+const source = fs.readFileSync(__APP_JS__, "utf8");
+const input = JSON.parse(fs.readFileSync(0, "utf8"));
+function element(tag) {
+  const self = {
+    tagName: tag, children: [], hidden: false, textContent: "", className: "",
+    append: (...kids) => { for (const kid of kids) self.children.push(kid); },
+    replaceChildren: (...kids) => { self.children = [...kids]; },
+    setAttribute: () => {},
+    classList: { add: () => {}, remove: () => {}, contains: () => false },
+  };
+  return self;
+}
+const ids = {};
+globalThis.document = {
+  getElementById: (id) => (ids[id] = ids[id] || element("div#" + id)),
+  createElement: element,
+  createElementNS: (_ns, tag) => element(tag),
+  createTextNode: (text) => ({ textContent: text, children: [] }),
+};
+globalThis.fetch = () => Promise.reject(new Error("network is not under test"));
+globalThis.setInterval = () => 0;
+const flat = (node) => [node.textContent || "", ...(node.children || []).flatMap(flat)];
+(async () => {
+  const scope = new Function(source + "; return { renderOutcomes };")();
+  await new Promise((resolve) => setImmediate(resolve));
+  const out = {};
+  for (const [name, outcomes] of Object.entries(input.outcomes)) {
+    ids.outcomes = element("tbody#outcomes");
+    scope.renderOutcomes(outcomes);
+    out[name] = ids.outcomes.children.map((row) => {
+      const cell = row.children[4];
+      return {
+        cells: row.children.length,
+        colSpan: row.children[0] ? (row.children[0].colSpan ?? null) : null,
+        cellText: cell ? flat(cell).join("").trim() : null,
+        chips: cell ? (cell.children || []).map((chip) => ({
+          dot: chip.children && chip.children[0] ? chip.children[0].className : "",
+          text: flat(chip).join("").trim(),
+        })) : [],
+      };
+    });
+  }
+  process.stdout.write(JSON.stringify(out));
+})().catch((error) => { console.error(error && error.stack || error); process.exit(1); });
+"""
+
+
+def _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measured_sidecar):
+    """Issue #323 — the per-lane dispatch tick counts, from the RUN LOG they are parsed out of, all
+    the way to the cell the page renders.
+
+    Split out of `_self_test` only because that function is already thousands of lines; every row
+    below is part of the same suite and `check` is the same accumulator."""
+    # --- the parser. `deferred` is the LINE's value (5-1-1 would derive 3, the line says 2), so a
+    # re-derivation here goes red; the second dispatcher block wins, matching `complete[-1]`.
+    log = (
+        "2025-01-01Z lane review: planned=9 launched=0 deferred=0 error=9\n"   # pre-complete: not
+        "2025-01-01Z dispatched worker owner/repo#1\n"                         # the dispatcher's
+        "2025-01-01Z dispatcher complete: 1 worker/review/fix run(s) launched\n"
+        "2025-01-01Z fix-dispatch: 0 eligible, 0 launched, 0 deferred (reasons: none)\n"
+        "2025-01-01Z lane worker: planned=4 launched=4 deferred=0 error=0\n"
+        "2025-01-01Z lane review: planned=4 launched=4 deferred=0 error=0\n"
+        "2025-01-01Z lane fix: planned=4 launched=4 deferred=0 error=0\n"
+        "2025-01-01Z lane disarm: planned=4 launched=4 deferred=0 error=0\n"
+        "2025-01-01Z defer attribution: none\n"
+        "2025-01-01Z dispatcher complete: 2 worker/review/fix run(s) launched\n"
+        "2025-01-01Z fix-dispatch: 3 eligible, 1 launched, 2 deferred (reasons: capacity=2)\n"
+        "2025-01-01Z lane worker: planned=5 launched=1 deferred=2 error=1\n"
+        "2025-01-01Z lane review: planned=2 launched=0 deferred=2 error=0\n"
+        "2025-01-01Z lane fix: planned=0 launched=0 deferred=0 error=0\n"
+        "2025-01-01Z lane disarm: planned=1 launched=1 deferred=0 error=1\n"
+        "2025-01-01Z defer attribution: none\n"
+        # Echoed AFTER the block's terminator — a clean `review` row that would have overwritten
+        # the dispatcher's stalled one under a last-wins scan of the whole tail.
+        "2025-01-01Z lane review: planned=0 launched=0 deferred=0 error=0\n")
+    check("[#323] the lane block parses into per-lane rows with the LINE's deferred count and a "
+          "display state per lane",
+          _dispatch_lane_rows(log),
+          [{"lane": "worker", "planned": 5, "launched": 1, "deferred": 2, "error": 1,
+            "state": "stalled"},
+           {"lane": "review", "planned": 2, "launched": 0, "deferred": 2, "error": 0,
+            "state": "stalled"},
+           {"lane": "fix", "planned": 0, "launched": 0, "deferred": 0, "error": 0,
+            "state": "idle"},
+           {"lane": "disarm", "planned": 1, "launched": 1, "deferred": 0, "error": 1,
+            "state": "stalled"}])
+    # AGENTS.md pre-flight item 5 — who can write the thing this reads? A whole run's log carries
+    # target-controlled text, and every line of a raw Actions log is timestamp-prefixed, so the
+    # `^\S+\s+` shape is NOT evidence the dispatcher printed it. The forged `review` row above sits
+    # before the last `dispatcher complete:` and must not appear at all; here it is the only lane
+    # line in the log, and the answer is still no rows rather than a fabricated stall.
+    check("[#323] a lane line the dispatcher did not print (before the last `dispatcher "
+          "complete:`) cannot fabricate a lane row",
+          (_dispatch_lane_rows(
+              "2025-01-01Z lane review: planned=9 launched=0 deferred=0 error=9\n"
+              "2025-01-01Z dispatcher complete: 1 worker/review/fix run(s) launched\n"),
+           _dispatch_lane_rows(
+               "2025-01-01Z lane review: planned=9 launched=0 deferred=0 error=9\n")),
+          (None, None))
+    check("[#323] a lane row echoed AFTER the block's terminator cannot overwrite the "
+          "dispatcher's own row for that lane (the scan stops at the terminator)",
+          [row for row in (_dispatch_lane_rows(log) or []) if row["lane"] == "review"],
+          [{"lane": "review", "planned": 2, "launched": 0, "deferred": 2, "error": 0,
+            "state": "stalled"}])
+
+    def lane_names(rows):
+        """The parsed lane names, or the refusal itself — so a mutant that turns a published block
+        into `None` reds ONE named row instead of raising out of the comprehension and aborting the
+        suite, which records as a kill while every check below it never runs (pre-flight item 4)."""
+        return None if rows is None else [row["lane"] for row in rows]
+
+    # --- the block is validated as a WHOLE (review round 1). Publishing the survivors of a
+    # damaged block renders a vanished lane as absent rather than unknown, which is precisely how
+    # the stalled review/fix lane or the failed disarm this cell exists to expose would go missing.
+    # Every shape below is a block the dispatcher could not have printed, and each must be None —
+    # asserting "no partial lane set is published" rather than "the bad row was dropped".
+    def block(*body):
+        """One dispatcher block: the completion marker, the fix-dispatch header, then `body`."""
+        return ("2025-01-01Z dispatcher complete: 1 worker/review/fix run(s) launched\n"
+                "2025-01-01Z fix-dispatch: 0 eligible, 0 launched, 0 deferred (reasons: none)\n"
+                + "".join(line + "\n" for line in body))
+
+    worker_row = "2025-01-01Z lane worker: planned=5 launched=0 deferred=5 error=0"
+    review_row = "2025-01-01Z lane review: planned=2 launched=0 deferred=2 error=0"
+    fix_row = "2025-01-01Z lane fix: planned=1 launched=1 deferred=0 error=0"
+    disarm_row = "2025-01-01Z lane disarm: planned=1 launched=0 deferred=0 error=1"
+    terminator = "2025-01-01Z defer attribution: none"
+    check("[#323] a block missing a required lane publishes NOTHING — neither the stalled review "
+          "lane nor the failed disarm may be silently absent from an otherwise healthy tick",
+          (_dispatch_lane_rows(block(worker_row, fix_row, disarm_row, terminator)),
+           _dispatch_lane_rows(block(worker_row, review_row, fix_row, terminator))),
+          (None, None))
+    check("[#323] a malformed row inside the block refuses the WHOLE block (an unsafe lane name, a "
+          "count that is not a bounded integer, and a duplicated lane)",
+          (_dispatch_lane_rows(block(
+              worker_row, review_row, fix_row,
+              "2025-01-01Z lane bad name: planned=1 launched=0 deferred=0 error=1", terminator)),
+           _dispatch_lane_rows(block(
+               worker_row, review_row, fix_row,
+               "2025-01-01Z lane disarm: planned=1234567 launched=0 deferred=0 error=1",
+               terminator)),
+           _dispatch_lane_rows(block(
+               worker_row, review_row, fix_row, disarm_row, disarm_row, terminator))),
+          (None, None, None))
+    check("[#323] a block that is truncated or non-contiguous is unknown rather than partially "
+          "published",
+          (_dispatch_lane_rows(block(worker_row, review_row, fix_row, disarm_row)),
+           _dispatch_lane_rows(block(worker_row, review_row,
+                                     "2025-01-01Z dispatched worker owner/repo#7",
+                                     fix_row, disarm_row, terminator))),
+          (None, None))
+    # The header anchor needs its OWN input, carrying a COMPLETE lane set — the two guards are
+    # otherwise mutually masking (pre-flight item 4): with the header line simply absent, the first
+    # lane row is eaten in its place, the block then looks like it is missing that lane, and the
+    # required-lane floor refuses it for the wrong reason. Deleting the anchor outright survived the
+    # suite until this row existed. Here the header's slot holds a foreign line and all four lanes
+    # follow, so ONLY the anchor can refuse it.
+    check("[#323] a block whose fix-dispatch header is not there — an unrelated line in its slot, "
+          "or no header line at all — publishes nothing even with every lane row present",
+          (_dispatch_lane_rows(block(worker_row, review_row, fix_row, disarm_row, terminator)
+                               .replace("2025-01-01Z fix-dispatch: 0 eligible, 0 launched, "
+                                        "0 deferred (reasons: none)",
+                                        "2025-01-01Z dispatched worker owner/repo#7")),
+           _dispatch_lane_rows(
+               "2025-01-01Z dispatcher complete: 1 worker/review/fix run(s) launched\n"
+               + "".join(line + "\n" for line in
+                         (worker_row, review_row, fix_row, disarm_row, terminator)))),
+          (None, None))
+    # ...and the required set is a FLOOR, not a pin: a lane added to dispatch-claim's
+    # DISPATCH_LANES still reaches the page with no change here (a check that only ever expected
+    # None would be satisfied by hard-coding `return None`).
+    check("[#323] a block carrying an UNKNOWN extra lane still publishes, extra row included",
+          lane_names(_dispatch_lane_rows(block(
+              worker_row, review_row, fix_row, disarm_row,
+              "2025-01-01Z lane audit: planned=3 launched=3 deferred=0 error=0", terminator))),
+          ["worker", "review", "fix", "disarm", "audit"])
+    # --- ...and the required four are ORDERED (review round 2). dispatch-claim iterates ONE fixed
+    # tuple, so a complete, contiguous, terminated block whose four required rows are permuted is a
+    # block it cannot have printed — provenance the membership/duplicate/cap checks all wave
+    # through. Both permutations are written LITERALLY, in an order no rotation of the shipped
+    # tuple produces, so neither this input nor its expectation moves if DISPATCH_REQUIRED_LANES is
+    # edited (pre-flight item 2(b)/(c)).
+    check("[#323] a COMPLETE block whose required lanes arrive out of the dispatcher's emission "
+          "order publishes nothing — every lane present is not evidence the dispatcher printed it",
+          (_dispatch_lane_rows(block(worker_row, fix_row, review_row, disarm_row, terminator)),
+           _dispatch_lane_rows(block(disarm_row, review_row, fix_row, worker_row, terminator))),
+          (None, None))
+    # The exemption is what keeps that order rule from being a pin on the whole block: an unknown
+    # lane may sit ANYWHERE, including between two required rows, and publishes in its own place.
+    # Without this row, refusing every block whose lane list is not exactly the required tuple —
+    # which would silently drop a future lane off the page — stays green.
+    check("[#323] an unknown extra lane INTERLEAVED among the required rows still publishes, in "
+          "the position the dispatcher printed it",
+          lane_names(_dispatch_lane_rows(block(
+              worker_row, review_row,
+              "2025-01-01Z lane audit: planned=3 launched=3 deferred=0 error=0",
+              fix_row, disarm_row, terminator))),
+          ["worker", "review", "audit", "fix", "disarm"])
+    # 12 and 13 are LITERAL here. Deriving either from DISPATCH_LANE_CAP would make the row
+    # vacuous — raising the constant would raise the input and the expectation together and stay
+    # green, which is the #941 shape AGENTS.md pre-flight item 2(c) names.
+    def padded(count):
+        return block(worker_row, review_row, fix_row, disarm_row, *[
+            f"2025-01-01Z lane l{index}: planned=1 launched=1 deferred=0 error=0"
+            for index in range(count)], terminator)
+
+    twelve = _dispatch_lane_rows(padded(8))
+    check("[#323] the lane row count is bounded at twelve, and a block that EXCEEDS the bound is "
+          "refused whole rather than truncated to the first twelve lanes",
+          (len(twelve or []), (lane_names(twelve) or ["<refused>"])[-1],
+           _dispatch_lane_rows(padded(9))),
+          (12, "l7", None))
+
+    # --- the display tone. The ALERTING predicate is the tick-health step of dispatch.yml; this
+    # oracle restates it (there is no importable copy — it is inline python inside the workflow),
+    # and the property is CONTAINMENT: everything that pages must render red. A tone rule that ever
+    # narrows toward the alert would hide a lane the operator is being paged about.
+    def workflow_alerts(lane, planned, launched, error):
+        if lane == "disarm":
+            return error > 0
+        if lane in ("review", "fix"):
+            return planned > 0 and launched == 0 and error > 0
+        return False
+
+    grid = [(lane, planned, launched, error)
+            for lane in ("worker", "review", "fix", "disarm")
+            for planned in range(3) for launched in range(planned + 1) for error in range(3)]
+    alerting = [case for case in grid if workflow_alerts(*case)]
+    check("[#323] EVERY lane state the dispatch.yml tick-health step pages on renders `stalled` "
+          "(containment), over a non-empty grid of cases",
+          (bool(alerting),
+           sorted({_dispatch_lane_state(*case[1:]) for case in alerting})),
+          (True, ["stalled"]))
+    check("[#323] ...and the tone is STRICTLY wider than the alert — a lane that planned work and "
+          "launched none of it is red here even with no hard error",
+          (_dispatch_lane_state(2, 0, 0), workflow_alerts("worker", 2, 0, 0)),
+          ("stalled", False))
+    check("[#323] the tone actually discriminates (a constant would satisfy containment alone)",
+          (_dispatch_lane_state(0, 0, 0), _dispatch_lane_state(3, 3, 0),
+           _dispatch_lane_state(3, 3, 1)),
+          ("idle", "ok", "stalled"))
+
+    # --- ...and the same rows reaching a published document through the REAL fetch path. Both
+    # `_fetch_dispatch_history` and `_run_log_counts` shell out to `gh`, so neither had ever
+    # executed in this suite (AGENTS.md pre-flight item 1: the entry points are where a fabricating
+    # bug survives) — dropping `"lanes": lanes` from the history entry was unkillable. `gh` is
+    # stubbed here, so the seam between the log parser and the published payload is real.
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("dispatch/9_Strictly validate, CAS claim, and dispatch.txt", log)
+    logs_zip = archive.getvalue()
+    stepless = io.BytesIO()
+    with zipfile.ZipFile(stepless, "w") as bundle:
+        bundle.writestr("dispatch/1_Set up job.txt", log)
+    stepless_zip = stepless.getvalue()
+    runs_payload = json.dumps({"workflow_runs": [
+        {"id": 11, "status": "completed", "conclusion": "success",
+         "run_started_at": "2025-06-15T15:05:00Z"},
+        {"id": 12, "status": "completed", "conclusion": "failure",
+         "run_started_at": "2025-06-15T14:05:00Z"},
+        {"id": 13, "status": "in_progress", "run_started_at": "2025-06-15T13:05:00Z"},
+        # The two log-shaped failures the counts share with the lanes: an archive with no claim
+        # step in it, and a body that is not an archive at all. Both must reach the caller as a
+        # THREE-value answer — the arity is the seam this change moved, and an unexercised return
+        # there raises out of _fetch_dispatch_history and takes the whole build down.
+        {"id": 14, "status": "completed", "conclusion": "success",
+         "run_started_at": "2025-06-15T12:05:00Z"},
+        {"id": 15, "status": "completed", "conclusion": "success",
+         "run_started_at": "2025-06-15T11:05:00Z"},
+    ]})
+
+    class _Completed:
+        def __init__(self, returncode, stdout):
+            self.returncode, self.stdout = returncode, stdout
+
+    def fake_gh(command, **kwargs):
+        url = command[-1]
+        if "/workflows/dispatch.yml/runs" in url:
+            return _Completed(0, runs_payload)
+        if url.endswith("/runs/11/logs"):
+            return _Completed(0, logs_zip)
+        if url.endswith("/runs/14/logs"):
+            return _Completed(0, stepless_zip)   # an archive with no claim-step member
+        if url.endswith("/runs/15/logs"):
+            return _Completed(0, b"not a zip")   # an unreadable archive
+        return _Completed(1, b"")                # run 12: the log fetch fails
+
+    # Every read below reports rather than raises. A mutant that changes `_run_log_counts`'s arity
+    # aborts this call, and an abort records as a kill while every check after it never runs
+    # (AGENTS.md pre-flight item 4, crash-after-partial-run) — so the failure is turned into a NAMED
+    # red row and the suite continues to its full check count.
+    saved_run = subprocess.run
+    try:
+        subprocess.run = fake_gh
+        fetched, fetch_error = _fetch_dispatch_history("owner/registry", 5), None
+    except Exception as exc:                    # noqa: BLE001 - reported as a row, never swallowed
+        fetched, fetch_error = [], f"{type(exc).__name__}: {exc}"
+    finally:
+        subprocess.run = saved_run
+    check("[#323] the fetched history carries the per-lane rows for the run whose log was read, "
+          "and an explicit None — never a fabricated empty lane set — for a run whose log it "
+          "could not read or which has not finished",
+          fetch_error or [(entry.get("dispatched"), entry.get("deferred"),
+                           None if entry.get("lanes") is None
+                           else [row["lane"] for row in entry["lanes"]])
+                          for entry in fetched],
+          # `deferred` is 2 because the fixture log carries the TWO dispatcher blocks the
+          # last-block-wins rule above is stated over, and DEFERRED_RE matches each block's
+          # `defer attribution:` header (pre-existing counting behaviour, untouched here).
+          [(2, 2, ["worker", "review", "fix", "disarm"]), (None, None, None), (None, None, None),
+           (None, None, None), (None, None, None)])
+    published = build_dashboard(issues, leases, usage, fetched, None, now, "fixture-salt",
+                                probe_status=measured_sidecar)
+    published_sweeps = published["fleet"]["dispatch_outcomes"]
+    published_lanes = next((sweep.get("lanes") or [] for sweep in published_sweeps), [])
+    # Stated as LITERALS, not as `fetched[0]["lanes"]`: comparing the payload against the object
+    # that was handed in is a tautology over a pass-through (pre-flight item 2(b)).
+    check("[#323] ...and they survive into the public payload the page fetches",
+          published_lanes[:2],
+          [{"lane": "worker", "planned": 5, "launched": 1, "deferred": 2, "error": 1,
+            "state": "stalled"},
+           {"lane": "review", "planned": 2, "launched": 0, "deferred": 2, "error": 0,
+            "state": "stalled"}])
+
+    # --- the page. The header and the row must agree on the column count: a cell appended without
+    # a `<th>` renders under the wrong heading, which is the failure this seam check exists for.
+    index_html = _repo_file("dashboard", "index.html")
+    thead = re.search(r"<thead>(.*?)</thead>\s*<tbody id=\"outcomes\">", index_html, re.S)
+    if thead is None:
+        raise DashboardError("wiring assertion cannot locate the dispatch-outcomes table header")
+    app_js = _repo_file("dashboard", "app.js")
+    outcomes_body = _js_function_body(app_js, "renderOutcomes")
+    check("[#323] renderOutcomes() appends the lane cell from the outcome's OWN lanes, and the "
+          "empty-history row spans the widened table",
+          (_js_code_count(outcomes_body, "laneCell(outcome.lanes)"),
+           _js_code_count(outcomes_body, "cell.colSpan = 5;")),
+          (1, 1))
+    lane_body = _js_function_body(app_js, "laneCell")
+    check("[#323] the lane tone comes from the GENERATOR's verdict, with an unknown state falling "
+          "back rather than reaching the stylesheet unvalidated",
+          _js_code_count(
+              lane_body,
+              'const state = LANE_STATES.has(lane.state) ? lane.state : "unknown";'), 1)
+    harness = _LANE_PAGE_HARNESS.replace("__APP_JS__", json.dumps(
+        str(Path(__file__).resolve().parent.parent / "dashboard" / "app.js")))
+    fixtures = {
+        "lanes": published_sweeps[:1],
+        "absent": [dict(history[0], lanes=None)],
+        "empty": [],
+        # A state token no stylesheet rule matches, and one that is not a string at all: both
+        # must land on `unknown` rather than being concatenated into the class attribute.
+        "hostile": [dict(history[0], lanes=[
+            {"lane": "worker", "planned": 1, "launched": 1, "deferred": 0, "error": 0,
+             "state": "ok stalled"},
+            {"lane": "review", "planned": 1, "launched": 1, "deferred": 0, "error": 0,
+             "state": None}])],
+    }
+    try:
+        page = _node_json(harness, {"outcomes": fixtures})
+    except DashboardError as exc:
+        # A page that throws while rendering IS the finding; reporting it as the value of every
+        # row below keeps those rows named and red instead of aborting the suite mid-run.
+        page = {"page script raised": str(exc)[:160]}
+
+    def rendered(name, field):
+        rows = page.get(name)
+        return rows[0].get(field) if isinstance(rows, list) and rows else page
+
+    def chips(name, *fields):
+        found = rendered(name, "chips")
+        if not isinstance(found, list):
+            return found
+        return [tuple(chip.get(field) for field in fields) if len(fields) > 1
+                else chip.get(fields[0]) for chip in found]
+
+    check("[#323] EXECUTED page script: the header and the rendered row agree on the column count",
+          (len(re.findall(r"<th\b", thead.group(1))), rendered("lanes", "cells"),
+           rendered("empty", "colSpan")),
+          (5, 5, 5))
+    check("[#323] EXECUTED page script: every lane renders all four counts unconditionally "
+          "(including the zeroes of a quiet lane) with the generator's tone on the dot",
+          chips("lanes", "dot", "text"),
+          [("lane-dot stalled", "worker 5p 1l 2d 1e"),
+           ("lane-dot stalled", "review 2p 0l 2d 0e"),
+           ("lane-dot idle", "fix 0p 0l 0d 0e"),
+           ("lane-dot stalled", "disarm 1p 1l 0d 1e")])
+    check("[#323] EXECUTED page script: a sweep with no lane data renders an explicit blank, not "
+          "an all-zero lane set that would read as a healthy tick",
+          (rendered("absent", "cellText"), rendered("absent", "chips")), ("—", []))
+    check("[#323] EXECUTED page script: a state token that is not one of the four known ones "
+          "renders `unknown` — it never reaches the class attribute as written",
+          chips("hostile", "dot"), ["lane-dot unknown", "lane-dot unknown"])
+
+
 def _self_test():
     ok = True
 
@@ -1614,8 +2131,20 @@ def _self_test():
     ]}
     usage = {handle: {"status": "allowed", "5h_util": "0.42", "5h_reset": now + 3600,
                       "7d_util": "0.8", "7d_reset": now + 86400}}
+    # Issue #323: the fixture sweep carries all four lanes in all three display states — `worker`
+    # productive, `review` stalled the way the alert defines it, `disarm` errored while still
+    # launching (the safety case the fleet `dispatched` count cannot see), `fix` idle — so the page
+    # assertions below can state a TONE per lane rather than merely that a cell was populated.
+    fixture_lanes = [
+        {"lane": "worker", "planned": 3, "launched": 2, "deferred": 1, "error": 0, "state": "ok"},
+        {"lane": "review", "planned": 2, "launched": 0, "deferred": 0, "error": 2,
+         "state": "stalled"},
+        {"lane": "fix", "planned": 0, "launched": 0, "deferred": 0, "error": 0, "state": "idle"},
+        {"lane": "disarm", "planned": 1, "launched": 1, "deferred": 0, "error": 1,
+         "state": "stalled"},
+    ]
     history = [{"at": "2025-06-15T15:05:00Z", "conclusion": "success",
-                "dispatched": 2, "deferred": 3}]
+                "dispatched": 2, "deferred": 3, "lanes": fixture_lanes}]
     got = build_dashboard(issues, leases, usage, history, None, now, "fixture-salt",
                           probe_status=measured_sidecar)
     expected = {
@@ -1655,7 +2184,8 @@ def _self_test():
     check("dispatch log counts", _parse_dispatch_log(
         "2025-01-01Z dispatched worker owner/repo#1\n"
         "2025-01-01Z defer owner/repo#2: busy\n"
-        "2025-01-01Z dispatcher complete: 1 worker/review/fix run(s) launched\n"), (1, 1))
+        "2025-01-01Z dispatcher complete: 1 worker/review/fix run(s) launched\n"), (1, 1, None))
+    _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measured_sidecar)
     check("raw identity absent", handle not in json.dumps(got) and email not in json.dumps(got), True)
     leaky = copy.deepcopy(got)
     leaky["provider_quota"][0]["debug"] = handle
@@ -2574,18 +3104,29 @@ def _self_test():
     # coverage and was not. The body is therefore EXTRACTED and EXECUTED against hermetic gh/jq
     # stubs, and every row below is an OUTCOME (which workflows got kicked) rather than a substring.
     # ------------------------------------------------------------------------------------------
+    def _keepalive_specs(script, leg):
+        """{workflow-file: (threshold-seconds, executed-marker or "")} read out of a leg's own
+        `for spec in ...` list. A watch list that cannot be read is a REFUSAL, never an empty
+        dict: the rows below would all pass trivially against a leg watching nothing."""
+        spec_line = re.search(r"for spec in ([^\n]+); do", script)
+        if spec_line is None:
+            raise DashboardError(
+                f"{leg}'s spec list could not be located in the extracted step body — refusing "
+                "to assert against a keepalive whose watch list cannot be read (fail closed)")
+        specs = {}
+        for raw in spec_line.group(1).split():
+            fields = raw.split(":")
+            if len(fields) not in (2, 3) or not fields[1].isdigit():
+                raise DashboardError(f"unparseable spec {raw!r} in {leg} — refusing")
+            specs[fields[0]] = (int(fields[1]), fields[2] if len(fields) > 2 else "")
+        if not specs:
+            raise DashboardError(f"{leg} watches no workflow at all — refusing")
+        return specs
+
     keepalive_script = _workflow_step_script(dashboard_workflow, "registry-keepalive")
-    spec_line = re.search(r"for spec in ([^\n]+); do", keepalive_script)
-    if spec_line is None:
-        raise DashboardError(
-            "cron-keepalive's spec list could not be located in the extracted step body — refusing "
-            "to assert against a keepalive whose watch list cannot be read (fail closed)")
-    keepalive_specs = {}
-    for raw in spec_line.group(1).split():
-        fields = raw.split(":")
-        if len(fields) not in (2, 3) or not fields[1].isdigit():
-            raise DashboardError(f"unparseable cron-keepalive spec {raw!r} — refusing")
-        keepalive_specs[fields[0]] = (int(fields[1]), fields[2] if len(fields) > 2 else "")
+    keepalive_specs = _keepalive_specs(keepalive_script, "cron-keepalive")
+    sparq_script = _workflow_step_script(dashboard_workflow, "sparq-keepalive-dispatch")
+    sparq_specs = _keepalive_specs(sparq_script, "the cross-repo cron-keepalive leg")
 
     # The floor module is the OTHER side of this wire contract. Loaded rather than restated, so the
     # marker name and the tick interval cannot drift out from under the threshold below.
@@ -2637,6 +3178,10 @@ case "${endpoint}" in
     jq -r "${filter}" < "${STUB_DIR}/artifacts.json"
     ;;
   *"/runs?per_page=30")
+    if [ "${STUB_LIVE_FAIL}" = 1 ]; then
+      printf 'gh-stub: live-run read failed\n' >&2
+      exit 1
+    fi
     wf="${endpoint#*/workflows/}"; wf="${wf%%/*}"
     jq -r "${filter}" < "${STUB_DIR}/live-${wf}.json"
     ;;
@@ -2658,11 +3203,14 @@ esac
     def _ka_run(age, status="completed"):
         return {"id": 1, "status": status, "conclusion": "success", "created_at": _ka_stamp(age)}
 
-    def run_keepalive_step(*, artifacts=(), runs=None, live=None, artifacts_fail=False):
-        """Execute the REAL cron-keepalive body. -> (exit code, [workflows kicked], log).
+    def run_keepalive_leg(script, specs, *, artifacts=(), runs=None, live=None,
+                          artifacts_fail=False, live_fail=False):
+        """Execute a REAL cron-keepalive leg body. -> (exit code, [dispatch argv], log).
 
         Every listed workflow defaults to one settled run a minute old and no live run, so a row
-        that says nothing about a workflow is asserting that leg stayed quiet."""
+        that says nothing about a workflow is asserting that leg stayed quiet. The dispatch argv is
+        returned WHOLE rather than reduced to workflow names, so a leg's target repository and ref
+        can be pinned by equality — the seam where a substring assertion goes vacuous."""
         runs, live = dict(runs or {}), dict(live or {})
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2673,7 +3221,7 @@ esac
             (binaries / "gh").chmod(0o755)
             (stubs / "artifacts.json").write_text(json.dumps({"artifacts": list(artifacts)}),
                                                   encoding="utf-8")
-            for workflow in keepalive_specs:
+            for workflow in specs:
                 (stubs / f"runs-{workflow}.json").write_text(
                     json.dumps({"workflow_runs": list(runs.get(workflow, [_ka_run(60)]))}),
                     encoding="utf-8")
@@ -2682,16 +3230,22 @@ esac
             calls = root / "calls"
             calls.write_text("", encoding="utf-8")
             completed = subprocess.run(
-                ["bash", "-c", keepalive_script], cwd=directory, capture_output=True, text=True,
+                ["bash", "-c", script], cwd=directory, capture_output=True, text=True,
                 timeout=120, check=False,
                 env=dict(os.environ,
                          PATH=f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
                          GITHUB_REPOSITORY="o/r", GH_TOKEN="stub",
                          STUB_DIR=str(stubs), STUB_CALLS=str(calls),
-                         STUB_ARTIFACTS_FAIL="1" if artifacts_fail else "0"))
-            kicked = sorted(re.findall(r"workflows/(\S+?)/dispatches",
-                                       calls.read_text(encoding="utf-8")))
-        return completed.returncode, kicked, completed.stdout + completed.stderr
+                         STUB_ARTIFACTS_FAIL="1" if artifacts_fail else "0",
+                         STUB_LIVE_FAIL="1" if live_fail else "0"))
+            dispatched = sorted(line for line in calls.read_text(encoding="utf-8").split("\n")
+                                if "/dispatches" in line)
+        return completed.returncode, dispatched, completed.stdout + completed.stderr
+
+    def run_keepalive_step(**fixtures):
+        """The REGISTRY leg, subject of the #922 rows. -> (exit code, [workflows kicked], log)."""
+        code, dispatched, log = run_keepalive_leg(keepalive_script, keepalive_specs, **fixtures)
+        return code, sorted(re.findall(r"workflows/(\S+?)/dispatches", "\n".join(dispatched))), log
 
     marker_name = tick_floor.TICK_MARKER_ARTIFACT
     dispatch_limit = keepalive_specs["dispatch.yml"][0]
@@ -2762,6 +3316,74 @@ esac
     keepalive_check(
         "[#922] control: a fleet that is fresh on BOTH anchors is kicked not at all",
         (code, kicked), (0, []), log)
+    # #559's guard has TWO live statuses and the row above exercises one. A guard narrowed to
+    # `.status == "in_progress"` leaves a QUEUED run — the run a kick most directly duplicates,
+    # because the singleton group then runs the pair back to back — kicked behind, which is the
+    # storm itself.
+    code, kicked, log = run_keepalive_step(
+        artifacts=[_ka_marker(dispatch_limit + 600)],
+        live={"dispatch.yml": [_ka_run(30, status="queued")]})
+    keepalive_check(
+        "[#559] a QUEUED run is live too — the guard reads 'not completed', not 'in_progress'",
+        (code, kicked), (0, []), log)
+    # ...and the guard's OWN fail-open, which nothing executed before: a live check that cannot be
+    # read must fall through to the age check. A guard that treats an unreadable read as "live"
+    # silences the whole keepalive on exactly the API blip it was added to survive.
+    code, kicked, log = run_keepalive_step(
+        artifacts=[_ka_marker(dispatch_limit + 600)], live_fail=True)
+    keepalive_check(
+        "[#559] FAIL-OPEN: an unreadable live-run check still consults age, and still kicks a "
+        "stale target", (code, kicked), (0, ["dispatch.yml"]), log)
+
+    # --- #559: the CROSS-REPO leg. It kicks sparq-org/sparq, where a dup-dispatch storm shows up in
+    # ANOTHER repo's telemetry entirely, and until now nothing executed it: the live-run guard, the
+    # target repository and the ref were all covered by `bash -n` and actionlint, neither of which
+    # can see any of the three. Same hermetic harness, same stubs — a leg of the mesh with no
+    # executable coverage is a leg that silently reverts.
+    # ------------------------------------------------------------------------------------------
+    sparq_target = "rearm-sweeper.yml"
+    check("[#559] the cross-repo leg watches exactly the one RUN-anchored spec these rows drive — "
+          "a second target, or a marker-anchored one (which this leg's 2-field `${spec##*:}` parse "
+          "cannot express), must go red here rather than ship untested",
+          {name: marker for name, (_limit, marker) in sparq_specs.items()},
+          {sparq_target: ""})
+    if sparq_target not in sparq_specs:
+        raise DashboardError(
+            f"the cross-repo keepalive leg no longer watches {sparq_target} — refusing: the #559 "
+            "rows below cannot be driven against a target that is not there, and a NAMED refusal "
+            "beats aborting the suite half-way through on a KeyError")
+    sparq_limit = sparq_specs[sparq_target][0]
+    # Pinned by EQUALITY, and deliberately not assembled from anything the body supplies: owner,
+    # repo and ref are the three values a mis-edit here would silently redirect (a kick at `master`
+    # on a `main`-default repo 404s and the sweeper simply stops being revived).
+    sparq_dispatch = ("api -X POST "
+                      f"repos/sparq-org/sparq/actions/workflows/{sparq_target}/dispatches "
+                      "-f ref=main")
+    code, dispatched, log = run_keepalive_leg(
+        sparq_script, sparq_specs, runs={sparq_target: [_ka_run(sparq_limit + 600)]})
+    keepalive_check(
+        "[#559] the cross-repo leg kicks a stale sparq sweeper — at sparq-org/sparq, on `main`",
+        (code, dispatched), (0, [sparq_dispatch]), log)
+    for status in ("queued", "in_progress"):
+        code, dispatched, log = run_keepalive_leg(
+            sparq_script, sparq_specs,
+            runs={sparq_target: [_ka_run(sparq_limit + 600)]},
+            live={sparq_target: [_ka_run(30, status=status)]})
+        keepalive_check(
+            f"[#559] ...but never behind a run whose status is {status}: an ancient run listing is "
+            "NOT stale while that run is still live, which is the cancel-storm this guard ends",
+            (code, dispatched), (0, []), log)
+    code, dispatched, log = run_keepalive_leg(
+        sparq_script, sparq_specs, runs={sparq_target: [_ka_run(sparq_limit + 600)]},
+        live_fail=True)
+    keepalive_check(
+        "[#559] FAIL-OPEN cross-repo too: an unreadable live check falls through to the age check "
+        "rather than wedging the sweeper's only fallback shut",
+        (code, dispatched), (0, [sparq_dispatch]), log)
+    code, dispatched, log = run_keepalive_leg(sparq_script, sparq_specs)
+    keepalive_check(
+        "[#559] control: a sweeper that ran inside its threshold is not kicked at all — the leg is "
+        "not simply dispatching on every fire", (code, dispatched), (0, []), log)
 
     # --- #612 review round 2, finding 5 (MINOR): the successful CLI -> builder handoff. Deleting
     # `probe_status=probe_status` from main()'s build_dashboard call left every direct-builder test
@@ -3058,11 +3680,11 @@ const degraded = (node) =>
         "flow": {"queue": [{"class": "2a", "depth": 1, "oldest_age_minutes": 12.34},
                            {"class": "4", "depth": 9, "oldest_age_minutes": 3},
                            {"class": "9z", "depth": 1}],
-                 "leases": [{"label": "ab12cd34", "provider": "anthropic",
+                 "leases": [{"label": "ab12cd340a5f9e71", "provider": "anthropic",
                              "utilization_1h": 0.8},
-                            {"label": "ef56ab78", "provider": "anthropic",
+                            {"label": "ef56ab78b3c2d104", "provider": "anthropic",
                              "utilization_1h": 0.4},
-                            {"label": "cd90ef12", "provider": "openai"}],
+                            {"label": "cd90ef1276a8b535", "provider": "openai"}],
                  "review_rounds": {"mean": 1.44444, "max": 3, "budget_exhausted_1h": 0},
                  "parks_1h": {"needs_user": 2, "needs_orchestrator": 1},
                  "arm_to_merge_minutes_24h": {"p50": 18, "p90": 55.5, "samples": 9},
@@ -3109,14 +3731,37 @@ const degraded = (node) =>
         "thresholds": {"workflow_failure_rate": 0.5, "defer_reason_hourly": 4,
                        "queue_age_clamp_minutes": 10, "merge_stall_minutes": 90},
     }
+
+    class ObsRefusal(dict):
+        """A FATAL `_normalize_observability` refusal rendered as a value instead of an exception.
+
+        The rows below hand this seam whole documents and then subscript the result, so a refusal
+        raised out of any one of them aborts every check after it — the crash-after-partial-run
+        shape (AGENTS.md, AUTHOR pre-flight item 4), which records as a kill while the rest of the
+        suite never ran. It measured as exactly that here: narrowing OBS_SALTED_LABEL_RE back to
+        the pre-#375 8-hex width took the run from 214 checks to 181 with no named row. A dict, so
+        subscript chains keep working (any missing key yields the refusal itself), carrying the
+        message and equal to nothing any row expects — one named red row, suite intact.
+        Rows that assert a refusal IS raised keep their own try/except and do not use this.
+        """
+
+        def __missing__(self, _key):
+            return self
+
+    def obs_normalized(document):
+        try:
+            return _normalize_observability(document)
+        except DashboardError as error:
+            return ObsRefusal(refused=str(error))
+
     check("observability golden normalization (bad rows dropped, top-N sorted, links pinned)",
-          _normalize_observability(obs_fixture), obs_expected)
+          obs_normalized(obs_fixture), obs_expected)
     check("absent observability snapshot stays hidden (None)",
           _normalize_observability(None), None)
     overflow = copy.deepcopy(obs_fixture)
     overflow["flow"]["review_rounds"]["mean"] = 1e309       # JSON 1e309 decodes to +Infinity
     overflow["thresholds"]["workflow_failure_rate"] = 1e309
-    overflow_normalized = _normalize_observability(overflow)
+    overflow_normalized = obs_normalized(overflow)
     check("non-finite review-round mean is rejected, never published",
           overflow_normalized["flow"]["review_rounds"]["mean"], None)
     check("non-finite threshold is dropped, never published",
@@ -3145,18 +3790,42 @@ const degraded = (node) =>
     def obs_leases(rows):
         fixture = copy.deepcopy(obs_fixture)
         fixture["flow"]["leases"] = rows
-        return _normalize_observability(fixture)["flow"]
+        return obs_normalized(fixture)["flow"]
 
-    one_lease = obs_leases([{"label": "ab12cd34", "provider": "anthropic",
+    one_lease = obs_leases([{"label": "ab12cd340a5f9e71", "provider": "anthropic",
                              "utilization_1h": 0.5}])
-    four_leases = obs_leases([{"label": f"ab12cd3{index}", "provider": "anthropic",
+    four_leases = obs_leases([{"label": f"ab12cd340a5f9e7{index}", "provider": "anthropic",
                                "utilization_1h": 0.5} for index in range(4)])
     check("[#374] lease rows of different fleet sizes normalize to the same published flow",
           (one_lease, one_lease == four_leases,
-           "ab12cd34" in json.dumps(one_lease)),
+           "ab12cd340a5f9e71" in json.dumps(one_lease)),
           (four_leases, True, False))
     check("[#374] no reported lease utilization publishes nothing rather than a zero",
           obs_leases([])["lease_utilization_1h"], None)
+    # ---- [#375] the salted label IS the canonical account fingerprint, sha256(handle:salt)[:16]
+    # (locked decision 22a). Pre-#375 this seam validated an 8-hex shape that NOTHING in this repo
+    # produces, so a collector handing over the same fingerprint model-health / worker-pr / the
+    # lease ledger all carry would have failed the build, while a truncated half of one was waved
+    # through as "salted". The accept row derives its label from the canonical implementation
+    # rather than from a literal, so a shortening on EITHER side of the wire turns it red.
+    canonical_label = _model_health_module().account_hash("acct-obs-375", "fixture-salt")
+    canonical_flow = obs_leases([{"label": canonical_label, "provider": "anthropic",
+                                  "utilization_1h": 0.5}])
+    check("[#375] the CANONICAL salted fingerprint (model-health.account_hash) is the accepted "
+          "lease label, and its row is really consumed rather than merely tolerated",
+          (len(canonical_label), canonical_flow["lease_utilization_1h"]),
+          (16, {"mean": 0.5, "max": 0.5}))
+    # ...and the pre-#375 8-hex format is now fatal rather than a second accepted identity shape.
+    # Widening the pattern back to `{8}` kills the row above; widening it to `{8,16}`/`{8,}` — the
+    # tempting "accept both" — is what these rows exist to kill, so they assert REJECTION.
+    for case, bad_label in (("the pre-#375 8-hex format", "ab12cd34"),
+                            ("the canonical fingerprint truncated to 8 hex", canonical_label[:8]),
+                            ("a 15-hex near-miss", canonical_label[:15]),
+                            ("a 17-hex overrun", canonical_label + "0")):
+        mis_shaped = copy.deepcopy(obs_fixture)
+        mis_shaped["flow"]["leases"][0]["label"] = bad_label
+        check(f"[#375] {case} is a fatal decision-22 violation, never a second accepted format",
+              _raises_dashboard(lambda: _normalize_observability(mis_shaped)), True)
     # ---- [#841] the ROW-FREE collector contract. #374 stopped this build PUBLISHING the rows; it
     # did not stop them EXISTING at data/observability.json on the public `ledger` branch. So the
     # aggregate is accepted directly and a collector need write no per-account rows anywhere.
@@ -3164,7 +3833,7 @@ const degraded = (node) =>
         fixture = copy.deepcopy(obs_fixture)
         fixture["flow"].pop("leases", None)          # the collector sends NO per-account rows
         fixture["flow"]["lease_utilization_1h"] = aggregate
-        return _normalize_observability(fixture)["flow"]["lease_utilization_1h"]
+        return obs_normalized(fixture)["flow"]["lease_utilization_1h"]
 
     check("[#841] a collector that sends NO lease rows still publishes the aggregate it computed",
           obs_flow_without_rows({"mean": 0.31, "max": 0.77}), {"mean": 0.31, "max": 0.77})
@@ -3174,22 +3843,22 @@ const degraded = (node) =>
     both = copy.deepcopy(obs_fixture)
     both["flow"]["lease_utilization_1h"] = {"mean": 0.99, "max": 0.99}
     check("[#841] lease ROWS outrank a collector-supplied aggregate (no silent override)",
-          _normalize_observability(both)["flow"]["lease_utilization_1h"],
+          obs_normalized(both)["flow"]["lease_utilization_1h"],
           {"mean": 0.6, "max": 0.8})
     # ...and precedence keys on the legacy KEY, not on a row happening to parse. Rows that are
     # present but report no usable utilization published null pre-#841 and must still publish null:
     # make the fallback conditional on `lease_utilizations` instead and these become {0.99, 0.99},
     # i.e. the new key overriding a legacy source that was sent.
     for case, rows in (
-        ("no utilization field", [{"label": "ab12cd34", "provider": "anthropic"}]),
-        ("malformed utilization", [{"label": "ab12cd34", "provider": "anthropic",
+        ("no utilization field", [{"label": "ab12cd340a5f9e71", "provider": "anthropic"}]),
+        ("malformed utilization", [{"label": "ab12cd340a5f9e71", "provider": "anthropic",
                                     "utilization_1h": "busy"}]),
         ("zero rows", []),
     ):
         unparseable = copy.deepcopy(both)
         unparseable["flow"]["leases"] = rows
         check(f"[#841] legacy rows with {case} keep their pre-#841 null, aggregate or not",
-              _normalize_observability(unparseable)["flow"]["lease_utilization_1h"], None)
+              obs_normalized(unparseable)["flow"]["lease_utilization_1h"], None)
     # ...and sending the aggregate is NOT a way around the decision-22 check on the rows that ARE
     # present. Make the label check conditional on the rows being used and this normalizes happily.
     both_raw = copy.deepcopy(both)
@@ -3211,8 +3880,11 @@ const degraded = (node) =>
     ):
         check(f"[#841] {case} collector aggregate is dropped, never published",
               obs_flow_without_rows(aggregate), None)
-    with_observability = build_dashboard(
-        issues, leases, usage, history, None, now, "fixture-salt", observability=obs_fixture)
+    try:
+        with_observability = build_dashboard(
+            issues, leases, usage, history, None, now, "fixture-salt", observability=obs_fixture)
+    except DashboardError as error:                 # same crash-after-partial-run guard as above
+        with_observability = ObsRefusal(refused=str(error))
     check("build_dashboard publishes the normalized observability key",
           with_observability.get("observability"), obs_expected)
     check("no observability input leaves data.json without the key (panel hidden)",

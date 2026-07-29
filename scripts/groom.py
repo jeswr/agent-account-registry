@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# [GPT-5.6] REG-5 fail-closed maintenance sweep for the private-registry orchestrator.
+# [GPT-5.6] REG-5 fail-closed maintenance sweep for the registry orchestrator.
 """Reclaim dead worker leases and conservatively repair target orchestration state.
 
 The live path uses deliberately separate credentials: ``REGISTRY_GH_TOKEN`` may only update the
-private registry lease ledger and inspect registry Actions runs, while ``TARGET_GH_TOKENS`` is a
+registry lease ledger and inspect registry Actions runs, while ``TARGET_GH_TOKENS`` is a
 JSON ``{owner: token}`` map of per-owner target-scoped GitHub App tokens used for issue and
 pull-request reads/writes — one token per enabled-policy owner, so a target under a second owner is
 never read or written with the wrong owner's token (issue #168: a single sparq-org-scoped token
@@ -97,7 +97,19 @@ HOLDER = re.compile(
     r"(?P<repo>[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)"
     r"#(?P<issue>[1-9][0-9]*)@(?P<run>[^\r\n]+)"
 )
-WORKER_RUN_NAME = re.compile(r"worker claim=(?P<claim>[0-9a-f]{32}|self)")
+# WORKFLOW SEAM (#1130): this parses a string ANOTHER file renders — worker.yml's `run-name:`,
+# `worker <target_repo> claim=<id>`. The target segment was added for the throughput-metrics
+# collector (scripts/metrics.py reads the same shape) and this pattern did not follow, so
+# `.fullmatch` matched NO real worker run title: every claim read as uncorrelated, the walk in
+# _correlate_claim_runs never took its early return, and classify_lease lost the exact run
+# evidence it exists to use. The target segment is OPTIONAL because the walk pages back through
+# up to WORKER_RUN_PAGE_CEILING x 100 runs of history, which reaches runs named before that
+# change; the claim id is the correlation key either way. _self_test renders worker.yml's OWN
+# run-name and asserts this matches it, so the next run-name edit reds instead of silently
+# disabling the correlation.
+WORKER_RUN_NAME = re.compile(
+    r"worker (?:(?P<target>\S+) )?claim=(?P<claim>[0-9a-f]{32}|self)"
+)
 # Cross-provider review/fix repair leases (dispatch-claim prefixes `review:` / `fix:`) carry no
 # target-issue holder; they are TTL-managed by groom-leases. Groom must SKIP them, never
 # issue-map them, and never fail the whole sweep on their holder shape (live incident
@@ -1075,16 +1087,20 @@ class GitHubAPI:
             except HTTPError as exc:
                 if allow_404 and exc.code == 404:
                     return None
-                if retry_conflict and exc.code in {409, 422}:
+                # Issue #647: report WHY. This exception is the only witness a per-object write
+                # failure ever gets, and the loops that call it now defer per object instead of
+                # aborting the sweep — a deferral whose cause is "HTTP 403" and nothing else is
+                # the #644 discarded-cause defect wearing a different hat. Read HERE, before the
+                # branches below: `exc.read()` is single-shot, and issue #240's 422 classifier
+                # needs the same envelope the fail-loud raise reports.
+                detail = _http_failure_detail(exc, self._token)
+                if retry_conflict and _is_cas_conflict(
+                    exc.code, detail, create=_is_create_put(method, body)
+                ):
                     raise GroomConflict("lease ledger compare-and-swap conflict") from exc
                 if retryable and exc.code in _TRANSIENT_HTTP and attempt < _TRANSIENT_RETRIES:
                     _sleep_transient(attempt, _retry_after_seconds(exc.headers))
                     continue
-                # Issue #647: report WHY. This exception is the only witness a per-object write
-                # failure ever gets, and the loops that call it now defer per object instead of
-                # aborting the sweep — a deferral whose cause is "HTTP 403" and nothing else is
-                # the #644 discarded-cause defect wearing a different hat.
-                detail = _http_failure_detail(exc, self._token)
                 raise GroomError(
                     f"{self._purpose} GitHub API {method} failed with HTTP {exc.code}"
                     + (f": {detail}" if detail else "")
@@ -1328,13 +1344,53 @@ def _sleep_backoff(attempt: int) -> None:
     time.sleep(random.uniform(0, _backoff_ceiling(attempt)))
 
 
+# ---- which failures the caller's CAS re-read loop owns (issue #240) -----------------------------
+# `retry_conflict` used to read EVERY HTTP 422 as lost contention, so an ordinary request-validation
+# failure (bad payload, missing branch) was retried until `_release_claims` exhausted its attempts
+# and reported "lease ledger CAS conflicts did not settle" — GitHub's real cause discarded on the
+# way, which is the #644/#647 lost-diagnostic defect wearing a third hat.
+#
+# HTTP 409 is always a lost-SHA race. A 422 is one in exactly ONE shape: a sha-less
+# create-if-absent PUT whose file appeared concurrently, which the contents API answers with
+# 'Invalid request.\n\n"sha" wasn't supplied.'. That is the same narrowing PR #229 applied to
+# select-and-claim's `_is_cas_conflict`, and the signature is taken from the SHARED ledger_retry
+# policy so the two ledger writers cannot drift apart on it.
+_ledger_retry = _load_module(
+    Path(__file__).resolve().with_name("ledger_retry.py"), "registry_ledger_retry"
+)
+_CREATE_RACE_SIGNATURE = _ledger_retry.CREATE_RACE_SIGNATURE
+
+
+def _is_create_put(method: str, body: Any) -> bool:
+    """True for the contents-API CREATE-IF-ABSENT form: a PUT carrying no `sha` (`ledger_put_body`
+    omits it when the ledger file was 404 on a present branch). Only that form can lose the create
+    race — an update PUT already names the revision it expects, so its 422 is validation."""
+    return method.upper() == "PUT" and not (isinstance(body, dict) and body.get("sha"))
+
+
+def _is_cas_conflict(code: int, detail: str, *, create: bool) -> bool:
+    """True only for a compare-and-swap race the caller's ledger re-read loop owns.
+
+    `detail` is GitHub's error envelope exactly as `_http_failure_detail` returns it: raw JSON
+    SOURCE, never parsed (it is a diagnostic), so the message's inner quotes arrive backslash-
+    escaped as ``\\"sha\\"`` — the backslashes are dropped before matching so the one shared
+    signature string stays the single source of truth. A `detail` bounded short of the signature
+    simply fails LOUD, which is the safe direction: the next scheduled sweep re-reads the ledger,
+    whereas a mis-classified validation error spins the retry loop to the same failure.
+    """
+    if code == 409:
+        return True
+    return code == 422 and create and _CREATE_RACE_SIGNATURE in (detail or "").replace("\\", "")
+
+
 # ---- transient-network retry (issue #494) -------------------------------------------------------
 # A scheduled sweep died on a raw http.client.RemoteDisconnected out of api.paginate -> request():
 # one transient TCP hiccup killed the ENTIRE hygiene pass, and groom's O(issues) comment fetches
 # (#36) maximise the exposure. request() now retries only genuinely TRANSIENT failures — the
 # RemoteDisconnected / ConnectionReset / timeout family and 502/503/504 — with bounded full-jitter
 # backoff, honouring a (capped) Retry-After. It still fails closed on every 4xx (auth/permission)
-# and on the 409/422 CAS conflict, which has its own caller-owned ledger re-read loop.
+# and on a CAS conflict (409, or the create-race 422 above), which has its own caller-owned ledger
+# re-read loop.
 #
 # Retries apply ONLY to reads. A dropped connection or gateway 5xx on a mutation does not prove
 # GitHub skipped the attempt — replaying a POST duplicates comments and replaying a PATCH/PUT can
@@ -1418,6 +1474,203 @@ def _release_claims(
                 print(f"WRITE lease release claim={claim[:8]}")
             return len(present)
     raise GroomError("lease ledger CAS conflicts did not settle")
+
+
+# ---- burned account-slot report (issue #245) ----------------------------------------------------
+#
+# `set-up-account` takes ATOMIC ownership of an account slot by creating `refs/acct-claims/acctNN`
+# BEFORE the `gh secret set` upsert (#186, hardened after review round 1 of #236), and a run that
+# fails AFTER claiming deliberately PRESERVES its claim: the slot is burned, never reused, because
+# releasing it would let a different credential overwrite an in-flight one — exactly the race the
+# claim exists to close. The manual runbook in README.md observes the same protocol.
+#
+# Burned slots are therefore SAFE but INVISIBLE — nothing ever counted them, so a broker whose
+# enrolments keep failing burns numbers indefinitely with no signal. This report names them.
+#
+# DELIBERATELY REPORT-ONLY, and deliberately in groom (the maintenance sweep) rather than in the
+# broker: it never deletes a claim ref and offers no opt-in mode that would, because deletion
+# re-opens the credential-overwrite race the claim closes.
+#
+# PRIVACY (locked decision 22b — public logs never carry an account handle): an ORPHANED slot names
+# NO account. Carrying neither an acctNN issue nor an ACCTNN_TOKEN secret is precisely what makes it
+# orphaned, so there is no account, no credential and no usage to correlate it with, and the claim
+# ref it names is already a world-readable git ref on this PUBLIC repo. Slots that DO back an
+# account are only ever COUNTED here, never named.
+ACCT_CLAIM_REF_RE = re.compile(r"^refs/acct-claims/acct([0-9]+)$")
+ACCT_ISSUE_TITLE_RE = re.compile(r"^acct([0-9]+)$")
+ACCT_SECRET_NAME_RE = re.compile(r"^ACCT([0-9]+)_TOKEN$")
+# The names-only ACCTNN_TOKEN inventory groom.yml's least-exposure filter step derives from the
+# job's `toJSON(secrets)` context (dispatch.yml's `acct-secrets` pattern): only that tiny inline
+# step ever sees the secrets map, and only NAMES reach this process.
+ACCT_SECRET_NAMES_ENV = "ACCT_SECRET_NAMES"
+ORPHAN_CLAIM_NOTE = (
+    "ORPHAN-CLAIMS report-only — NEVER delete a claim ref: a burned slot is harmless, while "
+    "recycling its number re-opens the credential-overwrite race the claim closes "
+    "(`gh secret set` is an upsert, and GitHub does not enforce unique issue titles)."
+)
+
+
+def claim_ref_slots(refs: Any) -> dict[int, str]:
+    """Pure: {slot number: ref} for every `refs/acct-claims/acctNN` in a matching-refs payload.
+
+    FAIL CLOSED on a malformed payload instead of returning whatever parsed. A silently short
+    CLAIM listing under-reports burned slots; a silently short issue/secret listing OVER-reports
+    them, and naming a live credential's slot as burned is what would invite a maintainer to
+    "clean up" the very ref protecting it.
+
+    An AMBIGUOUS listing fails closed for the same reason (review round 1 of #1167). Refs are
+    distinct as STRINGS but this map — like every allocation reader in the estate — keys on the
+    NUMBER, so `acct1` and `acct01` are two real claims and one key. Keeping the last writer would
+    silently drop the other from `claims=`, from `burned=` and from the named rows, which is
+    exactly the short claim listing this function exists to refuse."""
+    if not isinstance(refs, list):
+        raise GroomError("acct-claims ref listing is malformed")
+    slots: dict[int, str] = {}
+    for entry in refs:
+        ref = entry.get("ref") if isinstance(entry, dict) else None
+        if not isinstance(ref, str):
+            raise GroomError("acct-claims ref listing is malformed")
+        match = ACCT_CLAIM_REF_RE.match(ref)
+        if match:
+            slot = int(match.group(1))
+            if slot in slots:
+                # Deliberately names NEITHER ref NOR slot number, matching the messages above:
+                # locked decision 22b keeps account-backed slots counted, never named.
+                raise GroomError(
+                    "acct-claims ref listing is ambiguous — two distinct refs name the same "
+                    "account slot number"
+                )
+            slots[slot] = ref
+    return slots
+
+
+def account_issue_slots(issues: Any) -> set[int]:
+    """Pure: slot numbers of `acctNN` ACCOUNT ISSUES in ANY state, from an /issues payload.
+
+    Pull requests are skipped — /issues returns both, and a PR titled `acctNN` is not an account
+    record (the same `select(has("pull_request") | not)` filter the broker's slot union applies).
+    Closed and retired account issues DO count: their numbers stay permanently reserved, so a
+    claim behind one is allocated, not burned."""
+    if not isinstance(issues, list):
+        raise GroomError("account issue listing is malformed")
+    slots: set[int] = set()
+    for item in issues:
+        if not isinstance(item, dict):
+            raise GroomError("account issue listing is malformed")
+        if "pull_request" in item:
+            continue
+        title = item.get("title")
+        if not isinstance(title, str):
+            raise GroomError("account issue listing is malformed")
+        match = ACCT_ISSUE_TITLE_RE.match(title)
+        if match:
+            slots.add(int(match.group(1)))
+    return slots
+
+
+def account_secret_slots(names: Any) -> set[int]:
+    """Pure: slot numbers of the `ACCTNN_TOKEN` names in the derived secret inventory."""
+    if not isinstance(names, list):
+        raise GroomError(f"{ACCT_SECRET_NAMES_ENV} is malformed")
+    slots: set[int] = set()
+    for name in names:
+        if not isinstance(name, str):
+            raise GroomError(f"{ACCT_SECRET_NAMES_ENV} is malformed")
+        match = ACCT_SECRET_NAME_RE.match(name)
+        if match:
+            slots.add(int(match.group(1)))
+    return slots
+
+
+def parse_acct_secret_names(raw: Any) -> list[str]:
+    """Pure: the ACCTNN_TOKEN secret NAMES groom.yml's least-exposure filter derived from the
+    job's secrets context, as a JSON array of strings.
+
+    FAIL CLOSED on absent, blank or malformed input. Without a PROVEN secret inventory a slot
+    holding a live credential is indistinguishable from a burned one, so an unproven "no secret"
+    would report live slots as burned — the one wrong answer that could get a real credential's
+    claim ref deleted. An empty array is a PROVEN-empty inventory and is accepted."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise GroomError(
+            f"{ACCT_SECRET_NAMES_ENV} is unset or empty, so no ACCTNN_TOKEN secret can be proven "
+            "absent — refusing to report any slot as burned (fail closed)"
+        )
+    try:
+        names = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise GroomError(
+            f"{ACCT_SECRET_NAMES_ENV} is not valid JSON — refusing to report any slot as burned "
+            "(fail closed)"
+        ) from exc
+    if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+        raise GroomError(
+            f"{ACCT_SECRET_NAMES_ENV} is not a JSON array of secret names — refusing to report "
+            "any slot as burned (fail closed)"
+        )
+    return names
+
+
+def orphaned_claim_slots(
+    claims: dict[int, str] | set[int], issue_slots: set[int], secret_slots: set[int]
+) -> list[int]:
+    """Pure: sorted slots that own a claim ref but carry NEITHER an acctNN issue NOR an
+    ACCTNN_TOKEN secret — the slots a failed enrolment burned.
+
+    Both exclusions are load-bearing. A claim + secret with no issue is a STORED CREDENTIAL (the
+    enrolment died between the upsert and the issue), not a burned slot; a claim + issue with no
+    secret is an account mid-enrolment. Neither is free, and neither is what this reports.
+    Slots with an issue or a secret but NO claim are the legacy/out-of-band numbers the namespace
+    was never backfilled for — allocated, not burned, and outside this report."""
+    return sorted(set(claims) - issue_slots - secret_slots)
+
+
+def format_orphan_claim_report(
+    claims: dict[int, str], issue_slots: set[int], secret_slots: set[int]
+) -> list[str]:
+    """Pure: the report lines. One counted summary, one named line per burned slot."""
+    orphans = orphaned_claim_slots(claims, issue_slots, secret_slots)
+    lines = [
+        f"ORPHAN-CLAIMS claims={len(claims)} account_issues={len(issue_slots)} "
+        f"account_secrets={len(secret_slots)} burned={len(orphans)}"
+    ]
+    for slot in orphans:
+        lines.append(
+            f"ORPHAN-CLAIM {claims[slot]}: slot claimed, but no acct{slot:02d} issue and no "
+            f"ACCT{slot:02d}_TOKEN secret exist — burned by a failed enrolment"
+        )
+    lines.append(
+        ORPHAN_CLAIM_NOTE
+        if orphans
+        else "ORPHAN-CLAIMS none — every claimed slot has an account issue or a stored credential"
+    )
+    return lines
+
+
+def report_orphan_claims(args: argparse.Namespace) -> int:
+    """Report the burned account slots. READ-ONLY: three listings and a print, no mutation.
+
+    The secret inventory is resolved FIRST and fails closed, so a run that cannot prove which
+    ACCTNN_TOKEN secrets exist refuses before it reads anything else — it never degrades into
+    reporting every claimed slot as burned."""
+    registry_repo = args.registry_repo
+    if SAFE_REPO.fullmatch(registry_repo) is None:
+        raise GroomError("registry repo must be a safe owner/name")
+    secret_slots = account_secret_slots(
+        parse_acct_secret_names(os.environ.get(ACCT_SECRET_NAMES_ENV))
+    )
+    api = GitHubAPI(os.environ.get("REGISTRY_GH_TOKEN", ""), "registry")
+    # Both listings are FULLY PAGINATED, for the reason the broker's union is: a capped page
+    # silently drops account issues (over-reporting burned slots) or claim refs (under-reporting
+    # them). A listing that fails raises — the report refuses rather than guessing.
+    claims = claim_ref_slots(
+        api.paginate(f"/repos/{registry_repo}/git/matching-refs/acct-claims/")
+    )
+    issue_slots = account_issue_slots(
+        api.paginate(f"/repos/{registry_repo}/issues?state=all")
+    )
+    for line in format_orphan_claim_report(claims, issue_slots, secret_slots):
+        print(line)
+    return 0
 
 
 def _labels(item: dict[str, Any], where: str) -> set[str]:
@@ -3338,6 +3591,101 @@ def _self_test() -> int:
         "live",
     )
 
+    # ---- YAML seam: WORKER_RUN_NAME vs the title worker.yml actually renders (issue #1130) ----
+    # A regex over a string another file produces drifts silently the moment that file changes:
+    # `${{ inputs.target_repo }}` was added to worker.yml's run-name and this pattern did not
+    # follow, so the claim->run correlation matched nothing for months while the fixture-based
+    # checks below (which rendered their OWN title) stayed green. Render worker.yml's own
+    # `run-name:` and require a match. A missing/unparsable workflow raises — fail closed, never
+    # a skipped check.
+    #
+    # The RENDERER is imported, not written here (#1144): select-and-claim.py needed the identical
+    # seam for review-fix.yml and hand-wrote a second copy, and metrics.py — which reads the same
+    # two run-names for target attribution — had none at all. `run_name_grammar.py` is the one
+    # definition all three now share, and its own self-test reds if any of them re-declares a
+    # reader locally. Imported HERE rather than at module scope: groom's production sweep must not
+    # gain a new import-time dependency for a check only the self-test runs.
+    _grammar_spec = importlib.util.spec_from_file_location(
+        "registry_run_name_grammar", Path(__file__).resolve().with_name("run_name_grammar.py")
+    )
+    assert _grammar_spec and _grammar_spec.loader, "run_name_grammar.py is missing"
+    run_name_grammar = importlib.util.module_from_spec(_grammar_spec)
+    _grammar_spec.loader.exec_module(run_name_grammar)
+    _lane = run_name_grammar.WORKER_LANE
+    # An expression with no registered sample is REPORTED here and also renders to a sentinel that
+    # matches no grammar, so a new or renamed workflow input reds the seam twice over rather than
+    # quietly rendering to nothing.
+    _rendering = run_name_grammar.render_lane(_lane)
+    _rendered = _rendering.text
+    check(
+        "[#1130] every worker.yml run-name expression has a known rendering",
+        _rendering.unknown,
+        (),
+    )
+    check(
+        "[#1130] the render is not vacuous — every sample value reached the title",
+        _rendering.reached,
+        tuple(sorted(_lane.samples.values())),
+    )
+
+    def _matched_claim(title: str) -> str | None:
+        # None-safe: a regression here must report a readable FAIL, not abort the whole suite.
+        match = WORKER_RUN_NAME.fullmatch(title)
+        return match.group("claim") if match else None
+
+    _seam = WORKER_RUN_NAME.fullmatch(_rendered)
+    check(
+        "[#1130] WORKER_RUN_NAME fullmatches worker.yml's OWN rendered run-name",
+        _seam is not None and _seam.group("claim") == _lane.claim,
+        True,
+    )
+    # Second anchor: display_title values measured off the live runs API (#1130). Independent of
+    # the render above, so a run-name edit that is mirrored into BOTH still has to face reality.
+    for _measured, _claim in (
+        ("worker jeswr/agent-account-registry claim=f45ca53d124d4127b9279a7998e3303d",
+         "f45ca53d124d4127b9279a7998e3303d"),
+        ("worker sparq-org/sparq claim=e84718f205574e3fa4a1724912625e64",
+         "e84718f205574e3fa4a1724912625e64"),
+    ):
+        _m = WORKER_RUN_NAME.fullmatch(_measured)
+        check(
+            f"[#1130] live worker run title correlates: {_measured}",
+            _m is not None and _m.group("claim") == _claim,
+            True,
+        )
+    check(
+        "MUTATION: the target-less pattern matches NO live worker title (the #1130 defect)",
+        re.compile(r"worker claim=(?P<claim>[0-9a-f]{32}|self)").fullmatch(
+            "worker sparq-org/sparq claim=" + "f" * 32),
+        None,
+    )
+    check(
+        "[#1130] a pre-change (target-less) history title still correlates",
+        _matched_claim("worker claim=" + "a" * 32),
+        "a" * 32,
+    )
+    check(
+        "a self-dispatch run is matched but carries no claim",
+        _matched_claim("worker sparq-org/sparq claim=self"),
+        "self",
+    )
+    # The widened pattern must still be a PARSE, not a wildcard: a malformed claim id, a trailing
+    # suffix, or another lane's run must never correlate to a lease.
+    for _reject in (
+        "worker sparq-org/sparq claim=not-a-claim-id",
+        "worker sparq-org/sparq claim=" + "A" * 32,          # hex is lower-case only
+        "worker sparq-org/sparq claim=" + "a" * 31,
+        "worker sparq-org/sparq claim=" + "a" * 32 + " [resume]",
+        "worker sparq-org/sparq owner/other claim=" + "a" * 32,
+        "review-fix review sparq-org/sparq claim=" + "a" * 32,
+        "not-worker sparq-org/sparq claim=" + "a" * 32,
+    ):
+        check(
+            f"a non-worker-claim title never correlates: {_reject}",
+            WORKER_RUN_NAME.fullmatch(_reject),
+            None,
+        )
+
     # ---- _correlate_claim_runs: page the worker-run history, never just newest-100 (issue #173) ----
     # A dispatcher-held live lease whose worker run has aged off page 1 must still be correlated;
     # reading only the newest page would classify it dead on its timeout and reset a live worker.
@@ -3345,8 +3693,11 @@ def _self_test() -> int:
         return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
 
     def _worker_run(claim: str, created: int, status: str = "in_progress") -> dict[str, Any]:
+        # The REAL title shape worker.yml renders (#1130) — the target repo sits between the lane
+        # name and `claim=`. This fixture carried the target-less shape, which is why every
+        # correlation check below stayed green while the live correlation matched nothing.
         return {"status": status, "created_at": _iso(created),
-                "display_title": f"worker claim={claim}"}
+                "display_title": f"worker sparq-org/sparq claim={claim}"}
 
     # Fillers newer than the live lease's issuance, filling page 1 exactly (100) so the walk must
     # continue; none of them is the target claim.
@@ -5690,6 +6041,118 @@ def _self_test() -> int:
             patch_loud = "503" in str(exc)
         check("transient 503 on a PATCH is not replayed (fails loud, one attempt)",
               (patch_loud, calls["n"], transient_sleeps), (True, 1, []))
+
+        # ---- #240: a 422 is a CAS conflict ONLY in the create-race shape ----
+        # `retry_conflict` used to classify EVERY 422 as contention, so a request-VALIDATION 422
+        # was retried until _release_claims exhausted its attempts and reported "did not settle"
+        # with GitHub's real cause thrown away. These drive the REAL request(); widen the
+        # classifier back to `exc.code in {409, 422}` and the three fail-loud checks red, narrow
+        # it further (drop the 422 arm entirely) and the create-race check reds.
+        #
+        # The envelopes are GitHub's RAW answers — JSON SOURCE, so the message's inner quotes are
+        # backslash-escaped, which is precisely what the classifier has to cope with.
+        create_race_body = (
+            b'{"message":"Invalid request.\\n\\n\\"sha\\" wasn\'t supplied.",'
+            b'"documentation_url":"https://docs.github.com/rest/repos/contents"}'
+        )
+        validation_body = b'{"message":"Invalid request.\\n\\n\\"branch\\" wasn\'t supplied."}'
+        ledger_path = f"/repos/o/r/contents/{LEDGER_PATH}"
+        create_put = ledger_put_body("m", "e", None)     # sha-less: the create-if-absent form
+        update_put = ledger_put_body("m", "e", "sha1")   # sha-bearing: an update
+        check("the create/update PUT shapes under test really do differ by `sha`",
+              ("sha" in create_put, update_put.get("sha")), (False, "sha1"))
+
+        def _refusing(code, body_bytes):
+            def _raise(_request, timeout=None):
+                calls["n"] += 1
+                raise HTTPError("https://x", code, "Unprocessable Entity", {},
+                                io.BytesIO(body_bytes))
+            return _raise
+
+        # A distinct client: the shared `api` above holds the one-character token "t", and the
+        # credential mask would replace every "t" in the envelope — including the signature's own.
+        cas_api = GitHubAPI("CAS-SELFTEST-TOKEN", "registry")
+
+        def _classify(stub, put_body, retry_conflict=True):
+            """Run the LIVE request() against `stub` and report how it classified the failure."""
+            globals()["urlopen"] = stub
+            try:
+                cas_api.request("PUT", ledger_path, put_body, retry_conflict=retry_conflict)
+            except GroomConflict:
+                return "conflict"
+            except GroomError as exc:
+                return str(exc)
+            return "no error at all"
+
+        check(
+            "#240: the create-race 422 on a sha-less ledger PUT is still the retryable CAS "
+            "conflict the caller's re-read loop owns",
+            _classify(_refusing(422, create_race_body), create_put),
+            "conflict",
+        )
+        check(
+            "#240: a request-VALIDATION 422 fails LOUD carrying GitHub's own cause — it is not "
+            "retried as contention until the caller reports 'did not settle'",
+            _classify(_refusing(422, validation_body), create_put),
+            'registry GitHub API PUT failed with HTTP 422: {"message":"Invalid request.\\n\\n'
+            '\\"branch\\" wasn\'t supplied."}',
+        )
+        check(
+            "#240: even the create-race signature is validation on an UPDATE PUT — a write that "
+            "names the revision it expects cannot lose the CREATE race",
+            _classify(_refusing(422, create_race_body), update_put),
+            'registry GitHub API PUT failed with HTTP 422: {"message":"Invalid request.\\n\\n'
+            '\\"sha\\" wasn\'t supplied.","documentation_url":'
+            '"https://docs.github.com/rest/repos/contents"}',
+        )
+        check(
+            "#240: HTTP 409 stays a CAS conflict on BOTH ledger PUT shapes (a lost SHA is never "
+            "validation)",
+            (_classify(_refusing(409, b'{"message":"Conflict"}'), create_put),
+             _classify(_refusing(409, b'{"message":"Conflict"}'), update_put)),
+            ("conflict", "conflict"),
+        )
+        check(
+            "#240: a caller that owns NO CAS re-read loop never sees a conflict — 409 and the "
+            "create-race 422 both fail loud when retry_conflict is off",
+            (_classify(_refusing(409, b'{"message":"Conflict"}'), create_put,
+                       retry_conflict=False).startswith("registry GitHub API PUT failed"),
+             _classify(_refusing(422, create_race_body), create_put,
+                       retry_conflict=False).startswith("registry GitHub API PUT failed")),
+            (True, True),
+        )
+
+        # The reported symptom, end to end through the caller's retry loop: the PUT below goes
+        # through the LIVE request(), so this asserts the real classifier rather than a
+        # hand-raised exception.
+        class _ValidationLedgerAPI(_CasAPI):
+            def request(self, method, path, body=None, allow_404=False, retry_conflict=False):
+                if method == "GET":
+                    return super().request(method, path, body, allow_404, retry_conflict)
+                self.puts += 1
+                return cas_api.request("PUT", path, body, retry_conflict=retry_conflict)
+
+        globals()["urlopen"] = _refusing(422, validation_body)
+        saved_cas_backoff = globals()["_sleep_backoff"]
+        globals()["_sleep_backoff"] = lambda attempt: None
+        try:
+            rider = _ValidationLedgerAPI()
+            validation_failure = ""
+            try:
+                _release_claims(rider, "o/r", {dead})
+            except GroomError as exc:
+                validation_failure = str(exc)
+            check(
+                "#240 (the reported symptom): a VALIDATION 422 on the ledger PUT surfaces "
+                "GitHub's cause on the FIRST attempt — never six retries collapsed into "
+                "'lease ledger CAS conflicts did not settle'",
+                ("HTTP 422" in validation_failure and "branch" in validation_failure,
+                 "did not settle" in validation_failure,
+                 rider.puts),
+                (True, False, 1),
+            )
+        finally:
+            globals()["_sleep_backoff"] = saved_cas_backoff
     finally:
         globals()["urlopen"] = real_urlopen
         globals()["_sleep_transient"] = real_sleep_transient
@@ -7322,6 +7785,321 @@ def _self_test() -> int:
         os.chdir(sweep_prior_cwd)
         globals().update(sweep_saved)
 
+    # ---- burned account-slot report (issue #245) ------------------------------------------------
+    def _orphan_raises(function, *call_args) -> Any:
+        try:
+            function(*call_args)
+        except GroomError:
+            return True
+        except Exception as exc:                   # noqa: BLE001 - a WRONG exception is not a pass
+            return f"{type(exc).__name__}: {exc}"
+        return False
+
+    check("orphan-claims: claim refs are keyed by SLOT and keep the ref they were read from",
+          claim_ref_slots([{"ref": "refs/acct-claims/acct07"},
+                           {"ref": "refs/acct-claims/acct12"}]),
+          {7: "refs/acct-claims/acct07", 12: "refs/acct-claims/acct12"})
+    check("orphan-claims: only an EXACT refs/acct-claims/acctNN ref is a claimed slot",
+          claim_ref_slots([{"ref": "refs/heads/acct07"},
+                           {"ref": "refs/acct-claims/acctXX"},
+                           {"ref": "refs/acct-claims/acct07/sub"},
+                           {"ref": "refs/tags/acct08"}]), {})
+    check("orphan-claims: a malformed claim listing REFUSES rather than parsing what it can (a "
+          "silently short claim set under-reports burned slots)",
+          [_orphan_raises(claim_ref_slots, payload)
+           for payload in ("not-a-list", None, [{"ref": 7}], ["refs/acct-claims/acct01"])],
+          [True] * 4)
+    check("orphan-claims: DISTINCT refs colliding on one slot NUMBER refuse — alternate padding "
+          "(`acct1` vs `acct01`) and a repeated ref are two claims and one key, so keying by the "
+          "number would silently drop one from claims=/burned= and from the named rows",
+          [_orphan_raises(claim_ref_slots, payload)
+           for payload in ([{"ref": "refs/acct-claims/acct1"},
+                            {"ref": "refs/acct-claims/acct01"}],
+                           [{"ref": "refs/acct-claims/acct007"},
+                            {"ref": "refs/acct-claims/acct07"}],
+                           [{"ref": "refs/acct-claims/acct07"},
+                            {"ref": "refs/acct-claims/acct07"}])],
+          [True] * 3)
+    check("orphan-claims: the collision guard is EXACT — unpadded and padded numbers that DIFFER "
+          "are still two ordinary slots, so the refusal cannot swallow a normal inventory",
+          claim_ref_slots([{"ref": "refs/acct-claims/acct1"},
+                           {"ref": "refs/acct-claims/acct01x"},
+                           {"ref": "refs/acct-claims/acct10"}]),
+          {1: "refs/acct-claims/acct1", 10: "refs/acct-claims/acct10"})
+
+    check("orphan-claims: acctNN issues in ANY state count, and a PULL REQUEST titled acctNN does "
+          "NOT (an /issues page carries both)",
+          account_issue_slots([{"title": "acct03", "state": "open"},
+                               {"title": "acct04", "state": "closed"},
+                               {"title": "acct05", "pull_request": {"url": "x"}},
+                               {"title": "acct06-retired"},
+                               {"title": "groom: report orphaned acct-claims refs"}]), {3, 4})
+    check("orphan-claims: a malformed issue listing REFUSES (a silently short issue set reports "
+          "LIVE slots as burned)",
+          [_orphan_raises(account_issue_slots, payload)
+           for payload in ({"not": "a list"}, [{"title": None}], ["acct01"])], [True] * 3)
+
+    check("orphan-claims: EXACTLY the ACCTNN_TOKEN names map to slots",
+          account_secret_slots(["ACCT01_TOKEN", "ACCT12_TOKEN", "acct02_token",
+                                "ACCT03_TOKEN_BACKUP", "ACCTLOOKALIKE", "REGISTRY_SECRETS_PAT"]),
+          {1, 12})
+    check("orphan-claims: a malformed secret inventory REFUSES (same reason as the issue "
+          "listing — a short secret set reports LIVE slots as burned)",
+          [_orphan_raises(account_secret_slots, payload)
+           for payload in ("ACCT01_TOKEN", {"ACCT01_TOKEN": ""}, [7], [None])], [True] * 4)
+
+    check("orphan-claims: an UNPROVEN secret inventory REFUSES — unset, blank, bad JSON, or not an "
+          "array of names — because an unproven `no secret` reports live slots as burned",
+          [_orphan_raises(parse_acct_secret_names, raw)
+           for raw in (None, "", "   ", "{oops", '{"a": 1}', '["ACCT01_TOKEN", 7]', 7)],
+          [True] * 7)
+    check("orphan-claims: a PROVEN-EMPTY inventory is accepted (it is not the same as unset)",
+          parse_acct_secret_names("[]"), [])
+
+    orphan_claims_fixture = {5: "refs/acct-claims/acct05", 6: "refs/acct-claims/acct06",
+                             7: "refs/acct-claims/acct07", 8: "refs/acct-claims/acct08"}
+    check("orphan-claims: ONLY a claim with NEITHER an issue NOR a secret is burned — claim+secret "
+          "is a STORED CREDENTIAL, claim+issue is an account mid-enrolment",
+          orphaned_claim_slots(orphan_claims_fixture, {6}, {7}), [5, 8])
+    check("orphan-claims: dropping EITHER exclusion changes the answer, so neither is decorative",
+          (orphaned_claim_slots(orphan_claims_fixture, set(), {7}),
+           orphaned_claim_slots(orphan_claims_fixture, {6}, set())),
+          ([5, 6, 8], [5, 7, 8]))
+    check("orphan-claims: a legacy slot with an issue/secret but NO claim ref is allocated, not "
+          "burned, and is not reported",
+          orphaned_claim_slots({}, {2}, {3}), [])
+
+    orphan_burned_report = format_orphan_claim_report(orphan_claims_fixture, {6}, {7})
+    check("orphan-claims: the report counts the fleet and NAMES each burned ref",
+          (orphan_burned_report[0],
+           [line for line in orphan_burned_report if line.startswith("ORPHAN-CLAIM ")]),
+          ("ORPHAN-CLAIMS claims=4 account_issues=1 account_secrets=1 burned=2",
+           [f"ORPHAN-CLAIM refs/acct-claims/acct0{slot}: slot claimed, but no acct0{slot} issue "
+            f"and no ACCT0{slot}_TOKEN secret exist — burned by a failed enrolment"
+            for slot in (5, 8)]))
+    check("orphan-claims: a burned report carries the NEVER-DELETE instruction (deletion re-opens "
+          "the overwrite race the claim closes)",
+          orphan_burned_report[-1], ORPHAN_CLAIM_NOTE)
+    orphan_clean_report = format_orphan_claim_report({6: "refs/acct-claims/acct06"}, {6}, set())
+    check("orphan-claims: a clean fleet reports `none` and names no slot",
+          (len(orphan_clean_report), "burned=0" in orphan_clean_report[0],
+           [line for line in orphan_clean_report if line.startswith("ORPHAN-CLAIM ")]),
+          (2, True, []))
+
+    # The CLI contract, driven through main() exactly as groom.yml drives it: real argument
+    # parsing, real environment resolution, the real paginated request sequence. A pure function
+    # nothing CALLS is a vacuous guard, so the driver stubs only the HTTP boundary — GitHubAPI's
+    # own missing-token refusal and `paginate` stay live.
+    orphan_repo = "jeswr/agent-account-registry"
+    orphan_pages = {
+        f"/repos/{orphan_repo}/git/matching-refs/acct-claims/": [
+            {"ref": "refs/acct-claims/acct05"},
+            {"ref": "refs/acct-claims/acct06"},
+            {"ref": "refs/acct-claims/acct07"},
+            {"ref": "refs/acct-claims/acct09"},
+        ],
+        f"/repos/{orphan_repo}/issues": [
+            {"title": "acct06"},
+            # A PULL REQUEST titled acct09: not an account record, so slot 9 IS burned. Dropping
+            # the pull_request exclusion silently loses that row from the report.
+            {"title": "acct09", "pull_request": {"url": "x"}},
+            {"title": "groom: report orphaned acct-claims refs"},
+        ],
+    }
+    orphan_saved_api = globals()["GitHubAPI"]
+
+    def _orphan_cli(
+        env: dict[str, str | None], pages: dict[str, list[Any]], repo: str = orphan_repo
+    ) -> tuple[Any, ...]:
+        recorded: list[tuple[str, str, Any]] = []
+
+        class _RecordingAPI(orphan_saved_api):                       # type: ignore[misc, valid-type]
+            def request(self, method, path, body=None, **_kw):
+                recorded.append((method, path, body))
+                base = path.split("?", 1)[0]
+                return list(pages.get(base, [])) if "page=1" in path else []
+
+        held = {key: os.environ.get(key)
+                for key in ("REGISTRY_GH_TOKEN", ACCT_SECRET_NAMES_ENV)}
+        saved_orphan_argv, buffer = sys.argv, io.StringIO()
+        saved_out, saved_err = sys.stdout, sys.stderr
+        globals()["GitHubAPI"] = _RecordingAPI
+        try:
+            for key, value in env.items():
+                os.environ.pop(key, None) if value is None else os.environ.__setitem__(key, value)
+            sys.argv = ["groom.py", "--report-orphan-claims", "--registry-repo", repo]
+            # BOTH streams: the groom step's stderr lands in the same log as its stdout.
+            sys.stdout = sys.stderr = buffer
+            code = main()
+        finally:
+            sys.stdout, sys.stderr = saved_out, saved_err
+            sys.argv = saved_orphan_argv
+            globals()["GitHubAPI"] = orphan_saved_api
+            for key, value in held.items():
+                os.environ.pop(key, None) if value is None else os.environ.__setitem__(key, value)
+        return code, buffer.getvalue(), recorded
+
+    orphan_code, orphan_text, orphan_calls = _orphan_cli(
+        {"REGISTRY_GH_TOKEN": "registry-token",
+         ACCT_SECRET_NAMES_ENV: '["ACCT07_TOKEN", "REGISTRY_SECRETS_PAT"]'},
+        orphan_pages,
+    )
+    check("orphan-claims CLI: reports the burned slots and exits 0 (a hygiene report never takes "
+          "the sweep down)",
+          (orphan_code,
+           sorted(line.split()[1].rstrip(":") for line in orphan_text.splitlines()
+                  if line.startswith("ORPHAN-CLAIM "))),
+          (0, ["refs/acct-claims/acct05", "refs/acct-claims/acct09"]))
+    check("orphan-claims CLI: the summary line counts what the three listings proved",
+          [line for line in orphan_text.splitlines() if line.startswith("ORPHAN-CLAIMS ")][0],
+          "ORPHAN-CLAIMS claims=4 account_issues=1 account_secrets=1 burned=2")
+    check("orphan-claims CLI: REPORT-ONLY — every request is a GET, so no claim ref can be "
+          "deleted (deletion re-opens the credential-overwrite race the claim closes)",
+          sorted({method for method, _path, _body in orphan_calls}), ["GET"])
+    check("orphan-claims CLI: both listings go through the PAGINATED reader (a capped page drops "
+          "claim refs or account issues and silently changes the verdict)",
+          sorted(path for _method, path, _body in orphan_calls),
+          [f"/repos/{orphan_repo}/git/matching-refs/acct-claims/?per_page=100&page=1",
+           f"/repos/{orphan_repo}/issues?state=all&per_page=100&page=1"])
+    check("orphan-claims CLI: no secret VALUE and no token reaches the report's output",
+          [token for token in ("registry-token", "REGISTRY_SECRETS_PAT") if token in orphan_text],
+          [])
+
+    orphan_unproven_code, orphan_unproven_text, orphan_unproven_calls = _orphan_cli(
+        {"REGISTRY_GH_TOKEN": "registry-token", ACCT_SECRET_NAMES_ENV: None}, orphan_pages)
+    check("orphan-claims CLI: an UNPROVEN secret inventory exits NON-ZERO, names NO burned slot, "
+          "and reads NOTHING — `could not tell` must never read as `nothing is burned`",
+          (orphan_unproven_code, "ORPHAN-CLAIM" in orphan_unproven_text, orphan_unproven_calls),
+          (1, False, []))
+    orphan_ambiguous_code, orphan_ambiguous_text, _ = _orphan_cli(
+        {"REGISTRY_GH_TOKEN": "registry-token", ACCT_SECRET_NAMES_ENV: '["ACCT07_TOKEN"]'},
+        {**orphan_pages,
+         f"/repos/{orphan_repo}/git/matching-refs/acct-claims/": [
+             {"ref": "refs/acct-claims/acct1"},
+             {"ref": "refs/acct-claims/acct01"},
+             {"ref": "refs/acct-claims/acct09"},
+         ]})
+    check("orphan-claims CLI: an AMBIGUOUS claim inventory exits NON-ZERO and emits NO report — a "
+          "count that quietly dropped a real claim ref must never be published as the fleet's "
+          "burned-slot truth",
+          (orphan_ambiguous_code, "ORPHAN-CLAIM" in orphan_ambiguous_text), (1, False))
+    orphan_untoken_code, orphan_untoken_text, _ = _orphan_cli(
+        {"REGISTRY_GH_TOKEN": None, ACCT_SECRET_NAMES_ENV: '["ACCT07_TOKEN"]'}, orphan_pages)
+    check("orphan-claims CLI: a missing registry token is a REFUSAL, not an empty report",
+          (orphan_untoken_code, "ORPHAN-CLAIM" in orphan_untoken_text), (1, False))
+    orphan_unsafe_code, orphan_unsafe_text, orphan_unsafe_calls = _orphan_cli(
+        {"REGISTRY_GH_TOKEN": "registry-token", ACCT_SECRET_NAMES_ENV: '["ACCT07_TOKEN"]'},
+        orphan_pages, repo="jeswr/agent-account-registry/../../evil")
+    check("orphan-claims CLI: an unsafe --registry-repo REFUSES before any request is issued",
+          (orphan_unsafe_code, "ORPHAN-CLAIM" in orphan_unsafe_text, orphan_unsafe_calls),
+          (1, False, []))
+    saved_orphan_argv = sys.argv
+    try:
+        sys.argv = ["groom.py", "--report-orphan-claims"]
+        saved_err = sys.stderr
+        sys.stderr = io.StringIO()
+        try:
+            orphan_usage_code: Any = main()
+        except SystemExit as exc:
+            orphan_usage_code = exc.code
+        finally:
+            sys.stderr = saved_err
+    finally:
+        sys.argv = saved_orphan_argv
+    check("orphan-claims CLI: --report-orphan-claims without --registry-repo is a usage error, "
+          "not a silent pass", orphan_usage_code, 2)
+
+    # ---- THE YAML SEAM for the burned-slot report ------------------------------------------------
+    # The measured lesson of this estate: the uncaught mutants live one level ABOVE the Python — a
+    # renamed flag, an `if: false`, a dropped env line, a producer moved after its consumer. So the
+    # wiring is asserted STRUCTURALLY against groom.yml, with the same dependency-free line
+    # discipline the worker.yml run-name seam above uses: PyYAML is NOT installed in the `groom`
+    # job that runs this self-test (only the watchdog jobs install it). Anything that cannot be
+    # located fails CLOSED — "zero steps matched" must never read as a pass.
+    try:
+        orphan_yaml = (
+            Path(__file__).resolve().parent.parent / ".github" / "workflows" / "groom.yml"
+        ).read_text(encoding="utf-8")
+        orphan_yaml_lines = orphan_yaml.splitlines()
+        orphan_job_start = orphan_yaml_lines.index("  groom:")
+        orphan_job_end = next(
+            (index for index in range(orphan_job_start + 1, len(orphan_yaml_lines))
+             if re.match(r"^  [A-Za-z]", orphan_yaml_lines[index])),
+            len(orphan_yaml_lines),
+        )
+        orphan_job = orphan_yaml_lines[orphan_job_start:orphan_job_end]
+        orphan_step_starts = [index for index, line in enumerate(orphan_job)
+                              if re.match(r"^ {6}- name:", line)]
+        orphan_steps = [
+            orphan_job[start:(orphan_step_starts + [len(orphan_job)])[position + 1]]
+            for position, start in enumerate(orphan_step_starts)
+        ]
+
+        # COMMENT-BLIND matching (the dispatch-secrets-guard round-19 lesson): comment prose must
+        # never stand in for a real call site, a real env line or a real dependency edge — the
+        # rationale comments around these steps QUOTE the expressions being asserted, and
+        # `true  # python3 scripts/groom.py --report-orphan-claims ...` un-wires the report while
+        # leaving every substring intact. Stripping is delegated to the ONE shared quote-aware
+        # stripper rather than copied, so both call sites keep the same tokenization rules.
+        _orphan_shell = _load_module(
+            Path(__file__).resolve().with_name("dispatch-secrets-guard.py"),
+            "registry_dispatch_secrets_guard",
+        )
+
+        def _orphan_code(step: list[str]) -> str:
+            return _orphan_shell.strip_shell_comments("\n".join(step))
+
+        def _orphan_steps_with(needle: str) -> list[list[str]]:
+            return [step for step in orphan_steps if needle in _orphan_code(step)]
+
+        def _step_if_disabled(step: list[str]) -> bool:
+            # A step-level `if:` key sits at exactly 8 spaces; shell/python bodies are deeper.
+            return any(re.match(r"^ {8}if:", line) for line in step)
+
+        check("YAML seam: groom.yml invokes --report-orphan-claims exactly once, inside the "
+              "`groom` job", len(_orphan_steps_with("--report-orphan-claims")), 1)
+        orphan_report_step = _orphan_steps_with("--report-orphan-claims")[0]
+        orphan_filter_step = _orphan_steps_with("ALL_SECRETS: ${{ toJSON(secrets) }}")[0]
+        orphan_report_text = _orphan_code(orphan_report_step)
+        orphan_filter_text = _orphan_code(orphan_filter_step)
+        check("YAML seam: the report step runs THIS script against the registry repo",
+              ("python3 scripts/groom.py --report-orphan-claims" in orphan_report_text,
+               '--registry-repo "$GITHUB_REPOSITORY"' in orphan_report_text), (True, True))
+        check("YAML seam: the report step is fed the derived secret-name inventory from the "
+              "filter step's output (drop the env line and the report refuses every tick)",
+              "ACCT_SECRET_NAMES: ${{ steps.acct-slots.outputs.names }}" in orphan_report_text,
+              True)
+        check("YAML seam: LEAST EXPOSURE — the whole secrets context reaches exactly one step, the "
+              "FILTER, and never the report process",
+              (len(_orphan_steps_with("toJSON(secrets)")),
+               "toJSON(secrets)" in orphan_report_text,
+               "id: acct-slots" in orphan_filter_text), (1, False, True))
+        check("YAML seam: the filter step emits NAMES only — no secret value is written out",
+              ('output.write(f"names={json.dumps(names' in orphan_filter_text,
+               "ACCT[0-9]+_TOKEN" in orphan_filter_text), (True, True))
+        check("YAML seam: the filter runs BEFORE the report (a producer moved after its consumer "
+              "leaves the inventory empty and the report refuses)",
+              orphan_steps.index(orphan_filter_step) < orphan_steps.index(orphan_report_step),
+              True)
+        check("YAML seam: neither step is if:-disabled",
+              (_step_if_disabled(orphan_report_step), _step_if_disabled(orphan_filter_step)),
+              (False, False))
+        check("YAML seam: both steps are continue-on-error — a hygiene report must never abort "
+              "the dead-lease release that follows it",
+              ("continue-on-error: true" in orphan_report_text,
+               "continue-on-error: true" in orphan_filter_text), (True, True))
+        check("YAML seam: the job reading the secrets context is dispatch-secrets-bound (an "
+              "UNBOUND read resolves the provably-empty repo scope, and EVERY claimed slot would "
+              "then look burned)",
+              "    environment: dispatch-secrets" in orphan_job, True)
+        check("YAML seam: REPORT-ONLY at the seam — the report step carries no deletion or gate "
+              "flag",
+              [flag for flag in ("git/refs", "--delete", "--prune", "--fail-on", "DELETE")
+               if flag in orphan_report_text], [])
+    except Exception as exc:                       # noqa: BLE001 - fail CLOSED, never skip
+        check(f"YAML seam: groom.yml burned-slot wiring is inspectable "
+              f"({type(exc).__name__}: {exc})", False, True)
+
     print("groom self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -7341,6 +8119,13 @@ def main() -> int:
         help="with --print-owner-repos: read the target set from this environment variable (a "
              "JSON array of owner/name) instead of --policy-file — dispatch.yml's manifest-driven "
              "per-owner mints (issue #273)",
+    )
+    parser.add_argument(
+        "--report-orphan-claims",
+        action="store_true",
+        help="report `refs/acct-claims/` slots burned by a failed enrolment — claimed, but with "
+             "no acctNN issue and no ACCTNN_TOKEN secret (issue #245), then exit. REPORT-ONLY: "
+             "claim refs are never deleted",
     )
     parser.add_argument("--registry-repo")
     parser.add_argument("--policy-file", default="policy/repos.toml")
@@ -7383,6 +8168,17 @@ def main() -> int:
             print(f"groom: {exc}", file=sys.stderr)
             return 1
         return 0
+    if args.report_orphan_claims:
+        if not args.registry_repo:
+            parser.error("--report-orphan-claims requires --registry-repo")
+        try:
+            return report_orphan_claims(args)
+        except GroomError as exc:
+            # A refusal is the report. Exiting NON-ZERO on an unprovable inventory is what keeps
+            # "could not tell" from reading as "nothing is burned"; groom.yml runs this step
+            # continue-on-error so the refusal is loud without ever aborting the repair sweep.
+            print(f"groom: {exc}", file=sys.stderr)
+            return 1
     if not args.registry_repo:
         parser.error("--registry-repo is required outside --self-test")
     try:

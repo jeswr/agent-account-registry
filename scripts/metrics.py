@@ -1224,6 +1224,7 @@ def _self_test():
     _test_event_list_contract(chk)
     _test_collection_contract(chk)
     _test_run_windowing(chk)
+    _test_run_name_seam(chk)
     _test_review_lane_states(chk)
     _test_recovery_hysteresis_and_skip(chk)
     _test_ledger_cas(chk)
@@ -1449,7 +1450,8 @@ def _test_collection_contract(chk):
     runs_by_target = {
         "sparq-org/sparq": [
             {"path": ".github/workflows/review-fix.yml",
-             "display_title": "review-fix fix sparq-org/sparq#3400", "name": "review-fix",
+             "display_title": f"review-fix fix sparq-org/sparq#3400 claim={'d' * 32}",
+             "name": "review-fix",
              "status": "completed", "conclusion": "failure",
              "updated_at": _iso_ago(600, now), "created_at": _iso_ago(1200, now)},
             {"path": ".github/workflows/worker.yml",
@@ -1542,8 +1544,12 @@ def _test_run_windowing(chk):
     now = 1_000_000
     since = _iso_ago(3600, now)
     # target attribution: only runs whose run-name mentions the target AND match a lane name.
+    # The REAL shape review-fix.yml renders — `claim=<id>` included (#1144). This fixture carried a
+    # claim-less title, which is the drift that makes a hand-written fixture worthless as evidence;
+    # `_test_run_name_seam` now pins the shape against the workflow itself.
     rf = {"path": ".github/workflows/review-fix.yml",
-          "display_title": "review-fix fix sparq-org/sparq#1", "name": "review-fix"}
+          "display_title": f"review-fix fix sparq-org/sparq#1 claim={'a' * 32}",
+          "name": "review-fix"}
     chk("review-fix run attributes to its target",
         _run_matches(rf, REVIEW_LANE_WORKFLOWS, "sparq-org/sparq"), True)
     chk("run for one target does not attribute to another",
@@ -1575,6 +1581,51 @@ def _test_run_windowing(chk):
             (None, None))
     finally:
         _paginate_runs = real_pr
+
+
+def _test_run_name_seam(chk):
+    """[#1144] The YAML seam: attribution reads a title the WORKFLOWS compose, not one we wrote.
+
+    Every fixture above hand-writes its own `display_title`, so all of them stay green no matter
+    what `worker.yml` / `review-fix.yml` actually render. That is not a hypothetical gap: the same
+    shape in `groom.py` went unnoticed for eight days (#1130) — worker.yml's run-name gained a
+    `${{ inputs.target_repo }}` segment, groom's regex did not follow, and it `fullmatch`ed 0 of
+    100 live titles with a green suite throughout. Here the harm would be the mirror image: DROP
+    the target segment and every per-target throughput counter silently reads zero, which is
+    indistinguishable from a genuinely idle lane.
+
+    So render the workflows' OWN run-names — through `run_name_grammar.py`, the one reader all
+    three consumers share — and require that `_run_matches` still attributes them.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "registry_run_name_grammar",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_name_grammar.py"))
+    assert spec and spec.loader, "run_name_grammar.py is missing for the run-name seam check"
+    grammar = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(grammar)
+
+    for lane, lane_names in ((grammar.WORKER_LANE, WORKER_WORKFLOWS),
+                             (grammar.REVIEW_FIX_LANE, REVIEW_LANE_WORKFLOWS)):
+        rendering = grammar.render_lane(lane)
+        chk(f"[#1144] every {lane.name} run-name expression has a known rendering",
+            rendering.unknown, ())
+        # A run-name that DROPS a segment still renders to a perfectly plausible string; only the
+        # missing sample value reveals it, so this is the assertion that sees a removal.
+        chk(f"[#1144] the {lane.name} render is not vacuous — every sample value reached the title",
+            rendering.reached, tuple(sorted(lane.samples.values())))
+        run = {"path": lane.workflow, "name": lane.name, "display_title": rendering.text}
+        chk(f"[#1144] {lane.name}.yml's OWN rendered run-name is attributed to its target repo",
+            _run_matches(run, lane_names, lane.target), True)
+        # ...and attribution is a DECISION, not a constant True: the same run must not attribute to
+        # a target it has nothing to do with, or the row above would pass on a `return True`.
+        chk(f"[#1144] ...and that same run does NOT attribute to an unrelated target",
+            _run_matches(run, lane_names, "unrelated/repo"), False)
+        # State the harm the seam exists to prevent: with the target segment gone, the lane's runs
+        # stop being attributed at all — a silent zero, not an error.
+        without_target = " ".join(rendering.text.replace(lane.target, " ").split())
+        chk(f"[#1144] a {lane.name} title with the target segment REMOVED attributes to nothing — "
+            "this is the silent-zero the seam above prevents",
+            _run_matches(dict(run, display_title=without_target), lane_names, lane.target), False)
 
 
 def _test_review_lane_states(chk):
