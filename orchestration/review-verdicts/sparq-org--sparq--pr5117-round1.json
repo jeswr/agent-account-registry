@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5117,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "10f38c23933781e3c6db10c65bca48df66568c83",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly re-exports the existing workspace-derived partition resolver through the planner module consumed by the external registry, declares the export contract and representative parity fixture as data, and checks both attribute presence and resolver behavior through a freshly loaded planner module. The added CLI-path test independently verifies that the serialized partition mapping matches the same contract fixture and guards fixture coverage against accidental shrinkage. The planner self-test passes at the PR head, including the containment-vs-exact-string mutation witness. No correctness, soundness, test-validity, or security defect was found in the diff.",
+  "verdict": "approve"
+ }
+}
