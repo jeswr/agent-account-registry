@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1252,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e1a2ea5661853fc62e592b79f4b85ab11e504869",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 closes both prior major findings. The required `gate` job now runs on `edited` and `converted_to_draft`, so reference edits, repairs, and draft transitions refresh the advisory. The offline self-test reads the live workflow as parsed YAML and pins the exact trigger set, placement in the required job, absence of an `if:` condition, `continue-on-error: true`, the `check` subcommand, and exact flag/value order and adjacency. Its mutant table separately exercises deletion, disabling, relocation, duplication, argument damage, and trigger loss. The advisory remains one-sided and fail-closed: it imports the authoritative enrolment and mint predicates, stays silent on malformed policy or uncertain single-reference cases, emits no author-controlled text, grants no authority, and cannot fail the required gate. No review-directed instruction was present in the untrusted diff.",
+  "verdict": "approve"
+ }
+}
