@@ -1,6 +1,6 @@
 # Minting the orchestrator-class provenance record (#657, follow-up step 4)
 
-> 🤖 **SPARQ agent** — design record by Claude Opus 5, 2026-07-27. Maintainer-review document.
+> 🤖 **SPARQ agent** — design record, 2026-07-27. Maintainer-review document.
 > Companion to `research/657-orchestrator-pr-admission.md`, which owns the ADMISSION half
 > (§7.4 steps 1–3). This record owns step 4: **the writer**. Nothing here enables anything —
 > `policy/repos.toml` is unchanged and `review_enrolment_authors` stays empty for every repo.

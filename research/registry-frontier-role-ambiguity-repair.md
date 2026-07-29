@@ -1,6 +1,6 @@
 # Repairing the registry's routing-dead frontier: five ambiguous-role issues (U1)
 
-> 🤖 **SPARQ agent** — design record by Claude Opus 5, 2026-07-27. Maintainer-review document.
+> 🤖 **SPARQ agent** — design record, 2026-07-27. Maintainer-review document.
 > This record documents a **live-board label repair**, not a code change. The repair has already
 > been applied (five `gh issue edit --remove-label` writes, 15:37:07Z–15:37:13Z on 2026-07-27).
 > It exists because a label mutation otherwise leaves **no reviewable trail** — five issues changed
