@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5071,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9402ed7083704c56ba5d437024437e7c4a455abc",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The documentation-only correction remains accurate and internally consistent. OpenAlex's official February 2026 announcement confirms that API keys became required for production use, while the cited research program records that an OpenAlex key and polite-pool mailto exist and Semantic Scholar remains unavailable. The same credential correction is applied consistently to the access table and both needs-access lists, without changing executable behavior or making unsupported implementation claims. No correctness, soundness, test-validity, or security issue is present.",
+  "verdict": "approve"
+ }
+}
