@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1102,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "32116553b8152e0d06a3043c2de4f1ad073d6a57",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_dispatch_lane_rows` stores rows in a dictionary and checks only membership, duplication, syntax, and the row cap. It never compares the observed order with the authoritative `DISPATCH_LANES` order. Thus `worker, fix, review, disarm` (or any other permutation containing the four required names) is published, although `dispatch-claim.py` can only emit `worker, review, fix, disarm`. This contradicts the function's stated whole-block contract and leaves the prior round's explicit out-of-order fail-closed case unaddressed. The new self-tests cover interruption but contain no literal reordered complete block, so this omission stays green.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Validate the required lanes in their authoritative order (at minimum as the ordered required prefix/subsequence, with a clearly defined rule for future extra lanes), and return `None` for a complete but reordered block. Add a literal complete fixture whose required rows are permuted and assert that the whole block is refused; also retain a positive fixture for the chosen extra-lane compatibility rule.",
+    "severity": "major",
+    "title": "Reordered lane blocks are accepted despite the fixed authoritative emission order"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 fixes the central fail-open behavior from round 1: the parser now requires both block anchors, every required lane, valid contiguous rows, no duplicates, and a terminator, and its tests correctly reject missing, malformed, truncated, and interrupted blocks as a whole. However, it still accepts a reordered block even though the authoritative emitter has a fixed lane order and the parser's own contract says out-of-order blocks are refused. That leaves one of the prior finding's explicit integrity cases unresolved. The remaining defect is narrower, but under the required progress rubric it remains one major finding at the same severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
