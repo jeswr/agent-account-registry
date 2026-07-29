@@ -431,11 +431,23 @@ class DerivedIssue(NamedTuple):
 
 
 class RenderedProse(NamedTuple):
-    """What one rendered document contributes: its PROSE text, and the same-repository references
-    GitHub itself RESOLVED inside that prose (the `issue-link` anchors it emitted)."""
+    """What one rendered document contributes: its PROSE text, and the SPANS of that text GitHub
+    itself linkified into same-repository references — `(start, end, number)`, half-open over
+    `text`.
+
+    SPANS, NOT A SET OF NUMBERS, and that distinction is round 8's whole blocking finding. A set
+    answers "is #N resolved SOMEWHERE in this pull request", which any unrelated bare mention makes
+    true. The question the derivation has to ask is "is THIS OCCURRENCE — the one the closing-keyword
+    grammar matched — the one GitHub resolved". MEASURED end to end into the real writer, one `> `
+    character apart:
+
+        "Closes #929abc\\n\\n> quoting an old comment that says #929"  -> refused
+        "Closes #929abc\\n\\nquoting an old comment that says #929"    -> MINTED
+
+    GitHub emits no anchor for `#929abc`; the anchor came entirely from the unrelated mention."""
 
     text: str
-    anchored: frozenset
+    anchors: tuple
 
 
 class ClosingRefs(NamedTuple):
@@ -504,13 +516,20 @@ class _ProseExtractor(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.repo = repo
         self.parts = []
+        self.length = 0
         self.stack = []
-        self.anchored = set()
+        self.anchors = []
         self.quote_depth = 0
         self.opaque_depth = 0
 
-    def _record_anchor(self, attrs):
-        """Collect the issue number GitHub itself RESOLVED, if this anchor is one and it is ours.
+    def _emit(self, text):
+        """Append to the prose and keep the running offset. The offset is what makes the anchor
+        SPANS meaningful: an anchor is a REGION of the prose text, not a number."""
+        self.parts.append(text)
+        self.length += len(text)
+
+    def _anchor_number(self, attrs):
+        """The issue number GitHub itself RESOLVED for this anchor, if it is one and it is ours.
 
         Two filters, both load-bearing and both measured:
 
@@ -519,11 +538,11 @@ class _ProseExtractor(HTMLParser):
           `href=".../sparq-org/sparq/issues/4329"`), and that number belongs to a different lease
           partition;
         * `pull/` is accepted as well as `issues/`, and that is not sloppiness. GitHub renders a
-          reference to a PULL REQUEST as `href=".../pull/729"` (MEASURED on the live #729), and
-          `resolved_issue_refusal` is what refuses it — BY NAME, with the reason an author can act
-          on. Dropping `pull/` here would turn `reference-is-a-pull-request` into a nameless
-          "not resolved" and make that branch, which fires on the live population today (#710),
-          structurally unreachable."""
+          reference to a PULL REQUEST as `href=".../pull/729"` (MEASURED on the live #729 — PR #710
+          declares `fixed #729` and GitHub renders it as `pull/729`), and `resolved_issue_refusal`
+          is what refuses it — BY NAME, with the reason an author can act on. Dropping `pull/` here
+          would turn `reference-is-a-pull-request` into a nameless "not resolved" and make that
+          branch, which fires on the live population today, structurally unreachable."""
         for name, value in attrs:
             if name != "href":
                 continue
@@ -531,7 +550,8 @@ class _ProseExtractor(HTMLParser):
                 rf"https://github\.com/{re.escape(self.repo)}/(?:issues|pull)/([0-9]+)",
                 str(value or ""))
             if match:
-                self.anchored.add(int(match.group(1)))
+                return int(match.group(1))
+        return None
 
     def _classify(self, tag, attrs):
         if tag in OPAQUE_ELEMENTS:
@@ -554,9 +574,9 @@ class _ProseExtractor(HTMLParser):
 
     def _separator(self, kind):
         if kind.endswith("block"):
-            self.parts.append("\n")
+            self._emit("\n")
         elif kind in ("quoted-inline", "opaque"):
-            self.parts.append(SPAN_SENTINEL)
+            self._emit(SPAN_SENTINEL)
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
@@ -565,8 +585,8 @@ class _ProseExtractor(HTMLParser):
                 self.opaque_depth += 1
             return
         kind = self._classify(tag, attrs)
-        if tag == "a" and kind == "prose-inline" and not self.quote_depth:
-            self._record_anchor(attrs)
+        number = (self._anchor_number(attrs)
+                  if tag == "a" and kind == "prose-inline" and not self.quote_depth else None)
         self._separator(kind)
         if tag in VOID_ELEMENTS:
             return
@@ -575,7 +595,9 @@ class _ProseExtractor(HTMLParser):
             return
         if kind.startswith("quoted"):
             self.quote_depth += 1
-        self.stack.append((tag, kind))
+        # The anchor's SPAN opens here, at the current offset, and closes when this element is
+        # popped — so what is recorded is the REGION of prose text GitHub itself linkified.
+        self.stack.append((tag, kind, number, self.length))
 
     def handle_startendtag(self, tag, attrs):
         tag = tag.lower()
@@ -591,11 +613,13 @@ class _ProseExtractor(HTMLParser):
         if tag in VOID_ELEMENTS:
             return
         while self.stack:
-            open_tag, kind = self.stack.pop()
+            open_tag, kind, number, start = self.stack.pop()
             if kind.startswith("quoted"):
                 self.quote_depth -= 1
+            if number is not None:
+                self.anchors.append((start, self.length, number))
             if kind.endswith("block"):
-                self.parts.append("\n")
+                self._emit("\n")
             if open_tag == tag:
                 return
         # An end tag closing nothing means the document is not the shape this parser believes it
@@ -605,7 +629,17 @@ class _ProseExtractor(HTMLParser):
     def handle_data(self, data):
         if self.opaque_depth or self.quote_depth:
             return
-        self.parts.append(data)
+        self._emit(data)
+
+    def close(self):
+        super().close()
+        # An UNCLOSED anchor still spans what it holds. Its end is the end of the document, which
+        # is the conservative reading in the only direction that matters: it can only make a span
+        # LONGER, and a longer span is checked against `raw_refs` and the keyword grammar anyway.
+        while self.stack:
+            _tag, _kind, number, start = self.stack.pop()
+            if number is not None:
+                self.anchors.append((start, self.length, number))
 
     def text(self):
         return "".join(self.parts)
@@ -620,59 +654,46 @@ def rendered_prose(html, repo):
     so a positive allowlist over that vocabulary has a well-defined unknown case, and the unknown
     case here REFUSES.
 
-    HONEST LIMITS — MEASURED, over a 106-shape corpus rendered by the live `POST /markdown` and
-    frozen in `scripts/fixtures/auto-mint-provenance/rendered-oracle.json`, plus every rendered
-    title and body of the live enrolled-class population.
+    HONEST LIMITS — AND WHY THIS SECTION NO LONGER CONTAINS A LIST OR A COUNT.
 
-    THE SAFETY DIRECTION, machine-checked over every corpus row: **no row this file BINDS is a row
-    GitHub declined to resolve.** GitHub emits an `issue-link` anchor exactly for a `#N` it read as
-    a live reference — not code, not quoted, and correctly tokenised — and `expect_bind ⇒
-    github_linkified` holds for every binding row. Since round 7 that is true BY CONSTRUCTION and
-    not only by measurement: `closing_references` requires GitHub's own anchor as a conjunct, so a
-    row cannot bind without it.
+    Every previous version of this paragraph enumerated the remaining divergences by hand, and every
+    previous version was WRONG, in the permissive direction, for five consecutive rounds. The
+    failure stopped being about any one shape and became about hand-written claims, so the claims
+    are gone. What used to be asserted here is now DERIVED by `corpus_directions()` from GitHub's
+    own rendering, frozen into `scripts/fixtures/auto-mint-provenance/rendered-oracle.json` under
+    `directions`, and re-derived and compared by --self-test. Read the artefact; it cannot be out of
+    date without a check going red. Two rows in --self-test enforce the absence: this docstring may
+    contain no residue count and may restate no corpus row by label.
 
-    THE RESIDUAL DIVERGENCES ALL POINT THE OTHER WAY — 25 corpus rows where GitHub emitted an
-    anchor somewhere in the row and this file refuses. The list is pinned BY NAME in --self-test,
-    so this paragraph cannot drift away from what the corpus measures — which is exactly what it did
-    for three rounds. They are not one kind, so they are not summarised as one:
+    WHAT IS PROVED, structurally, and therefore worth writing in prose:
 
-      * ONE IS NOT A DIVERGENCE AT ALL: `a quoted anchor cannot resolve a run-on written in prose`.
-        The oracle column is DOCUMENT-level, and that row deliberately mixes an unresolved run-on in
-        prose with a resolved mention in a blockquote. GitHub resolves neither as a declaration.
-      * DELIBERATE GRAMMAR NARROWING (9 rows): a bare mention, `Refs #N`, a cross-repository
-        `owner/repo#N`, a conventional-commit scope `fix(#869):`, a keyword inside another word,
-        a keyword not adjacent to the number, `Closes GH-929`, `Closes <issue URL>`, and
-        `Closes #0929`. GitHub resolves the last three; this grammar reads a canonical `#N` only.
-      * DELIBERATE QUOTED-CONTEXT POLICY (7 rows): `blockquote` and its sub-shapes, `code`/`samp`/
-        `kbd`/`tt`/`var`. GitHub resolves a keyword inside a blockquote; this file treats quoting as
-        not declaring.
-      * THE TWO-DERIVATION AGREEMENT RULE (5 rows): `Clos**es** #7`, `Closes &#35;7`,
-        ``Fixes `mod` #7``, `Closes`x`#7`, `Closes [#7](url)` — cases where the rendered text and
-        the raw source disagree about whether the grammar matches. `closing_references` requires
-        BOTH, so a disagreement is a refusal.
-      * THE NEGATION SUPPRESSOR (3 rows), which by construction can only ever remove a declaration.
+      * A NEW GITHUB ELEMENT CANNOT MINT. Text reaches the derivation only from elements this file
+        positively classifies; anything else raises, and a raise is a refusal.
+      * A `#N` GITHUB DID NOT TOKENISE AS A REFERENCE CANNOT MINT. It carries no `issue-link`
+        anchor, and an unanchored occurrence is not a candidate.
+      * AN OCCURRENCE GITHUB DID NOT RESOLVE CANNOT MINT, even when the same number is resolved
+        elsewhere in the same pull request. The check is span containment, not set membership.
+      * ANYTHING DERIVED IS A LITERAL `#N` IN THE SOURCE, because `declared ⊆ raw_refs`, which is
+        what `mint-provenance.references_issue` requires.
+      * A RENDERER THIS RUN CANNOT REACH REFUSES, with no fall-back to the raw markdown.
 
-    WHAT IS NOT PROVEN, restated after round 7 found this paragraph wrong for a FOURTH time. It is
-    not a proof that no unmeasured shape can mint. What it IS:
+    WHAT IS NOT PROVED: that no unmeasured shape can mint. The residue is an element already
+    classified as PROSE whose content GitHub nonetheless does not resolve, for a reason that is
+    neither the element, nor the token, nor the occurrence. Three members of that set have been
+    found across rounds 6-8 and all three were closed the same way — by reading GitHub's own output
+    instead of re-deriving its rules. There may be a fourth. If there is, the fix belongs in the
+    same place and for the same reason.
 
-      * a NEW GitHub ELEMENT cannot mint — it is unclassified, so it raises;
-      * a `#N` GitHub does not TOKENISE as a reference cannot mint — it has no anchor, so the third
-        conjunct removes it. That was round 7's blocking class (`Closes #929abc`, `#929_x`,
-        `#929é`), and the reason it survived rounds 1-6 is worth keeping: the two TEXT derivations
-        share one tokenizer, so its blind spots are invisible to both by construction. The corpus
-        had no row on the `#N` boundary at all, so SAFETY was green while blind to the class that
-        failed it — the corpus now has thirteen.
-
-    The residue that remains is an element already classified as PROSE whose content GitHub
-    nonetheless does not resolve, for a reason that is neither the element nor the token. Two
-    members of that set have been found (an `<a>` without the `issue-link` class; a mis-tokenised
-    number) and BOTH are now closed by asking the renderer rather than by re-deriving its rules. I
-    am not claiming there is no third. If one is measured, the fix belongs in the same place — a
-    conjunct read off GitHub's own output — because a conjunct can only ever refuse more."""
+    ONE POLICY THAT IS DELIBERATE AND IS NOT A DIVERGENCE. A `<blockquote>` is quoted context and
+    does not declare; a GitHub ALERT (`> [!NOTE]`, `[!WARNING]`, …) is NOT a blockquote — the
+    renderer emits `<div class="markdown-alert">` — and it DOES declare. That is the intended
+    reading rather than an oversight: an alert is the author writing in their own voice with
+    emphasis, while a blockquote is the author reproducing someone else's text. --self-test pins
+    both halves so the distinction cannot drift silently."""
     parser = _ProseExtractor(repo)
     parser.feed(html or "")
     parser.close()
-    return RenderedProse(parser.text(), frozenset(parser.anchored))
+    return RenderedProse(parser.text(), tuple(parser.anchors))
 
 
 def is_negated(text, keyword_start):
@@ -706,10 +727,18 @@ def prose_of(title, body, render_markdown, repo):
     document with no `#` in it — there is deliberately no "looks harmless, skip it" branch, because
     a branch like that is the enumeration this redesign exists to delete."""
     parts = [rendered_prose(render_markdown(document), repo) if (document or "").strip()
-             else RenderedProse("", frozenset())
+             else RenderedProse("", ())
              for document in (title, body)]
-    return RenderedProse("\n".join(part.text for part in parts),
-                         frozenset().union(*(part.anchored for part in parts)))
+    # The two documents are JOINED with a newline, so the second one's spans must be SHIFTED by
+    # exactly that much. Getting this wrong would silently move every body anchor off the text it
+    # covers — a refusal, but one nobody could debug, so the offset is pinned by its own row.
+    text, anchors, offset = [], [], 0
+    for part in parts:
+        text.append(part.text)
+        anchors.extend((start + offset, end + offset, number)
+                       for start, end, number in part.anchors)
+        offset += len(part.text) + 1                  # +1 for the joining newline
+    return RenderedProse("\n".join(text), tuple(anchors))
 
 
 def derivation_texts(title, body, render_markdown, repo):
@@ -720,6 +749,21 @@ def derivation_texts(title, body, render_markdown, repo):
     read the prose, and computing it twice would double an already-network-bound step for no
     answer that can differ. --self-test asserts the count at the sweep's own call site."""
     return raw_text(title, body), prose_of(title, body, render_markdown, repo)
+
+
+def _occurrence_is_anchored(prose, match):
+    """True when THIS `#N` occurrence lies inside an anchor GitHub emitted for THAT number.
+
+    `match` comes from `CLOSING_REF_RE`, whose group 1 is the digits, so the `#` sits at
+    `match.start(1) - 1` and the whole reference is `[hash, end)`. The anchor's own text for a
+    same-repository reference is exactly `#N`, so containment is the natural test and it is
+    deliberately CONTAINMENT rather than equality: GitHub sometimes rewrites the anchor text (an
+    issue URL renders as `#929`), and a span that is longer than the reference is still a span
+    GitHub linkified."""
+    hash_at, end = match.start(1) - 1, match.end(1)
+    number = int(match.group(1))
+    return any(start <= hash_at and end <= stop and anchored == number
+               for start, stop, anchored in prose.anchors)
 
 
 def closing_references(raw, prose):
@@ -752,11 +796,22 @@ def closing_references(raw, prose):
     `Closes #929_x` and `Closes #929é` also minted and are also unresolved by GitHub, while
     `#929-x`, `#929's`, `#929.`, `#929)`, `#929/` and `#929;` ARE resolved and must keep binding.
 
-    So the third conjunct is `anchored`: the set of same-repository references GitHub ITSELF
-    resolved, read off the `issue-link` anchors it emitted in the prose. This is the same move as
-    the rest of the redesign — ask the authority instead of re-deriving its rules — and it closes
-    the CLASS rather than the instance: any divergence between this file's `#N` tokenizer and
-    GitHub's now lands on a refusal, whichever end of the token it is at.
+    So the third conjunct is GitHub's OWN ANCHOR — but over OCCURRENCES, not over numbers. This is
+    the same move as the rest of the redesign, ask the authority instead of re-deriving its rules,
+    and it closes the CLASS rather than the instance: any divergence between this file's `#N`
+    tokenizer and GitHub's now lands on a refusal, whichever end of the token it is at.
+
+    ROUND 8 CORRECTED THE SHAPE OF THAT CONJUNCT, and the correction is the interesting part. It was
+    first written as set membership — `N ∈ prose.anchored` — which asks "did GitHub resolve #N
+    SOMEWHERE in this pull request". Any unrelated bare mention makes that true, so the run-on
+    re-minted with the anchor supplied by a mention one `> ` character away. The intersection
+    argument ("a conjunct can only refuse more") was CORRECT over sets of numbers and was the wrong
+    argument: the guarantee it was being asked to carry was over OCCURRENCES. The invariant this
+    reaches for, stated properly, is:
+
+        THE OCCURRENCE THE GRAMMAR MATCHED MUST BE THE OCCURRENCE GITHUB RESOLVED.
+
+    Sets were an approximation of it. `_occurrence_is_anchored` is the thing itself.
 
     NOT the alternative of tightening `CLOSING_REF_RE`'s right boundary to `(?![0-9A-Za-z_])`. That
     re-derives GitHub's tokenizer a second time instead of reading it, and MEASURED it breaks a real
@@ -764,25 +819,29 @@ def closing_references(raw, prose):
     renders the prose text `Closes #929x` and a word-boundary guard would refuse a reference GitHub
     resolves.
 
-    A CONJUNCT CAN ONLY EVER REFUSE MORE. `declared` is an intersection, so adding a term to it
-    cannot admit anything that was previously refused, and cannot change WHICH number binds. That is
-    the property that makes this safe to add without re-auditing the other two terms, and it is why
-    `anchored` deliberately does NOT feed `all_refs`: GitHub anchors every bare mention too, so
-    putting it in the ambiguity union would make almost every pull request ambiguous.
+    A NUMBER IS DECLARED WHEN AT LEAST ONE OF ITS MATCHED OCCURRENCES IS ANCHORED — not all of
+    them. `Closes #929abc and closes #929` has two matched occurrences of 929, one unanchored and
+    one anchored, and GitHub really does close 929 from the second, so it binds. `unresolved` is
+    therefore the numbers with matched occurrences of which NONE was anchored.
+
+    THE ANCHORS DELIBERATELY DO NOT FEED `all_refs`: GitHub anchors every bare mention too, so
+    putting them in the ambiguity union would make almost every pull request ambiguous.
 
     It also keeps the shared writer's own precondition true by construction: `declared ⊆ raw_refs`,
     so anything derived here is a textual `#N` in the title or body and therefore satisfies
     `mint-provenance.references_issue`."""
     raw_refs = {int(match.group(1)) for match in CLOSING_REF_RE.finditer(raw)}
-    live, seen = set(), set(raw_refs)
+    resolved, matched, seen = set(), set(), set(raw_refs)
     for match in CLOSING_REF_RE.finditer(prose.text):
         number = int(match.group(1))
         seen.add(number)
-        if not is_negated(prose.text, match.start()):
-            live.add(number)
-    textual = live & raw_refs
-    return ClosingRefs(sorted(textual & prose.anchored), sorted(seen),
-                       sorted(textual - prose.anchored))
+        if is_negated(prose.text, match.start()):
+            continue
+        matched.add(number)
+        if _occurrence_is_anchored(prose, match):
+            resolved.add(number)
+    return ClosingRefs(sorted(resolved & raw_refs), sorted(seen),
+                       sorted((matched - resolved) & raw_refs))
 
 
 def closing_issue_candidates(title, body, render_markdown, repo):
@@ -1520,6 +1579,26 @@ RENDERED_ORACLE_CORPUS = (
     # exact body: `anchored` is empty as shipped and `[929]` with the quote-depth guard removed.
     ('a quoted anchor cannot resolve a run-on written in prose', 't',
      'Closes #929abc\n\n> quoting an old comment that says #929\n', False),
+    # ---- SPANS, NOT SETS: round 8's blocking class ---------------------------------------------
+    # THE ONE-CHARACTER PAIR. These two rows differ by a single `> `, and at the previous head they
+    # differed in OUTCOME: the quoted one refused and the unquoted one MINTED, because the conjunct
+    # asked "is #929 resolved somewhere in this pull request" instead of "is THIS occurrence the one
+    # GitHub resolved". Kept adjacent, because a regression in either direction shows up as the pair
+    # disagreeing.
+    ('an UNQUOTED unrelated mention cannot resolve a run-on either', 't',
+     'Closes #929abc\n\nquoting an old comment that says #929\n', False),
+    ('...nor a mention in a table cell', 't',
+     'Closes #929_x\n\n| a |\n|---|\n| #929 |\n', False),
+    ('...nor a mention in the TITLE resolving a run-on in the body',
+     'thing (#929)', 'Closes #929abc', False),
+    ('...nor a run-on in the TITLE resolved by a mention in the body',
+     'Closes #929abc', 'see #929 for background', False),
+    # ...and the CONTROLS. A conjunct that refused every run-on-adjacent body would satisfy all four
+    # rows above, so the same shapes with a REAL declaration beside the run-on must still bind.
+    ('a real declaration beside a run-on still binds', 't',
+     'Closes #929abc\n\nand separately, closes #929\n', True),
+    ('...and a real declaration in the TITLE beside a run-on in the body',
+     'Closes #929 - thing', 'also mentions #929abc somewhere', True),
 )
 
 
@@ -1574,6 +1653,42 @@ def _oracle_own_output_documents():
     return documents
 
 
+def corpus_directions(oracle, render):
+    """DERIVE, do not assert: each corpus row's actual direction, computed from the live-rendered
+    oracle and this file's real derivation.
+
+    WHY THIS FUNCTION EXISTS AT ALL. The `HONEST LIMITS` paragraph was hand-written and was FALSE
+    for five consecutive rounds, always in the permissive direction. That stopped being a fact about
+    any single defect and became a fact about hand-written claims. So the residue is no longer
+    stated anywhere a human types: it is computed here, frozen into the fixture by
+    `--refresh-rendered-oracle`, and --self-test re-derives it and compares. A divergence can then
+    no longer be CLAIMED wrongly — only MEASURED wrongly, which the oracle work already guards.
+
+    Three directions, and only one of them is a defect:
+
+      `agree`          GitHub resolved it and this file binds, or neither does;
+      `missed-mint`    GitHub emitted an anchor for the row's issue and this file refuses — the
+                       recoverable direction, and the only one the residue is allowed to contain;
+      `SPURIOUS-MINT`  this file binds and GitHub emitted no anchor at all. Silent, permanent, and a
+                       grant of review admission. Must always be empty.
+    """
+    directions = {"agree": [], "missed-mint": [], "SPURIOUS-MINT": []}
+    for label, title, body, _expect in RENDERED_ORACLE_CORPUS:
+        try:
+            binds = closing_issue_candidates(title, body, render, ORACLE_CONTEXT_REPO) == [
+                ORACLE_ISSUE]
+        except Exception:                             # noqa: BLE001 — a raise is a refusal
+            binds = False
+        linkified = bool(oracle["github_linkified"].get(label))
+        if binds and not linkified:
+            directions["SPURIOUS-MINT"].append(label)
+        elif linkified and not binds:
+            directions["missed-mint"].append(label)
+        else:
+            directions["agree"].append(label)
+    return {key: sorted(value) for key, value in directions.items()}
+
+
 def _refresh_rendered_oracle(render):
     """Re-render every corpus document against the LIVE GitHub renderer and rewrite the fixture.
 
@@ -1604,6 +1719,14 @@ def _refresh_rendered_oracle(render):
         "documents": documents,
         "github_linkified": linkified,
     }
+    # ...and the residue, DERIVED from the two columns above rather than written by anyone. This is
+    # the artefact that replaced five rounds of a hand-written `HONEST LIMITS` paragraph.
+    payload["directions"] = corpus_directions(
+        payload, _frozen_renderer(payload))
+    payload["directions"]["_comment"] = (
+        "GENERATED by corpus_directions(). Never hand-edit: --self-test re-derives this and "
+        "compares, so an edit here is a red check, and a behaviour change shows up as a diff in "
+        "review rather than as a sentence somebody has to remember to update.")
     with open(RENDERED_ORACLE_PATH, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=1, sort_keys=True, ensure_ascii=False)
         handle.write("\n")
@@ -1713,47 +1836,49 @@ def _self_test():                                                       # noqa: 
         check(f"ORACLE — {label}: "
               + ("BINDS" if expect_bind else "REFUSES"), oracle_binds[label], expect_bind)
 
-    # THE SAFETY DIRECTION, over the WHOLE table rather than row by row. GitHub emits an
-    # `issue-link` anchor exactly for a `#N` it read as a live reference — not code, not quoted —
-    # so this is the property the last three rounds failed: nothing this file BINDS may be something
-    # GitHub declined to resolve. It is asserted as a LIST of offending labels, not a count, so a
-    # failure names the shape.
-    check("SAFETY — no shape binds a reference GitHub renders as CODE",
-          sorted(label for label, binds in oracle_binds.items()
-                 if binds and not oracle["github_linkified"].get(label)), [])
-    # ...and its non-vacuity: the table really does contain rows GitHub renders as code, and rows it
-    # resolves, in both directions. A safety assertion over a table with no negative rows is vacuous.
-    check("...which is not vacuous: the corpus holds rows GitHub renders as CODE",
-          sum(1 for label in oracle_binds if not oracle["github_linkified"].get(label)) > 20, True)
+    # ---- THE RESIDUE IS DERIVED, NOT ASSERTED ---------------------------------------------------
+    # WHY THIS BLOCK LOOKS LIKE THIS. The `HONEST LIMITS` paragraph and the residue list used to be
+    # hand-written, and they were FALSE for FIVE consecutive rounds, always in the permissive
+    # direction. That is not a fact about any one defect; it is a fact about hand-written claims. So
+    # nothing here states the residue. `corpus_directions()` computes it from GitHub's own column
+    # and this file's real derivation; `--refresh-rendered-oracle` freezes it into the fixture; and
+    # these rows RE-DERIVE it and compare. A divergence can no longer be CLAIMED wrongly — only
+    # MEASURED wrongly, which the oracle validation above already guards.
+    directions = total(lambda: corpus_directions(oracle, frozen))
+    directions = directions if isinstance(directions, dict) else {
+        "agree": [], "missed-mint": [], "SPURIOUS-MINT": [("RAISED", directions)]}
+    # THE ONE CLAIM THAT IS A CLAIM, and it is GitHub's, not this file's: nothing binds that GitHub
+    # declined to resolve. Asserted as the LIST, so a failure names the shape.
+    check("SAFETY — no shape binds a reference GitHub emitted no anchor for",
+          directions["SPURIOUS-MINT"], [])
+    # ...and the residue, compared against the GENERATED artefact. Both sides are machine-produced:
+    # one now, one at the last refresh. A behaviour change is a diff in review, not a sentence
+    # somebody has to remember to update.
+    stored = (oracle.get("directions") or {})
+    check("the DERIVED residue still matches the generated artefact — regenerate with "
+          "--refresh-rendered-oracle and read the diff if this reds",
+          directions["missed-mint"], stored.get("missed-mint"))
+    check("...and so does the agreeing set, so a row cannot move between them unobserved",
+          directions["agree"], stored.get("agree"))
+    check("...and the artefact records no spurious mint either", stored.get("SPURIOUS-MINT"), [])
+    # NON-VACUITY, in both directions, so the comparison above is over a table that says something.
+    check("...over a corpus that really holds rows GitHub renders as CODE",
+          sum(1 for label in oracle["github_linkified"]
+              if not oracle["github_linkified"][label]) > 20, True)
     check("...and rows it RESOLVES that this file also binds",
-          sum(1 for label, binds in oracle_binds.items()
-              if binds and oracle["github_linkified"].get(label)) > 20, True)
-    # THE DECLARED FALSE NEGATIVES, counted rather than described. Every remaining divergence is a
-    # row GitHub resolves and this file refuses — the recoverable direction. The count is pinned so
-    # the `rendered_prose` docstring cannot drift away from what the corpus measures, which is
-    # exactly what happened for three rounds.
-    #
-    # ONE ROW IN THIS LIST IS NOT A TRUE DIVERGENCE, and saying so is cheaper than a number that
-    # quietly means two things. `github_linkified` is a DOCUMENT-level column — "GitHub anchored
-    # #929 somewhere in this row" — and `a quoted anchor cannot resolve a run-on written in prose`
-    # deliberately mixes contexts: the anchor GitHub emitted is for the QUOTED mention, not for the
-    # `#929abc` run-on, which GitHub does not resolve either. It is listed because the column cannot
-    # tell the two apart, not because a declaration was missed. SAFETY is unaffected either way.
-    check("...so every remaining divergence is a MISSED mint, and there are 25 of them",
-          sorted(label for label, binds in oracle_binds.items()
-                 if oracle["github_linkified"].get(label) and not binds),
-          sorted(["GH- form", "Refs is not a closing keyword",
-                  "a quoted anchor cannot resolve a run-on written in prose",
-                  "bare mention", "blockquote",
-                  "blockquote lazy paragraph", "bold emphasis around the keyword",
-                  "code span between keyword and number", "conventional-commit scope",
-                  "emphasis inside the keyword", "html <blockquote> passthrough",
-                  "inline html comment in a quoted line", "issue URL form", "kbd",
-                  "keyword inside another word", "keyword not adjacent",
-                  "leading zeros are not a canonical reference",
-                  "live #781 self-id banner", "negated prose", "negator across a code span",
-                  "numeric entity for the hash", "quoted lazy continuation", "samp",
-                  "span inside the keyword", "spliced with no spaces"]))
+          sum(1 for label, title, body, expect in RENDERED_ORACLE_CORPUS
+              if expect and oracle["github_linkified"].get(label)) > 20, True)
+    # AND THE DOCSTRING MAY NOT RESTATE ANY OF IT. If a sentence cannot be produced mechanically
+    # from the corpus, it does not belong in prose that a reader will trust. These two rows are the
+    # mechanical enforcement of that, aimed at exactly the two things that went wrong five times: a
+    # hand-written COUNT, and a hand-written LIST of shapes.
+    limits_doc = rendered_prose.__doc__ or ""
+    check("the docstring states no hand-written residue COUNT",
+          sorted(match.group(0)
+                 for match in re.finditer(r"\b\d+ (?:corpus )?rows?\b", limits_doc)), [])
+    check("...and restates no corpus row by label",
+          sorted(label for label, _t, _b, _e in RENDERED_ORACLE_CORPUS
+                 if len(label) > 15 and label in limits_doc), [])
 
     # ---- THE SEVEN SHAPES THAT MINTED AT THE PREVIOUS HEAD ------------------------------------
     # Each was driven end to end into the real `mint_provenance.mint()` by an independent review and
@@ -1880,6 +2005,19 @@ def _self_test():                                                       # noqa: 
           .strip(), "Closes #7")
     check("...while an author-written anchor is not, because GitHub does not resolve one",
           "#7" in prose_text_of('<p><a href="x">Closes #7</a></p>'), False)
+    # THE ALERT / BLOCKQUOTE DISTINCTION, stated rather than left as an accident of classification.
+    # `> [!NOTE]` LOOKS like a blockquote in source and is not one to GitHub: the renderer emits
+    # `<div class="markdown-alert">`. So an alert DECLARES and a blockquote does not. That is the
+    # intended reading — an alert is the author writing in their own voice with emphasis, a
+    # blockquote is the author reproducing someone else's text — and it is a hole in the "quoting is
+    # not declaring" policy only if left unstated. Both halves are pinned so neither can drift.
+    check("a GitHub ALERT is the author's own voice, so it declares",
+          "#7" in prose_text_of(
+              '<div class="markdown-alert markdown-alert-note"><p>Closes #7</p></div>'), True)
+    check("...while a BLOCKQUOTE is someone else's text, so it does not",
+          "#7" in prose_text_of("<blockquote><p>Closes #7</p></blockquote>"), False)
+    check("...and the corpus agrees with both, on shapes GitHub really rendered",
+          (oracle_binds.get("alert block"), oracle_binds.get("blockquote")), (True, False))
     # WHAT A DROPPED CONSTRUCT LEAVES BEHIND — the two separators, and the three properties of the
     # inline one. A SPACE would SPLICE (`Fixes `mod` #7` becomes a declaration nobody wrote); a
     # NEWLINE would end the negation window mid-sentence (`this does not `x` close #7` would stop
@@ -1924,6 +2062,38 @@ def _self_test():                                                       # noqa: 
     # GitHub disagrees with is invisible to BOTH and the agreement rule cannot catch it by
     # construction. `Closes #929abc` minted end to end at the previous head with the LIVE renderer
     # emitting no anchor at all.
+    # ---- SPANS, NOT SETS: the occurrence-level conjunct ------------------------------------------
+    # ROUND 8's BLOCKING CLASS. `N in prose.anchored` asked "is #N resolved SOMEWHERE in this pull
+    # request", which any unrelated bare mention makes true. These rows ask the question the
+    # derivation actually needs answered.
+    def anchor_at(text, number, repo=None):
+        """Prose HTML where ONLY the LAST `#N` is an anchor — the unrelated-mention shape."""
+        head, _sep, tail = text.rpartition(f"#{number}")
+        return (f"<p>{head}<a class=\"issue-link\" href=\"https://github.com/"
+                f"{repo or ORACLE_CONTEXT_REPO}/issues/{number}\">#{number}</a>{tail}</p>")
+
+    split = refs("t", "Closes #7abc and see #7",
+                 lambda _t: anchor_at("Closes #7abc and see #7", 7))
+    check("SPANS — an anchor on a DIFFERENT occurrence does not resolve the one the grammar "
+          "matched, even though the number is resolved in this pull request",
+          (split.declared, split.unresolved), ([], [7]))
+    check("...and the prose really does contain a resolved #7, so the row is not vacuous",
+          [number for _s, _e, number in
+           total(lambda: rendered_prose(anchor_at("Closes #7abc and see #7", 7),
+                                        ORACLE_CONTEXT_REPO)).anchors], [7])
+    both = refs("t", "Closes #7abc and closes #7",
+                lambda _t: anchor_at("Closes #7abc and closes #7", 7))
+    check("...while a number with TWO matched occurrences binds when EITHER is resolved — GitHub "
+          "really does close it from the second",
+          (both.declared, both.unresolved), ([7], []))
+    # THE SPAN OFFSET across the title/body join. Rendered as two documents, so the body's spans
+    # must shift by exactly `len(title_text) + 1`; an off-by-one moves every body anchor off its own
+    # text and turns every body declaration into a nameless refusal.
+    joined = total(lambda: derivation_texts(
+        "a title of some length", "Closes #7",
+        lambda text: anchored_html(text, ORACLE_CONTEXT_REPO), ORACLE_CONTEXT_REPO)[1])
+    check("SPANS — a body anchor's span still covers its own text after the title/body join",
+          [joined.text[start:stop] for start, stop, _n in joined.anchors], ["#7"])
     unanchored = refs("t", "Closes #7", lambda _t: "<p>Closes #7</p>")
     check("ANCHOR HALF — a reference GitHub did not resolve is not a candidate, even though BOTH "
           "text derivations see it",
@@ -2829,6 +2999,26 @@ def _self_test():                                                       # noqa: 
                       "an unresolved run-on beside a real declaration still binds the real one"):
             row, writes, _posts = e2e(label)
             check(f"E2E ROUND-7 CONTROL — {label}: still mints, and still writes",
+                  (row["minted"], row["refused"], writes), (1, 0, ["LEDGER-PUT"]))
+
+        # THE ROUND-8 CLASS, END TO END, AND THE ONE-CHARACTER PAIR. These two rows differ by a
+        # single `> ` and differed in OUTCOME at the previous head: the quoted one refused, the
+        # unquoted one MINTED. Driven together so a regression in either direction shows up as the
+        # pair disagreeing rather than as one silent row.
+        for label in ("a quoted anchor cannot resolve a run-on written in prose",
+                      "an UNQUOTED unrelated mention cannot resolve a run-on either",
+                      "...nor a mention in a table cell",
+                      "...nor a mention in the TITLE resolving a run-on in the body",
+                      "...nor a run-on in the TITLE resolved by a mention in the body"):
+            row, writes, _posts = e2e(label)
+            check(f"E2E ROUND-8 — {label}: an unrelated anchor does not resolve it, and NOTHING "
+                  "reaches the ledger",
+                  (row["minted"], row["refusals"], writes),
+                  (0, {REASON_REFERENCE_NOT_RESOLVED: 1}, []))
+        for label in ("a real declaration beside a run-on still binds",
+                      "...and a real declaration in the TITLE beside a run-on in the body"):
+            row, writes, _posts = e2e(label)
+            check(f"E2E ROUND-8 CONTROL — {label}: still mints, and still writes",
                   (row["minted"], row["refused"], writes), (1, 0, ["LEDGER-PUT"]))
 
         # THE RENDERER OUTAGE, end to end. Fail closed, censused, NOT commented.
