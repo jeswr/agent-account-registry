@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5024,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a1ff0ec3aca4b3e8b42b0fec839488008dd0ecf4",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Doc-only change (no code, tests, or security surface) retracting the false \"empty bypass_actors / current_user_can_bypass: never\" claim and recording the live state: one RepositoryRole bypass actor (actor_id: 5, bypass_mode: always), plus a merge_queue row in the live-rules table. Round 3 closes ALL FIVE round-2 findings; each verified against the checkout, not just the diff.\n\n1. MAJOR (self-contradicting headline claim) FIXED. docs/branch-protection.md:13-15 now reads \"direct pushes are disallowed for non-administrators. Repository administrators can always bypass the ruleset (see \\\"Other settings\\\")\" \u2014 the cross-reference now agrees with the section it points at.\n\n2. MAJOR (downstream compliance drift) FIXED in all four cited locations: compliance/openssf/controls/openssf.md:26, compliance/slsa/controls.md:141 (SL-S-b) and :142 (SL-S-c), compliance/slsa/evidence.md:125. Each now states the always-on administrator bypass and scopes the residual protection to the automated landing path. The pre-existing collateral drift flagged in the round-2 fix_hint (\"\u22651 approving review, require-code-owners, dismiss-stale\" in slsa/controls.md:141 and evidence.md:125) was also corrected to the enforced 0/false/false reality.\n\n3. MINOR (\"emergency bypass\" unsupported by bypass_mode: always) FIXED. `grep -rn -i emergency docs/ compliance/ .github/workflows/` returns nothing; all sites now use the accurate \"can always bypass\" / \"always-on\".\n\n4. NIT (workflow comments asserting an EMPTY bypass list) FIXED at .github/workflows/bench.yml:378 and :448 and .github/workflows/bead-autoclose.yml:36 \u2014 the GH013 rejection now stands for the right reason (GITHUB_TOKEN is not the administrator role).\n\n5. NIT (visible `[SONNET-4.6]` marker in an auditor-facing table cell) FIXED \u2014 no longer present in gap-register.md.\n\nConsistency cross-checks pass: the new merge_queue row (ALLGREEN / max_entries_to_merge: 8 / 60 min) matches the \u00a7Omnibus batching prose at line 454-455; the \u2026 [truncated 804 chars]",
+  "verdict": "approve"
+ }
+}
