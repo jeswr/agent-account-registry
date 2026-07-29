@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1161,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "890eb1c275b3a0ee21ef1955f6f817762be491ce",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly replaces job-wide credential metadata exports with explicit step outputs and routes those outputs only to the dry-run boundary, harness invocation, and rotation write-back consumers. The review/fix lanes restore provider, harness, format, and credential-path inputs from their authoritative selection/prepare outputs; write-back retains its fail-closed tamper baseline on successful prepares and its existing host-record rescue behavior when prepare aborts before outputs exist. The tests pin exact consumers in both live workflows, exact successful output contents, an empty successful GITHUB_ENV, the pre-change leak shape, hostile-gate routing detection, and the live no-format write-back path. No trust check is weakened, no credential value is emitted, and no reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
