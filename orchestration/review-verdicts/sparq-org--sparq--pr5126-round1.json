@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5126,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "84692b422d4eb723252586ccc090a8fec3d56784",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The workflow claims that checking out the default branch means no PR-authored code runs, but on the `pull_request` event the workflow YAML itself is selected from the PR/merge ref (the file's own gating-posture comment also acknowledges this). A same-repository PR can modify this job's steps or `run:` script and execute those changes with repository-level `issues: write` and `pull-requests: write`. Pinning `actions/checkout` to the default branch does not protect the workflow definition. This makes the added permission a real privilege-escalation surface and invalidates the security rationale.",
+    "file": ".github/workflows/pr-area-label.yml",
+    "fix_hint": "Move the mutating operation to a trusted-definition execution path, such as a carefully designed `pull_request_target` workflow that never checks out or executes PR content, or a separate trusted `workflow_run`/dispatch workflow consuming only validated PR metadata. Keep PR-authored validation on `pull_request` read-only. Add a structural test that pins the trusted trigger and verifies that no PR ref/content is executed in the write-capable job.",
+    "severity": "blocker",
+    "title": "Write token is exposed to PR-authored workflow code"
+   }
+  ],
+  "progress": null,
+  "summary": "The provisioning logic is well tested, but the workflow's stated trusted-code boundary is false. A `pull_request` run uses the workflow definition from the PR/merge ref even though the checkout step fetches the default branch. Consequently, a same-repository PR can alter the YAML `run:` body while it holds the newly granted `issues: write` and existing `pull-requests: write` token. The checkout ref protects the Python implementation, not the workflow program that invokes it. This privilege expansion therefore cannot be approved in the current trigger architecture.",
+  "verdict": "request_changes"
+ }
+}
