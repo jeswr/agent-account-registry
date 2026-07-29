@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1262,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3c7e5597b89b20e9552d2ce774188584b82aee45",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The held branch emits an ALERT and correction whenever `age_unpark_state` finds a grant matching the newest groom age-park receipt. That only proves a historical grant exists; it does not prove the currently live `review:parked` label is the label that grant attempted to remove. The same function's convergence branch explicitly compares the grant timestamp with `park_applications` because `review:parked` is shared by multiple writers. The held branch skips that check. Reachable sequence: groom age-parks, groom grants and successfully removes the label, another writer later applies `review:parked`, and a human hold is live. The new branch then says the earlier re-admission is withdrawn and asks a human to remove the current park, even though the earlier re-admission completed and the current label represents a distinct later decision. This is misleading trust-plane evidence and can direct a human to undo a valid park.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Before classifying the state as a stall, prove that the grant is strictly newer than every relevant park application, using the same fail-closed timestamp/readability discipline as the convergence branch (without authorizing any label write). If a later or unreadable park application exists, do not post the correction. Add a held-path test with a matching old grant plus a newer shared-writer park event and assert no ALERT/comment and a zero stall gauge.",
+    "severity": "major",
+    "title": "Stall correction mistakes a later shared-writer park for the old grant's residue"
+   },
+   {
+    "body": "`_execute_age_unpark_actions` now returns four values `(outcome, grants, convergences, stalls)`, and its caller unpacks four, but its annotation remains `tuple[PhaseOutcome, int, int]`. The public contract and implementation disagree, which will mislead readers and static checking.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Change the annotation to `tuple[PhaseOutcome, int, int, int]`.",
+    "severity": "minor",
+    "title": "Return annotation still declares three values"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe DELETE post-state verification is fail-closed and the added tests exercise both response and read-back paths. However, the new held-stall path treats any matching historical age-unpark grant as evidence about the currently live shared park label. It omits the recency/ownership distinction that the convergence path already requires, so a later park by another writer is falsely reported as a failed or withdrawn re-admission. That makes the correction unsound and requires changes.",
+  "verdict": "request_changes"
+ }
+}
