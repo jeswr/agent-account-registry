@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5005,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e051e68cf489085a64ca8d8ded39931623da86e7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Both `materialize_wac` and `materialize_acp_with` call `strip_reserved_graphs(graph)` before `wac_rules()`/`acp_rules()`. The new public contract says an unsupported/invalid rule set is returned as `Err` and the previous auth view is left untouched, but a compile error returns after the old `<urn:sparq:auth>` graph has already been deleted. Besides contradicting the API contract, this is a fail-open availability/security hazard if a caller handles the error and continues with a graph whose previously materialized authorization view disappeared.",
+    "file": "crates/sparq-solid/src/materialize.rs",
+    "fix_hint": "Resolve `wac_rules()`/`acp_rules()` before the first graph mutation (and ideally complete all other fallible input validation/assembly before stripping reserved graphs), then mutate/install only after those steps succeed. Add a focused regression test using an injectable/fallible compilation path or fact-assembly error to prove that an existing auth graph remains byte-for-byte unchanged on `Err`; the current `rule_sets_compile_at_startup` test only covers success and cannot detect this ordering bug.",
+    "severity": "major",
+    "title": "Fallible rule compilation occurs after the existing auth view is removed"
+   }
+  ],
+  "progress": null,
+  "summary": "The id-level differential tests are meaningful and non-vacuous, but the new error-path contract is violated by both materializers. Rule compilation is deliberately fallible and documented to leave the prior auth view untouched on failure, yet reserved graphs (including the existing auth view) are stripped before compilation is attempted. This makes a compilation failure destructive and fail-open with respect to callers that continue using the graph after the error. Resolve compilation before mutating the graph, and add a regression test that can exercise the failure ordering.",
+  "verdict": "request_changes"
+ }
+}
