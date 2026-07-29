@@ -44,8 +44,19 @@ wrong object, so this file FAILS CLOSED on every ambiguity, with a NAMED reason:
   reference-is-a-pull-request   the single reference resolves to a PR, not an issue
   reference-is-closed           the single reference resolves to a closed issue
   source-issue-unreadable       the reference could not be read, or read back as another number
+  body-render-unavailable       GitHub's renderer did not answer, so "is this quoted?" is unknown
+  body-shape-not-understood     the rendered body holds an element this derivation cannot classify
 
 There is NO fallback. A wrong `issue_number` is worse than no mint.
+
+WHERE THE DERIVATION READS FROM, and why it changed. The binding comes from GitHub's OWN RENDERING
+of the title and body (`POST /markdown`, mode `gfm`), parsed, with text kept only from elements
+POSITIVELY classified as prose — cross-checked against the raw source, so the two must agree. Three
+earlier rounds derived it from regex-stripped markdown instead, and each was measured permissive in
+the minting direction, because a blocklist of quoted contexts cannot be completed against a grammar
+as open as GFM. The unknown case now REFUSES, which turns every future gap into a missed mint
+(recoverable, visible, censused) rather than a spurious one (silent, permanent, and a grant of
+review admission).
 
 REFUSALS ARE VISIBLE ON THE PR, not only in a run log: an orchestrator-class PR that cannot be
 minted is invisible to the review lane again, which is the exact state #916 exists to end. One
@@ -56,6 +67,7 @@ because nobody notices when it stops.
 """
 
 import argparse
+from html.parser import HTMLParser
 import io
 import json
 import os
@@ -69,6 +81,39 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 
 class SweepError(RuntimeError):
     """A concise, credential-free operational error."""
+
+
+class RenderUnavailable(RuntimeError):
+    """GitHub's markdown renderer could not be reached, or did not answer.
+
+    THE FAIL-CLOSED CONTRACT. The binding is derived from the rendered body, so a renderer this run
+    cannot reach means this run cannot derive a binding. It REFUSES — it never falls back to reading
+    the raw markdown, because the raw markdown IS the permissive derivation this redesign removed,
+    and a fallback would restore it exactly when the safety check is unavailable.
+
+    The renderer is `POST /markdown` on api.github.com, which is the SAME host and the SAME
+    credential this sweep already needs to list the pull requests, read the source issue, probe the
+    ledger and write the record. It is not a new availability surface: when it is down the tick has
+    already skipped its target with `target-pulls-unreadable`. (Contrast sparq #4935 — a gating
+    check that fetched a corpus from a THIRD-PARTY host at CI time and reddened the gate when that
+    host was down. The rule this obeys is the same one that case violated: an unavailable oracle may
+    only ever move the answer to the safe side.)"""
+
+
+class UnknownRenderedElement(RuntimeError):
+    """GitHub's rendered output holds an element this file does not positively classify.
+
+    THIS IS THE UNKNOWN CASE, and it refuses. It is a fact about the pull request's body (the author
+    wrote markup that renders to something new), so unlike `RenderUnavailable` it is COMMENTED: the
+    author can act on it, and the operator learns that the classification needs a measured
+    extension. Whichever it is, no record is written."""
+
+    def __init__(self, tag):
+        super().__init__(
+            f"the rendered pull request contains a <{tag}> element this derivation does not "
+            "classify as prose or as quoted context, so it cannot say whether a closing keyword "
+            "in it is a declaration")
+        self.tag = tag
 
 
 # ---- WHAT THE SWEEP MAY ASSERT ----------------------------------------------------------------
@@ -113,7 +158,7 @@ CLOSING_REF_RE = re.compile(
     r"#([0-9]+)(?![0-9])",
     re.IGNORECASE)
 
-# QUOTED CONTEXT — stripped BEFORE the grammar runs, and the reason it must be.
+# QUOTED CONTEXT — and why this file no longer tries to FIND it in the author's markdown source.
 #
 # GitHub does not resolve a closing keyword inside a code block; running the grammar over the raw
 # text does, which makes it strictly MORE permissive than the grammar this file claims to
@@ -121,69 +166,98 @@ CLOSING_REF_RE = re.compile(
 # recovery: it is silent (no comment is posted on a success), permanent (records are create-only
 # and `existing_record_verdict` refuses to overwrite one with different identifying fields), and
 # from the next tick onwards it is counted as `with_record` — so the sealed census would absorb the
-# error AS A SUCCESS until a human deleted the ledger file.
+# error AS A SUCCESS until a human deleted the ledger file. It also GRANTS REVIEW ADMISSION:
+# `admits_orchestrator_pr` waives two gates of `enumerate_review_items` for a PR that has a record.
 #
-# It was also SELF-INFLICTED. `REASON_HINTS[REASON_NO_REFERENCE]` is posted on up to
+# IT WAS ALSO SELF-INFLICTED once. `REASON_HINTS[REASON_NO_REFERENCE]` is posted on up to
 # DEFAULT_MAX_COMMENTS pull requests per tick, and quoting that comment back into the PR
 # description — the single most likely author response to receiving it — was enough to mint a
-# record bound to the number in the tool's own worked example. Two independent fixes, because one
-# of them being right is not a reason to leave the other wrong: the hint no longer contains a
-# literal issue number at all (see REASON_HINTS), AND every quoted context is stripped here. The
-# self-test pins that the FULL refusal comment for every reason code is inert when fed back in,
-# even when the passed-through message is itself hostile.
+# record bound to the number in the tool's own worked example.
 #
-# STRIPPING ORDER, and why it is what it is. The two LINE-LEVEL strips run first, over the author's
-# own line structure: indented code is decided by the blank line that opens it, and a blockquote is
-# decided by a `>` at the start of a line. Everything after them substitutes a NEWLINE (see
-# `strip_quoted_contexts`), which REWRITES line structure — so running either line-level strip after
-# one of them reads lines the author did not write.
+# THREE ROUNDS OF BLOCKLIST, AND WHY THE BLOCKLIST WAS THE DEFECT. Rounds 3, 4 and 5 each stripped
+# the quoted constructs someone had thought of — fences, code spans, blockquotes, HTML comments,
+# CommonMark indented code — and each time an independent review found more shapes that still
+# minted: 13, then 10, then SEVEN (`<pre>`, `<pre>`+indented, quoted `<pre>`+indented, a pipe-less
+# GFM table+indented, inline `<code>`, `<details><pre>`, `<pre class=…>`), all driven end to end
+# into the real writer. The residue was on the permissive side EVERY time, and the docstring
+# asserting otherwise was measurably false three rounds running.
 #
-# HOW THIS WAS FOUND, and what actually holds it. Substituting a newline for the code span in PR
-# #781's live line 0 —
-#     > 🤖 **SPARQ agent** … no `VERDICT:` line. Closes #777.
-# — split that ONE quoted line into two, the second of which no longer began with `>`, so the strip
-# stopped seeing it and `Closes #777` became a live declaration out of a self-identification banner
-# the author never meant as one: the round-1 blocking class exactly, reintroduced by the fix.
+# The structural cause was that the strip was an ENUMERATION over an open grammar with an
+# unknown case that FELL OPEN: `_continues_a_paragraph` listed five block constructs and read
+# everything else as "paragraph → bind", and there was no strip for HTML code containers at all.
+# A blocklist of quoted contexts cannot be completed against GitHub-flavoured Markdown.
 #
-# That particular vector no longer depends on the order, because `SPAN_SENTINEL` is not a newline
-# any more (see `strip_quoted_contexts`) — so do not read it as the thing this order buys. What
-# still separates the two orders, MEASURED both ways, is an INLINE HTML COMMENT in a quoted line
-# (`> 🤖 agent <!-- marker --> Closes #777.`), which is replaced by a real newline and un-quotes the
-# remainder if the blockquote strip runs after it. That is the shape --self-test pins the order to.
+# WHAT REPLACES IT. The binding is now derived from GitHub's OWN RENDERED HTML for the pull
+# request's title and body (`POST /markdown`, mode `gfm`), parsed into a tree, with the text kept
+# only from elements this file POSITIVELY CLASSIFIES as prose. The unknown case — any element in
+# the rendered output that is in none of the classification sets below — REFUSES. See
+# `rendered_prose_text` for the classification and `closing_references` for the two-derivation
+# agreement rule that keeps a renderer surprise on the refusal side.
 #
-# Among the remaining three, an HTML comment can contain a fence and a fence can contain backticks.
-#
-# An UNCLOSED `<!--` strips to the end of the body, exactly as an unclosed fence does. GitHub hides
-# the remainder of the description from the author in that case, so text they cannot see must not be
-# able to bind the lease; the two constructs disagreeing about the unclosed case was an
-# inconsistency, not a design.
-HTML_COMMENT_RE = re.compile(r"<!--.*?(?:-->|\Z)", re.S)
-FENCED_BLOCK_RE = re.compile(
-    r"^[ \t]{0,3}(`{3,}|~{3,})[^\n]*$.*?(?:^[ \t]{0,3}\1[ \t]*$|\Z)", re.M | re.S)
-# Content that holds no backtick, delimited by a run of the same length: linear, and an UNBALANCED
-# backtick therefore consumes nothing rather than swallowing the document.
-CODE_SPAN_RE = re.compile(r"(`+)[^`]*?\1")
-BLOCKQUOTE_LINE_RE = re.compile(r"^[ \t]{0,3}>.*$", re.M)
-# What an INLINE code span leaves behind. See `strip_quoted_contexts` for why this is not a space
-# (it would splice) and not a newline (it would end the negation window mid-sentence). A control
-# character cannot occur in the keyword grammar, in NEGATOR_RE's character classes, or in
+# What an INLINE quoted element leaves behind. Not a space (it would SPLICE: the grammar's
+# `keyword[ \t]*:?[ \t]*#N` would read `` Fixes `mod` #1234 `` as a declaration the author never
+# wrote) and not a newline (it would end `is_negated`'s sentence window mid-sentence, so
+# ``this does not `x` close #7`` would stop being suppressed — a refusal turning into a mint). A
+# control character cannot occur in the keyword grammar, in NEGATOR_RE's character classes, or in
 # SENTENCE_BREAK_RE, which is exactly the set of properties required — and --self-test asserts all
 # three of those rather than trusting the choice.
 SPAN_SENTINEL = "\x00"
 
-# BLOCK CONSTRUCTS, used only by `_continues_a_paragraph` to decide whether an indented line opens a
-# CommonMark indented code block. Each one is here because GitHub's own renderer puts `<pre><code>`
-# after it and this file used to bind the keyword instead — they are measured shapes, not a
-# from-first-principles list of markdown syntax.
-ATX_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}([ \t]|$)")
-SETEXT_UNDERLINE_RE = re.compile(r"^[ \t]{0,3}(=+|-+)[ \t]*$")
-THEMATIC_BREAK_RE = re.compile(r"^[ \t]{0,3}((\*[ \t]*){3,}|(-[ \t]*){3,}|(_[ \t]*){3,})$")
-FENCE_MARKER_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
-TABLE_ROW_RE = re.compile(r"^[ \t]{0,3}\|")
-# ONE level of blockquote container: up to 3 spaces of indent, the marker, and its optional single
-# space. Applied repeatedly by `_continues_a_paragraph` so a nested quote unwraps to its content.
-# The space after `>` is optional because `>## Evidence` is a heading to GitHub too.
-BLOCKQUOTE_PREFIX_RE = re.compile(r"^[ \t]{0,3}>[ \t]?")
+# ---- THE RENDERED-ELEMENT CLASSIFICATION -------------------------------------------------------
+# Four CLOSED sets over GitHub's rendered output vocabulary, plus one conditional rule for `<a>`.
+# Everything not named here raises `UnknownRenderedElement`, which is a REFUSAL. That is the whole
+# inversion: the source grammar is open and cannot be enumerated, but the sanitised HTML GitHub
+# emits is a bounded vocabulary, so a positive allowlist over IT can be complete — and when it is
+# not, the gap is a missed mint (recoverable, visible, censused) rather than a spurious one.
+#
+# MEASURED against `POST /markdown` (mode `gfm`, this repository as context) over a 92-shape corpus
+# and every rendered title+body of the live enrolled-class population: every element below was
+# emitted by the real renderer for a real markdown shape. `svg`/`path` come from `> [!NOTE]` alert
+# blocks, `markdown-accessiblity-table` from every GFM table, `themed-picture` from an image,
+# `math-renderer` from `$…$`, `input` from a task-list checkbox, `section` from footnotes.
+#
+# PROSE_BLOCK: prose, and a container boundary that ENDS a proposition (a newline is emitted).
+PROSE_BLOCK_ELEMENTS = frozenset({
+    "p", "h1", "h2", "h3", "h4", "h5", "h6", "div", "section", "article", "aside", "header",
+    "footer", "main", "nav", "ul", "ol", "li", "dl", "dt", "dd", "hr",
+    "table", "thead", "tbody", "tfoot", "tr", "td", "th", "caption", "colgroup", "col",
+    "details", "summary", "markdown-accessiblity-table",
+})
+# PROSE_INLINE: prose, and NOT a proposition boundary — text either side of it is one sentence.
+PROSE_INLINE_ELEMENTS = frozenset({
+    "em", "strong", "b", "i", "del", "s", "strike", "ins", "u", "sup", "sub", "mark", "q",
+    "span", "small", "big", "cite", "dfn", "abbr", "time", "font", "ruby", "rt", "rp",
+    "br", "wbr", "img", "input", "picture", "source", "themed-picture", "g-emoji",
+    "math-renderer", "bdi", "bdo",
+})
+# QUOTED_BLOCK: the author is showing text, not asserting it. Its subtree contributes NO text, and
+# it ends the proposition. `pre` is GitHub's own verdict that the content is code — it is what the
+# renderer emits for a fence, an indented code block, a `<pre>` the author wrote, and every one of
+# the seven shapes round 5 found. `blockquote` is a deliberate policy choice, not a rendering fact:
+# GitHub DOES resolve a keyword inside one, so refusing it is a declared FALSE NEGATIVE (see
+# `rendered_prose_text`), taken because quoting someone else's text is not declaring it.
+QUOTED_BLOCK_ELEMENTS = frozenset({"pre", "blockquote"})
+# QUOTED_INLINE: the HTML "computer output" family. Its subtree contributes SPAN_SENTINEL, never
+# text. `code` is GitHub's verdict for a code span; the rest are the author's own markup saying the
+# same thing, and refusing them is again a declared false negative rather than a rendering fact.
+QUOTED_INLINE_ELEMENTS = frozenset({"code", "samp", "kbd", "tt", "var"})
+# OPAQUE: a foreign vocabulary whose subtree is dropped WITHOUT classifying its descendants. Only
+# SVG, which GitHub emits for alert icons and whose element names are not HTML's. Nothing escapes,
+# so not classifying inside it cannot admit anything.
+OPAQUE_ELEMENTS = frozenset({"svg"})
+# Elements that never carry an end tag, so they must not be pushed onto the open-element stack.
+VOID_ELEMENTS = frozenset({
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+    "source", "track", "wbr",
+})
+# THE ONE CONDITIONAL RULE. `<a>` cannot be classified by tag alone, and getting it wrong breaks the
+# feature in one direction or the trust model in the other. GitHub rewrites `Closes #929` into
+# `Closes <a class="issue-link js-issue-link" …>#929</a>`, so dropping every anchor's text would
+# make the derivation bind NOTHING; but an author-written `<a href=…>Closes #929</a>` (or the
+# markdown `[Closes #929](url)`) is NOT resolved by GitHub — it emits no `issue-link` anchor —
+# so treating every anchor as prose would bind a reference GitHub does not. The renderer tells the
+# two apart itself: only a reference it RESOLVED carries this class.
+ISSUE_LINK_CLASS = "issue-link"
 
 # NEGATED PROSE — a best-effort suppressor, and honestly labelled as one.
 #
@@ -241,6 +315,9 @@ REASON_ISSUE_UNREADABLE = "source-issue-unreadable"
 REASON_MINT_REFUSED = "mint-refused"
 REASON_RECORD_PROBE_FAILED = "record-probe-failed"
 REASON_MINT_FAILED = "mint-failed"
+# THE TWO FAIL-CLOSED EXITS OF THE RENDERED DERIVATION. Neither can ever produce a record.
+REASON_RENDER_UNAVAILABLE = "body-render-unavailable"
+REASON_BODY_NOT_UNDERSTOOD = "body-shape-not-understood"
 
 PR_REFUSAL_REASONS = (
     REASON_NO_REFERENCE,
@@ -251,14 +328,19 @@ PR_REFUSAL_REASONS = (
     REASON_MINT_REFUSED,
     REASON_RECORD_PROBE_FAILED,
     REASON_MINT_FAILED,
+    REASON_RENDER_UNAVAILABLE,
+    REASON_BODY_NOT_UNDERSTOOD,
 )
 
-# The refusals that are censused but NOT commented on the PR. Both are facts about the REGISTRY —
-# a probe that could not be read, a write that failed — not about the pull request. Commenting one
-# would put a transient registry outage on someone else's PR permanently, because the comment
-# dedupe is by reason and would never retract it. Every OTHER reason is a fact about the PR that
-# its author can act on, so every other reason comments. Asserted exactly, in both directions.
-SILENT_REASONS = frozenset({REASON_RECORD_PROBE_FAILED, REASON_MINT_FAILED})
+# The refusals that are censused but NOT commented on the PR. All three are facts about the
+# REGISTRY or the platform — a probe that could not be read, a write that failed, a renderer that
+# did not answer — not about the pull request. Commenting one would put a transient outage on
+# someone else's PR permanently, because the comment dedupe is by reason and would never retract
+# it. Every OTHER reason is a fact about the PR that its author can act on, so every other reason
+# comments — including `body-shape-not-understood`, which IS a fact about the body. Asserted
+# exactly, in both directions.
+SILENT_REASONS = frozenset({REASON_RECORD_PROBE_FAILED, REASON_MINT_FAILED,
+                            REASON_RENDER_UNAVAILABLE})
 
 # Target-level refusals (not per-PR reasons): see target_sweep_refusal.
 REASON_TARGET_NOT_ANNOTATABLE = "target-not-annotatable"
@@ -270,9 +352,10 @@ REASON_TARGET_PULLS_UNREADABLE = "target-pulls-unreadable"
 # WHY NO HINT HERE CONTAINS A LITERAL ISSUE NUMBER. These strings are posted verbatim onto pull
 # requests, and the likeliest author response to receiving one is to quote it back into the PR
 # description. A worked example reading `Closes #1234` was therefore a live payload that minted a
-# record bound to 1234. The quoted-context strip already neutralises the quoted form; writing the
-# placeholder without digits makes the text inert even when it is pasted UNQUOTED, and --self-test
-# pins both properties over the whole rendered comment.
+# record bound to 1234. The rendered derivation already neutralises the quoted form (the message is
+# a blockquote and every placeholder a code span, both of which GitHub renders as quoted context);
+# writing the placeholder without digits makes the text inert even when it is pasted UNQUOTED, and
+# --self-test pins both properties over GitHub's own rendering of the whole comment.
 REASON_HINTS = {
     REASON_NO_REFERENCE:
         "Add exactly one closing reference for the source issue — a `Closes #<issue-number>` line "
@@ -296,14 +379,22 @@ REASON_HINTS = {
     REASON_ISSUE_UNREADABLE:
         "Check the referenced number exists and is readable, then leave it as the single closing "
         "reference.",
+    REASON_BODY_NOT_UNDERSTOOD:
+        "The binding is derived from GitHub's own rendering of this description, and the element "
+        "named above is one this sweep does not classify as prose or as quoted context — so it "
+        "cannot tell whether a closing keyword inside it is a declaration, and it refuses rather "
+        "than guessing. Either express the closing reference in ordinary prose, or ask the "
+        "maintainer to classify that element (it is a measured, reviewed change to the sweep, not "
+        "a setting).",
     REASON_MINT_REFUSED:
         "The record was refused by the shared minting gate; the reason above is verbatim from it. "
         "Nothing was written, so this PR stays exactly as un-enumerated as it is now.",
 }
 
 # Reasons whose message is PASSED THROUGH from another component rather than built here. Their text
-# is quoted into the comment, so it is rendered as a blockquote — which this file's own strip then
-# treats as quoted context, making even a hostile passthrough inert if the comment is pasted back.
+# is quoted into the comment, so it is rendered as a blockquote — which this file's own derivation
+# then treats as quoted context, making even a hostile passthrough inert if the comment is pasted
+# back. --self-test drives GitHub's real rendering of every generated comment to assert it.
 PASSTHROUGH_REASONS = frozenset({REASON_MINT_REFUSED})
 
 COMMENT_MARKER_PREFIX = "<!-- auto-mint-provenance:refusal:"
@@ -359,130 +450,151 @@ def _load_policy_resolve():
 
 
 # ---- pure decisions (every one unit-tested by --self-test) -------------------------------------
-def _continues_a_paragraph(line):
-    """True when `line` leaves an OPEN PARAGRAPH that a following indented line would continue.
+class _ProseExtractor(HTMLParser):
+    """Walks GitHub's rendered HTML and keeps the text that is PROSE, refusing anything unclassified.
 
-    This is the predicate `strip_indented_code` turns on, and it is deliberately written as "what IS
-    paragraph text" rather than "what is a block construct", because the unknown case then falls to
-    NOT-a-paragraph — which strips, which refuses. An enumeration that fails safe is the only kind
-    worth having here.
+    THE INVARIANT: text reaches the output only from inside elements every one of whose ancestors
+    is in `PROSE_BLOCK_ELEMENTS`, `PROSE_INLINE_ELEMENTS`, or is an `<a>` the RENDERER marked as a
+    resolved issue link. There is no path by which an unrecognised element contributes text: it
+    raises before its content is read.
 
-    A BLOCKQUOTE MARKER IS A CONTAINER, NOT CONTENT, so it is stripped (repeatedly, for nested
-    quotes) and the question is then asked of what it holds. This is the whole of a round-5 blocking
-    finding: the earlier version treated every `>`-prefixed line as paragraph-ish always, so
-    `> ## Evidence` followed by an indented line read as a lazy paragraph continuation and MINTED
-    from text GitHub renders as `<pre><code>`. MEASURED, 10 quoted sub-shapes did that.
+    Three things it is careful about, each a way the old regex strip got it wrong:
 
-    The recursion has to be HERE, at the predicate, and not one layer out. Stripping blockquote
-    lines before `strip_indented_code` also silences those 10 — and breaks the control with them,
-    because a line erased wholesale can no longer say whether it held a paragraph or a heading, and
-    `> quoted paragraph` + indented really is a lazy continuation that GitHub resolves. Both layers
-    were measured before this one was chosen.
+    * A QUOTED element's whole SUBTREE is dropped, not just its direct text, so `<pre><code>…` and
+      `<a href><code>…` drop once and stay dropped.
+    * A dropped BLOCK leaves a newline and a dropped INLINE leaves `SPAN_SENTINEL`, for exactly the
+      reasons at `SPAN_SENTINEL`: neither can be crossed by the grammar's `[ \\t]*`, but only the
+      newline ends `is_negated`'s proposition window.
+    * ATTRIBUTES ARE NEVER TEXT. `<img alt="Closes #929">` renders no prose, and GitHub emits no
+      issue link for it — a fixture pins that."""
 
-    An HTML block other than a comment stays paragraph-ish on purpose: GitHub renders `<div>` /
-    `</div>` + indented as PLAIN TEXT, because the indented line is still inside the unterminated
-    block. A comment is the one HTML block that ends at its own terminator, so a line carrying
-    `-->` really does close it. All of this is ground truth from GitHub's `POST /markdown`."""
-    while True:
-        stripped = BLOCKQUOTE_PREFIX_RE.sub("", line, count=1)
-        if stripped == line:
-            break
-        line = stripped
-    if not line.strip():
-        return False                                  # a blank line closes any paragraph
-    if "-->" in line:
-        return False                                  # ...as does the END of an HTML comment
-    for pattern in (ATX_HEADING_RE, SETEXT_UNDERLINE_RE, THEMATIC_BREAK_RE, FENCE_MARKER_RE,
-                    TABLE_ROW_RE):
-        if pattern.match(line):
-            return False
-    return True
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.stack = []
+        self.quote_depth = 0
+        self.opaque_depth = 0
+
+    def _classify(self, tag, attrs):
+        if tag in OPAQUE_ELEMENTS:
+            return "opaque"
+        if tag == "a":
+            classes = ""
+            for name, value in attrs:
+                if name == "class":
+                    classes = value or ""
+            return "prose-inline" if ISSUE_LINK_CLASS in classes.split() else "quoted-inline"
+        if tag in PROSE_BLOCK_ELEMENTS:
+            return "prose-block"
+        if tag in PROSE_INLINE_ELEMENTS:
+            return "prose-inline"
+        if tag in QUOTED_BLOCK_ELEMENTS:
+            return "quoted-block"
+        if tag in QUOTED_INLINE_ELEMENTS:
+            return "quoted-inline"
+        raise UnknownRenderedElement(tag)
+
+    def _separator(self, kind):
+        if kind.endswith("block"):
+            self.parts.append("\n")
+        elif kind in ("quoted-inline", "opaque"):
+            self.parts.append(SPAN_SENTINEL)
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if self.opaque_depth:
+            if tag not in VOID_ELEMENTS:
+                self.opaque_depth += 1
+            return
+        kind = self._classify(tag, attrs)
+        self._separator(kind)
+        if tag in VOID_ELEMENTS:
+            return
+        if kind == "opaque":
+            self.opaque_depth = 1
+            return
+        if kind.startswith("quoted"):
+            self.quote_depth += 1
+        self.stack.append((tag, kind))
+
+    def handle_startendtag(self, tag, attrs):
+        tag = tag.lower()
+        if self.opaque_depth:
+            return
+        self._separator(self._classify(tag, attrs))
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if self.opaque_depth:
+            self.opaque_depth -= 1
+            return
+        if tag in VOID_ELEMENTS:
+            return
+        while self.stack:
+            open_tag, kind = self.stack.pop()
+            if kind.startswith("quoted"):
+                self.quote_depth -= 1
+            if kind.endswith("block"):
+                self.parts.append("\n")
+            if open_tag == tag:
+                return
+        # An end tag closing nothing means the document is not the shape this parser believes it
+        # is, so it is the unknown case too rather than a silently-ignored oddity.
+        raise UnknownRenderedElement("/" + tag)
+
+    def handle_data(self, data):
+        if self.opaque_depth or self.quote_depth:
+            return
+        self.parts.append(data)
+
+    def text(self):
+        return "".join(self.parts)
 
 
-def strip_indented_code(text):
-    """`text` with every CommonMark INDENTED CODE BLOCK blanked out.
+def rendered_prose_text(html):
+    """The PROSE text of GitHub's rendered HTML. Raises `UnknownRenderedElement` on anything else.
 
-    CommonMark's rule is that an indented code block MAY NOT INTERRUPT A PARAGRAPH — so four spaces
-    (or a tab) of indent opens code exactly when the preceding line does not leave a paragraph open.
-    An earlier version of this function used "a BLANK line opened it", which is a DIFFERENT
-    predicate, and the difference was in the minting direction: wherever the preceding line ended a
-    NON-paragraph block, GitHub rendered `<pre><code>` while this file bound the reference as live.
-    MEASURED against GitHub's own renderer in two rounds, because the first round's corpus was
-    mis-sampled. Round one found 13 unquoted shapes diverging (ATX and setext headings, both
-    thematic-break forms, closed and multi-line HTML comments, closed ``` and ~~~ fences, a GFM
-    table, a tab or 8-space indent after a heading, an indented FIRST body line). Round two found 10
-    more, all BLOCKQUOTED versions of the same constructs, because the predicate then treated every
-    `>` line as paragraph-ish unconditionally — see `_continues_a_paragraph`. Each one minted a real
-    record end to end. All 23 are frozen as fixtures.
+    This is the whole replacement for three rounds of source-level stripping, and the reason it can
+    be complete where they could not: GitHub SANITISES its output to a bounded element vocabulary,
+    so a positive allowlist over that vocabulary has a well-defined unknown case, and the unknown
+    case here REFUSES.
 
-    HONEST LIMITS — the divergences that REMAIN are all false NEGATIVES, none of them a mint, and
-    there are FIVE of them rather than the one an earlier version of this docstring claimed:
+    HONEST LIMITS — MEASURED, over a 92-shape corpus rendered by the live `POST /markdown` and
+    frozen in `scripts/fixtures/auto-mint-provenance/rendered-oracle.json`, plus every rendered
+    title and body of the live enrolled-class population.
 
-      * a paragraph continuing a LIST ITEM (three sub-shapes: bullet, numbered, nested) — GitHub
-        renders it as prose and resolves a keyword in it; closing this needs real list-context
-        tracking (the marker's own content indent), the genuinely hard part of block parsing;
-      * a lone GFM table DELIMITER row, which is not a table to GitHub but is treated as one here;
-      * an indented line after prose that merely CONTAINS `-->`.
+    THE SAFETY DIRECTION, machine-checked over every corpus row: **no row this file BINDS is a row
+    GitHub declined to resolve.** GitHub emits an `issue-link` anchor exactly for a `#N` it read as
+    a live reference (not code, not quoted), and `expect_bind ⇒ github_linkified` holds for 25 of
+    25 binding rows. The seven `<pre>`/`<code>`/table shapes that minted at the previous head all
+    land in `<pre>` or `<code>` and are dropped here.
 
-    The direction is the deliberate one for this file: a refusal is a comment naming the single edit
-    that fixes it, while a wrong mint is silent, permanent and censused as a success. --self-test
-    pins BOTH directions, so this cannot drift into stripping ordinary prose, and the count above is
-    what the 50-shape oracle corpus actually measures — not a summary of it."""
-    kept, in_block, prev_opens_code = [], False, True
-    for line in (text or "").split("\n"):
-        blank = not line.strip()
-        indented = line.startswith("    ") or line.startswith("\t")
-        if in_block and (blank or indented):
-            kept.append("")
-            prev_opens_code = True
-            continue
-        in_block = False
-        if indented and prev_opens_code and not blank:
-            in_block = True
-            kept.append("")
-            prev_opens_code = True
-            continue
-        kept.append(line)
-        prev_opens_code = not _continues_a_paragraph(line)
-    return "\n".join(kept)
+    THE RESIDUAL DIVERGENCES ALL POINT THE OTHER WAY — 23 corpus rows where GitHub resolves the
+    reference and this file refuses. They are not one kind, so they are not summarised as one:
 
+      * DELIBERATE GRAMMAR NARROWING (8 rows): a bare mention, `Refs #N`, a cross-repository
+        `owner/repo#N`, a conventional-commit scope `fix(#869):`, a keyword inside another word,
+        a keyword not adjacent to the number, `Closes GH-929`, and `Closes <issue URL>`. GitHub
+        resolves the last two; this grammar reads `#N` only.
+      * DELIBERATE QUOTED-CONTEXT POLICY (7 rows): `blockquote` and its sub-shapes, `code`/`samp`/
+        `kbd`/`tt`/`var`. GitHub resolves a keyword inside a blockquote; this file treats quoting as
+        not declaring.
+      * THE TWO-DERIVATION AGREEMENT RULE (5 rows): `Clos**es** #7`, `Closes &#35;7`,
+        ``Fixes `mod` #7``, `Closes`x`#7`, `Closes [#7](url)` — cases where the rendered text and
+        the raw source disagree about whether the grammar matches. `closing_references` requires
+        BOTH, so a disagreement is a refusal.
+      * THE NEGATION SUPPRESSOR (3 rows), which by construction can only ever remove a declaration.
 
-def strip_quoted_contexts(text):
-    """`text` with every QUOTED context removed: indented code blocks, blockquote lines, HTML
-    comments, fenced code blocks and inline code spans — in that order, for the reason given above
-    the regexes.
-
-    A closing keyword inside any of those is something the author QUOTED — a template, another
-    PR's description, this tool's own refusal comment — not something they declared. GitHub itself
-    does not resolve one, and neither may this.
-
-    NOTHING IS SUBSTITUTED WITH A SPACE, and that is load-bearing. A space SPLICES: the grammar's
-    `keyword[ \\t]*:?[ \\t]*#N` would read `` Fixes `mod` #1234 `` as a declaration that the author
-    never wrote, because removing the span manufactured the keyword→`#` adjacency that was not in
-    the source. What replaces a construct has to be something `[ \\t]*` cannot cross, so that a
-    construct the author put BETWEEN a keyword and a number BREAKS the reference instead of
-    completing it — the safe direction for a strip that is an enumeration, and therefore incomplete
-    by nature.
-
-    WHICH separator, though, is not one choice but two, and MEASURED — the differential over 4,245
-    inputs is what separated them:
-
-    * The four BLOCK constructs are replaced by a NEWLINE. They genuinely end a proposition, so
-      `is_negated`'s sentence window should stop at them.
-    * An INLINE code span is replaced by `SPAN_SENTINEL`, which is deliberately NOT a
-      SENTENCE_BREAK. A newline here over-signals: it ends the negation window mid-sentence, so
-      `this does not `x` close #7` stopped being suppressed and MINTED #7 — a refusal turning into
-      a mint, which is the one direction this file never permits. The sentinel is not `[ \\t]`, so
-      it still cannot be crossed by the grammar; it is not `[0-9A-Za-z_-]`, so it does not break
-      the keyword's `\\b` or the `#`'s preceding-character guard; and it is not in
-      SENTENCE_BREAK_RE, so the proposition continues across it exactly as the author wrote it.
-
-    --self-test pins both halves, and the differential pins the composition: 0 refusal→mint and 0
-    rebindings across the whole generated + live population."""
-    text = BLOCKQUOTE_LINE_RE.sub("\n", strip_indented_code(text))
-    text = HTML_COMMENT_RE.sub("\n", text)
-    text = FENCED_BLOCK_RE.sub("\n", text)
-    return CODE_SPAN_RE.sub(SPAN_SENTINEL, text)
+    WHAT IS NOT PROVEN. This is not a proof that no unmeasured shape can mint. It is a proof that a
+    shape can only mint by being rendered into an element in the two PROSE sets above, so a NEW
+    GitHub element cannot mint — it raises. The residue that remains is: an element already
+    classified as prose whose content GitHub nonetheless does not resolve. One such case exists and
+    is handled by name (`<a>` without the `issue-link` class); if another is ever measured, it is a
+    classification change here, not another strip."""
+    parser = _ProseExtractor()
+    parser.feed(html or "")
+    parser.close()
+    return parser.text()
 
 
 def is_negated(text, keyword_start):
@@ -497,46 +609,76 @@ def is_negated(text, keyword_start):
     return bool(NEGATOR_RE.search(window))
 
 
-def _stripped_title_and_body(title, body):
-    """The title and body stripped as the TWO SEPARATE DOCUMENTS GitHub renders, then joined.
-
-    Concatenating them first was itself a defect, and a measured one: the title occupied line 0, so
-    an indented FIRST body line always had a non-blank line above it and could never be seen as
-    the code block GitHub renders it as. The same concatenation let an unclosed ``` or `<!--` in a
-    TITLE swallow the whole body, which GitHub — rendering the two independently — never does.
-
-    A title is a single line of plain text, so no block-level construct can span the two."""
-    return f"{strip_quoted_contexts(title or '')}\n{strip_quoted_contexts(body or '')}"
+def raw_text(title, body):
+    """The pull request's own source text — exactly what mint-provenance.references_issue reads."""
+    return f"{title or ''}\n{body or ''}"
 
 
-def closing_references(title, body):
-    """Every same-repository closing reference in the PR's title and body, split into what may
-    BIND and what merely counts for AMBIGUITY.
+def prose_text(title, body, render_markdown):
+    """The PROSE text of the RENDERED title and body, as the TWO SEPARATE DOCUMENTS GitHub renders.
 
-    Quoted context is stripped first, and the grammar then runs on what is left — so anything this
-    returns is a keyword the author wrote in their own prose. It is still a textual `#N` in the
-    original, so it also satisfies mint-provenance.references_issue's binding requirement."""
-    text = _stripped_title_and_body(title, body)
-    declared, seen = set(), set()
-    for match in CLOSING_REF_RE.finditer(text):
+    Rendering them TOGETHER was itself a measured defect: the title occupied line 0, so an indented
+    FIRST body line always had a non-blank line above it and could never be the code block GitHub
+    renders it as, and an unclosed ``` or `<!--` in a TITLE swallowed the whole body, which GitHub
+    — rendering the two independently — never does. Two documents in, two renders out.
+
+    A BLANK DOCUMENT IS NOT RENDERED. That is an identity, not an optimisation: the empty string
+    renders to the empty string, so skipping the call cannot change any answer, and it keeps a PR
+    with no body from spending a request. Anything non-blank goes to the renderer, including a
+    document with no `#` in it — there is deliberately no "looks harmless, skip it" branch, because
+    a branch like that is the enumeration this redesign exists to delete."""
+    return "\n".join(
+        rendered_prose_text(render_markdown(document)) if (document or "").strip() else ""
+        for document in (title, body))
+
+
+def closing_references(title, body, render_markdown):
+    """Every same-repository closing reference, split into what may BIND and what counts for
+    AMBIGUITY. Raises `RenderUnavailable` / `UnknownRenderedElement`; both are refusals upstream.
+
+    TWO DERIVATIONS THAT MUST AGREE. The grammar is run over the RENDERED PROSE (what GitHub says
+    is live text) and over the RAW SOURCE (what the author literally typed), and:
+
+      * `declared`  — what may bind — is the INTERSECTION, minus anything negated;
+      * `all_refs`  — what ambiguity is judged over — is the UNION.
+
+    So a reference the two derivations disagree about can only ever produce a REFUSAL, never a
+    binding and never a different binding. That is what makes each side's residual gap safe:
+
+      * a keyword the renderer puts in `<pre>`/`<code>` is missing from the prose side, so it drops
+        out of the intersection — the seven shapes of round 5, and every shape like them;
+      * a keyword the RENDERER manufactures that the author did not type — `Clos**es** #7` renders
+        as the text `Closes #7`, `Closes &#35;7` as `Closes #7`, and `Closes <issue URL>` as
+        `Closes #929` because GitHub rewrites the anchor's text — is missing from the raw side, so
+        it drops out too. MEASURED: all three of those DO render as a live GitHub reference, and
+        all three refuse here.
+
+    It also keeps the shared writer's own precondition true by construction: `declared ⊆ raw_refs`,
+    so anything derived here is a textual `#N` in the title or body and therefore satisfies
+    `mint-provenance.references_issue`."""
+    raw = raw_text(title, body)
+    raw_refs = {int(match.group(1)) for match in CLOSING_REF_RE.finditer(raw)}
+    prose = prose_text(title, body, render_markdown)
+    live, seen = set(), set(raw_refs)
+    for match in CLOSING_REF_RE.finditer(prose):
         number = int(match.group(1))
         seen.add(number)
-        if not is_negated(text, match.start()):
-            declared.add(number)
-    return ClosingRefs(sorted(declared), sorted(seen))
+        if not is_negated(prose, match.start()):
+            live.add(number)
+    return ClosingRefs(sorted(live & raw_refs), sorted(seen))
 
 
-def closing_issue_candidates(title, body):
+def closing_issue_candidates(title, body, render_markdown):
     """The DISTINCT, sorted set of same-repository issue numbers this PR DECLARES it closes."""
-    return closing_references(title, body).declared
+    return closing_references(title, body, render_markdown).declared
 
 
-def mentioned_issue_numbers(title, body):
+def mentioned_issue_numbers(title, body, render_markdown):
     """ADVISORY: every same-repository `#N` the PR mentions, sorted, capped. Never a candidate.
 
-    Reads the SAME stripped text the grammar does, so the hint never advertises a number that only
-    exists inside a code block the author pasted."""
-    text = _stripped_title_and_body(title, body)
+    Reads the same RENDERED PROSE the grammar's binding half does, so the hint never advertises a
+    number that only exists inside a code block the author pasted."""
+    text = prose_text(title, body, render_markdown)
     return sorted({int(number) for number in MENTION_RE.findall(text)})[:MAX_ADVISORY_MENTIONS]
 
 
@@ -592,18 +734,28 @@ def resolved_issue_refusal(number, issue):
     return None
 
 
-def derive_issue_number(pull, read_issue):
+def derive_issue_number(pull, read_issue, render_markdown):
     """The whole `issue_number` derivation for ONE PR. TOTAL: never raises, never guesses.
 
-    `read_issue(number)` is the live read of the single candidate. Any failure of it is a refusal,
-    not an exception and emphatically not a fallback."""
+    `read_issue(number)` is the live read of the single candidate and `render_markdown(text)` is
+    GitHub's own renderer. Any failure of EITHER is a refusal, not an exception and emphatically
+    not a fallback — in particular there is no path from "the renderer did not answer" to "read the
+    raw markdown instead", because the raw markdown is the permissive derivation this file
+    deliberately no longer has."""
     if not isinstance(pull, dict):
         return DerivedIssue(None, REASON_ISSUE_UNREADABLE,
                             "the pull request payload is malformed", None)
-    references = closing_references(pull.get("title"), pull.get("body"))
-    refusal = candidate_refusal(
-        references.declared, mentioned_issue_numbers(pull.get("title"), pull.get("body")),
-        references.all_refs)
+    try:
+        references = closing_references(pull.get("title"), pull.get("body"), render_markdown)
+        mentions = mentioned_issue_numbers(pull.get("title"), pull.get("body"), render_markdown)
+    except UnknownRenderedElement as exc:
+        return DerivedIssue(None, REASON_BODY_NOT_UNDERSTOOD, str(exc), None)
+    except Exception as exc:                              # noqa: BLE001 — no render, no derivation
+        return DerivedIssue(None, REASON_RENDER_UNAVAILABLE,
+                            "GitHub's markdown renderer could not be read, so whether a closing "
+                            f"keyword is quoted context cannot be decided ({exc}); nothing was "
+                            "derived and nothing was written", None)
+    refusal = candidate_refusal(references.declared, mentions, references.all_refs)
     if refusal:
         return DerivedIssue(None, refusal[0], refusal[1], None)
     number = references.declared[0]
@@ -716,10 +868,12 @@ def refusal_comment_body(reason, message):
     """The comment left ON the pull request. Credential-free by construction: every message it
     interpolates is either built in this file or is mint-provenance's own concise refusal text.
 
-    THE MESSAGE IS RENDERED AS A BLOCKQUOTE. Not decoration: this file's own `strip_quoted_contexts`
-    treats a blockquote line as quoted context, so a comment pasted back into a PR description
-    cannot become a declaration — even for `mint-refused`, whose text comes from another component
-    and is therefore not this file's to vet."""
+    THE MESSAGE IS RENDERED AS A BLOCKQUOTE. Not decoration: GitHub renders it into a
+    `<blockquote>`, which `rendered_prose_text` drops, so a comment pasted back into a PR
+    description cannot become a declaration — even for `mint-refused`, whose text comes from another
+    component and is therefore not this file's to vet. The numbers in it are still counted for
+    AMBIGUITY (the raw half of the union sees them), so a pasted-back comment REFUSES rather than
+    quietly doing nothing, and --self-test asserts both halves over GitHub's own rendering."""
     hint = REASON_HINTS.get(reason, "")
     quoted = "\n".join(f"> {line}" for line in str(message).rstrip(".").splitlines() or [""])
     return (
@@ -795,8 +949,8 @@ def new_counters(*, mint_cap, comment_cap, apply_changes):
 
 # ---- the sweep ---------------------------------------------------------------------------------
 def sweep(targets, *, annotate_repo, read_routing, read_pulls, read_issue, read_record, mint_pr,
-          read_comments, post_comment, apply_changes=False, max_mints=DEFAULT_MAX_MINTS,
-          max_comments=DEFAULT_MAX_COMMENTS, log=print):
+          read_comments, post_comment, render_markdown, apply_changes=False,
+          max_mints=DEFAULT_MAX_MINTS, max_comments=DEFAULT_MAX_COMMENTS, log=print):
     """One tick. Returns the census row; every reader/writer is injectable so --self-test drives
     this exact orchestration — the call sites, not just the predicates."""
     mint_provenance = _load_mint_provenance()
@@ -861,7 +1015,9 @@ def sweep(targets, *, annotate_repo, read_routing, read_pulls, read_issue, read_
             if existing is not None:
                 counters["with_record"] += 1
                 continue
-            derived = derive_issue_number(pull, lambda n, r=target_repo: read_issue(r, n))
+            derived = derive_issue_number(
+                pull, lambda n, r=target_repo: read_issue(r, n),
+                lambda text, r=target_repo: render_markdown(r, text))
             if derived.reason:
                 refuse(target_repo, pull, derived.reason, derived.message)
                 continue
@@ -935,7 +1091,31 @@ def _gh_readers(mint_provenance, registry_repo):
             ["api", "-X", "POST", f"repos/{target_repo}/issues/{number}/comments",
              "-f", f"body={body}"])
 
-    return read_routing, read_pulls, read_issue, read_record, read_comments, post_comment
+    def render_markdown(target_repo, text):
+        """GitHub's own rendering of `text`, as it would render it IN `target_repo`.
+
+        `context` is the target repository so a `#N` GitHub resolves there is marked with the
+        `issue-link` class — that class is how `rendered_prose_text` tells the renderer's own
+        resolved reference apart from an author-written `<a>` (see ISSUE_LINK_CLASS). `mode=gfm`
+        because GFM is what GitHub renders a pull-request body with; tables, task lists and
+        strikethrough all differ under plain `markdown`.
+
+        FAILS CLOSED. A non-zero `gh` exit becomes `RenderUnavailable`, which `derive_issue_number`
+        turns into a refusal. There is no raw-markdown fallback: the point of the renderer is that
+        it is the authority on what is quoted, and an authority you ignore when it is inconvenient
+        is not one. It runs against api.github.com with the same token as every other call this
+        sweep makes, so it adds no host and no credential that the tick did not already depend on."""
+        result = mint_provenance._run_gh(
+            ["api", "-X", "POST", "/markdown", "-f", f"text={text}", "-f", "mode=gfm",
+             "-f", f"context={target_repo}"], check=False)
+        if result.returncode != 0:
+            raise RenderUnavailable(
+                f"GitHub's markdown renderer returned {result.returncode} for a "
+                f"{len(text or '')}-character document")
+        return result.stdout
+
+    return (read_routing, read_pulls, read_issue, read_record, read_comments, post_comment,
+            render_markdown)
 
 
 def _read_policy():
@@ -1061,11 +1241,214 @@ def sweep_workflow_seam_report(workflow=None):
     }
 
 
+# ---- THE RENDERED ORACLE: GitHub's own verdicts, frozen ---------------------------------------
+# The repository whose issue numbering the oracle was captured against, and the REAL open issue it
+# uses. Both matter: `POST /markdown` only emits an `issue-link` anchor for a reference that
+# RESOLVES, so a corpus keyed on a number that does not exist reads as "GitHub rendered it as code"
+# for EVERY row — an instrument artefact that a previous reviewer caught in their own harness before
+# it produced a wrong conclusion. #929 is this change's own tracking issue and is open.
+ORACLE_CONTEXT_REPO = "jeswr/agent-account-registry"
+ORACLE_ISSUE = 929
+RENDERED_ORACLE_PATH = SCRIPTS_DIR / "fixtures" / "auto-mint-provenance" / "rendered-oracle.json"
+
+# (label, title, body, expect_bind)
+#
+# WHAT `expect_bind` IS AND IS NOT. It is what THIS FILE must do, decided by hand from the design
+# rules and NOT read off the implementation. It is checked against a second, independent column the
+# corpus does not author: `github_linkified`, recorded from the live renderer, true exactly when
+# GitHub resolved the reference into an `issue-link` anchor. The suite then asserts the SAFETY
+# DIRECTION over the whole table — `expect_bind` implies `github_linkified` — so a row can never be
+# "corrected" into binding something GitHub renders as code without that assertion going red.
+#
+# One row's hand-written expectation WAS wrong when the corpus was first measured (`alert block`:
+# `> [!NOTE]` renders as a `markdown-alert` div, not a blockquote, so GitHub resolves it and so does
+# this file). It is recorded here because a corpus whose expectations never disagree with the
+# implementation is a corpus that was read off the implementation.
+RENDERED_ORACLE_CORPUS = (
+    ('plain closes line', 'fix: thing', 'Closes #929.', True),
+    ('title declaration', 'Closes #929 - thing', '', True),
+    ('closes with colon', 't', 'Closes: #929', True),
+    ('uppercase', 't', 'CLOSES #929', True),
+    ('inside a list item', 't', '- Closes #929', True),
+    ('inside a heading', 't', '## Closes #929', True),
+    ('inside a table cell', 't', '| a |\n|---|\n| Closes #929 |', True),
+    ('bold emphasis around the keyword', 't', '**Closes** #929', False),
+    ('declaration beside a fenced block', 't', '```\nx\n```\n\nCloses #929', True),
+    ('declaration beside a quoted block', 't', '> quoted stuff\n\nCloses #929', True),
+    ('inside <details> body', 't', '<details>\n<summary>s</summary>\n\nCloses #929\n\n</details>', True),
+    ('task list item', 't', '- [x] Closes #929', True),
+    ('paragraph continuation (indented, prose)', 't', 'some prose that wraps\n    Closes #929', True),
+    ('R1 <pre> block', 't', '<pre>\nCloses #929\n</pre>', False),
+    ('R2 <pre> then indented', 't', '<pre>x</pre>\n    Closes #929', False),
+    ('R3 quoted <pre> then indented', 't', '> <pre>\n> x\n> </pre>\n    Closes #929', False),
+    ('R4 pipe-less GFM table then indented', 't', 'a | b\n--- | ---\nc | d\n    Closes #929', False),
+    ('R5 inline HTML <code>', 't', 'Use <code>Closes #929</code> in the body', False),
+    ('R6 <details> wrapping <pre>', 't', '<details><pre>Closes #929</pre></details>', False),
+    ('R7 <pre class=...>', 't', '<pre class="highlight">Closes #929</pre>', False),
+    ('fenced block', 't', '```\nCloses #929\n```', False),
+    ('~~~ fence', 't', '~~~\nCloses #929\n~~~', False),
+    ('unclosed fence', 't', '```\nCloses #929', False),
+    ('inline code span', 't', 'write a `Closes #929` line', False),
+    ('multi-backtick span', 't', 'write ``Closes #929`` here', False),
+    ('blockquote', 't', 'their body reads:\n\n> Closes #929', False),
+    ('html comment', 't', '<!-- template: Closes #929 -->', False),
+    ('multi-line html comment', 't', '<!--\nCloses #929\n-->', False),
+    ('unclosed html comment', 't', '<!-- draft\nCloses #929', False),
+    ('4-space indented code', 't', 'prose\n\n    Closes #929', False),
+    ('tab indented code', 't', 'prose\n\n\tCloses #929', False),
+    ('ATX heading then indented', 't', '## Evidence\n    Closes #929', False),
+    ('setext heading then indented', 't', 'Evidence\n========\n    Closes #929', False),
+    ('*** break then indented', 't', 'prose\n\n***\n    Closes #929', False),
+    ('--- underline then indented', 't', 'Evidence\n---\n    Closes #929', False),
+    ('___ break then indented', 't', 'prose\n\n___\n    Closes #929', False),
+    ('closed html comment then indented', 't', '<!-- c -->\n    Closes #929', False),
+    ('closed fence then indented', 't', '```\nx\n```\n    Closes #929', False),
+    ('~~~ fence then indented', 't', '~~~\nx\n~~~\n    Closes #929', False),
+    ('GFM table then indented', 't', '| a | b |\n|---|---|\n| c | d |\n    Closes #929', False),
+    ('quoted ATX heading then indented', 't', '> ## Evidence\n    Closes #929', False),
+    ('quoted setext then indented', 't', '> Evidence\n> ========\n    Closes #929', False),
+    ('quoted *** then indented', 't', '> ***\n    Closes #929', False),
+    ('quoted fence then indented', 't', '> ```\n> x\n> ```\n    Closes #929', False),
+    ('quoted table then indented', 't', '> | a | b |\n> |---|---|\n    Closes #929', False),
+    ('quoted blank then indented', 't', '> quoted\n>\n    Closes #929', False),
+    ('nested quote holding a heading', 't', '> > ## Evidence\n    Closes #929', False),
+    ('nested quote holding a fence', 't', '> > ```\n> > x\n> > ```\n    Closes #929', False),
+    ('quote marker with no space', 't', '>## Evidence\n    Closes #929', False),
+    ('quoted lazy continuation', 't', '> quoted\n    Closes #929', False),
+    ('blockquote lazy paragraph', 't', '> quoted para\n    Closes #929', False),
+    ('indented FIRST body line', 'fix: thing', '    Closes #929', False),
+    ('live #781 self-id banner', 't', '> 🤖 **SPARQ agent** - AUTHOR ONLY; no `VERDICT:` line. Closes #929.', False),
+    ('inline html comment in a quoted line', 't', '> 🤖 agent <!-- marker --> Closes #929.', False),
+    ('bullet item continuation', 't', '- item\n\n    Closes #929', True),
+    ('numbered item continuation', 't', '1. item\n\n    Closes #929', True),
+    ('code span between keyword and number', 't', 'Fixes `mod` #929', False),
+    ('spliced with no spaces', 't', 'Closes`x`#929', False),
+    ('span inside the keyword', 't', 'clo`x`ses #929', False),
+    ('negator across a code span', 't', 'this PR does not `x` close #929', False),
+    ('negated prose', 't', 'this PR does NOT close #929', False),
+    ('negator in the previous sentence', 't', 'This is not a revert. Closes #929', True),
+    ('markdown link text', 't', 'Closes [#929](https://x)', False),
+    ('issue URL form', 't', 'Closes https://github.com/jeswr/agent-account-registry/issues/929', False),
+    ('GH- form', 't', 'Closes GH-929', False),
+    ('html anchor around the keyword', 't', "<a href='https://x'>Closes #929</a>", False),
+    ('img alt text', 't', "<img alt='Closes #929' src='x.png'>", False),
+    ('emphasis inside the keyword', 't', 'Clos**es** #929', False),
+    ('numeric entity for the hash', 't', 'Closes &#35;929', False),
+    ('cross-repo reference', 't', 'Fixes sparq-org/sparq#4329', False),
+    ('bare mention', 't', 'see #929, related work', False),
+    ('Refs is not a closing keyword', 't', 'Refs #929', False),
+    ('keyword inside another word', 't', 'unfixed #929', False),
+    ('conventional-commit scope', 'fix(#929): thing', '', False),
+    ('keyword not adjacent', 't', 'Closes the composition defect in #929', False),
+    ('kbd', 't', '<kbd>Closes #929</kbd>', False),
+    ('samp', 't', '<samp>Closes #929</samp>', False),
+    ('alert block', 't', '> [!NOTE]\n> Closes #929', True),
+    ('footnote definition', 't', 'x[^1]\n\n[^1]: Closes #929\n', True),
+    ('strikethrough', 't', '~~Closes #929~~', True),
+    ('math block', 't', '$$ Closes #929 $$', True),
+    ('nested code in anchor', 't', "<a href='x'><code>Closes #929</code></a>", False),
+    ('suggestion fence', 't', '```suggestion\nCloses #929\n```', False),
+    ('blockquote holding a fence', 't', '> ```\n> Closes #929\n> ```', False),
+    ('html <p> passthrough', 't', '<p>Closes #929</p>', True),
+    ('html <div> passthrough', 't', '<div>Closes #929</div>', True),
+    ('html <blockquote> passthrough', 't', '<blockquote>Closes #929</blockquote>', False),
+    ('definition list', 't', '<dl><dt>Closes #929</dt><dd>x</dd></dl>', True),
+    ('summary text', 't', '<details><summary>Closes #929</summary>x</details>', True),
+    ('ruby annotation', 't', '<ruby>Closes #929<rt>x</rt></ruby>', True),
+    ('mark + q + sup', 't', '<mark>Closes #929</mark>', True),
+    ('picture element', 't', "<picture><source srcset='a.png'><img src='a.png' alt='Closes #929'></picture>", False),
+)
+
+
+def _rendered_oracle():
+    """The frozen renderings, or a loud failure. Never falls back to rendering live in a test."""
+    with open(RENDERED_ORACLE_PATH, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _frozen_renderer(oracle):
+    """A `render_markdown` bound to the frozen corpus.
+
+    A DOCUMENT WITH NO FROZEN RENDER RAISES `SweepError`, deliberately NOT `RenderUnavailable`: a
+    missing fixture must red a NAMED check, never quietly satisfy a refusal assertion. That is the
+    difference between "this shape refuses because the derivation understood it and said no" and
+    "this shape refuses because the harness had nothing to give it"."""
+    documents = oracle["documents"]
+
+    def render(text):
+        if text not in documents:
+            raise SweepError(f"no frozen render for {text!r}; run --refresh-rendered-oracle")
+        return documents[text]
+
+    return render
+
+
+# THE TOOL'S OWN OUTPUT, fed back in. `REASON_HINTS` is posted onto up to DEFAULT_MAX_COMMENTS
+# pull requests per tick, and the likeliest author response is to quote the comment into the PR
+# description — which minted a record bound to the number in the tool's own worked example once
+# already. So every rendered refusal comment is a corpus document too, carrying a deliberately
+# HOSTILE passthrough message, and --self-test asserts the whole artefact derives NOTHING.
+#
+# The comments are GENERATED, not typed, so they cannot go stale silently: change the wording and
+# the frozen render no longer covers the text, `_frozen_renderer` raises `SweepError`, and the
+# named check goes red rather than quietly passing on the old artefact.
+ORACLE_HOSTILE_PASSTHROUGH = "Closes #1234 and fixes #777 -- resolves #657"
+
+
+def _oracle_own_output_documents():
+    """Every document the corpus derives from this file's OWN generated text."""
+    documents = [refusal_comment_body(reason, ORACLE_HOSTILE_PASSTHROUGH)
+                 for reason in PR_REFUSAL_REASONS]
+    # ...and the hints with their code spans DEFEATED. Feeding the hints in verbatim would be inert
+    # for the WRONG reason (every placeholder sits in a code span), so the backticks come off.
+    documents.append("\n".join(REASON_HINTS.values()).replace("`", ""))
+    documents.append(ORACLE_HOSTILE_PASSTHROUGH)
+    return documents
+
+
+def _refresh_rendered_oracle(render):
+    """Re-render every corpus document against the LIVE GitHub renderer and rewrite the fixture.
+
+    The corpus rows live in ONE place (above) and this derives the frozen artefact from them, so a
+    row can never disagree with its own fixture. `github_linkified` is recorded here, from GitHub's
+    output, and is never editable by hand in the checked-in file without the safety assertion in
+    --self-test catching a row that binds without it."""
+    anchor = re.compile(r'class="issue-link[^"]*"[^>]*/issues/%d"' % ORACLE_ISSUE)
+    documents, linkified = {}, {}
+    for label, title, body, _expect in RENDERED_ORACLE_CORPUS:
+        seen_link = False
+        for document in (title, body):
+            if not (document or "").strip():
+                continue
+            if document not in documents:
+                documents[document] = render(document)
+            seen_link = seen_link or bool(anchor.search(documents[document]))
+        linkified[label] = seen_link
+    for document in _oracle_own_output_documents():
+        if document not in documents:
+            documents[document] = render(document)
+    RENDERED_ORACLE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "_comment": "Frozen `POST /markdown` (mode=gfm) output. Regenerate with "
+                    "`auto-mint-provenance.py --refresh-rendered-oracle`; never hand-edit.",
+        "context": ORACLE_CONTEXT_REPO,
+        "issue": ORACLE_ISSUE,
+        "documents": documents,
+        "github_linkified": linkified,
+    }
+    with open(RENDERED_ORACLE_PATH, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=1, sort_keys=True, ensure_ascii=False)
+        handle.write("\n")
+    return len(documents)
+
+
 # ---- self-test ---------------------------------------------------------------------------------
 def _self_test():                                                       # noqa: C901 - flat asserts
     import base64
     import inspect
     import copy
+    import shutil
+    import tempfile
 
     ok = True
 
@@ -1093,268 +1476,282 @@ def _self_test():                                                       # noqa: 
 
     mint_provenance = _load_mint_provenance()
 
-    # ---- the closing-reference grammar --------------------------------------------------------
-    check("a plain Closes line is the candidate",
-          closing_issue_candidates("fix: thing", "Closes #869."), [869])
-    check("...and the title counts too", closing_issue_candidates("Closes #869 — thing", ""),
-          [869])
-    # A conventional-commit SCOPE is not a declaration: `fix(#869):` names the area the commit
-    # touches. MEASURED — PR #886's title is exactly this shape, and GitHub's own linked-issue
-    # resolution takes #869 from its `Closes #869` body line, not from the title scope.
-    check("a conventional-commit scope is not a closing reference",
-          closing_issue_candidates("fix(#869): emit the marker", ""), [])
-    check("...and every documented GitHub closing keyword is read", closing_issue_candidates(
-        "", "close #1 closes #2 closed #3 fix #4 fixes #5 fixed #6 resolve #7 resolves #8 "
-            "resolved #9"), [1, 2, 3, 4, 5, 6, 7, 8, 9])
-    check("...case-insensitively", closing_issue_candidates("", "CLOSES #12"), [12])
-    check("...with a colon", closing_issue_candidates("", "Closes: #12"), [12])
-    check("the same issue named twice is ONE candidate",
-          closing_issue_candidates("fix (#7)", "Closes #7 and fixes #7"), [7])
-    # NON-CANDIDATES. Each is a way a body mentions an issue WITHOUT declaring it as the binding.
-    check("a bare mention is not a closing reference",
-          closing_issue_candidates("", "see #7, related #8"), [])
-    check("`Refs #7` is not a closing reference", closing_issue_candidates("", "Refs #7"), [])
-    check("a CROSS-REPO closing reference names another lease partition and is not a candidate",
-          closing_issue_candidates("", "Fixes sparq-org/sparq#4329"), [])
-    check("a keyword inside another word is not a keyword",
-          closing_issue_candidates("", "unfixed #7"), [])
-    check("`Closes the ... in #7` does not bind #7",
-          closing_issue_candidates("", "Closes the composition defect in #7"), [])
-    check("a comment anchor is not an issue reference",
-          closing_issue_candidates("", "fixes #issuecomment-5096919798"), [])
+    # ---- THE RENDERED ORACLE, AND THE INSTRUMENT THAT MEASURES IT -----------------------------
+    # ROUND 6 REDESIGN. Rounds 3-5 stripped quoted markdown constructs from the SOURCE and were
+    # found permissive three times running, always in the minting direction, because the strip was
+    # an enumeration over an open grammar whose unknown case fell OPEN. The derivation now runs over
+    # GitHub's OWN RENDERING and refuses anything it does not positively classify. These rows are
+    # the measurement of that, against frozen output from the live `POST /markdown`.
+    oracle = total(_rendered_oracle)
+    check("the frozen rendered oracle loads", isinstance(oracle, dict), True)
+    oracle = oracle if isinstance(oracle, dict) else {"documents": {}, "github_linkified": {}}
+    frozen = _frozen_renderer(oracle)
 
-    # ---- QUOTED CONTEXT: one test per stripped context, each mutated separately ---------------
-    # Each of these MINTED before the strip existed. A closing keyword the author QUOTED is not a
-    # keyword the author DECLARED, and a wrong mint is the one outcome here with no recovery.
-    check("a keyword inside a FENCED code block is quoted, not declared",
-          closing_issue_candidates("t", "the template we give authors:\n```\nCloses #1234\n```\n"),
-          [])
-    check("...including a ~~~ fence", closing_issue_candidates("t", "~~~\nCloses #1234\n~~~\n"),
-          [])
-    check("...and an UNCLOSED fence strips to the end rather than leaking",
-          closing_issue_candidates("t", "```\nCloses #1234\n"), [])
-    check("a keyword inside an INLINE CODE SPAN is quoted, not declared",
-          closing_issue_candidates("t", "write a `Closes #1234` line in your description"), [])
-    check("...including a multi-backtick span",
-          closing_issue_candidates("t", "write ``Closes #1234`` at the top"), [])
-    check("a keyword inside a BLOCKQUOTE is quoted, not declared",
-          closing_issue_candidates("t", "superseded by #781, whose body reads:\n\n> Closes #777"),
-          [])
-    check("a keyword inside an HTML COMMENT is quoted, not declared",
-          closing_issue_candidates("t", "<!-- template: Closes #1234 -->"), [])
-    check("...even when the HTML comment spans lines",
-          closing_issue_candidates("t", "<!--\nCloses #1234\n-->"), [])
-    # ...and the strip does not eat a real declaration that merely SITS NEAR quoted context.
-    check("a real declaration beside a fenced block still binds",
-          closing_issue_candidates("t", "```\nCloses #1234\n```\n\nCloses #7"), [7])
-    check("...and beside a blockquote too",
-          closing_issue_candidates("t", "> quoted: Closes #1234\n\nCloses #7"), [7])
-    check("an unbalanced backtick consumes nothing",
-          closing_issue_candidates("t", "a ` stray tick, then Closes #7"), [7])
+    def cand(title, body, render=None):
+        """`closing_issue_candidates` through the FROZEN renderer, total-ised."""
+        return total(lambda: closing_issue_candidates(title, body, render or frozen))
 
-    # ---- WHAT THE STRIP SUBSTITUTES, and the order it substitutes in --------------------------
-    # A strip that leaves a SPACE behind SPLICES: removing the span manufactures the
-    # `keyword[ \t]*#N` adjacency the grammar reads, so a declaration appears that the author never
-    # wrote and GitHub would never resolve. A NEWLINE cannot be crossed by `[ \t]*`, so the same
-    # removal breaks the reference instead of completing it.
-    check("a code span BETWEEN the keyword and the number does not splice into a declaration",
-          closing_issue_candidates("t", "Fixes `mod` #1234"), [])
-    check("...nor when it is spliced with no spaces at all",
-          closing_issue_candidates("t", "Closes`x`#1234"), [])
-    check("...and a span INSIDE the keyword still breaks it, as it always did",
-          closing_issue_candidates("t", "clo`x`ses #1234"), [])
-    # THE SEPARATOR IS TWO CHOICES, NOT ONE, and the inline one is the subtle half. A NEWLINE for an
-    # inline span over-signals: it ends `is_negated`'s sentence window mid-sentence, so
-    # `this does not `x` close #7` stopped being suppressed and MINTED #7 — a refusal turning into a
-    # mint, the one direction this file never permits. MEASURED on the differential before this
-    # check existed. Both the outcome and the three properties that produce it are pinned.
-    check("a code span between a NEGATOR and its keyword does not end the proposition",
-          closing_issue_candidates("t", "this PR does not `x` close #7"), [])
-    check("...and the block constructs still DO end it, so a negator cannot reach across them",
-          closing_issue_candidates("t", "this does not close anything\n\n    quoted\n\nCloses #7"),
-          [7])
-    check("...the span sentinel cannot be crossed by the grammar's own separator",
-          bool(re.fullmatch(r"[ \t]", SPAN_SENTINEL)), False)
+    # THE INSTRUMENT IS VALIDATED BEFORE ANYTHING IS MEASURED WITH IT. A corpus keyed on an issue
+    # number that does not exist reads as "GitHub rendered it as code" for every single row, because
+    # GitHub only emits an `issue-link` anchor for a reference it RESOLVES — a real artefact, caught
+    # in a reviewer's own harness before it produced a wrong conclusion. A known POSITIVE and a
+    # known NEGATIVE are therefore asserted first: if these two are not opposite, every oracle row
+    # below is meaningless and says so by name.
+    check("INSTRUMENT — the known POSITIVE resolves: GitHub linkifies a plain closing line",
+          oracle["github_linkified"].get("plain closes line"), True)
+    check("INSTRUMENT — the known NEGATIVE does not: GitHub renders a fenced keyword as code",
+          oracle["github_linkified"].get("fenced block"), False)
+    check("INSTRUMENT — every corpus document has a frozen render, so no row can refuse merely "
+          "because the harness had nothing to give it",
+          sorted({document for _l, title, body, _e in RENDERED_ORACLE_CORPUS
+                  for document in (title, body)
+                  if (document or "").strip() and document not in oracle["documents"]}), [])
+    check("...and the fixture was captured against THIS repository's numbering",
+          (oracle.get("context"), oracle.get("issue")), (ORACLE_CONTEXT_REPO, ORACLE_ISSUE))
+    check("...and the corpus labels are distinct, so no row silently shadows another",
+          len({row[0] for row in RENDERED_ORACLE_CORPUS}), len(RENDERED_ORACLE_CORPUS))
+
+    oracle_binds = {}
+    for label, title, body, expect_bind in RENDERED_ORACLE_CORPUS:
+        oracle_binds[label] = cand(title, body) == [ORACLE_ISSUE]
+        check(f"ORACLE — {label}: "
+              + ("BINDS" if expect_bind else "REFUSES"), oracle_binds[label], expect_bind)
+
+    # THE SAFETY DIRECTION, over the WHOLE table rather than row by row. GitHub emits an
+    # `issue-link` anchor exactly for a `#N` it read as a live reference — not code, not quoted —
+    # so this is the property the last three rounds failed: nothing this file BINDS may be something
+    # GitHub declined to resolve. It is asserted as a LIST of offending labels, not a count, so a
+    # failure names the shape.
+    check("SAFETY — no shape binds a reference GitHub renders as CODE",
+          sorted(label for label, binds in oracle_binds.items()
+                 if binds and not oracle["github_linkified"].get(label)), [])
+    # ...and its non-vacuity: the table really does contain rows GitHub renders as code, and rows it
+    # resolves, in both directions. A safety assertion over a table with no negative rows is vacuous.
+    check("...which is not vacuous: the corpus holds rows GitHub renders as CODE",
+          sum(1 for label in oracle_binds if not oracle["github_linkified"].get(label)) > 20, True)
+    check("...and rows it RESOLVES that this file also binds",
+          sum(1 for label, binds in oracle_binds.items()
+              if binds and oracle["github_linkified"].get(label)) > 20, True)
+    # THE DECLARED FALSE NEGATIVES, counted rather than described. Every remaining divergence is a
+    # row GitHub resolves and this file refuses — the recoverable direction. The count is pinned so
+    # the `rendered_prose_text` docstring cannot drift away from what the corpus measures, which is
+    # exactly what happened for three rounds.
+    check("...so every remaining divergence is a MISSED mint, and there are 23 of them",
+          sorted(label for label, binds in oracle_binds.items()
+                 if oracle["github_linkified"].get(label) and not binds),
+          sorted(["GH- form", "Refs is not a closing keyword", "bare mention", "blockquote",
+                  "blockquote lazy paragraph", "bold emphasis around the keyword",
+                  "code span between keyword and number", "conventional-commit scope",
+                  "emphasis inside the keyword", "html <blockquote> passthrough",
+                  "inline html comment in a quoted line", "issue URL form", "kbd",
+                  "keyword inside another word", "keyword not adjacent",
+                  "live #781 self-id banner", "negated prose", "negator across a code span",
+                  "numeric entity for the hash", "quoted lazy continuation", "samp",
+                  "span inside the keyword", "spliced with no spaces"]))
+
+    # ---- THE SEVEN SHAPES THAT MINTED AT THE PREVIOUS HEAD ------------------------------------
+    # Each was driven end to end into the real `mint_provenance.mint()` by an independent review and
+    # produced `minted=1 ledger_writes=['LEDGER-PUT'] refused=0`. They are named here so a
+    # regression cannot be a nameless row in a big table.
+    for label in ("R1 <pre> block", "R2 <pre> then indented", "R3 quoted <pre> then indented",
+                  "R4 pipe-less GFM table then indented", "R5 inline HTML <code>",
+                  "R6 <details> wrapping <pre>", "R7 <pre class=...>"):
+        check(f"ROUND-5 REGRESSION — {label} no longer binds", oracle_binds.get(label), False)
+
+    # ---- THE UNKNOWN CASE: what happens to a shape nobody enumerated --------------------------
+    # This is the criterion that separates a REDESIGN from a fourth patch round, so it is asserted
+    # on the MECHANISM and not on a fixture: hand-written HTML holding an element that appears in no
+    # classification set, in no test above, and in no corpus row.
+    for label, html in (
+            ("a custom element nobody classified", "<p>Closes <weird-thing>#7</weird-thing></p>"),
+            ("...as the outermost element", "<x-frame>Closes #7</x-frame>"),
+            ("...nested inside prose", "<div><p>Closes <q><novel>#7</novel></q></p></div>"),
+            ("...a future GitHub wrapper around a table",
+             "<markdown-future-table><table><tr><td>Closes #7</td></tr></table>"
+             "</markdown-future-table>"),
+            ("...an end tag that closes nothing", "<p>Closes #7</p></section>")):
+        got = total(lambda h=html: rendered_prose_text(h))
+        check(f"UNKNOWN CASE — {label} raises rather than being read as prose",
+              got[0] if isinstance(got, tuple) else "NO RAISE — TEXT WAS READ",
+              "RAISED")
+    unknown_tag = None
+    try:
+        rendered_prose_text("<p>Closes <weird-thing>#7</weird-thing></p>")
+    except UnknownRenderedElement as exc:
+        unknown_tag = exc.tag
+    check("...and the raise NAMES the element, so an operator can classify it deliberately "
+          "instead of discovering it in a census count", unknown_tag, "weird-thing")
+    # ...and the unknown case reaches the DERIVATION as a named refusal, not as a crash and not as
+    # a mint. `derive_issue_number` is documented TOTAL, so this is asserted rather than assumed.
+    unknown_render = lambda _text: "<p>Closes <weird-thing>#7</weird-thing></p>"     # noqa: E731
+    check("UNKNOWN CASE — the derivation refuses it by name",
+          total(lambda: derive_issue_number({"title": "t", "body": "Closes #7"},
+                                            lambda n: None, unknown_render).reason),
+          REASON_BODY_NOT_UNDERSTOOD)
+    check("...and derives NO number",
+          total(lambda: derive_issue_number({"title": "t", "body": "Closes #7"},
+                                            lambda n: None, unknown_render).number), None)
+    # THE CONTROL for the two rows above: the SAME body, the SAME derivation, with the element
+    # classified — it binds. Without this, "the unknown case refuses" is satisfied by a derivation
+    # that refuses everything.
+    known_render = lambda _text: "<p>Closes #7</p>"                                  # noqa: E731
+    open_issue_7 = {"number": 7, "state": "open", "labels": [{"name": "area:ci"}]}
+    check("...while the same body through a render this file DOES understand binds",
+          total(lambda: derive_issue_number({"title": "", "body": "Closes #7"},
+                                            lambda n: open_issue_7, known_render).number), 7)
+
+    # ---- THE RENDERER ITSELF FAILING: fail closed, never fall back -----------------------------
+    def exploding_render(_text):
+        raise RenderUnavailable("GitHub's markdown renderer returned 22 for a 40-character document")
+
+    check("RENDERER OUTAGE — an unreachable renderer refuses by name",
+          total(lambda: derive_issue_number({"title": "t", "body": "Closes #7"},
+                                            lambda n: open_issue_7, exploding_render).reason),
+          REASON_RENDER_UNAVAILABLE)
+    check("...and derives NOTHING — there is no raw-markdown fallback",
+          total(lambda: derive_issue_number({"title": "t", "body": "Closes #7"},
+                                            lambda n: open_issue_7, exploding_render).number),
+          None)
+    check("...and it is censused rather than commented, because it is a fact about the PLATFORM "
+          "and the dedupe would make a transient outage permanent on someone else's PR",
+          REASON_RENDER_UNAVAILABLE in SILENT_REASONS, True)
+    check("...while a body this run cannot classify IS commented, because its author can act on it",
+          REASON_BODY_NOT_UNDERSTOOD in SILENT_REASONS, False)
+
+    # ---- THE PROSE EXTRACTOR, element class by element class -----------------------------------
+    check("prose text is kept", rendered_prose_text("<p>Closes #7</p>").strip(), "Closes #7")
+    check("a <pre> subtree contributes NO text",
+          "#7" in rendered_prose_text("<pre>Closes #7</pre>"), False)
+    check("...a <code> span contributes none either",
+          "#7" in rendered_prose_text("<p>a <code>Closes #7</code> b</p>"), False)
+    check("...nor a <blockquote>",
+          "#7" in rendered_prose_text("<blockquote><p>Closes #7</p></blockquote>"), False)
+    check("...nor anything nested inside one",
+          "#7" in rendered_prose_text("<pre><code><span>Closes #7</span></code></pre>"), False)
+    check("...nor an <svg> icon's own vocabulary",
+          "#7" in rendered_prose_text("<p><svg><title>Closes #7</title><path d='M0'/></svg>x</p>"),
+          False)
+    check("...and the text AFTER a quoted subtree is prose again",
+          "#7" in rendered_prose_text("<p><code>x</code> Closes #7</p>"), True)
+    # ATTRIBUTES ARE NEVER TEXT. `<img alt='Closes #7'>` renders nothing an author asserted, and
+    # GitHub emits no issue link for it — the `img alt text` corpus row is the live confirmation.
+    check("an attribute value is never prose",
+          "#7" in rendered_prose_text("<p><img alt='Closes #7' src='x'></p>"), False)
+    # THE `<a>` RULE, both halves. Getting either wrong breaks the feature or the trust model.
+    check("an anchor the RENDERER marked as a resolved issue link is prose — this is how a real "
+          "`Closes #7` survives at all",
+          rendered_prose_text('<p>Closes <a class="issue-link js-issue-link" href="x">#7</a></p>')
+          .strip(), "Closes #7")
+    check("...while an author-written anchor is not, because GitHub does not resolve one",
+          "#7" in rendered_prose_text('<p><a href="x">Closes #7</a></p>'), False)
+    # WHAT A DROPPED CONSTRUCT LEAVES BEHIND — the two separators, and the three properties of the
+    # inline one. A SPACE would SPLICE (`Fixes `mod` #7` becomes a declaration nobody wrote); a
+    # NEWLINE would end the negation window mid-sentence (`this does not `x` close #7` would stop
+    # being suppressed, a refusal turning into a mint).
+    check("a dropped INLINE construct leaves a sentinel the grammar cannot cross",
+          bool(CLOSING_REF_RE.search(rendered_prose_text(
+              "<p>Fixes <code>mod</code> #7</p>"))), False)
+    check("...which is not `[ \\t]`", bool(re.fullmatch(r"[ \t]", SPAN_SENTINEL)), False)
     check("...is not a word character, so it breaks no keyword boundary and no `#` guard",
           bool(re.fullmatch(r"[0-9A-Za-z_-]", SPAN_SENTINEL)), False)
-    check("...and is deliberately NOT a sentence break",
+    check("...and is deliberately NOT a sentence break, so a negator still reaches across it",
           bool(SENTENCE_BREAK_RE.search(SPAN_SENTINEL)), False)
-    # THE ORDER CONTROL: a newline substitution REWRITES line structure, so any strip that runs
-    # after one is reading lines the author did not write. Discovered on PR #781's live line 0 — a
-    # self-ID banner that is a blockquote AND contains a code span — where substituting a newline
-    # for the span split the quoted line in two, the second half no longer began with `>`, and
-    # `Closes #777` became a live declaration out of a banner nobody meant as one.
-    #
-    # HONEST NOTE ON WHAT KILLS WHAT. That original code-span vector no longer distinguishes the
-    # two orders, because `SPAN_SENTINEL` is not a newline any more — the sentinel fix closed it
-    # independently. Keeping only that fixture would have left the ORDER guard vacuous: the
-    # blockquote strip could be moved back to last and nothing would red. The HTML-comment vector
-    # below is the one that still separates them (MEASURED both ways), so it is the fixture the
-    # order is credited to. The code-span line stays as the sentinel's own pin, not the order's.
-    check("a code span in a BLOCKQUOTE line does not un-quote the rest of that line (live #781)",
-          closing_issue_candidates(
-              "t", "> 🤖 **SPARQ agent** — AUTHOR ONLY; no `VERDICT:` line. Closes #777."), [])
-    check("an inline HTML COMMENT in a blockquote line does not un-quote the rest of it",
-          closing_issue_candidates("t", "> 🤖 agent <!-- marker --> Closes #777."), [])
-    check("...nor does one that spans two quoted lines",
-          closing_issue_candidates("t", "> 🤖 agent <!-- m\n> ore --> Closes #777."), [])
-    # AN UNCLOSED `<!--` strips to the end of the body, exactly as an unclosed fence does — GitHub
-    # hides that remainder from the author, so it must not be able to bind.
-    check("an UNCLOSED HTML comment strips to the end rather than leaking",
-          closing_issue_candidates("t", "<!-- draft\nCloses #1234"), [])
-    check("...while a CLOSED one still stops at its terminator",
-          closing_issue_candidates("t", "<!-- t: Closes #1234 -->\n\nCloses #7"), [7])
-    # AN INDENTED CODE BLOCK is code, and GitHub does not resolve a keyword inside one.
-    check("a keyword in a 4-space INDENTED code block is quoted, not declared",
-          closing_issue_candidates("t", "prose\n\n    Closes #1234"), [])
-    check("...and a tab-indented one too",
-          closing_issue_candidates("t", "prose\n\n\tCloses #1234"), [])
-    # BOTH CONTROLS, because an indented strip that fires on ordinary prose refuses everything: an
-    # indented line that merely continues a paragraph is not code and still declares, and a
-    # declaration after the code block is untouched.
-    check("...while an indented PARAGRAPH CONTINUATION is prose and still declares",
-          closing_issue_candidates("t", "some prose that wraps\n    Closes #7"), [7])
-    check("...and a real declaration after the code block still binds",
-          closing_issue_candidates("t", "prose\n\n    Closes #1234\n\nCloses #7"), [7])
+    check("a dropped BLOCK construct DOES end the proposition, so a negator cannot reach past it",
+          bool(SENTENCE_BREAK_RE.search(
+              rendered_prose_text("<p>this does not close anything</p>"
+                                  "<pre>x</pre><p>Closes #7</p>"))), True)
 
-    # ---- THE PLATFORM IS THE ORACLE: GitHub's own renderer, frozen -----------------------------
-    # This file decides how GITHUB will interpret an author's text, so GitHub's renderer is the
-    # ground truth for it and it is one API call away (`POST /markdown`, mode `gfm`). It cannot be
-    # called per-body at sweep time — that would put a network dependency and a new failure mode on
-    # every derivation — so it is used as an ORACLE AT DEVELOPMENT TIME and its verdicts are frozen
-    # here as fixtures. Each row is a shape GitHub was actually asked about; `True` means GitHub put
-    # the keyword inside `<pre><code>`.
-    #
-    # WHY THE TABLE EXISTS. The predicate here used to be "an indented line that a BLANK line
-    # opened", which merely LOOKS like CommonMark's "may not interrupt a paragraph". They differ
-    # wherever the preceding line ends a NON-paragraph block, and every one of those differences was
-    # in the minting direction — 13 shapes where GitHub rendered code and this file bound the
-    # reference, each of which minted a real record end to end.
-    for label, body, github_renders_code in (
-            ("blank line then indented", "prose\n\n    Closes #4242", True),
-            ("ATX heading then indented", "## Evidence\n    Closes #4242", True),
-            ("setext heading then indented", "Evidence\n========\n    Closes #4242", True),
-            ("*** thematic break then indented", "prose\n\n***\n    Closes #4242", True),
-            ("--- underline then indented", "Evidence\n---\n    Closes #4242", True),
-            ("___ thematic break then indented", "prose\n\n___\n    Closes #4242", True),
-            ("closed HTML comment then indented", "<!-- c -->\n    Closes #4242", True),
-            ("multi-line HTML comment then indented", "<!-- a\nb -->\n    Closes #4242", True),
-            ("closed ``` fence then indented", "```\nx\n```\n    Closes #4242", True),
-            ("fence with a language then indented", "```python\nx\n```\n    Closes #4242", True),
-            ("closed ~~~ fence then indented", "~~~\nx\n~~~\n    Closes #4242", True),
-            ("GFM table then indented", "| a | b |\n|---|---|\n| c | d |\n    Closes #4242", True),
-            ("tab indent after a heading", "## Evidence\n\tCloses #4242", True),
-            ("8-space indent after a heading", "## Evidence\n        Closes #4242", True),
-            ("indented, then dedented prose after", "## E\n    Closes #4242\nmore prose", True),
-            ("two headings then indented", "# A\n## B\n    Closes #4242", True),
-            # ...and the shapes GitHub renders as PROSE, which therefore MUST still bind. Without
-            # these the strip could satisfy every row above by refusing everything.
-            ("paragraph continuation", "some prose that wraps\n    Closes #4242", False),
-            # ---- BLOCKQUOTE SUB-SHAPES ------------------------------------------------------
-            # THE SAMPLING LESSON, kept where it happened. The previous table had 39 rows and
-            # exactly ONE blockquote row — this lazy-continuation one, which is the single quoted
-            # sub-shape where "a `>` line leaves a paragraph open" is TRUE. The corpus did not
-            # under-sample the category; it sampled precisely the confirming instance, and 10 other
-            # quoted sub-shapes minted from text GitHub renders as `<pre><code>`. Count samples PER
-            # CATEGORY, and for a rule of the form "X implies Y", enumerate the sub-shapes of X and
-            # cover the ones where Y is least obvious.
-            ("blockquote then indented (lazy continuation)", "> quoted\n    Closes #4242", False),
-            ("quoted ATX heading then indented", "> ## Evidence\n    Closes #4242", True),
-            ("quoted setext heading then indented",
-             "> Evidence\n> ========\n    Closes #4242", True),
-            ("quoted *** break then indented", "> ***\n    Closes #4242", True),
-            ("quoted --- break then indented", "> ---\n    Closes #4242", True),
-            ("quoted closed fence then indented", "> ```\n> x\n> ```\n    Closes #4242", True),
-            ("quoted table then indented", "> | a | b |\n> |---|---|\n    Closes #4242", True),
-            ("quoted BLANK line then indented", "> quoted\n>\n    Closes #4242", True),
-            ("quote marker with no space", ">## Evidence\n    Closes #4242", True),
-            ("indented quote marker", "   > ## Evidence\n    Closes #4242", True),
-            ("composite: quoting a PR description that contains a heading",
-             "Superseded by #781, whose body reads:\n\n> ## Summary\n> text\n"
-             "> ## Evidence\n    Closes #4242", True),
-            ("nested quote then indented (still a paragraph)",
-             "> > inner\n    Closes #4242", False),
-            # NESTING NEEDS ITS OWN ROWS: the paragraph case above reads the same whether one level
-            # of marker is stripped or all of them, so on its own it cannot tell a recursive unwrap
-            # from a single one. These can.
-            ("nested quote holding a HEADING", "> > ## Evidence\n    Closes #4242", True),
-            ("triple-nested quote holding a heading", "> > > ## E\n    Closes #4242", True),
-            ("nested quote holding a fence",
-             "> > ```\n> > x\n> > ```\n    Closes #4242", True),
-            ("quoted list item then indented", "> - item\n    Closes #4242", False),
-            ("unterminated HTML block then indented", "<div>\n</div>\n    Closes #4242", False),
-            ("3-space indent is not code", "## E\n   Closes #4242", False),
-            ("`#Evidence` is not a heading", "#Evidence\n    Closes #4242", False),
-            ("heading, blank, paragraph, then indented",
-             "## E\n\nprose\n    Closes #4242", False)):
-        binds = closing_issue_candidates("t", body) == [4242]
-        expected = ("CODE, so the sweep must refuse" if github_renders_code
-                    else "PROSE, so the sweep must bind")
-        check(f"GitHub ORACLE — {label}: renders as {expected}",
-              binds, not github_renders_code)
-    # THE ONE REMAINING DIVERGENCE, asserted as the false negative it is rather than described. A
-    # list-item continuation is prose to GitHub and stripped here; closing it needs real
-    # list-context tracking. Pinned so it cannot silently flip to the MINTING direction, which
-    # is the thing that would actually matter.
-    for label, body in (("a bullet item", "- item\n\n    Closes #4242"),
-                        ("a numbered item", "1. item\n\n    Closes #4242"),
-                        ("a nested item", "- a\n  - b\n\n    Closes #4242")):
-        check(f"KNOWN false negative — {label} continuation is prose to GitHub, refused here",
-              closing_issue_candidates("t", body), [])
+    # ---- THE TWO-DERIVATION AGREEMENT RULE ------------------------------------------------------
+    # `declared` is the INTERSECTION of the rendered prose and the raw source; `all_refs` is their
+    # UNION. Each half is asserted with a shape only that half catches.
+    def refs(title, body, render):
+        return total(lambda: closing_references(title, body, render))
 
-    # THE TITLE AND BODY ARE TWO DOCUMENTS, and concatenating them was itself a defect.
-    check("an indented FIRST body line is code, which a title on line 0 used to hide",
-          closing_issue_candidates("fix: thing", "    Closes #4242"), [])
-    check("...and an unclosed fence in the TITLE cannot swallow the body's declaration",
-          closing_issue_candidates("fix: add a ``` marker", "Closes #7"), [7])
-    check("...nor can an unclosed HTML comment in the title",
-          closing_issue_candidates("fix: <!-- wip", "Closes #7"), [7])
-    check("...while a fenced block WITHIN the body still strips as before",
-          closing_issue_candidates("fix: thing", "```\nCloses #4242\n```"), [])
+    quoted_only = refs("t", "Closes #7", lambda _t: "<pre>Closes #7</pre>")
+    check("PROSE HALF — a reference the RENDERER puts in code drops out of the binding set",
+          (quoted_only.declared, quoted_only.all_refs), ([], [7]))
+    manufactured = refs("t", "Clos**es** #7", lambda _t: "<p>Clos<strong>es</strong> #7</p>")
+    check("RAW HALF — a reference only the RENDERER manufactures drops out too",
+          (manufactured.declared, manufactured.all_refs), ([], [7]))
+    check("...and BOTH agreeing is what binds",
+          refs("t", "Closes #7", lambda _t: "<p>Closes #7</p>").declared, [7])
+    # AND THE PROPERTY THAT MAKES BOTH SAFE: a disagreement can only ever REFUSE. Asserted over the
+    # whole corpus rather than on one shape — no row binds a number that is not the only reference
+    # either derivation saw.
+    check("...so nothing this file binds is ever one of several references it saw",
+          sorted(label for label, binds in oracle_binds.items() if binds
+                 and total(lambda ll=label: refs(
+                     *[row[1:3] for row in RENDERED_ORACLE_CORPUS if row[0] == ll][0],
+                     frozen).all_refs) != [ORACLE_ISSUE]), [])
+
+    # ---- the RAW closing-keyword grammar, which the intersection's raw half runs -----------------
+    # These need no renderer: they are properties of CLOSING_REF_RE over the author's own text.
+    def raw_refs(text):
+        return sorted({int(m.group(1)) for m in CLOSING_REF_RE.finditer(text)})
+
+    check("every documented GitHub closing keyword is read",
+          raw_refs("close #1 closes #2 closed #3 fix #4 fixes #5 fixed #6 resolve #7 "
+                   "resolves #8 resolved #9"), [1, 2, 3, 4, 5, 6, 7, 8, 9])
+    check("...case-insensitively", raw_refs("CLOSES #12"), [12])
+    check("...with a colon", raw_refs("Closes: #12"), [12])
+    check("a bare mention is not a closing reference", raw_refs("see #7, related #8"), [])
+    check("`Refs #7` is not a closing reference", raw_refs("Refs #7"), [])
+    check("a CROSS-REPO closing reference names another lease partition",
+          raw_refs("Fixes sparq-org/sparq#4329"), [])
+    check("a keyword inside another word is not a keyword", raw_refs("unfixed #7"), [])
+    check("a keyword not adjacent to the number does not bind it",
+          raw_refs("Closes the composition defect in #7"), [])
+    check("a comment anchor is not an issue reference",
+          raw_refs("fixes #issuecomment-5096919798"), [])
+    check("a conventional-commit scope is not a declaration", raw_refs("fix(#869): emit"), [])
 
     # ---- NEGATED PROSE: a suppressor that can only ever cause a refusal ------------------------
-    check("negated prose does not declare anything",
-          closing_issue_candidates("t", "this PR does NOT close #1234"), [])
+    # Driven through the REAL derivation on a rendered paragraph, because the suppressor now reads
+    # the prose text and nothing else.
+    def para(text):
+        return total(lambda: closing_references("t", text, lambda _t: f"<p>{text}</p>"))
+
     for phrase in ("does not close", "doesn't close", "will not fix", "won't fix",
                    "never closes", "cannot close", "no longer closes", "unable to close",
                    "neither closes", "closes nothing, and does not close",
                    "supersedes rather than closes"):
         check(f"...{phrase!r} suppresses the declaration",
-              closing_issue_candidates("t", f"this PR {phrase} #1234"), [])
+              para(f"this PR {phrase} #1234").declared, [])
     check("a negator in the PREVIOUS sentence does not suppress the next one",
-          closing_issue_candidates("t", "This is not a revert. Closes #7"), [7])
+          para("This is not a revert. Closes #7").declared, [7])
     check("...nor one in a different TABLE CELL (live shape, PR #710)",
-          closing_issue_candidates("t", "| not routed through `x` | ALREADY FIXED | fixed #7 |"),
-          [7])
+          para("| not routed through x | ALREADY FIXED | fixed #7 |").declared, [7])
     check("...while a negator in the SAME cell still suppresses",
-          closing_issue_candidates("t", "| a | this does not fix #7 |"), [])
+          para("| a | this does not fix #7 |").declared, [])
     # THE PROPERTY that makes the suppressor safe, asserted directly rather than described: a
     # negated reference is still counted for AMBIGUITY, so suppression can only turn a mint into a
     # refusal — never a refusal into a mint, and never a DIFFERENT binding.
-    mixed = closing_references("t", "Closes #7. This does not close #8.")
+    mixed = para("Closes #7. This does not close #8.")
     check("a negated reference is dropped from the DECLARED set", mixed.declared, [7])
     check("...but still counted for AMBIGUITY", mixed.all_refs, [7, 8])
     check("...so the pull request REFUSES rather than silently binding the survivor",
           total(lambda: (candidate_refusal(mixed.declared, (), mixed.all_refs)
                          or ("MINTED-THE-SURVIVOR",))[0]), REASON_AMBIGUOUS)
-    check("...and whenever a number IS derived it is the only closing reference there was",
-          [(closing_references("t", body).declared, closing_references("t", body).all_refs)
-           for body in ("Closes #7", "Closes #7. This does not close #8.",
-                        "this does not close #9")],
-          [([7], [7]), ([7], [7, 8]), ([], [9])])
 
-    # ---- the ADVISORY mention list (prose only; never a candidate) -----------------------------
-    check("mentions are collected for the hint", mentioned_issue_numbers("", "see #8 and #7"),
-          [7, 8])
+    # ---- the ADVISORY mention list (rendered prose only; never a candidate) --------------------
+    def mentions_of(text):
+        return total(lambda: mentioned_issue_numbers("", text, lambda _t: f"<p>{text}</p>"))
+
+    check("mentions are collected for the hint", mentions_of("see #8 and #7"), [7, 8])
     check("...cross-repository mentions are not this repo's numbers",
-          mentioned_issue_numbers("", "sparq-org/sparq#4329"), [])
+          mentions_of("sparq-org/sparq#4329"), [])
     check("...and the hint is capped",
-          len(mentioned_issue_numbers("", " ".join(f"#{n}" for n in range(1, 20)))),
+          len(total(lambda: mentioned_issue_numbers(
+              "", "x", lambda _t: "<p>" + " ".join(f"#{n}" for n in range(1, 20)) + "</p>"))),
           MAX_ADVISORY_MENTIONS)
+    check("...and the mention list reads the same RENDERED PROSE the grammar's binding half does",
+          total(lambda: mentioned_issue_numbers(
+              "t", "x", lambda _t: "<p><code>#1234</code></p><blockquote>#999</blockquote>")), [])
     # THE CONTROL that keeps the hint advisory: a body full of mentions and NO closing keyword
     # still derives NOTHING, and still refuses under the SAME reason as a body with no `#` at all.
     def mentions_only(text):
-        return derive_issue_number({"title": "t", "body": text}, lambda n: None)
+        return derive_issue_number({"title": "t", "body": text}, lambda n: None,
+                                   lambda _t: f"<p>{text}</p>")
 
     check("a body full of mentions still derives nothing",
           total(lambda: mentions_only("#7 #8 #9").number), None)
@@ -1423,7 +1820,12 @@ def _self_test():                                                       # noqa: 
           mint_provenance.references_issue(pull(body="Closes #7"), 7), True)
 
     # ---- the derivation end to end ------------------------------------------------------------
-    def derive(body, issue_payload=None, boom=False):
+    def paragraph_render(text):
+        """GitHub's rendering of a single line of ordinary prose — one `<p>`, which is what the
+        live renderer really returns for every body below (each is pinned as a corpus row)."""
+        return f"<p>{text}</p>"
+
+    def derive(body, issue_payload=None, boom=False, render=None):
         def read(number):
             if boom:
                 raise RuntimeError("HTTP 502")
@@ -1431,7 +1833,8 @@ def _self_test():                                                       # noqa: 
 
         # `total` so a derivation that RAISES reds these named checks instead of aborting the run:
         # "TOTAL: never raises, never guesses" is the property, so it is asserted, not assumed.
-        got = total(lambda: derive_issue_number(pull(body=body), read))
+        got = total(lambda: derive_issue_number(pull(body=body), read,
+                                                render or paragraph_render))
         return got if isinstance(got, DerivedIssue) else DerivedIssue(got, got, str(got), None)
 
     # POSITIVE CONTROL: a well-formed PR with exactly one open referenced issue derives it.
@@ -1478,25 +1881,32 @@ def _self_test():                                                       # noqa: 
     check("ARG 2 (mentions): the advisory numbers reach the refusal MESSAGE the author reads",
           total(lambda: all(token in derive("it relates to #7 and to #8").message
                             for token in ("#7", "#8"))), True)
-    # ...and the mention list itself reads the STRIPPED text, so the hint can never advertise a
-    # number that exists only inside quoted context the grammar already refused to read.
-    check("...and the mention list reads the same STRIPPED text the grammar does",
-          mentioned_issue_numbers("t", "`#1234`\n> #999\n<!-- #888 -->"), [])
+    # ARG 4 (render): the derivation really goes THROUGH the renderer rather than reading the raw
+    # body. A render that returns an EMPTY document must therefore derive nothing, even though the
+    # raw body declares a reference — if this binds, the renderer is not on the path at all.
+    check("ARG 4 (render): a body whose RENDERING is empty derives nothing, so the raw source is "
+          "never the binding derivation",
+          (derive("Closes #7", render=lambda _t: "").number,
+           derive("Closes #7", render=lambda _t: "").reason), (None, REASON_NO_REFERENCE))
 
     check("a malformed pull payload refuses rather than raising",
-          total(lambda: derive_issue_number(None, lambda n: issue()).reason),
+          total(lambda: derive_issue_number(None, lambda n: issue(),
+                                            paragraph_render).reason),
           REASON_ISSUE_UNREADABLE)
     check("...and so does a payload with no title or body at all",
-          total(lambda: derive_issue_number({}, lambda n: issue()).reason), REASON_NO_REFERENCE)
+          total(lambda: derive_issue_number({}, lambda n: issue(),
+                                            paragraph_render).reason), REASON_NO_REFERENCE)
 
     # ---- the refusal taxonomy + comment --------------------------------------------------------
     check("every per-PR refusal reason is distinct", len(set(PR_REFUSAL_REASONS)),
           len(PR_REFUSAL_REASONS))
-    check("exactly the two REGISTRY-side reasons are censused without a PR comment",
-          sorted(SILENT_REASONS), sorted([REASON_MINT_FAILED, REASON_RECORD_PROBE_FAILED]))
-    check("...and every silent reason really is a registry fact, not a PR fact",
+    check("exactly the three PLATFORM-side reasons are censused without a PR comment",
+          sorted(SILENT_REASONS), sorted([REASON_MINT_FAILED, REASON_RECORD_PROBE_FAILED,
+                                          REASON_RENDER_UNAVAILABLE]))
+    check("...and every silent reason really is a registry-or-platform fact, not a PR fact",
           [r for r in SILENT_REASONS if r not in (REASON_RECORD_PROBE_FAILED,
-                                                  REASON_MINT_FAILED)], [])
+                                                  REASON_MINT_FAILED,
+                                                  REASON_RENDER_UNAVAILABLE)], [])
     check("...and every OTHER reason carries an operator hint to put in that comment",
           sorted(reason for reason in PR_REFUSAL_REASONS
                  if reason not in SILENT_REASONS and not REASON_HINTS.get(reason)), [])
@@ -1508,25 +1918,35 @@ def _self_test():                                                       # noqa: 
     # THE TOOL'S OWN OUTPUT IS NOT A LIVE PAYLOAD. The likeliest author response to a refusal
     # comment is to quote it back into the PR description, so the WHOLE rendered comment — for
     # EVERY reason code, and with a deliberately HOSTILE passthrough message — must derive nothing.
-    # Two independent reasons it cannot: no hint carries a literal issue number, and every quoted
-    # context (the blockquoted message, the code-spanned placeholders, the marker comment) is
-    # stripped. Asserted over the rendered artefact, not over the ingredients.
-    hostile = "Closes #1234 and fixes #777 -- resolves #657"
+    # Driven through GITHUB'S OWN RENDERING of the comment (frozen), not through a description of
+    # it: two independent properties hold it, and each is asserted separately below.
+    check("every generated refusal comment has a frozen render — so a wording change reds these "
+          "checks instead of quietly passing on a stale artefact",
+          [document[:60] for document in _oracle_own_output_documents()
+           if document not in oracle["documents"]], [])
+    hostile = ORACLE_HOSTILE_PASSTHROUGH
     for reason in PR_REFUSAL_REASONS:
         rendered = refusal_comment_body(reason, hostile)
-        refs = closing_references("", rendered)
-        check(f"the {reason} comment is inert when quoted back into a PR body",
-              (refs.declared, refs.all_refs), ([], []))
-    # THE "UNQUOTED PASTE" TEST HAS TO DEFEAT THIS FILE'S OWN STRIP, or it proves nothing: every
+        refs = total(lambda r=rendered: closing_references("", r, frozen))
+        # `declared` is what could BIND, and it must be empty. `all_refs` is deliberately NOT
+        # empty: the raw half of the intersection still SEES the hostile numbers, which is what
+        # makes a pasted-back comment an AMBIGUOUS refusal rather than a quiet no-op. Asserting
+        # both is the honest statement — the previous version asserted `all_refs == []`, which was
+        # true only because the whole comment used to be erased by a source-level strip.
+        check(f"the {reason} comment binds NOTHING when quoted back into a PR body",
+              refs.declared if isinstance(refs, ClosingRefs) else refs, [])
+        check(f"...and the {reason} comment's numbers still reach the AMBIGUITY gate",
+              refs.all_refs if isinstance(refs, ClosingRefs) else refs, [657, 777, 1234])
+    # THE "UNQUOTED PASTE" TEST HAS TO DEFEAT THIS FILE'S OWN QUOTING, or it proves nothing: every
     # placeholder sits in a code span, so feeding the hints in verbatim is inert for the WRONG
     # reason. Strip the backticks first, and assert the structural property behind it.
     check("...and no hint contains a literal issue number at all",
           sorted(reason for reason, hint in REASON_HINTS.items() if re.search(r"#[0-9]", hint)),
           [])
     check("...proved with the code spans DEFEATED: backticks removed, the hints still bind nothing",
-          closing_issue_candidates("", "\n".join(REASON_HINTS.values()).replace("`", "")), [])
+          cand("", "\n".join(REASON_HINTS.values()).replace("`", "")), [])
     check("...which the hostile control proves is not vacuous: the payload DOES bind on its own",
-          closing_issue_candidates("", hostile), [657, 777, 1234])
+          cand("", hostile), [657, 777, 1234])
 
     check("an existing comment for THIS reason dedupes",
           already_refused([{"body": body}], REASON_AMBIGUOUS), True)
@@ -1628,7 +2048,7 @@ def _self_test():                                                       # noqa: 
             self.pulls, self.records = pulls, records or {}
             self.issues, self.comments = issues or {}, comments or {}
             self.actions = actions or {}
-            self.written, self.posted = [], []
+            self.written, self.posted, self.rendered = [], [], []
             # WHAT THE WRITER WAS HANDED, recorded verbatim. A fixture that only looks at the
             # RESULT cannot tell a dropped argument from a kept one, which is how a call site
             # becomes an untested seam while its callee is exhaustively unit-tested.
@@ -1637,7 +2057,8 @@ def _self_test():                                                       # noqa: 
         def run(self, *, apply_changes=True, max_mints=DEFAULT_MAX_MINTS,
                 max_comments=DEFAULT_MAX_COMMENTS, annotate_repo="o/r",
                 targets=(("o/r", ("jeswr",)),), record_boom=False, pulls_boom=False,
-                mint_boom=False, routing_boom=False, comments_boom=False):
+                mint_boom=False, routing_boom=False, comments_boom=False, render=None,
+                render_boom=False):
             def mint_pr(repo, number, issue_number, routing, authors, pl, iss):
                 self.handed.append({"repo": repo, "number": number, "issue_number": issue_number,
                                     "routing": routing, "authors": authors, "issue": iss})
@@ -1669,6 +2090,12 @@ def _self_test():                                                       # noqa: 
                     raise RuntimeError("comment listing failed: HTTP 502")
                 return self.comments.get(number, [])
 
+            def render_markdown(repo, text):
+                self.rendered.append((repo, text))
+                if render_boom:
+                    raise RenderUnavailable("GitHub's markdown renderer returned 22")
+                return (render or paragraph_render)(text)
+
             return sweep(
                 list(targets), annotate_repo=annotate_repo,
                 read_routing=read_routing,
@@ -1677,6 +2104,7 @@ def _self_test():                                                       # noqa: 
                 read_record=read_record, mint_pr=mint_pr,
                 read_comments=read_comments,
                 post_comment=lambda repo, n, b: self.posted.append((n, b)),
+                render_markdown=render_markdown,
                 apply_changes=apply_changes, max_mints=max_mints, max_comments=max_comments,
                 log=lambda *_a, **_k: None)
 
@@ -1975,6 +2403,90 @@ def _self_test():                                                       # noqa: 
             else:
                 os.environ[key] = value
 
+    # ---- END TO END: the production `sweep()` into the REAL `mint_provenance.mint()` -------------
+    # THE PATH AN INDEPENDENT REVIEW USED TO PROVE THE PREVIOUS HEAD MINTED. At `ba1a6030d`, each of
+    # the seven shapes below produced `minted=1 ledger_writes=['LEDGER-PUT'] refused=0` through this
+    # exact composition: production `sweep()`, `_mint_caller` bound to the real shared writer, only
+    # the ledger PUT stubbed, `apply_changes=True`. The unit rows above assert the derivation; these
+    # assert that nothing between the derivation and the ledger can undo it.
+    e2e_rows = {label: (title, body) for label, title, body, _e in RENDERED_ORACLE_CORPUS}
+
+    def e2e(label, render=None, pull_over=None):
+        """One corpus row, all the way to the (stubbed) ledger PUT. Returns (census, writes, posts)."""
+        title, body = e2e_rows.get(label, ("t", "no reference"))
+        writes, posts = [], []
+        routing = {"models": {AUTO_IMPL_ALIAS: {"provider": "anthropic"},
+                              "sol": {"provider": "openai"}}}
+        row = total(lambda: sweep(
+            [("o/r", ("jeswr",))], annotate_repo="o/r",
+            read_routing=lambda _r: routing,
+            read_pulls=lambda _r: [pull(number=41, title=title, body=body, **(pull_over or {}))],
+            read_issue=lambda _r, n: issue(number=n),
+            read_record=lambda _r, _n: None,
+            mint_pr=_mint_caller(mint_provenance, "reg/istry", True, lambda *_a, **_k: None,
+                                 write_record=lambda: writes.append("LEDGER-PUT")),
+            read_comments=lambda _r, _n: [],
+            post_comment=lambda _r, n, _b: posts.append(n),
+            render_markdown=(render or (lambda _r, text: frozen(text))),
+            apply_changes=True, log=lambda *_a, **_k: None))
+        if not isinstance(row, dict):
+            row = _NoCensus(row)
+        return row, writes, posts
+
+    e2e_env = {"GITHUB_RUN_ID": "555", "GITHUB_RUN_ATTEMPT": "1", "PROVENANCE_SALT": "s"}
+    e2e_saved = {key: os.environ.get(key) for key in e2e_env}
+    os.environ.update(e2e_env)
+    try:
+        # POSITIVE CONTROL FIRST, and it has to be a REAL WRITE. Without it "the seven refuse" is
+        # satisfied by a sweep that refuses everything, which is the failure mode a fail-closed
+        # redesign is most likely to have.
+        row, writes, posts = e2e("plain closes line")
+        check("E2E CONTROL — a genuine `Closes #929` mints ONE record through the real shared "
+              "writer, and the ledger PUT really happens",
+              (row["minted"], row["refused"], writes, posts),
+              (1, 0, ["LEDGER-PUT"], []))
+        check("...and the census says nothing was refused", row["refusals"], {})
+        for label in ("R1 <pre> block", "R2 <pre> then indented",
+                      "R3 quoted <pre> then indented", "R4 pipe-less GFM table then indented",
+                      "R5 inline HTML <code>", "R6 <details> wrapping <pre>",
+                      "R7 <pre class=...>"):
+            row, writes, posts = e2e(label)
+            check(f"E2E — {label}: minted 1 record at the previous head; now refuses and writes "
+                  "NOTHING to the ledger",
+                  (row["minted"], row["refused"], row["refusals"], writes),
+                  (0, 1, {REASON_NO_REFERENCE: 1}, []))
+            check(f"...and the refusal for {label} is VISIBLE on the PR", posts, [41])
+        # THE UNKNOWN CASE, end to end. A rendering this file cannot classify must stop at the
+        # census, not at the ledger — and it must be its OWN named reason, so an operator can tell
+        # "the author quoted it" from "we do not understand this body".
+        row, writes, posts = e2e(
+            "plain closes line",
+            render=lambda _r, _text: "<p>Closes <weird-thing>#929</weird-thing></p>")
+        check("E2E UNKNOWN CASE — an unclassified rendered element refuses by its own name and "
+              "writes NOTHING",
+              (row["minted"], row["refusals"], writes),
+              (0, {REASON_BODY_NOT_UNDERSTOOD: 1}, []))
+        check("...and the census carries WHICH element, so it is actionable rather than a count",
+              any("weird-thing" in cause
+                  for cause in row["refusal_causes"].get(REASON_BODY_NOT_UNDERSTOOD, [])), True)
+        check("...and it is commented on the PR, because its author can act on it", posts, [41])
+        # THE RENDERER OUTAGE, end to end. Fail closed, censused, NOT commented.
+        def _down(_repo, _text):
+            raise RenderUnavailable("GitHub's markdown renderer returned 22")
+
+        row, writes, posts = e2e("plain closes line", render=_down)
+        check("E2E RENDERER OUTAGE — the SAME body that mints when the renderer answers writes "
+              "NOTHING when it does not; there is no raw-markdown fallback",
+              (row["minted"], row["refusals"], writes),
+              (0, {REASON_RENDER_UNAVAILABLE: 1}, []))
+        check("...and a platform outage is not posted onto someone else's PR forever", posts, [])
+    finally:
+        for key, value in e2e_saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
     # ---- main(): THE PRODUCTION CALL SITE, argument by argument ---------------------------------
     # WHY THIS BLOCK EXISTS. Round 2 blocked on "a value pinned through a pure helper while the call
     # site independently re-wires it"; the repair swept `sweep()`'s call sites and STOPPED THERE.
@@ -2011,7 +2523,7 @@ def _self_test():                                                       # noqa: 
         def fake_gh_readers(mp, registry_repo):
             seen["gh_readers_repo"] = registry_repo
             return tuple(f"reader-{name}" for name in
-                         ("routing", "pulls", "issue", "record", "comments", "post"))
+                         ("routing", "pulls", "issue", "record", "comments", "post", "render"))
 
         doc = policy if policy is not None else {
             "repos": {"o/r": {"enabled": True, "review_enrolment_authors": list(targets_authors)}}}
@@ -2100,7 +2612,12 @@ def _self_test():                                                       # noqa: 
     # THE OPERATOR-VISIBLE OUTPUT. The census reaches the job summary, which is where a human
     # actually reads whether the tick did anything; a run that decides correctly and reports nowhere
     # is the silent-minter failure mode in another costume.
-    summary_path = SCRIPTS_DIR.parent / ".git" / f"auto-mint-summary-probe-{os.getpid()}"
+    # The probes go to a REAL temporary directory, not into `.git`. In a `git worktree` checkout
+    # `.git` is a FILE, so the old location made --self-test die with `NotADirectoryError` before it
+    # reached a single check — a red baseline for any reviewer following the house instruction to
+    # work in an isolated worktree, which is exactly who this suite most needs to serve.
+    probe_dir = Path(tempfile.mkdtemp(prefix="auto-mint-probe-"))
+    summary_path = probe_dir / "summary"
     try:
         main_call(["--registry-repo", "o/r", "--annotate-repo", "o/r"],
                   step_summary=summary_path)
@@ -2110,7 +2627,7 @@ def _self_test():                                                       # noqa: 
     # ...and the fixtures must not write into the job summary the ENVIRONMENT already set. In
     # Actions GITHUB_STEP_SUMMARY is always set, so an unpinned fixture appends one `### auto-mint`
     # block to the REAL summary per call — measured at 5 per green run before this was pinned.
-    leak_path = SCRIPTS_DIR.parent / ".git" / f"auto-mint-leak-probe-{os.getpid()}"
+    leak_path = probe_dir / "leak"
     leak_path.write_text("", encoding="utf-8")
     saved_env = os.environ.get("GITHUB_STEP_SUMMARY")
     os.environ["GITHUB_STEP_SUMMARY"] = str(leak_path)
@@ -2123,6 +2640,7 @@ def _self_test():                                                       # noqa: 
         else:
             os.environ["GITHUB_STEP_SUMMARY"] = saved_env
         leak_path.unlink(missing_ok=True)
+        shutil.rmtree(probe_dir, ignore_errors=True)
     check("...and a fixture run NEVER appends to the job summary the environment already set",
           leaked, "")
 
@@ -2140,9 +2658,10 @@ def _self_test():                                                       # noqa: 
 
         LEDGER_REF = "ledger"
 
-        def __init__(self, payloads=None):
+        def __init__(self, payloads=None, render_stdout="<p>rendered</p>", render_returncode=0):
             self.calls, self.posted = [], []
             self.payloads = payloads or {}
+            self.render_stdout, self.render_returncode = render_stdout, render_returncode
 
         def _gh_json(self, argv):
             self.calls.append(list(argv))
@@ -2151,8 +2670,13 @@ def _self_test():                                                       # noqa: 
                     return value
             return None
 
-        def _run_gh(self, argv):
+        def _run_gh(self, argv, *, check=True):
             self.posted.append(list(argv))
+            # The REAL `_run_gh` returns a CompletedProcess; `render_markdown` reads `.returncode`
+            # and `.stdout` off it, so the fake has to be that shape or the render call site is
+            # untested. `render_stdout`/`render_returncode` are what a fixture steers.
+            return type("R", (), {"returncode": self.render_returncode,
+                                  "stdout": self.render_stdout})()
 
         def _load_worker_pr(self):
             gh = self
@@ -2175,7 +2699,7 @@ def _self_test():                                                       # noqa: 
         def effective_record_body(probe, ledger_ref):
             return probe(ledger_ref)
 
-    def readers_for(payloads=None, policy=None, call=None):
+    def readers_for(payloads=None, policy=None, call=None, gh_kwargs=None):
         """Build the real readers over a fake gh, and run `call(readers)` WHILE the policy patch is
         still installed.
 
@@ -2185,7 +2709,7 @@ def _self_test():                                                       # noqa: 
         reason — "the policy row carries no routing pointer" from the LIVE policy, which has no
         `o/r` row at all. Those checks passed, and would have passed with the traversal guard
         deleted. Asserting the guard's own reason is what makes them mean anything."""
-        fake = _FakeGH(payloads)
+        fake = _FakeGH(payloads, **(gh_kwargs or {}))
         saved_policy = globals()["_read_policy"]
         globals()["_read_policy"] = lambda: (
             policy if policy is not None
@@ -2208,10 +2732,10 @@ def _self_test():                                                       # noqa: 
     fake, _built, _ = readers_for(
         payloads={"pulls?state=open": [[{"number": 41}, {"number": 42}], [{"number": 43}]],
                   "/comments": [[{"body": "a"}], [{"body": "b"}]]})
-    check("_gh_readers returns exactly the six readers the sweep's signature needs",
-          total(lambda: len(_built)), 6)
-    r_routing, r_pulls, r_issue, r_record, r_comments, r_post = (
-        list(_built) + [lambda *a, **k: "MISSING-READER"] * 6)[:6]
+    check("_gh_readers returns exactly the seven readers the sweep's signature needs",
+          total(lambda: len(_built)), 7)
+    r_routing, r_pulls, r_issue, r_record, r_comments, r_post, r_render = (
+        list(_built) + [lambda *a, **k: "MISSING-READER"] * 7)[:7]
     check("read_pulls FLATTENS the paginated slurp — an unflattened page list would make the "
           "population silently EMPTY while the census reported enrolled_pulls=0",
           total(lambda: [row["number"] for row in r_pulls("o/r")]), [41, 42, 43])
@@ -2274,6 +2798,33 @@ def _self_test():                                                       # noqa: 
     check("...and a payload that is not a base64 file refuses rather than being trusted, saying so",
           (refused[:2], "did not read back as a base64 file" in refused[2]),
           (("RAISED", "SweepError"), True))
+
+    # ---- render_markdown: the live renderer's own call site --------------------------------------
+    # This is the ONE new network dependency the redesign adds, and the whole safety argument rests
+    # on two properties of THIS function: what it asks for, and what it does when it does not get it.
+    fake, _built, _ = readers_for()
+    r_render = list(_built)[6]
+    rendered_html = total(lambda: r_render("o/r", "Closes #7"))
+    check("render_markdown returns GitHub's rendering verbatim", rendered_html, "<p>rendered</p>")
+    posted = fake.posted[0] if fake.posted else []
+    check("...asking GitHub's own /markdown endpoint",
+          posted[:4], ["api", "-X", "POST", "/markdown"])
+    check("...in GFM mode, because a pull-request body is GFM and plain `markdown` renders "
+          "tables, task lists and strikethrough differently",
+          "mode=gfm" in posted, True)
+    check("...with the TARGET repository as the context, which is what makes GitHub mark a "
+          "reference it RESOLVED with the `issue-link` class the prose extractor reads",
+          "context=o/r" in posted, True)
+    check("...and it sends the document it was given", "text=Closes #7" in posted, True)
+    # FAIL CLOSED. A non-zero exit must become `RenderUnavailable` — never an empty string (which
+    # would derive nothing for the WRONG reason) and never a fall back to the raw markdown (which
+    # is the permissive derivation this redesign deleted).
+    fake_down, built_down, _ = readers_for(gh_kwargs={"render_returncode": 22,
+                                                      "render_stdout": ""})
+    check("RENDERER OUTAGE — a non-zero `gh` exit raises RenderUnavailable rather than returning "
+          "an empty rendering",
+          total(lambda: list(built_down)[6]("o/r", "Closes #7"))[:2],
+          ("RAISED", "RenderUnavailable"))
 
     # ---- sweep()'s two remaining uncovered branches ---------------------------------------------
     routing_boom = _Recorder(clean)
@@ -2471,6 +3022,11 @@ def _live_routing():
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--refresh-rendered-oracle", action="store_true",
+                        help="re-render every --self-test corpus document against the LIVE GitHub "
+                             "renderer and rewrite scripts/fixtures/auto-mint-provenance/"
+                             "rendered-oracle.json. Never run on the sweep path; it writes a "
+                             "checked-in fixture and needs a token that can POST /markdown")
     parser.add_argument("--registry-repo", help="owner/name of THIS registry repository")
     parser.add_argument("--annotate-repo",
                         help="the ONLY repository whose pull requests this run may comment on; a "
@@ -2483,6 +3039,19 @@ def main():
     parser.add_argument("--apply", action="store_true",
                         help="write the records and post the refusal comments (default: dry run)")
     args = parser.parse_args()
+    if args.refresh_rendered_oracle:
+        mint_provenance = _load_mint_provenance()
+
+        def _render(text):
+            result = mint_provenance._run_gh(
+                ["api", "-X", "POST", "/markdown", "-f", f"text={text}", "-f", "mode=gfm",
+                 "-f", f"context={ORACLE_CONTEXT_REPO}"], check=False)
+            if result.returncode != 0:
+                raise SweepError(f"the renderer returned {result.returncode}")
+            return result.stdout
+
+        print(f"frozen documents: {_refresh_rendered_oracle(_render)}")
+        return 0
     if args.self_test:
         return _self_test()
     missing = [name for name in ("registry_repo", "annotate_repo") if not getattr(args, name)]
@@ -2495,12 +3064,14 @@ def main():
     policy_resolve = _load_policy_resolve()
     targets = enrolled_targets(_read_policy(), policy_resolve.review_enrolment_authors)
     readers = _gh_readers(mint_provenance, args.registry_repo)
-    read_routing, read_pulls, read_issue, read_record, read_comments, post_comment = readers
+    (read_routing, read_pulls, read_issue, read_record, read_comments, post_comment,
+     render_markdown) = readers
     row = sweep(targets, annotate_repo=args.annotate_repo, read_routing=read_routing,
                 read_pulls=read_pulls, read_issue=read_issue, read_record=read_record,
                 mint_pr=_mint_caller(mint_provenance, args.registry_repo, args.apply,
                                      lambda line: print(f"  mint: {line}")),
                 read_comments=read_comments, post_comment=post_comment,
+                render_markdown=render_markdown,
                 apply_changes=args.apply, max_mints=args.max_mints,
                 max_comments=args.max_comments)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
