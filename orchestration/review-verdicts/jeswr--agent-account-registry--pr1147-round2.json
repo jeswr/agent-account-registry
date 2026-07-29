@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1147,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0312c3b995ed3eaeef79dfcf06f59e2e6e1f360c",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 diff remains limited to correcting stale private-repository wording for a public registry while preserving the security-critical distinction that credentials and broker secrets remain private. Workflow behavior, permissions, action pins, checkout hardening, routing, lease logic, trust gates, and tests are unchanged. The revised comments in migrate-secrets-to-env.yml and pat-validity.yml accurately explain the explicit contents: read grant without weakening least privilege. No correctness, soundness, test-validity, or security issue is introduced.",
+  "verdict": "approve"
+ }
+}
