@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1209,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "93f5f64929a7468e752c25979b54e14759b6890d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change cleanly separates absent, green, red, and unproven aggregator evidence without changing the existing arm decision, emits the absent-check warning before all relevant arm exits, and carries the same classification into the manual freshness report. The tests cover the dispatch-claim producer, the local vocabulary agreement, the full classifier table, decision/classifier coherence, production call-site wiring, admitted and deferred paths, controls for green and red, exact alarm identity, and the report seam. Expected values are independently spelled where needed, and malformed or unknown grades cannot be classified green. I found no correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
