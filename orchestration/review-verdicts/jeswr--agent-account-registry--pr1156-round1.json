@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1156,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "af4f9de156bc877fc24698f0cb98c458010bcff8",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly narrows retryable HTTP 422 responses to the sha-less contents-API create-race shape while preserving HTTP 409 as a CAS conflict and failing loud for validation errors. The response body is read once before classification and remains available for the diagnostic path. The live-request tests exercise create versus update payloads, validation versus conflict responses, retry_conflict disabled behavior, and the end-to-end release loop; their expected values are independent of the new classifier constant and would detect both over-broad and over-narrow classifications. No trust check, audit trail, permission, or untrusted-text boundary is weakened.",
+  "verdict": "approve"
+ }
+}
