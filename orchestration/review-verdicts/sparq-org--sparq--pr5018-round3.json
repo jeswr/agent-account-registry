@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5018,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f80c737fed9f64023b81bb38095bb908611a4a3c",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly replaces the duplicated status caveat with an anchored mdBook include. The include path and anchor syntax match the repository's existing pattern, and the post-include link-fixup preprocessor rewrites the three allow-listed repo-relative targets; the lowercase root-level inference report is appropriately absolute because the current root-markdown matcher only accepts uppercase-leading names. The canonical README rendering remains valid, the guide receives the complete caveat, and the design record accurately scopes the shipped change versus follow-up work. No correctness, soundness, test-validity, or security defect is evident in the diff.",
+  "verdict": "approve"
+ }
+}
