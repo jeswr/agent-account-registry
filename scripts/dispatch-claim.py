@@ -1809,13 +1809,14 @@ def source_issue_holds(source_labels, nonhold_labels=()):
 
     FAIL-CLOSED IN BOTH DIRECTIONS. A malformed `source_labels` entry (non-str) is ignored rather
     than raising — this runs inside per-repo enumeration where an exception kills the whole sweep.
-    A malformed `nonhold_labels` entry cannot widen anything: only an exact string match against a
-    label already carrying the `needs:` prefix waives it, so a label outside the namespace, a
-    `None`, or a differently-cased spelling all keep holding. The label is matched EXACTLY as
-    GitHub reports it; policy-resolve refuses a non-canonical entry at the boundary so the
-    reviewed text and the matched value are the same string."""
-    waived = {label for label in nonhold_labels
-              if isinstance(label, str) and label.startswith(SOURCE_ISSUE_HOLD_PREFIX)}
+    A malformed `nonhold_labels` entry cannot widen anything BY CONSTRUCTION rather than by a
+    guard: the only labels considered at all are those already carrying the `needs:` prefix, and a
+    waiver is an EXACT string match against one of them, so an entry outside the namespace, a
+    `None`, an int, or a differently-cased spelling can never equal a candidate and the label
+    keeps holding. (A prefix filter over `nonhold_labels` was written and then deleted: it is an
+    unkillable line — no mutation of it can change an answer — and policy-resolve already refuses
+    a non-namespace or non-canonical entry at the boundary, which is a guard that CAN fail.)"""
+    waived = set(nonhold_labels)
     return sorted({
         label for label in (source_labels or [])
         if isinstance(label, str) and label.startswith(SOURCE_ISSUE_HOLD_PREFIX)
@@ -9216,6 +9217,14 @@ _RF_ADMISSION_ANCHOR = (
     r"(?m)^[ \t]*self_attested, admission_error = dispatch_claim\.review_fix_pr_admission\(")
 _RF_ADMISSION_END = r"(?m)^[ \t]*impl_provider = record\["
 
+# [#1306] The SOURCE-ISSUE hold decision inside review-fix.yml's `resolve` step. Line-anchored
+# (#584 finding 3) on the SHARED-predicate call, so a step that reverts to a local
+# `startswith("needs:")` glob loses the anchor and fails LOUDLY here rather than quietly refusing
+# a population PLAN and CLAIM have both started admitting.
+_RF_SOURCE_HOLD_ANCHOR = (
+    r"(?m)^[ \t]*_source_holds = dispatch_claim\.source_issue_holds\(")
+_RF_SOURCE_HOLD_END = r"(?m)^[ \t]*merged = set\(labels\)"
+
 
 def review_fix_admits_orchestrator_class(source=None):
     """BEHAVIOURAL: does review-fix.yml's resolve step ADMIT the #657 orchestrator class?
@@ -14375,6 +14384,170 @@ def _self_test():
         assert enumerate_review_items(repo, [starved], provenance, [], parked_issue, now,
                                       pr_status=conflicted) == []
     assert enumerate_review_items(repo, pulls[:1], provenance, [], parked_issue, now) == []
+
+    # ---- [#1306] THE SOURCE-ISSUE HOLD IS A NAMESPACE, NOT A HOLD ------------------------------
+    # Every leg globbed `needs:` and called the result "human-owned". MEASURED on sparq
+    # 2026-07-29 (1785 open issues, fully paginated): TEN distinct `needs:*` labels, and
+    # `needs:ec2` alone (87) outnumbers every human-question label together. On the 22:20Z
+    # executed tick 3 of the 3 worker drafts this leg refused for a source-issue hold were
+    # refused on `needs:ec2` and 0 on any human hold, each with a base review round unspent.
+    #
+    # NON-VACUITY IS THE POINT OF EVERY PAIR BELOW: each admission is stated together with the
+    # default-narrowing control that must still refuse, so "the waiver works" can never be
+    # satisfied by a predicate that stopped holding ANYTHING.
+    _ec2_issue = {7: ["area:crate-a", "needs:ec2", "role:impl"], 9: issue_labels[9]}
+    _ec2_pr = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"])
+    # (1) THE PURE PREDICATE. Default narrowing == the old glob, byte-for-byte.
+    assert source_issue_holds(_ec2_issue[7]) == ["needs:ec2"]
+    assert source_issue_holds(_ec2_issue[7], {"needs:ec2"}) == []
+    # a HUMAN hold survives the waiver — and is still named even when it arrives alongside one
+    assert source_issue_holds(["needs:ec2", "needs:user"], {"needs:ec2"}) == ["needs:user"]
+    # an UNLISTED member of the namespace keeps holding: this is a per-label waiver, not an
+    # inversion of the predicate onto a fixed human set (which would fail OPEN for any label
+    # minted later — the whole reason the narrowing is a master-protected list)
+    assert source_issue_holds(["needs:external-audit"], {"needs:ec2"}) == ["needs:external-audit"]
+    # a waiver that is not itself in the namespace waives NOTHING (it cannot widen the predicate
+    # into `area:*`/`status:*`/anything else), and malformed entries on either side are inert.
+    # These hold BY CONSTRUCTION — see the docstring on why a prefix filter over the waiver set
+    # would be an unkillable line rather than a guard.
+    assert source_issue_holds(["needs:ec2"], {"ec2", "area:crate-a", None, 7}) == ["needs:ec2"]
+    assert source_issue_holds(["area:crate-a", "status:parked"], {"needs:ec2"}) == []
+    assert source_issue_holds([None, 7, "needs:ec2"], ()) == ["needs:ec2"]
+    assert source_issue_holds(None) == [] and source_issue_holds([]) == []
+    # case is NOT folded: policy-resolve refuses a non-canonical entry at the boundary precisely
+    # so the reviewed text and the matched value are one string
+    assert source_issue_holds(["needs:ec2"], {"needs:EC2"}) == ["needs:ec2"]
+    # (2) THE DELIVERED OUTCOME. The measured population (a `review:needs` DRAFT whose source
+    # issue carries ONLY a resource gate) becomes a real review round.
+    assert [item["state"] for item in enumerate_review_items(
+        repo, [_ec2_pr], provenance, [], _ec2_issue, now,
+        nonhold_issue_labels={"needs:ec2"})] == ["needs-review"]
+    # ...and with the SHIPPED DEFAULT it is still refused, so the assertion above is measuring the
+    # narrowing rather than a hold that quietly stopped existing.
+    assert enumerate_review_items(repo, [_ec2_pr], provenance, [], _ec2_issue, now) == []
+    # (3) NOTHING ELSE IS WAIVED. A human hold on the source issue still parks the PR even with
+    # the resource gate waived; so does an unlisted member; so does the machine capacity park;
+    # so does a hold on the PR ITSELF.
+    for _still_held in (["area:crate-a", "needs:ec2", "needs:user"],
+                        ["area:crate-a", "needs:ec2", "needs:maintainer"],
+                        ["area:crate-a", "needs:ec2", "needs:external-audit"],
+                        ["area:crate-a", "needs:ec2", "status:parked"]):
+        assert enumerate_review_items(
+            repo, [_ec2_pr], provenance, [], {7: _still_held, 9: issue_labels[9]}, now,
+            nonhold_issue_labels={"needs:ec2"}) == [], _still_held
+    for _pr_hold in ("review:needs-user", "needs:user", MACHINE_PARK_PR_LABEL):
+        assert enumerate_review_items(
+            repo, [pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs", _pr_hold])],
+            provenance, [], _ec2_issue, now, nonhold_issue_labels={"needs:ec2"}) == [], _pr_hold
+    # ...and the per-PR review lease single-flight still bounds it: the waiver adds no capacity.
+    assert enumerate_review_items(
+        repo, [_ec2_pr], provenance,
+        [{"holder": f"review:{repo}#41@run.1", "expires_at": now + 100, "package": "crate-a"}],
+        _ec2_issue, now, nonhold_issue_labels={"needs:ec2"}) == []
+    # (4) THE EXCLUSION REASON NAMES ITS OWN CAUSE. The aggregate line at PLAN completion keys on
+    # this string, and a reason that calls a resource gate a "human hold" without naming it is how
+    # three PRs sat 1.5-3 days looking like a human's decision.
+    _reason_log = io.StringIO()
+    with contextlib.redirect_stdout(_reason_log):
+        enumerate_review_items(repo, [_ec2_pr], provenance, [], _ec2_issue, now)
+    assert "needs:ec2" in _reason_log.getvalue(), _reason_log.getvalue()
+    _held_reasons = Counter()
+    enumerate_review_items(repo, [_ec2_pr], provenance, [],
+                           {7: ["area:crate-a", "needs:ec2", "needs:user"], 9: issue_labels[9]},
+                           now, exclusions=_held_reasons, nonhold_issue_labels={"needs:ec2"})
+    assert [key for key in _held_reasons if "needs:user" in key and "needs:ec2" not in key], \
+        ("the exclusion tally must name the label that ACTUALLY held — a bucket keyed on the "
+         f"waived label would attribute the refusal to the wrong cause: {dict(_held_reasons)}")
+    # (5) LINKAGE PARITY. The crate-occupancy leg decides BUSY-vs-FREED from the same hold, and a
+    # PARKED provably-inert draft FREES its crates. With the waiver the enumerator emits the PR,
+    # so the occupancy leg must stop calling it parked or the two legs describe one PR
+    # differently. MUTANT: drop `nonhold_issue_labels` from busy_packages_of_pulls and the crate
+    # goes back to being freed while a review row exists for it.
+    _inert = pull(41, "sparq-agent/issue-7-1-1", sha_a, draft=True, labels=["review:needs"])
+    _inert["auto_merge"] = None                       # the explicit-null latch proof (#517)
+    assert busy_packages_of_pulls(repo, [_inert], _ec2_issue, provenance) == set(), \
+        "control: under the shipped glob this parked inert draft frees its crate"
+    assert busy_packages_of_pulls(repo, [_inert], _ec2_issue, provenance,
+                                  nonhold_issue_labels={"needs:ec2"}) == {"crate-a"}, \
+        "a PR the enumerator now emits must keep its crate BUSY on the occupancy leg"
+    # (6) THE SHIPPED POLICY ACTUALLY ENABLES IT. A default-empty field with no policy row is a
+    # correct fix that cannot execute — the failure mode this repo keeps measuring. Read the REAL
+    # policy through the REAL accessor.
+    _nonhold_policy = _load_module(
+        "registry_policy_resolve_nonhold_1306",
+        Path(__file__).resolve().parent / "policy-resolve.py")
+    with open(Path(__file__).resolve().parents[1] / "policy" / "repos.toml", "rb") as _handle:
+        _nonhold_doc = tomllib.load(_handle)
+    assert _nonhold_policy.review_loop_nonhold_issue_labels(
+        "sparq-org/sparq", _nonhold_doc) == frozenset({"needs:ec2"}), (
+        "policy/repos.toml must WAIVE needs:ec2 for sparq-org/sparq — the measured population is "
+        "3 worker drafts whose only source-issue hold is that resource gate; an empty list here "
+        "ships the whole change as dead code")
+    # ...and the accessor REFUSES the one label that can never be waived, plus a non-canonical or
+    # out-of-namespace entry. (Mutating repos.toml is not needed: the accessor is the seam. The
+    # per-message validation rows live in policy-resolve.py's own --self-test alongside
+    # review_enrolment_authors'; these two are the SAFETY floor, asserted here because this file's
+    # consumers are the ones that would be widened by a bad list.)
+    def _nonhold_row(body):
+        return tomllib.loads(
+            '[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+            'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+            'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n' + body)
+
+    for _bad, _why in (('review_loop_nonhold_issue_labels=["needs:user"]\n',
+                        "the issue-side half of the human park pair"),
+                       ('review_loop_nonhold_issue_labels=["ec2"]\n',
+                        "an entry outside the needs: namespace"),
+                       ('review_loop_nonhold_issue_labels=["needs:EC2"]\n', "non-canonical case"),
+                       ('review_loop_nonhold_issue_labels=["needs:ec2","needs:ec2"]\n',
+                        "duplicates"),
+                       ('review_loop_nonhold_issue_labels="needs:ec2"\n', "a bare string")):
+        try:
+            _nonhold_policy.review_loop_nonhold_issue_labels("o/r", _nonhold_row(_bad))
+        except _nonhold_policy.PolicyError:
+            continue
+        raise AssertionError(
+            f"review_loop_nonhold_issue_labels must REFUSE {_why}: {_bad!r}")
+    assert _nonhold_policy.review_loop_nonhold_issue_labels(
+        "o/r", _nonhold_row("")) == frozenset(), \
+        "an absent field must default to the UNCHANGED glob"
+    # (7) THE LAST LEG. review-fix.yml's resolve step can refuse a run the dispatcher already
+    # claimed a reviewer account and a lease for, so it must apply the SAME narrowing through the
+    # SAME shared predicate. EXEC the workflow's own decision block; the mutant restores the raw
+    # glob and the admission must flip back to a refusal.
+    _rf_hold_src = _review_fix_step_python(
+        _RF_SOURCE_HOLD_ANCHOR, _RF_SOURCE_HOLD_END, "source-issue hold decision")
+
+    def _rf_hold_refuses(labels, waived, block=None):
+        namespace = {"dispatch_claim": sys.modules[__name__],
+                     "issue_labels": list(labels), "nonhold_issue_labels": frozenset(waived)}
+        try:
+            exec(compile(block if block is not None else _rf_hold_src,   # noqa: S102
+                         "<review-fix.yml resolve source hold>", "exec"), namespace)
+        except SystemExit as exc:
+            return str(exc)
+        return None
+
+    assert _rf_hold_refuses(["needs:ec2"], {"needs:ec2"}) is None, \
+        "review-fix.yml still refuses the population PLAN and CLAIM now admit"
+    assert _rf_hold_refuses(["needs:ec2"], ()) is not None, \
+        "control: with the shipped default the same step must still refuse"
+    _rf_human = _rf_hold_refuses(["needs:ec2", "needs:user"], {"needs:ec2"})
+    assert _rf_human is not None and "needs:user" in _rf_human, _rf_human
+    _rf_glob_mutant = _rf_hold_src.replace(
+        "dispatch_claim.source_issue_holds(issue_labels, nonhold_issue_labels)",
+        '[l for l in issue_labels if l.startswith("needs:")]')
+    assert _rf_glob_mutant != _rf_hold_src, \
+        "the mutant is vacuous — the shared-predicate call is not where this test thinks it is"
+    assert _rf_hold_refuses(["needs:ec2"], {"needs:ec2"}, block=_rf_glob_mutant) is not None, \
+        ("MUTANT SURVIVED: restoring the local `needs:` glob in review-fix.yml must make this "
+         "step refuse again — otherwise this test cannot see the last leg reverting")
+    print("  ok   [#1306] the source-issue hold names the labels that HELD, waives only "
+          "master-protected resource gates (needs:ec2 shipped), keeps every human hold / machine "
+          "park / PR-side hold / lease bound intact, holds LINKAGE PARITY with the occupancy leg, "
+          "and review-fix.yml's resolve step applies the SAME predicate (block exec'd; the "
+          "raw-glob mutant reds)")
+
     # flip side: the SAME PR without the park emits (asserted red above via ci_items)
     # GAP-B beats GAP-A per tick: CI on a conflicted base is noise — rebase repair only
     both = {41: status_of(sha_a, gate="failure", conflicting=True, legs=["js"])}
@@ -15008,6 +15181,46 @@ def _self_test():
                         issue_labels=["area:crate-a"])
             run_items([ci_item])
             assert helper_calls == [], helper_calls
+            # ---- [#1306] CLAIM'S LIVE RE-DERIVATION APPLIES THE SAME NARROWING ------------------
+            # This leg is the one that turns an admitted PLAN row into "success, 0 dispatched": it
+            # re-reads the source issue LIVE and stands the item down. MEASURED gap while writing
+            # this change: dropping `nonhold_issue_labels` from the CLAIM predicate left the whole
+            # suite GREEN — every other assertion drives the PURE enumerator, and PLAN admitting
+            # while CLAIM refuses is indistinguishable from a healthy tick.
+            fake.update(pull=live_pull(draft=False, auto_merge={"merge_method": "squash"}),
+                        check_runs=gate_red,
+                        issue_labels=["area:crate-a", "needs:ec2"])
+
+            def _claim_source_hold(waived):
+                """Run the CLAIM leg and report (the hold's own defer line, helper calls made).
+
+                The observable is the HOLD BOUNDARY, not a launch: this fixture's PR is non-draft,
+                so a fully admitted ci-fix item legitimately spends its tick on the defuse-to-draft
+                and retries next tick. Asserting on a launch here would measure the defuse, and a
+                predicate that admitted everything would still read as `no launch`."""
+                log = io.StringIO()
+                with contextlib.redirect_stdout(log):
+                    run_items([ci_item], nonhold_issue_labels=waived)
+                held = [line for line in log.getvalue().splitlines()
+                        if "is human-owned" in line]
+                return held, list(helper_calls)
+
+            _held, _calls = _claim_source_hold(())
+            assert len(_held) == 1 and "needs:ec2" in _held[0] and _calls == [], (_held, _calls)
+            _held, _calls = _claim_source_hold({"needs:ec2"})
+            assert _held == [] and _calls, (
+                "CLAIM must carry the item PAST the source-issue hold — a leg that re-applies the "
+                "unnarrowed glob turns the whole fix into a `review:preclaim-defer` on a tick "
+                f"that reports success. held={_held} helper_calls={_calls}")
+            # ...and a human hold on the SAME issue still stands it down WITH the waiver live, so
+            # the admission above cannot be a predicate that stopped holding anything.
+            fake["issue_labels"] = ["area:crate-a", "needs:ec2", "needs:user"]
+            _held, _calls = _claim_source_hold({"needs:ec2"})
+            assert len(_held) == 1 and "needs:user" in _held[0] and "needs:ec2" not in _held[0] \
+                and _calls == [], (_held, _calls)
+            fake.update(pull=live_pull(draft=False, labels=["needs:user"],
+                                       auto_merge={"merge_method": "squash"}),
+                        issue_labels=["area:crate-a"])
             # stranded RECOVERY (issue #161): {draft, unarmed, reviewed head, green gate} is the
             # residue of an interrupted defuse/disarm, so CLAIM RE-REVIEWS the current head under
             # the bounded round budget instead of a terminal hand-off — the reviewed-sha marker
