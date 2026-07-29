@@ -1087,16 +1087,20 @@ class GitHubAPI:
             except HTTPError as exc:
                 if allow_404 and exc.code == 404:
                     return None
-                if retry_conflict and exc.code in {409, 422}:
+                # Issue #647: report WHY. This exception is the only witness a per-object write
+                # failure ever gets, and the loops that call it now defer per object instead of
+                # aborting the sweep — a deferral whose cause is "HTTP 403" and nothing else is
+                # the #644 discarded-cause defect wearing a different hat. Read HERE, before the
+                # branches below: `exc.read()` is single-shot, and issue #240's 422 classifier
+                # needs the same envelope the fail-loud raise reports.
+                detail = _http_failure_detail(exc, self._token)
+                if retry_conflict and _is_cas_conflict(
+                    exc.code, detail, create=_is_create_put(method, body)
+                ):
                     raise GroomConflict("lease ledger compare-and-swap conflict") from exc
                 if retryable and exc.code in _TRANSIENT_HTTP and attempt < _TRANSIENT_RETRIES:
                     _sleep_transient(attempt, _retry_after_seconds(exc.headers))
                     continue
-                # Issue #647: report WHY. This exception is the only witness a per-object write
-                # failure ever gets, and the loops that call it now defer per object instead of
-                # aborting the sweep — a deferral whose cause is "HTTP 403" and nothing else is
-                # the #644 discarded-cause defect wearing a different hat.
-                detail = _http_failure_detail(exc, self._token)
                 raise GroomError(
                     f"{self._purpose} GitHub API {method} failed with HTTP {exc.code}"
                     + (f": {detail}" if detail else "")
@@ -1340,13 +1344,53 @@ def _sleep_backoff(attempt: int) -> None:
     time.sleep(random.uniform(0, _backoff_ceiling(attempt)))
 
 
+# ---- which failures the caller's CAS re-read loop owns (issue #240) -----------------------------
+# `retry_conflict` used to read EVERY HTTP 422 as lost contention, so an ordinary request-validation
+# failure (bad payload, missing branch) was retried until `_release_claims` exhausted its attempts
+# and reported "lease ledger CAS conflicts did not settle" — GitHub's real cause discarded on the
+# way, which is the #644/#647 lost-diagnostic defect wearing a third hat.
+#
+# HTTP 409 is always a lost-SHA race. A 422 is one in exactly ONE shape: a sha-less
+# create-if-absent PUT whose file appeared concurrently, which the contents API answers with
+# 'Invalid request.\n\n"sha" wasn't supplied.'. That is the same narrowing PR #229 applied to
+# select-and-claim's `_is_cas_conflict`, and the signature is taken from the SHARED ledger_retry
+# policy so the two ledger writers cannot drift apart on it.
+_ledger_retry = _load_module(
+    Path(__file__).resolve().with_name("ledger_retry.py"), "registry_ledger_retry"
+)
+_CREATE_RACE_SIGNATURE = _ledger_retry.CREATE_RACE_SIGNATURE
+
+
+def _is_create_put(method: str, body: Any) -> bool:
+    """True for the contents-API CREATE-IF-ABSENT form: a PUT carrying no `sha` (`ledger_put_body`
+    omits it when the ledger file was 404 on a present branch). Only that form can lose the create
+    race — an update PUT already names the revision it expects, so its 422 is validation."""
+    return method.upper() == "PUT" and not (isinstance(body, dict) and body.get("sha"))
+
+
+def _is_cas_conflict(code: int, detail: str, *, create: bool) -> bool:
+    """True only for a compare-and-swap race the caller's ledger re-read loop owns.
+
+    `detail` is GitHub's error envelope exactly as `_http_failure_detail` returns it: raw JSON
+    SOURCE, never parsed (it is a diagnostic), so the message's inner quotes arrive backslash-
+    escaped as ``\\"sha\\"`` — the backslashes are dropped before matching so the one shared
+    signature string stays the single source of truth. A `detail` bounded short of the signature
+    simply fails LOUD, which is the safe direction: the next scheduled sweep re-reads the ledger,
+    whereas a mis-classified validation error spins the retry loop to the same failure.
+    """
+    if code == 409:
+        return True
+    return code == 422 and create and _CREATE_RACE_SIGNATURE in (detail or "").replace("\\", "")
+
+
 # ---- transient-network retry (issue #494) -------------------------------------------------------
 # A scheduled sweep died on a raw http.client.RemoteDisconnected out of api.paginate -> request():
 # one transient TCP hiccup killed the ENTIRE hygiene pass, and groom's O(issues) comment fetches
 # (#36) maximise the exposure. request() now retries only genuinely TRANSIENT failures — the
 # RemoteDisconnected / ConnectionReset / timeout family and 502/503/504 — with bounded full-jitter
 # backoff, honouring a (capped) Retry-After. It still fails closed on every 4xx (auth/permission)
-# and on the 409/422 CAS conflict, which has its own caller-owned ledger re-read loop.
+# and on a CAS conflict (409, or the create-race 422 above), which has its own caller-owned ledger
+# re-read loop.
 #
 # Retries apply ONLY to reads. A dropped connection or gateway 5xx on a mutation does not prove
 # GitHub skipped the attempt — replaying a POST duplicates comments and replaying a PATCH/PUT can
@@ -5805,6 +5849,118 @@ def _self_test() -> int:
             patch_loud = "503" in str(exc)
         check("transient 503 on a PATCH is not replayed (fails loud, one attempt)",
               (patch_loud, calls["n"], transient_sleeps), (True, 1, []))
+
+        # ---- #240: a 422 is a CAS conflict ONLY in the create-race shape ----
+        # `retry_conflict` used to classify EVERY 422 as contention, so a request-VALIDATION 422
+        # was retried until _release_claims exhausted its attempts and reported "did not settle"
+        # with GitHub's real cause thrown away. These drive the REAL request(); widen the
+        # classifier back to `exc.code in {409, 422}` and the three fail-loud checks red, narrow
+        # it further (drop the 422 arm entirely) and the create-race check reds.
+        #
+        # The envelopes are GitHub's RAW answers — JSON SOURCE, so the message's inner quotes are
+        # backslash-escaped, which is precisely what the classifier has to cope with.
+        create_race_body = (
+            b'{"message":"Invalid request.\\n\\n\\"sha\\" wasn\'t supplied.",'
+            b'"documentation_url":"https://docs.github.com/rest/repos/contents"}'
+        )
+        validation_body = b'{"message":"Invalid request.\\n\\n\\"branch\\" wasn\'t supplied."}'
+        ledger_path = f"/repos/o/r/contents/{LEDGER_PATH}"
+        create_put = ledger_put_body("m", "e", None)     # sha-less: the create-if-absent form
+        update_put = ledger_put_body("m", "e", "sha1")   # sha-bearing: an update
+        check("the create/update PUT shapes under test really do differ by `sha`",
+              ("sha" in create_put, update_put.get("sha")), (False, "sha1"))
+
+        def _refusing(code, body_bytes):
+            def _raise(_request, timeout=None):
+                calls["n"] += 1
+                raise HTTPError("https://x", code, "Unprocessable Entity", {},
+                                io.BytesIO(body_bytes))
+            return _raise
+
+        # A distinct client: the shared `api` above holds the one-character token "t", and the
+        # credential mask would replace every "t" in the envelope — including the signature's own.
+        cas_api = GitHubAPI("CAS-SELFTEST-TOKEN", "registry")
+
+        def _classify(stub, put_body, retry_conflict=True):
+            """Run the LIVE request() against `stub` and report how it classified the failure."""
+            globals()["urlopen"] = stub
+            try:
+                cas_api.request("PUT", ledger_path, put_body, retry_conflict=retry_conflict)
+            except GroomConflict:
+                return "conflict"
+            except GroomError as exc:
+                return str(exc)
+            return "no error at all"
+
+        check(
+            "#240: the create-race 422 on a sha-less ledger PUT is still the retryable CAS "
+            "conflict the caller's re-read loop owns",
+            _classify(_refusing(422, create_race_body), create_put),
+            "conflict",
+        )
+        check(
+            "#240: a request-VALIDATION 422 fails LOUD carrying GitHub's own cause — it is not "
+            "retried as contention until the caller reports 'did not settle'",
+            _classify(_refusing(422, validation_body), create_put),
+            'registry GitHub API PUT failed with HTTP 422: {"message":"Invalid request.\\n\\n'
+            '\\"branch\\" wasn\'t supplied."}',
+        )
+        check(
+            "#240: even the create-race signature is validation on an UPDATE PUT — a write that "
+            "names the revision it expects cannot lose the CREATE race",
+            _classify(_refusing(422, create_race_body), update_put),
+            'registry GitHub API PUT failed with HTTP 422: {"message":"Invalid request.\\n\\n'
+            '\\"sha\\" wasn\'t supplied.","documentation_url":'
+            '"https://docs.github.com/rest/repos/contents"}',
+        )
+        check(
+            "#240: HTTP 409 stays a CAS conflict on BOTH ledger PUT shapes (a lost SHA is never "
+            "validation)",
+            (_classify(_refusing(409, b'{"message":"Conflict"}'), create_put),
+             _classify(_refusing(409, b'{"message":"Conflict"}'), update_put)),
+            ("conflict", "conflict"),
+        )
+        check(
+            "#240: a caller that owns NO CAS re-read loop never sees a conflict — 409 and the "
+            "create-race 422 both fail loud when retry_conflict is off",
+            (_classify(_refusing(409, b'{"message":"Conflict"}'), create_put,
+                       retry_conflict=False).startswith("registry GitHub API PUT failed"),
+             _classify(_refusing(422, create_race_body), create_put,
+                       retry_conflict=False).startswith("registry GitHub API PUT failed")),
+            (True, True),
+        )
+
+        # The reported symptom, end to end through the caller's retry loop: the PUT below goes
+        # through the LIVE request(), so this asserts the real classifier rather than a
+        # hand-raised exception.
+        class _ValidationLedgerAPI(_CasAPI):
+            def request(self, method, path, body=None, allow_404=False, retry_conflict=False):
+                if method == "GET":
+                    return super().request(method, path, body, allow_404, retry_conflict)
+                self.puts += 1
+                return cas_api.request("PUT", path, body, retry_conflict=retry_conflict)
+
+        globals()["urlopen"] = _refusing(422, validation_body)
+        saved_cas_backoff = globals()["_sleep_backoff"]
+        globals()["_sleep_backoff"] = lambda attempt: None
+        try:
+            rider = _ValidationLedgerAPI()
+            validation_failure = ""
+            try:
+                _release_claims(rider, "o/r", {dead})
+            except GroomError as exc:
+                validation_failure = str(exc)
+            check(
+                "#240 (the reported symptom): a VALIDATION 422 on the ledger PUT surfaces "
+                "GitHub's cause on the FIRST attempt — never six retries collapsed into "
+                "'lease ledger CAS conflicts did not settle'",
+                ("HTTP 422" in validation_failure and "branch" in validation_failure,
+                 "did not settle" in validation_failure,
+                 rider.puts),
+                (True, False, 1),
+            )
+        finally:
+            globals()["_sleep_backoff"] = saved_cas_backoff
     finally:
         globals()["urlopen"] = real_urlopen
         globals()["_sleep_transient"] = real_sleep_transient
