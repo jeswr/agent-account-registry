@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1252,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e1a2ea5661853fc62e592b79f4b85ab11e504869",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 remains sound and complete. The advisory reuses the authoritative enrolment and mint-shape predicates, isolates draftness without relaxing any other refusal, and warns only for raw-reference cardinalities that guarantee the production reader will refuse. It remains non-authoritative, fail-closed on unreadable policy, non-blocking on runtime and import failures, and does not echo attacker-controlled title/body text into the annotation channel. The required `gate` job invokes it unconditionally with exact runner-owned arguments and refreshes it on both author-editable facts; the parsed-workflow assertions and independent mutant rows pin deletion, disabling, relocation, duplication, argument damage, and trigger loss without substring-vacuity. No reviewer-directed instruction appears in the untrusted diff.",
+  "verdict": "approve"
+ }
+}
