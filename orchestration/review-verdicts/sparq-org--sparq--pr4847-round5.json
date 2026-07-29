@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4847,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bc24dbaab4865d89a21ea87de1a98a36c4c58a71",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 5 finds no correctness, soundness, test-validity, or security defect. The diagnostic remains restricted to the already-failed parse path, preserves the rejected SPARQL byte-for-byte, and cannot affect execution. The scanner distinguishes keyword candidates from strings, IRIs, comments, variables, language tags, numeric literals, and the expanded PN_PREFIX/PN_LOCAL forms; its focused unit tests and public CanaryFailed integration tests exercise the motivating suggestion, non-application, unrelated parse failures, Unicode/escaped local names, and dotted prefixes on the real API path. Keyword-table drift, sortedness, output bounds, deduplication, and arbitrary-input well-formedness are also pinned. The README, public API documentation, error rendering, and design record consistently frame the feature as an optional, non-rewriting, unmeasured diagnostic. This matches round 4's clean finding set, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
