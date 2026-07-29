@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1147,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0312c3b995ed3eaeef79dfcf06f59e2e6e1f360c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe diff consistently corrects stale private-repository wording to reflect that the registry is public while preserving the important distinction that credentials remain private. All executable workflow configuration, permissions, action pins, checkout options, control flow, and trust checks are unchanged. The expanded permissions comments in migrate-secrets-to-env.yml and pat-validity.yml accurately explain why explicit contents: read remains appropriate and do not weaken least privilege. No correctness, soundness, test-validity, or security issue is introduced.",
+  "verdict": "approve"
+ }
+}
