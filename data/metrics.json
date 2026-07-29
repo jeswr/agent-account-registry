@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-29T00:00:18Z",
+  "generated_at": "2026-07-29T00:02:54Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
@@ -16,7 +16,7 @@
       "review_changes_backlog": 15,
       "needs_user_parked": 22,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 10,
+      "review_lane_runs_1h": 11,
       "worker_attempts_1h": 12,
       "worker_success_rate_1h": 0.5833,
       "pr_open_rate": 2.0,
@@ -24,26 +24,39 @@
       "net_pr_flow": -6.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 494,
-      "issues_ready": 120,
+      "issues_open": 498,
+      "issues_ready": 124,
       "issues_closed_1h": 3,
       "issues_closed_24h": 38,
-      "prs_open": 39,
-      "prs_draft": 28,
-      "prs_opened_1h": 5,
+      "prs_open": 40,
+      "prs_draft": 29,
+      "prs_opened_1h": 6,
       "prs_closed_1h": 1,
       "prs_merged_1h": 1,
       "prs_merged_24h": 53,
       "review_changes_backlog": 5,
       "needs_user_parked": 13,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 11,
-      "worker_attempts_1h": 4,
+      "review_lane_runs_1h": 13,
+      "worker_attempts_1h": 5,
       "worker_success_rate_1h": 1.0,
-      "pr_open_rate": 5.0,
+      "pr_open_rate": 6.0,
       "pr_close_rate": 2.0,
-      "net_pr_flow": 3.0
+      "net_pr_flow": 4.0
     }
   },
-  "alerts": []
+  "alerts": [
+    {
+      "target": "jeswr/agent-account-registry",
+      "classification": "backlog-growing",
+      "fire": true,
+      "summary": "open PRs 40 > 12 and net PR flow +4.0/hr (open 6.0 > close 2.0) sustained over 2 snapshots",
+      "metrics": {
+        "prs_open": 40,
+        "net_pr_flow": 4.0,
+        "pr_open_rate": 6.0,
+        "pr_close_rate": 2.0
+      }
+    }
+  ]
 }
