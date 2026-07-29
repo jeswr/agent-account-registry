@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5093,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7bb3fed22facdc4b4769b5b97fe668f3d15bfc40",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior self-invalidating repository-wide occurrence claim. The replacement is narrowly scoped to source files, dependencies, and test vectors outside the rustdoc note, so the documentation can mention `lws-spec` and `lws-ucs` without contradicting itself. The remaining specification-estate statements are consistent with the pinned dependency and the DPoP-SK test evidence.",
+  "verdict": "approve"
+ }
+}
