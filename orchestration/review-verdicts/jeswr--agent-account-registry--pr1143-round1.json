@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1143,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b5a15bf0b533cdf50734d2f97d6af43e1c3f44b5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly restores claim-to-run correlation for the current `worker <target_repo> claim=<id>` title while retaining compatibility with target-less historical runs. The consumer still uses `fullmatch`, the claim remains constrained to lowercase 32-hex or `self`, and malformed/suffixed/other-lane titles are rejected. The self-test is non-vacuous: it renders the actual workflow's top-level `run-name`, rejects unknown expressions, verifies both sample values reached the rendering, checks the parsed claim, anchors behavior to measured live titles, and updates the downstream paging fixtures to the real producer shape. No trust check is weakened, no default-allow path is introduced, and no reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
