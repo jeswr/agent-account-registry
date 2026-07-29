@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5005,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ae9957926bbaecff5439b0779a2fb44136f664d2",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 finds no correctness, soundness, test-validity, or security defect. The compiled materializers preserve the previously reviewed fail-before-mutation ordering: cached rule compilation and complete fact assembly/validation precede stripping reserved graphs or replacing the authorization view. Reserved-space graphs are excluded in both control/resource and WAC group-document assembly. The WAC, ACP, and ACP-provenance differential tests compare non-empty installed authorization views against the text evaluator; the fact-adapter test checks direct IDs against a text round trip; and the failed-rematerialization test exercises both real materializer paths while proving the previous non-empty view survives validation errors. No instruction-like content or prompt injection appears in the diff. Because the prior round also had no findings and approved the same material change, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
