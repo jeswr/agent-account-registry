@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4942,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bbbc8a29c0445eccaa5f37f1a0b2a905a9e4a47c",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new zip unit test pins the divergence at the library boundary \u2014 effectiveName === 'payload.nq', guessFormat('payload.nq') === 'nquads' vs guessFormat('bundle.zip') === 'turtle' \u2014 which is exactly the remedy round 2's fix_hint asked for, and it is genuinely non-vacuous (I decoded the fixture against the real central-directory/local-header logic).\n\nWhat remains untested is the one-line consumer at import-drawer.tsx:270, `guessFormat(file.effectiveName ?? file.name)`, and the propagation at line 607. Reverting line 270 to `guessFormat(file.name)` still leaves every test green, because no test drives an actual zip through readFilesWithDecompress into the drawer's format selection.\n\nRecording this as a nit, not a blocker: the divergence the fix depends on is now pinned by an executable assertion, the mapping is a trivial `??`, and demanding a component-level test would go beyond the remedy the prior round specified.",
+    "file": "gui/app/src/components/workbench/import-drawer.tsx",
+    "fix_hint": "Optional follow-up (a bead, not work for this PR): extend gui/e2e-playwright/specs/browser-upload.web.spec.ts with a STORED zip fixture \u2014 reuse the storedZip helper shape from file-decompress.test.ts \u2014 named 'bundle.zip' whose single member is 'payload.nq' containing an N-Quads triple in a named graph, and assert the quad lands in the store with its graph preserved. That is the end-to-end case that goes red if line 270 regresses.",
+    "severity": "nit",
+    "title": "import-drawer.tsx:270 wiring still has no test that goes red on revert (library-level divergence is pinned instead)"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 3 addresses all five round-2 findings; no new defects found.\n\n(1) gui/README.md:107 is now in the diff and corrected to '(.gz / .zip / .zst) ... while bzip2 and HDT remain native-only'. Verified with `grep -rn 'bz2|bzip2|tgz|tbz' gui/` that the only remaining bzip2 mentions are correct ones: README:103 and import-drawer.tsx:900 (native-loader copy \u2014 the native path really does stream .bz2), rdf-format.ts:28 COMPRESSION_EXTS (still needed for native .bz2 suffix stripping), the rejection list in file-decompress.ts:93, and the new desktop-only strings.\n\n(2) The effectiveName plumbing now has a test that pins the exact divergence the change repairs: file-decompress.test.ts adds a hand-built STORED zip 'bundle.zip' containing 'payload.nq' and asserts effectiveName === 'payload.nq', guessFormat(effectiveName) === 'nquads', and guessFormat('bundle.zip') === 'turtle'. I executed the fixture bytes against the same parsing logic @sparq/client's readCentralDirectory/readZipEntry uses: EOCD at 110, entryCount 1, central signature OK, name 'payload.nq', method 0 (STORED, supported), flags 0 (not encrypted), local header signature OK, member data byte-identical. isRdfMember('payload.nq') selects it over first-file fallback. The fixture is spec-correct and the assertion is non-vacuous.\n\n(3) The bzip2 magic check is now the four-byte form (bytes[3] in 0x31..0x39), matching packages/sparq-client/src/decompress.ts:50-58 and site/src/lib/rdf-import.ts. The extension list is the same set as CODEC_EXTENSIONS.bzip2 ([.bz2,.bzip2,.tbz,.tbz2]).\n\n(4) The conflated test is split into three discriminating cases: magic-only ('dataset.nt' + BZh9) must reject, extension-only ('dataset.nt.bz2' + plain UTF-8) must reject, and a negative guard that 'BZhX...' (non-digit fourth byte) falls through as text. Traced the negative case: codecFromMagic returns undefined, codecFromName('dataset.nt') returns undefined, decompressDatasetBytes throws 'Unrecognised compressed payloa\u2026 [truncated 873 chars]",
+  "verdict": "approve"
+ }
+}
