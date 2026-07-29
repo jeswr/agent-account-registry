@@ -1021,13 +1021,22 @@ def _require(path):
         return handle.read()
 
 
-def main(argv=None, runner=None):
-    """The CLI entry point. `runner` exists so the self-test can exercise THIS function.
+def main(argv=None, runner=None, clock=None):
+    """The CLI entry point. `runner` and `clock` exist so the self-test can exercise THIS function.
 
     It was at 0% line coverage until a coverage run said so: the CLI-flag gate proves each flag is
     DECLARED, not that it is wired, so a typo in the slug validation, in the `[bot]` login the
     marker scan depends on, or in the repairs-file read would have passed the whole suite and failed
-    only in production."""
+    only in production.
+
+    `clock` is the SAME KIND of seam as `runner`, added for the same reason `_pinned_env` exists.
+    The self-test's repair fixture is merged at a FIXED instant (`REPAIR_DETAIL["merged_at"]`), and
+    `Sweeper` defaults to the wall clock — so every assertion routed through here silently inherited
+    the calendar. Inside `REPAIR_LOOKBACK_HOURS` of the fixture date they passed; a day later the
+    same code put every repair `repair-outside-lookback`, which turned the `--bot-slug` wiring row
+    RED and turned the three rows that expect NO write green for the wrong reason (nothing was swept
+    at all). A time-bomb in one direction and vacuity in the other, from one unstated input. Passing
+    `None` (every production call) keeps the wall clock."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true",
                         help="run the in-file test suite and exit")
@@ -1057,7 +1066,7 @@ def main(argv=None, runner=None):
     if args.bot_slug and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args.bot_slug):
         parser.error("--bot-slug must be a safe GitHub App slug")
     sweeper = Sweeper(args.repo, repairs, runner=runner, apply=args.apply, cap=args.max_moves,
-                      lookback_hours=args.lookback_hours,
+                      lookback_hours=args.lookback_hours, clock=clock,
                       bot_login=f"{args.bot_slug}[bot]" if args.bot_slug else "",
                       summary_path=os.environ.get("GITHUB_STEP_SUMMARY") or None)
     return sweeper.run()
@@ -2130,17 +2139,35 @@ def _test_live_sweep(chk):
         "cannot name", isinstance(_raises(sweeper13.run), RegateSweepError), True)
 
 
-def _main_total(chk, argv, runner=None):
+def _main_total(chk, argv, runner=None, clock=None):
     """`main()` with an escaping exception converted into a NAMED red rather than an abort. Four
     arming mutants died here by traceback instead of by their own observer until this existed."""
     try:
-        return main(argv, runner=runner)
+        return main(argv, runner=runner, clock=clock)
     except SystemExit:
         raise
     except BaseException as exc:                                          # noqa: BLE001
         chk(f"main({argv[:2]}) completed without raising",
             f"{type(exc).__name__}: {exc}"[:120], "no exception")
         return None
+
+
+def _main_census(chk, argv, runner=None, clock=None):
+    """`_main_total` with the tick's CENSUS ROW returned as well: -> (result, census line or "").
+
+    A row that asserts only "no write was issued" is equally satisfied by a tick that swept NOTHING,
+    so the census — the operator-facing statement of what this tick actually classified — is the
+    only evidence that separates suppression from inertness. The captured output is re-emitted, so
+    the job log is unchanged by the act of reading it (same contract as `_run_capturing`)."""
+    import contextlib
+    import io
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        result = _main_total(chk, argv, runner=runner, clock=clock)
+    print(buffer.getvalue(), end="")
+    rows = [line.strip() for line in buffer.getvalue().splitlines()
+            if line.strip().startswith("CENSUS")]
+    return result, rows[0] if rows else ""
 
 
 class _pinned_env:
@@ -2183,13 +2210,28 @@ def _test_entry_point(chk):
     """`main()` was at 0% line coverage. The CLI-flag gate proves flags are DECLARED; nothing
     proved they were WIRED — including the `--bot-slug` -> `<slug>[bot]` construction the whole
     marker-authorship control rests on. Every assertion here runs with the ambient CI variables
-    PINNED, because the defaults under test are read from them."""
+    PINNED, because the defaults under test are read from them.
+
+    The CLOCK is pinned for the same reason and is the same class of bug: `_fixture`'s sweeper takes
+    `clock=lambda: NOW`, but `main()` built its own `Sweeper` with the WALL clock, so these rows read
+    an input nobody stated. See `main`'s docstring for what that cost. `pinned` is `NOW` — inside
+    `REPAIR_LOOKBACK_HOURS` of the fixture's merge — and `stale` is deliberately outside it; both
+    directions are asserted below so a `clock` that stops reaching `Sweeper` cannot go unnoticed."""
     import tempfile
     repairs = json.dumps({"schema": 1, "repairs": [dict(REPAIR)]})
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
         handle.write(repairs)
         path = handle.name
     repo = "jeswr/agent-account-registry"
+
+    def pinned():
+        """The same instant `_fixture`'s own sweeper is pinned to — inside the repair's window."""
+        return NOW
+
+    def stale():
+        """One second past the END of that window, derived from the fixture's own merge time."""
+        return REPAIR_MERGED + int(REPAIR_LOOKBACK_HOURS * 3600) + 1
+
     try:
         with _pinned_env():        # no GITHUB_REPOSITORY, no APP_SLUG, no step summary
             # A marker written by SOMEONE ELSE. If `main` mis-wires the slug into the login the
@@ -2197,22 +2239,44 @@ def _test_entry_point(chk):
             spoof = {"body": MARKER.format(repair=917, head="a" * 40), "user": {"login": "nobody"}}
             gh, _ = _fixture(comments={903: [spoof]})
             code = _main_total(chk, ["--repo", repo, "--repairs-file", path, "--bot-slug", BOT_SLUG,
-                         "--max-moves", "5", "--apply"], runner=gh)
+                         "--max-moves", "5", "--apply"], runner=gh, clock=pinned)
             chk("entry point: main() runs the sweep end to end and exits 0", code, 0)
             chk("entry point: main() wires --bot-slug through as `<slug>[bot]`, so a foreign marker "
                 "is ignored and the attributable PR is still moved", gh.updated(), [903])
+            # THE OTHER DIRECTION of the clock this row depends on, and the only thing that proves
+            # `main` hands its `clock` to the Sweeper rather than accepting and dropping it: the
+            # SAME argv and the SAME board, one second past the lookback, must sweep NOBODY and say
+            # so. Dropping the argument makes the row above red and this one green — neither can be
+            # satisfied by a `main` that ignores the seam, in either direction of the mutation.
+            gh_stale, _ = _fixture(comments={903: [spoof]})
+            _main_total(chk, ["--repo", repo, "--repairs-file", path, "--bot-slug", BOT_SLUG,
+                              "--max-moves", "5", "--apply"], runner=gh_stale, clock=stale)
+            chk("entry point: ...and main() carries the CLOCK through too — one second past the "
+                "repair's lookback window the same board is inert and censused, not moved",
+                gh_stale.updated(), [])
 
             gh2, _ = _fixture(comments={903: [{"body": MARKER.format(repair=917, head="a" * 40),
                                               "user": {"login": BOT_LOGIN}}]})
             _main_total(chk, ["--repo", repo, "--repairs-file", path, "--bot-slug", BOT_SLUG, "--apply"],
-                 runner=gh2)
+                 runner=gh2, clock=pinned)
             chk("entry point: and OUR OWN marker read through main() does suppress the move",
                 gh2.updated(), [])
 
             gh3, _ = _fixture()
-            _main_total(chk, ["--repo", repo, "--repairs-file", path], runner=gh3)
+            _, dry_census = _main_census(chk, ["--repo", repo, "--repairs-file", path],
+                                         runner=gh3, clock=pinned)
             chk("entry point: main() DEFAULTS to dry-run — --apply is opt-in, so a mis-wired "
                 "workflow cannot write", [c for c in gh3.calls if "--method" in c], [])
+            # ...and the row above, ALONE, is satisfied by a tick that swept nothing at all — which
+            # is what a conditionally-inert clock (`clock=clock if args.apply else None`) produces
+            # on exactly this call, the one row here with no `--apply`. The census is the evidence
+            # that the repair was LIVE, its class non-empty and a move IDENTIFIED, so what the dry
+            # run suppressed is the WRITE and not the work.
+            chk("entry point: ...and that dry run still SWEPT — live repair, non-empty class, a "
+                "move identified, nothing skipped",
+                (dry_census.startswith("CENSUS repair=917 "), "class=1" in dry_census,
+                 "moved=1" in dry_census, "skipped=" in dry_census),
+                (True, True, True, False))
 
             for label, argv in (
                     ("a malformed --bot-slug", ["--repo", "o/r", "--repairs-file", path,
@@ -2227,7 +2291,7 @@ def _test_entry_point(chk):
         with _pinned_env(GITHUB_REPOSITORY=repo, APP_SLUG=BOT_SLUG):
             gh4, _ = _fixture(comments={903: [{"body": MARKER.format(repair=917, head="a" * 40),
                                               "user": {"login": BOT_LOGIN}}]})
-            code = main(["--repairs-file", path, "--apply"], runner=gh4)
+            code = main(["--repairs-file", path, "--apply"], runner=gh4, clock=pinned)
             chk("entry point: with $GITHUB_REPOSITORY set, --repo may be omitted and the sweep runs",
                 code, 0)
             chk("entry point: and $APP_SLUG supplies --bot-slug, so OUR marker still suppresses — "
