@@ -46,7 +46,7 @@ import re
 import sys
 import tempfile
 from pathlib import Path
-from typing import Iterable, NamedTuple
+from typing import NamedTuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
@@ -129,6 +129,7 @@ LANES: tuple[Lane, ...] = (WORKER_LANE, REVIEW_FIX_LANE)
 # module's self-test, so a consumer that grows its own renderer reds HERE even if its own suite is
 # happy with it.
 CONSUMERS: tuple[str, ...] = ("groom.py", "select-and-claim.py", "metrics.py")
+
 
 def _resolve(workflow: str | Path) -> Path:
     path = Path(workflow)
