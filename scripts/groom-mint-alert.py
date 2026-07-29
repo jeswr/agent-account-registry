@@ -132,11 +132,21 @@ UPLOAD_STEP_ID = "mint-marker-upload"
 SWEEP_STEP_ID = "sweep"
 MINT_STEP_IDS = ("target-token-sparq", "target-token-jeswr")
 
+SUITE_MANIFEST = "scripts/selftest-suite.txt"
+
 # Every file the self-test asserts against. The host job sparse-checks-out exactly this set and
 # _test_workflow_seam asserts that it does — a trimmed checkout would make the YAML-seam
 # assertions silently unreachable on the live path.
+#
+# This tuple is a DECLARATION, and _test_workflow_seam re-derives it from what _require() actually
+# read rather than trusting it. Issue #1264: SUITE_MANIFEST was read by this self-test, absent from
+# both this tuple and the job's sparse-checkout, and the sparse-checkout assertion still passed —
+# it compared the YAML against this literal, so a file read but never declared was invisible to it.
+# The live sparse job then died on the missing file every tick while pr-gate's full checkout stayed
+# green. Anything _require()d must appear here, and the mismatch reds at pr-gate time.
 REQUIRED_FILES = (
     "scripts/groom-mint-alert.py",
+    SUITE_MANIFEST,
     GROOM_WORKFLOW,
 )
 
@@ -605,6 +615,13 @@ def _repo_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+# Every path _require() has SUCCESSFULLY read this process. _test_workflow_seam asserts this
+# equals REQUIRED_FILES, which is what turns that tuple from an unchecked comment into the
+# sparse-checkout contract. Recorded only on success, so the deliberate missing-input probe in
+# _test_selftest_guards does not enrol a file that must then be checked out.
+_REQUIRED_READS = set()
+
+
 def _require(path):
     """Read a file the self-test asserts against. FAIL CLOSED: a missing input aborts the
     self-test loudly rather than making its assertions quietly unreachable."""
@@ -615,7 +632,9 @@ def _require(path):
             "YAML-seam assertions cannot run, and a self-test that silently stops asserting is "
             "worse than no self-test. Add it to the job's sparse-checkout list.")
     with open(full, encoding="utf-8") as handle:
-        return handle.read()
+        content = handle.read()
+    _REQUIRED_READS.add(path)
+    return content
 
 
 def _load_workflow(path):
@@ -1729,11 +1748,19 @@ def _test_workflow_seam(chk):
 
     for path in REQUIRED_FILES:
         _require(path)
-    chk("seam: the job sparse-checks-out every file its self-test asserts against",
-        sorted(_sparse_paths(job)), sorted(REQUIRED_FILES))
-    suite = _require("scripts/selftest-suite.txt").split()
+    suite = _require(SUITE_MANIFEST).split()
     chk("seam: enrolled in scripts/selftest-suite.txt, so pr-gate runs this self-test",
         "groom-mint-alert.py" in suite, True)
+    # BEHAVIOUR-derived, and it must run LAST: every other assertion has already pulled whatever it
+    # reads through _require(), so this is the complete input set. Without it REQUIRED_FILES is a
+    # comment — the check below would keep comparing the YAML against a literal that silently omits
+    # a file the self-test genuinely needs, which is exactly how #1264 shipped green.
+    chk("seam: REQUIRED_FILES declares EXACTLY the inputs this self-test actually read — an "
+        "undeclared read is invisible to the sparse-checkout assertion below, so it reds HERE at "
+        "pr-gate time instead of on the live sparse path every tick",
+        sorted(_REQUIRED_READS), sorted(REQUIRED_FILES))
+    chk("seam: the job sparse-checks-out every file its self-test asserts against",
+        sorted(_sparse_paths(job)), sorted(REQUIRED_FILES))
 
 
 if __name__ == "__main__":
