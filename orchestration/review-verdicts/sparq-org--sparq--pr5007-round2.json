@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5007,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "893e16b1e777e7868a30d24d1dc4fc1f85bcf488",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In run_case, `$JSCPD` is intentionally expanded unquoted so the default string `npx --yes jscpd@4.0.5` splits into command arguments. ShellCheck reports this construction as SC2086 (word splitting/globbing). The workflow's preceding `shellcheck scripts/tests/test_docs_duplication.sh` step has no exclusion or directive, so the docs-duplication job fails at static analysis and never runs the fixture suite. This also makes the advertised `JSCPD=\"node \u2026/jscpd\"` override depend on unsafe shell parsing.",
+    "file": "scripts/tests/test_docs_duplication.sh",
+    "fix_hint": "Represent the command as an array and invoke it as `\"${JSCPD_CMD[@]}\"`, with a separate safe override mechanism if needed (for example, accept the executable path separately from fixed arguments). Then run the exact workflow shellcheck command and the behavioral self-test.",
+    "severity": "major",
+    "title": "Mandatory shellcheck rejects the unquoted JSCPD command expansion"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The gate is not merge-ready because its mandatory shellcheck step is expected to reject the self-test itself. The script deliberately stores a multi-word command in JSCPD and expands it unquoted; that is precisely the unsafe pattern diagnosed by ShellCheck SC2086. Since the workflow runs shellcheck before the behavioral fixtures, the new hard-gate job will fail before reaching them. Round 1 reported no findings, so this newly identified major finding makes progress regressing.",
+  "verdict": "request_changes"
+ }
+}
