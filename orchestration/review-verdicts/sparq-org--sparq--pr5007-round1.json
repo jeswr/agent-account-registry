@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5007,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2600c1387884fe3caef0d80ae8807d2ffaec02d3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new hard gate is internally consistent: the workflow preserves and returns jscpd's exit status, requests the JSON reporter used for the step summary, and runs a shellchecked self-test before scanning the corpus. The configuration keeps the documented threshold, scope, size limits, and rendered-book exclusion aligned with that test. The fixture suite is non-vacuous in both directions: it demonstrates clone detection with and without the threshold, validates the working and fail-closed ignore-marker spellings, and proves the rendered-book exclusion against a control that must fail. The two existing intentional repeats are narrowly annotated rather than globally excluded. I found no correctness, soundness, security, or test-validity defect in the diff.",
+  "verdict": "approve"
+ }
+}
