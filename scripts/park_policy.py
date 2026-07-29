@@ -4191,6 +4191,22 @@ def _self_test():
     check("(e5) an unparseable self-ID stamp can never bind an operation",
           void_admit(self_id_rows=({"login": "jeswr", "at": "not-a-timestamp"},),
                      auto_evidence=post_park_evidence)[0], None)
+    # THE CLOSED-EPISODE LOWER BOUND. Added because the mutation sweep for this change found it
+    # SURVIVED: no row reached it, so it was a guard that read like a rule and proved nothing. It is
+    # reachable in practice precisely because the window is wide enough to span two parks — a bot
+    # park at 18:34:00 and a hand re-park 32s later — and without it a self-ID belonging to the
+    # EARLIER, already-closed episode would authorise voiding the LATER one.
+    timelines[41] = [event("labeled", "review:parked", "2026-07-26T18:34:00Z",
+                           "sparq-orchestrator[bot]"), receiptless_park]
+    timelines[7] = []
+    check("(e5) a self-ID inside the window but belonging to a CLOSED EARLIER episode binds "
+          "nothing — while the same row moved past that episode's boundary does",
+          [void_admit(self_id_rows=({"login": "jeswr", "at": "2026-07-26T18:33:58Z"},),
+                      auto_evidence=post_park_evidence)[0],
+           void_admit(self_id_rows=({"login": "jeswr", "at": "2026-07-26T18:34:01Z"},))[0]],
+          [None, "void-mint"])
+    timelines[41] = [receiptless_park]
+    timelines[7] = []
     # THE DISCRIMINATION THAT PROVES THE GATE WAS NARROWED, NOT WIDENED. An OFF-CLASS receipt is not
     # receipt-lessness: the machine DID form an opinion about that park and it was not "capacity".
     # Unchanged, and no void is offered for it at any window or provenance.
@@ -4295,6 +4311,16 @@ def _self_test():
           "one-shot budget, so a writer that corrupts its own stamp earns no extra void",
           void_admit(void_receipts=[{"key": receiptless_void, "at": "not-a-timestamp"}],
                      void_marker_count=RECEIPTLESS_VOID_MAX)[0], None)
+    # THE BUDGET COUNTS MARKERS, NOT PARSED RECORDS — AUTO_READMIT_MARKER's rule, and this row is
+    # what makes it non-vacuous. Added because the mutation sweep found `spent = len(void_receipts)`
+    # SURVIVED the suite: the row above passes BOTH counts, so it could not tell them apart. Here the
+    # marker is corrupt enough to yield NO parsed record at all, which is exactly the state in which
+    # ignoring `void_marker_count` would hand a self-corrupting writer unlimited voids.
+    check("(e5) a marker too corrupt to parse at all STILL spends the one-shot budget (the count is "
+          "of MARKERS, not of records)",
+          [void_admit(void_receipts=(), void_marker_count=RECEIPTLESS_VOID_MAX)[0],
+           void_admit(void_receipts=(), void_marker_count=RECEIPTLESS_VOID_MAX - 1)[0]],
+          [None, "void-mint"])
     # EPISODE BINDING on the void receipt: a void of a DIFFERENT park application can never clear
     # this one. The key IS the park instant, so this is exact rather than a recency proxy.
     timelines[41] = [receiptless_park,
