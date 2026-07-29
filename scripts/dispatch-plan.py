@@ -918,23 +918,31 @@ def _self_test():
         return step
 
     def _refuse_unwired_etag_store(path):
-        """THE #1207 CONDITIONAL-READ SEAM: `etag-restore` -> `snapshot` -> `etag-save`, with the
-        save strictly BEFORE the first step that executes target code.
+        """THE #1207 CONDITIONAL-READ SEAM: `snapshot` -> `etag-save`, with the publish strictly
+        BEFORE the first step that executes target code, and NO extracting action anywhere in the
+        job.
 
         Every fact below is a SILENT one. The mechanism has no output of its own that anything
         else asserts on, so each of these mutations leaves a dispatcher that still plans, still
         dispatches, still goes green — and quietly pays full price for every read again, or (the
-        ordering rule) publishes a store that target code was in a position to write:
+        ordering and transport rules) reopens the write primitive the adversarial review of PR
+        #1218 found:
 
-          * the `SNAPSHOT_ETAG_STORE` env line deleted     -> unconditional sweep, no signal
-          * either cache step deleted or reordered         -> cold store every tick, no signal
-          * the cached `path:` and the store path diverge  -> saves an empty directory forever
-          * `actions/cache` (combined) instead of the split restore/save pair -> the save becomes
-            a POST step at the END of the job, i.e. AFTER the hostile target planner has run
+          * the `SNAPSHOT_ETAG_STORE` env line deleted    -> unconditional sweep, no signal
+          * the publish step deleted or reordered         -> cold store every tick, no signal
+          * the published `path:` and the store path diverge -> publishes nothing, forever
+          * ANY cache/artifact RESTORE action in this job -> `@actions/toolkit` extracts with
+            `tar -xf ... -P` (--absolute-names), i.e. an ARBITRARY FILE WRITE, in a job that
+            subsequently holds `github.token`. This is the finding that failed review round 1
+            and it is refused STRUCTURALLY here, not by ordering — the runner populates
+            `_actions/` before any step runs, so no placement of a restore is safe.
 
         Fail-closed like its neighbours: anything it cannot resolve raises rather than passes.
         """
         import yaml  # lazy, same as _refuse_exit_zero_swallow
+        # The artifact name is read from the PRODUCT, never restated here: a literal copy is a
+        # second place for the workflow and the reader to drift apart silently.
+        _STORE_ARTIFACT = _load("registry_plan_snapshot_seam", "plan-snapshot.py").STORE_ARTIFACT
         with open(path, encoding="utf-8") as handle:
             document = yaml.safe_load(handle)
         steps = ((document.get("jobs") or {}).get("plan") or {}).get("steps")
@@ -944,16 +952,30 @@ def _self_test():
         for position, step in enumerate(steps):
             if isinstance(step, dict) and step.get("id"):
                 index.setdefault(step["id"], position)
-        for required in ("etag-restore", "snapshot", "etag-save"):
+        for required in ("snapshot", "etag-save"):
             if required not in index:
                 raise AssertionError(
                     f"dispatch.yml `plan` has no step `id: {required}` — the #1207 conditional-"
                     "read seam is not wired, so every check-runs read is billable again and "
                     "nothing reports it. Refusing.")
-        if not index["etag-restore"] < index["snapshot"] < index["etag-save"]:
+        if not index["snapshot"] < index["etag-save"]:
             raise AssertionError(
-                "the #1207 seam is out of order: the ETag store must be RESTORED before the "
-                "snapshot reads it and SAVED after — refusing.")
+                "the #1207 seam is out of order: the ETag store must be PUBLISHED after the "
+                "snapshot writes it — refusing.")
+        # THE TRANSPORT RULE. No step in this job may RESTORE a cache or an artifact: those
+        # actions extract a tarball with `tar -P` (--absolute-names), which is an arbitrary file
+        # write landing in a job that subsequently holds `github.token`. Refused by SHAPE rather
+        # than by position, because `_actions/` is populated before the first step runs and no
+        # placement of a restore is safe. (Adversarial review of PR #1218.)
+        for position, step in enumerate(steps):
+            uses = str((step or {}).get("uses") or "") if isinstance(step, dict) else ""
+            bare = uses.split("@", 1)[0]
+            if bare in ("actions/cache", "actions/cache/restore", "actions/download-artifact"):
+                raise AssertionError(
+                    f"dispatch.yml `plan` step {position} uses `{bare}`, which EXTRACTS a "
+                    "tarball with `tar -P` (--absolute-names) — an arbitrary file write in a "
+                    "job that holds github.token. The store is read through the API into "
+                    "memory instead; see plan-snapshot.load_store_from_artifact. Refusing.")
         # The first step that can execute anything from a target repository. The clone step is
         # that boundary (it runs the target's own `--self-test`s), and the save must precede it.
         clone = [position for position, step in enumerate(steps)
@@ -967,15 +989,13 @@ def _self_test():
                 "the ETag store is published AFTER target code runs — a store written past the "
                 "target-clone step is one the hostile planner half was in a position to shape. "
                 "Refusing.")
-        for step_id, prefix in (("etag-restore", "actions/cache/restore@"),
-                                ("etag-save", "actions/cache/save@")):
+        for step_id, prefix in (("etag-save", "actions/upload-artifact@"),):
             step = steps[index[step_id]]
             uses = str(step.get("uses") or "")
             if not uses.startswith(prefix):
                 raise AssertionError(
-                    f"step `id: {step_id}` must use `{prefix}...`, not {uses!r} — the COMBINED "
-                    "`actions/cache` saves in a POST step at the END of the job, which is after "
-                    "the hostile target planner code has executed. Refusing.")
+                    f"step `id: {step_id}` must use `{prefix}...`, not {uses!r} — publishing the "
+                    "store must be an UPLOAD, which writes nothing locally. Refusing.")
             if step.get("continue-on-error"):
                 raise AssertionError(
                     f"step `id: {step_id}` carries a truthy `continue-on-error` — refusing.")
@@ -989,17 +1009,19 @@ def _self_test():
                 "the `snapshot` step does not pass `SNAPSHOT_ETAG_STORE` — plan-snapshot.py "
                 "defaults to NO store and sweeps unconditionally, at full price, silently. "
                 "Refusing.")
-        restore_path = str((steps[index["etag-restore"]].get("with") or {}).get("path") or "")
-        save_path = str((steps[index["etag-save"]].get("with") or {}).get("path") or "")
-        if not restore_path or restore_path != save_path:
+        published = str((steps[index["etag-save"]].get("with") or {}).get("path") or "")
+        if published != store_path:
             raise AssertionError(
-                f"the ETag cache restores {restore_path!r} but saves {save_path!r} — the store "
-                "would never survive a tick. Refusing.")
-        if not store_path.startswith(restore_path.rstrip("/") + "/"):
+                f"the snapshot writes its store to {store_path!r} but the publish step uploads "
+                f"{published!r} — the store would never survive a tick while every assertion "
+                "stayed green. Refusing.")
+        # The artifact NAME is what the reader looks up by equality; a drift here is a
+        # permanently cold store with nothing red.
+        published_name = str((steps[index["etag-save"]].get("with") or {}).get("name") or "")
+        if published_name != _STORE_ARTIFACT:
             raise AssertionError(
-                f"the snapshot writes its store to {store_path!r}, which is NOT inside the "
-                f"cached path {restore_path!r} — the cache would round-trip an empty directory "
-                "forever while every assertion stayed green. Refusing.")
+                f"the publish step uploads artifact {published_name!r}, but plan-snapshot.py "
+                f"reads {_STORE_ARTIFACT!r} — refusing.")
         return steps[index["snapshot"]]
 
     def _workflow_heredoc(path, step_id):
@@ -1687,37 +1709,61 @@ def _routing_doc():
         ("does not pass `SNAPSHOT_ETAG_STORE`" in _etag_callsite,
          "at full price, silently" in _etag_callsite), (True, True))
 
-    # THE STEP. Delete the save step's id and the seam cannot be found at all.
+    # THE STEP. Delete the publish step's id and the seam cannot be found at all.
     _etag_step = _etag_refusal(_without_line("        id: etag-save"))
     chk("[#1207][YAML seam] removing the store-publishing STEP is REFUSED",
         ("no step `id: etag-save`" in _etag_step, "billable again" in _etag_step), (True, True))
 
-    # THE `if:`. A condition on either cache step silences the seam without failing anything.
-    _etag_if = _etag_refusal(_with_line("        id: etag-restore", "        if: false"))
-    chk("[#1207][YAML seam] an `if:` on the ETag cache step is REFUSED",
+    # THE `if:`. A condition on the publish step silences the seam without failing anything.
+    _etag_if = _etag_refusal(_with_line("        id: etag-save", "        if: false"))
+    chk("[#1207][YAML seam] an `if:` on the store-publishing step is REFUSED",
         ("carries an `if:` condition" in _etag_if, "stayed green" in _etag_if), (True, True))
 
-    # THE ORDERING, which is a SECURITY property and not a throughput one: the combined
-    # `actions/cache` saves in a POST step at the END of the job — after the hostile target
-    # planner has run. Swapping the split save for it must be refused.
-    _etag_combined = _etag_refusal(_replacing_line(
-        "        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0",
-        "        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0"))
-    chk("[#1207][YAML seam] the COMBINED actions/cache (POST-step save, after target code) is "
-        "REFUSED",
-        ("must use `actions/cache/save@...`" in _etag_combined,
-         "after the hostile target planner code has executed" in _etag_combined), (True, True))
+    # THE TRANSPORT, which is a SECURITY property and not a throughput one: any RESTORE action
+    # in this job extracts a tarball with `tar -P` (--absolute-names) — an arbitrary file write
+    # in a job that goes on to hold github.token. This is the finding that failed review round 1.
+    # Injected as a WHOLE, well-formed step (not a line spliced into another step's body, which
+    # only produced malformed YAML and a vacuously-passing row).
+    _SNAPSHOT_NAME_LINE = ("      - name: Snapshot target issues and pull requests "
+                           "(authenticated, registry-inline only)")
+    for _label, _action in (("actions/cache/restore", "actions/cache/restore"),
+                            ("the combined actions/cache", "actions/cache"),
+                            ("actions/download-artifact", "actions/download-artifact")):
+        _etag_restore = _etag_refusal(_replacing_line(
+            _SNAPSHOT_NAME_LINE,
+            f"      - uses: {_action}@1bd1e32a3bdc45362d1e726936510720a7c30a57\n"
+            "        with:\n"
+            "          path: ${{ runner.temp }}/etag-store\n"
+            "          key: dispatch-etags-\n"
+            + _SNAPSHOT_NAME_LINE))
+        chk(f"[#1207][YAML seam][SECURITY] re-introducing {_label} into the PLAN job is REFUSED",
+            ("--absolute-names" in _etag_restore, "arbitrary file write" in _etag_restore),
+            (True, True))
 
-    # THE PATH CHAIN. Cache a directory the snapshot never writes into and the store round-trips
-    # empty forever, with nothing red anywhere.
+    # THE ORDERING. If target code can run before the publish, the store is one the hostile half
+    # was in a position to shape. Injecting a `git clone` into the SNAPSHOT step makes the
+    # first target-code step precede `etag-save`, and the refusal must fire.
+    _etag_order = _etag_refusal(_replacing_line(
+        "          python3 registry-snapshot/scripts/plan-snapshot.py --self-test",
+        "          git clone https://example.invalid/decoy\n"
+        "          python3 registry-snapshot/scripts/plan-snapshot.py --self-test"))
+    chk("[#1207][YAML seam][SECURITY] publishing the store AFTER target code is REFUSED",
+        ("AFTER target code runs" in _etag_order,
+         "in a position to shape" in _etag_order), (True, True))
+
+    # THE PATH CHAIN. Publish a path the snapshot never writes and the store is cold forever.
     _etag_path = _etag_refusal(_replacing_line(
-        "          path: ${{ runner.temp }}/etag-store",
-        "          path: ${{ runner.temp }}/etag-store-elsewhere", occurrence=0))
-    chk("[#1207][YAML seam] a cached path the store is not written into is REFUSED",
-        ("restores" in _etag_path and "but saves" in _etag_path), True)
+        "          path: ${{ runner.temp }}/etag-store/etags.json",
+        "          path: ${{ runner.temp }}/etag-store/elsewhere.json", occurrence=0))
+    chk("[#1207][YAML seam] publishing a path the store is not written to is REFUSED",
+        ("but the publish step uploads" in _etag_path), True)
 
-    # ...and the REAL workflow passes the identical guard, so none of the rows above is green
-    # merely because the refusal refuses everything.
+    # THE ARTIFACT NAME, read from plan-snapshot.py itself so the two cannot drift.
+    _etag_name = _etag_refusal(_replacing_line(
+        "          name: dispatch-etags", "          name: dispatch-etags-renamed"))
+    chk("[#1207][YAML seam] a publish/read artifact-name drift is REFUSED",
+        ("uploads artifact" in _etag_name), True)
+
     chk("[#1207][YAML seam] ...and the real workflow passes the same refusal",
         _etag_refusal(_with_line("        id: snapshot", "        # a harmless comment")), "")
 

@@ -71,17 +71,30 @@ Nothing about WHICH pages are fetched, how a walk terminates, the per-walk ceili
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import re
 import sys
+import threading
 import time
 import traceback
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.request import (Request, HTTPRedirectHandler, build_opener, urlopen)
+import zipfile
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    """Refuse to auto-follow. urllib re-sends request headers across a redirect, so following
+    GitHub's 302 to blob storage automatically would forward the `Authorization` header to a
+    third-party host. `make_download` takes the hop manually, without the credential."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 RETRYABLE = {429, 500, 502, 503, 504}
 # 403 is deliberately NOT in RETRYABLE (issue #819). It is not one status, it is three different
@@ -179,9 +192,51 @@ RATE_LIMIT_RESERVE = 100
 #     busy repo. Caching it would store ~100 large bodies to buy nothing, so `_is_cacheable`
 #     admits the check-runs reads ONLY. The listings are excluded for the same reason.
 #
-#   * Does the STORE cost more than it saves? No: it costs nothing from this bucket. The store
-#     rides `actions/cache`, which talks to the Actions cache service, not api.github.com —
-#     measured in the same Actions probe, one restore + save moved core `used` 555 -> 555.
+#   * Does the STORE cost more than it saves? It costs TWO requests per tick (the artifact
+#     listing and the download), against ~455 saved.
+#
+# HOW THE STORE TRAVELS, AND WHY IT IS NOT `actions/cache` (adversarial review of PR #1218).
+# The first version of this rode `actions/cache/restore`. That was WRONG, and not subtly:
+#
+#   1. `@actions/toolkit` extracts with `tar -xf ... -P`. `-P` is `--absolute-names`, which
+#      disables tar's leading-`/` stripping AND its refusal of `..` members (verified in
+#      actions/toolkit packages/cache/src/internal/tar.ts, `case 'extract'`). A cache entry is
+#      therefore an ARBITRARY FILE WRITE, not merely data.
+#   2. Cache entries carry NO writer attribution, and an exact-key miss falls through to the
+#      `restore-keys` prefix — i.e. "newest entry anyone in the default-branch scope wrote".
+#      The target-repo code this workflow's own comments call hostile runs in this very job,
+#      after the save; so do worker.yml and review-fix.yml.
+#   3. The restore landed BEFORE the `github.token`-bearing snapshot step, and the runner
+#      populates `_actions/` before any step runs — so reordering cannot fix it either.
+#
+# So the transport was a write primitive aimed at a job that subsequently holds a token. It is
+# replaced by one that CANNOT write: the previous tick's store is read from the ARTIFACTS API
+# straight into memory (`zipfile` over a `BytesIO`), bounded, and parsed. Nothing is extracted to
+# the filesystem, so there is no path for a poisoned entry to reach any file at all. Artifacts
+# also carry the provenance the cache API lacks — the producing run's `head_branch` and
+# `head_repository_id` — and this reader requires both before it will look at one.
+#
+# WHAT A POISONED STORE COULD STILL DO, stated exactly — and NOT the tidier claim it is tempting
+# to make here. Review round 1 suggested asserting that check-run data never crosses into the
+# PLAN->CLAIM artifact. THAT IS FALSE, and it was checked rather than adopted: check-run-DERIVED
+# values do cross, in two places. `review_items[].context` carries verbatim failing-leg NAMES
+# (dispatch-claim.py `interpret_check_runs` -> `_sanitize_leg` -> the `needs-ci-fix` emit) and a
+# gate-conclusion string ("gate evidence: ..." on `stranded`), and `review_items[].state` is
+# itself selected by `repair_gate_of`.
+#
+# The bound that DOES hold, and the only one relied on:
+#
+#   * CLAIM re-derives the gate LIVE. `_live_repair_gate` -> `_paged_check_runs` reads
+#     `repos/<repo>/commits/<head_sha>/check-runs` at CLAIM time, and `decide_repair_admission` /
+#     `stranded_live` gate every act on THAT value. The plan's `context` is advisory prompt text
+#     for the fix model; the plan's `state` only selects which live predicate runs. So a poisoned
+#     store cannot manufacture an admission the live head does not independently justify.
+#   * The dispatcher has NO arm or merge path at all — the only `ready-and-arm` in the repository
+#     is review-fix.yml's host-only step, and it re-reads live too.
+#
+# So the residual is: misleading advisory prompt text, and a wasted or skipped repair round that
+# the live read then refuses to confirm. `_the_plan_carries_no_new_check_run_derived_field` below
+# pins the crossing set so a THIRD channel cannot be added silently.
 #
 # FAIL TOWARD RE-FETCHING, ALWAYS. `If-None-Match` is sent ONLY when the payload it maps to is in
 # hand, so a 304 can never be answered from a cache we do not hold; a malformed, truncated or
@@ -191,6 +246,16 @@ CONDITIONAL_STORE_SCHEMA = "registry-snapshot-etags/v1"
 # Bound on stored entries, so a store that somehow accumulates cannot grow without limit. Two
 # targets x WORKER_PR_STATUS_LIMIT PRs x (2 tier names + the legs walk's pages) has ample room.
 CONDITIONAL_STORE_LIMIT = 4000
+# The artifact this travels in. Matched by EQUALITY, never by prefix — the same rule
+# dispatch-tick-floor.py applies to its own marker, and for the same reason.
+STORE_ARTIFACT = "dispatch-etags"
+STORE_MEMBER = "etags.json"
+# EVERY bound below exists because the bytes are REMOTE CONTENT. A measured live store is ~0.43
+# MiB, so these are orders of magnitude of headroom, not tuning knobs; their job is to make an
+# oversized or zip-bombed store a bounded no-op instead of a MemoryError that takes the sweep —
+# and every subsequent tick — down with it.
+STORE_MAX_DOWNLOAD_BYTES = 16 * 1024 * 1024
+STORE_MAX_JSON_BYTES = 64 * 1024 * 1024
 
 
 def _is_cacheable(url):
@@ -213,15 +278,38 @@ class ConditionalStore:
 
     def __init__(self, entries=None):
         self.entries = entries if isinstance(entries, dict) else {}
-        self.hits = 0
-        self.billable = 0
+        self._hits = 0
+        self._billable = 0
         self.seen = set()
+        # EVERY mutator below runs on the SNAPSHOT_CONCURRENCY-wide pool. `self._hits += 1` is a
+        # read-modify-write, so without this lock the audit line under-reports under exactly the
+        # load it exists to measure — and a hit-rate telemetry that can undercount cannot detect
+        # its own mechanism silently degrading to 0%, which is the failure this line is for.
+        # (Adversarial review of PR #1218; same class as a test that passes for the wrong reason.)
+        self._lock = threading.Lock()
+
+    @property
+    def hits(self):
+        return self._hits
+
+    @property
+    def billable(self):
+        return self._billable
+
+    def count_hit(self):
+        with self._lock:
+            self._hits += 1
+
+    def count_billable(self):
+        with self._lock:
+            self._billable += 1
 
     def note(self, url):
         """Record that THIS tick asked for `url`, so `prune` can tell a live head from a dead
         one. Called for every cacheable read, hit or miss."""
         if _is_cacheable(url):
-            self.seen.add(url)
+            with self._lock:
+                self.seen.add(url)
 
     def etag_for(self, url):
         """The ETag to send, or None to fetch unconditionally."""
@@ -254,9 +342,10 @@ class ConditionalStore:
         shape `etag_for` must never hand out."""
         if not _is_cacheable(url) or not isinstance(etag, str) or not etag:
             return
-        if url not in self.entries and len(self.entries) >= CONDITIONAL_STORE_LIMIT:
-            return
-        self.entries[url] = {"etag": etag, "payload": payload}
+        with self._lock:
+            if url not in self.entries and len(self.entries) >= CONDITIONAL_STORE_LIMIT:
+                return
+            self.entries[url] = {"etag": etag, "payload": payload}
 
     def prune(self):
         """Drop entries THIS tick never asked for — a head that advanced never comes back, so
@@ -272,24 +361,34 @@ class ConditionalStore:
                 f"stored for the next tick")
 
 
-def load_conditional_store(path):
-    """Read the store a previous tick wrote. EVERY failure — missing, unreadable, wrong schema,
-    malformed — yields an EMPTY store, which costs exactly today's unconditional sweep. A store
-    that cannot be trusted is not consulted; it is never partially believed."""
-    if not path:
-        return ConditionalStore()
+def parse_conditional_store(raw):
+    """Validate the store bytes a previous tick published. EVERY failure — unreadable, wrong
+    schema, malformed, oversized — yields an EMPTY store, which costs exactly today's
+    unconditional sweep. A store that cannot be trusted is not consulted; it is never partially
+    believed.
+
+    `MemoryError` IS CAUGHT HERE, deliberately. It is not an ordinary bug for this input: the
+    bytes are remote content, so an oversized store is an ATTACKER-REACHABLE way to raise it, and
+    letting it escape would stall this tick and every tick after it until the artifact expired.
+    The size ceilings upstream make it nearly unreachable; this makes it survivable."""
     try:
-        document = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        if isinstance(raw, (bytes, bytearray)):
+            if len(raw) > STORE_MAX_JSON_BYTES:
+                return ConditionalStore()
+            raw = raw.decode("utf-8")
+        if not isinstance(raw, str) or len(raw) > STORE_MAX_JSON_BYTES:
+            return ConditionalStore()
+        document = json.loads(raw)
+    except (ValueError, UnicodeDecodeError, MemoryError, RecursionError):
         return ConditionalStore()
     if (not isinstance(document, dict)
             or document.get("schema") != CONDITIONAL_STORE_SCHEMA):
         return ConditionalStore()
-    raw = document.get("entries")
-    if not isinstance(raw, dict):
+    entries_raw = document.get("entries")
+    if not isinstance(entries_raw, dict):
         return ConditionalStore()
     entries = {}
-    for url, entry in raw.items():
+    for url, entry in entries_raw.items():
         # Per-entry validation, so ONE malformed row costs one re-fetch rather than the tick's
         # whole cache. A row missing either half is dropped: see ConditionalStore.record.
         if (isinstance(url, str) and _is_cacheable(url) and isinstance(entry, dict)
@@ -297,6 +396,145 @@ def load_conditional_store(path):
                 and "payload" in entry and len(entries) < CONDITIONAL_STORE_LIMIT):
             entries[url] = {"etag": entry["etag"], "payload": entry["payload"]}
     return ConditionalStore(entries)
+
+
+def parse_rfc3339(raw):
+    """RFC3339 -> epoch seconds, or None for anything unparseable (which sorts as 'skip')."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(
+            tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def newest_store_artifact(payload, default_branch):
+    """The newest non-expired artifact named EXACTLY `STORE_ARTIFACT` that this repository's own
+    default branch produced. -> the artifact dict, or None.
+
+    PROVENANCE IS CHECKED HERE because the transport this replaced had none. `head_branch` must
+    be the default branch (so a run from an arbitrary `workflow_dispatch` ref cannot publish one
+    this reader will pick up) and the producing run's head repository must be the repository
+    itself (never a fork). An absent/garbage `default_branch` matches NOTHING — the fail-toward-
+    re-fetching direction, since a store we cannot attribute is one we decline to read."""
+    if not isinstance(default_branch, str) or not default_branch:
+        return None
+    artifacts = payload.get("artifacts") if isinstance(payload, dict) else None
+    if not isinstance(artifacts, list):
+        return None
+    best = None
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or artifact.get("name") != STORE_ARTIFACT:
+            continue
+        if artifact.get("expired"):
+            continue
+        run = artifact.get("workflow_run")
+        if not isinstance(run, dict) or run.get("head_branch") != default_branch:
+            continue
+        if (run.get("head_repository_id") is None
+                or run.get("head_repository_id") != run.get("repository_id")):
+            continue
+        created = parse_rfc3339(artifact.get("created_at"))
+        if created is None:
+            continue
+        if best is None or created > best[0]:
+            best = (created, artifact)
+    return None if best is None else best[1]
+
+
+def load_store_from_artifact(fetch, download, repo, default_branch):
+    """Read the previous tick's store, ENTIRELY IN MEMORY.
+
+    THIS FUNCTION IS THE SECURITY BOUNDARY of the whole mechanism, and the property it holds is
+    structural rather than defensive: nothing here writes to the filesystem, so a poisoned store
+    has no path to any file. The zip is opened over a `BytesIO`, exactly one member of an exact
+    name is admitted, and the read is bounded twice — once against the member's DECLARED size and
+    again against the bytes actually produced, because a zip header can lie.
+
+    Every failure returns an EMPTY store (an unconditional sweep). `BudgetExhausted` is allowed
+    to propagate: it is sweep-fatal everywhere else in this file and must not be downgraded here
+    into "no cache today"."""
+    try:
+        listing = fetch(f"https://api.github.com/repos/{repo}/actions/artifacts"
+                        f"?name={quote(STORE_ARTIFACT, safe='')}&per_page=100&page=1")
+    except FetchError:
+        return ConditionalStore()
+    artifact = newest_store_artifact(listing, default_branch)
+    if artifact is None:
+        return ConditionalStore()
+    url = artifact.get("archive_download_url")
+    if not isinstance(url, str) or not url.startswith("https://api.github.com/"):
+        return ConditionalStore()
+    try:
+        blob = download(url)
+    except FetchError:
+        return ConditionalStore()
+    try:
+        with zipfile.ZipFile(io.BytesIO(blob)) as bundle:
+            # EXACTLY the one member, by name. A bundle carrying anything else is not one this
+            # pipeline produced, and enumerating it is not this function's job.
+            if bundle.namelist() != [STORE_MEMBER]:
+                return ConditionalStore()
+            if bundle.getinfo(STORE_MEMBER).file_size > STORE_MAX_JSON_BYTES:
+                return ConditionalStore()
+            with bundle.open(STORE_MEMBER) as handle:
+                # +1 so an over-long stream is DETECTED rather than silently truncated into
+                # valid-looking JSON.
+                text = handle.read(STORE_MAX_JSON_BYTES + 1)
+    except (zipfile.BadZipFile, OSError, ValueError, EOFError, MemoryError) as exc:
+        print(f"SNAPSHOT conditional store unreadable ({type(exc).__name__}) — "
+              "sweeping unconditionally")
+        return ConditionalStore()
+    if len(text) > STORE_MAX_JSON_BYTES:
+        return ConditionalStore()
+    return parse_conditional_store(text)
+
+
+def make_download(token):
+    """RAW byte reader for the store artifact, with a hard ceiling.
+
+    NOT `make_fetch`: that one parses JSON, and this is a zip. It also must not follow GitHub's
+    redirect to blob storage with the Authorization header still attached — that would hand the
+    token to a third-party host — so the redirect is taken MANUALLY and the second leg is
+    unauthenticated (the redirect target is pre-signed and needs no credential)."""
+    opener = build_opener(_NoRedirect)
+
+    def _read(response):
+        # +1 so an over-long body is detected, not truncated into something that parses.
+        data = response.read(STORE_MAX_DOWNLOAD_BYTES + 1)
+        if len(data) > STORE_MAX_DOWNLOAD_BYTES:
+            raise FetchError("conditional store artifact exceeds its size ceiling")
+        return data
+
+    def download(url):
+        request = Request(url, headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "reg4-plan-snapshot",
+            "X-GitHub-Api-Version": "2022-11-28",
+        })
+        try:
+            with opener.open(request, timeout=60) as response:
+                return _read(response)
+        except HTTPError as exc:
+            location = exc.headers.get("Location") if exc.headers is not None else None
+            if exc.code not in (301, 302, 303, 307, 308) or not location:
+                raise FetchError(
+                    f"conditional store download failed (HTTP {exc.code})") from exc
+            if not location.startswith("https://"):
+                raise FetchError("conditional store redirect is not https") from exc
+            try:
+                # UNAUTHENTICATED on purpose — see the docstring.
+                with opener.open(Request(location, headers={
+                        "User-Agent": "reg4-plan-snapshot"}), timeout=60) as response:
+                    return _read(response)
+            except (HTTPError, URLError, TimeoutError) as inner:
+                raise FetchError("conditional store download failed") from inner
+        except (URLError, TimeoutError) as exc:
+            raise FetchError("conditional store download failed") from exc
+
+    return download
 
 
 def save_conditional_store(path, store):
@@ -501,7 +739,7 @@ def make_fetch(token, store=None):
                     # request too late.
                     _check_reserve(getattr(response, "headers", None))
                     if store is not None:
-                        store.billable += 1
+                        store.count_billable()
                         store.record(url, _response_etag(getattr(response, "headers", None)),
                                      payload)
                     return payload
@@ -517,7 +755,7 @@ def make_fetch(token, store=None):
                 # path below and is retried/reported, never silently treated as "unchanged".
                 if exc.code == 304 and etag is not None:
                     _check_reserve(getattr(exc, "headers", None))
-                    store.hits += 1
+                    store.count_hit()
                     return store.payload_for(url)
                 if exc.code == 403:
                     headers = getattr(exc, "headers", None)
@@ -1823,37 +2061,62 @@ def _self_test():
 
     def a_malformed_store_degrades_to_an_unconditional_sweep():
         """Every unreadable shape costs exactly today's behaviour, never a wrong answer."""
-        with tempfile.TemporaryDirectory() as workdir:
-            path = Path(workdir, "etags.json")
-            for label, text in (
-                    ("absent", None),
-                    ("not json", "{["),
-                    ("not an object", "[]"),
-                    # THE FIXTURE MUST BE LOADABLE BUT FOR THE DEFECT. A wrong-schema document
-                    # with EMPTY entries is satisfied by dropping the schema check entirely —
-                    # measured: that mutation survived this row until the entries were populated.
-                    ("wrong schema", json.dumps({"schema": "other/v1", "entries": {
-                        CHECK_RUNS_URL: {"etag": '"v1"', "payload": {"would": "be loaded"}}}})),
-                    ("no schema at all", json.dumps({"entries": {
-                        CHECK_RUNS_URL: {"etag": '"v1"', "payload": {"would": "be loaded"}}}})),
-                    ("entries not a map",
-                     json.dumps({"schema": CONDITIONAL_STORE_SCHEMA, "entries": []})),
-            ):
-                if text is None:
-                    path.unlink(missing_ok=True)
-                else:
-                    path.write_text(text, encoding="utf-8")
-                store = load_conditional_store(str(path))
-                assert store.entries == {}, (label, store.entries)
-                assert store.etag_for(CHECK_RUNS_URL) is None, label
-            # ...and ONE malformed row costs one re-fetch, not the whole tick's cache.
-            path.write_text(json.dumps({"schema": CONDITIONAL_STORE_SCHEMA, "entries": {
+        for label, text in (
+                ("empty", ""),
+                ("not json", "{["),
+                ("not an object", "[]"),
+                # THE FIXTURE MUST BE LOADABLE BUT FOR THE DEFECT. A wrong-schema document with
+                # EMPTY entries is satisfied by dropping the schema check entirely — measured:
+                # that mutation survived this row until the entries were populated.
+                ("wrong schema", json.dumps({"schema": "other/v1", "entries": {
+                    CHECK_RUNS_URL: {"etag": '"v1"', "payload": {"would": "be loaded"}}}})),
+                ("no schema at all", json.dumps({"entries": {
+                    CHECK_RUNS_URL: {"etag": '"v1"', "payload": {"would": "be loaded"}}}})),
+                ("entries not a map",
+                 json.dumps({"schema": CONDITIONAL_STORE_SCHEMA, "entries": []})),
+                ("invalid utf-8", b"\xff\xfe not text"),
+        ):
+            store = parse_conditional_store(text)
+            assert store.entries == {}, (label, store.entries)
+            assert store.etag_for(CHECK_RUNS_URL) is None, label
+        # ...and ONE malformed row costs one re-fetch, not the whole tick's cache.
+        store = parse_conditional_store(json.dumps({
+            "schema": CONDITIONAL_STORE_SCHEMA, "entries": {
                 CHECK_RUNS_URL: {"etag": '"v1"', "payload": {"ok": True}},
                 DETAIL_URL: {"etag": '"v2"', "payload": {"no": True}},
-                "https://api.github.com/x/check-runs?bad": {"etag": '"v3"'},
-            }}), encoding="utf-8")
-            store = load_conditional_store(str(path))
-            assert list(store.entries) == [CHECK_RUNS_URL], store.entries
+                "https://api.github.com/x/check-runs?bad": {"etag": '"v3"'}}}))
+        assert list(store.entries) == [CHECK_RUNS_URL], store.entries
+
+    def an_oversized_store_is_a_bounded_no_op():
+        """[#1207 review r1] The bytes are REMOTE CONTENT, so an oversized store is an
+        attacker-reachable MemoryError. Before this bound it escaped the parse and stalled EVERY
+        subsequent tick until the artifact expired.
+
+        THE FIXTURE MUST BE VALID JSON THAT IS MERELY TOO BIG. A giant blob of garbage is
+        rejected by `json.loads` whether or not the size bound exists — measured: with a garbage
+        fixture, deleting the bound outright SURVIVED this row."""
+        module = sys.modules[__name__]
+        valid = json.dumps({"schema": CONDITIONAL_STORE_SCHEMA, "entries": {
+            CHECK_RUNS_URL: {"etag": '"v1"', "payload": {"x": "y"}}}})
+        # CONTROL FIRST: the same document is accepted when it fits, so the refusal below is
+        # attributable to the SIZE and to nothing else.
+        assert parse_conditional_store(valid).entries != {}, "control fixture must load"
+        with patch.object(module, "STORE_MAX_JSON_BYTES", len(valid) - 1):
+            assert parse_conditional_store(valid).entries == {}, "str over the bound must refuse"
+            assert parse_conditional_store(valid.encode()).entries == {}, "bytes likewise"
+
+        # ...and MemoryError must not ESCAPE. Asserted by catching it here: letting it propagate
+        # would otherwise be reported as a harness CRASH, which this suite deliberately does not
+        # count as a kill.
+        try:
+            with patch.object(module.json, "loads",
+                              lambda *a, **k: (_ for _ in ()).throw(MemoryError())):
+                got = parse_conditional_store('{"schema": "x"}')
+        except MemoryError:
+            raise AssertionError(
+                "MemoryError escaped parse_conditional_store — one oversized store would stall "
+                "this tick and every tick after it until the artifact expired")
+        assert got.entries == {}, got.entries
 
     def the_store_keeps_only_the_urls_this_tick_asked_for():
         """A head that advanced never comes back; without the prune its entry would be carried by
@@ -1877,17 +2140,176 @@ def _self_test():
         store.prune()
         assert list(store.entries) == [live], store.entries
 
-    def the_store_round_trips_through_the_file_the_workflow_caches():
-        """The save/load pair must agree, or the cache round-trips something `load` then rejects
-        — which would look exactly like a 0% hit rate and report nothing."""
+    def the_store_round_trips_from_the_written_file_through_the_parser():
+        """The save/parse pair must agree, or the artifact round-trips something the reader then
+        rejects — which looks exactly like a 0% hit rate and reports nothing."""
         with tempfile.TemporaryDirectory() as workdir:
             path = str(Path(workdir, "nested", "etags.json"))
             store = ConditionalStore()
             store.record(CHECK_RUNS_URL, '"v1"', {"check_runs": [], "total_count": 0})
             assert save_conditional_store(path, store) is True
-            back = load_conditional_store(path)
+            back = parse_conditional_store(Path(path).read_text(encoding="utf-8"))
             assert back.etag_for(CHECK_RUNS_URL) == '"v1"', back.entries
             assert back.payload_for(CHECK_RUNS_URL) == {"check_runs": [], "total_count": 0}
+
+    def the_store_reader_never_writes_to_the_filesystem():
+        """[#1207 review r1] THE SECURITY PROPERTY, and the reason this is not `actions/cache`.
+
+        `@actions/toolkit` extracts with `tar -xf ... -P` (--absolute-names), so a restore action
+        is an ARBITRARY FILE WRITE — landing, in the original design, in a job that goes on to
+        hold `github.token`. The replacement reads the zip out of memory, asserted structurally:
+        the reader runs with every filesystem write path booby-trapped, so ANY write — by this
+        code or by zipfile underneath it — fails this row."""
+        module = sys.modules[__name__]
+        blob = io.BytesIO()
+        with zipfile.ZipFile(blob, "w") as bundle:
+            bundle.writestr(STORE_MEMBER, json.dumps({
+                "schema": CONDITIONAL_STORE_SCHEMA,
+                "entries": {CHECK_RUNS_URL: {"etag": '"v1"', "payload": {"in": "memory"}}}}))
+        payload = blob.getvalue()
+
+        def _no(*args, **kwargs):
+            raise AssertionError("the store reader touched the filesystem")
+
+        listing = {"artifacts": [{
+            "name": STORE_ARTIFACT, "expired": False,
+            "created_at": "2026-07-29T09:00:00Z",
+            "archive_download_url": "https://api.github.com/x/zip",
+            "workflow_run": {"head_branch": "master", "repository_id": 1,
+                             "head_repository_id": 1}}]}
+        with patch.object(module.Path, "write_text", _no), \
+                patch.object(module.Path, "write_bytes", _no), \
+                patch.object(module.os, "replace", _no), \
+                patch.object(module.zipfile.ZipFile, "extractall", _no), \
+                patch.object(module.zipfile.ZipFile, "extract", _no):
+            store = load_store_from_artifact(
+                lambda url: listing, lambda url: payload, repo, "master")
+        assert store.etag_for(CHECK_RUNS_URL) == '"v1"', store.entries
+
+    def only_attributable_store_artifacts_are_read():
+        """The transport this replaced had NO writer attribution and fell through to a bare
+        prefix match. Artifacts carry the producing run's branch and head repository, so the
+        reader requires both; anything it cannot attribute is declined."""
+        good = {"name": STORE_ARTIFACT, "expired": False,
+                "created_at": "2026-07-29T09:00:00Z",
+                "archive_download_url": "https://api.github.com/x/zip",
+                "workflow_run": {"head_branch": "master", "repository_id": 1,
+                                 "head_repository_id": 1}}
+        assert newest_store_artifact({"artifacts": [good]}, "master") is good
+        for label, mutation in (
+                ("another branch", {"workflow_run": dict(good["workflow_run"],
+                                                         head_branch="attacker")}),
+                ("a fork head", {"workflow_run": dict(good["workflow_run"],
+                                                      head_repository_id=99)}),
+                ("expired", {"expired": True}),
+                ("a look-alike name", {"name": "dispatch-etags-lookalike"}),
+        ):
+            assert newest_store_artifact({"artifacts": [dict(good, **mutation)]},
+                                         "master") is None, label
+        for branch in (None, "", 7):
+            assert newest_store_artifact({"artifacts": [good]}, branch) is None, branch
+        older = dict(good, created_at="2026-07-28T09:00:00Z")
+        junk = dict(good, created_at="not-a-date")
+        assert newest_store_artifact({"artifacts": [older, good, junk]}, "master") is good
+
+    def the_store_download_never_forwards_the_token_off_github():
+        """urllib re-sends request headers across a redirect and GitHub answers the artifact
+        download with a 302 to blob storage, so following it automatically would hand
+        `Bearer <token>` to a third-party host. The hop is taken manually, UNAUTHENTICATED."""
+        module = sys.modules[__name__]
+        seen = []
+
+        class _R:
+            def __init__(self, body):
+                self._b = io.BytesIO(body)
+
+            def read(self, *a):
+                return self._b.read(*a)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def _fake_open(self, request, timeout=None):
+            seen.append(request)
+            if "api.github.com" in request.full_url:
+                raise HTTPError(request.full_url, 302, "Found",
+                                {"Location": "https://blob.example/signed"}, None)
+            return _R(b"PAYLOAD")
+
+        opener_cls = module.build_opener(module._NoRedirect).__class__
+        with patch.object(opener_cls, "open", _fake_open):
+            got = make_download("SEKRIT")("https://api.github.com/x/zip")
+        assert got == b"PAYLOAD", got
+        assert len(seen) == 2, seen
+        assert seen[0].has_header("Authorization"), "the API leg must be authenticated"
+        assert not seen[1].has_header("Authorization"), (
+            "the redirect leg must NOT carry the token off api.github.com")
+
+    def the_plan_carries_no_new_check_run_derived_field():
+        """[#1207 review r1] THE BOUND ON A POISONED STORE, pinned rather than asserted in prose.
+
+        The store can only ever supply CHECK-RUN rows, so what matters is which plan fields those
+        rows can move. Today that set is exactly {state, context} on `review_items` — verified,
+        not assumed; the tidier claim that check-run data does not reach the plan at all is FALSE
+        (`context` carries verbatim failing-leg names and a gate-conclusion string).
+
+        This pins the crossing set from BOTH ends so a third channel cannot open quietly:
+        the frozen field list reds when any field is added, and the DIFFERENTIAL reds when an
+        existing field starts varying with check-run content. The disarm channel is pinned
+        INVARIANT for the same reason — it consumes detail fields only, deliberately, so that a
+        degraded/poisoned check-run record can never suppress the #42 safety act."""
+        claim_mod = _load_claim()
+        assert claim_mod.REVIEW_ITEM_FIELDS == {
+            "pr_number", "head_sha", "state", "impl_provider", "repo", "package", "security",
+            "self_attested", "context"}, claim_mod.REVIEW_ITEM_FIELDS
+        assert claim_mod.DISARM_ITEM_FIELDS == {
+            "pr_number", "head_sha", "reviewed_sha", "repo"}, claim_mod.DISARM_ITEM_FIELDS
+
+        # DIFFERENTIAL: hold everything constant but the check runs, and see what moves.
+        head = "c" * 40
+        base = {"head_sha": head, "mergeable": True, "draft": True, "auto_merge": None}
+        green = dict(base, check_runs=[gate_run(name=draft_gate, conclusion="success")])
+        red = dict(base, check_runs=[gate_run(name=draft_gate, conclusion="failure"),
+                                     gate_run(name="docs-quality", conclusion="failure")])
+        moved = {key for key in ("head_sha", "armed", "draft", "gate", "repair_gate",
+                                 "failing_legs")
+                 if claim_mod.pr_ci_status(green).get(key)
+                 != claim_mod.pr_ci_status(red).get(key)}
+        # The STATUS is allowed to move — it is the derived view. What must not move is the
+        # DISARM decision, which is the one act that consumes a degraded record on purpose.
+        assert "gate" in moved or "repair_gate" in moved, (
+            "the fixture no longer varies the gate at all — this differential would pass "
+            f"vacuously (moved={moved})")
+        # READY + head/marker MISMATCH, so the enumerator actually EMITS. A fixture that emits
+        # nothing makes "green == red" true for the wrong reason and could not witness a disarm
+        # that started consuming check runs.
+        ready = dict(base, draft=False)
+        green = dict(ready, check_runs=green["check_runs"])
+        red = dict(ready, check_runs=red["check_runs"])
+        # READY, reviewed-sha marker pointing at a DIFFERENT head -> the enumerator emits.
+        # pr_status and provenance are both keyed by the INT pr number, and pr_status carries
+        # `pr_ci_status` OUTPUT (what the assemble step builds), not the raw record.
+        pull = {"number": 11, "state": "open", "draft": False,
+                "body": "<!-- sparq-reviewed-sha:" + "d" * 40 + " -->",
+                "head": {"sha": head, "ref": "sparq-agent/issue-1-x",
+                         "repo": {"full_name": repo}},
+                "user": {"login": "bot[bot]"}}
+        provenance = {11: {"pr_number": 11}}
+        disarm_green = claim_mod.enumerate_disarm_items(
+            repo, [pull], {11: claim_mod.pr_ci_status(green)}, provenance,
+            bot_login="bot[bot]")
+        disarm_red = claim_mod.enumerate_disarm_items(
+            repo, [pull], {11: claim_mod.pr_ci_status(red)}, provenance,
+            bot_login="bot[bot]")
+        assert disarm_green, (
+            "the disarm fixture emits nothing, so this invariance check cannot witness a "
+            "disarm that started reading check runs — it would pass vacuously")
+        assert disarm_green == disarm_red, (
+            "the DISARM channel moved with check-run content; it must consume detail fields "
+            f"only (#42): {disarm_green} vs {disarm_red}")
 
     def the_inertness_attestation_adopts_the_claim_predicate_and_fails_closed():
         """[sparq#4819] The PLAN-side attestation must be `_pull_inactivity_decision`'s ANSWER —
@@ -2022,7 +2444,12 @@ def _self_test():
         only_check_runs_reads_are_cached,
         a_malformed_store_degrades_to_an_unconditional_sweep,
         the_store_keeps_only_the_urls_this_tick_asked_for,
-        the_store_round_trips_through_the_file_the_workflow_caches,
+        the_store_round_trips_from_the_written_file_through_the_parser,
+        an_oversized_store_is_a_bounded_no_op,
+        the_store_reader_never_writes_to_the_filesystem,
+        only_attributable_store_artifacts_are_read,
+        the_store_download_never_forwards_the_token_off_github,
+        the_plan_carries_no_new_check_run_derived_field,
     ))
     for row in rows:
         print(row)
@@ -2057,8 +2484,12 @@ def main():
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument(
         "--etag-store", default=os.environ.get("SNAPSHOT_ETAG_STORE", ""),
-        help=("path to the cross-tick ETag store (issue #1207). Absent/unreadable simply means "
-              "an unconditional sweep, so the dispatcher never depends on the cache existing."))
+        help=("WRITE path for the cross-tick ETag store (issue #1207) — the file the workflow's "
+              "upload-artifact step publishes for the NEXT tick. The read side does not use "
+              "this: it pulls the previous tick's store from the artifacts API straight into "
+              "memory, because an extracting action is a filesystem-write primitive. Absent or "
+              "unreadable means an unconditional sweep, so the dispatcher never depends on the "
+              "store existing."))
     args = parser.parse_args()
     if args.self_test:
         # [sparq#4819 round 4] THE CLI BOUNDARY IS THE LAST PLACE AN ESCAPE CAN BE NAMED.
@@ -2088,7 +2519,13 @@ def main():
         raise SystemExit("GH_TOKEN is required for the authenticated snapshot")
     repos = [line for line in
              Path(args.repos_file).read_text(encoding="utf-8").splitlines() if line]
-    store = load_conditional_store(args.etag_store)
+    # The READ side is the artifacts API, straight into memory — never an extracting action.
+    # See the CONDITIONAL READS block: the transport this replaced (`actions/cache`) extracts
+    # with `tar -P`, which is an arbitrary file write into a job that then holds this token.
+    fetch = make_fetch(token)
+    store = load_store_from_artifact(
+        fetch, make_download(token), os.environ.get("REGISTRY_REPO", ""),
+        os.environ.get("REGISTRY_STORE_BRANCH", ""))
     try:
         snapshot_targets(make_fetch(token, store), _load_claim(), repos, args.out_dir)
         # Only a COMPLETED sweep writes the store. A sweep that died half way has a `seen` set

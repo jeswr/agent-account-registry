@@ -174,6 +174,11 @@ jobs:
     # assemble step uses its own later checkout, so the early snapshot copy is tamper-inert).
     permissions:
       contents: read
+      # [#1207] READ-ONLY, and only so the snapshot step can LIST + DOWNLOAD the previous tick's
+      # `dispatch-etags` artifact through the API instead of via an extracting restore action.
+      # It grants no write of any kind, and the token still lives ONLY in the snapshot step's own
+      # env — the hostile target planner steps below hold no token and cannot use this.
+      actions: read
     steps:
       - name: Resolve the public target manifest
         env:
@@ -210,37 +215,6 @@ jobs:
           path: registry-snapshot
           persist-credentials: false
 
-      # THE CROSS-TICK ETag STORE (issue #1207). 77% of a 613-request tick was per-PR check-runs
-      # reads, and MEASURED against the live targets 213 of 222 of them are unchanged from the
-      # previous tick — an authenticated conditional request that answers 304 does not decrement
-      # the bucket, so those reads stop being billable without one of them being dropped. The
-      # full derivation, including the Actions-side proof that a 304 really is free on
-      # `github.token` and that this cache costs ZERO requests from the same bucket, is in
-      # scripts/plan-snapshot.py's CONDITIONAL READS block.
-      #
-      # RESTORE ONLY here, SAVE below — deliberately NOT the combined `actions/cache`, whose save
-      # runs as a POST step at the END of the job, which is AFTER the hostile target planner code
-      # has executed. Splitting them puts the write BEFORE any target code runs, so the entry
-      # this tick publishes is one no target code was ever in a position to touch. A restore that
-      # finds nothing is not an error: plan-snapshot.py degrades an absent or malformed store to
-      # exactly today's unconditional sweep.
-      #
-      # SIZE, measured rather than assumed, because each tick writes a NEW key (cache entries are
-      # immutable, so there is no overwrite) and they accumulate until GitHub's 7-day / 10 GB LRU
-      # reclaims them: the 214 check-runs payloads of a live tick total 440 KiB — mean 2.1 KiB,
-      # largest 13.6 KiB — so ~0.43 MiB per tick, and even at the floor's 6 ticks/h ceiling for a
-      # full 7 days that is ~0.42 GiB against a 10 GB repository quota. Nothing else in this
-      # repository uses actions/cache, so the only entries this can ever evict are its own older
-      # ones.
-      - name: Restore the cross-tick ETag store (pinned)
-        id: etag-restore
-        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
-        with:
-          path: ${{ runner.temp }}/etag-store
-          key: dispatch-etags-${{ github.run_id }}
-          restore-keys: |
-            dispatch-etags-
-
       # AUTHENTICATED, registry-inline snapshot — runs BEFORE any target code executes, so the
       # token (repo-scoped github.token, read-only against the public targets) never coexists
       # with hostile target planner code; the planner step below consumes only the local JSON
@@ -262,25 +236,42 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SNAPSHOT_ETAG_STORE: ${{ runner.temp }}/etag-store/etags.json
+          REGISTRY_REPO: ${{ github.repository }}
+          # The branch whose artifacts this run will READ a store from — always the branch this
+          # run is itself on, which for every legitimate trigger (schedule, workflow_run, the
+          # doorbell) is the default branch. `github.ref_name` is used rather than
+          # `github.event.repository.default_branch` because the latter is absent from a
+          # `schedule` payload, and an empty value here silently disables the mechanism on
+          # exactly the scheduled ticks. Provenance is enforced in plan-snapshot.py: a store
+          # produced by a run on any OTHER branch is never read.
+          REGISTRY_STORE_BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           python3 registry-snapshot/scripts/plan-snapshot.py --self-test
           python3 registry-snapshot/scripts/plan-snapshot.py \
             "$RUNNER_TEMP/dispatch-targets/repos.txt" "$RUNNER_TEMP"
 
-      # SAVE BEFORE ANY TARGET CODE RUNS. The next step is still registry code and the clone step
-      # after it is the first thing that executes anything from a target repo; publishing here is
-      # what keeps the store outside the hostile half's reach. It is also why this is
-      # `actions/cache/save` and not the combined action — see the restore note above.
+      # PUBLISH BEFORE ANY TARGET CODE RUNS. The next step is still registry code and the clone
+      # step after it is the first thing that executes anything from a target repo, so the store
+      # this tick publishes is one no target code was ever in a position to shape.
+      #
+      # An UPLOAD, deliberately — never a cache/artifact RESTORE action. Those extract a tarball
+      # (`@actions/toolkit` uses `tar -xf ... -P`, i.e. --absolute-names), which is an arbitrary
+      # file write, and it would land in this very job before the `github.token`-bearing snapshot
+      # step. Uploading writes nothing locally, and the READ side is plan-snapshot.py pulling the
+      # previous artifact through the API into memory. Adversarial review of PR #1218.
+      #
       # No `if:` and no `continue-on-error:`: a failed snapshot fails the job and never reaches
-      # this step, which is the correct behaviour (only a COMPLETED sweep publishes a store), and
+      # this step, which is correct (only a COMPLETED sweep publishes a store), and
       # scripts/dispatch-plan.py's self-test refuses both spellings at this seam.
       - name: Publish the ETag store for the next tick (pinned, pre-target)
         id: etag-save
-        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          path: ${{ runner.temp }}/etag-store
-          key: dispatch-etags-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dispatch-etags
+          path: ${{ runner.temp }}/etag-store/etags.json
+          if-no-files-found: error
+          retention-days: 1
 
       # Extract the policy-controlled trusted-bot allowlist (issue #111) from the registry policy
       # using REGISTRY code, BEFORE any target planner code runs (the clone/self-test step below is
