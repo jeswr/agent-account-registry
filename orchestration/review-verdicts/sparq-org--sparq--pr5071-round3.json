@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5071,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9402ed7083704c56ba5d437024437e7c4a455abc",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The documentation-only credential correction remains accurate, internally consistent, and unchanged in risk from round 2. The cited program record confirms that an OpenAlex API key and polite-pool mailto exist while Semantic Scholar remains unavailable. The diff consistently updates the access table and both needs-access lists, preserves the source-agnostic connector design, and retains the instruction to re-verify authentication and rate limits at build time. No correctness, soundness, test-validity, or security issue is present.",
+  "verdict": "approve"
+ }
+}
