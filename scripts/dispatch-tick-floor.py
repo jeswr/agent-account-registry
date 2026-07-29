@@ -186,8 +186,10 @@ SHARED_HOURLY_BUDGET = 5000
 # tick at its ceiling.
 #
 # The WIN is therefore not visible in this constant; it is visible in the number this gate reads.
-# Ticks that spend ~160 instead of 613 leave `x-ratelimit-remaining` high, so far more ticks clear
-# the same threshold. plan-snapshot.py prints the per-tick split ("SNAPSHOT conditional reads:
+# Ticks that spend ~190-200 instead of 613 leave `x-ratelimit-remaining` high, so far more ticks
+# clear the same threshold. (That figure is the UNDER-LOAD one: the 304 rate is ~87-90% when the
+# targets are busy, against 96-100% measured in a quieter window. The conservative number is the
+# one quoted, here and in the PR.) plan-snapshot.py prints the per-tick split ("SNAPSHOT conditional reads:
 # N of M ... billable") so the realised saving is auditable on every tick rather than assumed.
 MEASURED_REQUESTS_PER_TICK = 613
 # The highest hourly request rate observed to run clean, and the rate that broke. Both are

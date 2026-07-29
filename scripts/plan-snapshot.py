@@ -84,7 +84,8 @@ import time
 import traceback
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
-from urllib.request import (Request, HTTPRedirectHandler, build_opener, urlopen)
+from urllib.request import (Request, HTTPHandler, HTTPRedirectHandler, HTTPSHandler,
+                            build_opener, urlopen)
 import zipfile
 
 
@@ -179,7 +180,10 @@ RATE_LIMIT_RESERVE = 100
 #     that probe reported "exempt" while reading a missing header as -1, and the control is what
 #     caught it.
 #
-#   * How often is the answer actually unchanged? Over one tick interval, re-reading the exact
+#   * How often is the answer actually unchanged? UNDER LOAD ~87-90%, and that is the figure
+#     every saving here is stated at (independent re-measure on a busy window; my own first
+#     numbers came from a quieter one and were too favourable). Over one tick interval,
+#     re-reading the exact
 #     urls this file issues against the live targets: check-runs 214 of 214 unchanged (806 s),
 #     and 213 of 222 over ~25 min END TO END — that second figure RE-LISTS the pulls first, so a
 #     PR whose head advanced contributes a new url that no stored ETag can help, counted as a
@@ -451,6 +455,13 @@ def load_store_from_artifact(fetch, download, repo, default_branch):
     has no path to any file. The zip is opened over a `BytesIO`, exactly one member of an exact
     name is admitted, and the read is bounded twice — once against the member's DECLARED size and
     again against the bytes actually produced, because a zip header can lie.
+
+    THE THREE SIZE LAYERS, named honestly because they are not equally load-bearing: the
+    DECLARED size is checked before the member is opened at all (a zip bomb is refused without
+    expansion); the READ is issued with an explicit limit (a lying header cannot materialise
+    more than the ceiling); the trailing `len(text)` comparison is REDUNDANT with
+    `parse_conditional_store`'s identical ceiling and is kept only as defence in depth — its
+    deletion is an equivalent mutation, covered by `an_oversized_store_is_a_bounded_no_op`.
 
     Every failure returns an EMPTY store (an unconditional sweep). `BudgetExhausted` is allowed
     to propagate: it is sweep-fatal everywhere else in this file and must not be downgraded here
@@ -2171,13 +2182,23 @@ def _self_test():
         def _no(*args, **kwargs):
             raise AssertionError("the store reader touched the filesystem")
 
+        import builtins
+        _real_open = builtins.open
+
+        def _open_guard(file, mode="r", *args, **kwargs):
+            if any(flag in str(mode) for flag in ("w", "a", "x", "+")):
+                raise AssertionError(
+                    f"the store reader opened {file!r} for writing (mode {mode!r})")
+            return _real_open(file, mode, *args, **kwargs)
+
         listing = {"artifacts": [{
             "name": STORE_ARTIFACT, "expired": False,
             "created_at": "2026-07-29T09:00:00Z",
             "archive_download_url": "https://api.github.com/x/zip",
             "workflow_run": {"head_branch": "master", "repository_id": 1,
                              "head_repository_id": 1}}]}
-        with patch.object(module.Path, "write_text", _no), \
+        with patch.object(builtins, "open", _open_guard), \
+                patch.object(module.Path, "write_text", _no), \
                 patch.object(module.Path, "write_bytes", _no), \
                 patch.object(module.os, "replace", _no), \
                 patch.object(module.zipfile.ZipFile, "extractall", _no), \
@@ -2212,19 +2233,185 @@ def _self_test():
         junk = dict(good, created_at="not-a-date")
         assert newest_store_artifact({"artifacts": [older, good, junk]}, "master") is good
 
+    def _fake_https(seen, second_status=200, second_body=b"PAYLOAD",
+                    location="https://blob.example/signed"):
+        """A real urllib handler chain with a fake transport, so `_NoRedirect` ACTUALLY
+        PARTICIPATES. The earlier version of this double patched the opener CLASS's `open`,
+        one level ABOVE the handler — so deleting `_NoRedirect`, the primary token-leak
+        control, left the row green. Review round 2 caught that; test the control, not its
+        neighbour."""
+        import email
+        import urllib.response
+
+        def _resp(code, headers, body):
+            msg = email.message_from_string(
+                "".join(f"{k}: {v}\n" for k, v in headers.items()))
+            out = urllib.response.addinfourl(io.BytesIO(body), msg, "https://x", code)
+            out.msg = "Found" if code // 100 == 3 else "OK"
+            return out
+
+        # BOTH protocols. Serving only https made an `http://` redirect fail with a
+        # CONNECTION error, which takes the same FetchError path as the refusal — so deleting
+        # the https pin left the row green. The insecure leg must be SERVABLE for its refusal
+        # to mean anything.
+        class _Handler(HTTPHandler, HTTPSHandler):
+            def _answer(self, req):
+                seen.append(req)
+                if "api.github.com" in req.full_url:
+                    return _resp(302, {"Location": location}, b"")
+                return _resp(second_status, {}, second_body)
+
+            https_open = _answer
+            http_open = _answer
+
+        return _Handler()
+
     def the_store_download_never_forwards_the_token_off_github():
-        """urllib re-sends request headers across a redirect and GitHub answers the artifact
-        download with a 302 to blob storage, so following it automatically would hand
-        `Bearer <token>` to a third-party host. The hop is taken manually, UNAUTHENTICATED."""
+        """THE TOKEN-LEAK CONTROL, exercised through the REAL opener chain.
+
+        urllib re-sends request headers across a redirect — MEASURED by review round 2 to
+        include `Authorization` on a cross-origin 302 — and GitHub answers the artifact
+        download with a 302 to blob storage. `_NoRedirect` is what stops the automatic hop;
+        `make_download` then takes it manually, unauthenticated.
+
+        The fake transport is installed as a HANDLER alongside `_NoRedirect`, so removing
+        `_NoRedirect` from `build_opener` makes urllib follow the redirect itself and this row
+        sees the token on the second host."""
         module = sys.modules[__name__]
         seen = []
+        real_build_opener = module.build_opener
+        with patch.object(module, "build_opener",
+                          lambda *handlers: real_build_opener(*handlers,
+                                                              _fake_https(seen))):
+            got = make_download("SEKRIT")("https://api.github.com/x/zip")
+        assert got == b"PAYLOAD", got
+        assert len(seen) == 2, f"expected an API leg and a blob leg, got {len(seen)}"
+        assert seen[0].has_header("Authorization"), "the API leg must be authenticated"
+        assert not seen[1].has_header("Authorization"), (
+            "the redirect leg carried the token OFF api.github.com — `_NoRedirect` is what "
+            "prevents urllib following the 302 itself")
 
-        class _R:
-            def __init__(self, body):
-                self._b = io.BytesIO(body)
+    def the_store_download_refuses_a_non_https_redirect():
+        """A 302 to `http://` would put the download on the wire in clear. Refused."""
+        module = sys.modules[__name__]
+        seen = []
+        real_build_opener = module.build_opener
+        with patch.object(module, "build_opener",
+                          lambda *handlers: real_build_opener(
+                              *handlers, _fake_https(seen, location="http://blob.example/x"))):
+            try:
+                make_download("SEKRIT")("https://api.github.com/x/zip")
+                got = "followed"
+            except FetchError:
+                got = "refused"
+        assert got == "refused", "an http:// redirect target must be refused, not followed"
+        # The transport WOULD have served it (see _fake_https), so a single leg proves the
+        # refusal happened in the product, not in the harness.
+        assert len(seen) == 1, f"the insecure leg must never be requested: {len(seen)} legs"
 
-            def read(self, *a):
-                return self._b.read(*a)
+    def the_store_download_is_bounded():
+        """The body is REMOTE CONTENT. Without a ceiling, one oversized artifact is an
+        unbounded read into memory on every tick."""
+        module = sys.modules[__name__]
+        seen = []
+        real_build_opener = module.build_opener
+        with patch.object(module, "STORE_MAX_DOWNLOAD_BYTES", 8), \
+                patch.object(module, "build_opener",
+                             lambda *handlers: real_build_opener(
+                                 *handlers, _fake_https(seen, second_body=b"x" * 64))):
+            try:
+                make_download("SEKRIT")("https://api.github.com/x/zip")
+                got = "accepted"
+            except FetchError:
+                got = "refused"
+        assert got == "refused", "a body over the ceiling must be refused"
+        # CONTROL: the same path accepts a body that fits, so the refusal is attributable to
+        # the SIZE and not to the harness.
+        seen2 = []
+        with patch.object(module, "STORE_MAX_DOWNLOAD_BYTES", 64), \
+                patch.object(module, "build_opener",
+                             lambda *handlers: real_build_opener(
+                                 *handlers, _fake_https(seen2, second_body=b"x" * 8))):
+            assert make_download("SEKRIT")("https://api.github.com/x/zip") == b"x" * 8
+
+    def _artifact_listing(url="https://api.github.com/x/zip"):
+        return {"artifacts": [{
+            "name": STORE_ARTIFACT, "expired": False,
+            "created_at": "2026-07-29T09:00:00Z", "archive_download_url": url,
+            "workflow_run": {"head_branch": "master", "repository_id": 1,
+                             "head_repository_id": 1}}]}
+
+    def _zip_of(members):
+        blob = io.BytesIO()
+        with zipfile.ZipFile(blob, "w") as bundle:
+            for name, body in members.items():
+                bundle.writestr(name, body)
+        return blob.getvalue()
+
+    _GOOD_STORE = json.dumps({
+        "schema": CONDITIONAL_STORE_SCHEMA,
+        "entries": {CHECK_RUNS_URL: {"etag": '"v1"', "payload": {"in": "memory"}}}})
+
+    def the_download_url_must_be_on_the_github_api_host():
+        """`archive_download_url` comes off a listing this code did not write. Without the host
+        pin, a crafted artifact record aims the authenticated download at any host it likes."""
+        called = []
+
+        def _download(url):
+            called.append(url)
+            return _zip_of({STORE_MEMBER: _GOOD_STORE})
+
+        for label, url in (("another host", "https://evil.example/zip"),
+                           ("plain http", "http://api.github.com/x/zip"),
+                           ("not a url", "zip")):
+            store = load_store_from_artifact(
+                lambda _u, _l=label: _artifact_listing(
+                    {"another host": "https://evil.example/zip",
+                     "plain http": "http://api.github.com/x/zip",
+                     "not a url": "zip"}[_l]),
+                _download, repo, "master")
+            assert store.entries == {}, label
+        assert called == [], f"the download must never be issued at all: {called}"
+        # CONTROL: the api.github.com url IS downloaded and DOES load.
+        store = load_store_from_artifact(
+            lambda _u: _artifact_listing(), _download, repo, "master")
+        assert store.etag_for(CHECK_RUNS_URL) == '"v1"', store.entries
+        assert called == ["https://api.github.com/x/zip"], called
+
+    def the_store_bundle_must_hold_exactly_its_one_member():
+        """A bundle carrying anything besides the store is not one this pipeline produced.
+        Enumerating it is not this reader's job, and a bundle that smuggles extra members past
+        the reader is the shape that makes an extractor dangerous in the first place."""
+        payload = _zip_of({STORE_MEMBER: _GOOD_STORE, "evil.sh": "rm -rf /"})
+        store = load_store_from_artifact(
+            lambda _u: _artifact_listing(), lambda _u: payload, repo, "master")
+        assert store.entries == {}, (
+            "a bundle with an extra member must be refused wholesale, not read selectively")
+        # CONTROL: the same bundle WITHOUT the extra member loads.
+        ok = _zip_of({STORE_MEMBER: _GOOD_STORE})
+        assert load_store_from_artifact(
+            lambda _u: _artifact_listing(), lambda _u: ok,
+            repo, "master").etag_for(CHECK_RUNS_URL) == '"v1"'
+
+    def the_member_read_is_bounded():
+        """The bound that actually protects memory is the SIZE ARGUMENT on the read, not the
+        comparison after it — that comparison is equivalent-by-construction with
+        `parse_conditional_store`'s own ceiling (both use STORE_MAX_JSON_BYTES), so deleting it
+        changes nothing and `an_oversized_store_is_a_bounded_no_op` already covers the outcome.
+        What is NOT covered elsewhere is an unbounded `handle.read()`, which would materialise
+        a lying member in full before any ceiling could look at it. Asserted at that level: the
+        row fails if the read is issued with no limit."""
+        module = sys.modules[__name__]
+        asked = []
+        real_open = module.zipfile.ZipFile.open
+
+        class _Handle:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def read(self, n=None):
+                asked.append(n)
+                return self._inner.read() if n is None else self._inner.read(n)
 
             def __enter__(self):
                 return self
@@ -2232,21 +2419,35 @@ def _self_test():
             def __exit__(self, *a):
                 return False
 
-        def _fake_open(self, request, timeout=None):
-            seen.append(request)
-            if "api.github.com" in request.full_url:
-                raise HTTPError(request.full_url, 302, "Found",
-                                {"Location": "https://blob.example/signed"}, None)
-            return _R(b"PAYLOAD")
+        def _wrapped(self, name, *a, **k):
+            return _Handle(real_open(self, name, *a, **k))
 
-        opener_cls = module.build_opener(module._NoRedirect).__class__
-        with patch.object(opener_cls, "open", _fake_open):
-            got = make_download("SEKRIT")("https://api.github.com/x/zip")
-        assert got == b"PAYLOAD", got
-        assert len(seen) == 2, seen
-        assert seen[0].has_header("Authorization"), "the API leg must be authenticated"
-        assert not seen[1].has_header("Authorization"), (
-            "the redirect leg must NOT carry the token off api.github.com")
+        payload = _zip_of({STORE_MEMBER: _GOOD_STORE})
+        with patch.object(module.zipfile.ZipFile, "open", _wrapped):
+            load_store_from_artifact(
+                lambda _u: _artifact_listing(), lambda _u: payload, repo, "master")
+        assert asked and all(n is not None for n in asked), (
+            f"the store member was read with NO size limit ({asked}) — a lying zip header "
+            "would be materialised in full before any ceiling could refuse it")
+
+    def an_oversized_member_is_refused_without_being_read():
+        """THE ZIP-BOMB BOUND. The member's DECLARED size is checked BEFORE it is opened, so a
+        highly-compressible bomb is refused without ever being expanded. Asserted at that exact
+        level: `ZipFile.open` is booby-trapped, so a reader that skipped the declared-size check
+        and went straight to reading trips this row."""
+        module = sys.modules[__name__]
+        payload = _zip_of({STORE_MEMBER: "0" * 4096})
+
+        def _boom(*args, **kwargs):
+            raise AssertionError(
+                "the member was OPENED despite declaring a size over the ceiling — the "
+                "declared-size check must refuse it before any expansion happens")
+
+        with patch.object(module, "STORE_MAX_JSON_BYTES", 128), \
+                patch.object(module.zipfile.ZipFile, "open", _boom):
+            store = load_store_from_artifact(
+                lambda _u: _artifact_listing(), lambda _u: payload, repo, "master")
+        assert store.entries == {}, store.entries
 
     def the_plan_carries_no_new_check_run_derived_field():
         """[#1207 review r1] THE BOUND ON A POISONED STORE, pinned rather than asserted in prose.
@@ -2256,10 +2457,12 @@ def _self_test():
         not assumed; the tidier claim that check-run data does not reach the plan at all is FALSE
         (`context` carries verbatim failing-leg names and a gate-conclusion string).
 
-        This pins the crossing set from BOTH ends so a third channel cannot open quietly:
-        the frozen field list reds when any field is added, and the DIFFERENTIAL reds when an
-        existing field starts varying with check-run content. The disarm channel is pinned
-        INVARIANT for the same reason — it consumes detail fields only, deliberately, so that a
+        The two ends are pinned by DIFFERENT means, and the difference matters: the review-item
+        channel is pinned by a FROZEN FIELD LIST (it reds when a field is added, NOT when an
+        existing field starts carrying more check-run content), while the DISARM channel is
+        pinned by a true differential over check-run content. Review round 2 flagged the earlier
+        wording for implying the differential covered both. The disarm channel gets the stronger
+        check because it consumes a degraded record on purpose — it consumes detail fields only, deliberately, so that a
         degraded/poisoned check-run record can never suppress the #42 safety act."""
         claim_mod = _load_claim()
         assert claim_mod.REVIEW_ITEM_FIELDS == {
@@ -2449,6 +2652,12 @@ def _self_test():
         the_store_reader_never_writes_to_the_filesystem,
         only_attributable_store_artifacts_are_read,
         the_store_download_never_forwards_the_token_off_github,
+        the_store_download_refuses_a_non_https_redirect,
+        the_store_download_is_bounded,
+        the_download_url_must_be_on_the_github_api_host,
+        the_store_bundle_must_hold_exactly_its_one_member,
+        an_oversized_member_is_refused_without_being_read,
+        the_member_read_is_bounded,
         the_plan_carries_no_new_check_run_derived_field,
     ))
     for row in rows:
