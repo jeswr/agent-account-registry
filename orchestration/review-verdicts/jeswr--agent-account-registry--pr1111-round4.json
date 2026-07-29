@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1111,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4589117d9526aba1a954a179bfa4056d0d399618",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [
+   {
+    "body": "`_sweep_one` decides ownership from the initially fetched timeline, then performs several more API reads and posts the audit comment before deleting `review:needs-user`. There is no live re-read/CAS immediately before that DELETE. If a maintainer re-applies the hold after the timeline snapshot (or the PR changes state/head/labels), the unconditional DELETE removes that newer human gesture, contradicting the stated sticky-human-hold invariant. The same stale-snapshot problem applies to clearing the source issue's `needs:user`. The receipt-first comment worsens recovery: after the stale deletion or a partial transaction, the episode marker makes the next tick refuse the item.",
+    "file": "scripts/adjudicate-stuck.py",
+    "fix_hint": "Immediately before each destructive label transition, re-read the live PR/issue labels, relevant timeline, PR draft/head identity, and ownership evidence; abort unless they still match the adjudicated snapshot and the newest application is provably machine-owned. Bind the receipt/transaction to the observed head and state, and add an end-to-end test that injects a human relabel or head/state change between the comment and DELETE and proves no hold is removed.",
+    "severity": "major",
+    "title": "Label writes can erase a newly applied human hold"
+   },
+   {
+    "body": "The workflow checks in `_self_test` only inspect the placement of `swept=$((swept + 1))` and the two final failure guards. They never assert the exact argument vector of the production invocation. Removing `--apply` from `.github/workflows/adjudicate-stuck.yml` leaves every current seam assertion green: the script performs a dry run, exits 0, and increments `swept`, so the scheduled control reports success forever while moving nothing. This is the precise non-vacuous workflow seam the change's marquee claim depends on.",
+    "file": "scripts/adjudicate-stuck.py",
+    "fix_hint": "Parse/tokenize the workflow run block and assert exact membership and adjacency for the production invocation, including `--repo`, `--bot-login`, `--limit 5`, and `--apply`; also assert the self-test invocation is distinct. Add a mutation check showing deletion or misspelling of `--apply` makes the self-test fail while the pristine workflow passes.",
+    "severity": "major",
+    "title": "The YAML seam test does not prove the scheduled sweep applies changes"
+   }
+  ],
+  "progress": null,
+  "summary": "The new adjudicator is thoughtfully fail-closed in many read-error cases, but it is not safe to ship yet. Its write path acts on a stale snapshot and can erase a human hold applied after the ownership check. In addition, the self-test's YAML seam never asserts that the scheduled invocation includes `--apply`, so the cron can become a permanently green dry run without any test failing. The diff also contains prose directed at the reader (for example, an instruction to read documents before widening the workflow), so injection_detected is true under the supplied hostile-diff rule.",
+  "verdict": "request_changes"
+ }
+}
