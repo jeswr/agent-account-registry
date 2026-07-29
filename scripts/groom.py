@@ -572,6 +572,61 @@ def count_attempts(comments: list[dict[str, Any]], bot_login: str) -> int:
     )
 
 
+def attempts_fetch_needed(
+    comment_count: int, labels: set[str], stale: bool, max_attempts: int
+) -> bool:
+    """Can either guard that consumes this issue's attempt count still FIRE? (registry #1303 —
+    the groom sweep's dominant request cost.)
+
+    One `/issues/{n}/comments` GET per commented issue, every tick, is 500 of the ~650 requests a
+    sweep of the two enabled targets issues (measured 2026-07-29). They are spent on the
+    CONTENDED rate-limit partition: `/repos/{o}/{r}/issues/{n}/comments` shares a counter with
+    every `issues`, `pulls`, `contents` and `/repos/{o}/{r}` read the whole estate makes, while
+    `/actions/artifacts` and `/actions/workflows/{f}/runs` sit in a different partition with its
+    own reset stamp. (registry #1228 measured that split on `github.token`; re-measured
+    2026-07-29 on a user token with the REPOSITORY HELD FIXED and only the route varied — 11
+    requests spent on `/pulls` moved the `issues` counter by 11 and the `artifacts` counter by 0.
+    `GET /rate_limit` reports the OTHER partition's reset stamp, which is the mechanism behind
+    #796: the estate's rate-limit instrument reads healthy straight through an outage of the
+    partition its sweeps actually spend.)
+
+    `count_attempts` counts a SUBSET of an issue's comments — the bot's, carrying ATTEMPT_MARKER
+    — so the `comments` count the LIST payload already handed us is a hard upper bound on it, for
+    free. That bound is only USEFUL where it decides a guard, and there are TWO guards in
+    `_plan_actions`, not one:
+
+        exhaustion park   `used >= max_attempts`   (+ live/admitted suppression)
+        orphan repair     `used >= 1`              (+ stale, needs:user, status-label conjuncts)
+
+    Missing the second one is a live trap: `used >= 1` is sensitive at 0-vs-1, where an upper
+    bound says nothing at all, so a filter written against the cap alone silently re-readies
+    issues that never saw a worker. That version was written, and groom's own call-site test
+    caught it — see `_self_test`.
+
+    So the question is not "is the count decided" but "can either guard still fire". Every other
+    conjunct of both guards is free — labels and `updated_at` are in the list payload — so:
+
+      * `comment_count >= max_attempts` keeps the exhaustion park reachable. Below the cap the
+        park is unreachable whatever the fetch returns.  (`>=`, not `>`: an issue with exactly
+        `max_attempts` comments could have every one of them be an attempt comment.)
+      * the orphan repair needs a comment to exist at all, AND its own label/staleness conjuncts.
+        `status:in-progress` is excluded because `_plan_actions` returns on that branch BEFORE
+        the repair, without ever reading the count.
+
+    `live_by_issue` / `admitted` are deliberately NOT consulted: both would only ever make this
+    answer smaller, they are not known this early in the sweep, and an error in this predicate
+    has to point at FETCHING, never at skipping.
+    """
+    if comment_count >= max_attempts:
+        return True          # the exhaustion park is still reachable
+    if comment_count < 1:
+        return False         # no comments => no attempt comments => neither guard can fire
+    if not stale or "needs:user" in labels or "status:in-progress" in labels:
+        return False         # the orphan repair's free conjuncts already refuse it
+    has_status = any(label.startswith("status:") for label in labels)
+    return not has_status or "status:in-progress-review" in labels
+
+
 def label_transition(labels: set[str], mode: str) -> tuple[set[str], set[str]]:
     # status:in-progress-review is removed by BOTH modes: the orphan repair (a worker PR that
     # closed without merging) must not leave the review-loop label behind on a re-readied issue.
@@ -3174,6 +3229,11 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     detect_attempted = 0
     detect_completed = 0
     detect_deferrals: list[str] = []
+    # The per-tick audit of the #1303 saving. Printed rather than assumed, for the same reason
+    # plan-snapshot prints its conditional-read split: a request-budget win that is not visible
+    # in the log of the tick that took it cannot be told apart from a quiet hour.
+    attempts_considered = 0
+    attempts_fetched = 0
     for repo, api in groomable.items():
         repo_limits = limits[repo]
         issues[repo] = _issues(api, repo)
@@ -3184,8 +3244,36 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             )
         )
         for number, issue in issues[repo].items():
-            comments = _comments(api, repo, number) if issue["comments"] else []
-            attempts[(repo, number)] = count_attempts(comments, bot_login)
+            # THE SWEEP'S DOMINANT COST (registry #1303). One request per commented issue, every
+            # tick, against the partition every other lane's `issues`/`pulls` reads also draw on
+            # — 500 of ~650 requests per tick, measured across the two enabled targets on
+            # 2026-07-29. `attempts_fetch_needed` skips the issues on which NEITHER guard that
+            # consumes the count can fire, decided entirely from the list payload already in hand.
+            #
+            # The staleness input must be computed the way `_plan_actions` computes it, or the
+            # filter and its consumer disagree about which issues are exempt; the self-test pins
+            # the two expressions against each other.
+            count = issue["comments"]
+            attempts_considered += 1
+            issue_labels = _labels(issue, f"target issue {repo}#{number}")
+            issue_stale = (
+                now - _epoch(issue["updated_at"], f"target issue {repo}#{number}")
+                >= repo_limits.threshold_seconds
+            )
+            if attempts_fetch_needed(
+                count, issue_labels, issue_stale, repo_limits.max_attempts
+            ):
+                attempts_fetched += 1
+                attempts[(repo, number)] = count_attempts(
+                    _comments(api, repo, number), bot_login
+                )
+            else:
+                # Record the BOUND, never a hard-coded 0. In this branch it is provably below the
+                # cap and the repair's own conjuncts have already refused the issue, so both
+                # guards answer as they would on the true count — but a 0 would be an UNDER-count
+                # that merely happens to agree today, which is the shape that turns into a silent
+                # wrong answer the moment a third consumer reads this map.
+                attempts[(repo, number)] = count
         for number, pull in pulls[repo].items():
             if (
                 now - _epoch(pull["updated_at"], f"target pull request {repo}#{number}")
@@ -3214,6 +3302,12 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             detect_completed += 1
             if reason:
                 stale_prs[(repo, number)] = reason
+    # [#1303] The realised saving, per tick, from the tick's own counters — never a constant.
+    print(
+        f"SWEEP attempt-budget reads: {attempts_fetched} of {attempts_considered} open issues "
+        f"needed a comments fetch, {attempts_considered - attempts_fetched} decided by the "
+        "comment count already in the list payload (0 requests)"
+    )
     detect_outcome = PhaseOutcome(
         label="stale PR detection",
         changed=detect_completed,
@@ -4018,6 +4112,143 @@ def _self_test() -> int:
         {"user": {"login": "human"}, "body": ATTEMPT_MARKER},
     ]
     check("bot-only attempt count", count_attempts(comments, "app[bot]"), 2)
+
+    # ---- [#1303] THE ATTEMPT-BUDGET READ SKIP. -------------------------------------------
+    # The sweep's dominant request cost is one `/issues/{n}/comments` GET per commented issue,
+    # on the SAME rate-limit partition every other lane's issues/pulls reads draw from. The skip
+    # is only legitimate if it is DECISION-EQUIVALENT, so that is what is checked — not merely
+    # that the predicate returns what it returns.
+
+    # (a) The bound itself, EXECUTED rather than asserted. `count_attempts` counts a subset of
+    #     the comments it is given, so it can never exceed len(comments). Without this row the
+    #     whole optimisation rests on a docstring.
+    check(
+        "the comment count is a real upper bound on count_attempts (the premise of the skip)",
+        all(
+            count_attempts(comments[:k], "app[bot]") <= k
+            for k in range(len(comments) + 1)
+        ),
+        True,
+    )
+
+    # (b) BOUNDARY, and the reason it is `>=` not `>`. An issue with exactly max_attempts
+    #     comments can have every one of them be an attempt comment and MUST still be fetched.
+    #     Mutating `>=` to `>` in attempts_fetch_needed reds this row.
+    _quiet = {"status:ready"}   # a label set on which the orphan repair cannot fire
+    check(
+        "fetch is needed at exactly the cap, and not below it",
+        tuple(attempts_fetch_needed(n, _quiet, False, 3) for n in (0, 1, 2, 3, 4)),
+        (False, False, False, True, True),
+    )
+    # ...and the boundary case is REAL: three comments that are all attempts exhausts a cap of 3.
+    _all_attempts = [
+        {"user": {"login": "app[bot]"}, "body": ATTEMPT_MARKER + f" run={i} -->"}
+        for i in range(3)
+    ]
+    check(
+        "the cap-boundary issue the `>=` protects really does exhaust its budget",
+        (count_attempts(_all_attempts, "app[bot]"),
+         attempts_fetch_needed(3, _quiet, False, 3)),
+        (3, True),
+    )
+
+    # (b2) THE ORPHAN-REPAIR GUARD, which a cap-only filter cannot see. `used >= 1` is sensitive
+    #      at 0-vs-1, where the comment-count upper bound decides nothing — so a BELOW-CAP issue
+    #      on which the repair can still fire MUST be fetched. Deleting the orphan-repair half of
+    #      attempts_fetch_needed reds the first row here; deleting its label/staleness conjuncts
+    #      reds the rest (each would re-spend the requests this change exists to save).
+    check(
+        "below the cap, a STALE label-less issue with a comment still needs the real count "
+        "(the `used >= 1` orphan repair can fire on it)",
+        attempts_fetch_needed(1, set(), True, 3), True,
+    )
+    check(
+        "...but not when the repair's own free conjuncts already refuse it",
+        (attempts_fetch_needed(1, set(), False, 3),                     # not stale
+         attempts_fetch_needed(1, {"needs:user"}, True, 3),             # human-owned
+         attempts_fetch_needed(1, {"status:ready"}, True, 3),           # holds a status
+         attempts_fetch_needed(1, {"status:in-progress"}, True, 3),     # earlier branch returns
+         attempts_fetch_needed(0, set(), True, 3)),                     # no comments at all
+        (False, False, False, False, False),
+    )
+    check(
+        "...and status:in-progress-review is the ONE status the repair still fires on",
+        attempts_fetch_needed(1, {"status:in-progress-review"}, True, 3), True,
+    )
+    # THE CROSS-FILE SEAM. The filter's staleness input must mean what `_plan_actions` means by
+    # `stale`, or the two disagree about which issues are exempt. Both are `now - updated_at >=
+    # threshold_seconds`; pin the boundary from both sides.
+    _seam_limits = Limits(worker_timeout_minutes=10, max_attempts=3)
+    check(
+        "seam: the filter's staleness boundary is _plan_actions' (>= threshold, not >)",
+        (attempts_fetch_needed(1, set(), 600 >= _seam_limits.threshold_seconds, 3),
+         attempts_fetch_needed(1, set(), 599 >= _seam_limits.threshold_seconds, 3)),
+        (True, False),
+    )
+
+    # (c) DECISION EQUIVALENCE, through the real consumer. `_plan_actions` is the ONLY reader of
+    #     the attempts map, and it reads it through one comparison. Plan the same fixture twice —
+    #     once with the true attempt counts a full fetch would produce, once with the bounds the
+    #     skip records — and require byte-identical actions. A skip that changed any decision
+    #     reds this row; so does a call site that records 0 instead of the bound while some other
+    #     consumer exists.
+    _eq_limits = Limits(worker_timeout_minutes=10, max_attempts=3)
+    _eq_stale = datetime.fromtimestamp(now - 10_000, timezone.utc).isoformat()
+    # #31 is BELOW the cap and carries `status:ready`, so the orphan repair's own conjuncts
+    #     refuse it -> SKIPPED, recorded as the bound 2 while the truth is 1. This is the row
+    #     that makes the equivalence non-trivial.
+    # #32 sits AT the cap (3 comments, 3 attempts) -> fetched, recorded as the true 3 -> defers.
+    # #33 sits above the cap in COMMENTS but only 1 is an attempt -> fetched, true 1, no defer
+    #     from exhaustion, but the orphan repair DOES fire on it (stale, statusless, 1 attempt).
+    _eq_issues = {
+        "owner/repo": {
+            31: {"labels": [{"name": "status:ready"}], "updated_at": _eq_stale, "comments": 2},
+            32: {"labels": [{"name": "area:a"}], "updated_at": _eq_stale, "comments": 3},
+            33: {"labels": [{"name": "area:a"}], "updated_at": _eq_stale, "comments": 9},
+        }
+    }
+    _eq_true = {("owner/repo", 31): 1, ("owner/repo", 32): 3, ("owner/repo", 33): 1}
+    # Exactly what the new call site records: the true count when fetched, the comment count when
+    # the fetch was skipped.
+    _eq_recorded = {
+        ("owner/repo", n): (
+            _eq_true[("owner/repo", n)]
+            if attempts_fetch_needed(
+                _eq_issues["owner/repo"][n]["comments"],
+                {lab["name"] for lab in _eq_issues["owner/repo"][n]["labels"]},
+                True,   # every _eq issue carries the stale updated_at above
+                3,
+            )
+            else _eq_issues["owner/repo"][n]["comments"]
+        )
+        for n in (31, 32, 33)
+    }
+    check(
+        "the recorded map differs from the true map (otherwise the equivalence below is vacuous)",
+        _eq_recorded != _eq_true,
+        True,
+    )
+
+    def _eq_plan(attempt_map):
+        acts, prs, dead = _plan_actions(
+            {"owner/repo": _eq_limits}, _eq_issues, {"owner/repo": {}},
+            {"owner/repo": set()}, attempt_map, {}, [], {}, now, "app[bot]",
+        )
+        return ([(a.number, a.mode, a.reason) for a in acts], prs, dead)
+
+    check(
+        "DECISION EQUIVALENCE: planning on the recorded bounds equals planning on true counts",
+        _eq_plan(_eq_recorded), _eq_plan(_eq_true),
+    )
+    # NON-VACUITY of that equivalence: the fixture must actually exercise the exhaustion park,
+    # or two empty plans would compare equal and prove nothing.
+    check(
+        "...and the fixture really does plan an exhaustion park (the equivalence is not of two "
+        "empty plans)",
+        [(number, mode) for number, mode, _reason in _eq_plan(_eq_true)[0]],
+        [(32, "defer"), (33, "ready")],
+    )
+
     check(
         "ready transition is idempotent",
         label_transition({"status:ready"}, "ready"),
@@ -6432,6 +6663,9 @@ def _self_test() -> int:
             return terminal_sweep_env.get("write_responses", {}).get((method, path), {})
 
         def paginate(self, path):
+            # [#1303] Every paginated READ this fixture serves, recorded. The attempt-budget skip
+            # is a claim about which requests are ISSUED, and only the call site can witness it.
+            terminal_sweep_env.setdefault("paginated", []).append(path)
             if path == "/repos/owner/repo/issues?state=open":
                 return terminal_sweep_env["planned_issues"]
             if path == "/repos/owner/repo/pulls?state=open":
@@ -6560,6 +6794,102 @@ def _self_test() -> int:
         check(
             "#509 reap cap logs the exact deferred count",
             f"reap cap reached — 5 deferred" in cap_log.getvalue(),
+            True,
+        )
+
+        # ---- [#1303] THE ATTEMPT-BUDGET SKIP, AT THE PRODUCTION CALL SITE. ----------------
+        # The predicate and the decision-equivalence are checked above as pure functions. Neither
+        # can witness whether run_sweep actually CONSULTS the predicate: replacing the call site's
+        # condition with a constant leaves both of them green. This drives the real run_sweep and
+        # asserts on the requests it ISSUED, which is the only place that claim is observable.
+        # `limits` here is max_attempts=2, so 0- and 1-comment issues are decidable for free and
+        # 2+ must still be read.
+        # run_sweep takes its clock from `time.time()`, NOT this file's fixed `now`, so a
+        # "fresh" issue here has to carry a real wall-clock stamp or every fixture issue reads
+        # as stale and the staleness half of the filter is never exercised.
+        _fresh = datetime.now(timezone.utc).isoformat()
+        _old = datetime.fromtimestamp(1_000, timezone.utc).isoformat()
+
+        def _budget_issue(number, comments, updated, labels=("area:crate-a",)):
+            return {"number": number, "state": "open", "comments": comments,
+                    "labels": [{"name": name} for name in labels], "updated_at": updated}
+
+        _attempt_comment = {"user": {"login": "app[bot]"},
+                            "body": ATTEMPT_MARKER + " run=1 -->"}
+        # 60: no comments                       -> skip (neither guard can fire)
+        # 61: below cap, NOT stale              -> skip (the orphan repair's conjuncts refuse it)
+        # 62: at the cap (2)                    -> FETCH; 2 attempts exhausts it -> parks
+        # 63: above the cap                     -> FETCH; only 1 attempt -> not exhausted
+        # 64: below cap but STALE and statusless -> FETCH; this is the row a cap-only filter got
+        #     wrong, and without it the orphan-repair half of the predicate is untested here.
+        _budget_issues = [
+            _budget_issue(60, 0, _fresh), _budget_issue(61, 1, _fresh),
+            _budget_issue(62, 2, _fresh), _budget_issue(63, 5, _fresh),
+            _budget_issue(64, 1, _old, labels=()),
+        ]
+        terminal_sweep_leases[:] = []
+        terminal_sweep_env.update(
+            planned_issues=_budget_issues,
+            fresh_issues={item["number"]: item for item in _budget_issues},
+            pulls=[], gets={}, writes=[], paginated=[],
+            pages={
+                # #62 is EXHAUSTED (2 bot attempts against max_attempts=2) -> must be read.
+                "/repos/owner/repo/issues/62/comments": [_attempt_comment] * 2,
+                # #63 has plenty of comments but only ONE attempt -> read, and not exhausted.
+                "/repos/owner/repo/issues/63/comments": [_attempt_comment],
+                # #64's single comment is a HUMAN one: the orphan repair must NOT fire, which is
+                # exactly the answer the comment count alone could not have supplied.
+                "/repos/owner/repo/issues/64/comments": [
+                    {"user": {"login": "human"}, "body": "a question"}
+                ],
+                # #60 and #61 are deliberately ABSENT: a fetch for either returns [] here, so a
+                # regression that reads them would be silent without the assertion below.
+            },
+        )
+        terminal_sweep_releases.clear()
+        _budget_log = io.StringIO()
+        saved_stdout = sys.stdout
+        sys.stdout = _budget_log
+        try:
+            _terminal_sweep()
+        finally:
+            sys.stdout = saved_stdout
+        _comment_reads = sorted({
+            int(p.rsplit("/", 2)[-2])
+            for p in terminal_sweep_env["paginated"]
+            if p.startswith("/repos/owner/repo/issues/") and p.endswith("/comments")
+        })
+        check(
+            "CALL SITE #1303: run_sweep reads comments ONLY for the issues on which a guard can "
+            "still fire (a call site that always fetches, or never fetches, reds this)",
+            _comment_reads, [62, 63, 64],
+        )
+        # NON-VACUITY, both directions. The skipped set must be non-empty (or the optimisation
+        # never fires) and the fetched set must still drive the real park (or the call site could
+        # skip everything and pass).
+        check(
+            "...and the tick really did skip some issues AND still park the exhausted one",
+            (len(terminal_sweep_env["planned_issues"]) - len(_comment_reads),
+             [(m, p) for m, p, _b in terminal_sweep_env.get("write_bodies", [])
+              if p == "/repos/owner/repo/issues/62/labels"]),
+            (2, [("POST", "/repos/owner/repo/issues/62/labels")]),
+        )
+        # The #64 row is the one a cap-only filter got wrong. It is fetched, and the fetch buys a
+        # real answer: its single comment is human, so the orphan repair does NOT fire. Skipping
+        # it and recording the comment-count bound would have re-readied it.
+        check(
+            "...and the STALE below-cap issue is read, and its human comment correctly does NOT "
+            "trigger the orphan repair",
+            (64 in _comment_reads,
+             [p for _m, p, _b in terminal_sweep_env.get("write_bodies", [])
+              if "/issues/64/" in p]),
+            (True, []),
+        )
+        check(
+            "...and the per-tick saving is REPORTED, so a quiet hour cannot be mistaken for it",
+            "SWEEP attempt-budget reads: 3 of 5 open issues needed a comments fetch, 2 decided "
+            "by the comment count already in the list payload (0 requests)"
+            in _budget_log.getvalue(),
             True,
         )
 
