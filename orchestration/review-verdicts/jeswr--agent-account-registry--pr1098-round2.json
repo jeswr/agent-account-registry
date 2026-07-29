@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1098,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ed4c88068cfe3250746a682be318a365d3288ebd",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 closes the prior major finding. `record-refusal` now publishes the post-charge `exhausted` value, and the worker job prefers that value while preserving the budget-step fallback when the refusal step is skipped or produces no output. The self-test follows the recorder's real terminal output through the live worker-output expression and the final-state shell body, demonstrates `parked`, demonstrates that the former pre-charge value yields `deferred`, and kills both the stale-binding and missing-park-arm mutations. The claim-side deferred lane and worker-side checks consistently use `budget_used`, so refusal receipts participate in both the immediate convergence and later allocation gate without being conflated with model attempts. I found no remaining correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
