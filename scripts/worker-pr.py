@@ -2328,6 +2328,58 @@ def verdict_path(target_repo, pr_number, round_n):
     return f"{VERDICT_DIR}/{owner}--{name}--pr{pr_number}-round{round_n}.json"
 
 
+# ---- the review ATTEMPT store (registry #1288) --------------------------------------------------
+# WHY IT IS IN `data/` AND NOT BESIDE THE VERDICTS. `orchestration/review-verdicts/` is the record
+# of DECISIONS — what a reviewer concluded. An attempt is not a decision; it is operational state,
+# and `data/` is where this ledger already keeps operational state (leases, model-health, metrics).
+# Keeping them apart is what lets each surface mean exactly one thing.
+#
+# WHY IT IS CHARGED FROM THE `claim` JOB AND NOT FROM `run`. `run` is `contents: read` *because the
+# model executes there*. Charging the attempt from `run` would require giving a job that executes
+# prompt-injectable target code write access to the registry ledger — a far worse trade than the
+# target token this whole change removes. `claim` already holds `contents: write`, already performs
+# ledger writes, runs BEFORE the model, and executes no target code.
+#
+# WHY CREATE-ONLY RATHER THAN READ-MODIFY-WRITE. One file per (target, PR, round) needs no CAS and
+# has no contention: the path IS the idempotency key. A re-run of the same claim re-writes the same
+# document (`claimed_at_run` is volatile, exactly as provenance's stamp is); a DIFFERENT run trying
+# to claim a round that is already charged is a genuine double-dispatch and fails loud.
+ROUND_CLAIM_PREFIX = "data/review-round--"
+
+
+def round_claim_path(target_repo, pr_number, round_n):
+    """The ledger path charging one review ATTEMPT. Single `data/` path segment ending `.json`, so
+    it is already inside ledger-invariant.py's data-only allowlist — this store adds no new file
+    KIND to the trust guard."""
+    owner, name = target_repo.split("/", 1)
+    return f"{ROUND_CLAIM_PREFIX}{owner}--{name}--pr{pr_number}--r{round_n}.json"
+
+
+def round_claim_glob(target_repo, pr_number):
+    """The filename glob matching every attempt charged for one PR."""
+    owner, name = target_repo.split("/", 1)
+    return f"review-round--{owner}--{name}--pr{pr_number}--r*.json"
+
+
+def record_round_claim(registry_repo, target_repo, pr_number, round_n, head_sha, run_key):
+    """Charge one review attempt, BEFORE the model runs. Returns True when this call wrote it.
+
+    THE ORDERING IS THE WHOLE TERMINATION ARGUMENT and it is unchanged from the target-side marker
+    it replaces: charged pre-model, so a run that crashes before producing any verdict has still
+    consumed a round. Relocating the store must not relocate that property — see the executed
+    crash-loop proof in dispatch-claim's self-test."""
+    if not re.fullmatch(r"[0-9a-f]{40}", str(head_sha or "")):
+        raise WorkerPrError("review round claim requires a 40-hex head sha (fail closed)")
+    if not isinstance(round_n, int) or isinstance(round_n, bool) or round_n < 1:
+        raise WorkerPrError("review round claim requires a positive integer round")
+    document = {"repo": target_repo, "pr_number": pr_number, "round": round_n,
+                "head_sha_at_claim": head_sha, "claimed_at_run": str(run_key or "")}
+    return _registry_put_file(
+        registry_repo, round_claim_path(target_repo, pr_number, round_n), document,
+        f"charge review round {round_n} for {target_repo}#{pr_number}",
+        volatile_fields=frozenset({"claimed_at_run"}))
+
+
 def _probe_registry_file(registry_repo, path, ref=None):
     """(existing_body, sha) for a registry data file, or (None, None) on a clean 404. Any other
     probe failure raises with the REAL API error text (issue #96: a masked error class turned a

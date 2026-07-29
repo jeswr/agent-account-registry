@@ -6126,6 +6126,37 @@ def _escalate_repeated_declines(repo, item, outcomes, comments, bot_login, scrip
     return "rerouted" if action == "research" else "parked"
 
 
+def count_ledger_rounds(ledger_root, registry_root, worker_pr, repo, pr_number):
+    """How many review attempts have been CHARGED for this PR, read from the ledger.
+
+    THE DELIVERY-LAYER READER (registry #1288). The #657 defect in one sentence: every wiring fact
+    the enable interlock models is derived at `resolve`, one job ABOVE where delivery happens, so
+    all four read True while the lane delivered zero. This reader is deliberately on the other
+    side of that line — it counts artefacts that exist only because a run actually reached the
+    point of charging, and it is the same store the terminating budget gate consults.
+
+    Counted from the CHECKOUT, not the API: `dispatch.yml` already checks the ledger branch out,
+    so this costs no request and cannot be rate-limited into under-reporting. Under-reporting is
+    the dangerous direction — it would re-open the unbounded crash loop this store exists to
+    bound — so both roots are unioned by ROUND rather than summed, and an unreadable root
+    contributes nothing rather than raising.
+
+    Returns the count of DISTINCT charged rounds."""
+    charged = set()
+    pattern = worker_pr.round_claim_glob(repo, pr_number)
+    for root in (ledger_root, registry_root):
+        if not root:
+            continue
+        directory = Path(root) / "data"
+        if not directory.is_dir():
+            continue
+        for path in directory.glob(pattern):
+            match = re.search(r"--r([1-9][0-9]*)\.json$", path.name)
+            if match:
+                charged.add(int(match.group(1)))
+    return len(charged)
+
+
 def record_file_path(ledger_root, registry_root, relative):
     """Resolve a provenance/verdict record file: the `ledger` data-plane branch checkout is the
     PRIMARY location (issue #96 — master's required `gate` check rejects every direct
@@ -6659,7 +6690,15 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 continue
             # `comments` was read once above (before the park-proof gate); the round markers
             # and receipts below parse the same snapshot.
-            rounds = worker_pr.count_rounds(comments, bot_login)
+            # [registry #1288] The self-attested class has NO target-side writes — the review path
+            # holds no target App token, so there are no round-marker comments to parse and
+            # `count_rounds` over them would return 0 FOREVER: every dispatch round 1, the budget
+            # never exhausting, an unbounded crash loop. Its rounds are read from the ledger
+            # attempt store instead, which is the surface a run actually charges.
+            if orchestrator_admitted:
+                rounds = count_ledger_rounds(ledger_root, registry_root, worker_pr, repo, number)
+            else:
+                rounds = worker_pr.count_rounds(comments, bot_login)
             # Human-readmission window (live defect sparq#2804/PR#3442, 2026-07-23): the budget
             # decision below used to charge ALL historical rounds, so five rounds burned during
             # the broken-CI era (gate-aggregator churn, phantom-leg failures, Copilot-outage
@@ -12079,6 +12118,54 @@ def _self_test():
         # branch AND its non-bot author. Restoring either gate unconditionally reds the line above.
         assert not HEAD_REF_RE.match("fix/readiness-visibility-opus5")
         assert not "jeswr".endswith("[bot]")
+        # (1c) [registry #1288] THE CRASH-LOOP BOUND, PROVEN BY EXECUTION rather than asserted.
+        #
+        # The maintainer's first choice was "charge on a completed verdict and let the CAS lease
+        # bound the crash loop". MEASURED FALSE: `release` is `if: always()` gated on
+        # `claim.acquired` and never on `run.result`, `apply_release` DELETES the row rather than
+        # tombstoning it, and `doorbell` (`if: always()`) re-rings the dispatcher — so a crashed
+        # run leaves no residue and accelerates its own retry. Nothing else bounds it either
+        # (no review-lane missed-dispatch counter; every PARK_CAUSE needs durable evidence a
+        # crashed run never produces AND a target write to record it).
+        #
+        # So the bound must come from an attempt charged PRE-MODEL. This drives the REAL reader
+        # and the REAL budget predicate over a simulated deterministic crash: each iteration
+        # charges a round on the ledger and then dies before writing any verdict.
+        _bound_wp = _probe_worker_pr()
+        with tempfile.TemporaryDirectory() as _bound_root:
+            _data = Path(_bound_root) / "data"
+            _data.mkdir()
+            _max_rounds = 3
+            _iterations = 0
+            _terminated_by = None
+            while _iterations < 25:                      # a cap, so a FAILED bound loops finitely
+                _rounds = count_ledger_rounds(_bound_root, "", _bound_wp, "o/r", 41)
+                # The production budget gate CLAIM applies (dispatch-claim, review lane).
+                if _rounds >= _max_rounds:
+                    _terminated_by = "rounds >= max_review_rounds (the CLAIM budget gate)"
+                    break
+                # ...otherwise the lane dispatches. The run charges its attempt PRE-MODEL...
+                (_data / f"review-round--o--r--pr41--r{_rounds + 1}.json").write_text("{}")
+                # ...and then CRASHES: no verdict record, no target write, nothing else changes.
+                _iterations += 1
+            assert _terminated_by is not None, \
+                ("the deterministic pre-verdict crash loop DID NOT TERMINATE — this is the exact "
+                 "unbounded burn that made 'let the CAS lease bound it' unsafe")
+            assert _iterations == _max_rounds, \
+                (f"the crash loop must terminate after exactly max_review_rounds iterations; "
+                 f"got {_iterations}")
+            assert count_ledger_rounds(_bound_root, "", _bound_wp, "o/r", 41) == _max_rounds
+        # ...and the bound is LOAD-BEARING, not incidental: a reader that cannot see the charged
+        # attempts (the pre-#1288 behaviour, and what `count_rounds` over PR comments would give a
+        # class with no target writes) never terminates. This is the row that reds if the ledger
+        # reader is dropped or mis-globbed.
+        with tempfile.TemporaryDirectory() as _blind_root:
+            (Path(_blind_root) / "data").mkdir()
+            _blind = 0
+            while _blind < 25 and count_ledger_rounds(_blind_root, "", _bound_wp, "o/r", 41) < 3:
+                _blind += 1                              # nothing charged where the reader looks
+            assert _blind == 25, \
+                "a reader blind to the attempt store must be shown NOT to terminate (control row)"
         # (1b) ...AND IT WORKS ON THE SHAPE THE POPULATION ACTUALLY HAS: NON-DRAFT with NO
         # review:* label at all. This is the row that separates "the shape gates are waived" from
         # "the PR is reviewable" — RE-DERIVED on sparq 2026-07-27 (paginated open-PR listing,
