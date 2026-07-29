@@ -4657,13 +4657,39 @@ def _open_blockers(repo, body):
     snapshot, so a nonexistent number contributes ZERO there. Raising here made the two halves
     disagree in the ONE direction that can never self-clear: PLAN offers the row every tick, CLAIM
     404s on it every tick, and the item is stranded with no machine exit for as long as the text
-    stands. MEASURED on sparq-org/sparq#3817 — an issue whose BODY documents the marker syntax
-    (an inline-code `Blocked-by: #99999`) and which `BLOCKED_BY_RE` therefore reads back as a live
-    edge: it consumed a ready-lane frontier slot and returned `route-policy-failed` on 13 of 13
-    executed ticks over 4+ hours, while the sparq ready lane offers only 1-2 impl rows per tick in
-    total. Every OTHER read failure — 5xx, 403, a statusless read — still fails closed, so this
-    narrows the refusal to the single case where non-existence IS the answer rather than the
-    absence of one."""
+    stands.
+
+    WHY A 404 HERE CANNOT MEAN "NO ACCESS TO THIS REPOSITORY" — the premise the whole narrowing
+    rests on, and it is a property of the CALL SITE, not of this function. GitHub returns 404
+    rather than 403 for a repository the token cannot see, so in general a 404 is ambiguous
+    between "no such issue" and "no such repo, to you". It is not ambiguous on this path:
+    `_current_issue_matches` has ALREADY read `repos/{repo}/issues/{item['number']}` successfully
+    — that read is the first statement in the function and any failure raises out of it before
+    `_open_blockers` is ever called. So by the time we get here the token is PROVEN able to read
+    issues in this exact repository, and the only remaining reading of a 404 is that the number
+    names nothing. Move this call anywhere that has not already proven repository access and the
+    narrowing becomes unsound: a permissions 404 would then silently drop a REAL blocker.
+
+    SCOPE, stated so nobody later assumes the class is closed: this is 404-ONLY, not
+    example-detection. `BLOCKED_BY_RE` still reads back a marker quoted as an EXAMPLE when the
+    number it names happens to be a live open issue — MEASURED: a body containing an inline-code
+    `Blocked-by: #53` still returns [53]. That residual is a silent FALSE HOLD, and it is the
+    tolerable half of the pair: PLAN holds the row too (53 IS in `open_numbers`), so both halves
+    agree and the row is merely delayed rather than stranded forever by a disagreement neither
+    side can resolve. Stripping quoted contexts before the regex is the real fix for that half
+    and belongs with the marker grammar, in BOTH engines at once (cf. sparq#4995).
+
+    MEASURED on sparq-org/sparq#3817 — an issue whose BODY documents the marker syntax (an
+    inline-code `Blocked-by: #99999`) and which `BLOCKED_BY_RE` therefore reads back as a live
+    edge. The sparq ready lane's frontier is ONE row wide, and this issue was that row on 13 of
+    13 executed ticks over 4+ hours: the lane's ENTIRE per-tick capacity, spent on a phantom
+    edge. Not a marginal loss — a total occupancy loss on a width-1 frontier. (Removing it is
+    SUBSTITUTION, not addition: the frontier is width 1 both ways. The replacement head is real
+    work rather than a permanent refusal, which is the whole of the gain here.)
+
+    Every OTHER read failure — 5xx, 403, a statusless read — still fails closed, so this narrows
+    the refusal to the single case where non-existence IS the answer rather than the absence of
+    one."""
     numbers = sorted({int(match) for match in BLOCKED_BY_RE.findall(body)})
     still_open = []
     for number in numbers:
@@ -10308,16 +10334,22 @@ def _self_test():
     # own blocker-union (`int(n) in open_numbers`) scores the same reference ZERO, so the two
     # halves disagreed in the one direction that never self-clears: offered every tick, refused
     # every tick. MEASURED on sparq-org/sparq#3817 (body: an inline-code `Blocked-by: #99999`) —
-    # `route-policy-failed` on 13 of 13 executed ticks over 4+ hours, holding one of the 1-2 impl
-    # rows the sparq ready lane offers per tick.
+    # `route-policy-failed` on 13 of 13 executed ticks over 4+ hours. The sparq ready lane's
+    # frontier is ONE row wide, so that is the lane's ENTIRE per-tick capacity spent on a phantom
+    # edge: a total occupancy loss, not a marginal one. 404-ONLY, not example-detection — a
+    # quoted marker naming a LIVE open issue is still read as an edge, and the row below pins
+    # that residual so the scope cannot be misremembered as wider than it is.
     #
-    # FOUR ROWS, EACH KILLING A DIFFERENT MUTANT of the narrowed refusal:
+    # FIVE ROWS, EACH KILLING A DIFFERENT MUTANT of the narrowed refusal:
     #   (a) delete the `is ABSENT` arm / the `== "404"` arm  -> row (a) reds
     #   (b) widen it to any failed read (drop the status test) -> row (b) reds
     #   (c) widen it to any refusal status (401/403/422)       -> row (c) reds
     #   (d) drop `error.http_status =` in _run_gh              -> row (d) reds
+    #   (e) SCOPE: a quoted example naming a LIVE issue still holds -> row (e) reds
     # Row (d) is the one that makes (a)-(c) non-vacuous: without it the production path can never
     # produce the status these rows hand the classifier, and the guard would be dead in the tree.
+    # Row (e) pins what this change deliberately does NOT do, so a later reader cannot mistake it
+    # for example-detection and so a future fix to THAT half has to update these words on purpose.
     def _absent_gh_json(status):
         def fake(args):
             found = re.search(r"/issues/(\d+)$", args[-1])
@@ -10339,6 +10371,16 @@ def _self_test():
             "must not suppress a real open blocker in the same body")
         assert _open_blockers("example/repo", "Blocked-by: #99999\n") == []
         assert _gh_json_optional(["api", "repos/example/repo/issues/99999"]) is ABSENT
+        # (e) THE SCOPE BOUND, asserted rather than described. This narrowing is 404-ONLY: a
+        # marker quoted as an EXAMPLE whose number IS a live open issue is still an edge, and the
+        # row is still held. That residual is deliberate at this scope — PLAN's `open_numbers`
+        # holds it too, so both halves agree and the row is delayed, never stranded by a
+        # disagreement neither side can resolve. If someone teaches the marker grammar to strip
+        # quoted contexts, THIS row goes red and the docstring above must be rewritten with it.
+        assert _open_blockers(
+            "example/repo", "docs: nothing stops `Blocked-by: #53` in prose\n") == [53], (
+            "scope check: this change is 404-only, NOT example-detection — a quoted marker "
+            "naming a LIVE open issue must still hold the row")
         # (b)/(c) every OTHER failure still fails closed — including a statusless read and every
         # non-404 refusal status. Absence of a status is not proof of absence of the artifact.
         for _status in (None, "401", "403", "422", "429", "500", "502", "503"):
