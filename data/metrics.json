@@ -1,33 +1,33 @@
 {
-  "generated_at": "2026-07-29T23:02:24Z",
+  "generated_at": "2026-07-29T23:22:16Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 1788,
-      "issues_ready": 367,
+      "issues_open": 1790,
+      "issues_ready": 366,
       "issues_closed_1h": 0,
-      "issues_closed_24h": 46,
-      "prs_open": 93,
-      "prs_draft": 76,
-      "prs_opened_1h": 1,
+      "issues_closed_24h": 44,
+      "prs_open": 94,
+      "prs_draft": 77,
+      "prs_opened_1h": 2,
       "prs_closed_1h": 2,
       "prs_merged_1h": 0,
-      "prs_merged_24h": 38,
+      "prs_merged_24h": 36,
       "review_changes_backlog": 12,
       "needs_user_parked": 29,
       "review_lane_health": "ok",
       "review_lane_runs_1h": 9,
-      "worker_attempts_1h": 1,
+      "worker_attempts_1h": 2,
       "worker_success_rate_1h": 1.0,
-      "pr_open_rate": 1.0,
+      "pr_open_rate": 2.0,
       "pr_close_rate": 2.0,
-      "net_pr_flow": -1.0
+      "net_pr_flow": 0.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 603,
+      "issues_open": 607,
       "issues_ready": 211,
-      "issues_closed_1h": 0,
-      "issues_closed_24h": 49,
+      "issues_closed_1h": 1,
+      "issues_closed_24h": 47,
       "prs_open": 41,
       "prs_draft": 29,
       "prs_opened_1h": 2,
@@ -50,9 +50,9 @@
       "target": "sparq-org/sparq",
       "classification": "ready-starved",
       "fire": true,
-      "summary": "ready frontier 367 > 60 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
+      "summary": "ready frontier 366 > 60 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
       "metrics": {
-        "issues_ready": 367,
+        "issues_ready": 366,
         "issues_closed_1h": 0
       }
     },
@@ -66,16 +66,6 @@
         "net_pr_flow": 2.0,
         "pr_open_rate": 2.0,
         "pr_close_rate": 0.0
-      }
-    },
-    {
-      "target": "jeswr/agent-account-registry",
-      "classification": "ready-starved",
-      "fire": true,
-      "summary": "ready frontier 211 > 30 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
-      "metrics": {
-        "issues_ready": 211,
-        "issues_closed_1h": 0
       }
     }
   ]
