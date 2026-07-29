@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1100,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8c1c33b81370ebbb7a08b671732612e865eb9b1b",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-4 approval remains supported. The manual Anthropic form now carries the provider cap of 4, while the operator guidance consistently identifies OpenAI's cap of 12 and full alias set. The self-test reads the live form prefill, passes it through the allocator's real parser and schema validation, and compares the parsed provider/cap against both the executed broker derivation and an independent pinned tuple. Its extractor tests cover missing and duplicate fields, absent/inline/empty values, neighboring fields, non-text inputs, and sibling boundaries; wrapper false paths are also asserted without allowing exceptions to masquerade as mutation kills. The documented absent and non-numeric fallback behavior matches the allocator. I found no correctness, soundness, fail-closed, test-validity, injection, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
