@@ -1549,11 +1549,17 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
                 return _answer(None, None, PARK_REFUSAL_RECEIPTLESS_SPENT,
                                f"the one-shot receipt-less void is spent ({spent}/"
                                f"{RECEIPTLESS_VOID_MAX})")
+            # NO "if not void_key" guard here, and its ABSENCE is deliberate. `latest_park` is an
+            # aware datetime the module itself parsed, so canonical_ts of it is always a valid
+            # stamp and the derived key always satisfies safe_receipt_part — the branch was
+            # STRUCTURALLY UNREACHABLE, line-granular coverage showed it at 0 %, and this file's own
+            # precedent is to delete rather than keep it (see human_park_capacity_proof's note on
+            # the third check it removed: "dead code that asserts a rule is worse than no code — it
+            # reads like a guard while proving nothing"). If the key format is ever widened to
+            # something unsafe, `receiptless_void_marker` raises ValueError at the WRITER, which is
+            # the loud direction this module wants anyway. receiptless_void_key keeps its own None
+            # returns because it is public and directly tested.
             void_key = receiptless_void_key(canonical_ts(latest_park.isoformat()))
-            if not void_key:
-                return _answer(None, None, PARK_REFUSAL_EVIDENCE_MALFORMED,
-                               "the receipt-less void key could not be safely derived from the "
-                               "park application instant")
             void_evidence = {"key": void_key,
                              "park_at": canonical_ts(latest_park.isoformat()),
                              "prover": str(prover_row.get("login")),
@@ -2560,7 +2566,16 @@ def receiptless_void_records(comments, bot_login, log=print):
         login = str((comment.get("user") or {}).get("login", ""))
         if login.casefold() != str(bot_login).casefold():
             continue
-        for match in _RECEIPTLESS_VOID_RE.finditer(str(comment.get("body", ""))):
+        # QUOTED AND FENCED CONTEXTS STRIPPED FIRST, exactly as parse_park_reason does, and for
+        # #1096's measured reason rather than by analogy: resolve-conflicts.py interpolates raw git
+        # pathnames into App-authored comment bodies, so a crafted pathname is a receipt-minting
+        # surface for any App-comment scanner. The writer-side defence already covers this marker by
+        # construction — it carries the `sparq-` prefix RESERVED_MARKER_RE keys on, so
+        # neutralize_reserved_markers disarms it at the writer — but the reader-side half must hold
+        # for a writer that has not yet been taught to sanitise, and forging THIS marker would make
+        # the sweep clear a park's labels.
+        for match in _RECEIPTLESS_VOID_RE.finditer(
+                strip_quoted_contexts(str(comment.get("body", "")))):
             key, stamp = match.group(1), match.group(2)
             if not valid_timestamp(stamp):
                 log(f"::warning::malformed receipt-less void stamp {stamp!r} treated as absent — "
@@ -4398,6 +4413,38 @@ def _self_test():
           "structurally not a receipt (#1096's rule, inherited not re-derived)",
           receiptless_void_records([{"user": {"login": "bot"}, "body": f"- x: \"{void_body}\""}],
                                    "bot"), [])
+    # ...and the OTHER half of #1096: a marker on its own line but inside a context the comment
+    # itself marks as echoed. Forging this marker would make the sweep clear a park's labels, and
+    # resolve-conflicts.py interpolates raw git pathnames into App-authored bodies — so an App
+    # comment is a receipt-minting surface unless BOTH halves hold.
+    void_marker_line = void_body.rsplit("\n", 1)[-1]
+    check("(e5) a void marker inside a FENCED or QUOTED context is structurally not a receipt",
+          [receiptless_void_records(
+              [{"user": {"login": "bot"}, "body": f"echoing:\n\n```\n{void_marker_line}\n```\n"}],
+              "bot"),
+           receiptless_void_records(
+               [{"user": {"login": "bot"}, "body": f"they wrote:\n\n> {void_marker_line}\n"}],
+               "bot"),
+           receiptless_void_records(
+               [{"user": {"login": "bot"}, "body": f"echoing:\n\n  ```\n{void_marker_line}\n  ```"}],
+               "bot")],
+          [[], [], []])
+    check("(e5) ...while the marker in the bot's OWN unquoted prose still parses (the strip is not "
+          "simply eating every receipt)",
+          [row["key"] for row in receiptless_void_records(
+              [{"user": {"login": "bot"}, "body": void_body}], "bot")], [receiptless_void])
+    check("(e5) the self-ID reader cannot be reached from a fenced context either: a fence OPENER "
+          "is never itself a self-ID, and only line 1 is read",
+          self_identified_machine_comments([
+              {"user": {"login": "jeswr"}, "created_at": receiptless_self_id,
+               "body": "```\n> 🤖 SPARQ agent — echoed\n```"}]), [])
+    # The marker also carries the `sparq-` prefix the WRITER-side sanitiser keys on, so the two
+    # halves of #1096's defence are both live for it rather than only the one written here.
+    check("(e5) the void marker is inside RESERVED_MARKER_RE's namespace, so the writer-side "
+          "sanitiser disarms an echoed copy too",
+          [contains_reserved_marker(RECEIPTLESS_VOID_MARKER),
+           RECEIPTLESS_VOID_MARKER in neutralize_reserved_markers(
+               f"echo {RECEIPTLESS_VOID_MARKER} -->")], [True, False])
     check("(e5) the cap counts MARKERS, well-formed or not",
           [receiptless_void_marker_count([{"user": {"login": "bot"}, "body": void_body}], "bot"),
            receiptless_void_marker_count(
@@ -4423,6 +4470,54 @@ def _self_test():
           [receiptless_void_key(receiptless_park_at), receiptless_void_key("not-a-timestamp"),
            receiptless_void_key(None)],
           [receiptless_void, None, None])
+    # ---- THE REMAINING FAIL-CLOSED LINES, reached DIRECTLY. ----
+    #
+    # Added because line-granular coverage (AGENTS.md pre-flight item 1) found them at 0 % after the
+    # mutation sweep had already run and reported 16/16. A guard the suite never executes is not
+    # protected by a kill count, and every line below is a REFUSAL — the direction where an
+    # unexecuted guard is silently permissive.
+    check("(e5) provenance predicate: an unknown park instant binds nothing",
+          attempt(lambda: machine_operated_park_proof(
+              orchestrator_self_id, None, None, ("jeswr",))[:2]),
+          (False, "the park application instant is unknown, so no operation can be bound to it"))
+    check("(e5) provenance predicate: an unattributable applying actor binds nothing",
+          [attempt(lambda: machine_operated_park_proof(
+              orchestrator_self_id, receiptless_park_at, None, logins)[0])
+           for logins in ((), None, ("",))], [False, False, False])
+    check("(e5) provenance predicate: a malformed self-ID ROW is not a signal",
+          attempt(lambda: machine_operated_park_proof(
+              ("garbage", None, 7, {"login": "jeswr"}), receiptless_park_at, None,
+              ("jeswr",))[0]), False)
+    check("(e5) provenance predicate: ...while a well-formed row among the malformed ones IS",
+          attempt(lambda: machine_operated_park_proof(
+              ("garbage", None, {"login": "jeswr", "at": receiptless_self_id}),
+              receiptless_park_at, None, ("jeswr",))[0]), True)
+    check("(e5) the void-receipt READER drops a marker whose stamp is unparseable, LOUDLY, and "
+          "counts it toward the cap anyway",
+          [attempt(lambda: receiptless_void_records(
+              [{"user": {"login": "bot"},
+                "body": f"x\n\n{RECEIPTLESS_VOID_MARKER} key={receiptless_void} at=garbage "
+                        f"prover=jeswr prover_at={receiptless_self_id} -->"}],
+              "bot", log=logs.append)),
+           attempt(lambda: receiptless_void_marker_count(
+               [{"user": {"login": "bot"},
+                 "body": f"x\n\n{RECEIPTLESS_VOID_MARKER} key={receiptless_void} at=garbage "
+                         f"prover=jeswr prover_at={receiptless_self_id} -->"}], "bot"))],
+          [[], 1])
+    check("(e5) ...and says so",
+          any("malformed receipt-less void stamp" in line
+              and "still counts toward RECEIPTLESS_VOID_MAX" in line for line in logs), True)
+    check("(e5) the void-receipt reader and the cap counter both survive hostile comment rows",
+          [attempt(lambda: receiptless_void_records(["garbage", None, 7, {}], "bot")),
+           attempt(lambda: receiptless_void_marker_count(["garbage", None, 7, {}], "bot")),
+           attempt(lambda: receiptless_void_records("not a list", "bot")),
+           attempt(lambda: receiptless_void_marker_count("not a list", "bot"))],
+          [[], 0, [], 0])
+    check("(e5) the void comment writer REFUSES a non-dict evidence rather than writing a receipt "
+          "with no subject",
+          [attempt(lambda: receiptless_void_comment(None, "2026-07-26T19:00:00Z")),
+           attempt(lambda: receiptless_void_comment("garbage", "2026-07-26T19:00:00Z"))],
+          [("raised", "ValueError", "raised ValueError")] * 2)
     timelines[41] = [human_pr_park]
     timelines[7] = []
     check("(e2) MACHINE_OWNED_PARK_LABELS is exactly the machine subset of READMISSION_LABELS",
