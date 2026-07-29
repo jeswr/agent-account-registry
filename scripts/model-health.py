@@ -2280,6 +2280,16 @@ def _registry_fallback():
             os.environ.get("REGISTRY_ALERT_TOKEN") or os.environ.get("GH_TOKEN") or "")
 
 
+def _same_repo(a, b):
+    """Do these two names denote ONE GitHub repository? The single definition of repository
+    identity for alert routing (AGENTS.md: one definition, not a copy per call site). GitHub
+    owner/name is case-insensitive, so `Jeswr/Agent-Account-Registry` and the registry repo are the
+    same tracker with the same issues — a comparison that missed that would let the #432 r1
+    redaction rule leak a detailed body onto the public registry, and would let the #344 supersede
+    treat one tracker as two and close the only open copy of a firing alert."""
+    return a.strip().lower() == b.strip().lower()
+
+
 def _repo_confirmed_private(repo, token):
     """True ONLY on a definitive `"private": true` from GET /repos/{repo} read under the route
     token (sol review round 1 of #432). A configured ALERT_REPO+ALERT_TOKEN pair alone must never
@@ -2303,15 +2313,29 @@ def _deliver_alerts(actions, maintainer, fallback_open=frozenset()):
     (condition, provider) markers currently OPEN on the fallback route: the firing retry can
     CREATE an alert there, so a RECOVERY whose marker was seen on the fallback is delivered on
     BOTH routes and counts as delivered only when each route it targets confirms (review #340),
-    and a STILL-FIRING action whose marker is open there has its fallback copy closed as superseded
-    once the primary copy is confirmed (issue #344). Beyond that explicit binding, recoveries never
-    fall back cross-repo — "no open issue" on a repository whose marker was never seen is a no-op
-    that cannot confirm a close (review round 2). Returns the actions still undelivered (empty ==
+    and a STILL-FIRING action whose marker is open on a DISTINCT REPOSITORY has that duplicate copy
+    closed as superseded once the primary copy is confirmed (issue #344) — DISTINCT because a
+    same-repo pair of routes is one tracker under two credentials, where that "duplicate" is the
+    primary's own copy. Beyond that explicit binding, recoveries never fall back cross-repo — "no
+    open issue" on a repository whose marker was never seen is a no-op that cannot confirm a close
+    (review round 2). Returns the actions still undelivered (empty ==
     all delivered) so the caller can exit nonzero — an unusable alert token must fail the run,
     never silently drop the alert."""
     repo, token = _alert_target()
     fb_repo, fb_token = _registry_fallback()
     fb_distinct = (repo, token) != (fb_repo, fb_token) and bool(fb_token)
+    # A different TOKEN on the SAME repository is a second CREDENTIAL, not a second issue tracker —
+    # and that pair is a REAL configuration, the one the same-repo redaction rule below exists for
+    # (#432 r1): ALERT_REPO naming the registry itself with its own ALERT_TOKEN. Writing through
+    # the ambient credential is still worth doing there (the #175 firing retry, the #340 recovery
+    # close) because only the credential was unusable. CLOSING a "duplicate" found there is NOT:
+    # both enumerations return the very same issues, so on a still-firing tick the #344 supersede
+    # would find the primary's own just-confirmed alert and close the ONLY open copy, exiting 0
+    # with nothing open for a firing condition (review round 1 of #344). Superseding therefore
+    # requires a distinct REPOSITORY, normalized by the one _same_repo definition the redaction
+    # check below also uses — a second hand-written copy of that comparison would make each copy
+    # individually unkillable (AGENTS.md, the #945 shape).
+    fb_tracker_distinct = fb_distinct and not _same_repo(repo, fb_repo)
     # A DETAILED body (failure/fleet counts + reset hints + diagnostics) is emitted ONLY over a
     # POSITIVELY VERIFIED private route (sol-audit issue #204, hardened in #432 round 1): an
     # ALERT_REPO distinct from the public registry repo (case-insensitive) AND confirmed
@@ -2322,7 +2346,7 @@ def _deliver_alerts(actions, maintainer, fallback_open=frozenset()):
     # public/unverifiable ALERT_REPO, the #175 firing retry on the registry, and any fallback
     # recovery. The registry_fallback route is always public, so its writes are always redacted.
     registry_repo = os.environ["REGISTRY_REPO"]
-    primary_redact = (repo.strip().lower() == registry_repo.strip().lower()
+    primary_redact = (_same_repo(repo, registry_repo)
                       or not _repo_confirmed_private(repo, token))
     if primary_redact and any(a.get("fire") for a in actions):
         # FAIL LOUD (issue #204): a firing model-health alert is being filed with fleet/failure
@@ -2343,13 +2367,16 @@ def _deliver_alerts(actions, maintainer, fallback_open=frozenset()):
                 print(f"::warning::model-health: {action['condition']}/{action['provider']} alert "
                       "delivery failed on the private route — retrying on the registry")
                 delivered = _upsert_alert(action, fb_repo, fb_token, maintainer, redact=True)
-            elif fb_marker_open:
+            elif fb_marker_open and fb_tracker_distinct:
                 # Issue #344: the primary was transiently unusable, the #175 retry opened the alert
                 # on the fallback, and the primary has since RECOVERED — the branch above did not
                 # run, so this tick's primary copy is CONFIRMED and the fallback copy is now a
                 # second, untended open issue for one firing condition that only the eventual
                 # recovery would close. Reconcile it away, and require the reconciliation to confirm
                 # (a duplicate that cannot be closed is retried next tick, not silently left open).
+                # Guarded on a distinct REPOSITORY: on a same-repo pair the "duplicate" IS the copy
+                # the primary just confirmed, and closing it would leave the firing condition with
+                # no open alert anywhere (review round 1).
                 delivered = _supersede_fallback_alert(action, fb_repo, fb_token)
         elif fb_marker_open:
             # The marker was SEEN open on the fallback repo (a prior firing retry created it):
@@ -5281,7 +5308,12 @@ def _test_fallback_orphan(chk):
     Phase 5 (issue #344) pins the FIRING half: once the primary route recovers, a still-firing
     condition must not leave its fallback copy open alongside the refreshed primary one. It runs
     through _cmd_decide, so dropping `fallback_open` at the delivery call site — the only place the
-    fallback's markers are enumerated — goes red too."""
+    fallback's markers are enumerated — goes red too.
+
+    Phase 6 (review round 1 of #344) pins the configuration where the two routes are ONE tracker:
+    ALERT_REPO naming the registry itself with its own ALERT_TOKEN makes (repo, token) distinct
+    while both enumerations return the same issues, so an unguarded supersede closes the primary's
+    own just-confirmed alert and reports success with a firing condition untracked."""
     import argparse as _ap
     import types
     global _gh, GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune, read_ledger
@@ -5456,6 +5488,36 @@ def _test_fallback_orphan(chk):
         chk("#344: after a supersede the recovery closes the primary copy and the fallback "
             "duplicate stays closed",
             (_cmd_decide(ns), priv_states(), reg_states()), (0, ["closed"], ["closed"]))
+
+        # phase 6 (review round 1 of #344): the routes are TWO CREDENTIALS ON ONE TRACKER —
+        # ALERT_REPO naming the registry itself with its own working ALERT_TOKEN, the pair the #432
+        # r1 redaction rule exists for. (repo, token) is distinct, so the fallback is enumerated,
+        # but every marker it returns belongs to the primary's own tracker. Spelled in a different
+        # CASE so the repo-identity NORMALIZATION is load-bearing, not just the equality.
+        repos[reg_repo.upper()] = repos[reg_repo]        # GitHub repo names are case-insensitive
+        comments[reg_repo.upper()] = comments[reg_repo]
+        os.environ.update(ALERT_REPO=reg_repo.upper(), ALERT_TOKEN="priv2")
+        classify_records = lambda records, fleet, now, open_alerts=(): [dict(fire)]
+        try:
+            # A firing tick reopens the sole alert; its marker was not yet open when this tick
+            # enumerated, so the supersede is not reachable until the NEXT tick.
+            chk("#344 r1: same-repo routes — the firing tick reopens the sole alert",
+                (_cmd_decide(ns), reg_states()), (0, ["open"]))
+            # THE DEFECT: a still-firing tick with the marker now open. The primary confirms the
+            # refresh and the fallback enumeration returns that same issue. Without the
+            # repo-identity guard the supersede closes it and decide reports success — this reads
+            # (0, ['closed'], 1) pre-fix: no open alert anywhere for a condition that is firing.
+            mark = len(comments[reg_repo])
+            chk("#344 r1: a still-firing tick on same-repo routes leaves the SOLE alert OPEN, "
+                "un-superseded, and the run green",
+                (_cmd_decide(ns), reg_states(), len(comments[reg_repo]) - mark),
+                (0, ["open"], 0))
+        finally:
+            classify_records = real_classify
+        # What the guard DELIVERS INTO: the same-repo pair must still recover normally — the alert
+        # is not stranded open by refusing to supersede it.
+        chk("#344 r1: the same-repo pair still closes its alert on the ordinary recovery",
+            (_cmd_decide(ns), reg_states()), (0, ["closed"]))
     finally:
         _gh = real_gh
         (GitHubAPI, _enabled_provider_accounts, annotate_provider_status,
