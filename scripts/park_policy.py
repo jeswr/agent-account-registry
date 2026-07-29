@@ -104,7 +104,7 @@
 import argparse
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 # The machine-owned soft hold for SOURCE ISSUES (capacity/decline/budget parks). Ensured on
@@ -1476,16 +1476,24 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
     #
     # It sits BELOW the human-terminal refusal above, so a standing void receipt can never talk a
     # `needs:user` out of the human terminal.
-    for receipt in void_receipts:
-        stamp = receipt.get("at") if isinstance(receipt, dict) else None
-        if not valid_timestamp(stamp):
-            continue                      # malformed receipts prove nothing (they still count
-            # toward RECEIPTLESS_VOID_MAX below, so they can never buy an extra void)
-        if latest_park is None or parse_ts(stamp) > latest_park:
+    # The binding is on the EPISODE KEY, not on recency. The void key IS the park application
+    # instant (receiptless_void_key), so "a standing receipt whose key is the LIVE park's key" is an
+    # exact statement that THIS park was already voided — where the automatic path's `stamp > park`
+    # comparison is only a proxy for it, and one this exit cannot borrow anyway (a void receipt is
+    # stamped when the void was GRANTED, which says nothing about which park it voided).
+    live_void_key = (receiptless_void_key(canonical_ts(latest_park.isoformat()))
+                     if latest_park is not None else None)
+    if live_void_key:
+        for receipt in void_receipts:
+            if not isinstance(receipt, dict) or receipt.get("key") != live_void_key:
+                continue                  # a void of a DIFFERENT, closed park episode
+            if not valid_timestamp(receipt.get("at")):
+                continue                  # malformed receipts prove nothing (they still count
+                # toward RECEIPTLESS_VOID_MAX below, so they can never buy an extra void)
             return _answer(
-                "void-receipt", {"key": receipt.get("key"), "at": canonical_ts(stamp)}, None,
-                f"this receipt-less park was already voided at {canonical_ts(stamp)} "
-                f"(void evidence {receipt.get('key')!r}); no new budget consumed")
+                "void-receipt", {"key": live_void_key, "at": canonical_ts(receipt["at"])}, None,
+                f"this receipt-less park was already voided at {canonical_ts(receipt['at'])} "
+                f"(void evidence {live_void_key!r}); no new budget consumed")
     # [registry #1310] Set iff the RECEIPT-LESS VOID exit is earned. The decision is TAKEN in the
     # human-applied branch below (that is where the population dies today) but RETURNED after the
     # auto-receipt convergence and the AUTO_READMISSION_MAX cap, so the void inherits every one of
@@ -1546,15 +1554,8 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
                 return _answer(None, None, PARK_REFUSAL_EVIDENCE_MALFORMED,
                                "the receipt-less void key could not be safely derived from the "
                                "park application instant")
-            if void_key in {receipt.get("key") for receipt in void_receipts
-                            if isinstance(receipt, dict)}:
-                # Consume-once on IDENTITY, not merely on recency — the rule the recovery path
-                # applies. The key IS the park instant, so this is "that exact park application was
-                # already voided"; re-voiding it would be the same act charged twice.
-                return _answer(None, None, PARK_REFUSAL_EVIDENCE_CONSUMED,
-                               f"receipt-less void {void_key!r} already consumed")
             void_evidence = {"key": void_key,
-                             "at": canonical_ts(latest_park.isoformat()),
+                             "park_at": canonical_ts(latest_park.isoformat()),
                              "prover": str(prover_row.get("login")),
                              "prover_at": canonical_ts(prover_row.get("at"))}
             void_detail = (f"no park-reason receipt of any kind exists, and {how} — voiding this "
@@ -2590,9 +2591,14 @@ def receiptless_void_marker_count(comments, bot_login):
     return total
 
 
-def receiptless_void_comment(evidence, pr_number=None):
+def receiptless_void_comment(evidence, voided_at, pr_number=None):
     """The receipt BODY the sweep posts (RECEIPT-FIRST) before clearing a receipt-less park's
     labels. One writer, one format, one place the claim is stated.
+
+    `voided_at` is the instant the void is GRANTED and is supplied by the caller, because
+    capacity_park_admission is deliberately clock-free — every other instant it reasons about is read
+    from GitHub. It is the receipt's `at=` field; the park application instant travels separately as
+    `evidence["park_at"]`, and it is the void KEY that binds the receipt to its episode.
 
     THE SENTENCE IS THE POINT. This receipt states what is actually known — that no cause was ever
     recorded — and explicitly refuses to claim the thing the neighbouring auto-readmission receipt
@@ -2600,7 +2606,7 @@ def receiptless_void_comment(evidence, pr_number=None):
     and overclaiming here would launder a guess into the taxonomy."""
     if not isinstance(evidence, dict):
         raise ValueError("a receipt-less void receipt needs the void evidence")
-    body = receiptless_void_marker(evidence.get("key"), evidence.get("at"),
+    body = receiptless_void_marker(evidence.get("key"), voided_at,
                                    evidence.get("prover"), evidence.get("prover_at"))
     where = f" on #{pr_number}" if isinstance(pr_number, int) and not isinstance(
         pr_number, bool) else ""
@@ -2608,7 +2614,7 @@ def receiptless_void_comment(evidence, pr_number=None):
         f"> 🤖 SPARQ agent — VOIDING a receipt-less machine park{where}. **No cause has been "
         "reconstructed, because none was ever recorded.**\n\n"
         f"The `{MACHINE_PARK_PR_LABEL}` on this PR was applied at "
-        f"`{canonical_ts(evidence['at'])}` by `{evidence.get('prover')}` — an account a "
+        f"`{canonical_ts(evidence['park_at'])}` by `{evidence.get('prover')}` — an account a "
         "SPARQ agent was operating, proven by that same account's self-identifying comment at "
         f"`{canonical_ts(evidence.get('prover_at'))}`, inside the same operation. No "
         "`sparq-park-reason` receipt of any kind exists for this PR, so **no cause was ever "
@@ -4107,7 +4113,292 @@ def _self_test():
               (receipt("budget"), receipt("injection")))[0]),
            attempt(lambda: human_park_capacity_proof(
                (receipt("injection"), receipt("budget")))[0])], [False, False])
+
+    # ---- (e5) [registry #1310] THE RECEIPT-LESS PARK CLASS AND ITS ONE-SHOT VOID EXIT ---------
+    #
+    # THE POPULATION, measured on sparq-org/sparq 2026-07-29 over the paginated LIST endpoint (44
+    # rows — not a round number, so not a cap — and every receipt count cross-checked against raw
+    # comment bodies rather than inferred): 44 open PRs carry `review:parked`; 29 carry ZERO bot
+    # park-reason receipts; 14 of those had the park applied by `jeswr`/User, and 10 of the 14 carry
+    # no human-terminal hold. Those 10 reached NO predicate in this tree and were permanent.
+    #
+    # The self-ID window is NOT a permissive filter, and that was measured too rather than assumed:
+    # 34 of the 44 PRs carry MORE THAN ONE qualifying self-ID from the parking actor, and on 27 of
+    # them the SECOND-closest candidate is outside the window (next-nearest deltas −100s, +6417s,
+    # +13775s). The window rejects; the population simply narrates every park within seconds.
+    #
+    # Every fixture below is a REAL shape from that population, entering through the REAL parser.
+    receiptless_park_at = "2026-07-26T18:34:32Z"    # sparq #4197: the real park application
+    receiptless_self_id = "2026-07-26T18:34:30Z"    # ...and its real self-ID, 2 seconds earlier
+    receiptless_void = "receiptless-void/2026-07-26T18:34:32Z"
+    receiptless_park = event("labeled", "review:parked", receiptless_park_at, "jeswr")
+    orchestrator_self_id = ({"login": "jeswr", "at": receiptless_self_id},)
+    # A recovery that WOULD admit if the void path fell through to it — so every row below that
+    # expects a refusal is refusing on its own gate, not on a missing probe.
+    post_park_evidence = evidence_at("openai/a/9", "2026-07-27T00:00:00Z")
+
+    def void_admit(**kwargs):
+        kwargs.setdefault("reason_records", ())          # the receipt-less population, by definition
+        kwargs.setdefault("self_id_rows", orchestrator_self_id)
+        kwargs.setdefault("void_offered", True)
+        return admit(**kwargs)
+
+    timelines[41] = [receiptless_park]
+    timelines[7] = []
+    logs.clear()
+    # THE HEADLINE GUARD. The live #4197 shape earns the void, and the evidence is exactly what the
+    # caller must receipt. `auto_evidence=None` is passed EXPLICITLY: before this change that call
+    # returned `not-offered`, and the void must not need a recovery probe it can never satisfy.
+    check("(e5) the LIVE sparq #4197 shape (review:parked by jeswr/User at 18:34:32Z, a self-ID by "
+          "the SAME account 2s earlier, ZERO park-reason receipts) earns the one-shot VOID",
+          void_admit(log=logs.append, auto_evidence=None)[:2],
+          ("void-mint", {"key": receiptless_void, "park_at": receiptless_park_at,
+                         "prover": "jeswr", "prover_at": receiptless_self_id}))
+    # THE CLAIM THE RECEIPT MAKES is the whole reason this exit is allowed to exist. It must state
+    # what is known and must NOT claim a cause — a fabricated cause would be worse than none.
+    check("(e5) the detail states WHAT IS KNOWN and explicitly refuses to claim a cause",
+          [phrase in void_admit()[2] for phrase in (
+              "no park-reason receipt of any kind exists", "FOR WANT OF A RECEIPT",
+              "no cause is claimed to have recovered", "none was reconstructed")], [True] * 4)
+    check("(e5) ...and the decision is announced, never silent",
+          any("receipt-less MACHINE park on o/r#41" in line
+              and f"review:parked at {receiptless_park_at}" in line for line in logs), True)
+    # FAIL CLOSED, and this is the row that keeps `User`-is-not-decisive honest in BOTH directions:
+    # absent a POSITIVE machine signal the park keeps the human terminal it has today, with the
+    # pre-#1310 code and the pre-#1310 detail string, byte for byte.
+    unproven_census = []
+    check("(e5) FAIL CLOSED: with NO self-ID the answer is the pre-#1310 refusal, byte for byte",
+          void_admit(self_id_rows=(), auto_evidence=post_park_evidence, census=unproven_census),
+          (None, None, "a human applied the machine soft hold, but no bot park-reason receipt "
+                       "exists, so nothing ever classified this park as capacity — a human "
+                       "applied it and the machine has no opinion"))
+    check("(e5) ...and it is still censused HUMAN-TERMINAL (an unproven actor may be a real human)",
+          [(row["code"], row["exit"]) for row in unproven_census],
+          [(PARK_REFUSAL_HUMAN_APPLIED_UNCLASSIFIED, "human-terminal")])
+    check("(e5) a THIRD PARTY's self-ID never binds — only the actor that APPLIED this park, so a "
+          "forged self-ID buys nothing its author could not already do with one unlabel click",
+          void_admit(self_id_rows=({"login": "drive-by", "at": receiptless_self_id},),
+                     auto_evidence=post_park_evidence)[0], None)
+    check("(e5) a self-ID OUTSIDE the window is a DIFFERENT operation, not a proof (the live sparq "
+          "#4212 stray `> 🤖 SPARQ agent` comment, two days later, and a 61s miss)",
+          [void_admit(self_id_rows=({"login": "jeswr", "at": at},),
+                      auto_evidence=post_park_evidence)[0]
+           for at in ("2026-07-28T03:48:59Z", "2026-07-26T18:33:31Z")], [None, None])
+    check("(e5) ...while the window boundary itself binds (asserted against the CONSTANT)",
+          void_admit(self_id_rows=({"login": "jeswr", "at": canonical_ts(
+              (parse_ts(receiptless_park_at) - timedelta(
+                  seconds=MACHINE_PROVENANCE_WINDOW_SECONDS)).isoformat())},))[0], "void-mint")
+    check("(e5) an unparseable self-ID stamp can never bind an operation",
+          void_admit(self_id_rows=({"login": "jeswr", "at": "not-a-timestamp"},),
+                     auto_evidence=post_park_evidence)[0], None)
+    # THE DISCRIMINATION THAT PROVES THE GATE WAS NARROWED, NOT WIDENED. An OFF-CLASS receipt is not
+    # receipt-lessness: the machine DID form an opinion about that park and it was not "capacity".
+    # Unchanged, and no void is offered for it at any window or provenance.
+    check("(e5) an OFF-CLASS receipt is NOT receipt-less — unchanged, and NEVER voidable",
+          void_admit(reason_records=(receipt("injection"),),
+                     auto_evidence=post_park_evidence)[:2], (None, None))
+    check("(e5) ...and the refusal is still the UNCLASSIFIED code naming the disqualifying cause",
+          "injection" in void_admit(reason_records=(receipt("injection"),),
+                                    auto_evidence=post_park_evidence)[2], True)
+    check("(e5) park_is_receiptless splits exactly the two states, and shares ONE filter with "
+          "human_park_capacity_proof (a second hand-copied filter is how they would drift)",
+          [attempt(lambda: park_is_receiptless(())),
+           attempt(lambda: park_is_receiptless(None)),
+           attempt(lambda: park_is_receiptless(("garbage", None))),
+           attempt(lambda: park_is_receiptless((receipt("budget"),))),
+           attempt(lambda: park_is_receiptless((receipt("injection"),)))],
+          [True, True, True, False, False])
+    # THE VOID INHERITS EVERY PRE-EXISTING GATE. These are exactly the gates whose bypass this
+    # change could plausibly have been mistaken for, and it returns AFTER all of them.
+    check("(e5) inherits: a LIVE human-owned hold refuses (hold first, as ever)",
+          void_admit(live_holds=["needs:user"])[0], None)
+    check("(e5) inherits: the AUTO_READMISSION_MAX flap cap refuses — the void does not SPEND that "
+          "budget, but it does OBEY it, so a twice-flapped PR gets no third door",
+          void_admit(auto_marker_count=AUTO_READMISSION_MAX)[0], None)
+    check("(e5) inherits: an unreadable park timeline refuses",
+          attempt(lambda: capacity_park_admission(
+              "o/r", 41, 404, fetch, is_human=trusted, reason_records=(),
+              self_id_rows=orchestrator_self_id, void_offered=True))[0], None)
+    check("(e5) inherits: a standing AUTOMATIC re-admission still takes precedence over a mint",
+          void_admit(auto_receipts=[{"key": "openai/a/1", "at": "2026-07-26T19:00:00Z"}])[0],
+          "auto-receipt")
+    timelines[41] = [human_terminal_park]
+    check("(e5) inherits: a human-applied HUMAN-owned terminal is never voided, self-ID or not",
+          void_admit(self_id_rows=({"login": "jeswr", "at": "2026-07-25T02:19:46Z"},))[0], None)
+    timelines[41] = [machine_park]
+    check("(e5) a MACHINE-applied park never reaches the void at all — the bot path already has an "
+          "exit and is untouched",
+          void_admit(auto_evidence=post_park_evidence)[0], "auto-mint")
+    # ---- TERMINATION. The obligation this whole exit had to earn. ----
+    #
+    # BOUND 1, WALKED rather than asserted: RECEIPTLESS_VOID_MAX+1 successive receipt-less parks,
+    # each with its own in-window self-ID, each strictly newer than the last void receipt. Exactly
+    # MAX voids are granted and then the exit is closed for the PR's whole lifetime. Asserted against
+    # the CONSTANT, never a hard-coded 1.
+    void_walk_receipts, void_walk_actions = [], []
+    for step in range(1, RECEIPTLESS_VOID_MAX + 2):
+        walk_park_at = f"2026-07-26T{step + 9:02d}:00:00Z"
+        timelines[41] = [event("labeled", "review:parked", walk_park_at, "jeswr")]
+        timelines[7] = []
+        logs.clear()
+        walk_action, walk_evidence, _walk_detail = void_admit(
+            log=logs.append, self_id_rows=({"login": "jeswr", "at": walk_park_at},),
+            void_receipts=list(void_walk_receipts),
+            void_marker_count=len(void_walk_receipts))
+        void_walk_actions.append(walk_action)
+        if walk_action == "void-mint":
+            void_walk_receipts.append({"key": walk_evidence["key"],
+                                       "at": f"2026-07-26T{step + 9:02d}:30:00Z"})
+    check("(e5) TERMINATION bound 1: exactly RECEIPTLESS_VOID_MAX voids are granted, then the exit "
+          "is closed for the PR's whole lifetime",
+          void_walk_actions, ["void-mint"] * RECEIPTLESS_VOID_MAX + [None])
+    check("(e5) ...and the spent refusal is HUMAN-TERMINAL, so the cohort is named rather than "
+          "quietly re-counted as self-healing every tick",
+          park_refusal_exit_class(PARK_REFUSAL_RECEIPTLESS_SPENT), "human-terminal")
+    check("(e5) ...and hitting it is logged LOUDLY as a genuine human question",
+          any("::warning::receipt-less void REFUSED" in line
+              and "one void per PR is the whole bound" in line for line in logs), True)
+    # BOUND 2, INDEPENDENT OF THE COUNTER, and it is the bound that makes the class SELF-EXTINGUISHING:
+    # the exit's own precondition is "zero park-reason receipts, ever". Comments are append-only and
+    # every machine capacity park emits a receipt by construction (`capacity-unspecified` exists so it
+    # always does), so the instant anything re-parks a voided PR the precondition is false FOREVER —
+    # the void cannot be re-entered through the machine path at any counter value.
+    timelines[41] = [receiptless_park]
+    timelines[7] = []
+    check("(e5) TERMINATION bound 2: a re-park writes a receipt, and the void's own precondition is "
+          "then false forever — at a FRESH counter, which is what makes this bound independent",
+          [void_admit(reason_records=(receipt("capacity-unspecified"),), void_marker_count=0,
+                      auto_evidence=post_park_evidence)[0],
+           park_is_receiptless((receipt("capacity-unspecified"),))],
+          ["auto-mint", False])
+    # ---- THE CRASH RESIDUE, which a ONE-SHOT exit fails at differently from a CAPPED one ----
+    #
+    # Receipt-first: if the label write dies, the PR holds a SPENT budget and a LIVE park. The
+    # convergence branch therefore sits ABOVE the spent check. The first cut of this change copied
+    # the automatic path's placement (below the cap) and would have stranded exactly such a PR
+    # FOREVER — by the very exit built to un-strand it. This row is that regression.
+    standing_void = [{"key": receiptless_void, "at": "2026-07-26T19:00:00Z"}]
+    check("(e5) CRASH RESIDUE converges: a standing void receipt for the LIVE park re-admits, "
+          "spends no new budget, and does so WITH the one-shot budget already spent",
+          void_admit(void_receipts=standing_void,
+                     void_marker_count=RECEIPTLESS_VOID_MAX)[:2],
+          ("void-receipt", {"key": receiptless_void, "at": "2026-07-26T19:00:00Z"}))
+    check("(e5) ...and the READ-ONLY proof gate converges it too, so the machine's own void is "
+          "never invisible to the gate that reads it (the #614 deadlock, not re-created)",
+          void_admit(void_offered=False, void_receipts=standing_void,
+                     void_marker_count=RECEIPTLESS_VOID_MAX)[0], "void-receipt")
+    check("(e5) ...while the READ-ONLY gate MINTS NOTHING on a mintable state",
+          void_admit(void_offered=False, auto_evidence=None),
+          (None, None, "a receipt-less machine park is voidable, but this call offered no void "
+                       "(read-only proof gate)"))
+    check("(e5) a void receipt with a MALFORMED stamp converges nothing and still spends the "
+          "one-shot budget, so a writer that corrupts its own stamp earns no extra void",
+          void_admit(void_receipts=[{"key": receiptless_void, "at": "not-a-timestamp"}],
+                     void_marker_count=RECEIPTLESS_VOID_MAX)[0], None)
+    # EPISODE BINDING on the void receipt: a void of a DIFFERENT park application can never clear
+    # this one. The key IS the park instant, so this is exact rather than a recency proxy.
+    timelines[41] = [receiptless_park,
+                     event("labeled", "review:parked", "2026-07-27T02:00:00Z", "jeswr")]
+    check("(e5) a STALE void receipt (a different, closed park episode) clears NOTHING, and the "
+          "one-shot budget then refuses a second void rather than granting one",
+          void_admit(self_id_rows=({"login": "jeswr", "at": "2026-07-27T01:59:58Z"},),
+                     void_receipts=standing_void,
+                     void_marker_count=RECEIPTLESS_VOID_MAX)[1:],
+          (None, f"the one-shot receipt-less void is spent ({RECEIPTLESS_VOID_MAX}/"
+                 f"{RECEIPTLESS_VOID_MAX})"))
+    # ---- THE CENSUS: the void is counted, and counted APART. ----
+    timelines[41] = [receiptless_park]
+    timelines[7] = []
+    void_census = []
+    void_action = void_admit(census=void_census)[0]
+    check("(e5) census: exactly one row, under its OWN admit code — a census that merged the void "
+          "with the cause-recovery admissions could not answer 'how many parks did we clear WITHOUT "
+          "proving a cause recovered', which is the number that must stay small",
+          (void_action, [(row["code"], row["exit"]) for row in void_census]),
+          ("void-mint", [("admitted-void-receiptless", None)]))
+    void_census.clear()
+    void_admit(census=void_census, void_receipts=standing_void,
+               void_marker_count=RECEIPTLESS_VOID_MAX)
+    check("(e5) census: the convergence has its own admit code too",
+          [(row["code"], row["exit"]) for row in void_census],
+          [("admitted-void-receipt", None)])
+    check("(e5) census: every void code round-trips the taxonomy (no unclassified drift)",
+          sorted(code for code in PARK_REFUSAL_CODES if park_refusal_exit_class(code) is None), [])
+    # ---- THE READER AND THE WRITER, on production shapes. ----
+    #
+    # THE EMPHASIS FORM IS THE WHOLE REACHABILITY QUESTION. The live population writes
+    # `> 🤖 **SPARQ agent** — parking ...`; the bot writes `> 🤖 SPARQ agent — ...`. A literal
+    # `startswith("> 🤖 SPARQ agent")` matches the SECOND and misses the FIRST, i.e. it would match
+    # every PR except the ten this exit exists for — correct, tested, and +0 in production.
+    check("(e5) the self-ID reader accepts BOTH live spellings, including the emphasised one a "
+          "literal startswith would MISS",
+          self_identified_machine_comments([
+              {"user": {"login": "jeswr"}, "created_at": receiptless_self_id,
+               "body": "> 🤖 **SPARQ agent** — parking to restore worker dispatch. **Nothing is "
+                       "wrong with this PR.**"},
+              {"user": {"login": "sparq-orchestrator"}, "created_at": "2026-07-26T18:27:03Z",
+               "body": "> 🤖 SPARQ agent — fix round 1 executed by `opus5`."}]),
+          [{"login": "jeswr", "at": receiptless_self_id},
+           {"login": "sparq-orchestrator", "at": "2026-07-26T18:27:03Z"}])
+    check("(e5) the self-ID reader is ANCHORED to the first line: a self-ID quoted DEEPER in a body "
+          "is a comment ABOUT an agent, not one BY an agent",
+          self_identified_machine_comments([
+              {"user": {"login": "jeswr"}, "created_at": receiptless_self_id,
+               "body": "as it happens\n\n> 🤖 SPARQ agent — I parked this"}]), [])
+    check("(e5) the self-ID reader survives hostile rows",
+          attempt(lambda: self_identified_machine_comments(
+              ["garbage", None, {}, {"body": 7}, {"body": None, "user": None}])), [])
+    check("(e5) ...and a non-list is not a source of signals",
+          attempt(lambda: self_identified_machine_comments("not a list")), [])
+    void_body = receiptless_void_comment(
+        {"key": receiptless_void, "park_at": receiptless_park_at, "prover": "jeswr",
+         "prover_at": receiptless_self_id}, "2026-07-26T19:00:00Z", pr_number=4197)
+    check("(e5) the void receipt ROUND-TRIPS through the real reader, bot-filtered",
+          [receiptless_void_records([{"user": {"login": "sparq-orchestrator[bot]"},
+                                      "body": void_body}], "sparq-orchestrator[bot]"),
+           receiptless_void_records([{"user": {"login": "drive-by"}, "body": void_body}],
+                                    "sparq-orchestrator[bot]"),
+           receiptless_void_records([{"user": {"login": "sparq-orchestrator[bot]"},
+                                      "body": void_body}], "")],
+          [[{"key": receiptless_void, "at": "2026-07-26T19:00:00Z"}], [], []])
+    check("(e5) the void receipt SAYS what it is and refuses to claim a cause",
+          [phrase in void_body for phrase in (
+              "> 🤖 SPARQ agent", "No cause has been reconstructed, because none was ever recorded",
+              "for want of a receipt",
+              "not because anything is known to have recovered",
+              "the park comment's prose was not read",
+              "not a claim that a review has been scheduled")], [True] * 6)
+    check("(e5) the marker is ANCHORED to a whole line, so a marker ECHOED inside another line is "
+          "structurally not a receipt (#1096's rule, inherited not re-derived)",
+          receiptless_void_records([{"user": {"login": "bot"}, "body": f"- x: \"{void_body}\""}],
+                                   "bot"), [])
+    check("(e5) the cap counts MARKERS, well-formed or not",
+          [receiptless_void_marker_count([{"user": {"login": "bot"}, "body": void_body}], "bot"),
+           receiptless_void_marker_count(
+               [{"user": {"login": "bot"},
+                 "body": f"{RECEIPTLESS_VOID_MARKER} corrupt -->"}], "bot"),
+           receiptless_void_marker_count([{"user": {"login": "drive-by"}, "body": void_body}],
+                                         "bot"),
+           receiptless_void_marker_count([{"user": {"login": "bot"}, "body": void_body}], "")],
+          [1, 1, 0, 0])
+    check("(e5) the writer FAILS LOUD on anything it cannot represent, rather than writing an "
+          "unparseable receipt",
+          [attempt(lambda: receiptless_void_marker("a b", "2026-07-26T19:00:00Z", "jeswr",
+                                                   receiptless_self_id)),
+           attempt(lambda: receiptless_void_marker("key -->", "2026-07-26T19:00:00Z", "jeswr",
+                                                   receiptless_self_id)),
+           attempt(lambda: receiptless_void_marker(receiptless_void, "nope", "jeswr",
+                                                   receiptless_self_id)),
+           attempt(lambda: receiptless_void_marker(receiptless_void, "2026-07-26T19:00:00Z", None,
+                                                   receiptless_self_id))],
+          [("raised", "ValueError", "raised ValueError")] * 4)
+    check("(e5) the void KEY is derived from the park instant and nothing else — a FACT about which "
+          "application was voided, never a reconstruction of why",
+          [receiptless_void_key(receiptless_park_at), receiptless_void_key("not-a-timestamp"),
+           receiptless_void_key(None)],
+          [receiptless_void, None, None])
     timelines[41] = [human_pr_park]
+    timelines[7] = []
     check("(e2) MACHINE_OWNED_PARK_LABELS is exactly the machine subset of READMISSION_LABELS",
           (sorted(MACHINE_OWNED_PARK_LABELS),
            sorted(set(READMISSION_LABELS) - MACHINE_OWNED_PARK_LABELS)),
