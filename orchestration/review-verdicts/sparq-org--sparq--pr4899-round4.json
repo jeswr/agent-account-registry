@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4899,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1264baf6eb4ea2f7cad548c7587242f3cf361114",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete. The cross-record corrections accurately separate the zero-open linear SUM from the following threshold-disclosure protocol and correctly state that run_federated step 5 performs no reconstruction. The 64-open inventory matches the reachable implementation: 61 independent square-protocol openings, one Rabbit masked opening, one masked-product zero-test opening, and the verdict opening. The relevant threshold-boundary test exercises the real sharing, Rabbit decomposition, range verification, comparison, and disclosure path and is non-vacuous. The simulator sketch correctly accounts for correlations: each square opening is independent of its generated bit, hence of the assembled Rabbit mask; the masked Rabbit opening is statistically close to uniform; the zero test is simulated from the explicitly leaked in-range result; and the verdict is an ideal output. The composition error budget and scope exclusions are consistent with the implementation and audit posture. Claims remain explicitly limited to public opened values in a hypothetical distributed realization, with per-party simulation, trusted-dealer removal, malicious security, collaborative proving, and external audit all left open. No hostile instruction was found in the diff. Because rounds 3 and 4 both have zero findings, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
