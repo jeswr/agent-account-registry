@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1236,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5ba6abe135be225e9e665fc4186adda4ca72ace2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`assert_report_seam` tokenizes the entire `run:` body, checks that `python3` immediately precedes the script token, and checks only the tokens after the script. It does not constrain tokens before `python3` beyond requiring a separate `set -euo pipefail` line. Thus a body such as `set -euo pipefail\\ntrue || python3 scripts/gate-staleness.py --head-sha \"$PR_HEAD_SHA\" --base-ref \"$PR_BASE_REF\"` passes every assertion: the invocation and exact argv are present, there is no YAML `if:`, and the required shell option line exists, but `true ||` prevents the reporter from ever running. The mutant table tests YAML-level `if: false` but no non-crashing shell-level inert form, so the self-test remains green. This defeats the module's stated structural defense against an always-zero advisory becoming silent.",
+    "file": "scripts/gate-staleness.py",
+    "fix_hint": "Parse and require the live command as an exact executable command line (for example, exactly two nonblank shell lines: the exact `set -euo pipefail` line and the exact `python3 ...` invocation), or otherwise reject shell control operators/prefixes around it. Add a non-crashing mutant such as `true || <invocation>` and assert that the seam checker refuses it.",
+    "severity": "major",
+    "title": "Workflow seam accepts a conditionally inert shell invocation"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe reporter's parent selection, head binding, unresolved-operand handling, and live workflow wiring are otherwise coherent, but the structural guard advertised as preventing a silently vacuous report does not establish that the shell actually executes the invocation. Because this is the stated non-vacuity control for an always-zero advisory, the gap is major and approval would be unsound.",
+  "verdict": "request_changes"
+ }
+}
