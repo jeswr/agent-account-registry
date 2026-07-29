@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 980,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7987d68ed7122f82e26b55ac477c5758243bf0a0",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 3a declares heal_max_wait_minutes optional, specifies that absence means 10, and makes queue_controls()/resolve() the single authoritative place applying that default. It separately requires a policy with no registry row to raise. But section 4a still requires a \"malformed/absent heal_max_wait_minutes\" to make the fleet rule raise. Absence of the field in an otherwise valid registry row is resolvable under the stated contract, so an implementation cannot satisfy both the resolver contract and this acceptance test. This remains load-bearing because it determines whether a valid policy relying on the documented default produces queue metrics or fails every collection tick.",
+    "file": "research/636-queue-observability-export.md",
+    "fix_hint": "Change the section 4a test to require malformed values and a missing/invalid registry row to raise, while an absent heal_max_wait_minutes field in a valid row resolves to the authoritative default and feeds both sinks identically. If absence is instead intended to fail closed, remove the optional/default-10 contract everywhere and require the field explicitly.",
+    "severity": "major",
+    "title": "The fleet self-test still contradicts the optional-field default"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-4 contradiction remains in the required fleet self-tests. Section 3a still defines heal_max_wait_minutes as optional, makes an absent field resolve to the authoritative default of 10, and distinguishes that valid case from a missing registry row. Although section 3a's own fail-closed fixture list now correctly tests malformed values and a policy with no registry row, section 4a still requires a malformed/absent heal_max_wait_minutes to make the fleet rule raise. Thus the implementation contract remains impossible to satisfy consistently: the mandated shared resolver must return 10 for an absent field in an existing row, while the fleet acceptance test requires that case to fail the tick. Because the same load-bearing major issue persists at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
