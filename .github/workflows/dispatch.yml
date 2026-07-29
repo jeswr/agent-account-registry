@@ -174,6 +174,11 @@ jobs:
     # assemble step uses its own later checkout, so the early snapshot copy is tamper-inert).
     permissions:
       contents: read
+      # [#1207] READ-ONLY, and only so the snapshot step can LIST + DOWNLOAD the previous tick's
+      # `dispatch-etags` artifact through the API instead of via an extracting restore action.
+      # It grants no write of any kind, and the token still lives ONLY in the snapshot step's own
+      # env — the hostile target planner steps below hold no token and cannot use this.
+      actions: read
     steps:
       - name: Resolve the public target manifest
         env:
@@ -230,11 +235,51 @@ jobs:
         id: snapshot
         env:
           GH_TOKEN: ${{ github.token }}
+          SNAPSHOT_ETAG_STORE: ${{ runner.temp }}/etag-store/etags.json
+          REGISTRY_REPO: ${{ github.repository }}
+          # The branch whose artifacts this run will READ a store from — always the branch this
+          # run is itself on, which for every legitimate trigger (schedule, workflow_run, the
+          # doorbell) is the default branch. `github.ref_name` is used rather than
+          # `github.event.repository.default_branch` because the latter is absent from a
+          # `schedule` payload, and an empty value here silently disables the mechanism on
+          # exactly the scheduled ticks. Provenance is enforced in plan-snapshot.py: a store
+          # produced by a run on any OTHER branch is never read.
+          REGISTRY_STORE_BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           python3 registry-snapshot/scripts/plan-snapshot.py --self-test
           python3 registry-snapshot/scripts/plan-snapshot.py \
             "$RUNNER_TEMP/dispatch-targets/repos.txt" "$RUNNER_TEMP"
+
+      # PUBLISH BEFORE ANY TARGET CODE RUNS. The next step is still registry code and the clone
+      # step after it is the first thing that executes anything from a target repo, so the store
+      # this tick publishes is one no target code was ever in a position to shape.
+      #
+      # An UPLOAD, deliberately — never a cache/artifact RESTORE action. Those extract a tarball
+      # (`@actions/toolkit` uses `tar -xf ... -P`, i.e. --absolute-names), which is an arbitrary
+      # file write, and it would land in this very job before the `github.token`-bearing snapshot
+      # step. Uploading writes nothing locally, and the READ side is plan-snapshot.py pulling the
+      # previous artifact through the API into memory. Adversarial review of PR #1218.
+      #
+      # No `if:` and no `continue-on-error:`: a failed snapshot fails the job and never reaches
+      # this step, which is correct (only a COMPLETED sweep publishes a store), and
+      # scripts/dispatch-plan.py's self-test refuses both spellings at this seam.
+      - name: Publish the ETag store for the next tick (pinned, pre-target)
+        id: etag-save
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dispatch-etags
+          path: ${{ runner.temp }}/etag-store/etags.json
+          # `warn`, NOT `error`. This is an OPTIMISATION, and it must never be able to kill the
+          # tick it optimises: a disk-full runner that could not write the store would otherwise
+          # fail PLAN and dispatch nothing. The opposite trap — the store silently stopping and
+          # the mechanism degrading to 0% with everything green — is covered on two independent
+          # channels instead: plan-snapshot.py emits an explicit `::warning::` when the write
+          # fails, and its per-tick "SNAPSHOT conditional reads: N of M ... billable" line reports
+          # the realised hit rate, which goes to zero on the very next tick.
+          if-no-files-found: warn
+          # One tick is 10 minutes; a day is ample, and it bounds what accumulates.
+          retention-days: 1
 
       # Extract the policy-controlled trusted-bot allowlist (issue #111) from the registry policy
       # using REGISTRY code, BEFORE any target planner code runs (the clone/self-test step below is
