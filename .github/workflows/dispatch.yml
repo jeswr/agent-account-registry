@@ -1438,6 +1438,31 @@ jobs:
   # default-allow window. The guard is read-only (`gh api` GETs; asserted by its self-test).
   secrets-guard:
     name: GUARD (verify secret-exfil settings, fail closed)
+    # THE #819 RATE FLOOR, applied to this job too (issue #1208). Both halves are load-bearing and
+    # each defeats a different mutation — the `needs:` edge makes this job WAIT for the floor's
+    # decision, the `if:` makes it OBEY it — exactly as on `plan`. Asserted in BOTH directions
+    # (including the empty-string a deleted output produces) by scripts/dispatch-tick-floor.py's
+    # `_test_workflow_seam`.
+    #
+    # THIS DOES NOT WEAKEN THE GATE, AND THE REASON IS STRUCTURAL: on a tick the floor holds, the
+    # jobs this guard gates DO NOT RUN ANYWAY. `claim` needs [plan, secrets-guard] with no `if:`,
+    # and `plan` is gated on the same floor output, so a held tick already skips CLAIM; `plan-alert`
+    # requires `needs.secrets-guard.result == 'success'`, and a SKIPPED job's result is `skipped`,
+    # never `success`, so it skips too. The guard verifying settings on a held tick therefore
+    # protects nothing — it is pure observation — while costing an authenticated read from the one
+    # bucket that is currently the binding constraint on dispatch throughput. On an EXECUTING tick
+    # this job runs exactly as before and gates exactly as before.
+    #
+    # WHY IT MATTERS: `github.token` is ONE 5000/hr bucket shared repo-wide. MEASURED 2026-07-29
+    # 07:00-08:10Z (#1208): 41 dispatch runs started, 5 dispatched anything, and 69% of executable
+    # ticks were budget-deferred. Every deferred ring still paid for this job's settings reads
+    # against the bucket it was deferring to protect — and, when the budget was already gone, went
+    # RED reporting an "availability" failure that motivated re-ringing it. A held tick now costs
+    # this job nothing and produces no red row, and it self-clears with no human: a deferred tick
+    # writes NO anchor (#1190), so the first doorbell ring after `x-ratelimit-reset` executes and
+    # this guard verifies then.
+    needs: [tick-floor]
+    if: ${{ needs.tick-floor.outputs.proceed == 'true' }}
     # NO `continue-on-error` HERE, EVER (issue #618; closes the #276 advisory window opened
     # 2026-07-18 while #275's secret migration ran — that migration merged 2026-07-19). Job-level
     # `continue-on-error: true` is what made this fail-CLOSED control fail-OPEN: it does not merely
@@ -1501,6 +1526,7 @@ jobs:
           # added here goes RED instead of silently degrading a check to vacuous.
           sparse-checkout: |
             scripts/dispatch-secrets-guard.py
+            scripts/gh_403.py
             scripts/worker-live.sh
             scripts/worker-pr.py
             scripts/grant-account.py

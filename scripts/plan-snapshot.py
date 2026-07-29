@@ -83,6 +83,26 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+
+def _load_gh_403():
+    """Load scripts/gh_403.py (same checkout) — THE 403 taxonomy, shared with
+    dispatch-secrets-guard (registry #1208). By PATH, not `import gh_403`: `scripts/` is not a
+    package and the CWD a workflow step runs from is not this directory.
+
+    A load failure is FATAL and loud. This module's whole 403 policy (#819: which 403 is retried,
+    which stops the sweep) is defined there, and a missing taxonomy must never degrade into
+    "classify nothing, retry everything" — that is the exact behaviour #819 removed."""
+    path = Path(__file__).resolve().parent / "gh_403.py"
+    spec = importlib.util.spec_from_file_location("registry_gh_403_for_snapshot", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"cannot load registry helper {path} — the 403 taxonomy is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+gh_403 = _load_gh_403()
+
 RETRYABLE = {429, 500, 502, 503, 504}
 # 403 is deliberately NOT in RETRYABLE (issue #819). It is not one status, it is three different
 # server answers wearing the same number, and only one of them is a blip worth retrying:
@@ -99,8 +119,16 @@ RETRYABLE = {429, 500, 502, 503, 504}
 #
 # Until #819 every 403 took the retry path, so the tick that exhausted the budget answered by
 # issuing 3x the requests for every read, in 8 parallel threads.
-_SECONDARY_403_MARKERS = ("secondary rate limit", "abuse detection", "retry later")
-_BUDGET_403_MARKERS = ("rate limit exceeded", "rate limit for installation")
+#
+# THE TAXONOMY NOW LIVES IN scripts/gh_403.py (registry #1208), and this file is one of its two
+# consumers. It was moved because a SECOND component — dispatch-secrets-guard, which sees the same
+# 403 through `gh` CLI stderr rather than through response headers — had grown its own, coarser
+# copy that put every 403 in one "availability" bucket. One 403 must not have two diagnoses in one
+# pipeline. The markers and `classify_403` below are aliases of the shared definitions, NOT second
+# copies: rebinding is what makes divergence impossible, and `_test_classifier_is_the_shared_one`
+# pins the delegation so nobody can quietly re-inline it.
+_SECONDARY_403_MARKERS = gh_403.SECONDARY_403_MARKERS
+_BUDGET_403_MARKERS = gh_403.BUDGET_403_MARKERS
 LIST_PAGE_LIMIT = 50        # issues/pulls ceiling: 5000 entries, repo-level, sweep-fatal
 # Per-SHA ceiling backstop: 4000 entries (the f37d13f emergency bump — churned sparq heads
 # really do pass 1000, e.g. PR #2540 at 1061), and it now degrades PER ITEM, never per sweep.
@@ -210,66 +238,14 @@ def _retry_delay(exc, attempt):
     return 5 * (attempt + 1)
 
 
-def _header(headers, name):
-    """Case-insensitive single header read over anything dict-like (http.client.HTTPMessage,
-    a plain dict, or the dict a test hands an HTTPError). -> str|None."""
-    if headers is None:
-        return None
-    if hasattr(headers, "get"):
-        got = headers.get(name)
-        if got is not None:
-            return str(got)
-    try:
-        items = headers.items()
-    except AttributeError:
-        return None
-    lowered = name.lower()
-    for key, value in items:
-        if str(key).lower() == lowered:
-            return str(value)
-    return None
-
-
-def _retry_after_seconds(headers):
-    """The `Retry-After` header as a positive int, or 0. A date-form or malformed value is 0 —
-    the caller falls back to its own ladder rather than guessing at an HTTP-date."""
-    raw = _header(headers, "Retry-After")
-    if raw is None:
-        return 0
-    try:
-        seconds = int(raw.strip())
-    except ValueError:
-        return 0
-    return seconds if seconds > 0 else 0
-
-
-def _int_header(headers, name):
-    raw = _header(headers, name)
-    if raw is None:
-        return None
-    try:
-        return int(raw.strip())
-    except ValueError:
-        return None
-
-
-def classify_403(headers, body=""):
-    """-> 'secondary' | 'budget' | 'permission'. See the RETRYABLE block for what each means.
-
-    ORDER IS THE CONTRACT. `secondary` is tested first because a secondary-limit 403 can also
-    carry rate-limit headers; treating one as `budget` would stop a sweep that only needed to wait
-    the few seconds GitHub asked for. `budget` is tested before `permission` because a permission
-    refusal is the RESIDUAL class — the one with no positive evidence — and residual classes must
-    never be inferred from the ABSENCE of a header that a truncated response might simply have
-    dropped."""
-    text = (body or "").lower()
-    if _retry_after_seconds(headers) or any(m in text for m in _SECONDARY_403_MARKERS):
-        return "secondary"
-    if _int_header(headers, "x-ratelimit-remaining") == 0:
-        return "budget"
-    if any(m in text for m in _BUDGET_403_MARKERS):
-        return "budget"
-    return "permission"
+# Header readers + the classifier itself: ALIASES of the shared taxonomy (registry #1208), never
+# re-implementations. `classify_403`'s order contract, its docstring and its 27-failure measurement
+# all live in scripts/gh_403.py now; `the_three_403s_are_told_apart` below is unchanged and still
+# exercises the whole contract through this name, which is what proves the move changed nothing.
+_header = gh_403.header
+_retry_after_seconds = gh_403.retry_after_seconds
+_int_header = gh_403.int_header
+classify_403 = gh_403.classify_403
 
 
 def _budget_detail(headers):
@@ -1400,6 +1376,25 @@ def _self_test():
         # standing the tick down.
         assert classify_403({"Retry-After": "5", "x-ratelimit-remaining": "0"}, "") == "secondary"
 
+    def the_classifier_is_the_SHARED_one_not_a_local_copy():
+        """#1208. The check above passes just as happily against a private re-implementation, and a
+        private re-implementation is precisely the defect: dispatch-secrets-guard had one, and the
+        same 403 got two diagnoses in one pipeline — PLAN said "request budget exhausted", GUARD
+        said "an availability reason", and only one of those motivates a retry against a bucket at
+        zero.
+
+        So pin IDENTITY, not behaviour. Re-inline `classify_403` here (or copy the marker tuples
+        back) and this row goes red while every behavioural check above stays green."""
+        assert classify_403 is gh_403.classify_403, "classify_403 must BE the shared taxonomy's"
+        assert _SECONDARY_403_MARKERS is gh_403.SECONDARY_403_MARKERS
+        assert _BUDGET_403_MARKERS is gh_403.BUDGET_403_MARKERS
+        assert _header is gh_403.header
+        assert _retry_after_seconds is gh_403.retry_after_seconds
+        assert _int_header is gh_403.int_header
+        # ...and the shared module's OWN suite must pass, since this file's correctness now rests
+        # on it. A taxonomy that ships broken must not be adopted silently by its consumer.
+        assert gh_403._self_test(), "the shared gh_403 taxonomy's self-test must pass"
+
     def budget_403_is_not_retried_and_is_sweep_fatal():
         """Two properties, and BOTH are load-bearing at the call site:
 
@@ -1632,6 +1627,7 @@ def _self_test():
         sweep_fatal_listing_failure_is_still_fatal,
         retry_after_is_honoured_and_capped,
         the_three_403s_are_told_apart,
+        the_classifier_is_the_SHARED_one_not_a_local_copy,
         budget_403_is_not_retried_and_is_sweep_fatal,
         budget_403_is_never_downgraded_to_a_per_item_skip,
         the_reserve_stops_the_sweep_before_the_budget_is_gone,

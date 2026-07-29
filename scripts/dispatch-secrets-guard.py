@@ -143,6 +143,7 @@
 #
 # Pure verdict helpers + a stubbed-gh flow (including value-never-echoed sentinels) run under
 # --self-test (registry-selftest gate).
+import importlib.util
 import itertools
 import json
 import os
@@ -150,6 +151,33 @@ import re
 import subprocess
 import sys
 import time
+
+
+def _load_gh_403():
+    """Load scripts/gh_403.py (same checkout) — THE 403 taxonomy, shared with plan-snapshot
+    (registry #1208). By PATH, not `import gh_403`: `scripts/` is not a package and the CWD a
+    workflow step runs from is not this directory.
+
+    FAILS LOUD AND CLOSED, by design, and NAMED. This module is a fail-closed control, so a
+    missing dependency must never degrade a check into a verdict it did not earn — that is the
+    2026-07-25 dispatch halt (#616's undeclared `grant-account.py` load) verbatim. The two
+    protections against ever reaching this branch in production are the same two that closed that
+    class: `scripts/gh_403.py` is declared in SELF_TEST_LIVE_INPUTS, and
+    sparse_checkout_covers_verdict pins that list to the guard job's sparse-checkout block, so an
+    omission goes red in pr-gate's full checkout instead of halting dispatch."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gh_403.py")
+    spec = importlib.util.spec_from_file_location("registry_gh_403_for_guard", path)
+    if spec is None or spec.loader is None or not os.path.exists(path):
+        raise SystemExit(
+            f"::error::secrets-guard: the shared 403 taxonomy ({path}) is unavailable, so a failed "
+            "GitHub read cannot be classified — refusing to verify anything (fail closed). Add "
+            "scripts/gh_403.py to the secrets-guard job's sparse-checkout list in dispatch.yml.")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+gh_403 = _load_gh_403()
 
 ENVIRONMENT = "dispatch-secrets"
 REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
@@ -1187,6 +1215,13 @@ def guard_gate_verdict(workflow_text):
 # red until dispatch.yml's sparse-checkout list covers it.
 SELF_TEST_LIVE_INPUTS = (
     "scripts/dispatch-secrets-guard.py",
+    # THE 403 TAXONOMY (registry #1208). Loaded at MODULE IMPORT by _load_gh_403, so it is a live
+    # input of `--self-test` and of the live verification alike — and its absence is not a
+    # degraded check but a dead module. Declared here so sparse_checkout_covers_verdict pins it to
+    # the guard job's sparse-checkout block and pr-gate's full checkout catches an omission at
+    # review time, which is the control that exists because #616's undeclared by-path script load
+    # halted dispatch for a day.
+    "scripts/gh_403.py",
     "scripts/worker-live.sh",
     "scripts/worker-pr.py",
     "policy/repos.toml",
@@ -2163,14 +2198,44 @@ _TRANSIENT_READ_MARKERS = (
 )
 _TRANSIENT_STATUS = ("403", "429", "500", "502", "503", "504")
 _STATUS_RE = re.compile(r"HTTP[ :]*([1-5]\d\d)\b|\(HTTP ([1-5]\d\d)\)")
+# The statuses on which the 403 taxonomy is consulted. 403 is the real one; None is here because
+# `gh`'s message is TRUNCATED by some callers and by its own wrapping, and the measured primary
+# wording ("API rate limit exceeded for installation. For more information about rate limiting,
+# see https://docs.github.com/...") is long enough that the trailing `(HTTP 403)` is the first
+# thing to go — registry #710 measured exactly that excerpt on the live sink. A budget message
+# whose status was cut off is still a budget message.
+_BUDGET_CANDIDATE_STATUS = (None, "403")
 
 
 def classify_read_failure(stderr):
-    """-> 'transient' | 'refusal'. Which class a failed `gh api` GET belongs to.
+    """-> 'budget' | 'transient' | 'refusal'. Which class a failed `gh api` GET belongs to.
 
     `transient` requires BOTH a throttle/availability marker AND a status that can carry one, so a
     404 body that happens to contain the word "timeout" is still a refusal. Everything else is
-    `refusal`, which is what preserves today's behaviour for genuine settings gaps."""
+    `refusal`, which is what preserves today's behaviour for genuine settings gaps.
+
+    `budget` (registry #1208) IS CARVED OUT OF `transient`, NEVER OUT OF `refusal`, and the
+    structure below is written so that is checkable by reading rather than by trusting a comment:
+    both `refusal` returns come FIRST and are byte-identical to the pre-#1208 conditions, and the
+    new branch sits strictly inside what used to be the single `return "transient"`. So every
+    input that refused before still refuses, and the only inputs that change answer are ones that
+    were already being treated as "the guard could not look" — a class that fails closed either
+    way. That is the whole safety argument for this change.
+
+    WHY THE DISTINCTION IS WORTH DRAWING. Both classes fail closed, so the DECISION is identical;
+    what differs is what the guard TELLS THE OPERATOR, and those two things imply opposite
+    responses. An availability blip clears on its own in seconds and re-running is free. A primary
+    budget exhaustion carries NO `Retry-After`, resets on a clock up to an hour away, and every
+    retry spends a request from a bucket that has none — so "transient, recovers on its own" is
+    both false and actively harmful advice. MEASURED 2026-07-29 06:00-09:00Z: GUARD failed on 16 of
+    51 started dispatch runs (31%) calling this "an availability reason", and on the 4 of those
+    where the FLOOR admitted the tick, PLAN reached the same 403 and printed the truth —
+    `x-ratelimit-remaining=0/5000`.
+
+    THE EVIDENCE HERE IS WEAKER THAN PLAN'S, AND THE WORDING SAYS SO. `gh api` surfaces an error as
+    a message on stderr; the response headers are gone by then, so unlike plan-snapshot this cannot
+    read `x-ratelimit-remaining` and never claims to. It classifies from GitHub's own wording via
+    the shared taxonomy's TEXT entry point."""
     text = (stderr or "").lower()
     if not any(marker in text for marker in _TRANSIENT_READ_MARKERS):
         return "refusal"
@@ -2178,10 +2243,15 @@ def classify_read_failure(stderr):
     status = (match.group(1) or match.group(2)) if match else None
     # A statusless failure carrying an availability marker (a dropped connection never gets a
     # status line) is transient; a status we CAN read must be one of the throttle/5xx classes.
-    return "transient" if status is None or status in _TRANSIENT_STATUS else "refusal"
+    if status is not None and status not in _TRANSIENT_STATUS:
+        return "refusal"
+    # Everything from here down was `return "transient"` before #1208.
+    if status in _BUDGET_CANDIDATE_STATUS and gh_403.is_budget_exhaustion_text(stderr):
+        return "budget"
+    return "transient"
 
 
-def _api(path, transient_reads=None):
+def _api(path, transient_reads=None, budget_reads=None):
     """Read-only `gh api` GET. Returns the parsed JSON document, or None on any failure —
     sanitized: neither stderr nor the payload is ever echoed (GH_DEBUG=api can echo request
     bodies; an error page is remote-controlled content).
@@ -2190,13 +2260,23 @@ def _api(path, transient_reads=None):
     (a 403 throttle, a 429, a 5xx, a dropped connection) appends the endpoint to it. `main` uses
     that to tell "the settings are wrong" apart from "I could not check the settings" — the two
     were indistinguishable, so a budget outage printed a maintainer action item no human could act
-    on (issue #819's 06:19-06:32Z runs printed the #101 remediation having verified nothing)."""
+    on (issue #819's 06:19-06:32Z runs printed the #101 remediation having verified nothing).
+
+    `budget_reads` is the SAME "I could not look" class, split out (#1208) for the one sub-case
+    whose honest remedy is different: the request budget is spent, so the wait is a machine clock
+    and re-running costs a request nobody has. Both lists drive the identical FAIL-CLOSED decision;
+    they select only the wording. A caller that passes `transient_reads` but not `budget_reads`
+    gets the pre-#1208 behaviour with budget failures folded back into the transient list, so no
+    proven-unverified read is ever LOST by this split — that would be the one way this change could
+    turn an unverified failure back into a settings accusation."""
     result = subprocess.run(["gh", "api", path], capture_output=True, text=True)
     if result.returncode != 0:
-        if (transient_reads is not None
-                and classify_read_failure(getattr(result, "stderr", "")) == "transient"):
-            # The PATH only. stderr is never surfaced: it can carry request bodies under
-            # GH_DEBUG=api, and an error page is remote-controlled content.
+        kind = classify_read_failure(getattr(result, "stderr", ""))
+        # The PATH only. stderr is never surfaced: it can carry request bodies under
+        # GH_DEBUG=api, and an error page is remote-controlled content.
+        if kind == "budget" and budget_reads is not None:
+            budget_reads.append(path)
+        elif kind in ("transient", "budget") and transient_reads is not None:
             transient_reads.append(path)
         return None
     try:
@@ -2231,27 +2311,34 @@ def main():
     # but they are NOT evidence that any setting is wrong, so they must not print the maintainer
     # action item. See classify_read_failure.
     transient_reads = []
+    # The same "could not look" class, split for WORDING ONLY (#1208): a spent request budget is a
+    # machine-cleared wait, not an availability blip, and telling an operator otherwise invites the
+    # one response that makes it worse. Same fail-closed decision. See classify_read_failure.
+    budget_reads = []
     unverified = []
 
     def _unverified(message):
-        """Record a failure caused by a read that did not complete. Attributed to the transient
-        class only when the read that produced it was PROVEN transient."""
+        """Record a failure caused by a read that did not complete. Attributed to the unverified
+        class only when the read that produced it was PROVEN not to be a settings finding —
+        transient OR budget-exhausted. Both are "the guard could not look"; neither is evidence
+        about any setting."""
         failures.append(message)
-        if transient_reads:
+        if transient_reads or budget_reads:
             unverified.append(message)
 
-    repo_doc = _api(f"repos/{repo}", transient_reads)
+    repo_doc = _api(f"repos/{repo}", transient_reads, budget_reads)
     default_branch = repo_doc.get("default_branch") if isinstance(repo_doc, dict) else None
     if not isinstance(default_branch, str) or not default_branch:
         _unverified("cannot resolve the repository default branch (fail closed)")
     else:
-        environment_doc = _api(f"repos/{repo}/environments/{ENVIRONMENT}", transient_reads)
+        environment_doc = _api(f"repos/{repo}/environments/{ENVIRONMENT}",
+                               transient_reads, budget_reads)
         if environment_doc is None:
             _unverified(f"environment `{ENVIRONMENT}` is missing or unreadable")
         else:
             policies_doc = _api(
                 f"repos/{repo}/environments/{ENVIRONMENT}/deployment-branch-policies",
-                transient_reads)
+                transient_reads, budget_reads)
             policy_ok, reason = branch_policy_verdict(
                 environment_doc, policies_doc, default_branch)
             if not policy_ok:
@@ -2266,13 +2353,35 @@ def main():
         # action item — an API outage that manufactures one costs a human a trip to a settings page
         # that is already correct, and buries the real signal (#819).
         if unverified and len(unverified) == len(failures):
-            print(f"::error::secrets-guard: TRANSIENT — {len(transient_reads)} GitHub read(s) "
-                  f"failed for an availability reason ({', '.join(sorted(set(transient_reads)))}), "
-                  "so the settings above are UNVERIFIED, not known-wrong. This is NOT a settings "
-                  "finding and NO maintainer action is implied: the guard fails closed until a "
-                  "tick completes the reads, and recovers on its own when they do. If the "
-                  "dispatcher is also failing in PLAN, this is the same request-budget "
-                  "exhaustion — see scripts/dispatch-tick-floor.py (#819).")
+            # WHICH unverified wording. Budget wins whenever ANY read proved exhaustion, because
+            # the two messages differ in the advice they imply and only one of them is true then:
+            # "recovers on its own when a tick completes the reads" invites the retry that a bucket
+            # at zero cannot pay for. Availability is the residual — the class with no positive
+            # budget evidence — which is the same polarity rule the marker table above uses.
+            if budget_reads:
+                print(f"::error::secrets-guard: BUDGET — {len(budget_reads)} GitHub read(s) were "
+                      f"refused ({', '.join(sorted(set(budget_reads)))}) because the shared "
+                      "`github.token` REQUEST BUDGET IS SPENT (GitHub's primary rate-limit "
+                      "wording is the evidence — this job reads through `gh`, so unlike PLAN it "
+                      "cannot see `x-ratelimit-remaining` and does not claim to). The settings "
+                      "above are UNVERIFIED, not known-wrong: this is "
+                      "NOT a settings finding, NO maintainer action is implied, and it is NOT an "
+                      "availability problem. DO NOT RE-RUN THE TICK TO CLEAR IT — this 403 carries "
+                      "no `Retry-After`, it clears only when `x-ratelimit-reset` arrives (up to an "
+                      "hour away), and every retry spends a request from a bucket that has none. "
+                      "THE WAIT IS MACHINE-CLEARED: scripts/dispatch-tick-floor.py defers on the "
+                      "same condition and writes no anchor (#1190), so the first doorbell ring "
+                      "after the reset executes immediately and this guard verifies then. If PLAN "
+                      "is failing too, it is this same exhaustion — see #819, #1208.")
+            else:
+                print(f"::error::secrets-guard: TRANSIENT — {len(transient_reads)} GitHub read(s) "
+                      f"failed for an availability reason "
+                      f"({', '.join(sorted(set(transient_reads)))}), "
+                      "so the settings above are UNVERIFIED, not known-wrong. This is NOT a "
+                      "settings finding and NO maintainer action is implied: the guard fails "
+                      "closed until a tick completes the reads, and recovers on its own when they "
+                      "do. If the dispatcher is also failing in PLAN, this is the same "
+                      "request-budget exhaustion — see scripts/dispatch-tick-floor.py (#819).")
         else:
             print(f"::error::{REMEDIATION}")
         return 1
@@ -3155,6 +3264,24 @@ def _self_test():
     chk("GATE (LIVE): dispatch.yml's guard carries no continue-on-error and every "
         "secret-consuming job in the file is gated on it",
         guard_gate_verdict(live_docs.get("dispatch.yml", "")), (True, "ok"))
+    # LIVE [#1208]: THE GUARD JOB IS NOW ITSELF GATED on the #819 rate floor, so it no longer runs
+    # on a tick the floor holds. That is admissible ONLY because a guard that does not run must not
+    # admit anything, and a SKIPPED job's `result` is `skipped` — never `success`. The two consumers
+    # are checked by the two mechanisms that own them:
+    #   * `claim` carries no job-level `if:`, so GitHub's implicit needs-must-succeed skips it with
+    #     its dependency. dispatch-tick-floor's seam test pins the absence of that `if:`.
+    #   * `plan-alert` re-states the dependency because its `always()` cancels the implicit gate.
+    #     if_condition_admits decides that polarity for EVERY non-success result, `skipped`
+    #     included, and the row below asserts it against the LIVE expression rather than a sample.
+    # If either ever became admitting, gating the guard would convert a held tick into an UNGATED
+    # tick. It cannot: a held tick already skips `plan`, and `claim` needs `plan` too.
+    live_alert_if = job_if_expression(
+        (workflow_job_docs(live_docs.get("dispatch.yml", "")) or {}).get("plan-alert") or {})
+    chk("GATE (LIVE) [#1208]: a SKIPPED guard does NOT admit plan-alert — so gating the guard on "
+        "the floor can only ever skip MORE jobs, never admit one",
+        (live_alert_if is not None,
+         if_condition_admits(live_alert_if or "", GATE_SUCCESS_RE)[:2]),
+        (True, (False, True)))
     # LIVE: the guard job's sparse checkout must carry every file this self-test reads, so no
     # check can degrade to vacuous (or misleading) on a dispatch tick while passing in pr-gate.
     chk("GATE (LIVE): the guard job's sparse checkout covers every self-test live input",
@@ -3734,8 +3861,7 @@ printf '5\n'
         # read 403'd on an exhausted request budget, so the environment and branch-policy checks
         # never executed. Delete the `unverified` partition (or the `if`) and these go red.
         budget_403 = ("gh: API rate limit exceeded for installation. (HTTP 403)")
-        for label, stderr in (("primary budget 403", budget_403),
-                              ("secondary rate limit 403",
+        for label, stderr in (("secondary rate limit 403",
                                "gh: You have exceeded a secondary rate limit (HTTP 403)"),
                               ("502 from the API", "gh: Bad Gateway (HTTP 502)"),
                               ("dropped connection", "error connecting: unexpected EOF")):
@@ -3761,11 +3887,108 @@ printf '5\n'
         chk("#819 classify: a 404 whose body merely mentions a timeout is still a refusal",
             classify_read_failure("gh: Not Found (HTTP 404) request timed out earlier"),
             "refusal")
-        chk("#819 classify: the primary installation-budget 403 is transient",
-            classify_read_failure(budget_403), "transient")
         chk("#819 classify: a permission 403 is NOT transient",
             classify_read_failure("gh: Resource not accessible by integration (HTTP 403)"),
             "refusal")
+
+        # ---- #1208: the BUDGET 403 is not an availability blip ------------------------------
+        # Same fail-closed DECISION as #819 gave it; different, honest DIAGNOSIS. A primary budget
+        # exhaustion carries no Retry-After and resets on a clock up to an hour away, so calling it
+        # "an availability reason" that "recovers on its own" motivates exactly the retry that a
+        # bucket at zero cannot pay for.
+        chk("#1208 classify: the primary installation-budget 403 is BUDGET, not transient",
+            classify_read_failure(budget_403), "budget")
+        chk("#1208 classify: the user-token wording of the same limit is BUDGET too",
+            classify_read_failure("gh: API rate limit exceeded for user ID 4783300. (HTTP 403)"),
+            "budget")
+        # A TRUNCATED budget message (registry #710 measured the trailing `(HTTP 403)` cut off by a
+        # 200-char stderr excerpt) is still a budget message: a status-first reader sees nothing.
+        chk("#1208 classify: a budget 403 whose STATUS was truncated away is still BUDGET",
+            classify_read_failure("gh: API rate limit exceeded for installation. For more "
+                                  "information about rate limiting, see https://docs.github.com/"),
+            "budget")
+        # THE SEPARATION THAT MATTERS. The secondary limiter clears in seconds and GitHub tells you
+        # when; conflating the two would stand a tick down for an hour over a 30s wait.
+        chk("#1208 classify: the SECONDARY limit stays transient (it clears in seconds — standing "
+            "the tick down for an hour over it would be the opposite error)",
+            classify_read_failure("gh: You have exceeded a secondary rate limit (HTTP 403)"),
+            "transient")
+        # FAIL-CLOSED, RESTATED AS A PARTITION. Carving `budget` out of `transient` must not have
+        # moved anything out of `refusal`: every input that refused before still refuses.
+        for stderr in ("gh: Not Found (HTTP 404)",
+                       "gh: Not Found (HTTP 404) request timed out earlier",
+                       "gh: Resource not accessible by integration (HTTP 403)",
+                       "gh: Bad credentials (HTTP 401)",
+                       "gh: Validation Failed (HTTP 422) rate limit exceeded",
+                       "SENTINEL-STDERR"):
+            chk(f"#1208 partition: {stderr[:44]!r} still REFUSES (budget was carved out of the "
+                "transient class, never out of the refusal class)",
+                classify_read_failure(stderr), "refusal")
+
+        rc_b, out_b = run_main(empty_scope, {repo_path: None}, stderr=budget_403)
+        chk("#1208 flow: a budget 403 fails CLOSED (rc 1) and reports BUDGET, with NO maintainer "
+            "action item and NO false availability claim",
+            (rc_b, "BUDGET —" in out_b, "REQUIRED maintainer settings" in out_b,
+             "UNVERIFIED, not known-wrong" in out_b,
+             "failed for an availability reason" in out_b, "TRANSIENT —" in out_b),
+            (1, True, False, True, False, False))
+        chk("#1208 flow: the budget report tells the operator NOT to retry, and says the wait is "
+            "machine-cleared (this is the whole point — the old wording invited the retry)",
+            ("DO NOT RE-RUN" in out_b, "MACHINE-CLEARED" in out_b.upper(),
+             "no `Retry-After`" in out_b, "x-ratelimit-reset" in out_b), (True,) * 4)
+        chk("#1208 flow: the budget report never echoes the raw stderr either",
+            ("rate limit exceeded for installation" in out_b, "SENTINEL-STDERR" in out_b),
+            (False, False))
+        # KNOWN POSITIVE, on the budget path specifically. A genuine settings violation discovered
+        # while the budget is gone must STILL refuse loudly with the maintainer wording — the
+        # demotion is only ever "every failure is unverified", and this is the row that proves the
+        # new branch did not widen it.
+        rc_kp, out_kp = run_main(leaked, {repo_path: None}, stderr=budget_403)
+        chk("#1208 KNOWN POSITIVE: a real repo-scope secret leak alongside a BUDGET-exhausted read "
+            "still refuses LOUDLY with the maintainer remediation intact",
+            (rc_kp, "REQUIRED maintainer settings" in out_kp,
+             "REGISTRY_ADMIN_APP_KEY" in out_kp, "sentinel-private-key" in out_kp,
+             "BUDGET —" in out_kp), (1, True, True, False, False))
+        # #1190'S MESSAGE FIX, FROZEN. The transient wording was corrected once already (it used to
+        # demand three repo-settings changes); it is validated in production and must not drift.
+        # Pinned as a literal so a reflow, a reword, or a "helpful" merge of the two messages reds
+        # THIS row and names what it broke.
+        transient_out = run_main(empty_scope, {repo_path: None},
+                                 stderr="gh: Bad Gateway (HTTP 502)")[1]
+        chk("#1190 message fix PRESERVED byte-for-byte (the transient wording that replaced the "
+            "spurious three-settings demand)",
+            [line for line in transient_out.splitlines() if "TRANSIENT —" in line],
+            ["::error::secrets-guard: TRANSIENT — 1 GitHub read(s) failed for an availability "
+             "reason (repos/org/registry), so the settings above are UNVERIFIED, not known-wrong. "
+             "This is NOT a settings finding and NO maintainer action is implied: the guard fails "
+             "closed until a tick completes the reads, and recovers on its own when they do. If "
+             "the dispatcher is also failing in PLAN, this is the same request-budget exhaustion "
+             "— see scripts/dispatch-tick-floor.py (#819)."])
+        # THE SHARED TAXONOMY — and the row that had to be DERIVED, not hand-listed.
+        #
+        # Every hand-written fixture above is satisfied by a private re-implementation: replacing
+        # the shared call with an inline `"api rate limit" in stderr.lower()` passed the ENTIRE
+        # suite (measured — mutant T7 survived a first round of this work). The hand-listed
+        # examples all happen to contain that substring, so they cannot distinguish "uses the
+        # shared taxonomy" from "happens to agree with it on the cases I thought of".
+        #
+        # So DERIVE the obligation from the shared marker set itself: every marker gh_403 knows
+        # about must be recognised HERE. A private copy recognises only the markers whoever wrote
+        # it happened to think of, and a marker added to gh_403 tomorrow extends this row
+        # automatically instead of silently going unchecked on this side.
+        assert gh_403.BUDGET_403_MARKERS, "an empty marker set would make the row below vacuous"
+        chk("#1208: EVERY budget marker the shared taxonomy knows is recognised here — derived "
+            "from gh_403.BUDGET_403_MARKERS, so an inline re-implementation that covers only the "
+            "wordings someone remembered goes RED",
+            {marker: classify_read_failure(f"gh: You have hit the {marker} limit. (HTTP 403)")
+             for marker in gh_403.BUDGET_403_MARKERS},
+            {marker: "budget" for marker in gh_403.BUDGET_403_MARKERS})
+        chk("#1208: ...and the module those markers come from is the one plan-snapshot loads",
+            (gh_403.classify_403_text is not None,
+             classify_read_failure.__globals__["gh_403"].__name__),
+            (True, "registry_gh_403_for_guard"))
+        chk("#1208: the shared taxonomy's own self-test passes (this guard's classification now "
+            "rests on it)", gh_403._self_test(), True)
         rc_garbled, _out = run_main("SENTINEL {not json", verified_docs)
         chk("flow: malformed ALL_SECRETS -> rc 1 (fail closed)", rc_garbled, 1)
         rc_repo, _out = run_main(empty_scope, verified_docs, registry_repo="bad repo$name")
