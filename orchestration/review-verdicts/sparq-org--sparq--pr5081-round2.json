@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5081,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d73e3e0b69910a402dbfab9bb881f8e4a9423daa",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major completeness defect is fixed. The analyzer now excludes tasks lacking either baseline or capability answers, records a blocking reason, and cannot recommend adoption when those omissions make the run incomplete. The added tests cover a missing answer on either arm, all baseline answers absent while token pairs remain complete, and explicit null answers; they exercise the real verdict path and pass. The remaining refusal gates and documentation are consistent with the pre-registration's complete-pair requirement.",
+  "verdict": "approve"
+ }
+}
