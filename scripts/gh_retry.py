@@ -56,6 +56,14 @@ HARD SCOPE RULE (do not widen):
     attempt — a replay duplicates comments, repeats state transitions, or double-dispatches a
     worker (incident #559's storm class). Their fail-loud semantics are deliberate (#558).
 
+ARGV CONTRACT (registry #1137): every entry point here runs ``["gh", *args]`` — the binary is
+prepended by this layer, so an argv must START AT THE SUBCOMMAND (``["api", ...]``, never
+``["gh", "api", ...]``). A doubled binary is refused by `doubled_binary_reject` at the entry
+point rather than executed: `gh gh api …` is `unknown command "gh" for "gh"`, i.e. rc=1 on EVERY
+call, and it also parses as verb ``("gh","api")`` — outside `_READ_VERBS` — so the read silently
+loses its retries and logs a self-contradictory refusal naming a verb that IS in the admit-list.
+`latch-watchdog` shipped that shape and failed 16 runs out of 16 before anyone read the argv.
+
 SHELL CALLERS (PR #595 finding 6): `python3 scripts/gh_retry.py read <gh args...>` runs ONE
 idempotent read through this same policy and exits with gh's own status, so a workflow step gets the
 bounded backoff without hand-rolling (and drifting from) the loop in bash. The subcommand is
@@ -358,6 +366,20 @@ class GhResult(subprocess.CompletedProcess):
         self.gh_read_scoped = read_scoped
 
 
+def doubled_binary_reject(args):
+    """Reason string when `args` already begins with the binary this layer prepends, else None.
+
+    ONE definition, two consumers (`run_gh` raises on it, `read_cli_reject` refuses on it), because
+    a rule written twice drifts. There is no `gh gh` subcommand, so this is never a live argv being
+    refused — it is a caller bug that today executes and fails on every single call."""
+    listed = list(args)
+    if listed and listed[0] == "gh":
+        return ("argv must start with the gh SUBCOMMAND, not 'gh': this layer already runs "
+                f"['gh', *args], so {listed[:2]!r} would execute `gh gh …` and fail every call "
+                "(registry #1137)")
+    return None
+
+
 def run_gh(args, *, env=None, input=None, attempts=MAX_ATTEMPTS,
            classify=None, sleep=sleep_backoff, debug_status=True, log=None):
     """Run ``gh <args>`` (capture_output, text, check=False), retrying only retryable failures.
@@ -375,6 +397,13 @@ def run_gh(args, *, env=None, input=None, attempts=MAX_ATTEMPTS,
     refusal that could red a scheduled run outright.
     """
     listed = list(args)
+    # FAIL LOUD, BEFORE the subprocess. A doubled binary cannot succeed on any endpoint, so there
+    # is nothing to degrade to: running it once "conservatively" is 100 % failure with a scope
+    # refusal in front of it, which is how #1137 stayed alive for 16 red runs under a green
+    # self-test. Raising makes it a caller bug at the seam it belongs to.
+    doubled = doubled_binary_reject(listed)
+    if doubled:
+        raise ValueError(f"gh_retry.run_gh: {doubled}")
     report = log if log is not None else (lambda line: print(line, file=sys.stderr, flush=True))
     scope_reason = read_cli_reject(listed)
     read_scoped = scope_reason is None
@@ -484,6 +513,12 @@ def read_cli_reject(args):
     """Return a rejection reason for `args`, or None when it is an admissible IDEMPOTENT READ."""
     if not args:
         return "usage: gh_retry.py read <gh read args...>"
+    # Ahead of the verb check on purpose: `gh api …` parses as verb ("gh","api"), which is not in
+    # `_READ_VERBS`, so the generic branch below would answer with a refusal that names `api` in
+    # its own admit-list — true, useless, and it hides the actual defect.
+    doubled = doubled_binary_reject(args)
+    if doubled:
+        return doubled
     shape = gh_request_shape(args)
     if shape["verb"] not in _READ_VERBS:
         return (f"refusing to retry {' '.join(args[:2])!r}: the read wrapper admits only "
@@ -826,6 +861,72 @@ def _self_test():
         code = read_cli(argv, runner=mutating, out=io.StringIO(), err=io.StringIO())
         check(f"read CLI refuses {' '.join(argv) or '(empty)'}", (refused, code), (True, 2))
     check("a refused call never reached gh", mutating.calls, [])
+
+    # ---- registry #1137: the DOUBLED BINARY. `run_gh` execs ["gh", *args], so an argv that -----
+    # already starts with "gh" runs `gh gh api …` and fails 100 % of the time. latch-watchdog
+    # shipped exactly that and concluded `failure` on 16 of 16 runs while printing a green
+    # self-test, because nothing anywhere asserted the argv the tool actually executes.
+    check("#1137 an argv starting at the SUBCOMMAND is admitted (the accept direction)",
+          doubled_binary_reject(["api", "graphql", "-f", "query=x"]), None)
+    check("#1137 an empty argv is not mistaken for a doubled binary",
+          doubled_binary_reject([]), None)
+    check("#1137 'gh' appearing anywhere OTHER than argv[0] is untouched — a repo named `gh` is "
+          "a legitimate read target",
+          (doubled_binary_reject(["api", "repos/gh/gh/pulls/7"]),
+           doubled_binary_reject(["pr", "view", "7", "-R", "gh/gh"])), (None, None))
+    doubled_reason = doubled_binary_reject(["gh", "api", "graphql"])
+    check("#1137 a doubled binary is REFUSED, and the reason names the real defect rather than a "
+          "verb that is in the admit-list",
+          (doubled_reason is not None, "SUBCOMMAND" in (doubled_reason or ""),
+           "admits only" in (doubled_reason or "")), (True, True, False))
+    # THE PRODUCTION SEAM: `run_gh` must refuse BEFORE the subprocess, not run it once. Both
+    # directions in one experiment — deleting the raise leaves `spawned` non-empty (and `raised`
+    # False), which reds; and the control argv on the same stub must still reach gh exactly once.
+    real_run = subprocess.run
+    spawned = []
+
+    def _record_spawn(cmd, **kwargs):
+        spawned.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
+
+    try:
+        subprocess.run = _record_spawn
+        raised = None
+        try:
+            run_gh(["gh", "api", "graphql", "-f", "query=x"])
+        except ValueError as exc:
+            raised = str(exc)
+        check("#1137 run_gh RAISES on a doubled binary and spawns NO process",
+              (raised is not None, spawned), (True, []))
+        # The SHELL entry point has its own refusal (it consults `read_cli_reject` before ever
+        # reaching `run_gh`), so it is asserted on its own terms: the status, the reason it gives,
+        # and that nothing was spawned. Without the reason clause, deleting the doubled branch in
+        # `read_cli_reject` survives — the verb branch below it also returns 2.
+        check("#1137 read_cli refuses a doubled binary with the usage status and the DOUBLED "
+              "reason, runner untouched",
+              (read_cli(["gh", "api", "repos/o/r"], runner=_Stub(), out=io.StringIO(),
+                        err=io.StringIO()),
+               "admits only" in (read_cli_reject(["gh", "api", "repos/o/r"]) or ""),
+               "SUBCOMMAND" in (read_cli_reject(["gh", "api", "repos/o/r"]) or ""),
+               spawned), (2, False, True, []))
+        # CONTROL on the identical stub: the corrected argv is not refused, and what reaches the
+        # process starts with exactly one "gh". Without this row the guard above could be
+        # satisfied by a run_gh that refuses everything.
+        logged = []
+        run_gh(["api", "graphql", "-f", "query=x"], log=logged.append)
+        check("#1137 CONTROL: the corrected argv reaches gh, with the binary prepended EXACTLY "
+              "once",
+              [cmd[:3] for cmd in spawned], [["gh", "api", "graphql"]])
+        # The secondary defect in #1137: with the doubled argv the verb parsed as ("gh","api"),
+        # so the scope layer logged `admits only ['api', …]` about an argv whose second token IS
+        # `api`. Corrected, a graphql call is still refused a retry — but ON ITS MERITS, as the
+        # implicit POST it really is, which is the message an operator can act on.
+        check("#1137 the corrected argv is refused a retry as a non-GET, never with the "
+              "self-contradictory 'admits only' verb message",
+              ([line for line in logged if "admits only" in line],
+               any("non-GET" in line for line in logged)), ([], True))
+    finally:
+        subprocess.run = real_run
 
     # ---- registry #748: STATUSLESS read failures, status recovery, and the scope boundary --------
     # G1 — THE mutant that matters. `unexpected end of JSON input` with no status anywhere is the
