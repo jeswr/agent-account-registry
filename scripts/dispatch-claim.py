@@ -7680,6 +7680,13 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         raise DispatchError("worker workflow ref is missing or unsafe")
 
     dispatched = 0
+    # [Gate A telemetry] PER-TARGET worker-lane accounting. `lanes` is fleet-wide, and `dispatched`
+    # additionally folds in review/fix launches, so neither can be compared against a target's
+    # frontier width. This map is the REALISED half of the planned-vs-realised distinction the
+    # crate-region-parallelism Gate A criterion is written against; dispatch-telemetry.py joins it
+    # onto the PLAN-side census. Coarse counts only — no issue numbers, no account handles.
+    worker_by_repo = {}
+
     # Zero-dispatch visibility (registry #28/#32): count the ready items the PLAN carried and, per
     # tick, WHY each was NOT launched. A tick that PLANNED work but launched NOTHING is a health
     # signal (capacity/access/lease contention, not an empty backlog); the CLAIM step records it +
@@ -7713,7 +7720,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
     # planned>0/launched-0 summary for the workflow's always()-guarded tick recorder — instead of
     # a missing file that used to read as planned=0 and record nothing. The final write below
     # overwrites it with the real launched count + histogram.
-    _write_dispatch_summary(planned, 0, defer_reasons, lanes)
+    _write_dispatch_summary(planned, 0, defer_reasons, lanes, by_repo=worker_by_repo)
     for repository in plan["repositories"]:
         repo = repository["target_repo"]
         try:
@@ -7942,6 +7949,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         for item in repository["items"]:
             number = item["number"]
             lanes["worker"]["planned"] += 1
+            _bump_repo_count(worker_by_repo, repo, "planned")
             if number in linked_open_prs:
                 defer_reasons["existing-pr"] += 1
                 print(f"defer {repo}#{number}: an open worker/closing PR already exists")
@@ -8436,6 +8444,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 continue
             dispatched += 1
             lanes["worker"]["launched"] += 1
+            _bump_repo_count(worker_by_repo, repo, "launched")
             kind = "deferred-retry" if item["deferred"] else "worker"
             # Privacy (locked decision 22b): public workflow logs never carry account handles.
             print(f"dispatched {kind} {repo}#{number}: model={model}, claim={claim_id[:8]}")
@@ -8485,7 +8494,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
 
     # Final summary (registry #28/#32): overwrite the early claim-start write with the real
     # launched count + defer-reason histogram + per-lane counts.
-    _write_dispatch_summary(planned, dispatched, defer_reasons, lanes)
+    _write_dispatch_summary(planned, dispatched, defer_reasons, lanes, by_repo=worker_by_repo)
 
     # Fail LOUD on ledger rot (issue #28): a tick that launched NOTHING because the lease ledger
     # errored (CAS failures, unreadable ledger, auth) is byte-identical to a genuinely empty
@@ -8534,15 +8543,50 @@ def _lane_summary(lanes):
     return summary
 
 
-def _write_dispatch_summary(planned, dispatched, defer_reasons, lanes=None):
+def _bump_repo_count(by_repo, repo_name, key):
+    """[Gate A telemetry] Increment ONE per-target worker-lane counter, in place.
+
+    MODULE-LEVEL, and that is the point. This was a closure inside `dispatch()` that no test ever
+    CALLED: `_by_repo_summary` below is pure and stays green without it, and the call-site
+    assertions in --self-test read `inspect.getsource(dispatch)`, so they stay green too. Gutting
+    the counter's BODY to `pass` therefore survived the entire suite while making
+    `realised_dispatches` read 0 forever — Gate A permanently closed on a fabricated number, which
+    is the marquee guard of this change. Out here it has a direct, behavioural test.
+    """
+    row = by_repo.setdefault(repo_name, {"planned": 0, "launched": 0})
+    row[key] += 1
+    return by_repo
+
+
+def _by_repo_summary(by_repo):
+    """[Gate A telemetry] Normalise the per-target worker-lane counts for the summary file.
+
+    `launched` is CLAMPED to `planned`: the realised count must never exceed the rows the lane
+    actually saw, or a corrupted counter would manufacture a passing Gate A ratio. Coarse counts
+    only, keyed by `owner/repo`."""
+    out = {}
+    for repo, counts in (by_repo or {}).items():
+        if not isinstance(repo, str) or not isinstance(counts, dict):
+            continue
+        planned = int(counts.get("planned", 0) or 0)
+        launched = int(counts.get("launched", 0) or 0)
+        out[repo] = {"planned": max(0, planned), "launched": max(0, min(launched, planned))}
+    return out
+
+
+def _write_dispatch_summary(planned, dispatched, defer_reasons, lanes=None, by_repo=None):
     """Zero-dispatch visibility (registry #28/#32): emit a compact, privacy-safe summary
-    ({planned, dispatched, frontier_size, ledger, defer_reasons histogram, lanes}) for the CLAIM
+    ({planned, dispatched, frontier_size, ledger, defer_reasons histogram, lanes, by_repo}) for the
+    CLAIM
     step to render + record. `frontier_size` is the ready-frontier size the tick observed (==
     planned) and `ledger` is ok|error — together they let the run summary distinguish an empty
     frontier from a lease-ledger failure (issue #28), which both otherwise present as a green
     0-dispatch tick. `lanes` (issue #108) carries the worker/review/fix/disarm decomposition so the
     tick-health recorder can surface a stalled lane — or a failed safety disarm — regardless of
     activity in the other lanes. NO issue numbers or account handles — only coarse category counts.
+    `by_repo` (Gate A telemetry) carries the PER-TARGET worker-lane {planned, launched} split that
+    neither `lanes` (fleet-wide) nor `dispatched` (worker+review+fix) can express, so realised
+    dispatches can be compared against that target's own frontier width.
     Best-effort file write; a failure here must never fail dispatch. Called at claim START (planned
     only — review defect #6) and again at the end with the launched counts."""
     summary_path = os.environ.get("DISPATCH_SUMMARY_FILE")
@@ -8553,7 +8597,8 @@ def _write_dispatch_summary(planned, dispatched, defer_reasons, lanes=None):
             json.dump({"planned": planned, "dispatched": dispatched,
                        "frontier_size": planned, "ledger": _ledger_health(defer_reasons),
                        "defer_reasons": dict(defer_reasons),
-                       "lanes": _lane_summary(lanes)}, handle)
+                       "lanes": _lane_summary(lanes),
+                       "by_repo": _by_repo_summary(by_repo)}, handle)
     except OSError as exc:
         print(f"::warning::dispatch summary write failed ({exc}); continuing")
 
@@ -9995,6 +10040,56 @@ def _self_test():
     assert _lane_summary({"review": Counter({"planned": 3, "launched": 1})})["review"] == {
         "planned": 3, "launched": 1, "deferred": 2, "error": 0}
     assert _lane_summary({"fix": Counter({"planned": 1, "launched": 2})})["fix"]["deferred"] == 0
+    # [Gate A telemetry] the PER-TARGET worker split rides the same summary file. It must survive
+    # the masking fixture above (a summary without it silently zeroes every realised-dispatch
+    # count downstream), and `launched` is CLAMPED to `planned` so a corrupted counter can never
+    # manufacture a passing realised/frontier ratio.
+    assert "by_repo" in masked, masked
+    assert _by_repo_summary({"o/t": {"planned": 3, "launched": 1}}) == {
+        "o/t": {"planned": 3, "launched": 1}}
+    assert _by_repo_summary({"o/t": {"planned": 1, "launched": 9}}) == {
+        "o/t": {"planned": 1, "launched": 1}}
+    assert _by_repo_summary({"o/t": {"planned": -5, "launched": -5}}) == {
+        "o/t": {"planned": 0, "launched": 0}}
+    assert _by_repo_summary({7: {"planned": 1}, "o/t": "junk"}) == {}
+    assert _by_repo_summary(None) == {}
+    # THE COUNTER'S OWN BODY, executed. The two assertions on either side of this one are a PURE
+    # normalizer and a SOURCE-level call-site pairing; neither runs the increment, so gutting the
+    # counter to `pass` kept the whole suite green while `realised_dispatches` read 0 forever —
+    # Gate A permanently closed on a number nothing measured, which is the marquee guard of this
+    # change. That is only testable because the counter is module-level now (it was a closure
+    # inside dispatch()); this is the test that runs it.
+    _bumped = {}
+    _bump_repo_count(_bumped, "o/t", "planned")
+    _bump_repo_count(_bumped, "o/t", "planned")
+    _bump_repo_count(_bumped, "o/t", "launched")
+    _bump_repo_count(_bumped, "o/u", "launched")
+    assert _bumped == {"o/t": {"planned": 2, "launched": 1},
+                       "o/u": {"planned": 0, "launched": 1}}, _bumped
+    # ...and each target gets its OWN row: a shared default dict would make one target's launches
+    # read as every target's, which passes any single-target fixture.
+    assert _bumped["o/t"] is not _bumped["o/u"], _bumped
+    # CALL-SITE SEAM (source-level). The normalizer above is pure and stays green even if the
+    # dispatch loop never CALLS it — and a missing `_bump_repo_count(worker_by_repo, repo,
+    # "launched")` would make `realised_dispatches` permanently 0, i.e. Gate A permanently closed
+    # on a fabricated number. That is the marquee guard of this change, so pin the pairing: every
+    # fleet-lane worker increment is immediately mirrored into the per-target map.
+    _dispatch_src = inspect.getsource(dispatch)
+    for _lane_key in ("planned", "launched"):
+        _paired = (f'lanes["worker"]["{_lane_key}"] += 1\n'
+                   f'            _bump_repo_count(worker_by_repo, repo, "{_lane_key}")')
+        assert _dispatch_src.count(f'lanes["worker"]["{_lane_key}"] += 1') == 1, _lane_key
+        assert _paired in _dispatch_src, (
+            f'the worker-lane {_lane_key} increment is not mirrored into the per-target Gate A '
+            f'map — realised dispatches would read as 0 forever')
+    assert _dispatch_src.count('_write_dispatch_summary(') == 2, (
+        "expected exactly the early and the final summary write")
+    # BOTH writes, not just one: the early write happens before any launch, so if only IT carries
+    # the map the final write silently overwrites the realised counts with nothing (mutant M15c
+    # survived a plain `in` check until this was a count).
+    assert _dispatch_src.count('by_repo=worker_by_repo') == 2, (
+        "every _write_dispatch_summary call must hand over the per-target worker map — the final "
+        "write is the one that carries the realised dispatches")
     # Every REVIEW_STATE maps to exactly one lane and the split is EXHAUSTIVE (a new state would
     # KeyError the assertion below rather than silently land in the fix lane): needs-review + the
     # stranded escalation are the review lane; the three fix-run states are the fix lane.
@@ -21568,7 +21663,17 @@ _STARVATION_CLAIM_STEP = "claim"
 # survived the round-2 seam with ZERO violations. Anything able to skip, redirect or excuse this
 # step (`if:`, `shell:`, `continue-on-error:`, `working-directory:`, `timeout-minutes:`, or a
 # GitHub feature that does not exist yet) is now a violation BY DEFAULT. Widen deliberately.
-_ASSEMBLE_STEP_KEYS = frozenset({"name", "run"})
+#
+# WIDENED ONCE, DELIBERATELY, WITH THE REASON (registry #756). `id:` is admitted because it is the
+# only key here that is inert against this whitelist's OWN threat model: it cannot skip the step,
+# cannot hand it to another interpreter, and cannot forgive its failure — it only NAMES it. The
+# name is load-bearing in the opposite direction: `scripts/dispatch-telemetry.py --self-test`
+# locates this step by `id: assemble` in order to EXTRACT and EXECUTE its `assembler-census` block
+# against stubs, which is how that block gets any test at all. Refusing `id:` here would force the
+# telemetry seam test to locate the step by substring instead — the exact grep-the-YAML posture the
+# comment above says is invisible to a moved or re-pointed step. A RE-POINTED `id:` is still caught,
+# because dispatch-telemetry's own seam test asserts the id it extracts from.
+_ASSEMBLE_STEP_KEYS = frozenset({"name", "run", "id"})
 # The inline-python loop the assemble-census line must be emitted from, once per repo.
 _ASSEMBLE_REPO_LOOP = "enumerate(intermediate['repositories'])"
 

@@ -310,6 +310,24 @@ jobs:
 
           repos_path, out_dir = sys.argv[1:]
           root = Path(os.environ["TARGET_ROOT"])
+
+          # REG-4 ORDERING, LOAD-BEARING: the registry telemetry helper is imported HERE, as the
+          # first thing this step does, BEFORE `load_dispatch()` ever executes a line of target
+          # planner code. The `registry-snapshot` tree is therefore still pristine registry code at
+          # import time; a target module loaded later cannot swap it out from under us, because the
+          # module object already exists. Do NOT move this below the loop.
+          def _load_registry(modname, filename):
+              path = Path("registry-snapshot") / "scripts" / filename
+              spec = importlib.util.spec_from_file_location(modname, path)
+              if spec is None or spec.loader is None:
+                  raise SystemExit(f"cannot load registry helper {filename}")
+              module = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              return module
+
+          telemetry = _load_registry("registry_dispatch_telemetry", "dispatch-telemetry.py")
+          frontier_censuses = {}
+
           repos = Path(repos_path).read_text(encoding="utf-8").splitlines()
           trusted_associations = {"OWNER", "MEMBER", "COLLABORATOR"}
           # Policy-controlled per-repo trusted-bot allowlist (issue #111), extracted from the
@@ -1003,6 +1021,101 @@ jobs:
                     f"partition-deferred={max(0, len(deferred_input) - len(deferred_ready))} "
                     f"ready-lane-keys-held={len(taken)} top-contended: {_def_top}")
 
+              # PER-TICK DISPATCH TELEMETRY (Gate A of research/crate-region-parallelism.md §8 in
+              # the sparq target): record `frontier_width`, `conflict_deferrals` attributed by HELD
+              # AREA, and a census that partitions the WHOLE open-issue population, so the gate is
+              # evaluable without a human running `ready-issues.py --diagnose` by hand every tick.
+              # `realised_dispatches` cannot be known here — PLAN never launches anything — so CLAIM
+              # joins its per-repo worker-lane launch counts onto this document. ZERO added API
+              # cost: every input is the snapshot this step already fetched, and compute_ready is
+              # pure (the re-run below only re-derives the attribution sink).
+              # >>> frontier-census — EXTRACTED AND EXECUTED by
+              # `scripts/dispatch-telemetry.py --self-test` against a stub planner. The YAML seam is
+              # where vacuity lives in this repo (measured: every uncaught mutant of an 18-mutant
+              # run lived in a workflow if:/step/call-site), so this block is RUN, not
+              # pattern-matched: dropping the `conflict_log=` kwarg, the `ready_candidates` lookup,
+              # or the degrade branch each flips a named assertion red. Removing either sentinel
+              # makes that extraction FAIL CLOSED. Inputs: `dispatch`, `repo`, `telemetry`,
+              # `readiness_input`, `ready_input`, `ready`, `deferred_ready`; output: one entry in
+              # `frontier_censuses` (the PUBLICATION is inside the block on purpose — a block that
+              # computed a perfect census and then failed to hand it on would be invisible).
+              # THE WHOLE CENSUS IS GUARDED, and that is a POSTURE decision, not defensiveness.
+              # This block runs inside a `set -euo pipefail` PLAN step, and a failed PLAN step
+              # SKIPS THE ENTIRE CLAIM JOB — so an unguarded exception here would cost a whole
+              # tick's dispatching in order to record a number ABOUT dispatching. The recorder step
+              # in CLAIM already carries `continue-on-error: true` for exactly this reason; this is
+              # the same rule applied at the leg that has no step boundary to hide behind.
+              # The failure mode is a VISIBLE GAP, never a fabricated zero: the repo is simply left
+              # OUT of `frontier_censuses`, so the `missing_census` warning below names it, no
+              # record is appended for this tick, and the published panel reads `stale`/`no-record`
+              # rather than an all-zero census that would look like a healthy idle tick.
+              try:
+                  conflict_lines = []
+                  attribution = "unavailable"
+                  try:
+                      dispatch.compute_ready(ready_input, conflict_log=conflict_lines.append)
+                      attribution = "exact"
+                  except TypeError:
+                      print(f"::warning::{repo}: this target's compute_ready() takes no "
+                            "conflict_log — conflict deferrals are counted but NOT attributed "
+                            "to a held area")
+                  engine = getattr(dispatch, "_ready", None)
+                  candidates_fn = getattr(dispatch, "ready_candidates",
+                                          getattr(engine, "ready_candidates", None))
+                  reason_fn = getattr(dispatch, "exclusion_reason",
+                                      getattr(engine, "exclusion_reason", None))
+                  frontier_numbers = {issue.get("number") for issue in ready}
+                  if candidates_fn is None or reason_fn is None:
+                      # Degrade to a VISIBLE GAP. With no engine verdict we refuse to invent
+                      # buckets: everything unaccounted for lands in `unclassified`, so missing
+                      # instrumentation is loud instead of masquerading as a healthy census.
+                      print(f"::warning::{repo}: target planner exposes no ready_candidates()/"
+                            "exclusion_reason() — the dispatch census degrades to a visible gap")
+                      candidate_numbers, reasons_by_number, conflict_total = (
+                          set(frontier_numbers), {}, 0)
+                  else:
+                      candidate_numbers = {
+                          row[1] for row in candidates_fn(ready_input, log=lambda _line: None)}
+                      reasons_by_number = {
+                          row["number"]: reason_fn(set(row["labels"]), row.get("open_blockers", 0))
+                          for row in ready_input}
+                      conflict_total = max(0, len(candidate_numbers) - len(frontier_numbers))
+                  conflict_by_area, _attributed = telemetry.parse_conflict_areas(
+                      conflict_lines, conflict_total)
+                  frontier_census = {
+                      "open_issues": len(readiness_input),
+                      "candidates": len(candidate_numbers),
+                      "frontier_width": len(frontier_numbers),
+                      "deferred_retry_width": len(deferred_ready),
+                      "conflict_deferrals": conflict_total,
+                      "conflict_by_area": conflict_by_area,
+                      "attribution": attribution,
+                      "census": telemetry.census(
+                          {row["number"] for row in readiness_input},
+                          {row["number"] for row in ready_input},
+                          reasons_by_number, candidate_numbers, frontier_numbers,
+                          conflict_by_area),
+                  }
+                  # BRACE-FREE by construction: GitHub's secret masker rewrites `{`/`}` to `***`
+                  # in log output, so the log carries flat key=value text and the ledger carries
+                  # the record.
+                  print("frontier-census " + " ".join([
+                      repo,
+                      "open_issues=" + str(frontier_census["open_issues"]),
+                      "candidates=" + str(frontier_census["candidates"]),
+                      "frontier_width=" + str(frontier_census["frontier_width"]),
+                      "conflict_deferrals=" + str(conflict_total),
+                      "census_total=" + str(frontier_census["census"]["total"]),
+                      "unclassified=" + str(frontier_census["census"]["unclassified"]),
+                      "attribution=" + attribution,
+                  ]))
+                  frontier_censuses[repo] = frontier_census
+              except Exception as census_error:   # noqa: BLE001 — see the posture note above
+                  print(f"::warning::{repo}: the dispatch census FAILED "
+                        f"({type(census_error).__name__}: {census_error}) — this tick is recorded "
+                        "as a GAP and dispatch CONTINUES; telemetry never stops the fleet")
+              # <<< frontier-census
+
               routing_doc = dispatch._routing_doc()
               flagged_rows = [(row, False) for row in dispatch.plan_dispatch(ready, routing_doc)]
               flagged_rows += [(row, True)
@@ -1067,6 +1180,24 @@ jobs:
           Path(out_dir, "issue-plan.json").write_text(
               json.dumps({"repositories": repositories}, indent=2, sort_keys=True) + "\n",
               encoding="utf-8")
+          # The Gate A census travels to CLAIM in the SAME immutable artifact as the plan (a second
+          # file, so the strictly set-validated plan schema is untouched). A target that planned but
+          # produced no census is a telemetry hole, not a silent zero — say so out loud. This is
+          # NOT fatal: telemetry must never be able to stop the fleet dispatching.
+          # >>> census-write — EXTRACTED AND EXECUTED by `scripts/dispatch-telemetry.py
+          # --self-test`. This is the PRODUCING end of the PLAN -> CLAIM hand-off: the filename and
+          # the directory written here have to agree with the artifact member `upload-plan`
+          # carries, and neither agreement is visible in either step on its own. Executed, so the
+          # basename is READ OFF the file this block actually creates and compared with the parsed
+          # upload path. Inputs: `Path`, `json`, `out_dir`, `repos`, `frontier_censuses`.
+          missing_census = [repo for repo in repos if repo not in frontier_censuses]
+          if missing_census:
+              print("::warning::dispatch telemetry: no frontier census for "
+                    + ", ".join(missing_census))
+          Path(out_dir, "frontier-census.json").write_text(
+              json.dumps({"repositories": frontier_censuses}, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8")
+          # <<< census-write
           print(f"PLAN rows: {sum(len(repo['items']) for repo in repositories)} issue item(s)")
           PY
 
@@ -1095,6 +1226,10 @@ jobs:
         run: python3 registry/scripts/ledger-invariant.py registry-ledger
 
       - name: Assemble and validate the v2 plan (registry code only, no tokens, local data)
+        # `id:` so scripts/dispatch-telemetry.py --self-test can locate this step and EXECUTE
+        # the `assembler-census` block below against stubs (the YAML seam is where vacuity
+        # lives in this repo — every uncaught mutant of an 18-mutant run lived at one).
+        id: assemble
         run: |
           set -euo pipefail
           python3 - "$RUNNER_TEMP" "$RUNNER_TEMP/plan.json" <<'PY'
@@ -1161,6 +1296,8 @@ jobs:
           # never park a holder on an empty backlog.
           partition_starvation = []
           review_exclusions = Counter()
+          # [Gate A telemetry] per-repo accounting for the busy-area/lease assemble filter.
+          assembler_census = {}
           # [registry #762] The PR-side population census. `review_exclusions` is SIGNALLED-only
           # (it counts a PR that carries a review-loop label), so an UNLABELLED worker draft
           # sitting in the drafted-already-reviewed fall-through left no trace at all — which is
@@ -1293,16 +1430,45 @@ jobs:
               # [registry #677] `starvation` is filled BY the filter, at the branch that makes
               # each drop decision — never recounted afterwards from a different view.
               starvation = {}
-              # [registry #758] The assemble leg is where the frontier actually dies, and it had
-              # no counter: `frontier_size` downstream is assigned the POST-filter count, so the
-              # whole loss sat between "the frontier was wide" and "nothing was planned". The
-              # per-reason / per-HELD-AREA census is filled BY the filter, at the branch that makes
-              # each drop decision — never re-derived here from the surviving rows, which cannot
-              # see which reservation ate the others.
+              # >>> assembler-census — EXTRACTED AND EXECUTED by
+              # `scripts/dispatch-telemetry.py --self-test`. This is the leg where the frontier
+              # actually dies. MEASURED on run 30222895098: 30 rows dropped here and the tick ended
+              # `lane worker: planned=0 launched=0`. The pre-existing `frontier_size` field cannot
+              # see it — it is literally assigned the POST-filter `planned` count, so the whole loss
+              # sits between "the frontier was wide" and "nothing was planned" with no counter on
+              # it. Pure bookkeeping over lists this step already has: no extra call, no API request.
+              #
+              # THE CAUSE, NEVER THE VICTIM (registry #758; mutant M8, confirmed against THIS block
+              # by review of #756). The first draft of this census keyed every dropped row on the
+              # ROW'S OWN package. `filter_busy_area_items` drops a row when a `__global__` occupant
+              # reserves everything, when the row is itself `__global__`, or when the row's own crate
+              # is held — and in the FIRST case the row's crate is irrelevant to the decision: the
+              # row would have been dropped had its crate been completely free. On run 30222895098
+              # all 30 drops were caused by ONE `__global__` reservation (sparq#4360) and row-package
+              # keying published them as 27 crate names with one row each. That reading argues for
+              # WIDENING crate parallelism — the under-serialisation direction, and precisely the
+              # decision Gate A exists to gate.
+              #
+              # So the attribution is NOT re-derived here from the surviving rows (that view
+              # structurally cannot see which reservation ate the others). It is filled BY the
+              # filter, at the branch that makes each decision, through #758's shared
+              # `partition_defer_attribution` — ONE implementation of the precedence rule for both
+              # legs, because two implementations of one rule drift and that drift is what produced
+              # this bug.
+              #
+              # Inputs: `repository`, `repo`, `claim_mod`, `leases`, `now`, `pulls`,
+              # `issue_labels`, `provenance`, `pr_status`, `starvation`, `assembler_census`.
               partition_census = {}
               rows_before_assemble = len(repository["items"])
+              # The two filters are applied as SEPARATE statements so their drops are separately
+              # attributable. Nested, the deferred-retry drops (an impl lease on the row's own issue
+              # is still live) would inflate `assembler_deferrals` with rows the busy-area partition
+              # never saw, and the published buckets could not sum to the population entering the
+              # leg. Behaviour is unchanged: same functions, same order, same arguments.
+              retry_filtered = claim_mod.filter_deferred_items(
+                  repository["items"], repo, leases, now)
               repository["items"] = claim_mod.filter_busy_area_items(
-                  claim_mod.filter_deferred_items(repository["items"], repo, leases, now),
+                  retry_filtered,
                   repo, pulls, issue_labels, provenance, pr_status, leases, now,
                   starvation=starvation, census=partition_census)
               # BRACE-FREE by construction: GitHub's secret masker rewrites `{`/`}` to `***` in log
@@ -1317,6 +1483,35 @@ jobs:
                      in sorted((partition_census.get("by_held_area") or {}).items())]
                   + ["holder.pr" + holder + "=" + str(count) for holder, count
                      in sorted((partition_census.get("by_holder") or {}).items())]))
+              kept_numbers = {item["number"] for item in repository["items"]}
+              dropped_by_area = {str(area): int(count) for area, count
+                                 in (partition_census.get("by_held_area") or {}).items()}
+              # EVERY dropped row lands in a visible, counted bucket with a reason. The two
+              # non-crate buckets are named so a consumer can never read them as crate contention:
+              #   __deferred-retry__  eaten by the lease filter BEFORE the busy-area partition ran
+              #   __uncensused__      the arithmetic residual. Nonzero means a drop branch exists
+              #                       that fills no census — a MISSING EDGE, which must be visible
+              #                       on the feed rather than absorbed into a crate's count.
+              retry_dropped = rows_before_assemble - len(retry_filtered)
+              if retry_dropped:
+                  dropped_by_area["__deferred-retry__"] = retry_dropped
+              uncensused = (rows_before_assemble - len(kept_numbers)
+                            - sum(dropped_by_area.values()))
+              if uncensused:
+                  dropped_by_area["__uncensused__"] = uncensused
+              assembler_census[repo] = {
+                  "plan_rows_before_assemble": rows_before_assemble,
+                  "assembler_deferrals": rows_before_assemble - len(kept_numbers),
+                  "assembler_by_area": dropped_by_area,
+                  "plan_rows": len(kept_numbers),
+              }
+              print("assembler-census " + " ".join([
+                  repo,
+                  "plan_rows_before_assemble=" + str(rows_before_assemble),
+                  "assembler_deferrals=" + str(rows_before_assemble - len(kept_numbers)),
+                  "plan_rows=" + str(len(kept_numbers)),
+              ]))
+              # <<< assembler-census
               # Recorded ONLY for a genuinely starved lane: nothing survived AND rows were dropped
               # behind the serializing partition. A healthy or empty lane records nothing, so the
               # sweep on the CLAIM side has no starvation to act on at all.
@@ -1395,6 +1590,30 @@ jobs:
               f"{reason}={count}" for reason, count in sorted(review_exclusions.items()))
           print(f"review-enumeration excluded {sum(review_exclusions.values())} signalled "
                 f"worker PR(s): {exclusion_detail or 'none'}")
+          # [Gate A telemetry] Merge the assemble-leg counters into the PLAN census the readiness
+          # step wrote, so CLAIM receives ONE document describing the whole
+          # frontier -> plan-rows -> realised chain. Best-effort: a telemetry merge failure must
+          # never fail PLAN, and a census the merge could not reach simply carries no assemble leg
+          # (which the record then shows as a NULL leg, not as a zero — build_record._maybe, and
+          # the `a MISSING assemble leg records null, never a coerced 0` self-test row).
+          # >>> assemble-merge — EXTRACTED AND EXECUTED by
+          # `scripts/dispatch-telemetry.py --self-test` against a real census file on disk. It used
+          # to be checked by searching the RAW workflow text for two substrings, which the step's
+          # own comments satisfy: replacing this whole block with `pass` left the suite green while
+          # the assemble leg — the leg where the frontier was MEASURED to die — silently stopped
+          # reaching CLAIM. A block that is code is tested by RUNNING it.
+          # Inputs: `Path`, `json`, `out_dir`, `assembler_census`.
+          census_path = Path(out_dir, "frontier-census.json")
+          try:
+              census_doc = json.loads(census_path.read_text(encoding="utf-8"))
+              for census_repo, counters in assembler_census.items():
+                  census_doc.setdefault("repositories", {}).setdefault(
+                      census_repo, {}).update(counters)
+              census_path.write_text(
+                  json.dumps(census_doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          except (OSError, ValueError) as exc:
+              print(f"::warning::dispatch telemetry: assemble-leg merge failed ({exc})")
+          # <<< assemble-merge
           # [registry #762] ONE census line on EVERY plan, listing every bucket including the
           # zeros. A per-stage rate cannot express a MISSING EDGE (#753); only a population
           # partition can, and only if the empty buckets are printed too — an absent bucket and
@@ -1413,10 +1632,19 @@ jobs:
           PY
 
       - name: Upload immutable plan artifact (pinned)
+        # `id:` so scripts/dispatch-telemetry.py --self-test can assert THIS step still carries the
+        # frontier census: dropping the path is silent (CLAIM then reads a missing file and records
+        # nothing), and a whole-file substring search does not see it because the filename appears
+        # elsewhere in this workflow.
+        id: upload-plan
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dispatch-plan-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/plan.json
+          # frontier-census.json rides the SAME artifact so CLAIM can join realised dispatches onto
+          # the PLAN-side Gate A quantities without a second upload or any extra API call.
+          path: |
+            ${{ runner.temp }}/plan.json
+            ${{ runner.temp }}/frontier-census.json
           if-no-files-found: error
           retention-days: 1
 
@@ -1577,6 +1805,9 @@ jobs:
       issues: write   # write: upsert the rolling worker-availability alert issue (usage-alert.py)
     steps:
       - name: Download PLAN artifact (pinned)
+        # `id:` so the telemetry self-test can pin that the census lands where the recorder reads it
+        # (`plan/frontier-census.json`) — the artifact now carries two files, not one.
+        id: download-plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dispatch-plan-${{ github.run_id }}-${{ github.run_attempt }}
@@ -2103,6 +2334,57 @@ jobs:
                 --run-id "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
               ;;
           esac
+
+      # PER-TICK DISPATCH TELEMETRY (Gate A). Joins the PLAN-side frontier census
+      # (`frontier_width`, `conflict_deferrals` by held area, the population census) onto CLAIM's
+      # per-target worker-lane launch counts and appends ONE record per target to
+      # `data/dispatch-telemetry.json` on the `ledger` data-plane branch. This is what makes the
+      # gate evaluable without a human running `ready-issues.py --diagnose` by hand every tick.
+      #
+      # NOT the log: GitHub masks `{`/`}` to `***` in log output (measured on run 30222895098 — 159
+      # corrupted lines, runtime stdout included), so JSON emitted to the log is destroyed. The
+      # script prints a brace-free key=value line and writes the record over the contents API.
+      #
+      # `if: always()` — a tick that launched nothing is exactly the tick worth recording, and a
+      # zero-realised record is what a growing unrealised bucket is made of. `continue-on-error`
+      # — telemetry must never be able to stop the fleet dispatching.
+      #
+      # `if:` IS ASSERTED BY VALUE, not by substring. `always()` is a substring of
+      # `always() && false`, which disables the recorder outright while every `"if: always()" in
+      # step` assertion stays green — no record is ever written and Gate A reads a fabricated zero
+      # forever. --self-test compares the PARSED scalar, so widening the guard reds a named check.
+      #
+      # `id:` so `scripts/dispatch-telemetry.py --self-test` can assert THIS step's wiring: the
+      # recorder has exactly one call site, and deleting it, dropping `--frontier`, repointing
+      # `--summary` at a path nothing writes, or inverting the `if:` restores the un-instrumented
+      # state with every script-level test still green.
+      #
+      # `set -euo pipefail`, WITH the `-e`: without it a FAILING `--self-test` below does not stop
+      # the step, the `record` call runs anyway, and the step's exit status is the recorder's — so
+      # the in-workflow self-test gated precisely nothing. `continue-on-error: true` is what keeps
+      # a red self-test from failing the tick; `-e` is what makes it red at all.
+      #
+      # ADDED API COST: one contents GET + one contents PUT per tick in the common case (the same
+      # CAS shape the model-health recorder already uses). WORST CASE, DECLARED: `read_ledger` sits
+      # INSIDE the CAS loop, so `CAS_RETRIES = 8` fully contended ticks cost 8 GET + 8 PUT in one
+      # tick. That is the honest ceiling and it is within the ~102 req/tick headroom; it is not
+      # "fixed" by removing retries, because a dropped record is a hole in the very series the gate
+      # is evaluated from. Everything else is derived from data PLAN and CLAIM already fetched —
+      # no per-PR detail fetch, and no new listing.
+      - name: Record the per-tick dispatch telemetry (Gate A) on the ledger branch
+        if: always()
+        continue-on-error: true
+        id: dispatch-telemetry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 registry/scripts/dispatch-telemetry.py --self-test
+          python3 registry/scripts/dispatch-telemetry.py record \
+            --frontier plan/frontier-census.json \
+            --summary "$RUNNER_TEMP/dispatch-summary.json" \
+            --registry-repo "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
 
       # FAIL-LOUD maintainer alert: opposite posture to the fail-closed dispatcher. Runs even if the
       # claim step above skipped everything (all accounts capped), so degraded throughput is never

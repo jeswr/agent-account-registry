@@ -1117,12 +1117,26 @@ def _routing_doc():
                             _json.dump(document, handle)
             with open(os.path.join(workdir, "trusted-bots.json"), "w", encoding="utf-8") as handle:
                 _json.dump({name: [] for name in names}, handle)
-            saved = (sys.argv[:], os.environ.get("TARGET_ROOT"), os.environ.get("PATH"))
+            # The readiness step loads its registry helpers from the pristine `registry-snapshot`
+            # checkout by a path RELATIVE to the workflow's working directory (`_load_registry`),
+            # so the harness must stand that directory up and run FROM it — otherwise the step
+            # raises FileNotFoundError before any assertion is reached and this whole suite is
+            # unrunnable rather than red. Staged with THIS repository's real helper sources, not
+            # stubs: the point of exec-ing the step is that it runs the code that ships.
+            snapshot_scripts = os.path.join(workdir, "registry-snapshot", "scripts")
+            os.makedirs(snapshot_scripts)
+            for helper in os.listdir(os.path.join(_root, "scripts")):
+                if helper.endswith(".py"):
+                    shutil.copyfile(os.path.join(_root, "scripts", helper),
+                                    os.path.join(snapshot_scripts, helper))
+            saved = (sys.argv[:], os.environ.get("TARGET_ROOT"), os.environ.get("PATH"),
+                     os.getcwd())
             os.environ["TARGET_ROOT"] = root
             os.environ["PATH"] = bindir + os.pathsep + (saved[2] or "")
             sys.argv = ["-", repos_path, workdir]
             aborted = None
             try:
+                os.chdir(workdir)
                 printed = _captured(
                     lambda: exec(_readiness_source,                     # noqa: S102 — the step
                                  {"__name__": "__main__"}))
@@ -1131,6 +1145,7 @@ def _routing_doc():
                     raise
                 aborted, printed = f"STEP ABORTED: {type(exc).__name__}", ""
             finally:
+                os.chdir(saved[3])
                 sys.argv = saved[0]
                 os.environ["PATH"] = saved[2] or ""
                 if saved[1] is None:

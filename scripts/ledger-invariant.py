@@ -80,6 +80,9 @@ def self_test():
         (repo / "orchestration" / "review-verdicts").mkdir()
         (repo / "README.md").write_text("ledger\n", encoding="utf-8")
         (repo / "data" / "leases.json").write_text("{}\n", encoding="utf-8")
+        # The Gate A dispatch-telemetry ring is a flat data/*.json blob like every other
+        # bot-written store — pinned here so the allowlist can never be narrowed out from under it.
+        (repo / "data" / "dispatch-telemetry.json").write_text("{}\n", encoding="utf-8")
         (repo / "orchestration" / "provenance" / "1.json").write_text(
             "{}\n", encoding="utf-8")
         (repo / "orchestration" / "review-verdicts" / "1.json").write_text(

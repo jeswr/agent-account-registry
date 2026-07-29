@@ -12,6 +12,7 @@ dispatch-claim.py
 dispatch-plan.py
 dispatch-secrets-guard.py
 dispatch-stall-alert.py
+dispatch-telemetry.py
 dispatch-tick-floor.py
 gh_retry.py
 grant-account.py
