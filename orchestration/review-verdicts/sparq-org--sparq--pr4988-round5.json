@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4988,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a88d1cd3f44c676ef2a700f22bff6d29fbbe0688",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The round-4 issue remains. stub_with_timeout constructs sparq-oracle-stub-<pid>-<counter>.py under std::env::temp_dir(), writes it with fs::write, and executes that pathname. The symlink regression test similarly creates sparq-oracle-victim-<pid>.txt there with fs::write. Another local user can pre-create either predictable path as a symlink, so cargo test may overwrite an arbitrary file writable by the runner; the stub also remains replaceable between creation and interpreter access. Securing Scratch does not secure these separately created test artifacts.",
+    "file": "crates/sparq-bench/src/oracle.rs",
+    "fix_hint": "Place each executable stub and the victim inside private tempfile::TempDir instances, or use securely and atomically created NamedTempFile/create_new handles with owner-only permissions and retain their guards through execution. Execute only the securely created stub path. Keep only the inert planted symlink names directly in the shared temp directory.",
+    "severity": "major",
+    "title": "Test helpers still create predictable files in the shared temp directory"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant: the production subprocess scratch files now use a private owner-only TempDir, but the round-4 major finding remains in the test code. stub_with_timeout still writes and executes a predictable PID/counter-derived Python file directly in the shared system temp directory, and the symlink regression test still creates its victim through a predictable PID-derived shared-temp path. A local user can pre-create either path as a symlink, causing the test runner to overwrite another writable file; the executable stub can also be replaced between creation and Python opening it.",
+  "verdict": "request_changes"
+ }
+}
