@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5007,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "893e16b1e777e7868a30d24d1dc4fc1f85bcf488",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In `run_case`, `out=\"$(cd \"$WORK\" && $JSCPD \"${TUNING[@]}\" \"$@\" \"$dir\" 2>&1)\"` intentionally relies on word splitting to turn the default `npx --yes jscpd@4.0.5` string into command arguments. ShellCheck diagnoses this as SC2086. Because `.github/workflows/docs-quality.yml` runs `shellcheck scripts/tests/test_docs_duplication.sh` with no directive or exclusion before the fixture suite, the hard-gate job fails at static analysis. The documented `JSCPD=\"node \u2026/jscpd\"` override also continues to depend on unsafe shell parsing and pathname expansion.",
+    "file": "scripts/tests/test_docs_duplication.sh",
+    "fix_hint": "Represent the command and its fixed arguments as a Bash array and invoke it as `\"${JSCPD_CMD[@]}\"`. Provide any override through a safe mechanism that does not require parsing a command string, such as a separate executable-path variable. Then verify with the exact workflow ShellCheck command and run the behavioral self-test.",
+    "severity": "major",
+    "title": "Mandatory ShellCheck still rejects the unquoted JSCPD command expansion"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 remains blocked by the same major finding as round 2. `run_case` still invokes the configurable multi-word `JSCPD` string through an unquoted `$JSCPD` expansion. The workflow runs ShellCheck without an exclusion before running the behavioral fixtures, so SC2086 is expected to fail the new hard-gate job. The prior finding has not been addressed, making progress stagnant.",
+  "verdict": "request_changes"
+ }
+}
