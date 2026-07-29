@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1236,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "adc6d1cc9f58577a9adf8ad429a012af35ce72d1",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 resolves the prior major finding. `assert_report_seam` now requires exactly two nonblank lines, pins the first to the exact shell-safety prelude, and requires the second line to tokenize to the complete exact reporter invocation. The self-test separately exercises non-crashing shell-level inertness, including the prior round's `true ||` prefix as well as a swallowed failure, a commented invocation, and an early exit, while checking the specific refusal path. The live workflow matches that pinned structure, supplies the documented event fields through `env`, and retains the full-history default merge-ref checkout. The report's parent/head validation, fail-closed `unprovable` handling, receipt and annotation rendering, CLI coverage, and self-test-suite enrollment are coherent. No diff-embedded reviewer-directed instruction was detected.",
+  "verdict": "approve"
+ }
+}
