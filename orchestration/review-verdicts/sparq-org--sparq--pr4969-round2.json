@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4969,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1b78c2d26847c088742d60cff0e5b96ff8f8a19c",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new Learn more text names DPoP-SK for `src/pop/sk/` and the pinned verifier for token/DPoP verification, then says \u201cNeither is reimplemented here.\u201d The crate does implement the DPoP-SK profile in `src/pop/sk/`, and `src/auth_cache.rs` locally verifies fresh DPoP proof signature and claims, replay, and token binding on cache hits. This directly conflicts with the corrected, accurate explanation added to the skill and misstates which security-sensitive code integrators must audit.",
+    "file": "crates/sparq-lws-core/README.md",
+    "fix_hint": "Replace the absolute sentence with a narrow statement: DPoP-SK is implemented here against the cited profile; baseline cache-miss token/DPoP verification is delegated to the pinned verifier; cache-hit fresh-proof verification is performed locally using the verifier's public primitives. Avoid \u201cnot reimplemented\u201d unless its exact scope is specified.",
+    "severity": "major",
+    "title": "Normative-spec note falsely says neither mechanism is implemented locally"
+   },
+   {
+    "body": "Section 8 says the pinned `solid-oidc-verifier` is responsible for \u201call Solid-OIDC access-token + DPoP proof verification.\u201d That is false on verified-token-cache hits: the cached access token is reused while this crate's `auth_cache.rs` verifies the fresh proof's signature, `htm`/`htu`/`iat`, `ath`, `jti` replay, and `cnf.jkt` binding. Because this is a reconstructed security design record, the ownership boundary must match the real request path.",
+    "file": "research/lws-design-records.md",
+    "fix_hint": "Change the dependency row to attribute baseline/cache-miss token and DPoP verification to the pinned verifier, and explicitly attribute cache-hit fresh-DPoP verification to `src/auth_cache.rs` using verifier primitives and the shared replay store.",
+    "severity": "major",
+    "title": "Spec-estate table incorrectly delegates all DPoP proof verification"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 1's two specific errors were corrected: V4 now accurately exempts bare wildcard preconditions, and the skill now describes both delegated cache-miss verification and local cache-hit DPoP verification. However, the same security-boundary misstatement remains in two other changed documents. The crate README says neither DPoP-SK nor token/DPoP verification is reimplemented here, even though this crate implements DPoP-SK and locally verifies fresh DPoP proofs on verified-token-cache hits. The new design record likewise attributes all DPoP proof verification to solid-oidc-verifier. These claims contradict the implementation and the corrected skill, so the documentation is not yet safe to approve.",
+  "verdict": "request_changes"
+ }
+}
