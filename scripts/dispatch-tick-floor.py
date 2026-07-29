@@ -124,6 +124,79 @@
 # is never read from `GET /rate_limit`: that endpoint reports a DIFFERENT bucket and read healthy
 # through the whole 2026-07-27 outage (#796), which is why it is not called here and a response
 # header is.
+#
+# =============================================================================================
+# THE GATE WAS READING THE WRONG METER — registry #1228.
+#
+# Everything above is sound EXCEPT one sentence: "the `github.token` budget is ONE bucket shared
+# by every workflow run in the repository". That is FALSE, and the whole gate rested on it. The
+# anchor read is a real response, but it is not a response from the bucket this tick spends, so
+# the gate has been reporting the health of a counter its consumers barely touch.
+#
+# MEASURED, 2026-07-28T12:00Z-07-29T12:00Z, over the 616 dispatch runs created in that window
+# (the denominator for every rate in this block unless another is named):
+#
+#   * 102 EXECUTED ticks (the floor admitted them AND the PLAN job actually started).
+#   * 16 of those 102 (15.7%) died in PLAN, and 16 of 16 died on the request budget — 8 on a
+#     hard `x-ratelimit-remaining=0/5000` 403, 8 on the pre-emptive reserve stop at 39-100.
+#   * Live `tick-floor: DEFER (budget)` lines in the same window: ZERO.
+#
+# The gate never fired while the failure it exists to prevent fired 16 times. That is not a
+# threshold that needs tuning; it is a gate wired to the wrong signal.
+#
+# WHY. GitHub partitions this token's `core` allowance by API ROUTE, not by repository. Both
+# halves report `x-ratelimit-limit: 5000` and `x-ratelimit-resource: core`, so nothing in the
+# headers announces the split — only the RESET stamps do, and they sit ~20 minutes apart all day.
+#
+#   bucket the FLOOR reads   `/repos/{repo}/actions/artifacts`  (the anchor read below)
+#   bucket the TICK spends   `/repos/{repo}`, `/repos/{o}/{r}/issues`, `/pulls`, `/check-runs`
+#                            — i.e. PLAN's entire sweep, GUARD's default-branch read, CLAIM.
+#
+# THE DECISIVE OBSERVATION, and it is decisive because it holds the REPOSITORY FIXED. In run
+# 30447572002, both lines live (each after its own `self-test PASSED` sentinel — the fixture
+# output above the sentinel says `resets at unknown` and must never be quoted, #1250):
+#
+#   11:26:45Z  FLOOR  /repos/jeswr/agent-account-registry/actions/artifacts
+#                     -> x-ratelimit-remaining=4643/5000, resets at 11:55:30Z
+#   11:27:13Z  GUARD  repos/jeswr/agent-account-registry
+#                     -> "BUDGET - read refused ... REQUEST BUDGET IS SPENT"
+#
+# Same repository. Same `github.token`. Twenty-eight seconds apart. One route healthy at 4643,
+# the other refused as spent. A per-REPOSITORY split cannot produce that, so the earlier reading
+# of this data — that the registry's bucket was healthy while sparq's was empty — was wrong about
+# WHY, and a fix built on it (sweep the healthy target, skip the exhausted one) would have
+# delivered nothing: when this bucket empties, EVERY target's `issues` and `pulls` reads are
+# refused together. That design was built and thrown away rather than shipped on the inference.
+#
+# Per-job token minting is excluded too: five independent runs, with five independent GITHUB_TOKEN
+# mints, reported the SAME reset 10:55:23Z with `remaining` decrementing 4887 -> 4666 -> 4612 ->
+# 4546 -> 4395. A bucket minted per job starts full and cannot be shared.
+#
+# THE FIX, and its cost. The gate now takes its evidence from a response charged to the bucket the
+# tick SPENDS: one `GET /repos/{owner}/{repo}` — the same route GUARD reads, so one grep finds the
+# gate and its first consumer. That is +1 request per ADMITTED tick and it is NOT free, so it is
+# justified rather than assumed: a tick that is held by the wall-clock floor still costs exactly
+# the one anchor read it always did (the probe is issued only after `decide` says RUN), and an
+# admitted tick trades 1 request for not starting a sweep that cannot finish. At the measured 102
+# executed ticks/day that is ~102 extra requests against a 5,000/hour allowance.
+#
+# WHY NOT KEEP IT AT ZERO. The anchor is `dispatch-tick` artifact creation time, and artifacts are
+# only listable on `/actions/artifacts` — which is the OTHER bucket, by measurement. There is no
+# route that answers both questions, so one request cannot serve both. Deriving the anchor from
+# run conclusions instead would put it on the spend bucket, but it cannot work for the reason the
+# header states above: a no-op tick concludes `success` exactly like a real one.
+#
+# WITH N TARGETS THE BUDGET IS STILL SCALAR, which is the other thing getting the mechanism right
+# bought. Because the split is by route and not by repository, all N targets draw on ONE counter;
+# there is no per-target vector to hold on, and no "hold if ANY target is unreadable" rule that
+# could strand the pipeline on one bad target. The probe is deliberately aimed at the FIRST TARGET
+# rather than at the registry, which costs nothing and keeps the meter correct even if the route
+# partition turns out to be finer than measured — under any keying, the repo whose sweep dominates
+# the spend is the repo the gate is reading.
+#
+# POSITIVE EVIDENCE ONLY IS UNCHANGED, and is now the property that makes the extra request safe
+# to add: a probe that fails to produce a readable count RUNS the tick. The gate can only ever
+# hold on a number it actually read, so a broken probe costs one request and never a stall.
 import json
 import os
 import re
@@ -223,6 +296,12 @@ REQUIRED_FILES = (
     "scripts/dispatch-tick-floor.py",
     DISPATCH_WORKFLOW,
 )
+
+
+# The owner/repo grammar the workflow's own target-manifest step enforces. Duplicated here rather
+# than imported because this module is loaded in a job that checks out neither the manifest step
+# nor its helper; `_test_spend_probe_repo` pins the two against dispatch.yml's copy.
+_SAFE_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
 
 
 class TickFloorError(Exception):
@@ -380,8 +459,13 @@ def _gh_response(args, label="tick-floor"):
 
 
 def read_anchor(repo, runner=None):
-    """-> (newest executed-tick marker epoch|None, response headers dict). ONE API request — the
-    same one the pre-flight budget gate reads its evidence off, so that gate costs nothing.
+    """-> (newest executed-tick marker epoch|None, response headers dict). ONE API request.
+
+    ITS HEADERS ARE NO LONGER THE BUDGET EVIDENCE (registry #1228). `/actions/artifacts` is on a
+    DIFFERENT rate-limit bucket from everything this tick goes on to spend — measured, same
+    repository, 28 s apart, one route at 4643/5000 while the other was refused as spent. This
+    request answers "when did the last tick execute", and only that; `read_spend_budget` below
+    answers "can this tick afford to run".
 
     `runner` is resolved at CALL time, not bound as a default: a default argument captures the
     function object at definition, which makes the live path unpatchable and every stubbed-flow
@@ -391,6 +475,55 @@ def read_anchor(repo, runner=None):
                                f"/repos/{repo}/actions/artifacts"
                                f"?name={TICK_MARKER_ARTIFACT}&per_page={ARTIFACT_PAGE_SIZE}"])
     return newest_marker_epoch(payload), (headers or {})
+
+
+def spend_probe_repo(environ=None):
+    """The repository whose `/repos/{owner}/{repo}` response the budget gate reads (#1228).
+
+    The FIRST entry of the target manifest, because that is the repo whose sweep dominates the
+    tick's spend. Falling back to `REGISTRY_REPO` is not a degraded mode: by measurement the split
+    is by ROUTE, so `/repos/<anything>` is the same counter either way, and the fallback keeps the
+    gate ARMED rather than silently disabled when the manifest is absent or malformed. That
+    matters more than picking the ideal repo — an env var that can quietly turn a rate limiter off
+    is the #1234 class, and this one cannot.
+
+    Validated against the same owner/repo grammar the workflow's manifest step enforces, so a
+    malformed manifest can never be interpolated into a request path."""
+    environ = os.environ if environ is None else environ
+    try:
+        targets = json.loads(environ.get("DISPATCH_TARGET_REPOS") or "[]")
+    except ValueError:
+        targets = []
+    if isinstance(targets, list):
+        for entry in targets:
+            if isinstance(entry, str) and _SAFE_REPO.fullmatch(entry):
+                return entry
+    fallback = environ.get("REGISTRY_REPO") or ""
+    return fallback if _SAFE_REPO.fullmatch(fallback) else None
+
+
+def read_spend_budget(repo, runner=None):
+    """-> response headers dict for ONE `GET /repos/{owner}/{repo}` (#1228).
+
+    THE METER THAT MATCHES THE SPEND. This route is on the bucket PLAN's `issues`/`pulls`/
+    `check-runs` sweep, GUARD's default-branch read and CLAIM all draw from — `/actions/artifacts`
+    is not, which is the whole defect. It is deliberately the exact path GUARD reads
+    (`repos/{repo}` in dispatch-secrets-guard.py) so one grep finds the gate and its first
+    consumer, and a single small object keeps it to one unpaginated request.
+
+    Costs ONE request, and only on a tick the wall-clock floor has already admitted. Headers come
+    back even when the request FAILED, which is the point: a budget-exhausted 403 carries
+    `x-ratelimit-remaining: 0`, and that is precisely the evidence this gate needs and that no
+    successful request can supply once the bucket is empty."""
+    if not repo:
+        # No probe was possible, so there is NO evidence — which decide_budget reads as RUN. A
+        # rate limiter that stalls the pipeline because it could not name a repository is worse
+        # than the burst it prevents.
+        return {}
+    runner = runner or _gh_response
+    _payload, headers = runner(["api", "-i", "-H", "Accept: application/vnd.github+json",
+                                f"/repos/{repo}"], "tick-floor budget probe")
+    return headers or {}
 
 
 def _now():
@@ -422,7 +555,10 @@ def _record(line):
 
 def main():
     repo = os.environ["REGISTRY_REPO"]
-    anchor, headers = read_anchor(repo)
+    # The anchor read's headers are deliberately DISCARDED (#1228): they carry a real
+    # `x-ratelimit-remaining`, for a bucket this tick does not spend. Binding them to a name here
+    # is how the wrong number got believed for as long as it did.
+    anchor, _artifacts_bucket_headers = read_anchor(repo)
     action, age, reason = decide(anchor, _now())
     minutes = "unknown" if age is None else f"{age // 60}m{age % 60:02d}s"
     if action == "hold":
@@ -433,10 +569,22 @@ def main():
         return 0
 
     # PRE-FLIGHT BUDGET GATE. The wall-clock floor says this tick MAY run; this asks whether it
-    # can AFFORD to. Evidence is the `x-ratelimit-remaining` header on the anchor read above — no
-    # extra request, and the only authoritative source (#796). A tick that cannot pay defers here
-    # having spent ONE request, instead of starting a 613-request sweep that dies on its first
-    # read and takes GUARD, CLAIM and the ops-alert down with it.
+    # can AFFORD to. A tick that cannot pay defers here having spent TWO requests, instead of
+    # starting a sweep that dies on its first read and takes GUARD, CLAIM and the ops-alert with
+    # it.
+    #
+    # [#1228] THE EVIDENCE IS A SECOND REQUEST, ON PURPOSE, and this is the only place in this
+    # file that spends one it did not have to. The anchor read's headers are NOT usable here: they
+    # come from `/actions/artifacts`, which is a different rate-limit bucket from the one this
+    # tick spends — measured on the same repository, 28 s apart, one route at 4643/5000 while the
+    # other was refused as spent. Reading the anchor's counter was free and wrong; over the 102
+    # executed ticks of 2026-07-28T12:00Z-07-29T12:00Z it fired ZERO times while 16 ticks died in
+    # PLAN on the budget it was supposed to be watching.
+    #
+    # ORDER IS LOAD-BEARING: this runs AFTER the wall-clock `hold` returns above, so a tick inside
+    # the floor still costs exactly ONE request, exactly as before. Only an admitted tick pays for
+    # the probe.
+    headers = read_spend_budget(spend_probe_repo())
     budget_action, threshold, budget_reason = decide_budget(remaining_budget(headers))
     if budget_action == "hold":
         detail = budget_detail(headers)
@@ -629,6 +777,7 @@ def _self_test():
     _test_budget_arithmetic(chk)
     _test_floor_predicate(chk)
     _test_preflight_budget_predicate(chk)
+    _test_spend_probe_repo(chk)
     _test_anchor_parsing(chk)
     _test_response_splitting(chk)
     _test_a_too_soon_tick_issues_no_snapshot_requests(chk)
@@ -737,6 +886,50 @@ def _test_preflight_budget_predicate(chk):
     chk("preflight: ... and the gate's threshold is a small fraction of that bucket, so the gate "
         "throttles dispatch rather than reserving the bucket for it",
         budget_floor() < SHARED_HOURLY_BUDGET // 4, True)
+
+
+def _test_spend_probe_repo(chk):
+    """Which repository the budget probe names (registry #1228).
+
+    The failure mode being guarded is NOT "picks the wrong repo" — by measurement the split is by
+    route, so any `/repos/...` lands on the same counter. It is "picks NOTHING and silently stops
+    gating". An env var that can quietly disarm a rate limiter is the #1234 class, and this is the
+    row that refuses it: every malformed manifest still yields a repo, because REGISTRY_REPO is
+    always present in the floor step's own env."""
+    reg = {"REGISTRY_REPO": "jeswr/agent-account-registry"}
+    for label, environ, want in (
+            ("the FIRST target of the manifest — the repo whose sweep dominates the spend",
+             {**reg, "DISPATCH_TARGET_REPOS": '["sparq-org/sparq", "jeswr/agent-account-registry"]'},
+             "sparq-org/sparq"),
+            ("an ABSENT manifest falls back to the registry — still the spend bucket, so the "
+             "gate stays ARMED rather than silently disabled",
+             reg, "jeswr/agent-account-registry"),
+            ("a malformed manifest (not JSON) falls back", {**reg, "DISPATCH_TARGET_REPOS": "{["},
+             "jeswr/agent-account-registry"),
+            ("a manifest that is not a list falls back",
+             {**reg, "DISPATCH_TARGET_REPOS": '{"a": 1}'}, "jeswr/agent-account-registry"),
+            ("an EMPTY manifest falls back", {**reg, "DISPATCH_TARGET_REPOS": "[]"},
+             "jeswr/agent-account-registry"),
+            # The grammar is a REQUEST-PATH guard, not tidiness: this value is interpolated into
+            # `/repos/{entry}`, so a hostile or fat-fingered entry must never reach the wire.
+            ("a non-string entry is skipped, not interpolated",
+             {**reg, "DISPATCH_TARGET_REPOS": '[7, "o/r"]'}, "o/r"),
+            ("an entry that is not owner/repo is skipped",
+             {**reg, "DISPATCH_TARGET_REPOS": '["../../etc/passwd", "o/r"]'}, "o/r"),
+            ("... including one carrying a query that would rewrite the request",
+             {**reg, "DISPATCH_TARGET_REPOS": '["o/r?x=1", "o/r"]'}, "o/r"),
+            ("... and one with a traversal segment", {**reg, "DISPATCH_TARGET_REPOS": '["o/../r"]'},
+             "jeswr/agent-account-registry"),
+            ("with NEITHER a usable manifest nor a usable REGISTRY_REPO there is no probe at all "
+             "-> no evidence -> RUN (never a stall)", {"REGISTRY_REPO": "nope"}, None),
+            ("and an empty environment likewise", {}, None),
+    ):
+        chk(f"spend-probe repo: {label}", spend_probe_repo(environ), want)
+    # THE GRAMMAR IS THE WORKFLOW'S OWN. dispatch.yml's manifest step validates the same shape;
+    # two copies that drift would let the floor probe a repo the manifest step would have refused.
+    workflow = _require(DISPATCH_WORKFLOW)
+    chk("spend-probe repo: the owner/repo grammar is the one dispatch.yml's manifest step "
+        "enforces, character for character", _SAFE_REPO.pattern in workflow, True)
 
 
 def _test_response_splitting(chk):
@@ -929,20 +1122,46 @@ def _test_live_path(chk):
         f"name={TICK_MARKER_ARTIFACT}" in calls[0][-1], True)
     chk("live: ... and scoped to the registry repo",
         "/repos/jeswr/agent-account-registry/actions/artifacts" in calls[0][-1], True)
-    # The budget gate is FREE only because the request it reads is one the floor already made.
-    # Drop `-i` and the headers vanish, the gate goes permanently fail-open, and this row reds.
-    chk("live: ... requested with `-i`, so the SAME request carries the budget headers and the "
-        "pre-flight gate costs zero extra requests", "-i" in calls[0], True)
+    # `-i` is still required, but for the PROBE's sake, not the anchor's: it is what makes any
+    # response carry `x-ratelimit-*` at all. Drop it and the gate goes permanently fail-open.
+    chk("live: ... requested with `-i`, which is what makes a response carry rate-limit headers "
+        "at all", "-i" in calls[0], True)
     chk("live: it returns the marker's epoch", got, parse_rfc3339("2026-07-27T18:40:00Z"))
-    chk("live: ... and the remaining budget off that same response",
-        remaining_budget(headers), 4832)
     chk("live: a REFUSED listing (the 403 outage itself) reads as no anchor -> RUN",
         read_anchor("o/r", runner=lambda *a, **k: (None, {}))[0], None)
-    chk("live: ... but a refusal that CARRIES remaining=0 hands the gate its evidence, so the "
-        "tick defers instead of proceeding into a 613-request sweep (the #819 fail-open residual)",
-        decide_budget(remaining_budget(
-            read_anchor("o/r", runner=lambda *a, **k: (None, {"x-ratelimit-remaining": "0"}))[1]
-        ))[0], "hold")
+
+    # ---- the SPEND-bucket probe (registry #1228) -------------------------------------------
+    probe_calls = []
+
+    def fake_probe(args, label="tick-floor"):
+        probe_calls.append(args)
+        return ({"default_branch": "master"},
+                {"x-ratelimit-remaining": "41", "x-ratelimit-limit": "5000"})
+
+    probe_headers = read_spend_budget("sparq-org/sparq", runner=fake_probe)
+    chk("spend-probe: the budget probe is exactly ONE API request", len(probe_calls), 1)
+    # THE POINT OF THE WHOLE CHANGE. `/actions/artifacts` and `/repos/{owner}/{repo}` are
+    # different rate-limit buckets on this token — measured, same repository, 28 s apart, one at
+    # 4643/5000 while the other was refused as spent. Point this row back at the artifacts route
+    # and the gate is measuring the meter that never moved.
+    chk("spend-probe: ... on the `/repos/{owner}/{repo}` route the tick actually SPENDS, not the "
+        "`/actions/artifacts` route the anchor is listed on",
+        (probe_calls[0][-1], "actions/artifacts" in probe_calls[0][-1]),
+        ("/repos/sparq-org/sparq", False))
+    chk("spend-probe: ... and it yields that bucket's remaining count",
+        remaining_budget(probe_headers), 41)
+    # Drop `-i` and the response carries no headers at all, so the gate reads `remaining is None`
+    # and RUNS every tick — a silently disarmed rate limiter, green suite.
+    chk("spend-probe: ... requested with `-i`, or the probe returns a body and no budget at all",
+        "-i" in probe_calls[0], True)
+    chk("spend-probe: a refusal that CARRIES remaining=0 hands the gate its evidence, so the tick "
+        "defers instead of proceeding into a sweep that cannot finish (the #819 residual)",
+        decide_budget(remaining_budget(read_spend_budget(
+            "o/r", runner=lambda *a, **k: (None, {"x-ratelimit-remaining": "0"}))))[0], "hold")
+    chk("spend-probe: an UNNAMEABLE probe repo issues NO request and proves NOTHING, so the tick "
+        "RUNS — a rate limiter that cannot name a repo must not stall the pipeline",
+        (read_spend_budget(None, runner=fake_probe), len(probe_calls),
+         decide_budget(remaining_budget(read_spend_budget(None)))[0]), ({}, 1, "run"))
 
     # The workflow output contract, written the way GitHub reads it.
     #
@@ -961,14 +1180,26 @@ def _test_live_path(chk):
     import contextlib
     import io
     import tempfile
+    spent = {"x-ratelimit-remaining": "12", "x-ratelimit-limit": "5000"}
+    # Each row now pins TWO meters independently — the ARTIFACTS bucket the anchor is listed on
+    # and the SPEND bucket the tick draws from (registry #1228). The last two rows are the whole
+    # fix, and they are deliberately CONTRADICTORY pairs: a row where both meters agree cannot
+    # tell which one `main()` read, which is exactly how the wrong one went unnoticed while the
+    # gate fired 0 times against 16 budget deaths in 102 executed ticks.
     rows = (
-        ("hold", 60, healthy, "proceed=false\n", "tick-floor: HOLD", ""),
-        ("run", 4000, healthy, "proceed=true\n", "tick-floor: budget ok", ""),
-        # Past the wall-clock floor, but the shared bucket is empty: the gate, not the clock,
-        # is what refuses. Delete the call site in main() and this row reds.
-        ("budget-deferred", 4000, {"x-ratelimit-remaining": "12", "x-ratelimit-limit": "5000"},
+        ("hold", 60, healthy, healthy, "proceed=false\n", "tick-floor: HOLD", ""),
+        ("run", 4000, healthy, healthy, "proceed=true\n", "tick-floor: budget ok", ""),
+        # THE DEFECT ITSELF. The artifacts bucket reads healthy — as it did on every one of the
+        # 16 measured deaths — while the bucket PLAN is about to spend is empty. Read the anchor's
+        # headers here (the pre-#1228 behaviour) and this row goes green while production dies.
+        ("spend-bucket-empty-artifacts-bucket-healthy", 4000, healthy, spent,
          "proceed=false\n", "::warning::tick-floor: DEFER (budget)",
          "- `tick-floor` DEFER budget:"),
+        # THE INVERSE, and the row that reds if anyone ever wires the gate back to the anchor
+        # read: the artifacts bucket is empty and the spend bucket is fine, so the tick must RUN.
+        # Without this row a "gate on whichever meter is lower" mutant would pass the row above.
+        ("artifacts-bucket-empty-spend-bucket-healthy", 4000, spent, healthy,
+         "proceed=true\n", "tick-floor: budget ok", ""),
     )
     # THE OUTER SENTINEL. Every row drives the real `main()` under its OWN redirect; this one
     # catches whatever a missing inner redirect would let through. Delete an inner redirect and
@@ -977,14 +1208,16 @@ def _test_live_path(chk):
     leaked = io.StringIO()
     results = []
     with contextlib.redirect_stdout(leaked):
-        for label, anchor, budget, want, want_out, want_record in rows:
+        for label, anchor, artifacts_budget, spend_budget, want, want_out, want_record in rows:
             with tempfile.NamedTemporaryFile("w+", suffix=".txt", delete=False) as handle:
                 out_path = handle.name
             with tempfile.NamedTemporaryFile("w+", suffix=".md", delete=False) as handle:
                 summary_path = handle.name
             env_backup = {k: os.environ.get(k)
-                          for k in ("GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY", "REGISTRY_REPO")}
+                          for k in ("GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY", "REGISTRY_REPO",
+                                    "DISPATCH_TARGET_REPOS")}
             captured = io.StringIO()
+            routes = []
             try:
                 os.environ["GITHUB_OUTPUT"] = out_path
                 # Without this the fixture deferral appends to the RUN's real job summary — the
@@ -992,11 +1225,24 @@ def _test_live_path(chk):
                 # record a deferral it never took.
                 os.environ["GITHUB_STEP_SUMMARY"] = summary_path
                 os.environ["REGISTRY_REPO"] = "o/r"
+                os.environ["DISPATCH_TARGET_REPOS"] = '["t/one", "t/two"]'
                 stamp = datetime.fromtimestamp(_now() - anchor, tz=timezone.utc).strftime(
                     "%Y-%m-%dT%H:%M:%SZ")
                 saved = globals()["_gh_response"]
-                globals()["_gh_response"] = lambda *a, _b=budget, _s=stamp, **k: (
-                    {"artifacts": [{"name": TICK_MARKER_ARTIFACT, "created_at": _s}]}, _b)
+
+                def _routed(args, label="tick-floor", _a=artifacts_budget, _s=spend_budget,
+                            _stamp=stamp, _seen=routes):
+                    """A `gh` stub that answers PER ROUTE. The old stub returned one header set
+                    for every request, so it could not distinguish the two buckets — and a fixture
+                    that cannot express the defect cannot witness the fix."""
+                    path = args[-1]
+                    _seen.append(path)
+                    if "actions/artifacts" in path:
+                        return ({"artifacts": [{"name": TICK_MARKER_ARTIFACT,
+                                                "created_at": _stamp}]}, _a)
+                    return ({"default_branch": "master"}, _s)
+
+                globals()["_gh_response"] = _routed
                 try:
                     with contextlib.redirect_stdout(captured):
                         code = main()
@@ -1015,9 +1261,17 @@ def _test_live_path(chk):
                 os.unlink(out_path)
                 os.unlink(summary_path)
             results.append((label, want, want_out, want_record, code, written,
-                            captured.getvalue(), recorded))
+                            captured.getvalue(), recorded, routes))
 
-    for label, want, want_out, want_record, code, written, said, recorded in results:
+    for label, want, want_out, want_record, code, written, said, recorded, routes in results:
+        # REQUEST COUNT IS PART OF THE CONTRACT. A wall-clock hold must still cost exactly the
+        # ONE anchor read it always did — the probe is only worth its request on a tick that is
+        # otherwise about to sweep — and an admitted tick costs exactly two, never a third.
+        chk(f"live: a {label} tick issues the expected requests, in order",
+            routes,
+            ["/repos/o/r/actions/artifacts"
+             f"?name={TICK_MARKER_ARTIFACT}&per_page={ARTIFACT_PAGE_SIZE}"]
+            + ([] if label == "hold" else ["/repos/t/one"]))
         chk(f"live: a {label} tick exits 0 and writes {want.strip()!r}", (code, written),
             (0, want))
         # The captured output is ASSERTED, not merely swallowed — a redirect that hid a silent
@@ -1096,11 +1350,31 @@ def _test_workflow_seam(chk):
     chk("seam: the floor job holds exactly {actions:read, contents:read} — actions:read is what "
         "lets it LIST the marker artifacts, and nothing else is needed",
         floor.get("permissions"), {"actions": "read", "contents": "read"})
+    # A JOB-LEVEL `if:` ON THE FLOOR ITSELF. Measured survivor of this file's own mutation battery
+    # (2026-07-29) and the class sparq#5080 names: every wiring pin above asserts what the GATED
+    # jobs do with the floor's ANSWER, and not one of them notices the floor never being asked.
+    # `if: false` here skips the floor, so `proceed` is the empty string and the rows above stay
+    # green while the rate limiter is gone. The floor is unconditional by design — it is the thing
+    # that decides whether a tick happens, so nothing may decide whether IT happens.
+    chk("seam: the floor job carries NO job-level `if:` — a wiring pin cannot see a gate that was "
+        "never evaluated (sparq#5080), and `if: false` here disables the rate limiter with every "
+        "other seam row still passing", floor.get("if"), None)
     # `continue-on-error` discards exactly the exit status that would report a broken floor, and a
     # step can never red its own neutering — so something ELSE has to assert its absence.
     chk("seam: no truthy `continue-on-error` at the floor job or step level",
         [floor.get("continue-on-error")] + [s.get("continue-on-error") for s in _steps(floor)],
         [None] * (1 + len(_steps(floor))))
+
+    # [#1228] THE MANIFEST REACHES THE FLOOR PROCESS ONLY BY WORKFLOW-LEVEL `env:` INHERITANCE.
+    # The floor step does not name `DISPATCH_TARGET_REPOS`, so if it were moved down into a single
+    # job's `env:` the probe would silently fall back to REGISTRY_REPO. The gate would stay ARMED
+    # and correct — the split is by route, so both repos are the same counter — but the hedge that
+    # keeps it correct under a FINER partition would be gone, with every row still green. This is
+    # the only thing asserting that it is still inherited.
+    chk("seam[#1228]: the target manifest is workflow-level `env:`, so the floor process inherits "
+        "it and the budget probe can name the target whose sweep dominates the spend",
+        isinstance(workflow.get("env"), dict)
+        and "DISPATCH_TARGET_REPOS" in workflow["env"], True)
 
     # --- the call site ----------------------------------------------------------------------
     decision = _step_by_id(floor, FLOOR_STEP_ID)
