@@ -633,9 +633,23 @@ class _ProseExtractor(HTMLParser):
 
     def close(self):
         super().close()
-        # An UNCLOSED anchor still spans what it holds. Its end is the end of the document, which
-        # is the conservative reading in the only direction that matters: it can only make a span
-        # LONGER, and a longer span is checked against `raw_refs` and the keyword grammar anyway.
+        # AN UNCLOSED ANCHOR still spans what it holds, ending at the end of the document.
+        #
+        # THE HONEST REASON, which is NOT "it can only make the span longer". Longer is the
+        # PERMISSIVE direction: a span extended to the end of the document does cover a trailing
+        # run-on, and synthetically such a span BINDS one. That sentence was here first, and it was
+        # a safety argument for something that is not a safety property — exactly the shape that
+        # licenses the next widening.
+        #
+        # What actually holds is REACHABILITY, and it is three independent facts about the input,
+        # none of them about this method: GitHub balances the anchors it emits; it strips
+        # `class="issue-link"` from an author-written `<a>`, so an author cannot introduce one; and
+        # `handle_endtag` pops until it matches, so an anchor left open by a mis-nested ancestor is
+        # closed early rather than run on. If any of those three ever stops being true, this branch
+        # is a widening and must be re-decided — a REFUSAL (drop the unclosed anchor entirely) is
+        # the safe reading, and the only reason it is not the shipped one is that dropping it would
+        # refuse a real declaration in a truncated rendering, which is a live failure mode with no
+        # live counterpart on the other side.
         while self.stack:
             _tag, _kind, number, start = self.stack.pop()
             if number is not None:
@@ -1599,6 +1613,24 @@ RENDERED_ORACLE_CORPUS = (
      'Closes #929abc\n\nand separately, closes #929\n', True),
     ('...and a real declaration in the TITLE beside a run-on in the body',
      'Closes #929 - thing', 'also mentions #929abc somewhere', True),
+    # ---- THE TWO SHAPES A REVIEW DISAGREEMENT TURNED UP ------------------------------------------
+    # Round 8 closed with the reviewer and me reporting opposite outcomes for "a quoted declaration
+    # beside a run-on". Both measurements were right; we were running different bodies, and these are
+    # the two that separate them. They are here because that is the only way the question stops
+    # being re-litigated from memory.
+    #
+    # A genuinely QUOTED declaration beside a run-on refuses — but add ONE unquoted mention and the
+    # set-membership conjunct bound it. That is round 8's class in a third shape, and it is the body
+    # the disagreement was actually about.
+    ('a quoted declaration and a run-on and an unquoted mention', 't',
+     '> Closes #929\n\nand a run-on Closes #929abc, see #929\n', False),
+    # ...and the shape where "I quoted it" is the WRONG intuition. `> [!NOTE]` looks like a
+    # blockquote to the author who typed it and is a `<div class="markdown-alert">` to GitHub, so the
+    # declaration inside it is LIVE PROSE, GitHub resolves it, and it BINDS — correctly, and both
+    # before and after the span fix. A control, not a defect: it is the row that stops the alert
+    # policy being "fixed" into a refusal by someone reading `>` as quotation.
+    ('an ALERT declaration is live prose even beside a run-on', 't',
+     '> [!NOTE]\n> Closes #929\n\nand a run-on Closes #929abc\n', True),
 )
 
 
@@ -2176,6 +2208,16 @@ def _self_test():                                                       # noqa: 
         '<p>Closes <a class="issue-link" href="https://github.com/' + ORACLE_CONTEXT_REPO
         + '/issues/7">#7'))
     check("SPANS — an UNCLOSED anchor still spans its own text", unclosed.declared, [7])
+    # ...and the DIRECTION of that choice, demonstrated rather than described. Extending an unclosed
+    # anchor to the end of the document is PERMISSIVE — the span then covers text after it, and a
+    # trailing run-on inside that span binds. `close()` says so in as many words now; this row is
+    # what makes the sentence checkable, so nobody can re-read it as a safety argument.
+    runon_in_span = refs("t", "Closes #7abc", lambda _t: (
+        '<p>x <a class="issue-link" href="https://github.com/' + ORACLE_CONTEXT_REPO
+        + '/issues/7">y</a>'.replace("</a>", "") + ' and Closes #7abc</p>'))
+    check("SPANS — an unclosed anchor's span DOES reach a later run-on, which is the permissive "
+          "direction; it is unreachable on GitHub's own output, not safe by construction",
+          runon_in_span.declared, [7])
     # ...and the anchor must be in PROSE. A blockquote that merely QUOTES a reference carries a real
     # `issue-link` anchor; letting it satisfy the conjunct would mint from two halves neither of
     # which is a declaration. MEASURED with the live renderer before this row existed.
