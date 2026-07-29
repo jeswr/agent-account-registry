@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1108,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7acbed4a95a4424c3f0daedcd1af4c9eeced5eae",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The reverse scan skips `CLASS_IDLE`, so failures on opposite sides of confirmed empty-frontier ticks are counted as one consecutive run. For example, `zero, zero, zero, idle` closes the alert, but the very next `zero` reopens it immediately because all four zero records remain in `zd_tail`; likewise `zero, idle, zero, zero` fires despite only two failing ticks after the frontier was observed empty. `idle` is no longer absence of evidence: this change defines it as positive evidence that no work was ready. Such evidence interrupts the condition \"planned ready work but launched nothing\" and must break the consecutive failing-tick sequence. Preserving the old recordless semantics after adding this new observation defeats the threshold on re-entry and can cause alert flapping. The added interleaving test pins the unsound behavior rather than detecting it.",
+    "file": "scripts/model-health.py",
+    "fix_hint": "Treat `CLASS_IDLE` as a boundary when constructing `zd_tail` (as a productive success already is), while retaining the newest-idle recovery behavior. Add a regression showing that `zero, zero, zero, idle, zero` remains recovered and that three new zero-dispatch ticks after the idle boundary are required to fire again; change the interleaved-idle assertion to verify that the run is reset.",
+    "severity": "major",
+    "title": "An idle observation fails to reset the consecutive zero-dispatch run"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-1 finding is fixed: `idle` now requires a successful claim and a raw, mapping-shaped summary carrying type-strict `planned`, `dispatched`, and `defer_reasons` fields, and the added tests cover omitted fields, wrong containers, booleans, and the real summary producer. However, the new classifier treats a positive empty-frontier observation as transparent to the consecutive zero-dispatch run. That contradicts the run's meaning and allows stale pre-idle failures to re-arm the alert after only one or two new failing ticks. Because this is a new major finding relative to round 1, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
