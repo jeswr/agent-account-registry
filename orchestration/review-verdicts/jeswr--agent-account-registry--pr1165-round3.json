@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1165,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e9b33f7c45a02e479ccc12737d63401a848c326b",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_supersede_fallback_alert` ignores the return code from the post-close `issue comment` call and unconditionally returns `True`. A transient comment failure therefore certifies the action and exits green after silently closing a still-firing public alert. Because subsequent fallback enumeration only sees open issues, no later tick retries that comment. This contradicts the helper's claim that the duplicate is closed \"with a comment that says exactly that\" and defeats the reason for using supersede-specific wording rather than presenting an unexplained closure that can be mistaken for recovery. The test fake always makes comments succeed and asserts only their successful content, so it cannot detect this path.",
+    "file": "scripts/model-health.py",
+    "fix_hint": "Make the required close-plus-explanation transition confirm both writes, with retryable state that survives a close-success/comment-failure partial transition. Add a non-crashing regression where `issue comment` returns nonzero, assert the decide run does not certify success, and prove the next tick completes the missing explanation without reopening or falsely posting recovery wording.",
+    "severity": "major",
+    "title": "Supersede succeeds even when its still-firing explanation is not delivered"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 same-repository fix is sound: repository identity is centralized, normalized case-insensitively, and the decide-driven regression makes the guard load-bearing while preserving ordinary recovery. However, the new supersede operation does not confirm delivery of the comment that distinguishes a still-firing supersede from recovery. If that write fails after the close succeeds, the function returns success and later ticks see no open fallback issue, so the public alert remains permanently closed without the promised explanation even though the condition is still firing. This is a new finding relative to the prior round, so progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
