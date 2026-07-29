@@ -736,7 +736,7 @@ def owned_by_review_rebase_lane(pr, repo, claim):
     chain is irrelevant, so the point is not sequencing but that the one predicate no waiver may
     ever reach is not fused with the two that #657 waives elsewhere.
 
-    THE HOLD GATES ARE THE LANE'S, NOT COPIES (issue #1301). The three predicates above test the
+    THE HOLD GATES ARE THE LANE'S, NOT COPIES (PR #1294). The three predicates above test the
     PRODUCER shape — "did the worker lane make this PR?" — and the paragraph at the top says the
     cede is sound only while the lane will TAKE it. Those are different questions, and for the
     whole live population they gave different answers. MEASURED 2026-07-29 against the live fleet:
@@ -2364,7 +2364,7 @@ def _self_test():
     ).run()
     check("needs-rebase worker lane is never double-owned", worker_rebaser.calls, [])
 
-    # --- [registry #1301] THE CEDE IS ONLY SOUND WHERE THE LANE ADMITS ------------------------
+    # --- [registry #1294] THE CEDE IS ONLY SOUND WHERE THE LANE ADMITS ------------------------
     # The row directly above proves the hand-over HAPPENS. Nothing proved it happened only to PRs
     # the lane takes, and on the live fleet it did not: 20 of 20 ceded PRs carried a label
     # `review_items` refuses outright, so `--max-rebases 5` was being spent on nobody while the
@@ -2377,7 +2377,7 @@ def _self_test():
     # be ceded (the hand-over still works). A one-directional row passes for a predicate that
     # simply stopped ceding anything.
     refusing = review_lane_refusing_labels(claim)
-    check("[#1301] the refusing set is the lane's own three hold labels",
+    check("[#1294] the refusing set is the lane's own three hold labels",
           sorted(refusing), sorted({"needs:user", "review:needs-user", "review:parked"}))
     ceded, owned = [], []
     for index, hold in enumerate(sorted(refusing)):
@@ -2389,8 +2389,8 @@ def _self_test():
             ceded.append(hold)
         if not owned_by_review_rebase_lane(clean_pull, repo, claim):
             owned.append(hold)
-    check("[#1301] NO label the review lane refuses is ceded to it", ceded, [])
-    check("[#1301] ...and removing that label restores the hand-over", owned, [])
+    check("[#1294] NO label the review lane refuses is ceded to it", ceded, [])
+    check("[#1294] ...and removing that label restores the hand-over", owned, [])
     # END TO END, because the predicate is not the behaviour. A worker-shaped PR carrying a
     # MACHINE-applied `needs:user` — the live shape of 11 of the 20 — must now reach the rebaser
     # through the whole `run()` path (hold classification, ownership attribution, cede decision),
@@ -2406,7 +2406,7 @@ def _self_test():
     )
     with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
         held_resolver.run()
-    check("[#1301] a machine-held worker PR the lane refuses is REBASED here, not ceded",
+    check("[#1294] a machine-held worker PR the lane refuses is REBASED here, not ceded",
           (held_rebaser.calls,
            held_resolver.census[0]["skipped"].get("review-lane-owned"),
            held_resolver.census[0]["held_released"]),
@@ -2422,7 +2422,7 @@ def _self_test():
         empty_export = "returned"
     except ResolverError:
         empty_export = "raised"
-    check("[#1301] a lane exporting no hold labels raises rather than ceding everything",
+    check("[#1294] a lane exporting no hold labels raises rather than ceding everything",
           empty_export, "raised")
 
     # --- [registry #657 §7.4 step 2b] THE CEDE PREDICATE AND THE ORCHESTRATOR CLASS -----------
