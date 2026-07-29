@@ -22,6 +22,7 @@ replays a stale expected-SHA, so the CAS guarantee is exactly as strong under re
 import argparse
 import base64
 import collections
+import datetime
 import hashlib
 import importlib.util
 import json
@@ -127,7 +128,141 @@ ACTIVE_RUN_STATUSES = frozenset({"queued", "in_progress", "requested", "waiting"
 # that owns the lease for its duration, so neither matches here.
 HOLDER_RUN = re.compile(r"[^@]*@(?P<run>[1-9][0-9]*)\.[1-9][0-9]*")
 
-ReclaimOutcome = collections.namedtuple("ReclaimOutcome", "reclaimed renewed deferred")
+# ---- [#1128] liveness for a RUN-LESS holder: the dispatcher-minted repair lease ------------------
+# A `review:`/`fix:` repair lease is MINTED by the dispatcher with an `@dispatch-<id>.<n>` holder and
+# is ADOPTED by the review-fix run it dispatches, which rewrites the holder to its own
+# `@<run>.<attempt>`. Between those two points — and FOREVER, when the run dies before reaching its
+# adopt step — the holder names no run that owns the lease, so `holder_run_id` returns None and the
+# holder-run probe has nothing to ask about. groom.py does not cover the gap either: it FILTERS
+# repair holders out of its dead-lease sweep entirely (`is_repair_holder`), deliberately, because
+# they are documented there as "TTL-managed by groom-leases". So a repair lease had NO reclaim path
+# at all except running out its own TTL, in EITHER groomer.
+#
+# MEASURED (issue #1128, 2026-07-29): review-fix run 30409749675 concluded `failure` at 00:13:46Z
+# still holding `fix:jeswr/agent-account-registry#1102@dispatch-30409404963.1`, whose TTL ran to
+# 01:44:47Z. That one row pinned the last free review slot and the fleet took ZERO dispatches for
+# the intervening 91 minutes ("no eligible review lease is free this tick", every tick).
+#
+# The evidence was available the whole time, in the dead run's OWN NAME: review-fix.yml stamps
+# `claim=<claim_id>` into its `run-name`, so a lease correlates to the run holding it by CLAIM ID
+# even when its holder string cannot name one. (This is the same correlation groom.py already does
+# against worker.yml.) A POSITIVELY OBSERVED terminal conclusion therefore reclaims the row
+# immediately, with no TTL wait.
+#
+# WHAT THIS DELIBERATELY DOES NOT DO — issue #1071. ABSENCE OF A RUN IS NOT DEATH. A lease minted
+# seconds ago whose review-fix run has not materialised yet correlates to nothing, and reclaiming on
+# that would race the dispatcher and hand one account to two workers — the direction that is not
+# recoverable the way a stall is. An unmatched claim, an unparseable listing and a failed API read
+# are ALL "unknown" here, and unknown NEVER reclaims: the row falls through to the pre-existing TTL
+# path exactly as before. The only new reason a row can be dropped is a run document that says
+# `status: completed`.
+REVIEW_FIX_WORKFLOW = ".github/workflows/review-fix.yml"
+# review-fix.yml: `run-name: review-fix <mode> <target_repo>#<pr> claim=<claim_id|'self'>`. Matched
+# against the run's LIVE `display_title` (verified against the real API, not against the template):
+# a `self`-claimed run holds no dispatcher lease and correlates to nothing, so only the 32-hex form
+# is accepted here.
+REVIEW_FIX_RUN_NAME = re.compile(r"review-fix \S+ \S+ claim=(?P<claim>[0-9a-f]{32})")
+# Bounds the correlation walk on a busy repo: 20 x 100 runs. Exhausting it is NOT an error — the
+# unmatched claims simply stay unknown and keep their TTL — because this is a groomer, not a gate.
+CLAIM_RUN_PAGE_CEILING = 20
+
+ReclaimOutcome = collections.namedtuple(
+    "ReclaimOutcome", "reclaimed renewed deferred finished read", defaults=(0, 0))
+# `read` is the SIZE OF THE POPULATION the transaction decided over, and it is reported because
+# without it the cron's outcome line cannot distinguish the three states an operator most needs to
+# tell apart: a healthy tick over rows that were simply not due, a genuinely empty ledger, and a
+# ledger that was not read at all. Issue #1128 was filed on exactly that ambiguity — a
+# `0 / 0 / 0` line over a TEN-ROW ledger was read as "the reclaim processed an empty set". The
+# counters were right; the line just could not say what they were counted over.
+# `finished` is reported apart from `reclaimed` because the two carry DIFFERENT evidence, and an
+# operator reading the cron's outcome line has to be able to tell which fired: `reclaimed` is the
+# TTL backstop (the row's expiry passed and nothing proved it alive), `finished` is the #1128 path
+# (a correlated run positively concluded). Folding them would make "has the new path ever ACTED?"
+# unanswerable from the logs — which is exactly how the TTL-only behaviour went unnoticed.
+RenewalPlan = collections.namedtuple(
+    "RenewalPlan", "leases renewed reclaimed deferred finished")
+
+
+def classify_claim_run(run):
+    """Liveness of one review-fix run correlated to a lease by CLAIM ID: ``live``/``finished``/
+    ``unknown``.
+
+    ``finished`` means a POSITIVELY OBSERVED terminal status and is the only verdict that reclaims
+    a run-less holder ahead of its TTL — a `completed` run will not do any further work, whether it
+    succeeded, failed or was cancelled, so its lease is unowned either way. Anything this cannot
+    read — a non-document, a run from some other workflow, an unrecognised status — is ``unknown``
+    and reclaims NOTHING (see the header: absence and unreadability are not death)."""
+    if not isinstance(run, dict):
+        return "unknown"
+    if str(run.get("path", "")).split("@", 1)[0] != REVIEW_FIX_WORKFLOW:
+        return "unknown"
+    status = run.get("status")
+    if status in ACTIVE_RUN_STATUSES:
+        return "live"
+    return "finished" if status == "completed" else "unknown"
+
+
+def claim_liveness_map(pending, oldest_issued, fetch, ceiling=CLAIM_RUN_PAGE_CEILING):
+    """Correlate claim ids to run liveness over paged review-fix run documents, purely.
+
+    ``fetch(page)`` returns that page's run documents NEWEST-FIRST, or None for a page that could
+    not be read. Returns ``{claim_id: "live" | "finished"}``; a claim NOTHING correlated is simply
+    ABSENT, which every caller reads as unknown and never reclaims.
+
+    A claim is ``live`` if ANY correlated run is still active and ``finished`` only when every
+    correlated run has terminated — a re-dispatch that produced a second run must not let the
+    older, finished one reclaim a slot the newer, live one is using.
+
+    The walk stops as soon as every pending claim is correlated, the history is exhausted, a page
+    predates the OLDEST live lease's issuance (no run older than that can hold a current lease, so
+    the whole relevant window is then covered), or a page cannot be read. Unlike groom.py's
+    equivalent it does NOT raise on a truncated snapshot: leaving a claim unknown costs one more
+    TTL, and that is strictly safer here than failing the cron that frees every other slot."""
+    verdicts = {}
+    pending = set(pending)
+    for page in range(1, ceiling + 1):
+        if not pending:
+            break
+        runs = fetch(page)
+        if runs is None:
+            break                      # unreadable page: stop, leave the rest unknown.
+        page_oldest = None
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+            created = _run_created_epoch(run)
+            if created is not None:
+                page_oldest = created if page_oldest is None else min(page_oldest, created)
+            display = run.get("display_title")
+            if not isinstance(display, str):
+                continue
+            match = REVIEW_FIX_RUN_NAME.fullmatch(display)
+            if match is None or match.group("claim") not in pending:
+                continue
+            claim, state = match.group("claim"), classify_claim_run(run)
+            if state == "unknown":
+                continue
+            # `live` is sticky: once any run for this claim reads active, no sibling run may
+            # downgrade it to `finished`.
+            if verdicts.get(claim) != "live":
+                verdicts[claim] = state
+        if len(runs) < 100:
+            break                      # review-fix history exhausted.
+        if page_oldest is not None and oldest_issued is not None and page_oldest < oldest_issued:
+            break                      # the relevant time window is covered.
+    return verdicts
+
+
+def _run_created_epoch(run):
+    """A run document's `created_at` as epoch seconds, or None when it cannot be read."""
+    created = run.get("created_at")
+    if not isinstance(created, str):
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(created.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return int(parsed.timestamp()) if parsed.tzinfo is not None else None
 
 
 def holder_run_id(holder):
@@ -170,10 +305,11 @@ def _lease_epoch(lease, field):
 
 def plan_renewal(leases, now, liveness, renewal=RENEWAL_SECONDS,
                  ceiling=RENEWAL_CEILING_SECONDS, lead=RENEWAL_LEAD_SECONDS,
-                 grace=RENEWAL_GRACE_SECONDS):
+                 grace=RENEWAL_GRACE_SECONDS, claim_liveness=None):
     """THE groom-leases decision, pure: what the ledger should hold after this tick.
 
-    Returns ``(next_leases, renewed, reclaimed, deferred)``. A row is DUE for a decision once it
+    Returns a ``RenewalPlan(leases, renewed, reclaimed, deferred, finished)``. A row is DUE for a
+    decision once it
     has expired OR comes within `lead` of expiring; anything further out passes through untouched
     and costs no API call. A due row is:
       * RENEWED to `min(now + renewal, issued_at + ceiling)` when its run is provably active. This
@@ -193,14 +329,34 @@ def plan_renewal(leases, now, liveness, renewal=RENEWAL_SECONDS,
       * left ALONE when it is not yet expired and its run is not live — there is nothing to renew
         and nothing to reclaim yet, and the row is still suppressing on its own expiry.
 
+      * FINISHED — dropped with NO TTL wait, and the only decision here that can drop a row that
+        has not expired — when the row's holder names no run BUT its claim id correlates to a
+        review-fix run that has positively CONCLUDED (issue #1128). See the `REVIEW_FIX_RUN_NAME`
+        header: this is the repair lease's only reclaim path, because `holder_run_id` cannot name
+        its run and groom.py filters repair holders out of its own dead-lease sweep by design.
+
     `liveness` maps a run id to ``live``/``dead``/``unknown``. It is consulted ONLY for a due row
-    inside its ceiling that actually names a lease-owning run, so an idle ledger — and the
-    TTL-managed `review:`/`fix:` repair rows, which carry no run — cost no API calls at all."""
-    next_leases, renewed, reclaimed, deferred = [], 0, 0, 0
+    inside its ceiling that actually names a lease-owning run, so an idle ledger costs no API calls
+    at all.
+
+    `claim_liveness` maps a CLAIM ID to ``live``/``finished`` (anything else, including a missing
+    entry, is unknown) and is consulted only for a row whose holder names no run. It is deliberately
+    consulted on EVERY tick and not merely inside the lead window: the lead window is 30 minutes and
+    the stall this closes was the repair lease's full 105-minute TTL, so gating the death evidence
+    on it would still have burned an hour. Passing None restores the pre-#1128 behaviour exactly."""
+    next_leases, renewed, reclaimed, deferred, finished = [], 0, 0, 0, 0
     for lease in leases:
         expires = _lease_epoch(lease, "expires_at")
         issued = _lease_epoch(lease, "issued_at")
         run_id = holder_run_id(lease.get("holder"))
+        # [#1128] A run-less holder is a dispatcher-minted repair lease. It has no holder-run
+        # evidence BY CONSTRUCTION, so without this it can only ever be dropped by its TTL. A
+        # positively terminal correlated run frees it now; an ABSENT or unreadable correlation
+        # leaves it untouched on the TTL path below, which is the #1071 case this must not break.
+        if run_id is None and claim_liveness is not None:
+            if claim_liveness(lease.get("claim_id")) == "finished":
+                finished += 1
+                continue
         expired = expires is None or expires <= now
         if not expired and expires > now + lead:
             next_leases.append(lease)
@@ -229,7 +385,7 @@ def plan_renewal(leases, now, liveness, renewal=RENEWAL_SECONDS,
             next_leases.append(lease)     # nothing to reclaim yet; re-decided next tick
         else:
             reclaimed += 1
-    return next_leases, renewed, reclaimed, deferred
+    return RenewalPlan(next_leases, renewed, reclaimed, deferred, finished)
 
 
 ACCOUNT_FINGERPRINT_RE = re.compile(r"[0-9a-f]{16}")
@@ -896,6 +1052,71 @@ def _probe_run(repo, run_id):
         return "unknown"
 
 
+def _claim_runs_page(repo, page):
+    """One page of review-fix run documents, newest-first — or None when it cannot be read.
+
+    NEVER raises and never distinguishes a 403 from a 404 from a garbage body: every unreadable
+    shape becomes None, `claim_liveness_map` stops the walk, the uncorrelated claims stay unknown,
+    and unknown reclaims nothing. Failing this read closed (toward NOT reclaiming) is the safe
+    direction — it costs one more TTL, where the other direction puts two workers on one account."""
+    result = subprocess.run(
+        ["gh", "api",
+         f"repos/{repo}/actions/workflows/review-fix.yml/runs?per_page=100&page={page}"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        document = json.loads(result.stdout)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    runs = document.get("workflow_runs")
+    return runs if isinstance(runs, list) else None
+
+
+def _claim_liveness_source(repo, fetch=_claim_runs_page):
+    """Claim-id liveness for ONE reclaim transaction: `source(leases) -> lookup or None`.
+
+    `None` — which `plan_renewal` reads as "do not consult a claim source at all" — whenever no row
+    in the given ledger has a run-less holder, so an idle ledger and a ledger of ordinary worker
+    leases both cost ZERO extra API calls.
+
+    The paged walk runs AT MOST ONCE per transaction, for the same reason `_liveness_probe`
+    memoizes the holder-run probe: a CAS retry re-reads the LEDGER (that is the point of the retry)
+    but must not re-bill the Actions API for a correlation that cannot meaningfully change in the
+    seconds between two attempts. A claim id that the resolved map does not carry — including one
+    belonging to a row that only appeared on a later attempt — is simply unknown, and unknown
+    reclaims nothing, so the memoization can only ever cost an extra TTL, never a wrong drop."""
+    resolved, walked = {}, []
+
+    def source(leases):
+        # Scoped to REPAIR holders, not to every run-less holder. Two reasons, and they agree: the
+        # correlation source is review-fix.yml's run history, which by construction only ever names
+        # `review:`/`fix:` claims (a worker run's name is `worker <repo> claim=...`), so asking it
+        # about anything else is a guaranteed miss; and repair leases are exactly the class that
+        # has no other reclaim path, because groom.py filters them out of its dead-lease sweep.
+        # Worker leases keep their existing owner — groom.py — untouched by this change.
+        pending = {lease.get("claim_id") for lease in leases
+                   if lease_schema.is_repair_holder(lease.get("holder"))
+                   and holder_run_id(lease.get("holder")) is None}
+        pending = {claim for claim in pending if isinstance(claim, str)}
+        if not pending:
+            return None
+        if not walked:
+            walked.append(True)
+            issuances = [value for value in
+                         (_lease_epoch(lease, "issued_at") for lease in leases)
+                         if value is not None]
+            resolved.update(claim_liveness_map(
+                pending, min(issuances) if issuances else None,
+                lambda page: fetch(repo, page)))
+        return resolved.get
+
+    return source
+
+
 def _liveness_probe(repo, probe=_probe_run):
     """Memoize `probe` for one reclaim transaction, so a CAS retry re-reads the LEDGER (the whole
     point of the retry loop) without re-billing the Actions API for a run it already classified."""
@@ -909,39 +1130,47 @@ def _liveness_probe(repo, probe=_probe_run):
     return liveness
 
 
-def reclaim(repo, now, retries=6, probe=_probe_run):
+def reclaim(repo, now, retries=6, probe=_probe_run, claim_fetch=_claim_runs_page):
     """CAS-groom the ledger so crashed/cancelled workers free their slot while LIVE ones keep it.
 
     Expired leases are reclaimed as before EXCEPT where the holder's Actions run is provably still
     active, which instead RENEWS the expiry, or unprovable, which HOLDS it on a short grace deadline
-    (issue #35 — see `plan_renewal`). Returns a
-    `ReclaimOutcome(reclaimed, renewed, deferred)`, with `reclaimed == -1` if the CAS kept
-    CONFLICTING. A permanent non-conflict PUT error (auth/validation/branch) raises LeaseIOError
-    rather than masquerading as -1; a throttle/availability rejection is retried under its own
-    bounded budget and only then raises (issue #558)."""
+    (issue #35 — see `plan_renewal`). A row whose holder names NO run — the dispatcher-minted
+    `review:`/`fix:` repair lease — is additionally correlated to its review-fix run BY CLAIM ID and
+    dropped as soon as that run has positively concluded, rather than waiting out its TTL (issue
+    #1128). Returns a `ReclaimOutcome(reclaimed, renewed, deferred, finished)`, with
+    `reclaimed == -1` if the CAS kept CONFLICTING. A permanent non-conflict PUT error
+    (auth/validation/branch) raises LeaseIOError rather than masquerading as -1; a
+    throttle/availability rejection is retried under its own bounded budget and only then raises
+    (issue #558)."""
     budget = TransientWriteBudget()
     _pre_write_jitter()
     liveness = _liveness_probe(repo, probe)
+    claim_source = _claim_liveness_source(repo, claim_fetch)
     for attempt in _cas_attempts(retries, budget):
         if attempt:
             _sleep_backoff(attempt)
         leases, sha = _read_ledger(repo)
-        live, renewed, n, deferred = plan_renewal(leases, now, liveness)
+        # Asked against the ledger revision actually being planned — a retry re-reads because the
+        # row set may have changed — while the underlying walk itself is memoized across attempts.
+        live, renewed, n, deferred, finished = plan_renewal(
+            leases, now, liveness, claim_liveness=claim_source(leases))
         # WRITE ON ANY CHANGE, not just on `n or renewed`: a deferred row's grace hold moves
         # `expires_at` too, and it is only that written field — never the row's presence — that any
         # duplicate-suppression consumer reads. Skipping the PUT here would leave the unproven row
         # expired in the ledger and re-open the double-dispatch on the first flaky probe.
         if live == leases:
-            return ReclaimOutcome(0, 0, deferred)
+            return ReclaimOutcome(0, 0, deferred, 0, len(leases))
         # The historical subject is preserved verbatim in the reclaim-only case, so the ledger
         # branch's commit log stays greppable across this change.
         message = "; ".join(
             part for part in (f"reclaim {n} expired lease(s)" if n else "",
                               f"renew {renewed} live lease(s)" if renewed else "",
-                              f"hold {deferred} unproven lease(s)" if deferred else "") if part)
+                              f"hold {deferred} unproven lease(s)" if deferred else "",
+                              f"drop {finished} concluded lease(s)" if finished else "") if part)
         if _write_ledger(repo, live, sha, message, budget):
-            return ReclaimOutcome(n, renewed, deferred)
-    return ReclaimOutcome(-1, 0, 0)
+            return ReclaimOutcome(n, renewed, deferred, finished, len(leases))
+    return ReclaimOutcome(-1, 0, 0, 0, 0)
 
 
 # ---- account catalog + live claim / release ----------------------------------------------------
@@ -2524,9 +2753,15 @@ def _self_test():
         return ({k: v for k, v in rows[index].items() if k != "expires_at"}
                 if index < len(rows) else "GONE")
 
+    def _rows_reclaimed(plan):
+        """(surviving rows, TTL-reclaim count) of a plan — the pair these controls have always
+        asserted, said by NAME now that a plan also carries `finished`. Reading it positionally
+        would silently start comparing a different field the next time one is added."""
+        return plan.leases, plan.reclaimed
+
     live_worker = _lease35("o/r#7@4242.1", T35 - 6000, T35 - 10)     # expired 10s ago, run alive
     dead_worker = _lease35("o/r#8@4243.1", T35 - 6000, T35 - 10, "d" * 32)
-    renewed_rows, n_renew, n_reclaim, n_defer = plan_renewal(
+    renewed_rows, n_renew, n_reclaim, n_defer, _f = plan_renewal(
         [live_worker], T35, _fixed("live"))
     check("[RED #35] an EXPIRED lease whose worker run is LIVE is kept, not reclaimed",
           ([row["claim_id"] for row in renewed_rows], n_renew, n_reclaim, n_defer),
@@ -2544,7 +2779,7 @@ def _self_test():
           {k: v for k, v in live_worker.items() if k != "expires_at"})
     # [CONTROL] the behaviour that must NOT regress: a crashed/finished worker still frees its slot.
     check("[CONTROL] an expired lease whose run is DEAD is reclaimed exactly as before",
-          plan_renewal([dead_worker], T35, _fixed("dead"))[0::2], ([], 1))
+          _rows_reclaimed(plan_renewal([dead_worker], T35, _fixed("dead"))), ([], 1))
     check("[CONTROL] a holder that records NO run is reclaimed without ever probing",
           ([row["claim_id"] for row in plan_renewal(
               [_lease35("review:o/r#9", T35 - 6000, T35 - 10)], T35,
@@ -2553,13 +2788,13 @@ def _self_test():
     far_probes = []
     check("[CONTROL] a lease nowhere near expiry passes through untouched and is NEVER probed",
           (plan_renewal([far], T35, lambda r: (far_probes.append(r), "dead")[1]), far_probes),
-          (([far], 0, 0, 0), []))
+          ((([far], 0, 0, 0, 0)), []))
     # THE PRE-EMPTIVE RENEWAL — the difference between mitigating this bug and fixing it. Renewing
     # only ALREADY-expired rows leaves the live worker's lease reading expired for up to one cron
     # period, and a dispatch tick inside that window double-dispatches exactly as before. So a row
     # inside its lead window is renewed BEFORE it can ever be seen expired.
     soon = _lease35("o/r#7@4242.1", T35 - 3000, T35 + 60)   # 60s from expiry: inside the lead
-    soon_rows, soon_renew, soon_reclaim, _d = plan_renewal([soon], T35, _fixed("live"))
+    soon_rows, soon_renew, soon_reclaim, _d, _f = plan_renewal([soon], T35, _fixed("live"))
     check("[RED #35] a live lease is renewed BEFORE it expires, so it is never SEEN expired",
           (_expiry(soon_rows), soon_renew, soon_reclaim, len(reclaim_expired(soon_rows, T35))),
           (T35 + RENEWAL_SECONDS, 1, 0, 1))
@@ -2584,7 +2819,8 @@ def _self_test():
     # dispatcher while the original run may still be writing — the very double-dispatch this change
     # closes, re-opened by a flaky API. So the row is held on a short, ceiling-clamped grace
     # deadline and re-probed next tick.
-    deferred_rows, d_renew, d_reclaim, d_defer = plan_renewal([live_worker], T35, _fixed("unknown"))
+    deferred_rows, d_renew, d_reclaim, d_defer, _f = plan_renewal(
+        [live_worker], T35, _fixed("unknown"))
     check("[RED #35] an UNPROVEN probe HOLDS the row on grace instead of reclaiming it",
           (_expiry(deferred_rows), d_renew, d_reclaim, d_defer),
           (T35 + RENEWAL_GRACE_SECONDS, 0, 0, 1))
@@ -2618,7 +2854,7 @@ def _self_test():
     check("the grace hold brackets the 15-minute cron without out-staying its welcome",
           (RENEWAL_GRACE_SECONDS >= 2 * 15 * 60, RENEWAL_GRACE_SECONDS <= RENEWAL_LEAD_SECONDS,
            RENEWAL_GRACE_SECONDS < RENEWAL_SECONDS), (True, True, True))
-    held_rows, _hr, h_reclaim, h_defer = plan_renewal(
+    held_rows, _hr, h_reclaim, h_defer, _hf = plan_renewal(
         deferred_rows, T35 + 15 * 60, _fixed("unknown"))
     check("a still-unproven row is re-decided on the NEXT cron tick and held again, never "
           "silently coasting on the first hold",
@@ -2629,9 +2865,9 @@ def _self_test():
     # permanent capacity leak. Past the ceiling the reclaim happens REGARDLESS of liveness.
     wedged = _lease35("o/r#7@4242.1", T35 - RENEWAL_CEILING_SECONDS - 1, T35 - 10)
     check("[BACKSTOP] past issued_at + ceiling an expired lease is reclaimed even when LIVE",
-          plan_renewal([wedged], T35, _fixed("live"))[0::2], ([], 1))
+          _rows_reclaimed(plan_renewal([wedged], T35, _fixed("live"))), ([], 1))
     check("[BACKSTOP] ...and even when the probe keeps failing (unproven cannot pin a slot)",
-          plan_renewal([wedged], T35, _fixed("unknown"))[0::2], ([], 1))
+          _rows_reclaimed(plan_renewal([wedged], T35, _fixed("unknown"))), ([], 1))
     near = _lease35("o/r#7@4242.1", T35 - RENEWAL_CEILING_SECONDS + 60, T35 - 10)
     check("[BACKSTOP] a renewal CLAMPS to the ceiling rather than stepping over it",
           _expiry(plan_renewal([near], T35, _fixed("live"))[0]),
@@ -2645,11 +2881,80 @@ def _self_test():
           [len(reclaim_expired(plan_renewal([near], T35, _fixed(state))[0], T35))
            for state in ("live", "unknown")], [1, 1])
     check("a lease with an unreadable expiry/issuance is reclaimed, never renewed",
-          (plan_renewal([{**live_worker, "expires_at": "soon"}], T35, _fixed("live"))[0::2],
-           plan_renewal([{**live_worker, "issued_at": None}], T35, _fixed("live"))[0::2]),
+          (_rows_reclaimed(plan_renewal([{**live_worker, "expires_at": "soon"}], T35, _fixed("live"))),
+           _rows_reclaimed(plan_renewal([{**live_worker, "issued_at": None}], T35, _fixed("live")))),
           (([], 1), ([], 1)))
     check("the renewal window outlives the 15-minute groom-leases cron by several ticks",
           RENEWAL_SECONDS >= 3 * 15 * 60, True)
+
+    # ---- issue #1128: the RUN-LESS repair lease, whose only reclaim path was its own TTL --------
+    # THE INCIDENT, replayed at its real numbers. `fix:...#1102@dispatch-30409404963.1` was issued
+    # 23:59:47Z with a 105-minute TTL to 01:44:47Z; the review-fix run holding it concluded FAILURE
+    # at 00:13:46Z. groom-leases ran at 00:04:59 and 00:50:58 and dropped nothing, and the fleet
+    # took ZERO dispatches for the intervening 91 minutes.
+    #
+    # NOTE WHAT THE PRE-FIX CONTROL BELOW MEASURES, because the issue's own diagnosis was wrong
+    # about it: at 00:50 that row is 54 MINUTES from expiry, which is outside the 30-minute lead, so
+    # `plan_renewal` never looked at it and REPORTED 0/0/0 CORRECTLY. The bug was never that the
+    # reclaim "processed an empty set" — it was that a positively dead holder could not be seen at
+    # all. So the control asserts the row SURVIVES with no claim source, and the RED asserts it does
+    # not once one exists. A fix that only made the counters louder would leave the control green.
+    ISSUED_1102, EXPIRES_1102 = 1_785_283_187, 1_785_289_487        # 23:59:47Z -> 01:44:47Z
+    TICK_0050 = 1_785_287_458                                        # the 00:50:58Z groom tick
+    repair = _lease35("fix:o/r#1102@dispatch-30409404963.1", ISSUED_1102, EXPIRES_1102, "f" * 32)
+    check("[CONTROL #1128] the row is 54 minutes from expiry at the 00:50 tick — OUTSIDE the "
+          "30-minute lead, so 0 reclaimed / 0 renewed was the CORRECT report, not a failed read",
+          ((EXPIRES_1102 - TICK_0050) > RENEWAL_LEAD_SECONDS,
+           holder_run_id(repair["holder"])), (True, None))
+    check("[CONTROL #1128] with NO claim source the row survives the tick untouched — the "
+          "105-minute TTL really was its only exit",
+          _rows_reclaimed(plan_renewal([repair], TICK_0050, _fixed("live"))), ([repair], 0))
+    concluded = plan_renewal([repair], TICK_0050, _fixed("live"),
+                             claim_liveness={"f" * 32: "finished"}.get)
+    check("[RED #1128] a repair lease whose correlated run has CONCLUDED is dropped on the very "
+          "next tick, 54 minutes BEFORE its TTL, and is counted as `finished` not as expired",
+          (concluded.leases, concluded.finished, concluded.reclaimed, concluded.renewed),
+          ([], 1, 0, 0))
+    check("[RED #1128] ...and the drop really frees the slot: the suppression consumers, which "
+          "all key on `expires_at > now`, no longer read a live row",
+          (len(reclaim_expired(concluded.leases, TICK_0050)),
+           len(reclaim_expired(plan_renewal([repair], TICK_0050, _fixed("live")).leases,
+                               TICK_0050))), (0, 1))
+    # THE #1071 CASE, which this must not regress: a dispatcher-held lease whose review-fix run has
+    # not MATERIALISED yet correlates to nothing. Absence of a run is not death — reclaiming on it
+    # would race the dispatcher onto one account with two workers, the direction that is not
+    # recoverable the way a stall is. `{}.get` is precisely "the walk ran and matched nothing".
+    check("[CONTROL #1071] a dispatcher-held lease with NO materialised run is NOT reclaimed — "
+          "an unmatched claim is unknown, and unknown never drops a row",
+          _rows_reclaimed(plan_renewal([repair], TICK_0050, _fixed("live"), claim_liveness={}.get)),
+          ([repair], 0))
+    check("[CONTROL #1071] ...and neither is one whose correlated run is still LIVE",
+          _rows_reclaimed(plan_renewal([repair], TICK_0050, _fixed("live"),
+                                       claim_liveness={"f" * 32: "live"}.get)), ([repair], 0))
+    check("[CONTROL #1128] an ORDINARY worker lease is never routed through the claim source — "
+          "groom.py still owns those, and a `finished` verdict on its claim must not touch it",
+          _rows_reclaimed(plan_renewal([far], T35, _fixed("dead"),
+                                       claim_liveness=lambda _c: "finished")), ([far], 0))
+    # A concluded run frees the row whatever it concluded WITH: success, failure and cancelled all
+    # mean the run will do no further work, so its lease is unowned in every case. (A successful
+    # run normally releases its own lease; this is the path for when it did not.)
+    check("[#1128] `finished` is about TERMINATION, not about the conclusion's value",
+          [classify_claim_run({"path": REVIEW_FIX_WORKFLOW, "status": "completed",
+                               "conclusion": value})
+           for value in ("failure", "cancelled", "success", "timed_out", None)],
+          ["finished"] * 5)
+    check("[#1128] an ACTIVE run is live, and every active status the ledger recognises counts",
+          [classify_claim_run({"path": REVIEW_FIX_WORKFLOW, "status": status})
+           for status in sorted(ACTIVE_RUN_STATUSES)], ["live"] * len(ACTIVE_RUN_STATUSES))
+    # Fail-closed direction: everything unreadable is `unknown`, and unknown NEVER reclaims. The
+    # one thing this must never do is return `finished` for something it could not read.
+    check("[#1128] an unreadable run, or one from another workflow, is unknown — never finished",
+          [classify_claim_run(run) for run in
+           (None, "completed", {}, {"status": "completed"},
+            {"path": ".github/workflows/worker.yml", "status": "completed"},
+            {"path": REVIEW_FIX_WORKFLOW, "status": "banana"},
+            {"path": REVIEW_FIX_WORKFLOW})],
+          ["unknown"] * 7)
 
     # holder_run_id: ONLY the bare `<run>.<attempt>` suffix names a run that owns the lease for its
     # whole life. A dispatcher holder's run is dispatch.yml's, and a queued worker has not started.
@@ -3602,12 +3907,12 @@ def _self_test():
 
     live_outcome, live_probed, live_written = _drive_reclaim_liveness("live")
     check("[RED #35 e2e] reclaim() probes the holder's run and RENEWS instead of dropping it",
-          (live_outcome, live_probed), (ReclaimOutcome(0, 1, 0), [4242]))
+          (live_outcome, live_probed), (ReclaimOutcome(0, 1, 0, 0, 1), [4242]))
     check("[RED #35 e2e] ...and the ledger it PUTs carries the row with a FUTURE expiry",
           _put_summary(live_written), (["e" * 32], [RENEWAL_SECONDS], 1))
     dead_outcome, dead_probed, dead_written = _drive_reclaim_liveness("dead")
     check("[CONTROL e2e] a dead run's lease is still reclaimed, and the PUT drops the row",
-          (dead_outcome, dead_probed, dead_written), (ReclaimOutcome(1, 0, 0), [4242], []))
+          (dead_outcome, dead_probed, dead_written), (ReclaimOutcome(1, 0, 0, 0, 1), [4242], []))
     # An unproven probe must still WRITE the grace hold. `reclaim()` used to skip the PUT whenever
     # nothing was reclaimed or renewed, which left the expired row in the ledger exactly as read —
     # and an expired row suppresses nothing, so a flapping Actions API re-opened the double-dispatch
@@ -3617,19 +3922,250 @@ def _self_test():
     check("[RED #35 e2e] an unproven probe PUTs the row back with a FUTURE expiry rather than "
           "leaving it expired in the ledger",
           (unknown_outcome, _put_summary(unknown_written)),
-          (ReclaimOutcome(0, 0, 1), (["e" * 32], [RENEWAL_GRACE_SECONDS], 1)))
+          (ReclaimOutcome(0, 0, 1, 0, 1), (["e" * 32], [RENEWAL_GRACE_SECONDS], 1)))
     # ...and the other side of that write rule: a tick with nothing to decide must still write
     # NOTHING, or the 15-minute cron would rewrite the ledger branch forever. A row far outside its
     # lead window is not even probed.
     idle_outcome, idle_probed, idle_written = _drive_reclaim_liveness(
         "unknown", issued=T35, ttl=RENEWAL_LEAD_SECONDS + 600)
     check("[CONTROL e2e] a tick with nothing due issues no PUT and no probe",
-          (idle_outcome, idle_probed, idle_written), (ReclaimOutcome(0, 0, 0), [], "NO PUT"))
+          (idle_outcome, idle_probed, idle_written), (ReclaimOutcome(0, 0, 0, 0, 1), [], "NO PUT"))
     # A holder with no run suffix must not cost an Actions API call — the repair leases the
     # groom-leases header calls out are TTL-managed and reclaimed with no probe.
     norun_outcome, norun_probed, _w = _drive_reclaim_liveness("live", holder="review:o/r#1")
     check("[CONTROL e2e] a run-free holder is reclaimed without probing the Actions API",
-          (norun_outcome, norun_probed), (ReclaimOutcome(1, 0, 0), []))
+          (norun_outcome, norun_probed), (ReclaimOutcome(1, 0, 0, 0, 1), []))
+
+    # ---- issue #1128 END-TO-END: the repair lease's claim-id correlation --------------------------
+    class _NoMatch:
+        """Stand-in for a regex that did NOT match, so a drifted run-name reds its own named check
+        instead of raising AttributeError out of the assertion and aborting every check below it
+        (AGENTS.md: crash-after-partial-run). `"NO MATCH"` is a value no fixture uses."""
+
+        def group(self, _name):
+            return "NO MATCH"
+
+    def _run_doc(claim, status="completed", conclusion="failure", mode="fix",
+                 path=REVIEW_FIX_WORKFLOW, created="2026-07-28T23:59:53Z"):
+        return {"path": path, "status": status, "conclusion": conclusion,
+                "created_at": created,
+                "display_title": f"review-fix {mode} o/r#1102 claim={claim}"}
+
+    F = "f" * 32
+    check("[#1128] a claim correlates to its run through the run NAME, and a terminal run is "
+          "`finished`", claim_liveness_map({F}, None, lambda _p: [_run_doc(F)]), {F: "finished"})
+    check("[#1128] a claim NOTHING correlated is ABSENT from the map, never `finished` — this is "
+          "the #1071 no-materialised-run case, and absence is what stops it reclaiming",
+          claim_liveness_map({F}, None, lambda _p: [_run_doc("a" * 32)]), {})
+    check("[#1128] an UNREADABLE page yields no verdicts rather than an empty-and-therefore-dead "
+          "answer — a 403 must cost a TTL, never a wrong drop",
+          claim_liveness_map({F}, None, lambda _p: None), {})
+    check("[#1128] `live` is STICKY across sibling runs: a re-dispatch that left an older "
+          "finished run behind must not reclaim the slot the newer live run is using",
+          (claim_liveness_map({F}, None, lambda _p: [_run_doc(F), _run_doc(F, "in_progress", None)]),
+           claim_liveness_map({F}, None, lambda _p: [_run_doc(F, "in_progress", None), _run_doc(F)])),
+          ({F: "live"}, {F: "live"}))
+    walk_pages = []
+    claim_liveness_map({F}, None,
+                       lambda p: (walk_pages.append(p), [_run_doc(F)])[1])
+    check("[#1128] the walk STOPS as soon as every pending claim is correlated",
+          walk_pages, [1])
+    short_pages = []
+    claim_liveness_map({F}, None, lambda p: (short_pages.append(p), [_run_doc("b" * 32)])[1])
+    check("[#1128] ...and stops when the run history is exhausted (a short page)",
+          short_pages, [1])
+    window_pages = []
+    claim_liveness_map(
+        {F}, 2_000_000_000,
+        lambda p: (window_pages.append(p), [_run_doc("b" * 32)] * 100)[1])
+    check("[#1128] ...and stops once a page predates the oldest live lease's issuance, so a busy "
+          "repo cannot make this walk unbounded", window_pages, [1])
+    ceiling_pages = []
+    ceiling_map = claim_liveness_map(
+        {F}, None, lambda p: (ceiling_pages.append(p), [_run_doc("b" * 32)] * 100)[1], ceiling=3)
+    check("[#1128] ...and a truncated snapshot is BOUNDED and yields no verdict — it must not "
+          "raise (this cron frees every other slot) and must not guess",
+          (ceiling_pages, ceiling_map), ([1, 2, 3], {}))
+    # THE YAML SEAM. `REVIEW_FIX_RUN_NAME` is a regex over a string another FILE produces, so it can
+    # drift silently the moment that file's `run-name:` changes — which is not hypothetical: this
+    # repo already carries one such regex, groom.py's `WORKER_RUN_NAME` (`worker claim=<id>`), which
+    # a later `run-name` change to `worker <target_repo> claim=<id>` left unable to match ANY real
+    # worker run. So render review-fix.yml's ACTUAL run-name expression and require a match.
+    try:
+        review_fix_yml = open(
+            os.path.join(os.path.dirname(__file__), "..", ".github", "workflows",
+                         "review-fix.yml"), encoding="utf-8").read()
+    except OSError as exc:
+        review_fix_yml = ""
+        print(f"  FAIL review-fix.yml is unreadable: {exc}")
+        ok = False
+
+    def _render_expr(match):
+        body = match.group(0)
+        for needle, value in (("inputs.mode", "fix"), ("inputs.target_repo", "o/r"),
+                              ("inputs.pr_number", "1102"), ("inputs.claim_id", "f" * 32)):
+            if needle in body:
+                return value
+        return "?"
+
+    run_name_line = next((line[len("run-name:"):].strip()
+                          for line in review_fix_yml.splitlines()
+                          if line.startswith("run-name:")), "")
+    rendered_run_name = re.sub(r"\$\{\{[^}]*\}\}", _render_expr, run_name_line)
+    check("[#1128 YAML seam] review-fix.yml's OWN run-name expression, rendered, is matched by "
+          "the correlation regex — the check groom.py's equivalent never had",
+          (rendered_run_name,
+           bool(REVIEW_FIX_RUN_NAME.fullmatch(rendered_run_name)),
+           (REVIEW_FIX_RUN_NAME.fullmatch(rendered_run_name) or _NoMatch()).group("claim")),
+          (f"review-fix fix o/r#1102 claim={'f' * 32}", True, "f" * 32))
+    # ...and an independent anchor: the display_title MEASURED off the live Actions API for run
+    # 30409749675, the run that actually held the stalling lease. The rendered-template check above
+    # and this one can only agree if the regex matches reality, not just the template.
+    check("[#1128 known-positive] the LIVE display_title of the run that held the stalling lease "
+          "correlates to that lease's claim id",
+          (REVIEW_FIX_RUN_NAME.fullmatch(
+              "review-fix fix jeswr/agent-account-registry#1102 "
+              "claim=b4f7fd219c60463bb75c25ba14f8d5db") or _NoMatch()).group("claim"),
+          "b4f7fd219c60463bb75c25ba14f8d5db")
+    check("[#1128] a `self`-claimed run holds no dispatcher lease and correlates to nothing",
+          REVIEW_FIX_RUN_NAME.fullmatch("review-fix review o/r#7 claim=self"), None)
+
+    # E2E through the REAL reclaim() transaction, over a fake gh serving BOTH the ledger and the
+    # review-fix run listing. This is what pins the WIRING: deleting the `claim_liveness=` argument
+    # in reclaim() while keeping every pure check above turns exactly this red.
+    def _drive_reclaim_claim(runs_page, holder="fix:o/r#1102@dispatch-30409404963.1",
+                             issued=T35, ttl=RENEWAL_LEAD_SECONDS + 6000, put_errors=()):
+        """Drive reclaim() over a ledger holding ONE repair lease, well outside its lead window,
+        plus a review-fix run listing. Returns (outcome, the rows the PUT carried or 'NO PUT',
+        how many run-listing GETs were issued)."""
+        calls = []
+        row = make_lease("a1", holder, "p", "impl", "m", issued, ttl)
+        row["claim_id"] = F
+
+        def fake_gh(args, **_kwargs):
+            calls.append(list(args))
+            target = args[2] if len(args) > 2 else ""
+            if "review-fix.yml/runs" in target:
+                return _Res(0, stdout=json.dumps({"workflow_runs": runs_page})) \
+                    if runs_page is not None else _Res(1, stderr="gh: HTTP 403")
+            if "-X" not in args:
+                return _Res(0, stdout=json.dumps({"content": base64.b64encode(json.dumps(
+                    {"leases": [row]}).encode()).decode(), "sha": f"rev{len(calls)}"}))
+            index = sum(1 for c in calls if "-X" in c) - 1
+            text = put_errors[index] if index < len(put_errors) else ""
+            return _Res(1 if text else 0, stderr=text)
+
+        saved = (subprocess.run, globals()["_sleep_backoff"], globals()["_pre_write_jitter"])
+        subprocess.run = fake_gh
+        globals()["_sleep_backoff"] = lambda attempt: None
+        globals()["_pre_write_jitter"] = lambda: None
+        try:
+            result = reclaim("o/r", T35, probe=lambda _repo, _run: "dead")
+        finally:
+            (subprocess.run, globals()["_sleep_backoff"],
+             globals()["_pre_write_jitter"]) = saved
+        put = next((c for c in calls if "-X" in c), None)
+        written = json.loads(base64.b64decode(next(
+            a for a in put if a.startswith("content=")).split("=", 1)[1]).decode()) if put else None
+        return (result, (written or {}).get("leases", "NO PUT"),
+                sum(1 for c in calls if len(c) > 2 and "review-fix.yml/runs" in c[2]))
+
+    dead_out, dead_rows, dead_walks = _drive_reclaim_claim([_run_doc(F)])
+    check("[RED #1128 e2e] reclaim() correlates the run-less repair lease by CLAIM ID, drops it, "
+          "and PUTs a ledger without it — while the row is still 100 minutes from its TTL",
+          (dead_out, dead_rows, dead_walks),
+          (ReclaimOutcome(0, 0, 0, 1, 1), [], 1))
+    live_out, live_rows, _w = _drive_reclaim_claim([_run_doc(F, "in_progress", None)])
+    check("[CONTROL #1128 e2e] a repair lease whose correlated run is LIVE is left alone and "
+          "costs no PUT", (live_out, live_rows), (ReclaimOutcome(0, 0, 0, 0, 1), "NO PUT"))
+    none_out, none_rows, _w = _drive_reclaim_claim([])
+    check("[CONTROL #1071 e2e] a dispatcher-held lease with NO materialised run survives, and the "
+          "cron writes nothing at all", (none_out, none_rows),
+          (ReclaimOutcome(0, 0, 0, 0, 1), "NO PUT"))
+    err_out, err_rows, _w = _drive_reclaim_claim(None)
+    check("[CONTROL #1128 e2e] a 403 on the run listing survives the lease rather than dropping "
+          "it — the fail-closed direction costs a TTL, never a double-dispatch",
+          (err_out, err_rows), (ReclaimOutcome(0, 0, 0, 0, 1), "NO PUT"))
+    worker_out, _r, worker_walks = _drive_reclaim_claim(
+        [_run_doc(F)], holder="o/r#1102@4242.1")
+    check("[CONTROL #1128 e2e] an ordinary WORKER lease never triggers the run-listing walk at "
+          "all — zero added API cost on a ledger with no repair rows",
+          (worker_walks, worker_out.finished), (0, 0))
+    # ...and the scoping is by REPAIR HOLDER, not merely by "has no parsable run id". A worker
+    # holder whose run suffix is unreadable is still groom.py's to reclaim, and review-fix's run
+    # history could never name it anyway — so it must not spend an Actions call either.
+    stale_out, _r, stale_walks = _drive_reclaim_claim([_run_doc(F)], holder="o/r#1102@run")
+    check("[CONTROL #1128 e2e] a RUN-LESS but non-repair holder is not walked either — the scope "
+          "is `review:`/`fix:` rows, the class groom.py filters out of its own sweep",
+          (stale_walks, stale_out.finished, holder_run_id("o/r#1102@run")), (0, 0, None))
+    # THE API-COST GUARANTEE under CAS contention. A conflicted PUT re-reads the LEDGER — that is
+    # the point of the retry — but must not re-bill the Actions API for a correlation that cannot
+    # meaningfully change in the seconds between two attempts. #1088 measures ~9% of groom runs
+    # already dying on `403 rate limit exceeded`, so a walk-per-attempt is a real regression, and
+    # it is invisible to every check that drives only a first-attempt success.
+    retry_out, retry_rows, retry_walks = _drive_reclaim_claim(
+        [_run_doc(F)], put_errors=("gh: conflict (HTTP 409)",))
+    check("[#1128] the run-listing walk happens AT MOST ONCE per transaction — a CAS retry "
+          "re-reads the ledger but does not re-walk the Actions API",
+          (retry_walks, retry_out.finished, retry_rows), (1, 1, []))
+
+    # ---- issue #1128 criterion 3: a ledger READ FAILURE must not render as an empty set ---------
+    # THE WORST SHAPE this issue names: a read error that looks identical to a healthy quiet tick.
+    # registry #1088 measures ~9% of groom runs already dying on `403 rate limit exceeded`, so the
+    # question is not hypothetical. Two things are asserted, at the two layers where either could be
+    # lost: the transaction must RAISE rather than return zeros, and `main` must not swallow that
+    # into a zero exit. And the OUTCOME LINE must state the population it decided over, so a real
+    # `0 / 0 / 0` can be told from a ledger nobody read — the ambiguity this issue was filed on.
+    class _Captured:
+        def __init__(self):
+            self.text = ""
+
+        def write(self, chunk):
+            self.text += chunk
+
+        def flush(self):
+            return None
+
+    def _drive_reclaim_cli(gh):
+        """Run the REAL `--reclaim` CLI path over a fake gh. Returns (exit code or the exception
+        name, everything the command printed)."""
+        captured, saved = _Captured(), (subprocess.run, sys.argv, sys.stdout,
+                                        globals()["_pre_write_jitter"])
+        subprocess.run = gh
+        sys.argv = ["select-and-claim.py", "--reclaim", "--repo", "o/r"]
+        globals()["_pre_write_jitter"] = lambda: None
+        sys.stdout = captured
+        try:
+            outcome = f"exit {main()}"
+        except LeaseIOError as exc:
+            outcome = type(exc).__name__
+        finally:
+            (subprocess.run, sys.argv, sys.stdout,
+             globals()["_pre_write_jitter"]) = saved
+        return outcome, captured.text.strip()
+
+    forbidden, forbidden_text = _drive_reclaim_cli(
+        lambda args, **_k: _Res(1, stderr="gh: API rate limit exceeded (HTTP 403)"))
+    check("[RED #1128 c3] a 403 on the ledger read RAISES out of the CLI — it never returns an "
+          "exit 0, and it never prints a zeroed outcome line that reads like a quiet tick",
+          (forbidden, "reclaimed" in forbidden_text), ("LeaseIOError", False))
+    ten_rows = [{**make_lease("a1", f"o/r#{i + 1}@424{i}.1", "p", "impl", "m",
+                              T35, RENEWAL_LEAD_SECONDS + 6000),
+                 "claim_id": f"{i:032d}"} for i in range(10)]
+    busy, busy_text = _drive_reclaim_cli(lambda args, **_k: _Res(0, stdout=json.dumps(
+        {"content": base64.b64encode(json.dumps({"leases": ten_rows}).encode()).decode(),
+         "sha": "s1"})) if "-X" not in args else _Res(0))
+    empty, empty_text = _drive_reclaim_cli(lambda args, **_k: _Res(0, stdout=json.dumps(
+        {"content": base64.b64encode(json.dumps({"leases": []}).encode()).decode(),
+         "sha": "s1"})) if "-X" not in args else _Res(0))
+    # THE EXACT AMBIGUITY THAT PRODUCED THIS ISSUE. Both ticks below are healthy and both reclaim
+    # nothing; under the old line they printed the SAME text, and a ten-row ledger was read as "the
+    # reclaim processed an empty set". They must now differ.
+    check("[RED #1128 c3] a healthy tick over TEN not-due rows and one over an EMPTY ledger both "
+          "exit 0 and reclaim nothing — but their outcome lines are DISTINGUISHABLE",
+          (busy, empty, busy_text == empty_text,
+           busy_text.startswith("read 10 lease(s);"), empty_text.startswith("read 0 lease(s);")),
+          ("exit 0", "exit 0", False, True, True))
     # groom-leases.yml declares `permissions:` explicitly, so every unlisted scope is `none`. The
     # `actions: read` grant is what makes the probe answerable at all; without it every probe is a
     # 403 -> unproven -> nothing is reclaimed until the ceiling, i.e. the cron silently stops
@@ -3892,9 +4428,15 @@ def main():
         if outcome.reclaimed < 0:
             print("reclaim: CAS kept conflicting")
             return 1
-        print(f"reclaimed {outcome.reclaimed} expired lease(s); "
+        # The POPULATION comes first: every counter after it is a count OVER that number, and
+        # without it "0; 0; 0" reads identically whether the ledger held ten rows that were not due
+        # or none at all (issue #1128). A read that FAILS never reaches this line at all — it
+        # raises LeaseIOError out of `main`, so the job exits non-zero rather than printing zeroes.
+        print(f"read {outcome.read} lease(s); "
+              f"reclaimed {outcome.reclaimed} expired lease(s); "
               f"renewed {outcome.renewed} live lease(s); "
-              f"held {outcome.deferred} unproven lease(s) on grace")
+              f"held {outcome.deferred} unproven lease(s) on grace; "
+              f"dropped {outcome.finished} concluded lease(s)")
         return 0
     if args.claim:
         chain = [m.strip() for m in args.models.split(",") if m.strip()]
