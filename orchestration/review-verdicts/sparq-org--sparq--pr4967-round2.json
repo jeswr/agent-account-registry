@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4967,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "53483afd547d138ef8aed93e8117e95e041c340a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. Both pull_request and push path filters now include the directory-wide `.claude/workflows/*.js` pattern, so a newly added workflow script triggers the structural suite rather than bypassing it. The new gate-wiring assertion pins that glob on both events, while the coverage assertion checks every existing file under the workflow directory against the declared filters. The suite itself is also included in both path filters and invoked by the validating job. The schema, parse, and durability checks are non-vacuous and exercise the repository files directly. No correctness, soundness, security, or test-validity issue remains in the supplied diff.",
+  "verdict": "approve"
+ }
+}
