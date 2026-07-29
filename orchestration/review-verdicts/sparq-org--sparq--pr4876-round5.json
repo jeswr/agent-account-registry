@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4876,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1545442e810a0009a1ea1283c2230a622f1a0da0",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 3 still claims 16 marker sites, 10 corrected, and 6 untouched. At the PR head, `rg -n 'M2-next:' crates/sparq-lws-core/src` returns 8 literal occurrences: notifications/ws.rs (3), notifications/mod.rs (1), store/reconcile.rs (1), lib.rs (1), store/blob.rs (1), and ldp/content.rs (1). The diff changes four literal notification occurrences, not the claimed five; the untouched inventory says `store/blob.rs` \u00d73 and `store/sparq.rs`, but the head contains one and zero literal occurrences respectively. The table additionally splits conceptual claims within `lib.rs`, demonstrating that incompatible counting units are still being mixed. Thus the asserted exhaustive sweep is not reproducible.",
+    "file": "research/lws-branch-port-triage.md",
+    "fix_hint": "Rebuild section 3 from an explicitly defined unit. If counting literal `M2-next:` occurrences, list the base and head paths/lines and make all totals match those inventories. If conceptual deferred items or changed claims are useful, put them in separate tables and do not include them in marker-site arithmetic. Correct the notifications, blob, sparq, and 16/10/6 counts accordingly.",
+    "severity": "major",
+    "title": "M2-next sweep inventory still does not match the PR head"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant. The sole major finding from round 4 remains: section 3 still presents an exhaustive, arithmetic inventory of 16 `M2-next:` marker sites, 10 corrected and 6 untouched, but the PR head has 8 literal occurrences. The changed-marker accounting is also inconsistent with the diff: the notification files contain four changed literal marker occurrences, not five, while the claimed untouched list assigns three sites to `store/blob.rs` and one to `store/sparq.rs` although the head has one and zero respectively. The document still mixes literal occurrences, conceptual deferred items, and changed prose claims without defining a reproducible unit, so its load-bearing sweep evidence remains factually unsupported.",
+  "verdict": "request_changes"
+ }
+}
