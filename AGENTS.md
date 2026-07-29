@@ -162,6 +162,18 @@ unkillable.
     someone else's issue, mis-partitions the review lease, and points the human-hold at the wrong
     object.
 
+    **You do not have to remember any of this.** `pr-gate` runs `pr-body-ref.py check` on every
+    pull and annotates yours with the refusal by name when it is CERTAIN of one — declaring none,
+    or declaring two. It is advisory, it never fails the gate, and it stays quiet when it cannot be
+    certain, so **a clean run is not proof that you bound**; only the mint census is.
+
+    **And your PR must not be a DRAFT.** Re-measured for #1115: 6 of the 17 orchestrator-class open
+    pulls were drafts, and the lane refuses every one of them —
+    `is_enumerable_provenance` has no orchestrator opt-in, so a minted draft would be terminally
+    `needs:user`-parked by age instead of reviewed. That is a deliberate scope decision, not a bug
+    to route around (`research/657-orchestrator-provenance-minting.md` §10.3); mark the pull ready
+    for review.
+
 ### Mutation-run hygiene (these have destroyed whole measurement runs)
 
 - **`__pycache__` serves stale bytecode.** A mutate/restore cycle inside one mtime second re-runs

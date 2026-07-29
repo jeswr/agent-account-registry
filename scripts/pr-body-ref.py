@@ -56,6 +56,41 @@
 # are IMPORTED from auto-mint-provenance. A second copy of a regex is a second grammar, and the two
 # would drift in the permissive direction exactly once and then stay there. This file can only ever
 # emit LESS than the reader accepts, never more.
+#
+# ---------------------------------------------------------------------------------------------
+# THE `check` HALF (registry issue #1115) — the same knowledge, delivered at AUTHORING TIME.
+#
+# #1155 landed the composer and AGENTS.md item 13 landed the rule, and neither reaches an author who
+# did not think to look. Re-measured for #1115 with #937 merged: of the 17 live orchestrator-class
+# open pulls the review lane could enumerate, **8** refuse `no-issue-reference` and **6** are drafts
+# — the lane admits 1, and that one is #937 itself. Both populations are refusals the author can
+# see and fix in one edit, and NOTHING TOLD THEM. `check` is that telling: pr-gate already runs on
+# every pull, so the note lands on the object that is wrong, while it is being written.
+#
+# IT IS ADVISORY AND IT IS SOUND — it warns only where the reader is GUARANTEED to refuse.
+# `closing_references` computes `declared = resolved & raw_refs` and `all_refs = seen ⊇ raw_refs`,
+# so over the RAW text alone, with no renderer and no network:
+#
+#     0 raw closing refs  =>  declared ⊆ raw_refs = {} => `candidate_refusal` refuses, always
+#     2+ raw closing refs =>  |all_refs| >= 2          => `ambiguous-issue-reference`, always
+#     exactly 1           =>  UNDECIDABLE offline — the rendered half may still drop it
+#
+# The third row is why `check` says NOTHING at 1 rather than "looks good": a body whose only
+# reference sits in a fenced block is raw-declared and rendered-invisible, and an advisory that
+# called that fine would be worse than silence. So `check` has NO false alarms by construction and
+# accepts false NEGATIVES, which is the only asymmetry an advisory may have.
+#
+# IT NEVER BLOCKS, and it sits inside a REQUIRED gate, so it also never RAISES: every failure path
+# returns 0 with a `::notice::`. That is not a weakened trust check — `check` grants nothing,
+# admits nothing and writes nothing; the authority is still `auto-mint-provenance`, which re-derives
+# all of this against GitHub's own renderer and refuses on its own. A bug here must not be able to
+# red the gate for every pull in the repository.
+#
+# IT ECHOES NO AUTHOR TEXT. The PR title and body are attacker-controlled and the annotation stream
+# is a control channel — a body containing `::error::` would forge a gate failure. Every value that
+# reaches an annotation is an int (a PR number, an issue number parsed from `[0-9]+`) or a constant
+# in this file. The payload is read from `$GITHUB_EVENT_PATH` in Python for the same reason: no
+# `${{ }}` expansion of untrusted text into a shell ever happens.
 """pr-body-ref — compose the closing reference an orchestrator-class PR must declare.
 
 THE SOURCE ISSUE IS AN INPUT, NEVER A DERIVATION. It comes from the dispatch the agent was given.
@@ -75,6 +110,9 @@ So every doubt emits NOTHING, with a named reason:
 Emitting nothing is safe: the pull refuses as `no-issue-reference`, which is visible on the pull,
 censused every tick, and fixable by a human in one edit. Emitting the WRONG number is not — it
 mis-partitions the review lease and points the human-hold surface at an unrelated object.
+
+`check` is the advisory read half (#1115): it names, on the pull request itself, the refusals the
+review lane is CERTAIN to produce for an orchestrator-class pull. See the header note.
 """
 
 import argparse
@@ -117,6 +155,14 @@ closing_references = _auto_mint.closing_references
 _groom = _load_sibling_module("registry_groom", "groom.py")
 LINKED_ISSUE_RE = _groom.LINKED_ISSUE
 
+# `check` asks two questions it must not answer for itself: "is this pull in the orchestrator class
+# the review lane mints for" and "who may this repo enrol". Both are decided by the SAME code the
+# minter is subject to — `pr_mint_refusal` is the class predicate, `review_enrolment_authors` is the
+# master-protected allowlist. A local re-derivation of either would be an advisory about a lane that
+# does not exist, which is the one failure an advisory cannot be allowed to have.
+_mint = _load_sibling_module("registry_mint_provenance", "mint-provenance.py")
+_policy = _load_sibling_module("registry_policy_resolve", "policy-resolve.py")
+
 # An ARBITRARY pick among nine equivalent keywords — see the header table. Nothing downstream reads
 # this constant's value, only the separator that follows it, so changing it to `Fixes` would be
 # equally correct. It is a constant so the emitted form is uniform, not because the form is forced.
@@ -131,6 +177,18 @@ REASON_ALREADY_AMBIGUOUS = "body-already-ambiguous"
 
 REASONS = (REASON_NO_PROVEN_ISSUE, REASON_SOURCE_IS_PULL, REASON_SOURCE_UNREADABLE,
            REASON_DECLARES_ANOTHER, REASON_ALREADY_AMBIGUOUS)
+
+# The advisory's two reference codes are the READER'S OWN, imported for the same reason the grammar
+# is: an advisory that names a refusal by a spelling the census does not use cannot be correlated
+# with the census, and the two would drift apart silently.
+ADVISORY_NO_REFERENCE = _auto_mint.REASON_NO_REFERENCE           # "no-issue-reference"
+ADVISORY_AMBIGUOUS = _auto_mint.REASON_AMBIGUOUS                 # "ambiguous-issue-reference"
+# The draft refusal has no constant on the reader side — it is `pr_mint_refusal`'s inline prose, and
+# it is a REFUSAL OF THE PULL SHAPE rather than of a derivation, so it never reaches the derivation's
+# reason enum. Named here so the advisory can be asserted on by code rather than by substring.
+ADVISORY_DRAFT = "draft-not-enumerable"
+
+ADVISORY_CODES = (ADVISORY_DRAFT, ADVISORY_NO_REFERENCE, ADVISORY_AMBIGUOUS)
 
 
 def proven_issue_number(value):
@@ -238,6 +296,138 @@ def binds_to(title, body, render_markdown, repo):
     auto-mint-provenance, unmodified, declare exactly the number I meant". `render_markdown(text)`
     is GitHub's `POST /markdown` — the same authority the sweep uses."""
     return closing_references(*derivation_texts(title, body, render_markdown, repo)).declared
+
+
+def orchestrator_class_error(pull, repo, enrolled_authors):
+    """Why `pull` is not a pull the review lane would ever mint for, IGNORING draftness — or None.
+
+    THE PREDICATE IS `mint_provenance.pr_mint_refusal`, UNMODIFIED. It is asked about a copy of the
+    payload with `draft` cleared, which is the whole trick: the draft clause is the one refusal in
+    that function an AUTHOR can act on, so it has to be separated from the ten that are facts about
+    the pull (a fork head, a `[bot]` login, a login this repo does not enrol, a closed pull). Those
+    ten mean the advisory has nothing to say and must stay SILENT — an unenrolled contributor being
+    told their body is malformed for a lane they are not in is noise, and noise is how an advisory
+    stops being read.
+
+    Clearing `draft` cannot make a refusing pull admissible for any other reason: `pr_mint_refusal`
+    is a flat sequence of independent clauses over distinct keys, and this touches exactly one."""
+    if not isinstance(pull, dict):
+        return "the pull request payload is malformed"
+    undrafted = dict(pull)
+    undrafted["draft"] = False
+    return _mint.pr_mint_refusal(repo, undrafted, enrolled_authors)
+
+
+def lane_advisory(pull, repo, enrolled_authors):
+    """The notes the review lane owes this pull's AUTHOR, as a list of `(code, message)`.
+
+    EMPTY IS THE COMMON AND CORRECT ANSWER — for every pull outside the orchestrator class, and for
+    every orchestrator pull that is ready and declares exactly one reference. Every note here names
+    a refusal that is CERTAIN offline (see the header note for the `declared ⊆ raw_refs` /
+    `all_refs ⊇ raw_refs` argument); the undecidable single-reference case emits nothing.
+
+    Messages carry no author-supplied text — only this pull's number and the issue numbers the
+    grammar matched, both ints. See the header note on the annotation stream as a control channel."""
+    if orchestrator_class_error(pull, repo, enrolled_authors) is not None:
+        return []
+    number = pull.get("number")
+    notes = []
+    if pull.get("draft") is True:
+        # #1115 population 2, 6 of 17. NOT a defect and not a thing this file may fix: the draft
+        # refusal exists because groom's stale-draft carve-out reads `is_enumerable_provenance`,
+        # which deliberately has no orchestrator opt-in, so a minted draft would be age-parked
+        # `needs:user` instead of reviewed. The lane is CLOSED to drafts by decision, and the only
+        # thing that was ever wrong was that the decision was invisible from the pull request.
+        notes.append((ADVISORY_DRAFT,
+                      f"pull #{number} is a DRAFT. The orchestrator review lane refuses a draft "
+                      "outright (mint-provenance.pr_mint_refusal) because groom's stale-draft "
+                      "carve-out reads is_enumerable_provenance, which has no orchestrator opt-in "
+                      "— a minted draft would be terminally needs:user-parked by age instead of "
+                      "reviewed. Drafts are out of scope for this lane BY DECISION, not by "
+                      "accident (research/657-orchestrator-provenance-minting.md). Mark the pull "
+                      "ready for review to be enumerated."))
+    declared = declared_closing_numbers(pull.get("title"), pull.get("body"))
+    if not declared:
+        # #1115 population 1, 8 of 17.
+        notes.append((ADVISORY_NO_REFERENCE,
+                      f"pull #{number} declares no closing reference to a source issue, so "
+                      "auto-mint-provenance will refuse it as `no-issue-reference`, no provenance "
+                      "record will be minted, and the cross-provider review lane will never "
+                      "enumerate it. Declare the issue you were DISPATCHED against — never the "
+                      "branch name, never a number the body happens to mention — as one closing "
+                      "keyword, one or more spaces or tabs, then the number (AGENTS.md item 13), "
+                      "or run: python3 scripts/pr-body-ref.py compose --issue <n> --repo "
+                      f"{repo} --body-file <f>"))
+    elif len(declared) > 1:
+        named = ", ".join(f"#{n}" for n in declared)
+        notes.append((ADVISORY_AMBIGUOUS,
+                      f"pull #{number} declares {len(declared)} distinct closing references "
+                      f"({named}), so auto-mint-provenance will refuse it as "
+                      "`ambiguous-issue-reference`; exactly one is needed, because the source "
+                      "issue decides which lease partition the review reserves and which object a "
+                      "human hold can park. A closing pair inside a fenced block still counts — "
+                      "the raw side strips nothing."))
+    return notes
+
+
+def enrolled_authors_of(repo, policy_path):
+    """This repo's master-protected `review_enrolment_authors`, or an empty frozenset.
+
+    An unreadable or malformed policy yields EMPTY, which makes `pr_mint_refusal` refuse every pull
+    and so silences the advisory entirely. That is the right direction for a read-only note: a
+    policy this file cannot parse is not a licence to guess who is enrolled and start annotating
+    strangers' pull requests. The authoritative fail-closed read of the same field is
+    policy-resolve's, exercised on every dispatch; this one only decides whether to speak."""
+    import tomllib
+    try:
+        with open(policy_path, "rb") as handle:
+            return _policy.review_enrolment_authors(repo, tomllib.load(handle))
+    except Exception:                                  # noqa: BLE001 — unreadable policy = silent
+        return frozenset()
+
+
+def _annotate(level, message):
+    """One GitHub workflow annotation on ONE line.
+
+    Newlines are stripped rather than `%0A`-escaped: every message in this file is already a single
+    paragraph, so a newline reaching here means something unexpected got into the string, and
+    flattening it is strictly safer than encoding it into a multi-line annotation."""
+    print(f"::{level}::{' '.join(str(message).split())}")
+
+
+def _cmd_check(args, *, enrolled=None):
+    """Advise on the pull request in the workflow event payload. ALWAYS returns 0.
+
+    TOTAL BY CONSTRUCTION — see the header note. This runs as a step of the REQUIRED `gate` job, so
+    an unreadable payload, an unparseable policy or an outright bug must produce a notice and a zero
+    exit, never a red gate on a pull request that has nothing to do with this lane.
+
+    It also always says what it DECIDED, including when it decided to say nothing. An advisory that
+    is silent on both "nothing to report" and "I could not run" is indistinguishable from a step
+    that was accidentally disabled, which is how this class of check rots.
+
+    `enrolled` is injectable ONLY so the self-test can drive this entry point without a policy file
+    on disk; the default is the live read."""
+    try:
+        payload = json.loads(Path(args.event_path).read_text(encoding="utf-8"))
+        pull = payload.get("pull_request") if isinstance(payload, dict) else None
+        if not isinstance(pull, dict):
+            _annotate("notice", "pr-body-ref check: the event carries no pull_request; nothing to "
+                                "advise on")
+            return 0
+        authors = enrolled_authors_of(args.repo, args.policy) if enrolled is None else enrolled
+        notes = lane_advisory(pull, args.repo, authors)
+        if not notes:
+            _annotate("notice", "pr-body-ref check: nothing to advise — this pull is either "
+                                "outside the orchestrator review lane, or ready and declaring "
+                                "exactly one closing reference")
+            return 0
+        for code, message in notes:
+            _annotate("warning", f"review lane [{code}]: {message}")
+    except Exception as exc:                           # noqa: BLE001 — an advisory never reds a gate
+        _annotate("notice", f"pr-body-ref check did not run ({type(exc).__name__}); it is advisory "
+                            "and auto-mint-provenance remains the authority")
+    return 0
 
 
 def _gh_json(args):
@@ -517,6 +707,152 @@ def _self_test():  # noqa: C901 — a flat sequence of assertions, deliberately 
         chk(f"{label}: so the entry point writes NOTHING",
             run_cmd(ORACLE_ISSUE, body=body)[0::2], ("ComposeError", body))
 
+    # ---- `check`: the ADVISORY read half (#1115) ------------------------------------------------
+    # The whole claim of this half is "every note names a refusal the reader is CERTAIN to make",
+    # so every note below is asserted against what the READER ACTUALLY ANSWERS for the same body,
+    # driven through auto-mint's production `derive_issue_number` over the frozen oracle. Asserting
+    # the advisory against a hand-written expected code would restate this file's own belief and
+    # would still pass if the reader's cardinality rules moved underneath it.
+    def reader_verdict(pull):
+        """auto-mint's own refusal reason for this pull, offline. None means it would derive."""
+        return _auto_mint.derive_issue_number(
+            pull, lambda n: {"number": n, "state": "open"}, frozen_render, ORACLE_REPO).reason
+
+    ENROLLED = frozenset({"jeswr"})
+
+    def pull_payload(**over):
+        """A minimal LIVE-SHAPED payload that `pr_mint_refusal` admits, plus the overrides."""
+        payload = {"number": 1115, "state": "open", "draft": False,
+                   "head": {"repo": {"full_name": ORACLE_REPO}, "ref": "fix/lane", "sha": "a" * 40},
+                   "user": {"login": "jeswr"}, "title": SAMPLE_TITLE, "body": SAMPLE_BODY}
+        payload.update(over)
+        return payload
+
+    def advice(**over):
+        return [code for code, _ in lane_advisory(pull_payload(**over), ORACLE_REPO, ENROLLED)]
+
+    # CONTROL both ways, BEFORE any advisory row: an instrument that cannot say "this one is fine"
+    # makes every agreement below vacuous, and one that answers `render-unavailable` is answering
+    # about the oracle rather than about the grammar.
+    chk("CONTROL the reader instrument refuses the no-reference body under its own name",
+        reader_verdict(pull_payload()), ADVISORY_NO_REFERENCE)
+    chk("CONTROL ...and DERIVES from the composed one — it can say yes",
+        reader_verdict(pull_payload(body=composed)), None)
+
+    chk("#1115 population 1: a body with no closing reference is advised, with the READER'S code",
+        (advice(), reader_verdict(pull_payload())),
+        ([ADVISORY_NO_REFERENCE], ADVISORY_NO_REFERENCE))
+    chk("a ready pull declaring exactly one reference is advised about NOTHING",
+        (advice(body=composed), reader_verdict(pull_payload(body=composed))), ([], None))
+    chk("#1115 population 2: a DRAFT is advised, even when its reference is perfect",
+        advice(body=composed, draft=True), [ADVISORY_DRAFT])
+    chk("...and a drafted pull with no reference is advised about BOTH, draft first",
+        advice(draft=True), [ADVISORY_DRAFT, ADVISORY_NO_REFERENCE])
+    chk("two closing references are advised as ambiguous, with the READER'S code",
+        (advice(body=two), reader_verdict(pull_payload(body=two))),
+        ([ADVISORY_AMBIGUOUS], ADVISORY_AMBIGUOUS))
+
+    # ONE-SIDEDNESS, stated as a test rather than as a comment. `quoted` declares #700 in the raw
+    # text and NOTHING in the rendered prose, so the reader refuses it and the offline advisory
+    # cannot know that. It must stay QUIET rather than guess — a false alarm is the one failure
+    # mode that would make authors stop reading these notes.
+    chk("the advisory is silent where it cannot be certain, and the reader still refuses",
+        (advice(body=quoted), reader_verdict(pull_payload(body=quoted))), ([], ADVISORY_NO_REFERENCE))
+
+    # SILENCE OUTSIDE THE CLASS. Each row is a pull `pr_mint_refusal` refuses for a reason that is
+    # not draftness, so the lane was never open to it and there is nothing to advise. If any of
+    # these ever speaks, the advisory is annotating pulls belonging to people not in this lane.
+    for label, over in (
+            ("a [bot] author", {"user": {"login": "sparq-agent[bot]"}}),
+            ("an author this repo does not enrol", {"user": {"login": "someone-else"}}),
+            ("a FORK head", {"head": {"repo": {"full_name": "attacker/agent-account-registry"},
+                                      "ref": "fix/lane", "sha": "a" * 40}}),
+            ("a worker-lane head namespace", {"head": {"repo": {"full_name": ORACLE_REPO},
+                                                       "ref": "sparq-agent/123", "sha": "a" * 40}}),
+            ("a closed pull", {"state": "closed"}),
+            ("a malformed payload", None)):
+        got = ([] if over is None
+               else advice(**over))
+        chk(f"SILENT outside the class: {label}", got, [])
+    chk("SILENT outside the class: a non-dict payload is refused, not crashed on",
+        lane_advisory("not a dict", ORACLE_REPO, ENROLLED), [])
+    chk("SILENT when the repo enrols NOBODY — an empty allowlist is enrolment OFF",
+        [code for code, _ in lane_advisory(pull_payload(), ORACLE_REPO, frozenset())], [])
+    # ...and the silence is not the only thing this can produce: the same payload DOES speak once
+    # its author is enrolled. Without this row every assertion above passes on a dead function.
+    chk("...and the class predicate is not vacuously refusing everything", advice(),
+        [ADVISORY_NO_REFERENCE])
+
+    chk("relaxing draft does not relax anything else — the class probe reads pr_mint_refusal",
+        orchestrator_class_error(pull_payload(draft=True), ORACLE_REPO, ENROLLED), None)
+    chk("...and it still refuses a fork whose draft was cleared",
+        orchestrator_class_error(
+            pull_payload(draft=True, head={"repo": {"full_name": "attacker/x"}, "ref": "b",
+                                           "sha": "a" * 40}), ORACLE_REPO, ENROLLED) is not None,
+        True)
+
+    # ---- THE `check` ENTRY POINT, driven end to end offline --------------------------------------
+    import contextlib
+
+    def run_check(pull, *, enrolled=ENROLLED, payload=None):
+        """(exit_code, advisory codes annotated, whole stdout) for one real `check` invocation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "event.json")
+            path.write_text(json.dumps(payload if payload is not None
+                                       else {"pull_request": pull}), encoding="utf-8")
+            args = SimpleNamespace(event_path=str(path), repo=ORACLE_REPO, policy="/nonexistent")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = _cmd_check(args, enrolled=enrolled)
+            text = out.getvalue()
+            return code, [c for c in ADVISORY_CODES if f"[{c}]" in text], text
+
+    code, codes, text = run_check(pull_payload())
+    chk("ENTRY check exits 0 and warns with the reader's code", (code, codes),
+        (0, [ADVISORY_NO_REFERENCE]))
+    chk("ENTRY ...as a WARNING, never an error — it must not read as a gate failure",
+        (text.count("::warning::"), "::error::" in text), (1, False))
+    chk("ENTRY a clean pull still SAYS SO — silence and a disabled step must be distinguishable",
+        run_check(pull_payload(body=composed))[0:2] + ("::notice::" in
+                                                       run_check(pull_payload(body=composed))[2],),
+        (0, [], True))
+    # The TEXT is asserted, not just `(0, [])`. Both this and "nothing to advise" exit 0 and warn
+    # about nothing, so a mutant that drops the payload-shape branch is invisible to the codes and
+    # destroys only the diagnosis — the same class `run_cmd` above carries its own note about.
+    no_pull = run_check(None, payload={"action": "opened"})
+    chk("ENTRY a payload with no pull_request says SO, and is a notice rather than a failure",
+        (no_pull[0], no_pull[1], "no pull_request" in no_pull[2]), (0, [], True))
+    unreadable = io.StringIO()
+    with contextlib.redirect_stdout(unreadable):
+        unreadable_code = _cmd_check(SimpleNamespace(event_path="/nonexistent/event.json",
+                                                     repo=ORACLE_REPO, policy="/nonexistent"),
+                                     enrolled=ENROLLED)
+    chk("ENTRY an unreadable event path exits 0 with a NOTICE — an advisory never reds the gate",
+        (unreadable_code, unreadable.getvalue().startswith("::notice::")), (0, True))
+    chk("ENTRY an unreadable policy silences rather than guessing who is enrolled",
+        enrolled_authors_of(ORACLE_REPO, "/nonexistent/repos.toml"), frozenset())
+    chk("...and the live policy really does enrol this repo's orchestrator class",
+        bool(enrolled_authors_of(ORACLE_REPO, SCRIPTS_DIR.parent / "policy" / "repos.toml")), True)
+
+    # INJECTION: the annotation stream is a control channel and the body is attacker-controlled.
+    # A body carrying an annotation directive must not reach stdout — if it did, an author could
+    # forge `::error::` rows on the REQUIRED gate from their own pull request body.
+    forged = "> 🤖 SPARQ agent\n\n::error::forged gate failure\n::endgroup::\n"
+    _, codes, text = run_check(pull_payload(body=forged, title="::error::forged title"))
+    chk("INJECTION a body's own annotation directive is never echoed",
+        ("forged" in text, "::endgroup::" in text, codes), (False, False, [ADVISORY_NO_REFERENCE]))
+    chk("INJECTION every annotation line is exactly one line",
+        all(line.count("::") == 1 or line.startswith("::")
+            for line in text.splitlines() if line), True)
+    # The flattener has to be driven DIRECTLY: every message this file composes is already one
+    # paragraph, so a mutant that deleted the flattening would change no output anywhere above and
+    # the guard would be there without ever having been measured.
+    flattened = io.StringIO()
+    with contextlib.redirect_stdout(flattened):
+        _annotate("warning", "one\ntwo   three\n::error::four")
+    chk("INJECTION a multi-line message collapses to ONE annotation line",
+        flattened.getvalue(), "::warning::one two three ::error::four\n")
+
     # ---- The grammar is IMPORTED, not copied ----------------------------------------------------
     # If this ever fails, someone has re-declared the regex locally and the two will drift.
     chk("CLOSING_REF_RE is auto-mint's object, not a copy",
@@ -566,8 +902,9 @@ UNCLOSED_COMMENT = "> 🤖 SPARQ agent\n\n<!-- sparq-impl-provider:anthropic\n"
 # Deliberately absent from the corpus: the input that proves the oracle refuses loudly.
 UNRECORDED_PROBE = "a document the oracle has deliberately never recorded"
 # The number of DISTINCT documents a clean run renders. Pinned so that deleting an assertion that
-# renders one is caught here rather than silently shrinking the corpus check.
-EXPECTED_RENDERED_DOCUMENTS = 9
+# renders one is caught here rather than silently shrinking the corpus check. Moved 9 -> 10 when
+# `check`'s reader-agreement rows started driving the two-reference body through the real reader.
+EXPECTED_RENDERED_DOCUMENTS = 10
 
 
 def _oracle_documents():
@@ -622,6 +959,10 @@ def main(argv=None):
     compose_cmd.add_argument("--title", default="")
     compose_cmd.add_argument("--repo", required=True)
     compose_cmd.add_argument("--out")
+    check_cmd = sub.add_parser("check", help="advise on the pull request in a workflow event payload")
+    check_cmd.add_argument("--event-path", required=True, help="$GITHUB_EVENT_PATH")
+    check_cmd.add_argument("--repo", required=True)
+    check_cmd.add_argument("--policy", default=str(SCRIPTS_DIR.parent / "policy" / "repos.toml"))
     args = parser.parse_args(argv)
     if args.self_test:
         return _self_test()
@@ -629,6 +970,8 @@ def main(argv=None):
         return _refresh_oracle()
     if args.command == "compose":
         return _cmd_compose(args)
+    if args.command == "check":
+        return _cmd_check(args)
     parser.print_help()
     return 2
 

@@ -461,3 +461,93 @@ The two axes above are closed. What remains is data, and one half of it is a hum
    remains the operator's explicit per-mint acceptance of that cost, and it is not the default.
 3. `AUTO_READMISSION_PER_TICK_MAX` and the constant-reviewer-side item from the admission record's
    §9.5 are unchanged.
+
+## 10. The two populations the trigger refuses, decided rather than left emergent (#1115)
+
+> 🤖 **SPARQ agent** — design decision record, 2026-07-29. §9 closed the *trigger*; #937 automated
+> it. This section owns what the trigger **refuses**. Both populations below are correct behaviour
+> of code that is working as designed, and neither is owned by #657 or by #937 — which is exactly
+> why they stayed invisible: from #657 the class looks enabled, from #937 the sweep looks correct,
+> and only the composition delivers 1.
+
+### 10.1 The measurement
+
+`scripts/auto-mint-provenance.py` at #937's head `ba1a603`, plus `mint-provenance.pr_mint_refusal`
+and `issue_mint_refusal`, over the 17 live orchestrator-class open PRs (#1115):
+
+| verdict | count | share |
+|---|---|---|
+| `no-issue-reference` | **8** | 47% |
+| PR-shape refused — **DRAFT** | **6** | 35% |
+| `MINTABLE` | 2 | 12% |
+| `reference-is-a-pull-request` | 1 | 6% |
+
+One of the two mintable PRs carries `needs:user` (§9.5 item 1, the `MINTABLE-BUT-DEAD` bucket).
+**Net delivery: 1, and that one is #937 itself.** The derivation was validated against a known
+answer in both directions before the counts were reported — #937 binds `#929` correctly, and each
+refusal matches a case #937 documents deliberately.
+
+### 10.2 Population 1 — 8 of 17: a strict reader with no matching writer contract — **fixed here**
+
+#937 derives `issue_number` only from an adjacent closing-keyword reference in the PR's own title
+and body, and refuses with **no fallback**. That strictness is not negotiable and is not what is
+fixed: the derivation is author-controlled, and `record["issue"]` feeds the source-issue `needs:*`
+human-hold check and the `plan_package` lease partition, so a loose derivation would let an author
+pick a partition or step around a hold. **Loosening the derivation is REFUSED** — it re-opens the
+author-controlled-evidence axis #937 closed on review.
+
+What was missing was the obligation on the **authoring** side. Orchestrator agents wrote
+`Tracking issue: …`, `Closes the composition defect in #N`, conventional-commit scopes like
+`fix(#869):`, and cross-repository references, all of which #937 correctly refuses, and nothing
+ever told them. Three things now close that, in the order an author meets them:
+
+1. **The rule**, stated where orchestrator PR bodies are authored — `AGENTS.md` item 13 (#973).
+2. **The composer**, `scripts/pr-body-ref.py compose` (#1154/#1155), which emits the intersection
+   form and verifies its own output against the reader's *imported* grammar.
+3. **The advisory**, `scripts/pr-body-ref.py check`, run by `pr-gate.yml` on every pull (#1115).
+   This is the piece #1115 adds: the rule and the composer only reach an author who thought to look
+   for them, and the note now lands on the object that is wrong, while it is being written.
+
+The advisory is **sound and one-sided by construction**, which is the property that makes it worth
+having. `closing_references` computes `declared = resolved & raw_refs` and `all_refs = seen ⊇
+raw_refs`, so over the raw text alone, with no renderer and no network: **0** raw closing references
+guarantees a refusal, **2+** guarantees `ambiguous-issue-reference`, and **exactly 1** is
+undecidable offline — a body whose only reference sits in a fenced block is raw-declared and
+rendered-invisible. So `check` says nothing at 1 rather than "looks good": it has no false alarms
+and accepts false negatives, which is the only asymmetry an advisory may have. It grants nothing,
+admits nothing, writes nothing, makes no network call, and returns 0 on every path including its
+own bugs — `auto-mint-provenance` remains the sole authority.
+
+### 10.3 Population 2 — 6 of 17: drafts stay OUT OF SCOPE — **decision, with the cost stated**
+
+`pr_mint_refusal` refuses a draft, and the reason it gives is a coupling to a different component:
+groom's stale-draft carve-out reads `is_enumerable_provenance`, which hard-codes
+`admit_orchestrator=False`, so a *minted* orchestrator draft would be terminally `needs:user`-parked
+by age instead of reviewed.
+
+**The decision recorded here is that this stands: drafts are out of scope for the orchestrator
+review lane.** It was previously true only emergently — a property nobody had chosen — and #1115
+exists to make it a choice. The reasoning:
+
+* `provenance_admission_error`'s docstring already records the carve-out's `admit_orchestrator=False`
+  as deliberate: it asks *"is this a pipeline-owned worker draft?"*, and an orchestrator PR is not
+  one. The carve-out also governs paths that **push commits**, and the orchestrator class is
+  self-attested (the actor that wrote the diff wrote the record). Per §3 option (b) and the arm
+  boundary in `enrolment_enable_error`, that class must never reach a leg with a write in it.
+* A draft is a **reversible, author-owned state**. Unlike `no-issue-reference`, the cost of the
+  refusal is one click by the person who already holds the object.
+
+**The cost is real and is not hidden: 35% of the class.** For that population the lane is not "not
+yet enabled" — it is closed, and it will keep reading as a silent zero in the census.
+
+The rejected alternative, stated so a future reader does not have to re-derive it: give groom's
+age-park a **review-only exemption** that does not hand the fix lane write access. That is a
+genuine option, and it is not taken here because it is a **new opt-in on a trust-plane predicate**
+whose current fail-closed default protects four consumer legs — a change of that shape needs its own
+design record, its own mutant battery over each leg, and maintainer sign-off, none of which belong
+in an advisory-check PR. **This section is not that sign-off.** If a maintainer wants the draft
+population inside the lane, §10.3 is the record to reopen.
+
+What #1115 changes for this population instead is **visibility**: `pr-gate.yml`'s advisory now names
+the draft refusal on the pull itself, with its reason and the one-click fix, so a drafted
+orchestrator PR is no longer silently outside a lane its author believes it is in.
