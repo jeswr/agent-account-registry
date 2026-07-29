@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4799,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "dee67f26366aec2f68cf594812c254ce4471cc0c",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`parse_float` still maps both `INF` and `+INF` to positive infinity. The XSD float/double special lexical representations are `INF`, `-INF`, and `NaN`; `+INF` is not valid. This contradicts the generated module's claim that floating-point lexical well-formedness is enforced. The generated-loader datatype harness still has no xsd:float or xsd:double properties, so the real emitted path remains untested for this case.",
+    "file": "crates/sparq-wrapper-shacl/src/emit.rs",
+    "fix_hint": "Remove `+INF` from the accepted special forms and extend the generated-loader behavioral harness with xsd:float and xsd:double properties. Test acceptance of `INF`, `-INF`, `NaN`, and ordinary decimal/exponent forms, and rejection of `+INF`, Rust-only spellings such as `inf`/`infinity`, case variants, whitespace, and malformed numeric forms.",
+    "severity": "major",
+    "title": "Floating-point validator still accepts the non-XSD `+INF` lexical form"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 leaves the round-4 major correctness finding unresolved. The generated loader still accepts `+INF` for both xsd:float and xsd:double even though the XSD special lexical forms are `INF`, `-INF`, and `NaN`. The behavioral datatype harness still defines no float or double properties, so it does not exercise the advertised floating-point lexical validation. Progress is stagnant because the same major issue remains at the same severity.",
+  "verdict": "request_changes"
+ }
+}
