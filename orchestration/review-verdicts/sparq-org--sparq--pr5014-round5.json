@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5014,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "83896dd3edbfdb4d05936ba6b620b33d652ff401",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "build_field records only the special singleton sh:IRI case in `iri_only`, then applies it only when `source` is None. If the same property also has sh:datatype, sh:class, or sh:node, the node-kind constraint is ignored. For example, `sh:datatype xsd:string; sh:nodeKind sh:IRI` is unsatisfiable, but lowering emits a scalar String field whose loader accepts an xsd:string literal. Likewise, other node-kind sets fall through the wildcard arm and become unconstrained Term fields. This is a wrong-acceptance bug, not merely a constraint that does not affect the Rust field type, because emitted loaders are presented as enforcing the represented shape and lowering claims irreconcilable value types fail with SchemaError.",
+    "file": "crates/sparq-wrapper-shacl/src/lower.rs",
+    "fix_hint": "Represent node-kind requirements in the lowering constraint accumulator and conjoin them with datatype/class/node requirements. At minimum, return a typed SchemaError whenever a node-kind constraint cannot be faithfully enforced; do not discard it. Add an end-to-end generated-loader test for a contradictory datatype + sh:nodeKind sh:IRI property that proves lowering fails closed (or, if modeled, that nonconforming values are rejected), plus coverage for non-IRI node-kind constraints.",
+    "severity": "major",
+    "title": "Combined sh:nodeKind constraints are silently dropped"
+   }
+  ],
+  "progress": null,
+  "summary": "The generated-loader path is well tested for its advertised happy paths, cardinality, datatypes, closed shapes, references, and cyclic nesting. However, lowering silently discards a load-bearing SHACL value constraint when sh:nodeKind is combined with another value source. This can turn an unsatisfiable shape into generated code that accepts data, contradicting the crate's fail-closed/faithful-lowering contract.",
+  "verdict": "request_changes"
+ }
+}
