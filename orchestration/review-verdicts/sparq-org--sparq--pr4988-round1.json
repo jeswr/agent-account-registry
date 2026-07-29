@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4988,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e5ad13a2187028a4c842e74c5ac19d52c2da0d1e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "cross_check_oracles uses `let Ok(...) = eval(...) else { return OracleCross::Skipped; }` for both engines. This maps OracleError::Backend and OracleError::Data to the same result as OracleError::Unsupported. Thus spawn failures, timeouts, crashes, signal termination, garbage stdout, and data rejection increment `o2_skipped` and the run remains successful. That directly violates the diff's claim that a broken oracle must not read as an innocuous skip, and permits a misconfigured or dead second oracle to compare zero cases without a distinct fault signal.",
+    "file": "crates/sparq-bench/src/fuzz.rs",
+    "fix_hint": "Preserve error classes in OracleCross (for example, add a Broken/Backend variant carrying details), count and print backend faults separately, and make the run clearly fail or otherwise unmistakably report that the configured oracle was non-operational. Only OracleError::Unsupported should become Skipped. Add an integration-level cross_check_oracles test using a stub that returns Backend (and Data where applicable) and assert it cannot produce Skipped.",
+    "severity": "major",
+    "title": "Backend failures are silently collapsed into the skipped bucket"
+   }
+  ],
+  "progress": null,
+  "summary": "The subprocess adapter distinguishes a legitimate Unsupported decline from Backend/Data failures, but the integration immediately erases that distinction: every Oracle::eval error becomes OracleCross::Skipped. Consequently a missing executable, timeout, crash, malformed JSON, or input rejection is reported only as an innocuous skipped query. This contradicts the stated wire-protocol safety property and can make a completely broken second oracle look like a healthy run with skips. The tests cover adapter classification in isolation but do not exercise the load-bearing propagation into the fuzz counters.",
+  "verdict": "request_changes"
+ }
+}
