@@ -8,6 +8,7 @@ cross-resolver-agreement.py
 curate-frontier.py
 dashboard-gen.py
 deprecated_models.py
+diagnostic-sink.py
 dispatch-claim.py
 dispatch-plan.py
 dispatch-secrets-guard.py

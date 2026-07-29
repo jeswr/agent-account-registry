@@ -785,6 +785,20 @@ the parsed document in memory and required to come back named.
   cleared and python isolated; and the gate step's own runner command files are redirected to a
   quarantine path, removing that persistence primitive at its source. Drift ABORTS without
   mutating human-owned issue state; `final_state` returns the issue to the pool.
+- **The account diagnostics do not run here, and cannot be made to.** `account-whoami.yml`
+  (identity probe) and `fingerprint-accounts.yml` (fleet 7d-reset fingerprint) write a stable
+  per-account identifier into an Actions log, and these logs are public — so both jobs carry
+  `if: ${{ github.event.repository.private == true }}` and skip on this repo forever, touching no
+  secret (issue #183). `scripts/diagnostic-sink.py` is their bootstrap into the **private** sink
+  (`jeswr/agent-account-data`, the `ALERT_REPO` this registry already routes account-enumerating
+  output to): `plan` prints the ordered runbook — visibility read-back, environment +
+  default-branch-only deployment policy, then the secret values, in that order — and `emit` writes
+  the two workflows out **byte-for-byte, guard included**, so GitHub re-evaluates the guard against
+  the destination on every run and a sink later flipped public goes inert by itself. Both commands
+  refuse (exit 2, nothing written) unless every job of every probe is *provably* unreachable while
+  that guard is false, decided by `dispatch-secrets-guard.if_condition_admits` — the same procedure
+  that proves the exfil gate above. The enrolled self-test asserts that proof against the live
+  tree on every PR, which is the only continuous check the two inert workflows have (issue #370).
 
 ## Registering a new account (web-login broker)
 
