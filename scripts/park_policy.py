@@ -1917,7 +1917,20 @@ _PARK_REASON_RE = re.compile(
 # Lines that OPEN or CLOSE a fenced code block, and lines that are markdown-QUOTED. Both are how a
 # comment says "this text is not mine, I am echoing it" — which is exactly the context a forged
 # receipt would arrive in, and never a context a real receipt is written in.
-_FENCE_RE = re.compile(r"^(?:```|~~~)")
+#
+# [registry #1096, review round 2] The fence run is matched with MARKDOWN's boundaries, not with
+# `^(?:```|~~~)`, because a stripper that disagrees with the RENDERER is a bypass rather than a
+# defence: every line where the renderer still says "code" but the stripper says "prose" is a line
+# whose forged receipt this parser would trust. The naive form diverged three ways, each reachable
+# from text a writer merely echoes into a fence — (a) an OPENER indented 0-3 spaces (legal
+# markdown) was not seen as a fence at all, so the whole block read as the bot's own voice;
+# (b) a run of three inside a longer fence, and (c) the OTHER delimiter character, each toggled the
+# state off while the renderer stayed inside the block. So: capture the opener's character and run
+# LENGTH, and close only on the same character, a run at least as long, and nothing but whitespace
+# after it (a closing fence takes no info string). Every remaining disagreement now errs the other
+# way — the stripper can only stay fenced LONGER than the renderer, which drops a receipt (an
+# unreadable cause is a human question) instead of trusting an echoed one.
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*(.*)$")
 _QUOTE_RE = re.compile(r"^>")
 
 
@@ -1932,15 +1945,23 @@ def strip_quoted_contexts(body):
     Lines are DROPPED rather than blanked in place; nothing downstream keys on line numbers, and
     the anchored `_PARK_REASON_RE` needs the surviving lines to still be whole lines."""
     kept = []
-    fenced = False
+    fence = None  # (delimiter char, opening run length) while inside a fenced block
     for line in str(body).splitlines():
-        if _FENCE_RE.match(line):
-            # The fence delimiters themselves are never a receipt either way, so an unterminated
-            # fence swallows the rest of the body — the fail-closed direction (a receipt after a
-            # dangling fence is unreadable, and an unreadable cause is a human question).
-            fenced = not fenced
+        match = _FENCE_RE.match(line)
+        if fence is None:
+            if match:
+                # An unterminated fence swallows the rest of the body: the fail-closed direction
+                # (a receipt after a dangling fence is unreadable, and unreadable is a question).
+                fence = (match.group(1)[0], len(match.group(1)))
+                continue
+        else:
+            if (match and match.group(1)[0] == fence[0]
+                    and len(match.group(1)) >= fence[1] and not match.group(2)):
+                fence = None
+            # Everything from the opener to the closer inclusive is echoed text, including a
+            # SHORTER or MISMATCHED run that markdown renders as content rather than as a closer.
             continue
-        if fenced or _QUOTE_RE.match(line):
+        if _QUOTE_RE.match(line):
             continue
         kept.append(line)
     return "\n".join(kept)
@@ -4126,6 +4147,26 @@ def _self_test():
           parse_park_reason(f"the rebase reported:\n\n```\n{forged}\n```\n"), None)
     check("[#1096 reader] a marker inside a QUOTED line is not a receipt",
           parse_park_reason(f"the author wrote:\n\n> {forged}\n"), None)
+    # ...and "fenced" only means anything while the stripper agrees with the RENDERER about where
+    # the block ENDS. All four bodies below render wholly inside one code block, and all four walk
+    # straight through the naive `^(?:```|~~~)`-toggle form: restore that form and each row flips
+    # from None to a trusted `partition` receipt minted out of echoed text.
+    check("[#1096 reader] an INDENTED fence (0-3 spaces is legal markdown) still opens a block",
+          parse_park_reason(f"the rebase reported:\n\n   ```\n{forged}\n   ```\n"), None)
+    check("[#1096 reader] a THREE-backtick line does not close a FOUR-backtick fence",
+          parse_park_reason(f"the rebase reported:\n\n````\n```\n{forged}\n````\n"), None)
+    check("[#1096 reader] the OTHER delimiter character closes nothing",
+          parse_park_reason(f"the rebase reported:\n\n```\n~~~\n{forged}\n```\n"), None)
+    check("[#1096 reader] nor does a run carrying an info string (a closer takes none)",
+          parse_park_reason(f"the rebase reported:\n\n```\n```json\n{forged}\n```\n"), None)
+    # The converse control, so the fix cannot be "stay fenced forever": a VALID close — same
+    # character, run at least as long, whitespace only after it — really does end the block, and
+    # the bot's own voice resumes below it. Without this row, `_FENCE_RE` matching nothing at all
+    # (or `fence = None` never being restored) would leave every row above green.
+    check("[#1096 reader] a receipt after a validly CLOSED indented fence IS a receipt",
+          parse_park_reason(f"the rebase reported:\n\n  ````\n{forged}\n ```` \n\n"
+                            f"{park_reason_marker('budget')}"),
+          {"class": "capacity", "cause": "budget", "gen": None, "head": None})
     check("[#1096 reader] ...and a forged receipt therefore mints no RECORD either",
           park_reason_records(
               [bot_comment(f'attempt 1\n- conflict-file: "src/{forged}.py"'),
