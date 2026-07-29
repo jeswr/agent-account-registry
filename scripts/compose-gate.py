@@ -128,6 +128,20 @@ BLOCKING_STATES = (BROKEN, UNPROVABLE)
 
 RECEIPT_PREFIX = "compose-gate:"
 
+
+def exit_code(result):
+    """PURE: the process exit status for a verdict — the ONE place the fail direction is decided.
+
+    ⚠️ EXTRACTED SO IT CAN BE TESTED AGAINST SOMETHING OTHER THAN ITSELF. The row that claimed to pin
+    "the receipt's blocking= field cannot drift from the exit code" derived its expected value from
+    `1 if state in BLOCKING_STATES else 0` and compared it against that same expression, and never
+    invoked `main()`. Mutating `main()` to `state == BROKEN` left the self-test passing 123/123 while
+    the receipt printed `blocking=true` and the process exited 0 — the exact drift the row was named
+    after, and a one-token re-opening of the fail-open retracted in 4a3a3bfeb. A test that derives its
+    expectation from the expression under test measures nothing. `main()` now returns THIS, the
+    receipt reads the same predicate, and the self-test pins both against a LITERAL table."""
+    return 1 if (result or {}).get("state") in BLOCKING_STATES else 0
+
 # The workflow seam this check is wired into, and the exact wiring the self-test pins.
 PR_GATE_WORKFLOW = ".github/workflows/pr-gate.yml"
 GATE_JOB = "gate"
@@ -152,6 +166,23 @@ RUNNER_ARM = "run-selftest)"
 # So a fault is detected the way `_run_suite` already detects a gh-escape: by the marker in the
 # output, never by the status. A marker-bearing run is NOT GRADEABLE, which is a third outcome —
 # not a pass, not a failure.
+# ⚠️ AN OPEN-WORLD ALLOWLIST, SO IT CANNOT BE COMPLETE — and that is stated rather than papered over.
+# Uncovered shapes exist (a bare `Traceback`, `command not found`, an OOM `Killed`, and note that
+# `worker-live.sh: line N: syntax error` is NOT the `worker-live: ` marker). None is a reachable
+# FAIL-OPEN: on the composed side every one reads as a failure, which is fail-closed and visible; on
+# the baseline side excusing one would require the graded tree to fault on an entry that PASSED in the
+# same job minutes earlier, which the step ordering prevents. So all KNOWN instances are pinned and
+# the CLASS is not claimed closed.
+#   ⚠️ `Traceback` is deliberately NOT a marker, and this is measured: the known-positive composition
+#   failure (`dispatch-claim.py`, `NameError: name 'repository' is not defined`) PRINTS a Traceback,
+#   because a failing Python self-test normally does. Adding it would reclassify the marquee case from
+#   a precise `composes-broken` to `unprovable` — trading exact attribution for a vaguer red. The
+#   structurally complete fix is INVERSE POLARITY (require a recognised positive verdict line), which
+#   needs 7 of 56 entries normalised onto a `PASSED/FAILED`-shaped terminal line first; a follow-up,
+#   not a one-token addition here.
+#   The broad `"worker-live: "` substring is a latent FAIL-CLOSED trip: a future self-test that echoes
+#   such a line ON SUCCESS would be read as ungradeable. Measured zero false positives across all 56
+#   known-PASS logs today, and the failure direction is a visible red, never a silent green.
 HARNESS_FAULT_MARKERS = ("worker-live: ", "::error::self-test sandbox")
 # An escape is NOT a harness fault: the sandbox worked and caught a self-test reaching the real gh.
 # That is a genuine failure of the entry and stays one.
@@ -614,9 +645,14 @@ def assert_merge_ref_inputs(job):
             "without full history refs/remotes/origin/<base> is not fetched and the live tip "
             "cannot be read")
         # A checkout into a SEPARATE `path:` does not redefine the workspace HEAD, so it is free to
-        # pin a ref; one into the workspace is not.
-        assert "ref" not in with_block or with_block.get("path"), (
-            f"checkout step #{index} pins a ref: override into the workspace, so HEAD is not "
+        # pin a ref (regate-sweep.yml relies on this); one into the workspace is not. ⚠️ `path: '.'`
+        # and `path: './'` ARE the workspace — they clobber HEAD while looking scoped — so the
+        # allowance is granted only to a path that normalises to something other than the root.
+        checkout_path = str(with_block.get("path") or "").strip()
+        scoped = bool(checkout_path) and os.path.normpath(checkout_path) not in (".", "/")
+        assert "ref" not in with_block or scoped, (
+            f"checkout step #{index} pins a ref: override into the workspace "
+            f"(path={with_block.get('path')!r} resolves to the root), so HEAD is not "
             "refs/pull/N/merge and HEAD^1 is not a base tip at all")
 
 
@@ -697,17 +733,40 @@ def _self_test():
         annotation(classify("", ""))[:9], "::error::")
     chk("a FRESH state needs no annotation", annotation(classify(A, A)), "")
 
-    # ⚠️ THE RECEIPT'S `blocking=` FIELD AND THE EXIT CODE ARE TWO STATEMENTS OF ONE FACT, and a
-    # reader who greps the receipt must never be told something the exit code contradicts. They are
-    # computed from the same predicate today; this pins that they cannot drift apart tomorrow.
-    for _state in STATES:
+    # ⚠️ THE FAIL DIRECTION, PINNED AGAINST A LITERAL — and against `main()` itself.
+    # The previous version of this block derived its expected value from `1 if _state in
+    # BLOCKING_STATES else 0` and compared it to that same expression, and never called `main()`.
+    # Mutating `main()` to `state == BROKEN` kept it passing 123/123 while the receipt said
+    # `blocking=true` and the process exited 0. So: the expectation is a hand-written TABLE (a change
+    # to BLOCKING_STATES must be argued for here, not silently ratified), and the assertion runs the
+    # real entry point.
+    EXPECTED_EXIT = {FRESH: 0, CLEAN: 0, CONFLICT: 0, PREEXISTING: 0, BROKEN: 1, UNPROVABLE: 1}
+    chk("the fail-direction table covers every declared state, so a new state cannot skip it",
+        sorted(EXPECTED_EXIT), sorted(STATES))
+    for _state, _want in sorted(EXPECTED_EXIT.items()):
         _row = {"state": _state}
-        chk(f"receipt blocking= agrees with the exit code for {_state!r}",
-            (f"blocking={'true' if _state in BLOCKING_STATES else 'false'}" in receipt(_row),
-             (1 if _state in BLOCKING_STATES else 0)),
-            (True, 1 if _state in BLOCKING_STATES else 0))
-    chk("every state is either blocking or not — none is unclassified",
-        sorted(set(STATES)) == sorted(set(STATES) | set(BLOCKING_STATES)), True)
+        chk(f"exit_code is the LITERAL expected status for {_state!r}", exit_code(_row), _want)
+        chk(f"...and the receipt's blocking= field says the same thing for {_state!r}",
+            f"blocking={'true' if _want else 'false'}" in receipt(_row), True)
+
+    # ...and the ENTRY POINT returns it. `compose` is stubbed at the module attribute `main` resolves
+    # through, so this exercises the real argument parsing, the real receipt print and the real
+    # return — the three things a pure-function assertion cannot reach.
+    _module = sys.modules[__name__]
+    _real_compose, _real_summary = compose, os.environ.pop("GITHUB_STEP_SUMMARY", None)
+    try:
+        for _state, _want in sorted(EXPECTED_EXIT.items()):
+            _module.compose = (lambda *a, _s=_state, **k:
+                               {"state": _s, "reason": "stub", "graded_base": "a" * 40,
+                                "live_tip": "b" * 40})
+            _got = main(["--base-ref", "master"])
+            chk(f"main() RETURNS the blocking status for {_state!r} (mutating it must red)",
+                _got, _want)
+    finally:
+        _module.compose = _real_compose
+        if _real_summary is not None:
+            os.environ["GITHUB_STEP_SUMMARY"] = _real_summary
+    chk("a usage error is neither of the two verdict statuses", main([]), 2)
 
     # ---- the receipt must never let a small selection pass for a full one --------------------
     chk("the receipt prints the entry count so a vacuous selection is visible",
@@ -943,10 +1002,23 @@ def _self_test():
 
         # ...and does NOT over-block: a checkout into a SEPARATE `path:` cannot redefine the
         # workspace HEAD, so pinning a ref there is legitimate (regate-sweep.yml does exactly this).
+        def _extra_checkout(**with_kv):
+            return mutate(lambda j: j["steps"].insert(
+                1, {"uses": "actions/checkout@abc", "with": dict({"fetch-depth": 0}, **with_kv)}))
+
         chk("a path-scoped sibling checkout pinning a ref is ALLOWED",
-            _refused(assert_merge_ref_inputs, mutate(lambda j: j["steps"].insert(
-                1, {"uses": "actions/checkout@abc",
-                    "with": {"fetch-depth": 0, "path": "other", "ref": "master"}}))), "")
+            _refused(assert_merge_ref_inputs,
+                     _extra_checkout(path="other", ref="master")), "")
+        # ⚠️ ...but `path:` values that RESOLVE TO THE ROOT are the workspace, and clobber HEAD while
+        # looking scoped. Found by review: the allowance admitted `.` and `./`.
+        for _root_path in (".", "./", "././", ""):
+            chk(f"a second workspace checkout with path={_root_path!r} + a ref is REFUSED",
+                bool(_refused(assert_merge_ref_inputs,
+                              _extra_checkout(path=_root_path,
+                                              ref="${{ github.event.pull_request.head.sha }}"))),
+                True)
+        chk("a path-scoped checkout with NO ref is allowed regardless of path",
+            _refused(assert_merge_ref_inputs, _extra_checkout(path=".")), "")
 
     for shape, job in (("an absent job", None), ("a step-less job", {}),
                        ("a malformed steps: block", {"steps": "not-a-list"})):
@@ -987,11 +1059,11 @@ def main(argv=None):
     if note:
         print(note)
     _append_step_summary(summary_markdown(result, args.base_ref))
-    # ⚠️ ONLY a semantic composition break reds the gate. A textual conflict is the author's
-    # routine problem and is reported as a warning; see the header. An UNPROVABLE operand does not
-    # red either — the structural guard against this check going vacuous is the mutation-tested
-    # YAML seam above, which reds the SUITE step instead, exactly as gate-staleness.py's is.
-    return 1 if result.get("state") in BLOCKING_STATES else 0
+    # A semantic composition break reds the gate, and so does an UNPROVABLE reading — see
+    # BLOCKING_STATES for why the latter is a RETRACTION of this file's first position rather than an
+    # oversight. A textual conflict and a pre-existing red are the author's business, reported as
+    # warnings, and do not red. The fail direction lives in `exit_code` and nowhere else.
+    return exit_code(result)
 
 
 if __name__ == "__main__":
