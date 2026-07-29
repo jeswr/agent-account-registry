@@ -75,10 +75,55 @@
 # the anchor cannot be read — artifacts expired, listing refused, malformed page — this proceeds
 # and says so loudly. A rate limiter that can permanently stop the pipeline is a worse failure than
 # the burst it prevents (a human-only unpark turns a transient outage into a permanent stall), and
-# the blast radius of the fail-open is exactly ONE tick: that tick writes a fresh anchor. Note the
-# honest residual — during a total budget outage this read 403s too, so the floor stops bounding
-# and every tick costs the ~3 requests it takes to die. That is deliberate: it is what lets the
-# pipeline notice its own recovery without a human.
+# the blast radius of the fail-open is exactly ONE tick: that tick writes a fresh anchor.
+#
+# =============================================================================================
+# WHY A WALL-CLOCK FLOOR IS NOT ENOUGH — the 2026-07-29 06:19-06:32Z recurrence.
+#
+# The floor above WORKS, and the re-measurement says so rather than the reading: over
+# 03:10Z-06:52Z on 2026-07-29 it admitted 18 EXECUTED ticks out of 68 non-coalesced runs (4.86
+# executed ticks/h, inside its own 6/h ceiling) and HELD the other 50 — including, live, a tick
+# 8m36s after the previous one. The doorbell rang 138 times in that window; the floor is exactly
+# what kept 138 rings from becoming 138 sweeps. None of that stopped the budget going to zero
+# again at 06:19Z.
+#
+# The defect is the DENOMINATOR. Every number in the arithmetic above is dispatch's own, and it
+# is compared against a band (`OBSERVED_SAFE_REQUESTS_PER_HOUR`) that was also measured from
+# dispatch's own tick counts — as though this workflow were the only thing spending. It is not.
+# The `github.token` budget is ONE bucket shared by every workflow run in the repository, and in
+# the exhausted hour 05:33:47Z-06:33:47Z (the window whose reset the pipeline recovered on) that
+# repository ran 360 workflow runs: 131 triage-issue, 99 set-up-account, 52 dispatch, ~40
+# review-fix, ~12 worker, 10 pr-gate, and the scheduled sweeps. Four full dispatch ticks in that
+# hour spent 4 x 613 = 2,452 requests — 49% of the entire repository's 5,000 — and the other
+# ~2,548 were spent by the other 356 runs. The floor's own ceiling, 6 x 613 = 3,678/h, is 74% of
+# a budget it does not own.
+#
+# So the floor cannot be fixed by lowering the constant: the right number depends on what the
+# REST of the estate is spending this hour, which no constant can know. What it can know is the
+# ONE authoritative number — `x-ratelimit-remaining`, off a real response — and the anchor read
+# below is already a real response. The budget gate therefore costs ZERO extra requests: it reads
+# the remaining budget off the headers of the request the floor was making anyway, and holds the
+# tick when what is left cannot pay for one.
+#
+# This also closes the fail-open residual the paragraph above used to end on. During a total
+# budget outage the anchor read 403s — but that 403 CARRIES `x-ratelimit-remaining: 0`, which is
+# positive evidence, so the tick now defers on it instead of proceeding into PLAN's 613-request
+# sweep. Measured shape of the outage this removes: of the 10 red ticks at 06:19-06:32Z, 8 had
+# PLAN correctly SKIPPED by the wall-clock floor and went red anyway, and 2 were admitted into an
+# empty bucket and died in the snapshot.
+#
+# THE HOLD HAS A MACHINE EXIT, and it is the same one the wall-clock hold has: a deferred tick
+# writes NO anchor (the upload step is gated on the same `proceed` output), so nothing is
+# ratcheted forward and the very first doorbell ring after the budget resets executes
+# immediately. No human unparks this. The cost of a deferred tick is the ONE request the anchor
+# read already spent.
+#
+# POSITIVE EVIDENCE ONLY, in both directions. An ABSENT `x-ratelimit-remaining` proceeds — an
+# absent header proves nothing, and failing closed on it would take the pipeline down on any
+# proxy that strips it (the same polarity `plan-snapshot._check_reserve` chose). And the number
+# is never read from `GET /rate_limit`: that endpoint reports a DIFFERENT bucket and read healthy
+# through the whole 2026-07-27 outage (#796), which is why it is not called here and a response
+# header is.
 import json
 import os
 import re
@@ -111,6 +156,21 @@ def requests_per_tick(worker_prs=WORKER_PR_STATUS_LIMIT):
     counted = min(max(int(worker_prs), 0), WORKER_PR_STATUS_LIMIT)
     return SNAPSHOT_LISTING_REQUESTS + SNAPSHOT_REQUESTS_PER_WORKER_PR * counted
 
+
+# THE PRE-FLIGHT BUDGET RESERVE. Held back so a tick that IS admitted leaves enough behind for the
+# jobs that are not PLAN — secrets-guard's 3 reads, CLAIM's lease/launch writes, and plan-alert's
+# one `gh issue list`. Deliberately the SAME number as plan-snapshot.RATE_LIMIT_RESERVE, and the
+# self-test cross-asserts the two whenever that file is present: a snapshot that stops at 100
+# remaining and a floor that admits a tick at 50 remaining would be two halves of one control
+# disagreeing about what the reserve is for.
+RATE_LIMIT_RESERVE = 100
+
+# The SHARED bucket, as reported by `x-ratelimit-limit` on this repository's own responses. It is
+# recorded here only so the arithmetic below can state the thing the original derivation missed:
+# this number is not dispatch's allowance, it is the whole repository's, and dispatch is one of
+# ~360 runs an hour drawing on it. Never used as a runtime threshold — the live remaining count
+# off a real response is the only number the gate acts on.
+SHARED_HOURLY_BUDGET = 5000
 
 MEASURED_REQUESTS_PER_TICK = 613
 # The highest hourly request rate observed to run clean, and the rate that broke. Both are
@@ -163,6 +223,31 @@ def decide(last_executed_epoch, now, interval=MIN_TICK_INTERVAL_SECONDS):
     return "run", age, "ok"
 
 
+def budget_floor(worker_prs=WORKER_PR_STATUS_LIMIT):
+    """The remaining request budget a tick must SEE before it is allowed to start: everything the
+    tick will spend, plus the reserve the rest of the pipeline needs after it. Sized at
+    requests_per_tick()'s CEILING for the same reason the wall-clock floor is — an error in a rate
+    limiter should point at spending less, not more."""
+    return int(requests_per_tick(worker_prs)) + RATE_LIMIT_RESERVE
+
+
+def decide_budget(remaining, threshold=None):
+    """-> ('run'|'hold', threshold, reason). The PRE-FLIGHT half of the floor (#819 recurrence).
+
+    POSITIVE EVIDENCE ONLY. `hold` is returned solely for a remaining count that was actually read
+    off a response and is below what one tick costs. `remaining is None` — header absent, stripped
+    by a proxy, unparseable — RUNS: an absent header proves nothing, and a rate limiter that fails
+    closed on a missing header can stall the pipeline with no human-free way back. That is the same
+    polarity plan-snapshot._check_reserve chose, and the same one decide() uses for a missing
+    anchor."""
+    threshold = budget_floor() if threshold is None else int(threshold)
+    if remaining is None:
+        return "run", threshold, "no readable remaining-budget header"
+    if int(remaining) < threshold:
+        return "hold", threshold, "remaining request budget cannot pay for one tick"
+    return "run", threshold, "ok"
+
+
 def newest_marker_epoch(payload, marker=TICK_MARKER_ARTIFACT):
     """Newest `created_at` among non-expired artifacts named exactly `marker`. -> epoch|None.
 
@@ -200,33 +285,87 @@ def parse_rfc3339(raw):
 # ---------------------------------------------------------------------------------------------
 # live path
 # ---------------------------------------------------------------------------------------------
-def _gh_json(args, label="tick-floor"):
-    """Run `gh <args>` and parse stdout as JSON. -> parsed|None (never raises).
+def split_response(raw):
+    """`gh api -i` stdout -> (headers dict, lower-cased keys; body str).
+
+    REFUSES TO GUESS: a payload that does not begin with a status line is treated as headerless
+    (`{}` — no budget evidence, which decide_budget reads as RUN) rather than being scanned for
+    colons. A JSON body is full of them, and inventing an `x-ratelimit-remaining` out of one would
+    make the gate fire on noise."""
+    if not isinstance(raw, str) or not raw:
+        return {}, ""
+    text = raw.replace("\r\n", "\n")
+    if not text.startswith("HTTP/"):
+        return {}, raw
+    head, _, body = text.partition("\n\n")
+    headers = {}
+    for line in head.splitlines()[1:]:
+        key, sep, value = line.partition(":")
+        if sep:
+            headers[key.strip().lower()] = value.strip()
+    return headers, body
+
+
+def _int_header(headers, name):
+    try:
+        return int(str((headers or {})[name]).strip())
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def remaining_budget(headers):
+    """`x-ratelimit-remaining` off a real response, or None. The ONLY source this file will accept
+    for the number: `GET /rate_limit` reports a different bucket and read healthy through the whole
+    2026-07-27 outage (#796), so it is never called here."""
+    return _int_header(headers, "x-ratelimit-remaining")
+
+
+def budget_detail(headers):
+    """`remaining/limit, resets at ...` for the recorded deferral line. Deliberately the same shape
+    as plan-snapshot._budget_detail, so one grep finds both halves of the control."""
+    remaining = remaining_budget(headers)
+    limit = _int_header(headers, "x-ratelimit-limit")
+    reset = _int_header(headers, "x-ratelimit-reset")
+    when = (datetime.fromtimestamp(reset, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            if reset is not None else "unknown")
+    return (f"x-ratelimit-remaining={remaining if remaining is not None else 'absent'}"
+            f"/{limit if limit is not None else 'absent'}, resets at {when}")
+
+
+def _gh_response(args, label="tick-floor"):
+    """Run `gh <args>` and read it as an `-i` response. -> (parsed|None, headers dict).
+
+    The headers come back EVEN WHEN THE REQUEST FAILED, and that is the point: a budget-exhausted
+    403 carries `x-ratelimit-remaining: 0`, which is precisely the evidence the pre-flight gate
+    needs and which no successful request can supply once the bucket is empty.
 
     Sanitized: only the subcommand words and the return code are ever printed — `GH_DEBUG=api`
-    echoes request bodies into stderr, so stderr is never surfaced."""
+    echoes request bodies into stderr, so stderr is never surfaced, and the rate-limit numbers are
+    the only part of the response this file ever prints."""
     result = subprocess.run(["gh"] + args, capture_output=True, text=True, check=False)
+    headers, body = split_response(result.stdout)
     if result.returncode != 0:
         print(f"::warning::{label}: gh {args[0]} failed (rc={result.returncode})")
-        return None
+        return None, headers
     try:
-        return json.loads(result.stdout or "null")
+        return json.loads(body or "null"), headers
     except ValueError:
         print(f"::warning::{label}: gh {args[0]} succeeded but returned unparseable JSON")
-        return None
+        return None, headers
 
 
 def read_anchor(repo, runner=None):
-    """Newest executed-tick marker for `repo`, as an epoch. One API request.
+    """-> (newest executed-tick marker epoch|None, response headers dict). ONE API request — the
+    same one the pre-flight budget gate reads its evidence off, so that gate costs nothing.
 
     `runner` is resolved at CALL time, not bound as a default: a default argument captures the
     function object at definition, which makes the live path unpatchable and every stubbed-flow
     assertion below quietly exercise the real `gh`."""
-    runner = runner or _gh_json
-    payload = runner(["api", "-H", "Accept: application/vnd.github+json",
-                      f"/repos/{repo}/actions/artifacts"
-                      f"?name={TICK_MARKER_ARTIFACT}&per_page={ARTIFACT_PAGE_SIZE}"])
-    return newest_marker_epoch(payload)
+    runner = runner or _gh_response
+    payload, headers = runner(["api", "-i", "-H", "Accept: application/vnd.github+json",
+                               f"/repos/{repo}/actions/artifacts"
+                               f"?name={TICK_MARKER_ARTIFACT}&per_page={ARTIFACT_PAGE_SIZE}"])
+    return newest_marker_epoch(payload), (headers or {})
 
 
 def _now():
@@ -242,9 +381,23 @@ def _emit(proceed):
         handle.write(f"proceed={'true' if proceed else 'false'}\n")
 
 
+def _record(line):
+    """Append a deferral to the run's job summary as well as the log, so deferred ticks are
+    COUNTABLE after the fact rather than only greppable. Uses the always-present
+    GITHUB_STEP_SUMMARY file, so recording needs no new workflow wiring to go wrong."""
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        pass
+
+
 def main():
     repo = os.environ["REGISTRY_REPO"]
-    anchor = read_anchor(repo)
+    anchor, headers = read_anchor(repo)
     action, age, reason = decide(anchor, _now())
     minutes = "unknown" if age is None else f"{age // 60}m{age % 60:02d}s"
     if action == "hold":
@@ -253,6 +406,24 @@ def main():
               "PLAN and CLAIM will be skipped and no snapshot request will be issued.")
         _emit(False)
         return 0
+
+    # PRE-FLIGHT BUDGET GATE. The wall-clock floor says this tick MAY run; this asks whether it
+    # can AFFORD to. Evidence is the `x-ratelimit-remaining` header on the anchor read above — no
+    # extra request, and the only authoritative source (#796). A tick that cannot pay defers here
+    # having spent ONE request, instead of starting a 613-request sweep that dies on its first
+    # read and takes GUARD, CLAIM and the ops-alert down with it.
+    budget_action, threshold, budget_reason = decide_budget(remaining_budget(headers))
+    if budget_action == "hold":
+        detail = budget_detail(headers)
+        print(f"::warning::tick-floor: DEFER (budget) — {budget_reason}: one tick costs up to "
+              f"{int(requests_per_tick())} requests and this job holds back {RATE_LIMIT_RESERVE} "
+              f"for GUARD/CLAIM/ALERT, so it needs {threshold} ({detail}). This tick is a clean "
+              "no-op: PLAN and CLAIM are skipped, NO anchor is written, and the first doorbell "
+              "ring after the reset executes immediately — no human unparks this.")
+        _record(f"- `tick-floor` DEFER budget: needed {threshold}, {detail}")
+        _emit(False)
+        return 0
+
     if anchor is None:
         print(f"::warning::tick-floor: {reason} — proceeding (fail-open). The floor is a rate "
               "limiter, not a safety control; refusing here would stall the pipeline until a "
@@ -260,6 +431,7 @@ def main():
     else:
         print(f"tick-floor: RUN — last executed tick was {minutes} ago (floor "
               f"{MIN_TICK_INTERVAL_SECONDS // 60} min).")
+    print(f"tick-floor: budget ok — {budget_detail(headers)} (needs {threshold})")
     _emit(True)
     return 0
 
@@ -425,8 +597,11 @@ def _self_test():
 
     _test_budget_arithmetic(chk)
     _test_floor_predicate(chk)
+    _test_preflight_budget_predicate(chk)
     _test_anchor_parsing(chk)
+    _test_response_splitting(chk)
     _test_a_too_soon_tick_issues_no_snapshot_requests(chk)
+    _test_an_unaffordable_tick_issues_no_snapshot_requests(chk)
     _test_live_path(chk)
     _test_workflow_seam(chk)
 
@@ -491,6 +666,136 @@ def _test_floor_predicate(chk):
     chk("floor: a FUTURE-dated anchor runs rather than holding out ticks on a skewed clock",
         decide(now + 600, now)[0], "run")
     chk("floor: the held tick reports its real age", decide(now - 120, now)[1], 120)
+
+
+def _test_preflight_budget_predicate(chk):
+    """THE PRE-FLIGHT GATE (#819 recurrence). The wall-clock floor bounds dispatch's OWN rate; this
+    bounds it against what the rest of the estate has already spent out of the shared bucket."""
+    floor_value = budget_floor()
+    chk("preflight: the threshold is one tick's own cost PLUS the reserve the rest of the "
+        "pipeline needs after it", floor_value,
+        int(requests_per_tick(WORKER_PR_STATUS_LIMIT)) + RATE_LIMIT_RESERVE)
+    chk("preflight: an EXHAUSTED budget (remaining 0 — the 06:19Z outage) HOLDS",
+        decide_budget(0)[0], "hold")
+    chk("preflight: a budget that cannot cover one tick HOLDS", decide_budget(floor_value - 1)[0],
+        "hold")
+    chk("preflight: EXACTLY the threshold runs; one request under it holds (an off-by-one here is "
+        "either a stalled pipeline or a tick that dies mid-sweep)",
+        (decide_budget(floor_value)[0], decide_budget(floor_value - 1)[0]), ("run", "hold"))
+    chk("preflight: a healthy budget RUNS", decide_budget(4832)[0], "run")
+    chk("preflight: an ABSENT remaining header RUNS (positive evidence only — an absent header "
+        "proves nothing, and failing closed on it strands the pipeline behind a human)",
+        decide_budget(None)[0], "run")
+    # The reserve is only real if it is the same number the snapshot stops at. Two halves of one
+    # control disagreeing about the reserve is how a tick gets admitted at 50 remaining.
+    snapshot = os.path.join(_repo_root(), "scripts", "plan-snapshot.py")
+    if os.path.isfile(snapshot):
+        with open(snapshot, encoding="utf-8") as handle:
+            declared = re.search(r"^RATE_LIMIT_RESERVE\s*=\s*(\d+)", handle.read(), re.M)
+        chk("preflight: the reserve matches plan-snapshot.py's live RATE_LIMIT_RESERVE",
+            int(declared.group(1)) if declared else None, RATE_LIMIT_RESERVE)
+    # THE SHARED-BUCKET ARITHMETIC that makes a pre-flight gate necessary AT ALL, and the reason
+    # the wall-clock floor alone could not stop the 2026-07-29 recurrence. Measured over
+    # 05:33:47Z-06:33:47Z (the window whose reset the pipeline recovered on): 360 workflow runs in
+    # this ONE repository, of which dispatch was 52. Every one of them spends from this bucket.
+    chk("preflight: the wall-clock floor's own hourly ceiling is a MAJORITY of the whole SHARED "
+        "bucket, so no constant can be safe — the other ~356 runs/h in this repository can empty "
+        "it inside a legal 6-tick hour, which is why the gate reads the LIVE remaining budget",
+        ((3600 // MIN_TICK_INTERVAL_SECONDS) * MEASURED_REQUESTS_PER_TICK
+         > SHARED_HOURLY_BUDGET // 2), True)
+    chk("preflight: ... and the gate's threshold is a small fraction of that bucket, so the gate "
+        "throttles dispatch rather than reserving the bucket for it",
+        budget_floor() < SHARED_HOURLY_BUDGET // 4, True)
+
+
+def _test_response_splitting(chk):
+    """`gh api -i` parsing. The gate is only as good as the header read that feeds it, and a
+    permissive misparse here would invent budget evidence out of a JSON body."""
+    raw = ("HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n"
+           "X-RateLimit-Limit: 5000\r\nX-RateLimit-Remaining: 4832\r\n"
+           "X-RateLimit-Reset: 1785308701\r\n\r\n{\"artifacts\": []}")
+    headers, body = split_response(raw)
+    chk("split: the remaining budget is read off the response headers, case-insensitively",
+        remaining_budget(headers), 4832)
+    chk("split: the body still parses as JSON after the headers are stripped",
+        json.loads(body), {"artifacts": []})
+    chk("split: the detail line names the budget and its reset", budget_detail(headers),
+        "x-ratelimit-remaining=4832/5000, resets at 2026-07-29T07:05:01Z")
+    # A 403 response is where the number MATTERS most: no successful request can supply it once
+    # the bucket is empty, so the failure path must still yield the headers.
+    refused = ("HTTP/2.0 403 Forbidden\r\nX-RateLimit-Limit: 5000\r\n"
+               "X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1785310427\r\n\r\n"
+               "{\"message\": \"API rate limit exceeded for installation\"}")
+    chk("split: a REFUSED (403) response still yields remaining=0 — the evidence the gate needs "
+        "is only ever on the failure",
+        (remaining_budget(split_response(refused)[0]),
+         decide_budget(remaining_budget(split_response(refused)[0]))[0]), (0, "hold"))
+    # REFUSING TO GUESS, and why it is load-bearing rather than decorative. Without the status-line
+    # requirement, ANY captured text with two colon-bearing lines is read as a header block — so a
+    # `gh` deprecation notice, a proxy error page, or a mangled capture could hand the gate a
+    # `remaining: 0` it never received from GitHub and hold the pipeline out on noise. A rate
+    # limiter that can be stalled by arbitrary text is worse than one that fails open.
+    forged = ("Warning: gh is deprecated in this environment\n"
+              "x-ratelimit-remaining: 0\n\n{\"artifacts\": []}")
+    chk("split: text that is NOT an HTTP response yields NO budget evidence, even when it contains "
+        "header-shaped lines (delete the status-line requirement and noise can stall the floor)",
+        (remaining_budget(split_response(forged)[0]),
+         decide_budget(remaining_budget(split_response(forged)[0]))[0]), (None, "run"))
+    for label, payload in (("headerless JSON body", "{\"x-ratelimit-remaining\": 0}"),
+                           ("empty string", ""), ("not a string", None)):
+        chk(f"split: {label} yields NO budget evidence (refuses to guess) -> RUN",
+            (remaining_budget(split_response(payload)[0]),
+             decide_budget(remaining_budget(split_response(payload)[0]))[0]), (None, "run"))
+
+
+def _test_an_unaffordable_tick_issues_no_snapshot_requests(chk):
+    """THE REGRESSION THIS GATE EXISTS FOR (the 2026-07-29 06:19-06:32Z recurrence): a tick that
+    arrives past the wall-clock floor but into an EMPTY shared bucket must not start the sweep.
+
+    Composed end to end against a counting fake, exactly as dispatch.yml wires it, because the
+    defect class is a gate that returns the right answer into a pipeline that ignores it — and
+    because the anchor-write side is what makes the hold self-exiting rather than a stall."""
+    clock = {"now": 1_800_000_000}
+    store, budget, snapshot_calls = [], {"remaining": 5000}, {"n": 0}
+
+    def tick():
+        anchor = newest_marker_epoch({"artifacts": store})
+        if decide(anchor, clock["now"])[0] != "run":
+            return "noop-floor"
+        budget["remaining"] -= 1                     # the anchor read itself
+        if decide_budget(budget["remaining"])[0] != "run":
+            return "noop-budget"                     # NO anchor written: nothing ratchets forward
+        store.append({"name": TICK_MARKER_ARTIFACT,
+                      "created_at": datetime.fromtimestamp(clock["now"], tz=timezone.utc)
+                      .strftime("%Y-%m-%dT%H:%M:%SZ")})
+        snapshot_calls["n"] += MEASURED_REQUESTS_PER_TICK
+        budget["remaining"] -= MEASURED_REQUESTS_PER_TICK
+        return "executed"
+
+    chk("unaffordable: a tick with a full budget executes", tick(), "executed")
+    # Drain the bucket the way the other ~356 runs/h in the repository actually drain it.
+    budget["remaining"] = 12
+    clock["now"] += 20 * 60
+    baseline = snapshot_calls["n"]
+    chk("unaffordable: past the wall-clock floor but with an EMPTY bucket, the tick DEFERS",
+        tick(), "noop-budget")
+    chk("unaffordable: ... and it issued ZERO snapshot requests (it spent 1, not 613)",
+        snapshot_calls["n"] - baseline, 0)
+    anchor_before = len(store)
+    for _ in range(9):
+        clock["now"] += 60
+        tick()
+    chk("unaffordable: nine more rings into the empty bucket still issue ZERO snapshot requests",
+        snapshot_calls["n"] - baseline, 0)
+    chk("unaffordable: ... and NONE of them wrote an anchor, so the deferral cannot ratchet the "
+        "wall-clock floor forward while the budget is out", len(store), anchor_before)
+    # THE MACHINE EXIT. The budget resets on its own hourly schedule; nothing human is involved,
+    # and the very next ring must run. A hold with no proven exit is a stall (this estate has
+    # shipped several).
+    budget["remaining"] = 5000
+    clock["now"] += 60
+    chk("unaffordable: the FIRST ring after the budget resets executes immediately — the hold "
+        "self-exits with no human unpark", tick(), "executed")
 
 
 def _test_anchor_parsing(chk):
@@ -580,25 +885,43 @@ def _test_live_path(chk):
     """read_anchor()/main() over a stubbed `gh`: the anchor read is ONE request, and every failure
     mode of it lands on the fail-open side rather than raising."""
     calls = []
+    healthy = {"x-ratelimit-remaining": "4832", "x-ratelimit-limit": "5000"}
 
     def fake(args, label="tick-floor"):
         calls.append(args)
-        return {"artifacts": [{"name": TICK_MARKER_ARTIFACT,
-                               "created_at": "2026-07-27T18:40:00Z"}]}
+        return ({"artifacts": [{"name": TICK_MARKER_ARTIFACT,
+                                "created_at": "2026-07-27T18:40:00Z"}]}, healthy)
 
-    got = read_anchor("jeswr/agent-account-registry", runner=fake)
+    got, headers = read_anchor("jeswr/agent-account-registry", runner=fake)
     chk("live: the anchor read is exactly ONE API request", len(calls), 1)
     chk("live: ... filtered to the marker name server-side",
         f"name={TICK_MARKER_ARTIFACT}" in calls[0][-1], True)
     chk("live: ... and scoped to the registry repo",
         "/repos/jeswr/agent-account-registry/actions/artifacts" in calls[0][-1], True)
+    # The budget gate is FREE only because the request it reads is one the floor already made.
+    # Drop `-i` and the headers vanish, the gate goes permanently fail-open, and this row reds.
+    chk("live: ... requested with `-i`, so the SAME request carries the budget headers and the "
+        "pre-flight gate costs zero extra requests", "-i" in calls[0], True)
     chk("live: it returns the marker's epoch", got, parse_rfc3339("2026-07-27T18:40:00Z"))
+    chk("live: ... and the remaining budget off that same response",
+        remaining_budget(headers), 4832)
     chk("live: a REFUSED listing (the 403 outage itself) reads as no anchor -> RUN",
-        read_anchor("o/r", runner=lambda *a, **k: None), None)
+        read_anchor("o/r", runner=lambda *a, **k: (None, {}))[0], None)
+    chk("live: ... but a refusal that CARRIES remaining=0 hands the gate its evidence, so the "
+        "tick defers instead of proceeding into a 613-request sweep (the #819 fail-open residual)",
+        decide_budget(remaining_budget(
+            read_anchor("o/r", runner=lambda *a, **k: (None, {"x-ratelimit-remaining": "0"}))[1]
+        ))[0], "hold")
 
     # The workflow output contract, written the way GitHub reads it.
     import tempfile
-    for label, anchor, want in (("hold", 60, "proceed=false\n"), ("run", 4000, "proceed=true\n")):
+    for label, anchor, budget, want in (
+            ("hold", 60, healthy, "proceed=false\n"),
+            ("run", 4000, healthy, "proceed=true\n"),
+            # Past the wall-clock floor, but the shared bucket is empty: the gate, not the clock,
+            # is what refuses. Delete the call site in main() and this row reds.
+            ("budget-deferred", 4000, {"x-ratelimit-remaining": "12", "x-ratelimit-limit": "5000"},
+             "proceed=false\n")):
         with tempfile.NamedTemporaryFile("w+", suffix=".txt", delete=False) as handle:
             out_path = handle.name
         env_backup = {k: os.environ.get(k) for k in ("GITHUB_OUTPUT", "REGISTRY_REPO")}
@@ -607,13 +930,13 @@ def _test_live_path(chk):
             os.environ["REGISTRY_REPO"] = "o/r"
             stamp = datetime.fromtimestamp(_now() - anchor, tz=timezone.utc).strftime(
                 "%Y-%m-%dT%H:%M:%SZ")
-            saved = globals()["_gh_json"]
-            globals()["_gh_json"] = lambda *a, **k: {
-                "artifacts": [{"name": TICK_MARKER_ARTIFACT, "created_at": stamp}]}
+            saved = globals()["_gh_response"]
+            globals()["_gh_response"] = lambda *a, _b=budget, _s=stamp, **k: (
+                {"artifacts": [{"name": TICK_MARKER_ARTIFACT, "created_at": _s}]}, _b)
             try:
                 code = main()
             finally:
-                globals()["_gh_json"] = saved
+                globals()["_gh_response"] = saved
             with open(out_path, encoding="utf-8") as handle:
                 written = handle.read()
         finally:
