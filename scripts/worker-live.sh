@@ -1232,6 +1232,30 @@ _pr_gate_escape_channel() {
   ' "$file"
 }
 
+# [issue #849] PURE (self-tested): print pr-gate.yml's actionlint provisioning tail -- the
+# `bin_sha256=` pin read through the `$GITHUB_PATH` append -- normalised to stripped, comment-free
+# lines, so the ORDER of download / tarball-verify / extract / binary-verify / publish-to-PATH can
+# be pinned by exact whole-block match. Prints nothing when the file or the block is absent, which
+# fails closed against any expected block.
+#
+# Pinned as an exact ADJACENT block, not by containment: `_assert_actionlint_pin_single_sourced`
+# only proves the step reads the pin file, and a step that merely MENTIONS
+# ACTIONLINT_BIN_SHA256_LINUX_AMD64 while verifying nothing -- `|| true`, an `if false`, or the
+# verification moved after `$GITHUB_PATH` -- satisfies every containment check while putting an
+# unverified binary on the PATH the lint step executes. That is the #941/#956 YAML-seam shape: the
+# surviving mutants all sat at a step, never in the Python.
+_pr_gate_actionlint_install_verify() {
+  local file=$1
+  [[ -f "$file" ]] || return 0
+  awk '
+    { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+    line ~ /^#/ || line == "" { next }
+    line ~ /^bin_sha256=/ { on = 1 }
+    on { print line }
+    on && line ~ /GITHUB_PATH/ { exit }
+  ' "$file"
+}
+
 # PURE (self-tested): print pr-gate.yml's self-test loop -- `for s in $suite; do` through its
 # `done` -- normalised to stripped, comment-free lines, so the gate's ACTUAL suite invocation can be
 # pinned by exact whole-block match. Prints nothing when the file or the loop is absent, which fails
@@ -6112,6 +6136,46 @@ CHANNEL
        && printf missed || printf caught)" "caught"
   chk "pr-gate loop check fails CLOSED on an unreadable workflow" \
     "$([[ "$(_pr_gate_suite_loop "$loopfix/absent.yml" 2>/dev/null | paste -sd'|' -)" == "$expected_loop" ]] \
+       && printf missed || printf caught)" "caught"
+
+  # ---- [issue #849] the gate must verify the EXTRACTED actionlint binary, not only the tarball.
+  # worker-live's _fetch_pinned_actionlint_unpack has checked both digests since #428 r2; pr-gate --
+  # the REQUIRED `gate` check -- checked only the tarball, so a verified-tarball-but-wrong-binary
+  # (partial extraction, tar quirk) went straight onto $GITHUB_PATH and was executed. The mutants
+  # below are cut from the REAL workflow, not from the expected constant, so they measure the
+  # extractor rather than themselves. ----
+  local real_gate="$SCRIPT_DIR/../.github/workflows/pr-gate.yml"
+  local expected_al_verify
+  expected_al_verify=$(cat <<'ALVERIFY'
+bin_sha256=$(pin_value ACTIONLINT_BIN_SHA256_LINUX_AMD64 '[0-9a-f]{64}') \
+|| { echo "::error::$pin: ACTIONLINT_BIN_SHA256_LINUX_AMD64 missing, duplicated or malformed"; exit 1; }
+curl -fsSL --retry 3 -o /tmp/actionlint.tar.gz \
+"https://github.com/rhysd/actionlint/releases/download/v${ver}/actionlint_${ver}_linux_amd64.tar.gz"
+echo "${sha256}  /tmp/actionlint.tar.gz" | sha256sum -c -
+mkdir -p "$RUNNER_TEMP/actionlint-bin"
+tar -C "$RUNNER_TEMP/actionlint-bin" -xzf /tmp/actionlint.tar.gz actionlint
+echo "${bin_sha256}  $RUNNER_TEMP/actionlint-bin/actionlint" | sha256sum -c -
+echo "$RUNNER_TEMP/actionlint-bin" >> "$GITHUB_PATH"
+ALVERIFY
+)
+  chk "pr-gate.yml sha256-verifies the EXTRACTED actionlint binary BEFORE \$GITHUB_PATH (exact block)" \
+    "$(_pr_gate_actionlint_install_verify "$real_gate")" "$expected_al_verify"
+  grep -vF '${bin_sha256}  $RUNNER_TEMP' "$real_gate" > "$loopfix/al-deleted.yml"
+  awk '/\$\{bin_sha256\}/ { print $0 " || true"; next } { print }' "$real_gate" \
+    > "$loopfix/al-inert.yml"
+  awk '/\$\{bin_sha256\}/ { held = $0; next }
+       /GITHUB_PATH/ { print; print held; next } { print }' "$real_gate" > "$loopfix/al-late.yml"
+  chk "binary-digest check is NON-VACUOUS: a DELETED extracted-binary verification no longer matches" \
+    "$([[ "$(_pr_gate_actionlint_install_verify "$loopfix/al-deleted.yml")" == "$expected_al_verify" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "binary-digest check is NON-VACUOUS: an '|| true'-suppressed verification no longer matches" \
+    "$([[ "$(_pr_gate_actionlint_install_verify "$loopfix/al-inert.yml")" == "$expected_al_verify" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "binary-digest check is NON-VACUOUS: verifying AFTER the PATH append no longer matches" \
+    "$([[ "$(_pr_gate_actionlint_install_verify "$loopfix/al-late.yml")" == "$expected_al_verify" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "binary-digest check fails CLOSED on an unreadable workflow" \
+    "$([[ "$(_pr_gate_actionlint_install_verify "$loopfix/absent.yml" 2>/dev/null)" == "$expected_al_verify" ]] \
        && printf missed || printf caught)" "caught"
 
   if [[ "$failures" -eq 0 ]]; then
