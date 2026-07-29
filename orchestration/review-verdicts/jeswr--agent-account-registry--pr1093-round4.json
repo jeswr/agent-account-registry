@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1093,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f684774b782ef3a15c9dff75884eda6a4c9799b3",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 remains approved. The workflow passes the issue event's type through a quoted environment variable, while retriage obtains the mutable type from the same fail-closed live read as body and state and distinguishes GitHub's explicit null from absent or malformed schema. Normalization remains centralized at the classifier boundary; mapped-type precedence, area fallback, and the trust-surface override are preserved. The tests discriminate workflow binding, CLI and live-read forwarding, typed versus untyped label outcomes, malformed documents, and trust-surface precedence. The regate entry-point clock is wired into the real Sweeper and tested in both live and stale directions; the dry-run no-write assertion is paired with a census proving useful work was actually classified. No blocker, major, minor, or nit finding is supported by the diff, and no reviewer-directed instruction appears in it.",
+  "verdict": "approve"
+ }
+}
