@@ -144,6 +144,175 @@ RETRY_AFTER_CAP_SECONDS = 30
 # stall raised no alarm at all.
 RATE_LIMIT_RESERVE = 100
 
+# ---------------------------------------------------------------------------------------------
+# CONDITIONAL (ETag) READS — issue #1207.
+#
+# The tick's request SET is not reducible without weakening completeness (the module docstring
+# above derives why: REST `check_name` takes one value, and REST cannot filter check runs by
+# conclusion). But most of those requests do not have to be BILLABLE. An authenticated
+# conditional request that answers `304 Not Modified` does not decrement the bucket, so the
+# lever is to stop PAYING for reads whose answer has not changed, without issuing fewer of them.
+#
+# MEASURED 2026-07-29, and every number here is off a real response, not the documentation:
+#
+#   * Is a 304 free on THIS token class? Yes. Probed in Actions with `github.token` — the token
+#     this job actually runs on, whose bucket reports `x-ratelimit-limit: 5000`,
+#     `x-ratelimit-resource: core`. Against a live worker head: 10 unconditional GETs moved
+#     `x-ratelimit-used` by +10; 10 conditional GETs carrying `If-None-Match` answered 304 and
+#     moved it by +0. Measured on all three check-runs legs this file issues (`check_name=gate`,
+#     `check_name=gate, draft-tier`, and the unfiltered legs walk). The A/B is kept in that
+#     order deliberately: the unconditional burst is a KNOWN ANSWER, so a run whose control does
+#     not read +10 has proved its instrument broken and may not be believed. The first version of
+#     that probe reported "exempt" while reading a missing header as -1, and the control is what
+#     caught it.
+#
+#   * How often is the answer actually unchanged? Over one tick interval, re-reading the exact
+#     urls this file issues against the live targets: check-runs 214 of 214 unchanged (806 s),
+#     and 213 of 222 over ~25 min END TO END — that second figure RE-LISTS the pulls first, so a
+#     PR whose head advanced contributes a new url that no stored ETag can help, counted as a
+#     miss rather than quietly dropped. Settled heads dominate because a concluded gate is
+#     terminal for that SHA: the reads that churn are exactly the ones that must be re-fetched.
+#
+#   * PR DETAIL is NOT cached, on the same measurement: 0 of 107 and 0 of 111 `/pulls/{n}` reads
+#     were unchanged across a tick. The detail body embeds the repository object, which moves on
+#     every push and every issue anywhere in the repo, so its ETag turns over continuously in a
+#     busy repo. Caching it would store ~100 large bodies to buy nothing, so `_is_cacheable`
+#     admits the check-runs reads ONLY. The listings are excluded for the same reason.
+#
+#   * Does the STORE cost more than it saves? No: it costs nothing from this bucket. The store
+#     rides `actions/cache`, which talks to the Actions cache service, not api.github.com —
+#     measured in the same Actions probe, one restore + save moved core `used` 555 -> 555.
+#
+# FAIL TOWARD RE-FETCHING, ALWAYS. `If-None-Match` is sent ONLY when the payload it maps to is in
+# hand, so a 304 can never be answered from a cache we do not hold; a malformed, truncated or
+# absent store simply degrades to today's unconditional sweep. Acting on stale check state would
+# be far worse than spending the request, so every ambiguous case spends the request.
+CONDITIONAL_STORE_SCHEMA = "registry-snapshot-etags/v1"
+# Bound on stored entries, so a store that somehow accumulates cannot grow without limit. Two
+# targets x WORKER_PR_STATUS_LIMIT PRs x (2 tier names + the legs walk's pages) has ample room.
+CONDITIONAL_STORE_LIMIT = 4000
+
+
+def _is_cacheable(url):
+    """Which reads may be answered conditionally. CHECK-RUNS ONLY — see the measurement above:
+    it is the 77% leg AND the one that is actually static between ticks. Matched on the
+    parameter BOUNDARY (`/check-runs?`) rather than a bare substring, the same rule
+    `_fetch_check_runs` applies to its own filter."""
+    return "/check-runs?" in url
+
+
+class ConditionalStore:
+    """Cross-tick ETag store for the check-runs reads. Not a general HTTP cache: it holds one
+    `{etag, payload}` per url and refuses to answer anything it cannot fully account for.
+
+    THE SAFETY INVARIANT, and the only one that matters: `etag_for` returns an ETag ONLY when
+    this store also holds the PAYLOAD that ETag names. That is what makes a 304 impossible to
+    receive without the body to satisfy it — the failure mode the issue calls out (treating a
+    cache miss as "no change") is not handled here, it is unreachable.
+    """
+
+    def __init__(self, entries=None):
+        self.entries = entries if isinstance(entries, dict) else {}
+        self.hits = 0
+        self.billable = 0
+        self.seen = set()
+
+    def note(self, url):
+        """Record that THIS tick asked for `url`, so `prune` can tell a live head from a dead
+        one. Called for every cacheable read, hit or miss."""
+        if _is_cacheable(url):
+            self.seen.add(url)
+
+    def etag_for(self, url):
+        """The ETag to send, or None to fetch unconditionally."""
+        entry = self.entries.get(url)
+        if not isinstance(entry, dict) or "payload" not in entry:
+            return None
+        etag = entry.get("etag")
+        return etag if isinstance(etag, str) and etag else None
+
+    def payload_for(self, url):
+        """The stored payload for a url whose conditional read answered 304.
+
+        TOTAL and fail-closed. `etag_for` already makes it impossible to receive a 304 we cannot
+        satisfy, so reaching the raise below means that invariant has been broken — and the one
+        thing this must never do then is hand back something wrong. It raises FetchError, which
+        the callers already handle as "this read did not complete" (a per-item skip, or a
+        sweep-fatal listing failure) rather than as data. `FetchError` is resolved at CALL time,
+        so defining it further down this module is fine."""
+        entry = self.entries.get(url)
+        if not isinstance(entry, dict) or "payload" not in entry:
+            raise FetchError(
+                "a conditional read answered 304 for a url this store holds no payload for — "
+                "refusing to treat an unsatisfiable 304 as 'unchanged' for "
+                + url.split("?")[0])
+        return entry["payload"]
+
+    def record(self, url, etag, payload):
+        """Remember a 200 so the NEXT tick can ask conditionally. Storing the ETag without the
+        payload (or vice versa) is refused rather than half-written: a half-entry is exactly the
+        shape `etag_for` must never hand out."""
+        if not _is_cacheable(url) or not isinstance(etag, str) or not etag:
+            return
+        if url not in self.entries and len(self.entries) >= CONDITIONAL_STORE_LIMIT:
+            return
+        self.entries[url] = {"etag": etag, "payload": payload}
+
+    def prune(self):
+        """Drop entries THIS tick never asked for — a head that advanced never comes back, so
+        its entry is dead weight every future restore would carry. Pruning to `seen` also means
+        a tick that read nothing (an aborted sweep) is never mistaken for a tick that found
+        nothing live: `save_conditional_store` is only reached on a completed sweep."""
+        self.entries = {url: entry for url, entry in self.entries.items() if url in self.seen}
+
+    def summary(self):
+        total = self.hits + self.billable
+        return (f"SNAPSHOT conditional reads: {self.hits} of {total} cacheable read(s) answered "
+                f"304 (budget-exempt), {self.billable} billable; {len(self.entries)} entries "
+                f"stored for the next tick")
+
+
+def load_conditional_store(path):
+    """Read the store a previous tick wrote. EVERY failure — missing, unreadable, wrong schema,
+    malformed — yields an EMPTY store, which costs exactly today's unconditional sweep. A store
+    that cannot be trusted is not consulted; it is never partially believed."""
+    if not path:
+        return ConditionalStore()
+    try:
+        document = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ConditionalStore()
+    if (not isinstance(document, dict)
+            or document.get("schema") != CONDITIONAL_STORE_SCHEMA):
+        return ConditionalStore()
+    raw = document.get("entries")
+    if not isinstance(raw, dict):
+        return ConditionalStore()
+    entries = {}
+    for url, entry in raw.items():
+        # Per-entry validation, so ONE malformed row costs one re-fetch rather than the tick's
+        # whole cache. A row missing either half is dropped: see ConditionalStore.record.
+        if (isinstance(url, str) and _is_cacheable(url) and isinstance(entry, dict)
+                and isinstance(entry.get("etag"), str) and entry["etag"]
+                and "payload" in entry and len(entries) < CONDITIONAL_STORE_LIMIT):
+            entries[url] = {"etag": entry["etag"], "payload": entry["payload"]}
+    return ConditionalStore(entries)
+
+
+def save_conditional_store(path, store):
+    """Write the store for the next tick. Best-effort by design: this is an optimisation, and a
+    tick that cannot write its cache must still emit its snapshot."""
+    if not path or store is None:
+        return False
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(
+            json.dumps({"schema": CONDITIONAL_STORE_SCHEMA, "entries": store.entries}),
+            encoding="utf-8")
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
 
 class FetchError(Exception):
     """A GitHub read failed for good (retries exhausted) or returned a malformed page."""
@@ -298,18 +467,31 @@ def _check_reserve(headers):
     return remaining
 
 
-def make_fetch(token):
+def make_fetch(token, store=None):
     """Authenticated single-page reader with retry/backoff; raises FetchError, never exits
-    (the caller decides sweep-fatal vs per-item)."""
+    (the caller decides sweep-fatal vs per-item).
+
+    With a `store`, cacheable reads (see `_is_cacheable`) carry `If-None-Match` and a `304` is
+    answered from the store WITHOUT spending a request — issue #1207. Everything else about the
+    read is unchanged: the same urls, the same page walks, the same ceilings, the same
+    `total_count` cross-check, the same budget reserve. What changes is only what GitHub charges
+    for them."""
 
     def fetch(url):
+        if store is not None:
+            store.note(url)
         for attempt in range(3):
+            # Re-read on EVERY attempt: a retry after a transient failure must make the same
+            # decision, and re-reading keeps the etag and the payload from drifting apart.
+            etag = store.etag_for(url) if store is not None else None
             request = Request(url, headers={
                 "Accept": "application/vnd.github+json",
                 "Authorization": f"Bearer {token}",
                 "User-Agent": "reg4-plan-snapshot",
                 "X-GitHub-Api-Version": "2022-11-28",
             })
+            if etag is not None:
+                request.add_header("If-None-Match", etag)
             try:
                 with urlopen(request, timeout=30) as response:
                     payload = json.load(response)
@@ -318,8 +500,25 @@ def make_fetch(token):
                     # sweep that only looks after it has already been refused has learned it one
                     # request too late.
                     _check_reserve(getattr(response, "headers", None))
+                    if store is not None:
+                        store.billable += 1
+                        store.record(url, _response_etag(getattr(response, "headers", None)),
+                                     payload)
                     return payload
             except HTTPError as exc:
+                # 304 IS DELIVERED AS AN HTTPError by urllib (its processor raises for every
+                # non-2xx, and nothing handles 304), so this branch — not the success path above
+                # — is where an unchanged read lands.
+                #
+                # `etag is not None` is load-bearing, not defensive noise: it is the whole
+                # fail-toward-re-fetching rule. We only ever hold a payload for a url we sent a
+                # conditional request for, so a 304 arriving on a request we did NOT make
+                # conditional is a response we cannot satisfy — it falls through to the error
+                # path below and is retried/reported, never silently treated as "unchanged".
+                if exc.code == 304 and etag is not None:
+                    _check_reserve(getattr(exc, "headers", None))
+                    store.hits += 1
+                    return store.payload_for(url)
                 if exc.code == 403:
                     headers = getattr(exc, "headers", None)
                     kind = classify_403(headers, _error_body(exc))
@@ -352,6 +551,19 @@ def make_fetch(token):
                     "authenticated GitHub read failed for " + url.split("?")[0]) from exc
 
     return fetch
+
+
+def _response_etag(headers):
+    """The `ETag` off a response, or None. Case-insensitive on purpose: urllib speaks HTTP/1.1,
+    where GitHub sends `ETag`, while the same header arrives lower-cased over HTTP/2 — reading
+    only one casing silently stores nothing and quietly disables the whole mechanism."""
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    if getter is None:
+        return None
+    value = getter("ETag") or getter("etag")
+    return value if isinstance(value, str) and value else None
 
 
 def _error_body(exc):
@@ -1508,6 +1720,175 @@ def _self_test():
                     got = "stop"
             assert got == want, (label, got, want)
 
+    # ------------------------------------------------------------------------------------------
+    # [#1207] CONDITIONAL READS. The whole mechanism turns on one rule — an `If-None-Match` is
+    # sent ONLY when the payload it names is in hand — so the tests below are written against
+    # that rule from both sides, including the two ways it could fail OPEN (answering a 304 we
+    # cannot satisfy, and sending a conditional request we cannot satisfy).
+    # ------------------------------------------------------------------------------------------
+    CHECK_RUNS_URL = (f"https://api.github.com/repos/{repo}/commits/{'a' * 40}"
+                      "/check-runs?check_name=gate&per_page=100&page=1")
+    DETAIL_URL = f"https://api.github.com/repos/{repo}/pulls/7"
+
+    class _Resp:
+        def __init__(self, body, headers):
+            self.headers = headers
+            self._body = io.BytesIO(body)
+
+        def read(self, *args):
+            return self._body.read(*args)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def _wire(module, body=b"[]", headers=None, code=None, seen=None):
+        """A urlopen double that records the REQUEST (so the header the fetch actually put on the
+        wire is observable) and can answer a 304 the way urllib really delivers one — as an
+        HTTPError, not a success."""
+        headers = {"ETag": '"v1"'} if headers is None else headers
+
+        def _fake(request, timeout=None):
+            if seen is not None:
+                seen.append(request)
+            if code == 304:
+                raise HTTPError(request.full_url, 304, "Not Modified", headers, None)
+            return _Resp(body, headers)
+
+        return patch.object(module, "urlopen", _fake)
+
+    def a_304_is_answered_from_the_store_and_carries_the_conditional_header():
+        """The mechanism, end to end: a stored {etag, payload} makes the next read conditional,
+        and the 304 GitHub answers is satisfied from the store rather than re-fetched."""
+        module = sys.modules[__name__]
+        store = ConditionalStore({CHECK_RUNS_URL: {"etag": '"v1"',
+                                                   "payload": {"check_runs": [], "total_count": 0}}})
+        seen = []
+        with _wire(module, code=304, seen=seen):
+            got = make_fetch("t", store)(CHECK_RUNS_URL)
+        assert got == {"check_runs": [], "total_count": 0}, got
+        assert len(seen) == 1 and seen[0].has_header("If-none-match"), (
+            "the read must actually carry If-None-Match — without it GitHub can never answer "
+            "304 and the whole mechanism is inert")
+        assert (store.hits, store.billable) == (1, 0), (store.hits, store.billable)
+
+    def no_conditional_request_is_made_without_the_payload_in_hand():
+        """FAIL TOWARD RE-FETCHING. A half-entry (etag, no payload) is exactly the state that
+        would make a 304 unanswerable, so it must never reach the wire as a conditional request.
+        Deleting the `"payload" not in entry` clause in `etag_for` turns this red."""
+        module = sys.modules[__name__]
+        for label, entry in (("etag but NO payload", {"etag": '"v1"'}),
+                             ("payload but no etag", {"payload": {"a": 1}}),
+                             ("empty etag", {"etag": "", "payload": {"a": 1}}),
+                             ("not a mapping", ["nope"])):
+            store = ConditionalStore({CHECK_RUNS_URL: entry})
+            seen = []
+            with _wire(module, body=b'{"check_runs": [], "total_count": 0}', seen=seen):
+                make_fetch("t", store)(CHECK_RUNS_URL)
+            assert not seen[0].has_header("If-none-match"), label
+            assert store.billable == 1, (label, store.billable)
+
+    def a_304_on_an_unconditional_request_is_never_read_as_unchanged():
+        """THE FAIL-OPEN THIS CLOSES. If a 304 were honoured on its status alone, a server (or a
+        proxy) answering 304 to a request we never made conditional would be served from an
+        entry we do not hold — or, worse, from a STALE one. Deleting `and etag is not None` from
+        the 304 branch turns this red."""
+        module = sys.modules[__name__]
+        store = ConditionalStore()            # nothing stored: no conditional request possible
+        with _wire(module, code=304):
+            try:
+                make_fetch("t", store)(CHECK_RUNS_URL)
+                got = "returned"
+            except FetchError:
+                got = "refused"
+        assert got == "refused", (
+            "a 304 we did not ask for must fall through to the error path, never be treated as "
+            f"'unchanged' — got {got}")
+        assert store.hits == 0, store.hits
+
+    def only_check_runs_reads_are_cached():
+        """PR detail and listings measured 0% unchanged across a tick, so caching them stores
+        large bodies to buy nothing. `_is_cacheable` is the one place that decides it."""
+        module = sys.modules[__name__]
+        store = ConditionalStore()
+        with _wire(module, body=b'{"check_runs": [], "total_count": 0}'):
+            make_fetch("t", store)(CHECK_RUNS_URL)
+        with _wire(module, body=b'{"number": 7}'):
+            make_fetch("t", store)(DETAIL_URL)
+        assert CHECK_RUNS_URL in store.entries, "the check-runs read must be stored"
+        assert DETAIL_URL not in store.entries, "the PR detail read must NOT be stored"
+        assert store.etag_for(DETAIL_URL) is None
+
+    def a_malformed_store_degrades_to_an_unconditional_sweep():
+        """Every unreadable shape costs exactly today's behaviour, never a wrong answer."""
+        with tempfile.TemporaryDirectory() as workdir:
+            path = Path(workdir, "etags.json")
+            for label, text in (
+                    ("absent", None),
+                    ("not json", "{["),
+                    ("not an object", "[]"),
+                    # THE FIXTURE MUST BE LOADABLE BUT FOR THE DEFECT. A wrong-schema document
+                    # with EMPTY entries is satisfied by dropping the schema check entirely —
+                    # measured: that mutation survived this row until the entries were populated.
+                    ("wrong schema", json.dumps({"schema": "other/v1", "entries": {
+                        CHECK_RUNS_URL: {"etag": '"v1"', "payload": {"would": "be loaded"}}}})),
+                    ("no schema at all", json.dumps({"entries": {
+                        CHECK_RUNS_URL: {"etag": '"v1"', "payload": {"would": "be loaded"}}}})),
+                    ("entries not a map",
+                     json.dumps({"schema": CONDITIONAL_STORE_SCHEMA, "entries": []})),
+            ):
+                if text is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.write_text(text, encoding="utf-8")
+                store = load_conditional_store(str(path))
+                assert store.entries == {}, (label, store.entries)
+                assert store.etag_for(CHECK_RUNS_URL) is None, label
+            # ...and ONE malformed row costs one re-fetch, not the whole tick's cache.
+            path.write_text(json.dumps({"schema": CONDITIONAL_STORE_SCHEMA, "entries": {
+                CHECK_RUNS_URL: {"etag": '"v1"', "payload": {"ok": True}},
+                DETAIL_URL: {"etag": '"v2"', "payload": {"no": True}},
+                "https://api.github.com/x/check-runs?bad": {"etag": '"v3"'},
+            }}), encoding="utf-8")
+            store = load_conditional_store(str(path))
+            assert list(store.entries) == [CHECK_RUNS_URL], store.entries
+
+    def the_store_keeps_only_the_urls_this_tick_asked_for():
+        """A head that advanced never comes back; without the prune its entry would be carried by
+        every future restore for ever.
+
+        THE READS ARE DRIVEN THROUGH `make_fetch`, NOT BY CALLING `note` BY HAND. Measured: with
+        the live head noted directly, deleting the `store.note(url)` CALL SITE in `fetch` left
+        this row green — the unit was pinned and the wiring was not, so the prune would have
+        silently emptied the store on every tick."""
+        module = sys.modules[__name__]
+        live = CHECK_RUNS_URL
+        dead = CHECK_RUNS_URL.replace("a" * 40, "b" * 40)
+        store = ConditionalStore({live: {"etag": '"v1"', "payload": {"live": True}},
+                                  dead: {"etag": '"v2"', "payload": {"dead": True}}})
+        with _wire(module, code=304):
+            store_payload = make_fetch("t", store)(live)
+        assert store_payload == {"live": True}, store_payload
+        with _wire(module, body=b'{"number": 7}'):
+            make_fetch("t", store)(DETAIL_URL)   # not cacheable: never becomes a `seen` key
+        assert store.seen == {live}, store.seen
+        store.prune()
+        assert list(store.entries) == [live], store.entries
+
+    def the_store_round_trips_through_the_file_the_workflow_caches():
+        """The save/load pair must agree, or the cache round-trips something `load` then rejects
+        — which would look exactly like a 0% hit rate and report nothing."""
+        with tempfile.TemporaryDirectory() as workdir:
+            path = str(Path(workdir, "nested", "etags.json"))
+            store = ConditionalStore()
+            store.record(CHECK_RUNS_URL, '"v1"', {"check_runs": [], "total_count": 0})
+            assert save_conditional_store(path, store) is True
+            back = load_conditional_store(path)
+            assert back.etag_for(CHECK_RUNS_URL) == '"v1"', back.entries
+            assert back.payload_for(CHECK_RUNS_URL) == {"check_runs": [], "total_count": 0}
+
     def the_inertness_attestation_adopts_the_claim_predicate_and_fails_closed():
         """[sparq#4819] The PLAN-side attestation must be `_pull_inactivity_decision`'s ANSWER —
         never an independent re-derivation of it — and every unprovable shape must read False.
@@ -1635,6 +2016,13 @@ def _self_test():
         budget_403_is_not_retried_and_is_sweep_fatal,
         budget_403_is_never_downgraded_to_a_per_item_skip,
         the_reserve_stops_the_sweep_before_the_budget_is_gone,
+        a_304_is_answered_from_the_store_and_carries_the_conditional_header,
+        no_conditional_request_is_made_without_the_payload_in_hand,
+        a_304_on_an_unconditional_request_is_never_read_as_unchanged,
+        only_check_runs_reads_are_cached,
+        a_malformed_store_degrades_to_an_unconditional_sweep,
+        the_store_keeps_only_the_urls_this_tick_asked_for,
+        the_store_round_trips_through_the_file_the_workflow_caches,
     ))
     for row in rows:
         print(row)
@@ -1667,6 +2055,10 @@ def main():
     parser.add_argument("repos_file", nargs="?", help="newline-delimited owner/repo manifest")
     parser.add_argument("out_dir", nargs="?", help="directory for the raw-*.json snapshots")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument(
+        "--etag-store", default=os.environ.get("SNAPSHOT_ETAG_STORE", ""),
+        help=("path to the cross-tick ETag store (issue #1207). Absent/unreadable simply means "
+              "an unconditional sweep, so the dispatcher never depends on the cache existing."))
     args = parser.parse_args()
     if args.self_test:
         # [sparq#4819 round 4] THE CLI BOUNDARY IS THE LAST PLACE AN ESCAPE CAN BE NAMED.
@@ -1696,8 +2088,15 @@ def main():
         raise SystemExit("GH_TOKEN is required for the authenticated snapshot")
     repos = [line for line in
              Path(args.repos_file).read_text(encoding="utf-8").splitlines() if line]
+    store = load_conditional_store(args.etag_store)
     try:
-        snapshot_targets(make_fetch(token), _load_claim(), repos, args.out_dir)
+        snapshot_targets(make_fetch(token, store), _load_claim(), repos, args.out_dir)
+        # Only a COMPLETED sweep writes the store. A sweep that died half way has a `seen` set
+        # covering only the reads it got to, and pruning to that would throw away live entries
+        # for every PR it never reached — turning one failed tick into a cold cache for the
+        # next one.
+        store.prune()
+        save_conditional_store(args.etag_store, store)
     except BudgetExhausted as exc:
         # A distinct, annotated exit: this is not "a read failed", it is "the dispatcher is
         # running hotter than its request budget allows", and it needs a different fix from
@@ -1706,6 +2105,10 @@ def main():
         raise SystemExit(f"::error title=dispatch request budget exhausted::{exc}") from exc
     except FetchError as exc:
         raise SystemExit(str(exc)) from exc
+    finally:
+        # ALWAYS report, including on the failure paths above: "how much of this tick was
+        # billable" is exactly the number wanted when a tick has just died on the budget.
+        print(store.summary())
     return 0
 
 

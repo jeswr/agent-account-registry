@@ -172,6 +172,23 @@ RATE_LIMIT_RESERVE = 100
 # off a real response is the only number the gate acts on.
 SHARED_HOURLY_BUDGET = 5000
 
+# [#1207] THIS IS NOW THE COLD-CACHE CEILING, and it stays the admission threshold on purpose.
+# plan-snapshot.py makes the per-PR check-runs reads CONDITIONAL against a cross-tick ETag store,
+# and measured against the live targets 213-222 of 222 of them answer 304 — which does not
+# decrement the bucket — so a warm tick now spends roughly 23 listings + 116 detail + ~19
+# billable check-runs reads, not 613.
+#
+# The floor is NOT lowered to that number. A cold store is a real state (first tick after a cache
+# eviction, a mass force-push, a restore that finds nothing) and in that state the tick really
+# does cost 613. Admitting a tick at the warm price would let exactly the cold tick through with
+# too little budget to finish — reopening the #819 exhaustion this file exists to prevent. An
+# error in a rate limiter must point at spending less, not more, so the gate keeps costing the
+# tick at its ceiling.
+#
+# The WIN is therefore not visible in this constant; it is visible in the number this gate reads.
+# Ticks that spend ~160 instead of 613 leave `x-ratelimit-remaining` high, so far more ticks clear
+# the same threshold. plan-snapshot.py prints the per-tick split ("SNAPSHOT conditional reads:
+# N of M ... billable") so the realised saving is auditable on every tick rather than assumed.
 MEASURED_REQUESTS_PER_TICK = 613
 # The highest hourly request rate observed to run clean, and the rate that broke. Both are
 # measured, both are asserted against the floor by _test_budget_arithmetic.

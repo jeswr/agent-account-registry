@@ -607,6 +607,44 @@ def _self_test():
             out.write("\n".join(lines))
         return path
 
+    def _without_line(pattern):
+        """The workflow with the ONE line matching `pattern` DELETED. Insertion-only probes can
+        express "someone added a neutraliser" but not "someone removed the wiring", which is the
+        mutation the #1207 seam is most exposed to — a deleted env line leaves every other
+        assertion in this file green."""
+        with open(_dispatch_yml, encoding="utf-8") as handle:
+            lines = handle.read().split("\n")
+        hits = [i for i, line in enumerate(lines) if line.rstrip() == pattern]
+        if len(hits) != 1:
+            raise AssertionError(f"expected one {pattern!r} line, found {len(hits)}")
+        del lines[hits[0]]
+        path = os.path.join(_root, ".github", "workflows", ".dispatch-seam-probe.yml")
+        with open(path, "w", encoding="utf-8") as out:
+            out.write("\n".join(lines))
+        return path
+
+    def _replacing_line(pattern, replacement, occurrence=None):
+        """The workflow with a line matching `pattern` REPLACED. `occurrence` selects which hit
+        when the line legitimately appears more than once (the cached `path:` appears on both the
+        restore and the save); None demands exactly one."""
+        with open(_dispatch_yml, encoding="utf-8") as handle:
+            lines = handle.read().split("\n")
+        hits = [i for i, line in enumerate(lines) if line.rstrip() == pattern]
+        if occurrence is None:
+            if len(hits) != 1:
+                raise AssertionError(f"expected one {pattern!r} line, found {len(hits)}")
+            target = hits[0]
+        else:
+            if len(hits) <= occurrence:
+                raise AssertionError(
+                    f"expected >{occurrence} {pattern!r} lines, found {len(hits)}")
+            target = hits[occurrence]
+        lines[target] = replacement
+        path = os.path.join(_root, ".github", "workflows", ".dispatch-seam-probe.yml")
+        with open(path, "w", encoding="utf-8") as out:
+            out.write("\n".join(lines))
+        return path
+
     def _refusal(path):
         try:
             _workflow_block(path, "readiness", "blocker-union")
@@ -879,6 +917,91 @@ def _self_test():
                 "producer would be swallowed. Refusing.")
         return step
 
+    def _refuse_unwired_etag_store(path):
+        """THE #1207 CONDITIONAL-READ SEAM: `etag-restore` -> `snapshot` -> `etag-save`, with the
+        save strictly BEFORE the first step that executes target code.
+
+        Every fact below is a SILENT one. The mechanism has no output of its own that anything
+        else asserts on, so each of these mutations leaves a dispatcher that still plans, still
+        dispatches, still goes green — and quietly pays full price for every read again, or (the
+        ordering rule) publishes a store that target code was in a position to write:
+
+          * the `SNAPSHOT_ETAG_STORE` env line deleted     -> unconditional sweep, no signal
+          * either cache step deleted or reordered         -> cold store every tick, no signal
+          * the cached `path:` and the store path diverge  -> saves an empty directory forever
+          * `actions/cache` (combined) instead of the split restore/save pair -> the save becomes
+            a POST step at the END of the job, i.e. AFTER the hostile target planner has run
+
+        Fail-closed like its neighbours: anything it cannot resolve raises rather than passes.
+        """
+        import yaml  # lazy, same as _refuse_exit_zero_swallow
+        with open(path, encoding="utf-8") as handle:
+            document = yaml.safe_load(handle)
+        steps = ((document.get("jobs") or {}).get("plan") or {}).get("steps")
+        if not isinstance(steps, list) or not steps:
+            raise AssertionError("dispatch.yml `plan` job has no steps — refusing")
+        index = {}
+        for position, step in enumerate(steps):
+            if isinstance(step, dict) and step.get("id"):
+                index.setdefault(step["id"], position)
+        for required in ("etag-restore", "snapshot", "etag-save"):
+            if required not in index:
+                raise AssertionError(
+                    f"dispatch.yml `plan` has no step `id: {required}` — the #1207 conditional-"
+                    "read seam is not wired, so every check-runs read is billable again and "
+                    "nothing reports it. Refusing.")
+        if not index["etag-restore"] < index["snapshot"] < index["etag-save"]:
+            raise AssertionError(
+                "the #1207 seam is out of order: the ETag store must be RESTORED before the "
+                "snapshot reads it and SAVED after — refusing.")
+        # The first step that can execute anything from a target repository. The clone step is
+        # that boundary (it runs the target's own `--self-test`s), and the save must precede it.
+        clone = [position for position, step in enumerate(steps)
+                 if isinstance(step, dict) and "git clone" in str(step.get("run") or "")]
+        if not clone:
+            raise AssertionError(
+                "cannot locate the target-clone step in dispatch.yml `plan` — refusing to "
+                "assert the #1207 store is published before target code without finding it.")
+        if index["etag-save"] > min(clone):
+            raise AssertionError(
+                "the ETag store is published AFTER target code runs — a store written past the "
+                "target-clone step is one the hostile planner half was in a position to shape. "
+                "Refusing.")
+        for step_id, prefix in (("etag-restore", "actions/cache/restore@"),
+                                ("etag-save", "actions/cache/save@")):
+            step = steps[index[step_id]]
+            uses = str(step.get("uses") or "")
+            if not uses.startswith(prefix):
+                raise AssertionError(
+                    f"step `id: {step_id}` must use `{prefix}...`, not {uses!r} — the COMBINED "
+                    "`actions/cache` saves in a POST step at the END of the job, which is after "
+                    "the hostile target planner code has executed. Refusing.")
+            if step.get("continue-on-error"):
+                raise AssertionError(
+                    f"step `id: {step_id}` carries a truthy `continue-on-error` — refusing.")
+            if "if" in step:
+                raise AssertionError(
+                    f"step `id: {step_id}` carries an `if:` condition — the seam would go quiet "
+                    "while every assertion over it stayed green. Refusing.")
+        store_path = (steps[index["snapshot"]].get("env") or {}).get("SNAPSHOT_ETAG_STORE")
+        if not isinstance(store_path, str) or not store_path.strip():
+            raise AssertionError(
+                "the `snapshot` step does not pass `SNAPSHOT_ETAG_STORE` — plan-snapshot.py "
+                "defaults to NO store and sweeps unconditionally, at full price, silently. "
+                "Refusing.")
+        restore_path = str((steps[index["etag-restore"]].get("with") or {}).get("path") or "")
+        save_path = str((steps[index["etag-save"]].get("with") or {}).get("path") or "")
+        if not restore_path or restore_path != save_path:
+            raise AssertionError(
+                f"the ETag cache restores {restore_path!r} but saves {save_path!r} — the store "
+                "would never survive a tick. Refusing.")
+        if not store_path.startswith(restore_path.rstrip("/") + "/"):
+            raise AssertionError(
+                f"the snapshot writes its store to {store_path!r}, which is NOT inside the "
+                f"cached path {restore_path!r} — the cache would round-trip an empty directory "
+                "forever while every assertion stayed green. Refusing.")
+        return steps[index["snapshot"]]
+
     def _workflow_heredoc(path, step_id):
         """The dedented python heredoc of the ONE workflow step whose `id:` is `step_id`.
 
@@ -926,6 +1049,9 @@ def _self_test():
     _refuse_producer_swallow(
         os.path.join(_root, ".github", "workflows", "dispatch.yml"), "snapshot",
         "plan-snapshot.py")
+    # [#1207] ...and the conditional-read seam around that same step, for the same reason: it is
+    # pure throughput with no consumer that would notice its absence.
+    _refuse_unwired_etag_store(os.path.join(_root, ".github", "workflows", "dispatch.yml"))
 
     # A PR-AWARE planner, written to sparq's contract: an OPEN PR row reserves the `area:` keys it
     # declares (and NOTHING when it declares none — the occupancy-side rule, see the GLOBAL
@@ -1536,6 +1662,64 @@ def _routing_doc():
     # ...and the refusal is not passing because it refuses everything: the REAL workflow passes.
     chk("[sparq#4819][YAML seam] ...and the real producer step passes the same refusal",
         _producer_refusal(_with_line("        id: snapshot", "        # a harmless comment")), "")
+
+    # ------------------------------------------------------------------------------------------
+    # [#1207] THE CONDITIONAL-READ SEAM. Mutated at all three places the estate's uncaught
+    # mutants live: the `if:`, the STEP, and the CALL SITE. Each mutation is injected into a real
+    # copy of the workflow and the refusal must FIRE, so none of these rows can be green because
+    # the assertion is unreachable — and the last row proves the real file still passes, so none
+    # of them is green because the guard refuses everything.
+    # ------------------------------------------------------------------------------------------
+    def _etag_refusal(path):
+        try:
+            _refuse_unwired_etag_store(path)
+        except AssertionError as exc:
+            return str(exc)
+        finally:
+            os.remove(path)
+        return ""
+
+    # THE CALL SITE. Delete the one env line and the mechanism is gone: plan-snapshot.py defaults
+    # to no store, sweeps unconditionally at full price, and every other assertion stays green.
+    _etag_callsite = _etag_refusal(_without_line(
+        "          SNAPSHOT_ETAG_STORE: ${{ runner.temp }}/etag-store/etags.json"))
+    chk("[#1207][YAML seam] deleting the SNAPSHOT_ETAG_STORE call site is REFUSED",
+        ("does not pass `SNAPSHOT_ETAG_STORE`" in _etag_callsite,
+         "at full price, silently" in _etag_callsite), (True, True))
+
+    # THE STEP. Delete the save step's id and the seam cannot be found at all.
+    _etag_step = _etag_refusal(_without_line("        id: etag-save"))
+    chk("[#1207][YAML seam] removing the store-publishing STEP is REFUSED",
+        ("no step `id: etag-save`" in _etag_step, "billable again" in _etag_step), (True, True))
+
+    # THE `if:`. A condition on either cache step silences the seam without failing anything.
+    _etag_if = _etag_refusal(_with_line("        id: etag-restore", "        if: false"))
+    chk("[#1207][YAML seam] an `if:` on the ETag cache step is REFUSED",
+        ("carries an `if:` condition" in _etag_if, "stayed green" in _etag_if), (True, True))
+
+    # THE ORDERING, which is a SECURITY property and not a throughput one: the combined
+    # `actions/cache` saves in a POST step at the END of the job — after the hostile target
+    # planner has run. Swapping the split save for it must be refused.
+    _etag_combined = _etag_refusal(_replacing_line(
+        "        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0",
+        "        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0"))
+    chk("[#1207][YAML seam] the COMBINED actions/cache (POST-step save, after target code) is "
+        "REFUSED",
+        ("must use `actions/cache/save@...`" in _etag_combined,
+         "after the hostile target planner code has executed" in _etag_combined), (True, True))
+
+    # THE PATH CHAIN. Cache a directory the snapshot never writes into and the store round-trips
+    # empty forever, with nothing red anywhere.
+    _etag_path = _etag_refusal(_replacing_line(
+        "          path: ${{ runner.temp }}/etag-store",
+        "          path: ${{ runner.temp }}/etag-store-elsewhere", occurrence=0))
+    chk("[#1207][YAML seam] a cached path the store is not written into is REFUSED",
+        ("restores" in _etag_path and "but saves" in _etag_path), True)
+
+    # ...and the REAL workflow passes the identical guard, so none of the rows above is green
+    # merely because the refusal refuses everything.
+    chk("[#1207][YAML seam] ...and the real workflow passes the same refusal",
+        _etag_refusal(_with_line("        id: snapshot", "        # a harmless comment")), "")
 
     # THE FILENAME CHAIN, END TO END. Round 1's rows all fed the consumer an attestation THIS
     # HARNESS wrote, so the producer could rename `raw-inertness-<i>.json` — and rename its own
