@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5024,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a1ff0ec3aca4b3e8b42b0fec839488008dd0ecf4",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The diff correctly rewrites the sibling comment in this file (line ~36) and both bench.yml sites, but the same false claim survives at scripts/ci-close-merged-beads.py:42:\n\n  # The default GITHUB_TOKEN cannot push to protected `main` (GH013, empty bypass list \u2014 see\n  # bead-autoclose.yml's history, sq-roe3), and a PR-based write is equally dead from that\n\nThis is the identical assertion the PR exists to retract, in a tracked and currently-executed script, and it explicitly cross-references this workflow's history -- so the two comments now disagree with each other about the same ruleset fact. Round 2 flagged this claim class as a NIT; round 3 recorded it fixed on the strength of a grep scoped to docs/ compliance/ .github/workflows/, which cannot reach scripts/.\n\nNot a blocker: the comment makes no wrong behavioral claim (GITHUB_TOKEN is indeed not the administrator role, so it is still GH013-rejected, and the issue-native close path the comment goes on to describe is unaffected). It is a doc-honesty leftover, and leaving it means a future reader can still cite \"empty bypass list\" from a file in main.",
+    "file": ".github/workflows/bead-autoclose.yml",
+    "fix_hint": "In scripts/ci-close-merged-beads.py:42, mirror the wording already adopted in bead-autoclose.yml -- e.g. \"(GH013; only the repository-administrator role can bypass, not GITHUB_TOKEN \u2014 see bead-autoclose.yml's history, sq-roe3)\". Then re-run the verification grep with scripts/ IN scope so the sweep is provably complete, e.g.: grep -rn -iE 'empty bypass|bypass_actors: \\[\\]|no admin bypass|current_user_can_bypass' --include='*.md' --include='*.yml' --include='*.py' --include='*.sh' docs/ compliance/ .github/ scripts/ research/ (expect zero hits; .beads/issues.jsonl is an intentional historical archive and should stay excluded).",
+    "severity": "minor",
+    "title": "Retraction of the \"empty bypass list\" claim is incomplete: one site remains in scripts/ci-close-merged-beads.py:42"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Doc/comment-only change (no code, tests, or runtime surface) retracting the false \"empty bypass_actors / current_user_can_bypass: never\" claim and recording the live state: one RepositoryRole bypass actor (actor_id: 5, bypass_mode: always) plus a merge_queue row in the live-rules table.\n\nPROGRESS LABEL: the head is UNCHANGED since round 3 (still a1ff0ec3; no round-3 fix commit), so the artifact is byte-identical to the one round 3 approved. Nothing regressed. Hence \"stagnant\", not \"regressing\": the finding below is not new damage, it is round-2 NIT #4 (\"comments asserting an EMPTY bypass list\") only PARTIALLY closed -- round 3's grep was scoped to docs/ compliance/ .github/workflows/ and could not see scripts/.\n\nVerified against the checkout, not just the diff:\n- All five round-2 findings remain closed. docs/branch-protection.md:13-15 now agrees with the section it cross-references; the \"Other settings\", solo-maintainer, compensating-controls and live-rules-table sites are mutually consistent.\n- Compliance drift closed at all four cited sites (openssf.md:26, slsa/controls.md:141/:142, slsa/evidence.md:125); the collateral over-claim (\"\u22651 approving review, require-code-owners, dismiss-stale\") now matches the enforced 0/false/false reality.\n- No \"emergency bypass\" phrasing survives anywhere.\n- actor_id: 5 for RepositoryRole is the documented admin role id, so the identification is correct. The live ruleset is out-of-repo and unverifiable from a read-only checkout -- exactly why these stay AR, not IV.\n- The merge_queue row (ALLGREEN / max_entries_to_merge: 8 / 60 min) matches \u00a7Omnibus batching at lines 452-455.\n- research/orchestration-private-registry-worker.md:140,257 (\"the App is not on any bypass list\") stay TRUE under an admin-only bypass list -- not drift. .beads/issues.jsonl:57-58 quote the old text inside CLOSED bead records; correctly left alone.\n\nOne residual site remains in a tracked, active script (below): comment-only, so it does not block.",
+  "verdict": "approve"
+ }
+}
