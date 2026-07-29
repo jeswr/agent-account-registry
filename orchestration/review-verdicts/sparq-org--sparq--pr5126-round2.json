@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5126,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "aca8f54e606fe2b00c1ccb225a01c5c0b46bbf30",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior blocker by removing the false claim that a default-branch checkout protects the workflow definition and explicitly documenting that same-repository PR workflow YAML remains author-controlled. The revised rationale correctly identifies the fork read-only GITHUB_TOKEN as the boundary for untrusted contributors, acknowledges the residual capability available to push-access actors, and avoids claiming the checkout constrains permissions. The implementation confines durable label creation to complete path enumerations with positive crate evidence, a strict label-name pattern, a non-crate-lane collision check, and a requirement that provisioning changes the derivation to resolved. Creation failures fail closed except for a verified lost race. The tests exercise the real effect path, including dry-run, idempotence, incomplete inputs, forks, races, hard failures, and structural workflow trigger/permission assertions. No hostile reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
