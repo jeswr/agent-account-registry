@@ -40,12 +40,24 @@ DEFERRED_RE = re.compile(r"^\S+\s+defer(?:red)?\s", re.MULTILINE)
 # so the RUN LOG is the only place these counts are reachable from here. The lane NAME is read from
 # the log rather than pinned to a list, exactly as _obs_lane_rows does for the collector's lanes: a
 # lane added to dispatch-claim's DISPATCH_LANES appears on the page with no change here. Counts are
-# digit-bounded and the name must be a safe token, so a malformed line is dropped, never rendered.
+# digit-bounded and the name must be a safe token.
 DISPATCH_LANE_RE = re.compile(
     r"^\S+\s+lane (?P<lane>[A-Za-z0-9][A-Za-z0-9_.-]{0,31}): "
     r"planned=(?P<planned>\d{1,6}) launched=(?P<launched>\d{1,6}) "
     r"deferred=(?P<deferred>\d{1,6}) error=(?P<error>\d{1,6})\s*$", re.MULTILINE)
 DISPATCH_LANE_CAP = 12
+# The block dispatch-claim prints is BOUNDED on both sides — `dispatcher complete:`, the
+# `fix-dispatch:` fan-out line, one lane line per DISPATCH_LANES, then `defer attribution:` — and
+# `_dispatch_lane_rows` validates it as a WHOLE against these two anchors plus the lanes below.
+# A tick truncated mid-block has no terminator; a lane row omitted from a rendered tick reads as a
+# healthy lane that simply is not there. Both must be "unknown", never a selectively complete tick.
+DISPATCH_FIX_LINE_RE = re.compile(r"^\S+\s+fix-dispatch: ")
+DISPATCH_LANE_END_RE = re.compile(r"^\S+\s+defer attribution:")
+# The lanes dispatch-claim's DISPATCH_LANES prints on EVERY tick, and so the minimum a rendered
+# block must carry. This is a floor, not a pin: an ADDED lane still reaches the page unread-ahead
+# (the name comes from the log), while a MISSING one — the stalled review or failed disarm this
+# feature exists to expose — refuses the whole block instead of publishing the survivors.
+DISPATCH_REQUIRED_LANES = ("worker", "review", "fix", "disarm")
 
 # Agent-run observability (issue #246). The collector persists a snapshot of cache-effectiveness /
 # per-lane run-health / flow metrics + auto-fixer trigger fires on the ledger data-plane branch
@@ -977,31 +989,50 @@ def _dispatch_lane_rows(log_text):
     """Per-lane tick counts (issues #108/#323) for ONE dispatch run, or None when the run printed
     none (a claim that aborted before the dispatcher finished, or a pre-#108 run).
 
-    Read ONLY from the tail after the LAST `dispatcher complete:` line. dispatch-claim prints the
-    lane block immediately after that line, so the tail is the dispatcher's own trusted output —
+    Read ONLY from the block after the LAST `dispatcher complete:` line. dispatch-claim prints the
+    lane block immediately after that line, so the block is the dispatcher's own trusted output —
     while everything before it is a whole run's log, into which target-controlled text (an issue
     title, a rejected plan row) is echoed. Every line of a raw Actions log carries a timestamp
-    prefix, so `^\\S+\\s+` alone does not make a line the dispatcher's; anchoring to the tail is what
-    stops an echoed string from FABRICATING a lane row (AGENTS.md pre-flight item 5: who can write
-    the thing this reads?). No complete line => no lanes, rather than a scan of the whole log."""
+    prefix, so `^\\S+\\s+` alone does not make a line the dispatcher's; anchoring to the block is
+    what stops an echoed string from FABRICATING a lane row (AGENTS.md pre-flight item 5: who can
+    write the thing this reads?). No complete line => no lanes, rather than a scan of the log.
+
+    The block is validated as a WHOLE, and a partial one is refused rather than trimmed (review
+    round 1): the rows must be CONTIGUOUS between the `fix-dispatch:` header and the
+    `defer attribution:` terminator, each must parse, none may repeat, DISPATCH_REQUIRED_LANES must
+    all be present, and the block may not exceed DISPATCH_LANE_CAP rows. Publishing the survivors of
+    a truncated or malformed block renders the vanished lane as absent rather than unknown — which
+    is exactly how a stalled review/fix lane or a failed disarm would disappear from the one cell
+    built to show it — so every one of those shapes returns None and the page shows `—`. Trailing
+    output cannot reach the rows either: the scan STOPS at the terminator, so a lane line echoed
+    after the block cannot overwrite the dispatcher's own count for that lane."""
     complete = list(DISPATCH_COMPLETE_RE.finditer(log_text))
     if not complete:
         return None
+    # `[1:]` drops the remainder of the completion line itself; last block wins, matching the
+    # `complete[-1]` rule above for a log that carries more than one dispatcher run.
+    lines = log_text[complete[-1].end():].splitlines()[1:]
+    if not lines or not DISPATCH_FIX_LINE_RE.match(lines[0]):
+        return None
     rows = {}
-    for match in DISPATCH_LANE_RE.finditer(log_text[complete[-1].end():]):
-        lane = match.group("lane")
-        if lane not in rows and len(rows) >= DISPATCH_LANE_CAP:
-            continue
+    for line in lines[1:]:
+        if DISPATCH_LANE_END_RE.match(line):
+            if any(lane not in rows for lane in DISPATCH_REQUIRED_LANES):
+                return None
+            return list(rows.values())
+        match = DISPATCH_LANE_RE.match(line)
+        if match is None or match.group("lane") in rows or len(rows) >= DISPATCH_LANE_CAP:
+            return None
         planned, launched, error = (int(match.group(key))
                                     for key in ("planned", "launched", "error"))
         # `deferred` is READ from the line, not re-derived: dispatch-claim derives it there
         # (planned-launched-error, clamped) and re-deriving it here would republish this build's
-        # arithmetic as if it were the dispatcher's count. Last block wins, matching the
-        # `complete[-1]` rule above for a log that carries more than one dispatcher run.
-        rows[lane] = {"lane": lane, "planned": planned, "launched": launched,
-                      "deferred": int(match.group("deferred")), "error": error,
-                      "state": _dispatch_lane_state(planned, launched, error)}
-    return list(rows.values()) or None
+        # arithmetic as if it were the dispatcher's count.
+        rows[match.group("lane")] = {
+            "lane": match.group("lane"), "planned": planned, "launched": launched,
+            "deferred": int(match.group("deferred")), "error": error,
+            "state": _dispatch_lane_state(planned, launched, error)}
+    return None   # ran off the end of the log: the block was truncated, so nothing is known
 
 
 def _parse_dispatch_log(log_text):
@@ -1695,15 +1726,22 @@ def _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measur
         "2025-01-01Z lane review: planned=9 launched=0 deferred=0 error=9\n"   # pre-complete: not
         "2025-01-01Z dispatched worker owner/repo#1\n"                         # the dispatcher's
         "2025-01-01Z dispatcher complete: 1 worker/review/fix run(s) launched\n"
+        "2025-01-01Z fix-dispatch: 0 eligible, 0 launched, 0 deferred (reasons: none)\n"
         "2025-01-01Z lane worker: planned=4 launched=4 deferred=0 error=0\n"
+        "2025-01-01Z lane review: planned=4 launched=4 deferred=0 error=0\n"
+        "2025-01-01Z lane fix: planned=4 launched=4 deferred=0 error=0\n"
+        "2025-01-01Z lane disarm: planned=4 launched=4 deferred=0 error=0\n"
+        "2025-01-01Z defer attribution: none\n"
         "2025-01-01Z dispatcher complete: 2 worker/review/fix run(s) launched\n"
+        "2025-01-01Z fix-dispatch: 3 eligible, 1 launched, 2 deferred (reasons: capacity=2)\n"
         "2025-01-01Z lane worker: planned=5 launched=1 deferred=2 error=1\n"
         "2025-01-01Z lane review: planned=2 launched=0 deferred=2 error=0\n"
         "2025-01-01Z lane fix: planned=0 launched=0 deferred=0 error=0\n"
         "2025-01-01Z lane disarm: planned=1 launched=1 deferred=0 error=1\n"
-        "2025-01-01Z lane bad name: planned=1 launched=1 deferred=0 error=0\n"
-        "2025-01-01Z lane huge: planned=1234567 launched=0 deferred=0 error=0\n"
-        "2025-01-01Z defer attribution: none\n")
+        "2025-01-01Z defer attribution: none\n"
+        # Echoed AFTER the block's terminator — a clean `review` row that would have overwritten
+        # the dispatcher's stalled one under a last-wins scan of the whole tail.
+        "2025-01-01Z lane review: planned=0 launched=0 deferred=0 error=0\n")
     check("[#323] the lane block parses into per-lane rows with the LINE's deferred count and a "
           "display state per lane",
           _dispatch_lane_rows(log),
@@ -1728,20 +1766,97 @@ def _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measur
            _dispatch_lane_rows(
                "2025-01-01Z lane review: planned=9 launched=0 deferred=0 error=9\n")),
           (None, None))
-    check("[#323] malformed lane lines are dropped, not rendered (unsafe name token, and a count "
-          "that is not a bounded integer)",
-          [row["lane"] for row in _dispatch_lane_rows(log)], ["worker", "review", "fix", "disarm"])
-    # 20 and 12 are LITERAL here. Deriving either from DISPATCH_LANE_CAP would make the row
+    check("[#323] a lane row echoed AFTER the block's terminator cannot overwrite the "
+          "dispatcher's own row for that lane (the scan stops at the terminator)",
+          [row for row in (_dispatch_lane_rows(log) or []) if row["lane"] == "review"],
+          [{"lane": "review", "planned": 2, "launched": 0, "deferred": 2, "error": 0,
+            "state": "stalled"}])
+
+    def lane_names(rows):
+        """The parsed lane names, or the refusal itself — so a mutant that turns a published block
+        into `None` reds ONE named row instead of raising out of the comprehension and aborting the
+        suite, which records as a kill while every check below it never runs (pre-flight item 4)."""
+        return None if rows is None else [row["lane"] for row in rows]
+
+    # --- the block is validated as a WHOLE (review round 1). Publishing the survivors of a
+    # damaged block renders a vanished lane as absent rather than unknown, which is precisely how
+    # the stalled review/fix lane or the failed disarm this cell exists to expose would go missing.
+    # Every shape below is a block the dispatcher could not have printed, and each must be None —
+    # asserting "no partial lane set is published" rather than "the bad row was dropped".
+    def block(*body):
+        """One dispatcher block: the completion marker, the fix-dispatch header, then `body`."""
+        return ("2025-01-01Z dispatcher complete: 1 worker/review/fix run(s) launched\n"
+                "2025-01-01Z fix-dispatch: 0 eligible, 0 launched, 0 deferred (reasons: none)\n"
+                + "".join(line + "\n" for line in body))
+
+    worker_row = "2025-01-01Z lane worker: planned=5 launched=0 deferred=5 error=0"
+    review_row = "2025-01-01Z lane review: planned=2 launched=0 deferred=2 error=0"
+    fix_row = "2025-01-01Z lane fix: planned=1 launched=1 deferred=0 error=0"
+    disarm_row = "2025-01-01Z lane disarm: planned=1 launched=0 deferred=0 error=1"
+    terminator = "2025-01-01Z defer attribution: none"
+    check("[#323] a block missing a required lane publishes NOTHING — neither the stalled review "
+          "lane nor the failed disarm may be silently absent from an otherwise healthy tick",
+          (_dispatch_lane_rows(block(worker_row, fix_row, disarm_row, terminator)),
+           _dispatch_lane_rows(block(worker_row, review_row, fix_row, terminator))),
+          (None, None))
+    check("[#323] a malformed row inside the block refuses the WHOLE block (an unsafe lane name, a "
+          "count that is not a bounded integer, and a duplicated lane)",
+          (_dispatch_lane_rows(block(
+              worker_row, review_row, fix_row,
+              "2025-01-01Z lane bad name: planned=1 launched=0 deferred=0 error=1", terminator)),
+           _dispatch_lane_rows(block(
+               worker_row, review_row, fix_row,
+               "2025-01-01Z lane disarm: planned=1234567 launched=0 deferred=0 error=1",
+               terminator)),
+           _dispatch_lane_rows(block(
+               worker_row, review_row, fix_row, disarm_row, disarm_row, terminator))),
+          (None, None, None))
+    check("[#323] a block that is truncated or non-contiguous is unknown rather than partially "
+          "published",
+          (_dispatch_lane_rows(block(worker_row, review_row, fix_row, disarm_row)),
+           _dispatch_lane_rows(block(worker_row, review_row,
+                                     "2025-01-01Z dispatched worker owner/repo#7",
+                                     fix_row, disarm_row, terminator))),
+          (None, None))
+    # The header anchor needs its OWN input, carrying a COMPLETE lane set — the two guards are
+    # otherwise mutually masking (pre-flight item 4): with the header line simply absent, the first
+    # lane row is eaten in its place, the block then looks like it is missing that lane, and the
+    # required-lane floor refuses it for the wrong reason. Deleting the anchor outright survived the
+    # suite until this row existed. Here the header's slot holds a foreign line and all four lanes
+    # follow, so ONLY the anchor can refuse it.
+    check("[#323] a block whose fix-dispatch header is not there — an unrelated line in its slot, "
+          "or no header line at all — publishes nothing even with every lane row present",
+          (_dispatch_lane_rows(block(worker_row, review_row, fix_row, disarm_row, terminator)
+                               .replace("2025-01-01Z fix-dispatch: 0 eligible, 0 launched, "
+                                        "0 deferred (reasons: none)",
+                                        "2025-01-01Z dispatched worker owner/repo#7")),
+           _dispatch_lane_rows(
+               "2025-01-01Z dispatcher complete: 1 worker/review/fix run(s) launched\n"
+               + "".join(line + "\n" for line in
+                         (worker_row, review_row, fix_row, disarm_row, terminator)))),
+          (None, None))
+    # ...and the required set is a FLOOR, not a pin: a lane added to dispatch-claim's
+    # DISPATCH_LANES still reaches the page with no change here (a check that only ever expected
+    # None would be satisfied by hard-coding `return None`).
+    check("[#323] a block carrying an UNKNOWN extra lane still publishes, extra row included",
+          lane_names(_dispatch_lane_rows(block(
+              worker_row, review_row, fix_row, disarm_row,
+              "2025-01-01Z lane audit: planned=3 launched=3 deferred=0 error=0", terminator))),
+          ["worker", "review", "fix", "disarm", "audit"])
+    # 12 and 13 are LITERAL here. Deriving either from DISPATCH_LANE_CAP would make the row
     # vacuous — raising the constant would raise the input and the expectation together and stay
     # green, which is the #941 shape AGENTS.md pre-flight item 2(c) names.
-    over_cap = "2025-01-01Z dispatcher complete: 0 worker/review/fix run(s) launched\n" + "".join(
-        f"2025-01-01Z lane l{index}: planned=1 launched=1 deferred=0 error=0\n"
-        for index in range(20))
-    check("[#323] the lane row count is bounded at twelve, and bounding it keeps the FIRST lanes "
-          "rather than truncating to nothing",
-          (len(_dispatch_lane_rows(over_cap)), _dispatch_lane_rows(over_cap)[0]["lane"],
-           _dispatch_lane_rows(over_cap)[-1]["lane"]),
-          (12, "l0", "l11"))
+    def padded(count):
+        return block(worker_row, review_row, fix_row, disarm_row, *[
+            f"2025-01-01Z lane l{index}: planned=1 launched=1 deferred=0 error=0"
+            for index in range(count)], terminator)
+
+    twelve = _dispatch_lane_rows(padded(8))
+    check("[#323] the lane row count is bounded at twelve, and a block that EXCEEDS the bound is "
+          "refused whole rather than truncated to the first twelve lanes",
+          (len(twelve or []), (lane_names(twelve) or ["<refused>"])[-1],
+           _dispatch_lane_rows(padded(9))),
+          (12, "l7", None))
 
     # --- the display tone. The ALERTING predicate is the tick-health step of dispatch.yml; this
     # oracle restates it (there is no importable copy — it is inline python inside the workflow),
@@ -1836,7 +1951,10 @@ def _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measur
                            None if entry.get("lanes") is None
                            else [row["lane"] for row in entry["lanes"]])
                           for entry in fetched],
-          [(2, 1, ["worker", "review", "fix", "disarm"]), (None, None, None), (None, None, None),
+          # `deferred` is 2 because the fixture log carries the TWO dispatcher blocks the
+          # last-block-wins rule above is stated over, and DEFERRED_RE matches each block's
+          # `defer attribution:` header (pre-existing counting behaviour, untouched here).
+          [(2, 2, ["worker", "review", "fix", "disarm"]), (None, None, None), (None, None, None),
            (None, None, None), (None, None, None)])
     published = build_dashboard(issues, leases, usage, fetched, None, now, "fixture-salt",
                                 probe_status=measured_sidecar)
