@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1165,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e9b33f7c45a02e479ccc12737d63401a848c326b",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-1 blocker is resolved. Repository identity is now normalized independently of credential identity, and the still-firing supersede path is gated on a genuinely distinct repository, so two credentials for the same tracker cannot close the sole active alert. The same helper also replaces the prior duplicated redaction comparison. The new decide-driven regression test exercises the supported same-repository/different-token configuration with case variation, proves the sole alert remains open without a supersede comment while firing, and verifies the ordinary recovery path still closes it. I found no new correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
