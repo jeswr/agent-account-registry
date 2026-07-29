@@ -120,6 +120,26 @@ unkillable.
     test?"* — is what turned up real defects in the same authors' own patches that night,
     including one author catching its **own fix** one layer short.
 
+13. **Declare the source issue your PR closes — and compose the line, don't hand-write it.** The
+    cross-provider review lane can only enumerate a PR that has a provenance record, and
+    `auto-mint-provenance.py` derives its one hard input — the source issue — from the PR's own
+    closing reference. Measured on the live board the night **#937** merged: of **15**
+    enrolled-class pulls, **12** refused `no-issue-reference` and **1** `reference-is-a-pull-request`
+    (#710 declared `fixed #729`, which is a pull request). Every body this repo composes **in code**
+    already declares one; **every refusal was a body composed by hand.** The form is not free:
+    `Closes #<n>`, one ASCII space, no colon, alone in its paragraph, is the only form all three
+    consumers accept — `auto-mint-provenance.CLOSING_REF_RE` tolerates a colon, `groom.LINKED_ISSUE`
+    requires `\s+` and would not see it, and GitHub's auto-close needs both. A **second** closing
+    pair anywhere — including inside a fenced block, which the raw side does **not** strip — refuses
+    the whole PR as `ambiguous-issue-reference`. So run
+    `scripts/pr-body-ref.py compose --issue <n> --repo <owner/name> --body-file <f>`: it emits that
+    form, and verifies its own output against the reader's *imported* grammar before writing.
+    ⚠️ **The number is the issue you were DISPATCHED against — never the branch name, never a number
+    the body happens to mention.** If you cannot prove one, emit **nothing**: a missing reference is
+    a visible, censused, one-edit-recoverable refusal; a wrong one silently binds your PR to
+    someone else's issue, mis-partitions the review lease, and points the human-hold at the wrong
+    object.
+
 ### Mutation-run hygiene (these have destroyed whole measurement runs)
 
 - **`__pycache__` serves stale bytecode.** A mutate/restore cycle inside one mtime second re-runs

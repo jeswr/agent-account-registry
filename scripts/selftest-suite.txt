@@ -33,6 +33,7 @@ pat-validity.py
 plan-alert.py
 plan-snapshot.py
 policy-resolve.py
+pr-body-ref.py
 ready-issues.py
 reconcile-conflict-park.py
 reconcile-park-misescalation.py
