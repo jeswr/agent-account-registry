@@ -293,11 +293,14 @@ def annotation(result):
         # tree predating the sandboxed runner arm these failures cannot be shown to postdate the
         # base move, and telling an author "the composition broke this" without that caveat is the
         # same false attribution in the other direction.
+        # Deliberately does NOT name a cause: there are four (no runner arm, an unreadable manifest,
+        # an entry master added, a harness fault), the per-entry reason is already printed above, and
+        # a caveat that asserts the wrong one of the four is its own small false statement.
         caveat = ("" if result.get("baseline_established", True) else
-                  " ⚠️ NO BASELINE could be established — the tree this gate graded has no "
-                  "sandboxed runner arm, so these failures cannot be shown to POSTDATE the base "
-                  "move; they are attributed to the composition because an unverifiable excuse is "
-                  "not an excuse. Merging the base branch in produces a gradeable baseline.")
+                  " ⚠️ NO BASELINE could be established for at least one of these (see the baseline "
+                  "rows above for which and why), so they cannot be shown to POSTDATE the base move; "
+                  "they are attributed to the composition because an unverifiable excuse is not an "
+                  "excuse. Merging the base branch in produces a gradeable baseline.")
         return (f"::error::composition break — {reason}. Neither side need be wrong on its own: "
                 f"this is master and this PR disagreeing. Merge the base branch in and re-run "
                 f"{listed} locally.{caveat}")
