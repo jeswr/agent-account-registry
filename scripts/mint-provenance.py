@@ -47,6 +47,7 @@ and this script never prints the login it hashed alongside the hash.
 import argparse
 from collections import Counter
 import copy
+import inspect
 import json
 import os
 from pathlib import Path
@@ -1660,6 +1661,18 @@ def _self_test():                                                       # noqa: 
               for needle in ("target-App identity gate", "issue #7 binds")), True)
     check("...so no census line offers a mint the writer would refuse",
           any("mint with --issue" in line for line in _live_lines), False)
+    # ...and the property that keeps that true for a caller that does not exist yet. The rows above
+    # all drive the ONE current call site, which passes the probe explicitly — so giving the
+    # parameter a permissive default survived every one of them (measured: mutant M17). The
+    # docstring claims the conjunct is impossible to forget; that claim is a fact about the
+    # SIGNATURE, so the signature is what is asserted.
+    check("census_verdict's identity_admits is REQUIRED — a default is what would let a future "
+          "caller silently omit the run gate",
+          inspect.signature(census_verdict).parameters["identity_admits"].default,
+          inspect.Parameter.empty)
+    check("...and it is keyword-ONLY, so it cannot be satisfied by positional accident",
+          inspect.signature(census_verdict).parameters["identity_admits"].kind,
+          inspect.Parameter.KEYWORD_ONLY)
     # The census must never print a hash — it is the ONE surface that walks the whole population,
     # and the record's privacy decision (22a) is that a login's hash is only ever written, never
     # reported alongside anything that identifies it.
