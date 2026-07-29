@@ -1264,6 +1264,28 @@ jobs:
           REGISTRY_SECRETS_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
         run: bash registry/scripts/worker-live.sh write-back
 
+      # [issue #232 review r2] THE CREDENTIAL FILES, not just the pointers. Keeping
+      # WORKER_CREDENTIAL_PATH and the isolated HOME out of the job-wide $GITHUB_ENV (above) stops
+      # any later step being HANDED the credential; it does not stop one FINDING it. GitHub supplies
+      # $RUNNER_TEMP to every step unconditionally, WORKER_ROOT is `$RUNNER_TEMP/registry-worker`,
+      # and the two steps below run TARGET-CONTROLLED code as this same runner user — rustup honours
+      # the target's own `rust-toolchain.toml`, and the gate executes its build scripts and tests. A
+      # mode-600 file owned by that user is readable to it. So the tree goes NOW, while every step
+      # that has run so far is host-authored.
+      #
+      # It must sit after the write-back (which reads the rotation baseline and the mounted
+      # credential to make #134's containment assertion) and before the toolchain step. `always()`,
+      # never a success guard: the window this closes is widest on the runs that FAILED, and a purge
+      # skipped by a failed model step is a purge that was not there. A purge that cannot remove the
+      # material exits nonzero, and the gate's own `if:` carries an implicit `success()`, so the
+      # target's code never runs on a runner that still holds the account credential.
+      - name: Purge the account credential tree before any target-controlled code
+        id: purge
+        if: ${{ always() }}
+        env:
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+        run: bash registry/scripts/worker-live.sh purge-credentials
+
       - name: Ensure a Rust toolchain for the crate-scoped gate
         # [OPUS-4.8] The gate runs `cargo clippy/test` directly on the runner; a stock ubuntu-latest may
         # have rustup with NO default toolchain set (and the target may pin one via rust-toolchain.toml),

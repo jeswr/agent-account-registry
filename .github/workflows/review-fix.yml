@@ -1400,6 +1400,18 @@ jobs:
             --bot-login "${{ steps.target.outputs.bot_login }}" \
             --exit-class "$EXIT_CLASS"
 
+      # [issue #232 review r2] See the same step in worker.yml: the fix lane runs the TARGET's own
+      # rustup pin and cargo gate on this runner, and $RUNNER_TEMP reaches every step whatever the
+      # job environment says — so the account credential tree is removed here, before either of them
+      # exists to discover it. `always()` so it also covers the review lane (no gate there, but a
+      # failed or cancelled run leaves the same tree behind) and every failure path.
+      - name: Purge the account credential tree before any target-controlled code
+        id: purge
+        if: ${{ always() }}
+        env:
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+        run: bash registry/scripts/worker-live.sh purge-credentials
+
       - name: Ensure a Rust toolchain for the crate-scoped gate
         if: ${{ inputs.mode == 'fix' && steps.fix.outputs.fix_made_changes == 'true' && steps.fix.outputs.injection_detected != 'true' }}
         working-directory: target

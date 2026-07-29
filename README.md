@@ -400,10 +400,21 @@ titles).
     `$GITHUB_ENV` (#232). Each lane then routes them by hand to the only steps that need them — the
     model/review/fix run and the rotation write-back — so the policy gate, which executes the target's
     own build scripts and tests on that runner, never inherits a pointer to the account credential,
-    the raw account handle, or a `HOME` the model itself could write. There is no exposure window and
-    no dependence on a later scrub step running in the right order; `worker-live.sh`'s self-test
+    the raw account handle, or a `HOME` the model itself could write. `worker-live.sh`'s self-test
     asserts the routing on both live workflows and that a successful prepare writes **nothing** to
     `$GITHUB_ENV`.
+  - **...and the credential FILES leave the runner before any target-controlled code runs.** Routing
+    decides which steps are *handed* the path; it does not decide which steps can *find* it. GitHub
+    supplies `$RUNNER_TEMP` to every step unconditionally, the credential is materialized under
+    `$RUNNER_TEMP/registry-worker`, and the gate's build scripts run as the runner user that owns
+    that mode-600 file — so both lanes call `worker-live.sh purge-credentials` in an `always()` step
+    ordered after the rotation write-back and **before** the rustup pin and the gate. It removes the
+    isolated `HOME` and every host-side credential artifact, then re-scans for residue and **dies**
+    if anything survived, so the gate's implicit `success()` keeps the target's code off a runner
+    that still holds the credential. Non-vacuous both ways: the self-test reads a real prepared tree
+    through a gate-shaped reader that has only `$RUNNER_TEMP` (it finds the credential before the
+    purge and nothing after), pins the purge/toolchain/gate ordering on both live workflows against
+    a moved-late and a deleted mutant, and proves an un-removable credential fails the step closed.
 - On this work box, pre-provisioned Anthropic setup-tokens already exist as files
   `~/.claude-acctN-token` (one per account). Read the file; do not echo it.
 

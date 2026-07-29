@@ -304,11 +304,22 @@ fi
 #
 # Step OUTPUTS are inert data the workflow must ROUTE deliberately, so the credential paths now
 # reach exactly the two consumers that need them — the model run and the rotation write-back — as
-# step-level `env:`, and nothing else. There is no exposure window to scrub afterwards and no
-# dependence on a later purge step running in the right order (the defense-in-depth follow-up to
-# #124). The account handle, provider, harness and credential format are NOT re-exported at all:
-# the workflow already resolved them in its account-SELECTION step and passes them straight from
-# there to the steps that need them, so this script is no longer a second source for them.
+# step-level `env:`, and nothing else.
+#
+# THAT IS HALF THE CONTAINMENT, AND ONLY HALF (issue #232 review r2). Routing decides which steps
+# are HANDED the path; it does not decide which steps can FIND the file. WORKER_ROOT is
+# `$RUNNER_TEMP/registry-worker` in both live lanes and GitHub supplies $RUNNER_TEMP to every step,
+# so target-controlled cargo in the gate can walk this tree and read a mode-600 file owned by the
+# same runner user without any environment pointer at all. The other half is `worker-live.sh
+# purge-credentials`, which both lanes run in an always() step ordered after the write-back and
+# BEFORE the rustup pin and the gate: it removes this HOME and every host-side credential artifact
+# and fails closed if anything survives. Neither half substitutes for the other — this one shrinks
+# what a step inherits, that one shrinks how long the file exists (both are the defense-in-depth
+# follow-up to #124).
+#
+# The account handle, provider, harness and credential format are NOT re-exported at all: the
+# workflow already resolved them in its account-SELECTION step and passes them straight from there
+# to the steps that need them, so this script is no longer a second source for them.
 #
 # Nothing emitted here is derived from the credential VALUE: these are paths under WORKER_ROOT. And
 # nothing is emitted that no lane routes — CODEX_HOME in particular is NOT exported, because the only

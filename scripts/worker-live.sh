@@ -3084,6 +3084,87 @@ PY
   printf 'worker-live: wrote the full refreshed credential back to the account secret (env dispatch-secrets)\n'
 }
 
+# PURE (self-tested): print every path under WORKER_ROOT that can still hold account credential
+# material — the isolated HOME subtree in full, plus the host-side pre-flight artifacts that sit
+# directly under the root — in sorted order. Expected output after `purge-credentials` is EMPTY.
+#
+# It is a DISCOVERY scan and takes ONLY the root, deliberately: that is exactly what
+# target-controlled code in the gate has to work with. GitHub hands $RUNNER_TEMP to every step
+# unconditionally and WORKER_ROOT is `$RUNNER_TEMP/registry-worker` in both live lanes, so hostile
+# cargo needs no environment pointer to walk this tree — a residue this scan cannot see is a residue
+# the purge assertion below would wave through. Name it the way an attacker finds it, not the way
+# the workflow addressed it.
+_credential_residue() {
+  local root=$1
+  [[ -n "$root" && "$root" != / ]] || die 'unsafe credential-residue root'
+  [[ -d "$root" ]] || return 0
+  {
+    find "$root/home" -print 2>/dev/null || true
+    find "$root" -maxdepth 1 \( -name '.credential-*' -o -name '.selected-credential' \) -print \
+      2>/dev/null || true
+  } | sort
+}
+
+# THE PRE-GATE CREDENTIAL PURGE (issue #232 review r2). Keeping the credential POINTERS out of the
+# job-wide $GITHUB_ENV is only half the containment, and it is the half a FILESYSTEM does not
+# respect: `worker-prep.sh` materializes the account credential (and its rotation baseline) under
+# $WORKER_ROOT, the tree survives the write-back, and the gate then runs the TARGET's own build
+# scripts and tests as the same runner user. Not routing `steps.prepare.outputs.credential_path`
+# into the gate step proves nobody HANDED it the path; it proves nothing about whether the gate can
+# FIND the file. So the tree is removed before any target-controlled step exists to look for it.
+#
+# FAIL CLOSED, and that is the whole point of the residue re-scan: `rm` reports permission failures
+# on stderr and this runs with `|| true` so a partial removal cannot abort ahead of the check, but a
+# purge that could not remove the material must DIE rather than return 0 and let the workflow's
+# implicit `success()` admit the gate. Idempotent (a re-run, or a prepare that never materialized
+# anything, is a clean no-op) because both live lanes call it under `always()`.
+#
+# What is deliberately NOT removed: `$WORKER_ROOT/cli` (the pinned harness install, on $GITHUB_PATH)
+# and the plain data files the post-gate steps still read — the fix lane's `followups.jsonl` among
+# them. Those carry no account credential; widening this into the job's whole scratch tree would
+# break the lanes without closing anything.
+purge_credentials() {
+  local worker_root=${WORKER_ROOT:-}
+  [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
+  if [[ ! -d "$worker_root" ]]; then
+    printf 'worker-live: no isolated worker tree to purge\n'
+    return 0
+  fi
+  rm -rf -- "$worker_root/home" || true
+  rm -f -- "$worker_root"/.credential-* "$worker_root"/.selected-credential || true
+  local residue
+  residue=$(_credential_residue "$worker_root")
+  [[ -z "$residue" ]] ||
+    die "credential purge left readable account material under WORKER_ROOT: $(printf '%s' "$residue" | tr '\n' ' ')"
+  printf 'worker-live: purged the isolated account credential tree before any target-controlled code\n'
+}
+
+# PURE (self-tested): verdict on whether a live worker lane purges the account credential tree
+# BEFORE it runs any target-controlled code. `ordered` is the only passing value; every other
+# outcome — including a lane with no purge step at all — is a named refusal, so a deleted step reads
+# as a defect rather than as an ordering that trivially holds.
+#
+# The two target-controlled steps are the rustup provisioning (which honours the TARGET's own
+# `rust-toolchain.toml`) and the gate itself (which executes the target's build scripts and tests).
+# Both are matched on their exact `run:`/`- name:` line rather than by substring: `worker-live.sh
+# gate` also appears inside a comment above the gate step in worker.yml, and a containment match
+# there would measure the comment's position, not the step's.
+_purge_before_target_code() {
+  local file=$1
+  [[ -f "$file" ]] || { printf 'worker-live: workflow file missing: %s\n' "$file" >&2; return 1; }
+  local purge_ln tool_ln gate_ln
+  purge_ln=$(_first_match_line '^        run: bash registry/scripts/worker-live\.sh purge-credentials$' < "$file")
+  tool_ln=$(_first_match_line '^      - name: Ensure a Rust toolchain for the crate-scoped gate$' < "$file")
+  gate_ln=$(_first_match_line '^        run: bash \.\./registry/scripts/worker-live\.sh gate$' < "$file")
+  [[ -n "$purge_ln" ]] || { printf 'no-purge-step\n'; return 0; }
+  [[ -n "$tool_ln" && -n "$gate_ln" ]] || { printf 'no-target-code-step\n'; return 0; }
+  if [[ "$purge_ln" -lt "$tool_ln" && "$purge_ln" -lt "$gate_ln" ]]; then
+    printf 'ordered\n'
+  else
+    printf 'purge-after-target-code\n'
+  fi
+}
+
 # PURE (self-tested): print the step id of every `worker`-job token mint that does NOT disable
 # the action's token-revocation post phase. Expected output is EMPTY.
 #
@@ -4395,6 +4476,66 @@ WFFIX
   # ...and it is needle-specific rather than matching every step it walks past.
   chk "#232: an expression no step references matches nothing (the scan is not a blanket hit)" \
     "$(_workflow_steps_referencing "$wf" 'steps.prepare.outputs.no_such_output' | wc -l | tr -d ' ')" "0"
+
+  # --- [issue #232 review r2] ...and the half of the containment the ROUTING scan above cannot
+  # measure. Which steps are HANDED `steps.prepare.outputs.credential_path` is a routing fact; which
+  # steps can FIND the credential is a FILESYSTEM fact. worker-prep materializes it under
+  # `$RUNNER_TEMP/registry-worker`, GitHub gives $RUNNER_TEMP to every step, and the two steps below
+  # the purge run TARGET-CONTROLLED code as the runner user that owns the mode-600 file. So the
+  # ordering — purge strictly before any target-controlled step — is the property, asserted per
+  # lane. The behavioural half (a gate-shaped reader really cannot find it afterwards) is in the
+  # pre-flight section further down; this is the wiring that makes it happen on a live run. ---
+  chk "#232 r2 (LIVE worker.yml): the credential purge precedes every target-controlled step" \
+    "$(_purge_before_target_code "$wf")" "ordered"
+  chk "#232 r2 (LIVE review-fix.yml): ...and the fix lane's own toolchain+gate too" \
+    "$(_purge_before_target_code "$rf_wf")" "ordered"
+  # MANDATORY, exact-match: a purge gated on the model/gate path is absent on exactly the failed
+  # runs whose credential tree is most likely to outlive the job. `always()` is the whole condition
+  # — a containment check must not acquire an extra conjunct that can turn it off (#941's `if:`
+  # mutants all survived a containment assertion).
+  chk "#232 r2 (LIVE): both lanes make the purge unconditional (always(), nothing else)" \
+    "$(_workflow_step_if "$wf" purge):$(_workflow_step_if "$rf_wf" purge)" \
+    '${{ always() }}:${{ always() }}'
+  # ...and each lane purges by calling the self-tested subcommand, not by an inline `rm` that no
+  # self-test can reach and nothing re-scans for residue.
+  local purge_run='run: bash registry/scripts/worker-live.sh purge-credentials'
+  chk "#232 r2 (LIVE): each lane purges through the self-tested subcommand exactly once" \
+    "$(grep -Fc "$purge_run" "$wf" || true):$(grep -Fc "$purge_run" "$rf_wf" || true)" "1:1"
+  # ...and its nonzero exit must stay TERMINAL. `continue-on-error: true` would leave the step green
+  # to the job, restoring the implicit `success()` the gate's `if:` depends on and admitting the
+  # target's build scripts onto a runner whose credential purge just reported it could not finish —
+  # the fail-OPEN twin of deleting the step, and invisible to every assertion above.
+  chk "#232 r2 (LIVE): a failed purge is TERMINAL in both lanes (no continue-on-error)" \
+    "$(_workflow_step_body "$wf" purge | grep -c 'continue-on-error' || true):$(_workflow_step_body "$rf_wf" purge | grep -c 'continue-on-error' || true)" \
+    "0:0"
+  # ...over a body the extractor really found: a zero from an empty body proves nothing (#941).
+  chk "#232 r2: ...and that zero is read off the REAL purge step body (extractor non-vacuous)" \
+    "$(_workflow_step_body "$wf" purge | grep -Fc "$purge_run" || true):$(_workflow_step_body "$rf_wf" purge | grep -Fc "$purge_run" || true)" \
+    "1:1"
+  # NON-VACUITY, both regression directions, on the REAL workflow. (1) The purge MOVED after the
+  # gate — the exact shape review round 2 found, where the routing looks right and the file is still
+  # there. (2) The purge DELETED outright, which must read as a defect and not as an ordering that
+  # holds trivially because there is nothing to order.
+  local wf_purge_late="$tmp/worker-purge-late.yml" wf_purge_gone="$tmp/worker-purge-gone.yml"
+  grep -Fv "$purge_run" "$wf" > "$wf_purge_gone"
+  {
+    cat "$wf_purge_gone"
+    printf '      - name: Purge the account credential tree before any target-controlled code\n'
+    printf '        %s\n' "$purge_run"
+  } > "$wf_purge_late"
+  chk "#232 r2: a purge moved AFTER the gate is REPORTED (non-vacuous)" \
+    "$(_purge_before_target_code "$wf_purge_late")" "purge-after-target-code"
+  chk "#232 r2: a DELETED purge step is REPORTED, never read as ordered (fail closed)" \
+    "$(_purge_before_target_code "$wf_purge_gone")" "no-purge-step"
+  # ...and the ordering verdict is not a blanket 'ordered' for any file it is handed: a lane that
+  # purges but runs NO target code (nothing to be early to) is a distinct, named outcome.
+  local wf_purge_nogate="$tmp/worker-purge-nogate.yml"
+  grep -Fv 'run: bash ../registry/scripts/worker-live.sh gate' "$wf" > "$wf_purge_nogate"
+  chk "#232 r2: ...and a lane whose target-controlled step is missing is named, not waved through" \
+    "$(_purge_before_target_code "$wf_purge_nogate")" "no-target-code-step"
+  chk "#232 r2: _purge_before_target_code fails CLOSED on an unreadable workflow" \
+    "$(_purge_before_target_code "$tmp/no-such-workflow.yml" 2>/dev/null; printf '%s' "$?")" "1"
+
   local verify_ln mint_ln
   verify_ln=$(_first_match_line 'worker-live\.sh verify-bundle' < "$wf")
   mint_ln=$(_first_match_line '^        id: app-token-pub$' < "$wf")
@@ -5755,6 +5896,141 @@ print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcaplive/
   chk "(#232) ...and #134's mount-containment check RAN (not the no-mount rescue warning)" \
     "$(grep -c 'no mount-containment assertion applies' "$tmp/wb-live.log" || true)" "0"
 
+  # --- [issue #232 review r2] THE PRE-GATE PURGE, measured the way the attacker measures it. The
+  # step-output routing above proves the gate was never HANDED the credential path. It proves
+  # nothing about the FILE: worker-prep materializes it under `$RUNNER_TEMP/registry-worker`, the
+  # write-back leaves the tree in place, and the gate then runs the TARGET's own build scripts and
+  # tests as the same runner user that owns the mode-600 file. These rows run the REAL worker-prep,
+  # then read the tree through a GATE-SHAPED reader that has ONLY $RUNNER_TEMP — no WORKER_ROOT, no
+  # credential path, no isolated HOME. BEFORE the purge that reader finds the account secret; AFTER
+  # it there is nothing to find. Both directions, on real artifacts, because either one alone is
+  # satisfiable by a scan that never looks at anything. ---
+  local purge_rt="$tmp/runner-temp" purge_root purge_sentinel='sk-ant-PURGE-SENTINEL-00000000'
+  purge_root="$purge_rt/registry-worker"
+  rm -rf -- "$purge_rt"
+  mkdir -p "$purge_root/cli/node_modules/.bin"
+  printf '#!/bin/sh\nexit 0\n' > "$purge_root/cli/node_modules/.bin/claude"
+  chmod +x "$purge_root/cli/node_modules/.bin/claude"
+  # A gate-shaped process: it is handed the runner temp and NOTHING else, which is precisely the
+  # inheritance of a cargo build script. It prints the runner-temp-relative path of every file whose
+  # CONTENT carries the account secret — content, not filename, because a name-based scan would
+  # report the purge complete while a copy of the credential sat under some other name.
+  _gate_shaped_reader() {
+    local runner_temp=$1 sentinel=$2
+    (
+      unset WORKER_ROOT WORKER_CREDENTIAL_PATH WORKER_CREDENTIAL_BASELINE WORKER_ACCOUNT
+      grep -rlF -- "$sentinel" "$runner_temp" 2>/dev/null | sed "s#^$runner_temp/##" | sort \
+        | tr '\n' '|'
+    )
+  }
+  local purge_prep_rc
+  if (
+    export WORKER_ROOT="$purge_root" WORKER_ACCOUNT=acctexample WORKER_PROVIDER=anthropic \
+           WORKER_HARNESS=claude WORKER_CREDENTIAL_FORMAT=claude-oauth-token \
+           WORKER_ACCOUNT_CREDENTIAL="$purge_sentinel" \
+           GITHUB_ENV="$tmp/pf-purge.env" GITHUB_OUTPUT="$tmp/pf-purge.out"
+    unset GITHUB_PATH
+    bash "$SCRIPT_DIR/worker-prep.sh"
+  ) > "$tmp/pf-purge.log" 2>&1; then purge_prep_rc=0; else purge_prep_rc=$?; fi
+  chk "(#232 r2) the purge fixture is a REAL prepared account tree (control)" \
+    "$purge_prep_rc:$([[ -f "$purge_root/home/.claude/worker-token" ]] && printf mounted || printf missing)" \
+    "0:mounted"
+  # NON-VACUITY / the finding itself: with the tree in place, $RUNNER_TEMP alone is enough. Both
+  # copies are named, so a purge that removed the mount and forgot the rotation baseline is red.
+  chk "(#232 r2) BEFORE the purge a gate-shaped reader finds the credential via \$RUNNER_TEMP alone" \
+    "$(_gate_shaped_reader "$purge_rt" "$purge_sentinel")" \
+    "registry-worker/.credential-baseline|registry-worker/home/.claude/worker-token|"
+  # The residue scan the purge FAILS CLOSED on has to see the same two regions, or its post-purge
+  # zero is a property of a blind scan. Named exactly, and covering BOTH of its arms: the mounted
+  # HOME subtree, and the host-side artifact that sits OUTSIDE it (`.credential-baseline` here;
+  # `.credential-durable` on a rotating account is the long-lived refresh token itself).
+  chk "(#232 r2) the residue scan sees both regions BEFORE the purge (its post-purge zero is earned)" \
+    "$(_credential_residue "$purge_root" | sed "s#^$purge_root/##" | tr '\n' '|')" \
+    ".credential-baseline|home|home/.claude|home/.claude/worker-token|"
+  # The fix lane reads followups.jsonl AFTER the gate; the purge must not take it (or the pinned CLI)
+  # with it. Written here so the survival assertion below is about the purge, not about absence.
+  printf '{"title": "t", "body": "b", "labels": ["kind:bug"]}\n' > "$purge_root/followups.jsonl"
+  local purge_rc purge_out
+  if purge_out=$( export WORKER_ROOT="$purge_root"; purge_credentials 2>&1 ); then
+    purge_rc=0
+  else
+    purge_rc=$?
+  fi
+  chk "(#232 r2) the purge succeeds on a real prepared tree" "$purge_rc" "0"
+  chk "(#232 r2) AFTER the purge the SAME reader finds nothing — no \$RUNNER_TEMP path to it" \
+    "$(_gate_shaped_reader "$purge_rt" "$purge_sentinel")" ""
+  chk "(#232 r2) ...the isolated HOME is gone and the residue scan agrees (nothing left to find)" \
+    "$([[ -e "$purge_root/home" ]] && printf home-survives || printf gone):$(_credential_residue "$purge_root" | wc -l | tr -d ' ')" \
+    "gone:0"
+  chk "(#232 r2) ...and the purge is SCOPED: the pinned CLI and the post-gate followups survive" \
+    "$([[ -x "$purge_root/cli/node_modules/.bin/claude" ]] && printf cli || printf cli-lost):$([[ -f "$purge_root/followups.jsonl" ]] && printf followups || printf followups-lost)" \
+    "cli:followups"
+  # IDEMPOTENT: both lanes call this under always(), so it also runs when prepare never materialized
+  # anything and (on a re-run) when it has already run. Neither may fail the job.
+  chk "(#232 r2) a second purge of the same tree is a clean no-op (always() is safe)" \
+    "$( ( export WORKER_ROOT="$purge_root"; purge_credentials ) >/dev/null 2>&1; printf '%s' "$?")" "0"
+  chk "(#232 r2) a purge with no worker tree at all is a clean no-op (prepare aborted early)" \
+    "$( ( export WORKER_ROOT="$tmp/never-prepared"; purge_credentials ) >/dev/null 2>&1; printf '%s' "$?")" "0"
+  chk "(#232 r2) ...but an unset or root WORKER_ROOT is REFUSED, never an rm -rf of /" \
+    "$( ( unset WORKER_ROOT; purge_credentials ) >/dev/null 2>&1; printf '%s' "$?"):$( ( export WORKER_ROOT=/; purge_credentials ) >/dev/null 2>&1; printf '%s' "$?")" \
+    "1:1"
+  # FAIL CLOSED, the direction that matters most: a purge that could not actually remove the
+  # material must DIE. Reproduced by dropping write permission on the credential's parent directory,
+  # which makes `rm` fail while leaving the file perfectly readable — the exact state in which
+  # reporting success would admit the gate onto a runner that still holds the account credential.
+  local purge_locked="$tmp/purge-locked" purge_locked_rc purge_locked_out
+  rm -rf -- "$purge_locked"
+  mkdir -p "$purge_locked/home/.claude"
+  printf '%s' "$purge_sentinel" > "$purge_locked/home/.claude/worker-token"
+  chmod 500 "$purge_locked/home/.claude"
+  # PRECONDITION, so the row below cannot pass for the wrong reason. Dropping write permission on
+  # the parent is a no-op for uid 0, and under root the purge would simply succeed and the
+  # fail-closed assertion would be unfalsifiable — an instrument that cannot fail has told you
+  # nothing. So the inability to remove the file is asserted FIRST: a suite running as root goes red
+  # HERE, visibly, instead of silently proving nothing. (Neither pr-gate.yml nor the worker's
+  # registry-selftest profile runs as root; both execute on ubuntu-latest as `runner`.)
+  chk "(#232 r2) the locked fixture really is un-removable for this user (next row is falsifiable)" \
+    "$(rm -f -- "$purge_locked/home/.claude/worker-token" 2>/dev/null; \
+       [[ -f "$purge_locked/home/.claude/worker-token" ]] && printf locked || printf removable)" \
+    "locked"
+  if purge_locked_out=$( export WORKER_ROOT="$purge_locked"; purge_credentials 2>&1 ); then
+    purge_locked_rc=0
+  else
+    purge_locked_rc=$?
+  fi
+  chk "(#232 r2) a purge that CANNOT remove the credential FAILS CLOSED (no silent success)" \
+    "$purge_locked_rc:$(printf '%s' "$purge_locked_out" | grep -c 'left readable account material' || true)" \
+    "1:1"
+  chk "(#232 r2) ...and what survived really is the readable credential the reader can still see" \
+    "$(_gate_shaped_reader "$purge_locked" "$purge_sentinel")" "home/.claude/worker-token|"
+  # ...and the refusal is a property of the permissions, not of the function: restore them and the
+  # same call now purges. Without this the row above is satisfied by a purge that never works.
+  chmod 700 "$purge_locked/home/.claude"
+  chk "(#232 r2) ...with the permission restored the SAME purge succeeds (refusal was not blanket)" \
+    "$( ( export WORKER_ROOT="$purge_locked"; purge_credentials ) >/dev/null 2>&1; printf '%s' "$?"):$(_gate_shaped_reader "$purge_locked" "$purge_sentinel")" \
+    "0:"
+  # --- the residue scan's own edges. It is what makes the purge fail closed, so it must be SELECTIVE
+  # (a scan that reports everything makes every purge look broken and would be relaxed away) and it
+  # must report a host-side artifact with NO mounted HOME beside it — the shape a prepare that died
+  # after the rotation leaves behind, and the one arm no other row above exercises alone. ---
+  local res_root="$tmp/residue-edges"
+  rm -rf -- "$res_root"
+  mkdir -p "$res_root/cli/node_modules" "$res_root/publish-bundle"
+  printf 'x\n' > "$res_root/followups.jsonl"
+  printf 'x\n' > "$res_root/model-image.id"
+  chk "(#232 r2) the residue scan reports NOTHING for a worker tree carrying no credential" \
+    "$(_credential_residue "$res_root" | tr '\n' '|')" ""
+  printf 'x\n' > "$res_root/.credential-durable"
+  printf 'x\n' > "$res_root/.selected-credential"
+  chk "(#232 r2) ...and DOES report host-side artifacts with no mounted HOME beside them" \
+    "$(_credential_residue "$res_root" | sed "s#^$res_root/##" | sort | tr '\n' '|')" \
+    ".credential-durable|.selected-credential|"
+  chk "(#232 r2) ...an absent root is empty-and-clean, not an error (prepare never ran)" \
+    "$(_credential_residue "$tmp/no-such-worker-root"; printf '|%s' "$?")" "|0"
+  chk "(#232 r2) ...but the scan itself refuses an empty or root path (fail closed)" \
+    "$( ( _credential_residue '' ) >/dev/null 2>&1; printf '%s' "$?"):$( ( _credential_residue / ) >/dev/null 2>&1; printf '%s' "$?")" \
+    "1:1"
+
   # HONESTY of the classification: a prep failure that is NOT a refresh failure (here a malformed
   # stored credential) must classify NOTHING — downstream then records the truthful `unknown`
   # rather than a refresh class nobody observed.
@@ -6299,6 +6575,10 @@ case "${1:-}" in
   fix) run_fix ;;
   push-fix) push_fix ;;
   write-back) write_back ;;
+  # issue #232 review r2: removes the materialized credential tree from the runner BEFORE any
+  # target-controlled step (rustup honouring the target's toolchain pin, then the gate's build
+  # scripts and tests) exists to discover it through $RUNNER_TEMP.
+  purge-credentials) purge_credentials ;;
   print-selftest-suite)
     [[ $# -eq 3 ]] || die 'usage: worker-live.sh print-selftest-suite <base-manifest> <base-retirements>'
     _derive_full_selftest_suite "$SCRIPT_DIR" "$SELFTEST_MANIFEST" "$2" "$3"
@@ -6316,5 +6596,5 @@ case "${1:-}" in
     run_enrolled_selftest "$2"
     ;;
   self-test) self_test ;;
-  *) die 'usage: worker-live.sh <model|gate|bundle|verify-bundle|publish|review|fix|push-fix|write-back|print-selftest-suite|run-selftest|self-test>' ;;
+  *) die 'usage: worker-live.sh <model|gate|bundle|verify-bundle|publish|review|fix|push-fix|write-back|purge-credentials|print-selftest-suite|run-selftest|self-test>' ;;
 esac
