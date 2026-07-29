@@ -660,6 +660,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             scripts/groom-mint-alert.py
+            scripts/selftest-suite.txt
             .github/workflows/groom.yml
           sparse-checkout-cone-mode: false
 
