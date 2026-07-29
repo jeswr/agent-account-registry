@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1090,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8e1d56f1ad7830d022cf184b075d2d2e408a09a2",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 clean verdict still holds. The rewrite resolves the supplied spelling through symbolic refs and permits only the resulting full `refs/heads/` name; the validated name is then used consistently for the pre-scan, filter operation, and post-scan. Scanning fails closed on missing or malformed history and snapshots, counts structural and optional literal exposures without printing handles, and rewriting preserves canonical lease rows while removing legacy raw-identity rows and claim-message occurrences. The self-test exercises the operator CLI, real Git rewrite/filter seams, remote and symbolic-ref refusals, backup ordering, post-rewrite verification, output privacy, and positive local-branch behavior with non-vacuous expected values. The README keeps publication as an explicit maintainer force-with-lease step with quiescence and independent verification. I found no new correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
