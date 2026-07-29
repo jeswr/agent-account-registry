@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5071,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0811d9cefad711dd5487bac604ad848866c60420",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The documentation correction is accurate and internally supported. OpenAlex's official changelog states that API keys became required on 2026-02-13, and the referenced research program records that an OpenAlex key and polite-pool mailto exist while Semantic Scholar remains unavailable. The edits consistently update both access-blocker lists and the source table without changing the connector design or making unsupported implementation claims. No executable code or test behavior is affected.",
+  "verdict": "approve"
+ }
+}
