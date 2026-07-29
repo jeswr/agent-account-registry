@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4930,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d85e11c0379a37baac258df7c7fe8c55bc2070a8",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The feature is documented as reaching durable CDC history beyond the restart-losing ring, but reconstruction assumes the current ring and retained log share one generation numbering. A fresh AppState ring starts at generation 0 while an existing change log can end at generation N. base_generation(records, 0) returns 0; resolve_generation can return a historical target > 0; rewind then immediately returns Uncovered because target_generation > base_generation. Thus prior-process history is unavailable after restart, despite durability being the feature's headline distinction. Existing tests only query within one server process and cannot catch this.",
+    "file": "crates/sparq-server/src/pit.rs",
+    "fix_hint": "Define and persist a sound lineage/base mapping across restart (or retain/restore generation numbering and prove the loaded base snapshot corresponds to the log tail), then add an end-to-end test that writes commits, stops the server, starts a new AppState against the same durable store/log, and successfully queries a pre-restart instant. If restart reconstruction is intentionally unsupported, remove the durable/restart-spanning claims and state the actual limitation consistently in Cargo.toml, README, module docs, and the HTTP skill.",
+    "severity": "blocker",
+    "title": "Durable history cannot be reconstructed after the ring generation resets on restart"
+   },
+   {
+    "body": "at_accepts_an_xsd_datetime_lexical claims the lexical resolves to the same state as the equivalent nanosecond integer, but it truncates the recorded instant, adds one second, never queries the integer form, and accepts either generation 1 or 2. It therefore proves only that some dateTime lexical returns 200, not parsing/resolution equivalence or correct fractional-second handling.",
+    "file": "crates/sparq-server/tests/point_in_time.rs",
+    "fix_hint": "Format the exact recorded nanosecond timestamp as RFC 3339 with a nine-digit fractional component, query both that lexical and the integer value, and assert identical Sparq-Generation headers and result bindings.",
+    "severity": "minor",
+    "title": "The xsd:dateTime test does not test equivalence to the recorded nanosecond instant"
+   }
+  ],
+  "progress": null,
+  "summary": "The in-process rewind path is well guarded and the main end-to-end test exercises real HTTP behavior, but the advertised durable/restart-spanning capability is not implemented. The algorithm keys history by ring generation while a fresh AppState ring restarts at generation 0; after a restart, retained change-log records from the prior process have higher generation numbers, so base_generation chooses 0 and rewind refuses targets from that history as Uncovered. This contradicts the central claim that the feature extends beyond restart-losing time travel and reaches the durable log retention horizon. The suite has no restart witness. The dateTime acceptance test is also too permissive to establish its stated equivalence.",
+  "verdict": "request_changes"
+ }
+}
