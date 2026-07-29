@@ -1002,8 +1002,26 @@ class ConflictResolver:
         return None
 
     def _post(self, repo, number, body):
+        """THE ONE PLACE this program speaks under the App installation — and therefore the one
+        place the reserved-marker sanitiser has to be (registry #1096).
+
+        Every body posted here interpolates REPOSITORY-CONTROLLED text: `_handle_conflict` and
+        `escalation_body` echo raw `git diff` pathnames (git does not C-quote under `-z`, so a
+        pathname is arbitrary bytes), and those pathnames are chosen by whoever can push to the
+        branch. Unsanitised, a crafted pathname carrying `<!-- sparq-park-reason:v1 class=capacity
+        cause=partition -->` survived intact into a comment authored by the App — and
+        park_policy.park_reason_records reads EVERY App-authored comment, not only park receipts.
+        Authorship is not forgeable (a `[bot]` login is unregistrable); CONTENT was.
+
+        The neutralisation is applied to the WHOLE BODY rather than field by field, because a
+        per-field call is a defence the NEXT writer added to this file can silently skip — which is
+        exactly how this program came to lack it while its sibling worker-pr.py had it. That is
+        only sound because this program is not a `sparq-` writer at all: every durable marker it
+        mints lives in the `conflict-resolver` namespace and passes through untouched. --self-test
+        pins that (`the resolver's OWN markers survive the sanitiser`), so adding a `sparq-` marker
+        here reds rather than being silently defanged on the way out."""
         if self.apply:
-            self.api.comment(repo, number, body)
+            self.api.comment(repo, number, _park_policy.neutralize_reserved_markers(body))
 
     def _count_exit(self, exit_kind, park_label):
         """Record ONE escalation against both of its axes — which exit fired, and which class it
@@ -2668,6 +2686,89 @@ def _self_test():
           row["parked_machine"] + row["parked_human"] == row["escalated"])
          for row in exits_seen + [mixed_row, _aggregate_census(mixed_resolver.census)]],
         [(True, True)] * 4,
+    )
+
+    # (n2) [registry #1096] THE FORGED PARK-REASON RECEIPT.
+    #
+    # This program echoes RAW `git diff` pathnames into a comment authored by the App installation
+    # (`git diff -z` does not C-quote, so a pathname is arbitrary attacker-chosen bytes), and
+    # park_policy.park_reason_records reads EVERY App-authored comment — not only park receipts —
+    # to decide whether a `review:parked` label is machine-owned. Its sibling writer worker-pr.py
+    # had the reserved-marker sanitiser; this one did not. Authorship was never forgeable (a
+    # `[bot]` login is unregistrable); CONTENT was, and the consumer trusts content it did not
+    # itself write.
+    #
+    # THE MUTATION THIS MUST KILL: delete the `neutralize_reserved_markers` call in `_post` and the
+    # first two checks go red. The path is deliberately asserted to REACH the body in defanged form
+    # (`<!- sparq-`), so a sanitiser that "worked" by dropping the paths outright would red too.
+    forged_marker = _park_policy.park_reason_marker("partition")
+    hostile_path = f"src/{forged_marker}/value.py"
+    forging_api = FakeAPI([pull(90, "9" * 40)])
+
+    class ForgingRebaser:
+        """A conflict whose PATHNAME is the attack — everything else is an ordinary conflict."""
+
+        def __call__(self, _repo_name, pr, _base):
+            return RebaseResult("conflict", pr["head"]["sha"],
+                                conflicting_files=(hostile_path,))
+
+    ConflictResolver(forging_api, snapshot, claim, [repo], bot_login, True, 5,
+                     ForgingRebaser()).run()
+    forged_bodies = [row["body"] for row in forging_api.comment_rows[90]]
+    check(
+        "[#1096] a git pathname carrying a park-reason marker is NEUTRALISED in the App-authored "
+        "conflict comment — and still reaches the reader, defanged, so the guard is not the paths "
+        "being silently dropped",
+        (len(forged_bodies),
+         any(_park_policy.contains_reserved_marker(body) for body in forged_bodies),
+         any("<!- sparq-park-reason:v1" in body for body in forged_bodies)),
+        (1, False, True),
+    )
+    check(
+        "[#1096] ...so the crafted pathname classifies NO park: the consumer that reads every "
+        "App-authored comment finds no receipt",
+        _park_policy.park_reason_records(forging_api.comment_rows[90], bot_login),
+        [],
+    )
+    # THE SECOND SINK, pinned separately because it is a different call site with a different
+    # body-builder: `escalation_body` re-echoes the same paths recovered from the durable attempt
+    # comments. Both reach GitHub through `_post`, which is the whole point of putting the
+    # sanitiser there rather than at each field.
+    escalation_api = FakeAPI([pull(91, "9" * 40)])
+    ConflictResolver(escalation_api, snapshot, claim, [repo], bot_login, True, 5,
+                     FakeRebaser())._post(
+        repo, 91, escalation_body(EXIT_TWO_HEAD, (hostile_path,), 2, HUMAN_PARK_LABEL))
+    escalation_body_text = escalation_api.comment_rows[91][0]["body"]
+    check(
+        "[#1096] the ESCALATION body goes out through the same choke point and is neutralised too",
+        (_park_policy.contains_reserved_marker(escalation_body_text),
+         "<!- sparq-park-reason:v1" in escalation_body_text,
+         _park_policy.park_reason_records(escalation_api.comment_rows[91], bot_login)),
+        (False, True, []),
+    )
+    # WHY WHOLE-BODY NEUTRALISATION IS SOUND HERE, asserted rather than asserted-in-prose. `_post`
+    # defangs the entire body, which is only safe while this program mints nothing in the reserved
+    # `sparq-` namespace — every durable marker it writes lives in the `conflict-resolver` one and
+    # must survive byte-for-byte. The constant NAMES are pinned as well as their transparency, so
+    # adding a marker reds here (pointing at this reasoning) instead of being silently defanged on
+    # the way out, which is the failure mode that let the sanitiser be skipped in the first place.
+    resolver_markers = {name: value for name, value in globals().items()
+                        if name.endswith("_MARKER") and isinstance(value, str)}
+    check(
+        "[#1096] EVERY durable marker this program mints survives the sanitiser byte-for-byte — a "
+        "NEW writer in the reserved namespace cannot silently skip the choke point",
+        (sorted(resolver_markers),
+         sorted(name for name, value in resolver_markers.items()
+                if _park_policy.neutralize_reserved_markers(value) != value)),
+        (["DEPENDABOT_MARKER", "ESCALATION_MARKER", "STUCK_PARK_MARKER", "STUCK_UNPARK_MARKER"],
+         []),
+    )
+    check(
+        "[#1096] ...including the RENDERED grace-window receipts, not just the marker openers",
+        [receipt for receipt in (stuck_receipt(STUCK_PARK_MARKER, "a" * 40, 1),
+                                 stuck_receipt(STUCK_UNPARK_MARKER, "a" * 40, 1))
+         if _park_policy.neutralize_reserved_markers(receipt) != receipt],
+        [],
     )
 
     # (o) THE YAML SEAM. Every uncaught mutant in this repo's measured mutation runs lived in a

@@ -1557,6 +1557,55 @@ def park_fingerprint(head_sha, attempt_key):
     return f"{head}/{attempt}"
 
 
+# --- THE RESERVED `<!-- sparq-` NAMESPACE, and the ONE sanitiser every writer shares -----------
+#
+# [registry #1096] A parser that emits examples of its own syntax will parse them back. Every
+# durable control marker the fleet writes and later re-reads out of BOT-AUTHORED comments — the
+# review-round budget, the fix-outcome counters, the reviewed-sha binding, and the park-reason
+# receipt below — opens with this exact literal. Any program that interpolates a
+# REPOSITORY-CONTROLLED string (a git pathname, a branch ref, a model's free text) into a comment
+# it posts under the App installation can therefore MINT one of those markers on behalf of an
+# attacker: the author filter is sound (only the App token posts as `<slug>[bot]`, and a `[bot]`
+# login is unregistrable), but authorship is not what is being forged — CONTENT is, and the
+# consumers trust content they did not themselves write.
+#
+# The sanitiser lived in worker-pr.py alone (issue #137), which made it a per-writer defence that
+# a SIBLING writer could silently skip — and resolve-conflicts.py did skip it, echoing raw `git
+# diff` pathnames straight into an App-authored comment, so a crafted pathname carrying a
+# `sparq-park-reason` receipt survived intact into a comment `park_reason_records` reads. Declared
+# HERE for the same reason CONFLICT_STUCK_PARK_MARKER is: the writers are separate entry points
+# with separate checkout roots, and a hand-copied sanitiser is a defence that can drift silently
+# from the parser it is supposed to protect. One spelling, imported by every writer.
+#
+# The parsers require the exact `<!-- sparq-` opener, so DETECTION/DEFANGING is deliberately WIDER
+# than matching: case-insensitive with optional inner whitespace, so no near-miss opener can be
+# massaged back into a live marker. Naming a marker in prose (`sparq-review-round`) never trips
+# this — only the literal HTML-comment opener does.
+#
+# worker-pr.py KEEPS its own copy rather than delegating here, and that is a deliberate, bounded
+# choice rather than an oversight: it loads this module LAZILY, once per call site, so routing
+# `contains_reserved_marker` through it would either re-exec this module ~30 times per verdict
+# validation or force an eager import onto every worker-pr entry point. The duplicate is made safe
+# the only way a duplicate can be — --self-test loads worker-pr.py and asserts the two are one
+# sanitiser, by PATTERN, by FLAGS, and behaviourally over a sample set.
+RESERVED_MARKER_RE = re.compile(r"<!--\s*sparq-", re.IGNORECASE)
+
+
+def contains_reserved_marker(text):
+    """True when `text` carries the reserved `<!-- sparq-` bot-marker opener. Used to REJECT
+    model-derived free text at validation (fail closed) where defanging would silently alter a
+    field a human then reads as verbatim."""
+    return bool(RESERVED_MARKER_RE.search(str(text)))
+
+
+def neutralize_reserved_markers(text):
+    """Visibly defang the reserved `<!-- sparq-` namespace so republished repository-controlled or
+    model-derived text can never mint a durable bot marker. Breaking the opener to `<!- sparq-` is
+    sufficient (the parsers require the exact opener) and leaves the text readable to a human.
+    Reformation-safe — the replacement never re-contains the opener — and idempotent."""
+    return RESERVED_MARKER_RE.sub("<!- sparq-", str(text))
+
+
 # --- G4: the machine-readable PARK REASON marker ---------------------------------------------
 #
 # Every park exit used to record its cause in FREE PROSE only. That is why triaging the 33
@@ -1852,14 +1901,60 @@ def park_reason_marker(cause, generation=None, head=None):
     return marker + " -->"
 
 
+# [registry #1096] ANCHORED TO A WHOLE LINE. Every writer of this receipt emits it as
+# `"\n\n" + park_reason_marker(...)` — on its own line, at top level, at the end of the body — so
+# requiring the marker to BE a line costs a genuine receipt nothing. What it buys is that a marker
+# ECHOED inside some other line (`- conflict-file: "<path>"`, a list item, a quoted diff hunk) is
+# structurally not a receipt. Unanchored, ANY App-authored comment that interpolated an attacker's
+# string was a receipt-minting surface, because park_reason_records scans every App comment rather
+# than only the parks. The writer-side sanitiser is the primary defence; this is the reader-side
+# half, and it holds even for a writer that has not yet been taught to sanitise.
 _PARK_REASON_RE = re.compile(
-    re.escape(PARK_REASON_MARKER)
-    + r" class=(\S+) cause=(\S+?)(?: gen=(\S+))?(?: head=(\S+))? -->")
+    r"^" + re.escape(PARK_REASON_MARKER)
+    + r" class=(\S+) cause=(\S+?)(?: gen=(\S+))?(?: head=(\S+))? -->[ \t]*$",
+    re.MULTILINE)
+
+# Lines that OPEN or CLOSE a fenced code block, and lines that are markdown-QUOTED. Both are how a
+# comment says "this text is not mine, I am echoing it" — which is exactly the context a forged
+# receipt would arrive in, and never a context a real receipt is written in.
+_FENCE_RE = re.compile(r"^(?:```|~~~)")
+_QUOTE_RE = re.compile(r"^>")
+
+
+def strip_quoted_contexts(body):
+    """`body` with every fenced-code-block and blockquote line removed.
+
+    A receipt is a statement the bot makes in its OWN voice. Text the bot merely ECHOES — a diff
+    hunk in a fence, a maintainer's comment re-quoted with `>` — carries no authority even though
+    the App authored the comment that contains it. Dropping those lines before the receipt scan is
+    what makes "the App said it" mean "the App said it", rather than "the App printed it".
+
+    Lines are DROPPED rather than blanked in place; nothing downstream keys on line numbers, and
+    the anchored `_PARK_REASON_RE` needs the surviving lines to still be whole lines."""
+    kept = []
+    fenced = False
+    for line in str(body).splitlines():
+        if _FENCE_RE.match(line):
+            # The fence delimiters themselves are never a receipt either way, so an unterminated
+            # fence swallows the rest of the body — the fail-closed direction (a receipt after a
+            # dangling fence is unreadable, and an unreadable cause is a human question).
+            fenced = not fenced
+            continue
+        if fenced or _QUOTE_RE.match(line):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
 
 
 def parse_park_reason(body, log=print):
     """The LAST well-formed park-reason marker in `body` as
     {"class", "cause", "gen", "head"}, else None.
+
+    The marker must occupy a WHOLE LINE of the bot's own unquoted prose (`_PARK_REASON_RE` is
+    line-anchored, and `strip_quoted_contexts` removes fenced/quoted lines first): a receipt is
+    something the bot ASSERTS, not something it echoed. See registry #1096 — resolve-conflicts.py
+    interpolated raw git pathnames into an App-authored comment, so a crafted pathname could mint
+    a receipt that this parser then trusted.
 
     A marker whose `class=` DISAGREES with its cause's registered class, or whose cause is
     outside the closed taxonomy, is REJECTED (dropped with a loud log), not repaired. Repairing it
@@ -1869,7 +1964,7 @@ def parse_park_reason(body, log=print):
     if not isinstance(body, str):
         return None
     found = None
-    for match in _PARK_REASON_RE.finditer(body):
+    for match in _PARK_REASON_RE.finditer(strip_quoted_contexts(body)):
         park_class, cause, generation, head = match.groups()
         expected = park_cause_class(cause)
         if expected is None:
@@ -3979,6 +4074,78 @@ def _self_test():
     check("without a bot login NOTHING is trusted",
           park_reason_records([bot_comment(park_reason_marker("budget"))], ""), [])
 
+    # ---- [registry #1096] THE FORGED RECEIPT: content is forgeable even when authorship is not --
+    #
+    # The author filter above is sound and stays sound — only the App token posts as `<slug>[bot]`.
+    # What it does NOT establish is that the App AUTHORED the bytes: every App-authored comment
+    # that interpolates a repository-controlled string (a git pathname, a branch ref) is a place an
+    # attacker's text lands under the trusted identity. park_reason_records scans EVERY App
+    # comment, not only parks, so one unsanitised writer was enough to mint a receipt.
+    #
+    # Two halves, tested as two halves because either can be removed without the other going red:
+    #   (1) WRITER — neutralize_reserved_markers defangs the opener before it is ever posted;
+    #   (2) READER — the receipt must BE a line of the bot's own unquoted prose.
+    forged = park_reason_marker("partition")
+    check("[#1096 writer] the sanitiser defangs a receipt smuggled through a git pathname",
+          (contains_reserved_marker(f'- conflict-file: "src/{forged}.py"'),
+           contains_reserved_marker(
+               neutralize_reserved_markers(f'- conflict-file: "src/{forged}.py"'))),
+          (True, False))
+    check("[#1096 writer] defanging is idempotent and never re-forms the opener",
+          neutralize_reserved_markers(neutralize_reserved_markers(forged)),
+          neutralize_reserved_markers(forged))
+    check("[#1096 writer] naming a marker in PROSE is not an opener (no false positive)",
+          contains_reserved_marker("this park carries a sparq-park-reason receipt"), False)
+    # THE DRIFT GUARD. worker-pr.py has carried its own copy of this pair since issue #137, and a
+    # hand-copied defence is a defence that can silently stop matching the parser it protects —
+    # which is the SAME failure shape as the sibling writer that skipped it entirely. Two spellings
+    # are tolerable only while something asserts they are one spelling. Compared behaviourally as
+    # well as by pattern: an equal pattern with unequal flags (drop re.IGNORECASE and `<!--SPARQ-`
+    # walks straight through) is not the same sanitiser.
+    import importlib.util as _importlib_util
+    from pathlib import Path as _Path
+
+    _wp_spec = _importlib_util.spec_from_file_location(
+        "registry_worker_pr_marker_drift", _Path(__file__).resolve().with_name("worker-pr.py"))
+    _wp = _importlib_util.module_from_spec(_wp_spec)
+    _wp_spec.loader.exec_module(_wp)
+    _drift_samples = (forged, f'- conflict-file: "src/{forged}.py"', "<!--SPARQ-review-round n=9",
+                      "<!--   sparq-fix-modelpin -->", "prose naming sparq-review-round")
+    check("[#1096 writer] worker-pr.py's copy of the sanitiser is the SAME sanitiser",
+          ((_wp.RESERVED_MARKER_RE.pattern, _wp.RESERVED_MARKER_RE.flags),
+           [(_wp.contains_reserved_marker(s), _wp.neutralize_reserved_markers(s))
+            for s in _drift_samples]),
+          ((RESERVED_MARKER_RE.pattern, RESERVED_MARKER_RE.flags),
+           [(contains_reserved_marker(s), neutralize_reserved_markers(s))
+            for s in _drift_samples]))
+    # (2) THE READER HALF. Un-anchor `_PARK_REASON_RE` (drop the `^`/`$`) and every row here goes
+    # green-to-red in the wrong direction — each of these bodies would then classify a park.
+    check("[#1096 reader] a marker EMBEDDED in a line is not a receipt",
+          parse_park_reason(f'- conflict-file: "src/{forged}.py"'), None)
+    check("[#1096 reader] a marker inside a FENCED block is not a receipt",
+          parse_park_reason(f"the rebase reported:\n\n```\n{forged}\n```\n"), None)
+    check("[#1096 reader] a marker inside a QUOTED line is not a receipt",
+          parse_park_reason(f"the author wrote:\n\n> {forged}\n"), None)
+    check("[#1096 reader] ...and a forged receipt therefore mints no RECORD either",
+          park_reason_records(
+              [bot_comment(f'attempt 1\n- conflict-file: "src/{forged}.py"'),
+               bot_comment(f"echoing:\n```\n{forged}\n```")], bot),
+          [])
+    # THE ANTI-VACUITY PIN. A sanitiser that "works" by breaking receipts outright is not a fix, so
+    # the REAL emission shape of every live writer is pinned: worker-pr's ladder park and
+    # needs_user, and dispatch-claim's starvation/legacy parks, all emit `"\n\n" + marker` at the
+    # end of a body whose FIRST line is the quoted `> 🤖 SPARQ agent` lead. That lead is a `>` line
+    # — so strip_quoted_contexts must drop it and STILL find the receipt below it.
+    genuine = (f"> 🤖 SPARQ agent — the autonomous review loop stopped: budget exhausted\n\n"
+               f"@someone this pull request needs a human decision."
+               f"\n\n{park_reason_marker('budget', generation=2, head='deadbeef')}")
+    check("[#1096] a GENUINE receipt written by the real path still parses",
+          parse_park_reason(genuine),
+          {"class": "capacity", "cause": "budget", "gen": "2", "head": "deadbeef"})
+    check("[#1096] ...and still becomes a record on the bot's own comment",
+          [record["cause"] for record in park_reason_records([bot_comment(genuine)], bot)],
+          ["budget"])
+
     # ---- G1: legacy prose re-classification -------------------------------------------------
     budget_prose = ("> 🤖 SPARQ agent — the autonomous review loop stopped: the review round "
                     "budget is exhausted at 6 round(s) with no extension left")
@@ -4015,9 +4182,12 @@ def _self_test():
           ("marker-corrupt", PARK_CLASS_QUESTION))
     check("an unrecognised park stays put (an unreadable cause is a human question)",
           reclassify_legacy_park([bot_comment("something went wrong")], bot)[0], None)
+    # The receipt is on its OWN LINE, exactly as every writer emits it (`"\n\n" + marker`), because
+    # since #1096 that is what a receipt IS — a marker glued onto the end of a prose line is echoed
+    # text, not an assertion.
     check("a park that ALREADY carries a reason marker is not legacy",
           reclassify_legacy_park(
-              [bot_comment(budget_prose + park_reason_marker("budget"))], bot)[0], None)
+              [bot_comment(budget_prose + "\n\n" + park_reason_marker("budget"))], bot)[0], None)
     check("prose in a NON-bot comment can never classify a park",
           reclassify_legacy_park([bot_comment(budget_prose, login="drive-by")], bot)[0], None)
 
