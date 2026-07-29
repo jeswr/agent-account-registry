@@ -2136,7 +2136,7 @@ def _execute_age_unpark_actions(
     registry_api: "GitHubAPI",
     registry_repo: str,
     bot_login: str,
-) -> tuple[PhaseOutcome, int, int]:
+) -> tuple[PhaseOutcome, int, int, int]:
     """Re-admit MACHINE age-parks whose own cause has provably recovered — the exit that makes the
     class split honest.
 
@@ -2177,10 +2177,13 @@ def _execute_age_unpark_actions(
         re-admission that never happened. _label_gone proves the post-state; an unproven removal
         defers the PR instead of counting.
       - AND THE CONTRADICTION IT CANNOT FIX IS REPORTED, NOT SKIPPED. When a human-owned hold
-        makes the convergence retry permanently refuse while a grant is already on record, the PR
+        makes the convergence retry permanently refuse while a grant that is PROVABLY THE LIVE
+        LABEL'S OWN (the same recency conjunct, _grant_is_current) is already on record, the PR
         publicly claims a re-admission its labels contradict. That is ALERTed and corrected ON THE
         PR (one comment per grant fingerprint, no label write) — the log alone is a cron nobody
-        reads, which is how four sparq PRs stayed in that state for ~17 hours.
+        reads, which is how four sparq PRs stayed in that state for ~17 hours. A grant OLDER than
+        the live park is a completed re-admission plus a later, unrelated park: no contradiction,
+        and a correction there would point a human at undoing a valid park.
 
     Every failure is PER-PR: one unreadable PR never stops the rest.
 
@@ -2228,6 +2231,53 @@ def _execute_age_unpark_actions(
                 comments = _comments(api, repo, number)
                 owed, granted = age_unpark_state(comments, bot_login)
                 held = park_policy.human_owned_holds(labels)
+
+                def _grant_is_current(grant: dict[str, Any]) -> tuple[bool, str]:
+                    """Is THIS grant STRICTLY NEWER than every park application on the PR?
+
+                    A grant matching the newest park receipt proves a re-admission was once
+                    earned. It does NOT prove that the `review:parked` live RIGHT NOW is the label
+                    that grant attempted to remove: the label is a SHARED MULTI-WRITER one
+                    (dispatch-claim at two sites, worker-pr's capacity park), so a grant that
+                    completed perfectly still matches while a LATER, unrelated park stands.
+
+                    BOTH readers of that question ask it here, so they cannot drift:
+                      - the convergence retry, which would otherwise DELETE a different writer's
+                        later park off this sweep's stale grant (registry #614's recency conjunct);
+                      - the stall correction, which would otherwise tell a human that a completed
+                        re-admission is "withdrawn" and invite them to remove a park that is a
+                        distinct later decision — misleading trust-plane evidence pointing at the
+                        wrong action.
+
+                    Fail-closed in every direction: an unreadable receipt stamp, an unreadable
+                    timeline and an instant TIE all answer False, and park_applications absorbs a
+                    raising timeline into `readable=False` rather than into permission. It
+                    AUTHORISES NOTHING — the delete authorisation remains _clearable() /
+                    label_application_machine_owned, and the stall caller writes no label at all.
+                    """
+                    stamp = grant.get("at")
+                    if not park_policy.valid_timestamp(stamp):
+                        return False, ("the un-park receipt carries no readable timestamp, so it "
+                                       "cannot be proven newer than the park")
+                    # park_applications is the RIGHT api here, and is NOT the #690 misuse: #690 is
+                    # about authorising the DELETE of one specific label with evidence about three.
+                    # This asks its documented question — "when was the newest park applied" — and
+                    # a park on ANY park label refuses, the conservative direction.
+                    latest_park, _human, readable = park_policy.park_applications(
+                        repo, number, None,
+                        lambda r, n: api.paginate(f"/repos/{r}/issues/{n}/timeline"),
+                        is_human=lambda login: _is_human_maintainer(api, repo, login))
+                    if not readable:
+                        return False, ("the park application timeline could not be read, so the "
+                                       "grant cannot be proven current")
+                    if latest_park is not None and park_policy.parse_ts(stamp) <= latest_park:
+                        return False, (
+                            f"a park application at "
+                            f"{park_policy.canonical_ts(latest_park.isoformat())} is NEWER than "
+                            f"the un-park receipt at {park_policy.canonical_ts(stamp)} — this "
+                            "label is a DIFFERENT park, not the one that receipt cleared")
+                    return True, "the grant is newer than every park application"
+
                 if held:
                     print(f"age park stands {repo}#{number}: human-owned hold(s) live "
                           f"({'/'.join(held)}) — a machine never un-parks past a human decision, "
@@ -2254,7 +2304,24 @@ def _execute_age_unpark_actions(
                     # that shape would put a comment on every human-held PR the loop ever
                     # re-admitted, which is noise a maintainer learns to filter, and filtered
                     # alerts are how the next 17 hours get missed.
-                    if owed is not None and granted:
+                    #
+                    # AND THE GRANT MUST BE PROVABLY THE LIVE LABEL'S GRANT (_grant_is_current,
+                    # the same conjunct the convergence branch applies for the same reason). A
+                    # matching grant alone is a HISTORICAL fact: age-park -> recover -> grant ->
+                    # the un-park lands -> another writer parks the PR later -> a human holds it,
+                    # and every receipt still matches while nothing is contradictory at all. The
+                    # correction would then tell a human the completed re-admission is withdrawn
+                    # and point them at removing a park that is a separate, later decision. An
+                    # ALERT that names the wrong action is worse than the silence #83 replaced,
+                    # so an unproven grant is reported as the park standing and nothing else.
+                    current, why_current = (
+                        _grant_is_current(granted) if owed is not None and granted
+                        else (False, ""))
+                    if why_current and not current:
+                        print(f"age park stands {repo}#{number}: a re-admission receipt is on "
+                              f"record, but {why_current}; no stall is reported against a park "
+                              "this grant cannot be shown to have cleared")
+                    if current:
                         stalled += 1
                         print(f"ALERT PR {repo}#{number}: an automatic re-admission for "
                               f"(cause={owed['cause']}, gen={owed['gen']}) is on record, yet "
@@ -2366,29 +2433,12 @@ def _execute_age_unpark_actions(
                     # capped path handles it as the new park it is. What remains under this branch
                     # is only ever a RETRY of one already-authorised, never-effected write, so it
                     # is counted separately from grants and can never become one.
-                    stamp = granted.get("at")
-                    if not park_policy.valid_timestamp(stamp):
-                        print(f"age park stands {repo}#{number}: the un-park receipt carries no "
-                              "readable timestamp, so it cannot be proven newer than the park")
-                        continue
-                    # park_applications is the RIGHT api here, and is NOT the #690 misuse: #690 is
-                    # about authorising the DELETE of one specific label with evidence about three.
-                    # This asks its documented question — "when was the newest park applied" — and
-                    # a park on ANY park label refuses, the conservative direction. The delete
-                    # authorisation remains _clearable() / label_application_machine_owned.
-                    latest_park, _human, readable = park_policy.park_applications(
-                        repo, number, None,
-                        lambda r, n: api.paginate(f"/repos/{r}/issues/{n}/timeline"),
-                        is_human=lambda login: _is_human_maintainer(api, repo, login))
-                    if not readable:
-                        print(f"age park stands {repo}#{number}: the park application timeline "
-                              "could not be read, so the grant cannot be proven current")
-                        continue
-                    if latest_park is not None and park_policy.parse_ts(stamp) <= latest_park:
-                        print(f"age park stands {repo}#{number}: a park application at "
-                              f"{park_policy.canonical_ts(latest_park.isoformat())} is NEWER than "
-                              f"the un-park receipt at {park_policy.canonical_ts(stamp)} — this "
-                              "label is a DIFFERENT park, not the one that receipt cleared")
+                    # The delete authorisation remains _clearable() /
+                    # label_application_machine_owned; this conjunct only proves WHICH park the
+                    # live label is.
+                    current, why_current = _grant_is_current(granted)
+                    if not current:
+                        print(f"age park stands {repo}#{number}: {why_current}")
                         continue
                     if not _clearable():
                         print(f"age park stands {repo}#{number}: "
@@ -6954,6 +7004,16 @@ def _self_test() -> int:
             return {f"/repos/owner/repo/issues/{number}/timeline": [
                 _labelled("review:parked", "2026-07-26T10:00:00Z", "app[bot]")]}
 
+        class _RaisingPages(dict):
+            """A page store whose TIMELINE read fails. Every consumer of the timeline must fail
+            CLOSED on it — the park stands, and no claim is made off evidence nobody could read.
+            Defined here rather than at its first use because two call sites now need it."""
+
+            def get(self, key, default=None):
+                if key.endswith("/timeline"):
+                    raise GroomError("timeline read failed")
+                return super().get(key, default)
+
         recovered_pr = _machine_parked_pr(33, "clean", ("review:parked",))
         unpark_receipt = f"{AGE_UNPARK_MARKER} cause=merge-dirty head={33:040x} gen=1 -->"
         terminal_sweep_env["pages"] = {
@@ -7305,6 +7365,72 @@ def _self_test() -> int:
             ),
             (True, True),
         )
+        # [#83, round-1 finding] A MATCHING GRANT IS NOT PROOF THAT THE LIVE LABEL IS ITS RESIDUE.
+        # `review:parked` is a SHARED MULTI-WRITER label, so the grant must be proven STRICTLY
+        # NEWER than every park application before the state is called a stall — the same conjunct
+        # the convergence branch below already applies, and for the same reason. The reachable
+        # shape: groom age-parks, grants, and the un-park LANDS; the account later starves and
+        # worker-pr capacity-parks the PR at 12:00; a human then holds it. Every receipt still
+        # matches, yet nothing is contradictory — the re-admission completed and the live label is
+        # a separate later decision. Correcting there tells a human the completed re-admission is
+        # "withdrawn" and invites them to remove a VALID park. Drop the `_grant_is_current`
+        # conjunct from the held branch and all three of these red.
+        _held_grant = _grant_comment(
+            f"{AGE_UNPARK_MARKER} cause=merge-dirty head={37:040x} gen=1 -->",
+            at="2026-07-26T11:00:00Z")
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/37/comments": [_park_receipt_comment(1, 37), _held_grant],
+            "/repos/owner/repo/issues/37/timeline": [
+                _labelled("review:parked", "2026-07-26T10:00:00Z", "app[bot]"),
+                _labelled("review:parked", "2026-07-26T12:00:00Z", "app[bot]")],
+        }
+        later_park_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(37, "clean", ("review:parked", "needs:user"),
+                                          fresh=True),))
+        check(
+            "[#83] a LATER shared-writer park under the SAME hold is NOT this grant's residue — "
+            "no ALERT, no correction, gauge at zero, and the log says which fact is missing",
+            (
+                terminal_sweep_env["writes"],
+                "age_unpark_stalled=0" in later_park_log,
+                "ALERT PR owner/repo#37:" in later_park_log,
+                "is NEWER than the un-park receipt" in later_park_log,
+            ),
+            ([], True, False, True),
+        )
+        # The same conjunct's two AMBIGUITY directions, which must fail CLOSED (silent), not open:
+        # an unreadable timeline proves nothing about which park is live, and a grant with no
+        # readable stamp cannot be ordered against any park at all. Relax either to "assume
+        # current" and the correction fires on evidence that does not exist.
+        for _label, _pages, _needle in (
+            ("an UNREADABLE park timeline",
+             _RaisingPages({"/repos/owner/repo/issues/37/comments": [
+                 _park_receipt_comment(1, 37), _held_grant]}),
+             "could not be read"),
+            ("a grant with NO readable timestamp",
+             {"/repos/owner/repo/issues/37/comments": [
+                 _park_receipt_comment(1, 37),
+                 {"user": {"login": "app[bot]"},
+                  "body": f"{AGE_UNPARK_MARKER} cause=merge-dirty head={37:040x} gen=1 -->"}],
+              **_bot_park_timeline(37)},
+             "carries no readable timestamp"),
+        ):
+            terminal_sweep_env["pages"] = _pages
+            ambiguous_log, _e, _r = _sweep_with_refusals(
+                {}, pulls=(_machine_parked_pr(37, "clean", ("review:parked", "needs:user"),
+                                              fresh=True),))
+            check(
+                f"[#83] {_label} cannot prove the live park is this grant's residue — the "
+                "correction fails CLOSED: no ALERT, no comment, gauge at zero",
+                (
+                    terminal_sweep_env["writes"],
+                    "age_unpark_stalled=0" in ambiguous_log,
+                    "ALERT PR owner/repo#37:" in ambiguous_log,
+                    _needle in ambiguous_log,
+                ),
+                ([], True, False, True),
+            )
+
         # CONTROL, the direction that keeps every check above from passing on a stall branch that
         # fires unconditionally: the SAME hold with NO grant on record is an ordinary human-held
         # park. It must stay silent — no ALERT, no comment, gauge at zero. (The `_hold` loop above
@@ -7464,12 +7590,6 @@ def _self_test() -> int:
         # The PR body claims "unreadable timeline -> stay parked"; before this check that claim was
         # unsupported (deleting the branch left the suite green). A raising timeline read must
         # refuse, and must NOT be swallowed into a re-admission.
-        class _RaisingPages(dict):
-            def get(self, key, default=None):
-                if key.endswith("/timeline"):
-                    raise GroomError("timeline read failed")
-                return super().get(key, default)
-
         terminal_sweep_env["pages"] = _RaisingPages(
             {"/repos/owner/repo/issues/40/comments": [_park_receipt_comment(1, 40)]})
         unreadable_log, _e, _r = _sweep_with_refusals(
