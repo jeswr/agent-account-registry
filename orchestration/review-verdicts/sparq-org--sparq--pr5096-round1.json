@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5096,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "08511781fd25f0218ae1e793a771e322e5298a09",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly narrows a historical statement: it makes clear that the two advisory IDs were the synchronized set when the control landed, not a permanently current inventory, and points readers to the designated current control record. The underlying set-equality behavior and negative-test claim are unchanged. This is a complete, internally consistent documentation correction with no correctness, soundness, test-validity, or security issue.",
+  "verdict": "approve"
+ }
+}
