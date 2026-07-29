@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1145,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a73192390600aec08335ca4366e28fcb6f40af7e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nApproved. The new 135-minute M3 floor is independently pinned above the measured 91.5-minute maximum and below the former unreachable six-hour threshold, while the production behavior is exercised immediately below and above the boundary and on the real worker lane/event key. The policy parser is line-anchored, selects the maximum configured timeout, and fails closed when no assignment exists. The real-file seam binds the shipped constant to policy/repos.toml, and the workflow adds that policy file to the sparse checkout; existing exact-line sparse-checkout assertions cover the live YAML seam. The tests use independent literals and tracking inputs, so the key derivation and reachability claims are non-vacuous. No trust check, permission boundary, token handling, or action pin is weakened.",
+  "verdict": "approve"
+ }
+}
