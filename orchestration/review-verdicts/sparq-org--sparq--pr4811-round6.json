@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4811,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8ebb746bc15184ee722c07eca3078fc263dd06ec",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 6 remains correct and complete on the load-bearing invariant. The A/B driver records count and digest for every revision/configuration, compares all legs against the released/default reference, accumulates failures, and exits nonzero on divergence. Its self-test covers equal results, independent digest/count mutations, and missing fields, so the gate is non-vacuous. The shared parser driver hashes raw typed RDF components in stream order and checks repeatability within each binary. Documentation accurately limits the evidence to this corpus, labels timings non-canonical, and avoids overstating conformance or allocation-count portability. No correctness, soundness, test-validity, security, or prompt-injection issue is evident. Relative to round 5 there are still no findings, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
