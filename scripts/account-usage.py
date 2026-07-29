@@ -548,8 +548,14 @@ def persist_limits(usage_path, run=None):
     if not isinstance(usage, dict):
         print("account-usage: usage snapshot is not a map; tier-limit persistence skipped")
         return 0
-    listing = run(["gh", "issue", "list", "-R", registry_repo, "--state", "open", "--limit", "500",
-                   "--json", "number,title"],
+    # [OPUS-5] Same page bound + same truncation posture as the catalog read this lane writes back
+    # to (select-and-claim.ACCOUNT_CATALOG_LIST_LIMIT, registry #1131). The bound is IMPORTED, not
+    # re-declared: two hand-maintained copies is exactly how one lane silently keeps reading a
+    # truncated catalog after the other is fixed. Account issues are the OLDEST open issues, so a
+    # filled page silently drops precisely the records this lane exists to update.
+    catalog_limit = account_catalog.ACCOUNT_CATALOG_LIST_LIMIT
+    listing = run(["gh", "issue", "list", "-R", registry_repo, "--state", "open",
+                   "--limit", str(catalog_limit), "--json", "number,title"],
                   capture_output=True, text=True, timeout=60, check=False)
     if listing.returncode != 0:
         # PROPAGATE (issue #198): the old code swallowed a failed catalog read and still printed
@@ -561,6 +567,12 @@ def persist_limits(usage_path, run=None):
     except json.JSONDecodeError:
         print("::warning::account-usage: account catalog read unparseable; tier-limit persistence "
               "skipped")
+        return 1
+    if isinstance(issues, list) and len(issues) >= catalog_limit:
+        # A filled page cannot be proven complete; writing tier limits from a listing that may have
+        # dropped the oldest (= the account) records would silently skip exactly those accounts.
+        print("::warning::account-usage: account catalog listing filled its page bound and may be "
+              "TRUNCATED; refusing tier-limit writes")
         return 1
     failures = 0
     for issue in issues:
@@ -610,6 +622,27 @@ def main():
     # legitimately needs no token, and refusing there would degrade a healthy steady state. Today the
     # catalog is anthropic-majority by construction, so this condition is always true in production;
     # it exists so the guard cannot become a false alarm if that ever changes.
+    # [OPUS-5] EMPTY-CATALOG GATE (2026-07-29 fleet outage, registry #1131). This MUST precede the
+    # materialization proof gate below, because that gate's population is `accounts` — over an EMPTY
+    # catalog `any(...)` is False, the proof is VACUOUS, the loop emits nothing, and this script
+    # exits 0 having "measured" a fleet of zero accounts. The workflow then records
+    # `outcome=ok detail=probe-succeeded` next to an empty snapshot, usage-alert's sidecar check
+    # reads MEASURED, and dispatch's `_load_usage` collapses `{}` to None -> every `require_usage`
+    # repo holds fail-closed. That is a TOTAL fleet stall wearing a green probe.
+    #
+    # A registry with zero readable account records is never a legitimate steady state for this
+    # probe: it is a catalog read that lost the fleet (truncated listing, parse boundary dropping
+    # every record, wrong repo). Exit NONZERO so the outcome sidecar says the measurement did NOT
+    # happen and usage-alert raises the wholesale banner WITH a cause. This does not change what
+    # dispatch does — it already holds — it stops the hold from being indistinguishable from a
+    # healthy tick. No counts, no handles (locked decision 22b).
+    if not accounts:
+        print("::error::account-usage: the account catalog read yielded NO account records — "
+              "refusing to emit a usage snapshot (an empty catalog is an unread fleet, never a "
+              "measured one with no capacity)", file=sys.stderr)
+        json.dump({}, sys.stdout)
+        return 1
+
     if any(not _is_exempt_provider(account.get("provider")) for account in accounts) \
             and not _usable_secret_refs(secrets):
         # No counts, no names (locked decision 22b) — the condition, not the fleet.
@@ -1299,6 +1332,27 @@ def _self_test_ledgergate(chk):
     sub("[#639] the refusal names the condition and leaks no token/handle/count",
         [token for token in ("redacted", "ACCT01_TOKEN", "acctexempt", "1 ")
          if token in run_main(subset="empty-value")[2]], [])
+
+    # ---- [OPUS-5] EMPTY-CATALOG GATE (registry #1131, the 2026-07-29 fleet outage) ----------------
+    # The materialization proof gate above is SCOPED to `any(non-exempt account)`. Over an EMPTY
+    # catalog that population does not exist, so the proof is VACUOUS, the loop emits nothing, and
+    # pre-fix main() returned (0, {}, no ::error::). The workflow then recorded
+    # `outcome=ok detail=probe-succeeded` beside an empty snapshot, usage-alert's sidecar read
+    # MEASURED, and dispatch's `_load_usage` collapsed {} to None -> every `require_usage` repo held
+    # fail-closed for hours with nothing anywhere saying the fleet had never been read.
+    # This is the same shape as the #639 ordering defect one layer out: the guard that proves
+    # measurement happened cannot be conditioned on a population the failure ERASES.
+    empty_catalog_code, empty_catalog_snapshot, empty_catalog_err = run_main(accounts=())
+    sub("[#1131] an EMPTY account catalog exits NONZERO with an empty map and a loud cause",
+        (empty_catalog_code, empty_catalog_snapshot, "::error::" in empty_catalog_err),
+        (1, {}, True))
+    sub("[#1131] the empty-catalog refusal leaks no handle/token/count",
+        [token for token in ("acct01", "acctexempt", "ACCT01_TOKEN", "redacted", "0 accounts")
+         if token in empty_catalog_err], [])
+    # NEGATIVE CONTROL: the gate is not a blanket refusal — a populated catalog still measures and
+    # still exits 0, so this cannot pass merely by making the probe always fail.
+    sub("[#1131] a POPULATED catalog is unaffected by the empty-catalog gate",
+        (run_main()[0], sorted(run_main()[1])), (0, ["acct01", "acctexempt"]))
     # ...and that empty map is what MAKES the outage detection fire. Asserted through the real
     # consumer, so "empty map" is not merely asserted to be empty but shown to be actionable.
     alerts = _load_sibling(script_dir, "usage-alert.py", "registry_usage_alert")
