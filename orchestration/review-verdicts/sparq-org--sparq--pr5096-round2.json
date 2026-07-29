@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5096,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "08511781fd25f0218ae1e793a771e322e5298a09",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and complete. The edit accurately scopes the two advisory IDs as the set present when the control landed, explicitly states that the tolerated-advisory set can change, and directs readers to the designated current control record. It preserves the underlying set-equality guarantee and negative-test claim without introducing a correctness, soundness, test-validity, or security issue.",
+  "verdict": "approve"
+ }
+}
