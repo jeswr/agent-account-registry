@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4998,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a51ba72ec4ae044dc7cd9d67f21ae5dc1f083fe3",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete on the diff-scoped evidence. The opt-in CLI feature forwards sparq-reason/datalog without changing default builds; datalog profile dispatch is fail-closed and occurs before monotone-profile parsing. The real CLI load path parses the RDF and rules, rejects unstratifiable programs before evaluation, preserves the distinct input fact set, materializes the closure, and applies the configured store profile. The end-to-end binary tests exercise aggregation, filtering, negation as failure, closure serialization, query visibility, unsafe rules, unstratifiable rules, missing rule files, and feature-off behavior. Documentation, feature-matrix coverage, and the stratified-Datalog design record agree with the implementation. No correctness, soundness, security, hostile-instruction, or vacuous-test issue was found. With zero findings in rounds 3 and 4, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
