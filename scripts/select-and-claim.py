@@ -1158,16 +1158,49 @@ def normalize_legacy_models(account):
     return account
 
 
+# [OPUS-5] The catalog read's page bound, and the reason it needs a truncation guard at all
+# (2026-07-29 fleet outage, registry #1131). `gh issue list --limit N` returns the N NEWEST open
+# issues and exits 0 — a truncated listing is byte-for-byte indistinguishable from a complete one.
+# The account records are the OLDEST open issues in the registry (they are created once, at
+# enrolment, and never close), so they sit at the TAIL of that ordering: as the registry's open-issue
+# population grew past the bound, the account records fell out of the window one by one and then
+# entirely. `read_accounts` returned [] from a rc=0 read, `account-usage.main` measured a fleet of
+# zero accounts and exited 0 ("probe-succeeded"), the empty snapshot made `dispatch-claim._load_usage`
+# return None, and every `require_usage` repo held fail-closed — a TOTAL fleet stall presenting as a
+# healthy probe. The allocator saw the same empty pool, so every review/fix claim also read
+# "no eligible lease is free" with zero leases outstanding.
+#
+# Raising the bound alone only moves the cliff, so the bound is paired with a POSITIVE truncation
+# check: a listing that FILLS the page may be truncated, and a catalog we cannot prove complete is
+# not a catalog. Fail closed on it — the same LeaseIOError a rc!=0 read raises — rather than hand
+# every consumer a silently partial pool. This is the guard `metrics.py` and `model-health.py`
+# already apply to their own listings; the catalog read was the one that never got it.
+ACCOUNT_CATALOG_LIST_LIMIT = 2000
+
+
 def read_accounts(repo):
     """The structurally selected account catalog from open issues.
 
     Non-account issues never reach the drop boundary. Selected records are validated loudly, then
     receive the shared legacy-shape normalization, so dispatch and worker adoption see one pool.
+
+    A listing that fills the page bound cannot be proven complete and raises LeaseIOError — see
+    ACCOUNT_CATALOG_LIST_LIMIT. A partial catalog is a silent capacity loss, and an empty one stalls
+    the whole fleet; neither may be returned as if it were the fleet.
     """
-    out = _run(["gh", "issue", "list", "-R", repo, "--state", "open", "--limit", "500",
+    out = _run(["gh", "issue", "list", "-R", repo, "--state", "open",
+                "--limit", str(ACCOUNT_CATALOG_LIST_LIMIT),
                 "--json", "title,body,labels"]).stdout
+    listing = json.loads(out or "[]")
+    if isinstance(listing, list) and len(listing) >= ACCOUNT_CATALOG_LIST_LIMIT:
+        # No count of ACCOUNTS is disclosed (locked decision 22b) — only that the ISSUE listing
+        # filled its page, which is a property of the public issue tracker.
+        raise LeaseIOError(
+            "registry account catalog read may be TRUNCATED: the open-issue listing filled its "
+            f"{ACCOUNT_CATALOG_LIST_LIMIT}-row page bound, so the catalog cannot be proven "
+            "complete (raise ACCOUNT_CATALOG_LIST_LIMIT or reduce the open-issue population)")
     accounts = []
-    for it in select_account_issues(json.loads(out or "[]")):
+    for it in select_account_issues(listing):
         a = _parse_account(it.get("body"))
         a["handle"] = it["title"].strip()
         a["available"] = "status:available" in _issue_label_names(it)
@@ -1738,6 +1771,66 @@ def _self_test():
     check("provider/harness mismatch warning names handle, value and expectation",
           "dropping account 'acct08': harness 'codex' does not match provider 'anthropic' "
           "(expected 'claude')" in boundary_log.getvalue(), True)
+
+    # ---- [OPUS-5] catalog-read TRUNCATION guard (registry #1131, the 2026-07-29 fleet outage) ----
+    # `gh issue list --limit N` returns the N NEWEST open issues and EXITS 0, so a truncated listing
+    # is indistinguishable from a complete one. Account records are the OLDEST open issues in the
+    # registry — created once at enrolment, never closed — so a filled page drops precisely them.
+    # Measured on the live registry that night: 515 open issues, all 10 account records at
+    # created-desc positions 503..514, `--limit 500` selected ZERO of them. read_accounts returned []
+    # from a rc=0 read; account-usage exited 0 having measured nothing; every `require_usage` repo
+    # held fail-closed and every review/fix claim read "no eligible lease is free" against an empty
+    # pool. The bound alone only moves the cliff, so a page we cannot prove complete FAILS CLOSED.
+    truncation_row = {
+        "title": "healthy-anthropic",
+        "body": "provider: anthropic\nharness: claude\nmodels: [fable]\n"
+                "credential_format: claude-credentials-json\nsecret_ref: ANTHROPIC_TOKEN",
+        "labels": [{"name": "status:available"}]}
+    truncation_filler = {"title": "ordinary work item", "body": "no account metadata here",
+                         "labels": [{"name": "role:ci"}]}
+
+    def _catalog_read(rows):
+        """(raised_LeaseIOError, handles) from a REAL read_accounts over a stubbed listing."""
+        globals()["_run"] = lambda args: SimpleNamespace(stdout=json.dumps(rows))
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                return False, [account["handle"] for account in read_accounts("o/r")]
+        except LeaseIOError:
+            return True, []
+        finally:
+            globals()["_run"] = real_run_fn
+
+    # A page that FILLS the bound may have dropped the account records: refuse it. Deleting the
+    # guard makes this row read (False, []) — the exact silent-empty-catalog shape of the outage.
+    check("a catalog listing that FILLS its page bound fails closed, never returns partial",
+          _catalog_read([truncation_filler] * ACCOUNT_CATALOG_LIST_LIMIT), (True, []))
+    # ...and it must refuse even when the truncated page happens to still contain SOME accounts:
+    # a partial catalog is silent capacity loss, which is how this outage began before it completed.
+    check("a FILLED page still refuses when it carries some accounts (partial is not complete)",
+          _catalog_read([truncation_row]
+                        + [truncation_filler] * (ACCOUNT_CATALOG_LIST_LIMIT - 1)), (True, []))
+    # NEGATIVE CONTROL: one row short of the bound is provably complete and must parse normally —
+    # the guard must not convert every large-but-complete registry into a fleet outage of its own.
+    check("a page one row SHORT of the bound is complete and still yields the catalog",
+          _catalog_read([truncation_row]
+                        + [truncation_filler] * (ACCOUNT_CATALOG_LIST_LIMIT - 2)),
+          (False, ["healthy-anthropic"]))
+    # The refusal message must not disclose how many ACCOUNTS exist (locked decision 22b); the page
+    # bound and the fact the page filled are properties of the PUBLIC issue tracker.
+    globals()["_run"] = lambda args: SimpleNamespace(
+        stdout=json.dumps([truncation_row] * ACCOUNT_CATALOG_LIST_LIMIT))
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            read_accounts("o/r")
+        truncation_message = ""
+    except LeaseIOError as exc:
+        truncation_message = str(exc)
+    finally:
+        globals()["_run"] = real_run_fn
+    check("the truncation refusal names the condition and discloses no account count",
+          ("TRUNCATED" in truncation_message,
+           [t for t in ("healthy-anthropic", "ANTHROPIC_TOKEN") if t in truncation_message]),
+          (True, []))
 
     # ---- structural account-issue selection (issue #521 escalation tripwires) ----
     # A broad issue listing is expected: audit/work items live beside account records. Only the
