@@ -945,40 +945,94 @@ def _test_live_path(chk):
         ))[0], "hold")
 
     # The workflow output contract, written the way GitHub reads it.
+    #
+    # THESE ROWS DRIVE THE REAL `main()`, SO THEIR OUTPUT MUST NOT ESCAPE THIS FUNCTION. The
+    # workflow runs `--self-test` and the live floor in the SAME step (dispatch.yml), so anything
+    # `main()` prints here lands in the job log, and a `::warning::` line lands in the Actions
+    # ANNOTATIONS API, where a fixture is indistinguishable from a live deferral. That is not
+    # hypothetical: the `x-ratelimit-remaining=12/5000` below was read off the annotations feed as
+    # a live budget outage on 2026-07-29 and cost two separate wrong diagnoses — one of them
+    # #1240, which was filed against `resets at unknown` when the LIVE responses carry
+    # `x-ratelimit-reset` perfectly well (the fixture simply omits it).
+    #
+    # So stdout is CAPTURED and `GITHUB_STEP_SUMMARY` is redirected alongside `GITHUB_OUTPUT`.
+    # Capturing alone would only hide the evidence, so each row now ASSERTS on what it captured:
+    # the fixture output stays inside the test AND is checked, rather than escaping unchecked.
+    import contextlib
+    import io
     import tempfile
-    for label, anchor, budget, want in (
-            ("hold", 60, healthy, "proceed=false\n"),
-            ("run", 4000, healthy, "proceed=true\n"),
-            # Past the wall-clock floor, but the shared bucket is empty: the gate, not the clock,
-            # is what refuses. Delete the call site in main() and this row reds.
-            ("budget-deferred", 4000, {"x-ratelimit-remaining": "12", "x-ratelimit-limit": "5000"},
-             "proceed=false\n")):
-        with tempfile.NamedTemporaryFile("w+", suffix=".txt", delete=False) as handle:
-            out_path = handle.name
-        env_backup = {k: os.environ.get(k) for k in ("GITHUB_OUTPUT", "REGISTRY_REPO")}
-        try:
-            os.environ["GITHUB_OUTPUT"] = out_path
-            os.environ["REGISTRY_REPO"] = "o/r"
-            stamp = datetime.fromtimestamp(_now() - anchor, tz=timezone.utc).strftime(
-                "%Y-%m-%dT%H:%M:%SZ")
-            saved = globals()["_gh_response"]
-            globals()["_gh_response"] = lambda *a, _b=budget, _s=stamp, **k: (
-                {"artifacts": [{"name": TICK_MARKER_ARTIFACT, "created_at": _s}]}, _b)
+    rows = (
+        ("hold", 60, healthy, "proceed=false\n", "tick-floor: HOLD", ""),
+        ("run", 4000, healthy, "proceed=true\n", "tick-floor: budget ok", ""),
+        # Past the wall-clock floor, but the shared bucket is empty: the gate, not the clock,
+        # is what refuses. Delete the call site in main() and this row reds.
+        ("budget-deferred", 4000, {"x-ratelimit-remaining": "12", "x-ratelimit-limit": "5000"},
+         "proceed=false\n", "::warning::tick-floor: DEFER (budget)",
+         "- `tick-floor` DEFER budget:"),
+    )
+    # THE OUTER SENTINEL. Every row drives the real `main()` under its OWN redirect; this one
+    # catches whatever a missing inner redirect would let through. Delete an inner redirect and
+    # the last assertion in this function goes red, so the containment is tested, not just
+    # performed. `chk` is called after the block closes, so its own output is never swallowed.
+    leaked = io.StringIO()
+    results = []
+    with contextlib.redirect_stdout(leaked):
+        for label, anchor, budget, want, want_out, want_record in rows:
+            with tempfile.NamedTemporaryFile("w+", suffix=".txt", delete=False) as handle:
+                out_path = handle.name
+            with tempfile.NamedTemporaryFile("w+", suffix=".md", delete=False) as handle:
+                summary_path = handle.name
+            env_backup = {k: os.environ.get(k)
+                          for k in ("GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY", "REGISTRY_REPO")}
+            captured = io.StringIO()
             try:
-                code = main()
+                os.environ["GITHUB_OUTPUT"] = out_path
+                # Without this the fixture deferral appends to the RUN's real job summary — the
+                # very surface #1208 made deferred ticks countable on — so every tick would
+                # record a deferral it never took.
+                os.environ["GITHUB_STEP_SUMMARY"] = summary_path
+                os.environ["REGISTRY_REPO"] = "o/r"
+                stamp = datetime.fromtimestamp(_now() - anchor, tz=timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ")
+                saved = globals()["_gh_response"]
+                globals()["_gh_response"] = lambda *a, _b=budget, _s=stamp, **k: (
+                    {"artifacts": [{"name": TICK_MARKER_ARTIFACT, "created_at": _s}]}, _b)
+                try:
+                    with contextlib.redirect_stdout(captured):
+                        code = main()
+                finally:
+                    globals()["_gh_response"] = saved
+                with open(out_path, encoding="utf-8") as handle:
+                    written = handle.read()
+                with open(summary_path, encoding="utf-8") as handle:
+                    recorded = handle.read()
             finally:
-                globals()["_gh_response"] = saved
-            with open(out_path, encoding="utf-8") as handle:
-                written = handle.read()
-        finally:
-            for key, value in env_backup.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
-            os.unlink(out_path)
+                for key, value in env_backup.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                os.unlink(out_path)
+                os.unlink(summary_path)
+            results.append((label, want, want_out, want_record, code, written,
+                            captured.getvalue(), recorded))
+
+    for label, want, want_out, want_record, code, written, said, recorded in results:
         chk(f"live: a {label} tick exits 0 and writes {want.strip()!r}", (code, written),
             (0, want))
+        # The captured output is ASSERTED, not merely swallowed — a redirect that hid a silent
+        # `main()` would otherwise turn this whole block green for the wrong reason.
+        chk(f"live: ... and a {label} tick still SAYS so ({want_out!r}), into the capture rather "
+            "than into the live job's log and annotations", want_out in said, True)
+        # `_record` stays under test, but writes to the FIXTURE summary. Only the deferral records.
+        chk(f"live: ... and a {label} tick records {want_record or '(nothing)'!r} to the FIXTURE "
+            "step summary, never the run's own",
+            recorded[:len(want_record)] if want_record else recorded, want_record)
+
+    chk("live: driving main() through the fixture rows emits NOTHING on this process's own stdout "
+        "— the workflow runs `--self-test` in the SAME step as the live floor, so a leaked "
+        "`::warning::` becomes an annotation indistinguishable from a real budget deferral (#1240)",
+        leaked.getvalue(), "")
 
 
 def _test_workflow_seam(chk):
