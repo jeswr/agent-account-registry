@@ -24,7 +24,30 @@ name: pr-gate
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # `edited` and `converted_to_draft` are here for the advisory step below (#1115), and only for
+    # it: the two facts that step diagnoses — the closing references in the TITLE/BODY, and
+    # DRAFTNESS — are the only inputs to this job that change without the head sha changing, so
+    # without these two activity types the note is delivered once at `opened` and then goes stale
+    # against the very edit it asks the author to make. Concretely: a pull that opens with one
+    # valid reference and later edits it away, or adds a second, is never warned; a ready pull
+    # converted BACK to a draft never gets the draft explanation (`ready_for_review` only covers
+    # the other direction); and an author who repairs a warned body gets no clean run to confirm
+    # it, leaving the warning as the last word.
+    #
+    # THE COST, STATED. Each added type is a full `gate` run at an UNCHANGED head, so this trades
+    # runner time for the advisory being true whenever it is displayed. It is bounded: nothing in
+    # this repository edits a pull body or title in code (the lanes write COMMENTS and LABELS), and
+    # `converted_to_draft` fires on the arm lane's fail-closed `gh pr ready --undo` restore, which
+    # is per-arm-failure, not per-tick. NOT a correctness change either way — `gate` is required and
+    # sha-bound, so an extra run at the same head can only re-derive the same verdict, and the
+    # concurrency group below already resolves the ready/undo churn pair the same way it resolves a
+    # push burst (cancel the older run; `_live_repair_gate` is newest-run-wins, so a cancelled twin
+    # cannot decide a head whose real run is newer).
+    #
+    # Membership is PINNED by `pr-body-ref.py --self-test`'s workflow-seam assertion, as an exact
+    # set: dropping either of these two silently restores the stale-advisory hole, and adding a
+    # type nobody argued for is equally a change to what this required gate runs on.
+    types: [opened, synchronize, reopened, ready_for_review, edited, converted_to_draft]
 
 permissions:
   contents: read
@@ -81,6 +104,44 @@ jobs:
           REQ
           python3 -m pip install --disable-pip-version-check --require-hashes \
             --only-binary=:all: -r "$RUNNER_TEMP/gate-requirements.txt"
+
+      - name: Advisory — can the review lane enumerate this pull? (ANNOTATION ONLY, never blocking)
+        # [issue #1115] The ONE step in this REQUIRED job that must not be able to fail it, and the
+        # only one carrying `continue-on-error`. Two INDEPENDENT controls, because they fail in
+        # different places: the script returns 0 on every RUNTIME path (asserted by its own
+        # --self-test, which drives the entry point over an unreadable event path and an unparseable
+        # policy), and this key covers what that cannot — an IMPORT-time failure in one of the four
+        # sibling modules the script loads, which would otherwise red the gate for every pull in the
+        # repository before `main()` is ever reached. Same shape as worker.yml's annotation-only
+        # steps; NOT the shape dispatch.yml forbids, which is about a step that decides something.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # Measured with #937 merged: of the 17 live orchestrator-class open pulls, 8 refuse
+          # `no-issue-reference` and 6 are drafts — the lane admits 1, and that one is #937 itself.
+          # Both are one-edit-recoverable refusals that nothing ever told the author about, so the
+          # note is delivered here, on the pull, while it is being written
+          # (research/657-orchestrator-provenance-minting.md §10).
+          #
+          # Placed AFTER the PyYAML install and BEFORE the network-bound actionlint fetch: it needs
+          # the author to get the note even when the gate reds later for an unrelated reason, and
+          # its sibling imports must not be the first thing in the job to touch a missing dep.
+          #
+          # It warns only where auto-mint-provenance is GUARANTEED to refuse (see the soundness
+          # argument in the script header) — no false alarms — and it grants, admits and writes
+          # nothing; auto-mint-provenance stays the sole authority.
+          #
+          # The payload is read from $GITHUB_EVENT_PATH BY THE SCRIPT, so no GitHub expression
+          # interpolation of the attacker-controlled PR title/body reaches this shell at all — the
+          # two values below are runner-set environment variables, not workflow expressions. (This
+          # comment deliberately spells no empty expression literal: `run:` bodies are expanded
+          # before the shell sees them, comments included, and a REQUIRED gate is the wrong place to
+          # rely on the parser tolerating one.) No author text is ever echoed
+          # into the annotation stream (which is a control channel — a body carrying `::error::`
+          # would otherwise forge a gate failure). No network call and no `gh`: the check reads the
+          # raw title and body with the reader's own imported grammar and nothing else.
+          python3 scripts/pr-body-ref.py check \
+            --event-path "$GITHUB_EVENT_PATH" --repo "$GITHUB_REPOSITORY"
 
       - name: Install actionlint (pinned release, sha256-verified)
         run: |
