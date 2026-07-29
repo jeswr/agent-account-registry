@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1172,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "477288ed23531f9a994c3a3c007b85e73733a7c4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly removes the duplicated `gh` token from all three watchdog read builders and adds a single shared fail-loud guard at the retry layer. The guard runs before subprocess execution, while the shell read entry point reports a precise usage refusal. The tests are non-vacuous: they exercise the real production read seam beneath `gh_retry`, assert the exact executed argv, validate distinct endpoints and parsed results, verify downstream census delivery, and pair the static reader scan with a positive write-path control. The write seam remains unchanged, and no trust check, permission boundary, token handling, or retry-scope rule is weakened.",
+  "verdict": "approve"
+ }
+}
