@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1187,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ff0b899b95bdf6a458515490bca1218c8c9e76cd",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe gate now reads the separately pinned extracted-binary digest, validates the extracted actionlint binary before publishing its directory through GITHUB_PATH, and remains fail-closed on a missing, duplicate, malformed, or mismatched pin. The accompanying self-test pins the relevant workflow tail as an exact ordered block and includes non-vacuous deletion, conditional-inertness, ordering, and absent-file mutants. I found no correctness, soundness, test-validity, or security defect in the diff.",
+  "verdict": "approve"
+ }
+}
