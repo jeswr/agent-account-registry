@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1161,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "890eb1c275b3a0ee21ef1955f6f817762be491ce",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Removing `WORKER_CREDENTIAL_PATH` and the isolated `HOME` from `$GITHUB_ENV` does not prevent the later gate from reading the credential. `worker-prep.sh` materializes it below `${{ runner.temp }}/registry-worker/home`, the workflow leaves that tree in place through `Run policy-selected local gate`, and GitHub supplies `RUNNER_TEMP` to every step. Cargo build scripts/tests run as the same host user, so hostile target code can enumerate `$RUNNER_TEMP/registry-worker` and read the mode-600 file. The same ordering exists in `review-fix.yml`. The new `_workflow_steps_referencing` assertions prove only that the output expression was not explicitly routed; they do not test whether the credential is reachable through the filesystem. This contradicts README's claim that the policy gate never inherits a pointer and that there is no exposure window.",
+    "file": ".github/workflows/worker.yml",
+    "fix_hint": "Before any target-controlled toolchain or gate step, remove the materialized credential/home tree in a fail-closed host step and assert that cleanup is ordered and mandatory in both workflows. Alternatively run the gate in an isolation boundary that cannot read the worker tree. Add a non-vacuous contract test that demonstrates a gate-shaped process cannot resolve or read the credential via `RUNNER_TEMP`, not merely that its step text lacks `steps.prepare.outputs.credential_path`.",
+    "severity": "major",
+    "title": "Target-controlled gate can still discover the credential through RUNNER_TEMP"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe step-output refactor removes the direct job-wide credential variables, but it does not establish the advertised security boundary. Both live jobs leave the mode-600 credential under the deterministic `${RUNNER_TEMP}/registry-worker/home` tree when the target-controlled gate runs. GitHub's default `RUNNER_TEMP` remains available to target build scripts, which execute as the same runner user, so hostile code can discover and read the credential without `WORKER_CREDENTIAL_PATH` or the rewritten `HOME`. The new routing tests only scan workflow expressions and therefore cannot detect this residual filesystem exposure. Because round 1 recorded no findings and this round identifies a major issue, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
