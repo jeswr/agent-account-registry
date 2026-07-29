@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5132,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a2dab001b6312ef6b675dd75c30ab0a3ac578eba",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`hold_ownership` accepts a matching `class=...` comment from every actor recognized as a bot. The surrounding claim says the signal represents the orchestrator's intent, but `_is_bot_actor` only establishes that the commenter is some bot. An unrelated review/app bot can post or quote a `class=` token within the symmetric 300-second window and convert a genuinely human-applied hold to `machine`, causing `classify_pr` to ignore the terminal human hold. This is especially unsafe because comment bodies are untrusted and the regex is intentionally broad. The tests only prove that a human-authored marker is rejected; they do not exercise a non-orchestrator bot.",
+    "file": "scripts/review_lane_alarm.py",
+    "fix_hint": "Authenticate the receipt source, for example by requiring the exact allowlisted orchestrator bot login/app identity that emits park receipts (and preferably a receipt format tied to the PR/operation), rather than accepting any Bot actor. Add a test where an unrelated bot posts `class=capacity` inside the window and assert the hold remains human-owned.",
+    "severity": "major",
+    "title": "Any bot comment can revoke a genuine human hold"
+   }
+  ],
+  "progress": null,
+  "summary": "The event-based bot-actor path is coherent, but the credential-drift fallback does not authenticate the receipt as coming from the orchestrator. Any GitHub Bot account commenting text containing a broad `class=<token>` marker within five minutes of a genuinely human-applied hold causes that hold to be classified as machine-owned and removes its exemption. That can produce a false alarm against an actual human decision. The added tests cover human quotation but not unrelated or adversarial bot comments. The focused unittest module could not execute in this checkout because the `yaml` dependency is unavailable.",
+  "verdict": "request_changes"
+ }
+}
