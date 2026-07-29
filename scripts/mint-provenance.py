@@ -790,13 +790,18 @@ def census_verdict(repo, pull, open_issues, enrolled_authors, routing, stamp, sa
                    recorded=(), impl_alias=DEFAULT_IMPL_ALIAS, allow_global_partition=False,
                    attestation_class, orchestrator_class, plan_package, global_package,
                    account_hash, json_type_exact, enumerate_review_items, now, hold_labels=(),
-                   park_label=None):
+                   park_label=None, identity_admits):
     """ONE disjoint census verdict for ONE open PR: `(verdict, detail)`.
 
     Every branch is decided by the PRODUCTION functions this file already ships — `pr_mint_refusal`
     for the shape, `mint_decision` for the binding, `delivery_refusal` for whether the lane would
-    act. The census therefore cannot drift from what a real `--apply` would do: to change the
-    census you have to change the mint."""
+    act, `review_run_refusal` for whether a reviewer would ever start. The census therefore cannot
+    drift from what a real `--apply` would do: to change the census you have to change the mint.
+
+    `identity_admits` is keyword-only and REQUIRED — no default — precisely because this is the
+    conjunct a census would otherwise be able to omit and go on reporting MINTABLE for a PR that
+    `mint()` refuses. That divergence is the defect this docstring's last sentence promises cannot
+    happen, so the parameter is made impossible to forget rather than merely documented."""
     number = pull.get("number") if isinstance(pull, dict) else None
     shape_error = pr_mint_refusal(repo, pull, enrolled_authors)
     if shape_error:
@@ -827,6 +832,13 @@ def census_verdict(repo, pull, open_issues, enrolled_authors, routing, stamp, sa
             # Keep looking: a SECOND candidate issue can be live where the first is not, and
             # returning the first dead binding would under-report the population.
             dead = dead or (CENSUS_DEAD, f"issue #{candidate} binds, but {delivery}")
+            continue
+        # ...and the THIRD last mile, asked AFTER the binding so the row still tells the operator
+        # which issue bound. A class-global refusal reported as MINTABLE would be the census
+        # drifting from the mint — the one thing this function's contract forbids.
+        run_error = review_run_refusal(identity_admits)
+        if run_error:
+            dead = dead or (CENSUS_DEAD, f"issue #{candidate} binds, but {run_error}")
             continue
         return CENSUS_MINTABLE, f"mint with --issue {candidate}"
     if dead:
@@ -921,7 +933,8 @@ def census(repo, registry_repo, routing, enrolled_authors, *, impl_alias=DEFAULT
             account_hash=worker_pr.account_hash, json_type_exact=worker_pr._json_type_exact,
             enumerate_review_items=dispatch_claim.enumerate_review_items, now=time.time(),
             hold_labels=dispatch_claim.HUMAN_HOLD_PR_LABELS,
-            park_label=dispatch_claim.MACHINE_PARK_PR_LABEL)
+            park_label=dispatch_claim.MACHINE_PARK_PR_LABEL,
+            identity_admits=dispatch_claim.review_fix_identity_admits_orchestrator_class)
         tally[verdict] += 1
         out.append((pull.get("number"), verdict, detail))
         log(f"census {repo}#{pull.get('number')}: {verdict} — {detail}")
@@ -1547,15 +1560,30 @@ def _self_test():                                                       # noqa: 
     census_issues = [issue(), {"number": 8, "state": "open", "pull_request": {"url": "x"},
                                "labels": []}]
 
+    # The census consults the SAME third last mile `mint()` does, so with the live identity gate
+    # every enrollable row reads MINTABLE-BUT-DEAD. That is the truth, and it is asserted by its
+    # own row below; the rows about the OTHER census branches inject an admitting gate so each
+    # keeps testing the branch it names instead of passing for this one reason.
+    class _AdmittingClaim:
+        def __getattr__(self, name):                     # delegate everything else, unchanged
+            return getattr(dispatch_claim, name)
+
+        @staticmethod
+        def review_fix_identity_admits_orchestrator_class(*_a, **_k):
+            return True
+
+    census_modules = (worker_pr, _AdmittingClaim(), lease_schema)
+
     def run_census(*, env=None, pulls=None, issues=None, recorded=frozenset({46}),
-                   authors=None):
+                   authors=None, census_mods=None):
         rows = []
         result = census(
             repo, "reg/istry", routing, enrolled if authors is None else authors,
             env=good_env if env is None else env,
             read_pulls=lambda: census_pulls if pulls is None else pulls,
             read_issues=lambda: census_issues if issues is None else issues,
-            read_recorded=lambda: recorded, modules=modules, log=rows.append)
+            read_recorded=lambda: recorded,
+            modules=census_mods or census_modules, log=rows.append)
         return result, rows
 
     verdicts, lines = run_census()
@@ -1618,8 +1646,20 @@ def _self_test():                                                       # noqa: 
                          account_hash=worker_pr.account_hash,
                          json_type_exact=worker_pr._json_type_exact,
                          enumerate_review_items=dispatch_claim.enumerate_review_items,
-                         now=1_800_000_000)[0],
+                         now=1_800_000_000, identity_admits=lambda: True)[0],
           CENSUS_NO_ISSUE)
+    # THE CENSUS CANNOT DRIFT FROM THE MINT. With the LIVE identity gate — no injection — the row
+    # that reads MINTABLE above becomes MINTABLE-BUT-DEAD, and says why. A census still offering
+    # `mint with --issue <n>` for a PR `mint()` refuses is the exact divergence census_verdict's
+    # contract forbids, and this is the row that measures it.
+    _live_verdicts, _live_lines = run_census(census_mods=modules)
+    check("with the LIVE identity gate the census reports the class DEAD, not MINTABLE",
+          [row[1] for row in _live_verdicts if row[0] == 41], [CENSUS_DEAD])
+    check("...and the row names the gate that refuses, and the issue that did bind",
+          all(needle in next(line for line in _live_lines if line.startswith("census o/r#41:"))
+              for needle in ("target-App identity gate", "issue #7 binds")), True)
+    check("...so no census line offers a mint the writer would refuse",
+          any("mint with --issue" in line for line in _live_lines), False)
     # The census must never print a hash — it is the ONE surface that walks the whole population,
     # and the record's privacy decision (22a) is that a login's hash is only ever written, never
     # reported alongside anything that identifies it.
