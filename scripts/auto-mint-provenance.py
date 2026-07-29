@@ -1653,6 +1653,20 @@ def _oracle_own_output_documents():
     return documents
 
 
+def hand_written_residue_claims(doc):
+    """The hand-written residue claims in `doc` — a COUNT of rows, or a corpus row restated by name.
+
+    A NAMED PREDICATE, not an inline expression, because a guard that has never fired on a known
+    positive cannot be told apart from one that cannot fire. --self-test runs it on a string that
+    DOES contain both shapes before trusting it on the real docstring. That is not hypothetical: the
+    inline version of this guard SURVIVED a mutant that disabled it, because the docstring it
+    pointed at was already clean."""
+    counts = [match.group(0) for match in re.finditer(r"\b\d+ (?:corpus )?rows?\b", doc or "")]
+    labels = [label for label, _t, _b, _e in RENDERED_ORACLE_CORPUS
+              if len(label) > 15 and label in (doc or "")]
+    return sorted(counts) + sorted(labels)
+
+
 def corpus_directions(oracle, render):
     """DERIVE, do not assert: each corpus row's actual direction, computed from the live-rendered
     oracle and this file's real derivation.
@@ -1849,6 +1863,20 @@ def _self_test():                                                       # noqa: 
         "agree": [], "missed-mint": [], "SPURIOUS-MINT": [("RAISED", directions)]}
     # THE ONE CLAIM THAT IS A CLAIM, and it is GitHub's, not this file's: nothing binds that GitHub
     # declined to resolve. Asserted as the LIST, so a failure names the shape.
+    # THE DETECTOR IS VALIDATED BEFORE IT IS TRUSTED. `SPURIOUS-MINT == []` is the headline claim of
+    # this whole file, and a detector that has never produced a non-empty answer is worth nothing —
+    # MEASURED: deleting the branch that records the direction SURVIVED a green suite, because on a
+    # correct corpus the list is empty either way. So it is first run against a corpus whose oracle
+    # column has been forced to "GitHub resolved NOTHING", where every binding row must be reported.
+    blind_oracle = dict(oracle, github_linkified={label: False
+                                                  for label in oracle["github_linkified"]})
+    blind = total(lambda: corpus_directions(blind_oracle, frozen))
+    check("INSTRUMENT — the spurious-mint detector really fires: against an oracle that resolved "
+          "NOTHING, every binding row is reported",
+          len(blind["SPURIOUS-MINT"]) if isinstance(blind, dict) else blind,
+          sum(1 for _l, _t, _b, expect in RENDERED_ORACLE_CORPUS if expect))
+    check("...and reports nothing as agreeing-and-bound in that world",
+          [label for label in (blind["missed-mint"] if isinstance(blind, dict) else [])], [])
     check("SAFETY — no shape binds a reference GitHub emitted no anchor for",
           directions["SPURIOUS-MINT"], [])
     # ...and the residue, compared against the GENERATED artefact. Both sides are machine-produced:
@@ -1861,6 +1889,14 @@ def _self_test():                                                       # noqa: 
     check("...and so does the agreeing set, so a row cannot move between them unobserved",
           directions["agree"], stored.get("agree"))
     check("...and the artefact records no spurious mint either", stored.get("SPURIOUS-MINT"), [])
+    # A ROW THAT RAISES IS A REFUSAL, NOT A BIND. `corpus_directions` swallows the raise, and which
+    # way it resolves it decides whether an unclassifiable body would be reported as agreeing. Fed a
+    # renderer that raises for everything, no row may be counted as binding.
+    exploding = total(lambda: corpus_directions(
+        oracle, lambda _text: (_ for _ in ()).throw(RenderUnavailable("down"))))
+    check("...and a row whose render RAISES is counted as a refusal, never as a bind",
+          (exploding["SPURIOUS-MINT"], len(exploding["agree"]) > 0)
+          if isinstance(exploding, dict) else exploding, ([], True))
     # NON-VACUITY, in both directions, so the comparison above is over a table that says something.
     check("...over a corpus that really holds rows GitHub renders as CODE",
           sum(1 for label in oracle["github_linkified"]
@@ -1872,13 +1908,18 @@ def _self_test():                                                       # noqa: 
     # from the corpus, it does not belong in prose that a reader will trust. These two rows are the
     # mechanical enforcement of that, aimed at exactly the two things that went wrong five times: a
     # hand-written COUNT, and a hand-written LIST of shapes.
-    limits_doc = rendered_prose.__doc__ or ""
-    check("the docstring states no hand-written residue COUNT",
-          sorted(match.group(0)
-                 for match in re.finditer(r"\b\d+ (?:corpus )?rows?\b", limits_doc)), [])
-    check("...and restates no corpus row by label",
-          sorted(label for label, _t, _b, _e in RENDERED_ORACLE_CORPUS
-                 if len(label) > 15 and label in limits_doc), [])
+    # THE GUARD IS VALIDATED ON A KNOWN POSITIVE FIRST. A guard that has never fired cannot be told
+    # apart from one that cannot fire — MEASURED: the inline version of this check SURVIVED a mutant
+    # that disabled it, because the docstring it pointed at was already clean, so the row was
+    # vacuous. My own control, and it was the failure it exists to catch.
+    planted = ("...and there are 24 rows where GitHub resolves it, including "
+               + next(label for label, _t, _b, _e in RENDERED_ORACLE_CORPUS if len(label) > 15))
+    check("INSTRUMENT — the hand-written-claim guard fires on a planted COUNT and a planted LABEL",
+          len(hand_written_residue_claims(planted)), 2)
+    check("...and stays silent on prose that states neither",
+          hand_written_residue_claims("This paragraph states no counts and names no shapes."), [])
+    check("the HONEST LIMITS docstring makes no hand-written residue claim",
+          hand_written_residue_claims(rendered_prose.__doc__), [])
 
     # ---- THE SEVEN SHAPES THAT MINTED AT THE PREVIOUS HEAD ------------------------------------
     # Each was driven end to end into the real `mint_provenance.mint()` by an independent review and
@@ -2113,6 +2154,28 @@ def _self_test():                                                       # noqa: 
     foreign = refs("t", "Closes #7", lambda _t: (
         '<p>Closes #7 (see <a class="issue-link" '
         'href="https://github.com/other/repo/issues/7">other/repo#7</a>)</p>'))
+    # THE ANCHOR MUST BE FOR THIS NUMBER, not merely overlap the occurrence. GitHub's anchor text
+    # and its href can disagree (`Closes #0929` links to issue 929), so containment alone is not
+    # enough — the recorded number has to match the matched one.
+    wrong_number = refs("t", "Closes #7", lambda _t: (
+        '<p>Closes <a class="issue-link" href="https://github.com/' + ORACLE_CONTEXT_REPO
+        + '/issues/8">#7</a></p>'))
+    check("SPANS — a span recorded for a DIFFERENT number does not resolve this occurrence",
+          (wrong_number.declared, wrong_number.unresolved), ([], [7]))
+    # ...and a FOREIGN anchor covering the occurrence itself. The href filter is what stops it, and
+    # until this row existed the filter's mutant survived: the only fixture had the foreign anchor
+    # somewhere ELSE in the prose, where the span check refuses it for an unrelated reason.
+    foreign_span = refs("t", "Closes #7", lambda _t: (
+        '<p>Closes <a class="issue-link" '
+        'href="https://github.com/other/repo/issues/7">#7</a></p>'))
+    check("SPANS — an anchor into ANOTHER repository does not resolve an occurrence it covers",
+          (foreign_span.declared, foreign_span.unresolved), ([], [7]))
+    # AN UNCLOSED ANCHOR still spans what it holds — `close()` records it at the end of the
+    # document. Without that, a truncated rendering would refuse a real declaration.
+    unclosed = refs("t", "Closes #7", lambda _t: (
+        '<p>Closes <a class="issue-link" href="https://github.com/' + ORACLE_CONTEXT_REPO
+        + '/issues/7">#7'))
+    check("SPANS — an UNCLOSED anchor still spans its own text", unclosed.declared, [7])
     # ...and the anchor must be in PROSE. A blockquote that merely QUOTES a reference carries a real
     # `issue-link` anchor; letting it satisfy the conjunct would mint from two halves neither of
     # which is a declaration. MEASURED with the live renderer before this row existed.
