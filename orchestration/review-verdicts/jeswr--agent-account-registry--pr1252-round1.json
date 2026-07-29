@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1252,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a36b02262e473bdff5869a964ed12b55407c61a8",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The workflow subscribes only to `opened`, `synchronize`, `reopened`, and `ready_for_review`. The new check diagnoses facts that can change on `pull_request.edited` (title/body closing references) and `pull_request.converted_to_draft` (draft refusal), but neither event starts the job. A pull can therefore open with one valid reference, later edit it away or add a second reference, and receive no warning; a ready pull converted to draft likewise never receives the promised draft explanation. Conversely, repairing a warned body by editing it cannot produce a clean follow-up run, leaving the old warning as the last advisory result. This contradicts the stated authoring-time/on-the-object visibility guarantee for exactly the two populations introduced here.",
+    "file": ".github/workflows/pr-gate.yml",
+    "fix_hint": "Add the relevant `pull_request` activity types, at minimum `edited` and `converted_to_draft`, and add a seam assertion that pins those exact trigger memberships so either event cannot disappear unnoticed.",
+    "severity": "major",
+    "title": "The advisory does not run when the author edits the body or converts the pull to draft"
+   },
+   {
+    "body": "The new self-tests drive `_cmd_check` directly, but none parses `.github/workflows/pr-gate.yml` or asserts that the advisory step exists and is runnable. Deleting the entire added workflow step, adding `if: false`, repointing it to another command, or dropping/mangling `check`, `--event-path`, or `--repo` leaves every added assertion green. Since the feature's outcome is delivery of a workflow annotation, this is an untested production call site rather than a cosmetic omission; a fully correct Python helper with no live invocation delivers nothing.",
+    "file": "scripts/pr-body-ref.py",
+    "fix_hint": "In the offline self-test, parse the workflow YAML and select the advisory step structurally. Assert exactly one enabled step invokes `python3 scripts/pr-body-ref.py check`; tokenize the command and pin exact flag membership and flag/value adjacency for `--event-path \"$GITHUB_EVENT_PATH\"` and `--repo \"$GITHUB_REPOSITORY\"`; also assert the intended `continue-on-error: true` value and absence of a disabling `if:`. Include the relevant trigger activity types in the same seam test.",
+    "severity": "major",
+    "title": "No test reaches the workflow delivery seam"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe advisory's Python-side classification is carefully one-sided and reuses the authoritative mint and policy predicates, but the feature is incomplete at its delivery boundary. The workflow does not run for edits that create or repair the reference defect, nor when an existing pull is converted to draft. In addition, all new tests exercise the Python entry point directly; none proves the required workflow step exists, is enabled, or invokes the intended command with exact arguments. Those gaps leave the marquee author-time visibility claim both operationally incomplete and vulnerable to an undetected YAML/call-site regression.",
+  "verdict": "request_changes"
+ }
+}
