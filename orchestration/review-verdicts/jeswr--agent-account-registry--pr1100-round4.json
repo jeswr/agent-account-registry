@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1100,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8c1c33b81370ebbb7a08b671732612e865eb9b1b",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 approval remains supported. The manual-registration form now prefills the Anthropic provider cap of 4 and gives explicit OpenAI conversion guidance with the cap of 12. The self-test extracts the live form prefill, validates it through the allocator's real record parser and schema checks, and compares its parsed cap with both the executed provider-default derivation and an independent expected tuple. Its malformed-form cases cover missing, duplicate, neighboring, inline, empty, and non-text inputs with loud refusals; the wrapper's false paths and the block-boundary behavior are also asserted, avoiding vacuous success and crash-after-partial-run false kills. I found no correctness, soundness, fail-closed, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
