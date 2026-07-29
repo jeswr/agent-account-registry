@@ -826,9 +826,13 @@ _path_within() {
 # PURE (self-tested): emit the `docker run` argv prefix for the gate sandbox, one element per line.
 #
 #   $1 target_dir  the target checkout — mounted WRITABLE at /workspace (cargo writes ./target)
-#   $2 cache_dir   scratch dir for CARGO_HOME + $HOME, mounted at /gate-cache (the cache strategy:
-#                  one host dir shared by every cargo invocation of the gate, so the crates.io index
-#                  and the downloaded sources are fetched once per job rather than once per command)
+#   $2 cache_dir   scratch dir for CARGO_HOME + RUSTUP_HOME + $HOME, mounted at /gate-cache (the
+#                  cache strategy: one host dir shared by every cargo invocation of the gate, so the
+#                  crates.io index and the downloaded sources are fetched once per job rather than
+#                  once per command). RUSTUP_HOME lives here and NOT at the image's /usr/local/rustup
+#                  because every gate command is a separate `docker run --rm`: a toolchain a target
+#                  pin materialises in the container layer — and every component provisioned for it —
+#                  is discarded the moment that command exits.
 #   $3 uid:gid     the invoking user, so files landing in the mounted tree stay runner-owned
 #   $4..$n         paths that MUST NOT be reachable through any mount (the credential/bundle tree,
 #                  the registry checkout). Empty entries are skipped.
@@ -885,25 +889,77 @@ _gate_sandbox_args() {
     --mount "type=bind,src=$cache_dir,dst=/gate-cache" \
     --env HOME=/gate-cache/home \
     --env CARGO_HOME=/gate-cache/cargo \
+    --env RUSTUP_HOME=/gate-cache/rustup \
     --env CARGO_TERM_COLOR=never \
     --env CI=true \
     --env PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 }
 
-# Prove the sandbox exists BEFORE any target code could run, and provision the toolchain inside the
-# image (replacing the runner-side rustup step worker.yml used to run). FAIL CLOSED on a missing
-# docker: the gate does not degrade to host execution, because that would reinstate the exact
-# unsandboxed path this whole mechanism removes, silently, at the moment it is least expected.
+# PURE (self-tested): the /bin/sh program that provisions the toolchain the TARGET selected. Run
+# INSIDE the sandbox, with /workspace mounted and current, before any target-controlled command.
+#
+# [review r1] The image can only carry clippy/rustfmt for the ONE toolchain that existed when it was
+# built. A target that pins another channel through rust-toolchain.toml makes rustup install THAT
+# toolchain at gate time, with the image's `minimal` profile — no rustfmt, no clippy — and all three
+# cargo gate profiles invoke `cargo fmt` and/or `cargo clippy`. So a legitimate pinned workspace
+# would fail the gate for a missing component. This is the step the deleted runner-side
+# `rustup component add` used to perform, moved inside the boundary rather than dropped.
+#
+# Order is load-bearing and each line is pinned by a self-test row:
+#   SEED    the mounted rustup home from the image once — `docker run --rm` throws the container
+#           layer away after every gate command, so a toolchain installed there (and every component
+#           added to it) would be gone by the next one. A sentinel file, not the mere existence of
+#           toolchains/, marks completion: an interrupted copy must re-seed, not be trusted.
+#   SELECT  `cargo --version` is the cheapest rustup PROXY call, and invoking a proxy is what makes
+#           rustup read rust-toolchain.toml and materialize the pin. It compiles nothing and runs no
+#           build script — and where a toolchain file can still reach code (a `path =` toolchain the
+#           target supplies), that code runs HERE, inside this sandbox, which is precisely why the
+#           step is in-container rather than the host rustup step it replaces. It must come BEFORE
+#           the component add, which acts on whatever toolchain is active by then.
+#   ADD     both components, for that active toolchain.
+#   PROVE   both actually resolve. Without this the failure surfaces later as an opaque clippy error
+#           in the middle of the gate; here it is a named, fail-closed refusal before target code
+#           has run at all.
+# `set -e` makes any of those a hard stop: a half-provisioned toolchain never reaches the gate.
+#
+# The copy must NOT ask to preserve OWNERSHIP (`cp -a` / `cp -p`): the sandbox runs as the
+# unprivileged invoking uid and the image tree is root-owned, so cp would fail the chown and take
+# the whole gate down with it.
+_gate_toolchain_provision_script() {
+  cat <<'PROVISION'
+set -eu
+if [ ! -e "$RUSTUP_HOME/.gate-seeded" ]; then
+  rm -rf "$RUSTUP_HOME"
+  mkdir -p "$RUSTUP_HOME"
+  cp -R --preserve=mode,timestamps /usr/local/rustup/. "$RUSTUP_HOME/"
+  : > "$RUSTUP_HOME/.gate-seeded"
+fi
+cargo --version
+rustup component add clippy rustfmt
+cargo fmt --version
+cargo clippy --version
+PROVISION
+}
+
+# Prove the sandbox exists BEFORE any target code could run, and provision the toolchain inside it
+# (replacing the runner-side rustup step worker.yml used to run). FAIL CLOSED on a missing docker:
+# the gate does not degrade to host execution, because that would reinstate the exact unsandboxed
+# path this whole mechanism removes, silently, at the moment it is least expected.
 _gate_sandbox_prepare() {
   command -v docker >/dev/null 2>&1 \
     || die 'gate sandbox unavailable: docker not found (fail closed — the policy gate never runs target-controlled code on the runner)'
   local context="$GATE_SANDBOX_CACHE/image-context"
+  # Deliberately NOT creating the rustup home here: the provisioning script owns that directory
+  # end to end (it rm -rf's an unfinished one before re-seeding), and a second host-side creation of
+  # it would be a duplicated guard — the kind where removing either copy alone changes nothing.
   mkdir -p "$GATE_SANDBOX_CACHE/cargo" "$GATE_SANDBOX_CACHE/home" "$context"
   chmod 700 "$GATE_SANDBOX_CACHE" "$context"
   docker build --quiet \
     --file "$SCRIPT_DIR/../containers/worker-gate.Dockerfile" \
     --tag "$GATE_SANDBOX_IMAGE" \
     "$context" > "$GATE_SANDBOX_CACHE/image.id"
+  _gate_sandbox_run sh -c "$(_gate_toolchain_provision_script)" \
+    || die 'gate sandbox could not provision rustfmt/clippy for the toolchain the target selected (fail closed — the gate never runs with a half-provisioned toolchain)'
 }
 
 # Run ONE target-controlled command inside the sandbox. The forbidden-path list is what binds the
@@ -3522,11 +3578,28 @@ self_test() {
   chk "gate sandbox inherits NO job env: every --env is NAME=VALUE, never the inheriting --env NAME" \
     "$_bad_env" "0"
   chk "gate sandbox declares --env at all (the NAME=VALUE assertion above is not vacuous)" \
-    "$(grep -cx -- '--env' <<< "$gate_lines" || true)" "5"
+    "$(grep -cx -- '--env' <<< "$gate_lines" || true)" "6"
   chk "gate sandbox uses no --env-file (a host env file defeats the no-inheritance property)" \
     "$(grep -cx -- '--env-file' <<< "$gate_lines" || true)" "0"
   chk "gate sandbox forwards nothing GitHub/token/credential-shaped" \
     "$(grep -ciE 'GH_TOKEN|GITHUB_|SECRET|CREDENTIAL|ACCT[0-9]|TOKEN=' <<< "$gate_lines" || true)" "0"
+  # [review r1] RUSTUP_HOME must land on the PERSISTENT cache mount, never in the container layer.
+  # Every gate command is its own `docker run --rm`: a toolchain that a target's rust-toolchain.toml
+  # pin materializes inside the container — and the clippy/rustfmt provisioned for it — is discarded
+  # when that command exits, so the very next `cargo clippy` finds neither. The mount destination is
+  # read back out of the emitted argv instead of restated here, so this compares two values the
+  # builder actually emitted rather than a constant against itself.
+  local gate_cache_dst gate_rustup_home
+  gate_cache_dst=$(sed -n 's|^type=bind,src=/t/cache,dst=||p' <<< "$gate_lines")
+  gate_rustup_home=$(sed -n 's|^RUSTUP_HOME=||p' <<< "$gate_lines")
+  chk "gate sandbox names a cache mount destination (the RUSTUP_HOME row below is not vacuous)" \
+    "${gate_cache_dst:-MISSING}" "/gate-cache"
+  # Strictly BELOW the mount root, never the root itself: the provisioning script rm -rf's this path
+  # to re-seed, and the mount root also carries CARGO_HOME and the sandbox $HOME.
+  chk "gate sandbox keeps RUSTUP_HOME on the persistent cache mount (a container-layer rustup home is thrown away by --rm, taking a target's pinned toolchain and its components with it)" \
+    "$( [[ -n "$gate_rustup_home" && "$gate_rustup_home" != "$gate_cache_dst" ]] \
+      && _path_within "$gate_cache_dst" "$gate_rustup_home" \
+      && echo persistent || echo ephemeral)" "persistent"
   chk "gate sandbox drops every capability" \
     "$(grep -c -- '--cap-drop ALL' <<< "$gate_flat" || true)" "1"
   chk "gate sandbox blocks privilege escalation" \
@@ -3610,6 +3683,71 @@ self_test() {
       | _bare_cargo_call_sites)" "0"
   chk "bare-cargo detector does NOT fire on a word merely CONTAINING cargo" \
     "$(printf '%s\n' 'cargohome=/gate-cache/cargo' | _bare_cargo_call_sites)" "0"
+
+  # --- [review r1] TOOLCHAIN PROVISIONING for the toolchain the TARGET selects. The image can only
+  # carry clippy/rustfmt for the one toolchain that existed when it was built; a target pinning
+  # another channel through rust-toolchain.toml gets that toolchain installed at gate time with the
+  # image's `minimal` profile — neither component — and all three cargo profiles invoke `cargo fmt`
+  # and/or `cargo clippy`, so a legitimate pinned workspace would fail the gate on a missing
+  # component. A RUNTIME test against a non-default pin needs a docker daemon and a real toolchain
+  # download, neither of which this offline suite has; the runtime proof is therefore built into the
+  # provisioning script itself (it ends by resolving both subcommands for whatever toolchain is
+  # active, under `set -e`), and these rows pin that proof, its ORDER, and its fail-closed wiring. ---
+  # `|| true` on every one of these: a MISSING line must land as an empty variable that reds its own
+  # row, never as a pipefail abort that takes the rest of the suite down with it — a mutant that
+  # crashes the harness reads as a kill while every check below it silently never ran.
+  local gate_provision prov_select prov_add prov_fmt prov_clippy
+  gate_provision=$(_gate_toolchain_provision_script)
+  prov_select=$(grep -nx -- 'cargo --version' <<< "$gate_provision" | cut -d: -f1 || true)
+  prov_add=$(grep -nx -- 'rustup component add clippy rustfmt' <<< "$gate_provision" | cut -d: -f1 || true)
+  prov_fmt=$(grep -nx -- 'cargo fmt --version' <<< "$gate_provision" | cut -d: -f1 || true)
+  prov_clippy=$(grep -nx -- 'cargo clippy --version' <<< "$gate_provision" | cut -d: -f1 || true)
+  chk "toolchain provisioning adds BOTH clippy and rustfmt (exact whole line — dropping either component changes it)" \
+    "$(grep -cx -- 'rustup component add clippy rustfmt' <<< "$gate_provision" || true)" "1"
+  chk "toolchain provisioning MATERIALIZES the target's pin first — a component add that runs before the pin is selected provisions the IMAGE's toolchain and leaves the pinned one bare" \
+    "$( [[ -n "$prov_select" && -n "$prov_add" && "$prov_select" -lt "$prov_add" ]] \
+      && echo ordered || echo unordered)" "ordered"
+  chk "toolchain provisioning PROVES cargo fmt resolves for the selected toolchain, after the add" \
+    "$( [[ -n "$prov_fmt" && -n "$prov_add" && "$prov_fmt" -gt "$prov_add" ]] \
+      && echo proven || echo unproven)" "proven"
+  chk "toolchain provisioning PROVES cargo clippy resolves for the selected toolchain, after the add" \
+    "$( [[ -n "$prov_clippy" && -n "$prov_add" && "$prov_clippy" -gt "$prov_add" ]] \
+      && echo proven || echo unproven)" "proven"
+  chk "toolchain provisioning stops at the FIRST failure — a half-provisioned toolchain never reaches the gate" \
+    "$(grep -cx -- 'set -eu' <<< "$gate_provision" || true)" "1"
+  # It is handed to `sh -c` inside the container, where a syntax error would surface as an opaque
+  # gate failure long after this suite could have named it. Parsed here, both directions.
+  chk "toolchain provisioning parses as /bin/sh" \
+    "$(printf '%s\n' "$gate_provision" | sh -n 2>/dev/null && echo parses || echo broken)" "parses"
+  chk "the sh parse check can FAIL (it is not an unconditional 'parses')" \
+    "$(printf '%s\n' 'if [ 1' | sh -n 2>/dev/null && echo parses || echo broken)" "broken"
+  # The seed. Without it the persistent rustup home starts empty and even a PIN-LESS target downloads
+  # a whole toolchain before the gate can run. `cp -a` / `cp -p` are the trap: the sandbox runs as the
+  # unprivileged invoking uid, the image tree is root-owned, and cp fails the chown — so the exact
+  # option set is pinned, and the second row makes that exactness total by proving there is only one
+  # copy command to change.
+  chk "toolchain provisioning SEEDS the persistent rustup home from the image, preserving mode but never ownership" \
+    "$(grep -cF -- 'cp -R --preserve=mode,timestamps /usr/local/rustup/. "$RUSTUP_HOME/"' \
+      <<< "$gate_provision" || true)" "1"
+  chk "toolchain provisioning has exactly ONE copy command (so the exact-option row above is the whole story)" \
+    "$(grep -cE '(^|[[:space:]])cp[[:space:]]' <<< "$gate_provision" || true)" "1"
+  chk "the seed is completion-marked, so an INTERRUPTED copy re-seeds instead of being trusted" \
+    "$(grep -cF -- '.gate-seeded' <<< "$gate_provision" || true)" "2"
+  # Wiring: the script is worthless unless prepare actually runs it, in-container, unconditionally,
+  # and dies if it fails. All three are asserted separately — the call is anchored at the start of
+  # its line (so a `[[ … ]] &&` guard in front of it no longer matches) and prepare is pinned as
+  # BRANCH-FREE, because the dangerous mutant here is not deletion but a guard that is simply never
+  # true: the gate then runs cargo against a toolchain nothing ever provisioned, and says nothing.
+  chk "gate sandbox prepare RUNS the provisioning script INSIDE the sandbox, unguarded" \
+    "$(_shell_function_body "$SCRIPT_DIR/worker-live.sh" _gate_sandbox_prepare \
+      | grep -cE '^_gate_sandbox_run sh -c "\$\(_gate_toolchain_provision_script\)" \\$' || true)" "1"
+  chk "gate sandbox prepare is BRANCH-FREE: every line of it runs on every gate" \
+    "$(_shell_function_body "$SCRIPT_DIR/worker-live.sh" _gate_sandbox_prepare \
+      | grep -cE '^(if|while|until|for|case)[[:space:]]' || true)" "0"
+  chk "gate sandbox prepare FAILS CLOSED on a provisioning failure (the || die is on the very next line)" \
+    "$(_shell_function_body "$SCRIPT_DIR/worker-live.sh" _gate_sandbox_prepare \
+      | grep -A1 -F -- '_gate_sandbox_run sh -c "$(_gate_toolchain_provision_script)"' \
+      | grep -c -- '^|| die ' || true)" "1"
 
   # --- telemetry: claude stream-json fixture (with transcript content that must NOT cross) ---
   cat > "$tmp/claude.log" <<'LOG'

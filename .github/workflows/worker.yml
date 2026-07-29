@@ -1239,10 +1239,12 @@ jobs:
       # [issue #242] The runner-side "Ensure a Rust toolchain for the crate-scoped gate" step that
       # used to sit here is GONE. It provisioned `rustup default stable` + clippy/rustfmt on the
       # runner because the gate ran `cargo clippy/test` directly there. The gate no longer does:
-      # toolchain provisioning moved INSIDE containers/worker-gate.Dockerfile, which is the only
-      # place a target `rust-toolchain.toml` pin is now materialised (see worker-live.sh
-      # `_gate_sandbox_prepare`). Re-adding a host rustup step would not restore host execution, but
-      # it would signal that the gate still runs on the runner — it does not.
+      # toolchain provisioning moved INSIDE the sandbox. containers/worker-gate.Dockerfile carries
+      # clippy/rustfmt for the image's own toolchain, and worker-live.sh `_gate_sandbox_prepare`
+      # materialises a target `rust-toolchain.toml` pin and adds those two components FOR THAT
+      # PINNED TOOLCHAIN, in-container, before any target code runs. Re-adding a host rustup step
+      # would not restore host execution, but it would signal that the gate still runs on the
+      # runner — it does not.
 
       - name: Run policy-selected local gate (SANDBOXED — target code never runs on the runner)
         id: gate
