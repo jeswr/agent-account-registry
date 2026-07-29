@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4847,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bc24dbaab4865d89a21ea87de1a98a36c4c58a71",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 6 finds no correctness, soundness, test-validity, or security defect. The diagnostic remains confined to the failed-parse path, returns the rejected SPARQL unchanged, and cannot alter query execution. The scanner handles the lexical contexts implicated by prior review rounds, including Unicode and escaped local names and dotted prefixes, while bounding emitted hints and avoiding quadratic rescanning. The focused unit tests and public error-contract tests exercise the real canary path, non-application, unrelated failures, and the previously problematic name forms; keyword-table drift, deterministic ranking, deduplication, and arbitrary Unicode input are also covered. Public documentation and the design record accurately describe the feature as optional diagnostic data with no measured efficacy claim. Because round 5 also had no findings, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
