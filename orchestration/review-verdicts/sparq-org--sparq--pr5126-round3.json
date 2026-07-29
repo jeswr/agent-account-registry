@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5126,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "aca8f54e606fe2b00c1ccb225a01c5c0b46bbf30",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "crate_labels_to_provision treats any normalized changed path exactly equal to crates/<name>/Cargo.toml as positive evidence. The path list loses change status and includes previous_filename for renames, so a deleted manifest or the old side of a rename can qualify. Even an added file with that name need not be a valid Cargo manifest. This contradicts the load-bearing claim that the PR establishes a crate and permits durable area-label creation for a crate that does not exist on the resulting PR head. The current tests cover nested and stray paths but not deletion/rename-away or manifest validity.",
+    "file": "scripts/pr-area-labels.py",
+    "fix_hint": "Carry file status through the changed-file model and accept only added/renamed-to crate-root manifests, then validate the PR-head manifest (at minimum parse it and confirm a package/workspace crate identity consistent with the directory) using a read-only, data-only fetch rather than executing PR code. Add real-path tests proving deletion and previous_filename cannot provision, malformed manifests cannot provision, and a valid added manifest still can.",
+    "severity": "major",
+    "title": "A Cargo.toml path is not sufficient evidence that the PR establishes a crate"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The provisioning path is mostly fail-closed and its effect tests exercise the real write sequence, but the claimed crate evidence is not actually established by the available input. A changed path named crates/<name>/Cargo.toml can represent deletion or rename-away and says nothing about whether the manifest is valid. The code nevertheless turns that path into permanent repository state. Round 2 reported no findings, so this newly identified major correctness/security-boundary issue makes round 3 regressing.",
+  "verdict": "request_changes"
+ }
+}
