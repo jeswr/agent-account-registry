@@ -1,0 +1,115 @@
+# [OPUS-5] The TRIGGER for the #657 `orchestrator`-class provenance record (registry issue #929).
+#
+# WHY THIS EXISTS. mint-provenance.yml is `workflow_dispatch`-ONLY — no schedule, no
+# repository_dispatch, no programmatic caller anywhere in this repository. #916 turned review-lane
+# enrolment ON for the orchestrator class, but a human still had to fire one dispatch per PR, and
+# nobody ever did: zero orchestrator-attested records on `ledger` while the ledger was otherwise
+# busy with worker verdicts every few seconds. #916 converted "impossible" into "possible but
+# manual"; this workflow is the missing link that makes it automatic.
+#
+# WHY A SCHEDULE AND NOT A `pull_request` TRIGGER. mint-provenance.yml's header states the
+# constraint and it has not changed: a `pull_request`-triggered workflow would have to live in the
+# TARGET repository, putting a registry-writing job in the repo whose PRs the model fleet writes.
+# The one alternative that repo comment rejected — "a reconciliation sweep would turn a per-PR
+# gesture into a standing 'trust this author' claim" — is answered by keeping the ALLOWLIST as the
+# sole authority on the population: this sweep reads `review_enrolment_authors` and can neither
+# widen nor bypass it, and the record it writes is still the weakest, self-attested class that the
+# arm refuses outright. What becomes standing is the TRIGGER, not the trust.
+#
+# WHAT IT CANNOT DO, all of it inherited from scripts/mint-provenance.py, which this sweep IMPORTS
+# rather than re-implements:
+#   * it cannot enrol anyone (`review_enrolment_authors`, master-protected, behind the gate);
+#   * it cannot name the implementing model — the alias is a PINNED CONSTANT in
+#     scripts/auto-mint-provenance.py, and this file passes no `--impl-alias`, declares no such
+#     input, and binds no such env var. The lane picks the reviewer by INVERTING `impl_provider`,
+#     so an alias lever here would be the class choosing its own reviewer's side;
+#   * it cannot accept the serializing `__global__` partition: no `--allow-global-partition`;
+#   * it cannot mint a MACHINE-attested record: the stamp is built inside the script from this
+#     run's own GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT, and no input on this path names a run key;
+#   * it cannot authorise a merge — the arm refuses this class outright (worker-pr.ready_and_arm).
+#
+# BOUNDED, AND NEVER SILENT. Each tick writes at most `DEFAULT_MAX_MINTS` records and posts at most
+# `DEFAULT_MAX_COMMENTS` refusal comments, and EVERY tick prints a census — enrolled-class PRs
+# lacking a record, how many were minted, how many were refused and for which named reason. A
+# refusal is also left ON the pull request (once per distinct reason), because an orchestrator-class
+# PR that cannot be minted is invisible to the review lane again, which is the exact state #916
+# exists to end.
+#
+# DRY RUN on a manual dispatch unless apply=true; the schedule always applies.
+name: auto-mint-provenance
+run-name: auto-mint-provenance apply=${{ github.event_name != 'workflow_dispatch' || inputs.apply }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: >-
+          Write the records and post the refusal comments (false = census-only preview). The
+          SCHEDULE always applies; this input exists so an operator can read a census first.
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    # Explicit minutes mirror dispatch/retriage/curate and avoid GitHub's degraded */N scheduling.
+    # Offset from curate (17,47) and the other half-hourly sweeps so the ticks do not pile up.
+    - cron: '13,43 * * * *'
+
+permissions: {}
+
+concurrency:
+  group: auto-mint-provenance
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: Mint the missing orchestrator-class provenance records (ledger branch)
+    # The salt is a secret: refuse to run from any non-default ref (a modified branch copy of this
+    # workflow must never see it — the sol-audit arbitrary-ref class). It is also what stops a
+    # branch that adds itself to policy/repos.toml from being read as the enrolment allowlist.
+    #
+    # THE `schedule` CARVE-OUT IS LOAD-BEARING, not a loosening. The strict comparison reads
+    # `github.event.repository`, and NO other scheduled workflow in this repository depends on that
+    # object being present in a cron payload. If it ever were not, this job would evaluate FALSE
+    # and skip — silently, with no census, forever: a scheduled minter that never runs is
+    # bit-for-bit the #929 defect this file exists to fix. GitHub only ever schedules a workflow
+    # from the DEFAULT branch, so there is no non-default ref for a cron tick to come from, while
+    # the arbitrary-ref attack the guard exists for is a DISPATCH — which carries a full repository
+    # payload, and is where the strict check is therefore applied. The server-side
+    # deployment-branch policy on the `dispatch-secrets` environment (default branch only) is the
+    # primary control on both paths regardless; this guard complements it.
+    if: >-
+      ${{ github.event_name == 'schedule'
+          || github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # SECRET-EXFIL GUARD (issue #101): reads PROVENANCE_SALT, which lives in the `dispatch-secrets`
+    # environment (deployment-branch policy: default branch only). Complements the ref guard above.
+    environment: dispatch-secrets
+    permissions:
+      contents: write        # ledger-branch record PUT via github.token
+      pull-requests: write   # the refusal comment, ON the PR — requirement 4 of #929
+      # Deliberately NO `actions: read`. Run-log reading is BACKFILL's identity source; this path's
+      # identity source is the live API read of the PR, and granting log access here would blur two
+      # attestation classes that must stay distinguishable.
+    steps:
+      - name: Checkout registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Sweep the enrolled class (self-test first; dry run unless apply=true)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Raw logins never appear beside their hash — the script prints only the salted hash.
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+          REGISTRY_REPO: ${{ github.repository }}
+          APPLY: ${{ github.event_name != 'workflow_dispatch' || inputs.apply }}
+        run: |
+          set -euo pipefail
+          python3 scripts/auto-mint-provenance.py --self-test
+          # --annotate-repo is THIS repository on purpose: `github.token` can only comment here, and
+          # an enrolled target whose refusals would be invisible is skipped loudly in the census
+          # rather than swept silently. Widening needs the target-scoped App token plumbing.
+          args=(--registry-repo "$REGISTRY_REPO" --annotate-repo "$REGISTRY_REPO")
+          if [[ "$APPLY" == "true" ]]; then args+=(--apply); fi
+          python3 scripts/auto-mint-provenance.py "${args[@]}"
