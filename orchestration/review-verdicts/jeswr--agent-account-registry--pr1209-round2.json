@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1209,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "93f5f64929a7468e752c25979b54e14759b6890d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The change keeps the existing arm decision intact while making absent aggregator evidence explicit and observable. The classifier recognizes only the two independently pinned graded-green values as green, separates concluded failure and missing evidence, and sends malformed or unknown values to unproven. The production arm path feeds it the grade read at the reviewed SHA and emits the absence annotation before the stale, red, and admitted exits; the manual freshness report uses the live draft-aware gate reader and remains read-only. The self-tests independently cover the zero-run producer, local vocabulary agreement, the full classifier table, decision coherence, production call-site wiring, admitted and deferred paths, green and red controls, exact alarm identity, and report wiring. I found no correctness, soundness, test-validity, injection, or security issue. Because round 1 also had no findings and approved this materially identical change, progress is stagnant under the supplied scale rather than regressing.",
+  "verdict": "approve"
+ }
+}
