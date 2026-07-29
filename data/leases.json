@@ -11,16 +11,6 @@
    "expires_at": 1785314767
   },
   {
-   "account": "efb4eb2781de6958",
-   "claim_id": "38e48eb7cab842208d0f3d44a2f54960",
-   "holder": "jeswr/agent-account-registry#1139@30430171434.1",
-   "package": "workflows",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785308538,
-   "expires_at": 1785311238
-  },
-  {
    "account": "9e13ea21abf27e68",
    "claim_id": "e1dfd03ef00c4e6aa258dcac50c17664",
    "holder": "jeswr/agent-account-registry#680@30430178672.1",
@@ -99,16 +89,6 @@
    "model": "sol",
    "issued_at": 1785310834,
    "expires_at": 1785315034
-  },
-  {
-   "account": "9e13ea21abf27e68",
-   "claim_id": "d3b38b59cae147cab654b0a59ab11553",
-   "holder": "fix:jeswr/agent-account-registry#1167@dispatch-30431932404.1",
-   "package": "groom",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785310840,
-   "expires_at": 1785317140
   }
  ]
 }
