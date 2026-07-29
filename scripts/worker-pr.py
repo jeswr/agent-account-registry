@@ -284,6 +284,17 @@ IDENTITY_REFUSAL_REASONS = {
     "unsafe-default-branch": "the target repository's default branch is not a safe ref name",
     "not-an-app-bot": "the target App token did not identify a GitHub App bot",
     "author-not-app-bot": "the pull request author is not the registry App bot",
+    # [registry #1288] The two refusals that guard the #657 self-attested path. The App-author
+    # check does not apply there — what replaces it is that the run holds NO target authority at
+    # all — so these are the executable statements of that property. Both are as deterministic as
+    # the four above: whether a token was minted and whether the target is public are facts about
+    # the workflow and the repository, not about the attempt.
+    "self-attested-run-holds-a-target-token":
+        "the self-attested review path minted a target App token, which is the authority its "
+        "admission rule exists to remove",
+    "self-attested-target-is-not-public":
+        "the self-attested review path requires a public target, because everything it reads "
+        "must be readable without target authority",
 }
 # The window key for the initial no-cutoff window — mirrors park_policy.PARK_WINDOW_NONE
 # (kept literal here so the pure marker parser needs no module load; never valid ISO-8601, so
@@ -2329,6 +2340,17 @@ def verdict_path(target_repo, pr_number, round_n):
     return f"{VERDICT_DIR}/{owner}--{name}--pr{pr_number}-round{round_n}.json"
 
 
+def verdict_glob(target_repo, pr_number):
+    """The filename glob matching every recorded review verdict for one PR, at any round.
+
+    Exists because the DELIVERY-layer readers ask "has any round ever produced a verdict bound to
+    this head?" and cannot know the round number in advance. Kept beside `verdict_path` so the two
+    can never disagree about the naming — the same reason `round_claim_glob` sits beside
+    `round_claim_path`."""
+    owner, name = target_repo.split("/", 1)
+    return f"{owner}--{name}--pr{pr_number}-round*.json"
+
+
 # ---- the review ATTEMPT store (registry #1288) --------------------------------------------------
 # WHY IT IS IN `data/` AND NOT BESIDE THE VERDICTS. `orchestration/review-verdicts/` is the record
 # of DECISIONS — what a reviewer concluded. An attempt is not a decision; it is operational state,
@@ -2379,6 +2401,27 @@ def record_round_claim(registry_repo, target_repo, pr_number, round_n, head_sha,
         registry_repo, round_claim_path(target_repo, pr_number, round_n), document,
         f"charge review round {round_n} for {target_repo}#{pr_number}",
         volatile_fields=frozenset({"claimed_at_run"}))
+
+
+def charge_round_claim(registry_repo, target_repo, pr_number, round_n, head_sha, run_key):
+    """CLI leg for `round-claim`. Prints what it did; raises on a genuine write failure.
+
+    THERE IS DELIBERATELY NO ERASER. `round-record`'s target-side twin has one (`round-void`,
+    issue #596), and its input is `WORKER_EXIT_CLASS` — a value derived from the model launch,
+    written into `$GITHUB_ENV` by a step in the same job the model runs in. For the worker class
+    that trade was made knowingly. This store must NOT inherit it: the whole point of moving the
+    accounting here is that the round budget bounding a prompt-injectable model's re-dispatch
+    loop must have no writer downstream of that model. One writer (`claim`, pre-model), no
+    eraser — so nothing the model can influence can extend its own budget.
+
+    The cost is named rather than hidden: a credential-outage launch failure (#596's case) stays
+    CHARGED for this class. That is bounded and self-healing — `max_review_rounds` of them route
+    the PR into the CAPACITY `budget` park, which has automatic re-admission — where the target
+    marker's forever-charge was not. Tracked as its own follow-up, not smuggled in here."""
+    created = record_round_claim(registry_repo, target_repo, pr_number, round_n, head_sha,
+                                 run_key)
+    print(f"review attempt {'charged' if created else 'already charged'} on the ledger for "
+          f"{target_repo}#{pr_number} round {round_n} @ {head_sha[:12]}")
 
 
 def _probe_registry_file(registry_repo, path, ref=None):
@@ -12472,6 +12515,19 @@ def main():
                        help="worker-live.sh exit class for THIS run; only a credential-outage "
                             "class voids the round (every other value is a no-op)")
 
+    # [registry #1288] The LEDGER twin of round-record, for the #657 self-attested class, whose
+    # review path holds no target token and therefore cannot write a target-side marker. Charged
+    # from review-fix.yml's `claim` job — pre-model, and in a job that executes no target code.
+    rclaim = subparsers.add_parser("round-claim")
+    rclaim.add_argument("--registry-repo", required=True)
+    rclaim.add_argument("--target-repo", required=True)
+    rclaim.add_argument("--pr", required=True, type=int)
+    rclaim.add_argument("--round", required=True, type=int)
+    rclaim.add_argument("--head-sha", required=True,
+                        help="the head this attempt is charged against; a malformed value fails "
+                             "closed rather than charging an unbound attempt")
+    rclaim.add_argument("--run-key", required=True)
+
     rchk = subparsers.add_parser("round-check", parents=[common])
     rchk.add_argument("--max-rounds", required=True, type=int)
     rchk.add_argument("--bot-login", required=True)
@@ -12747,6 +12803,9 @@ def main():
         elif args.command == "round-record":
             record_round(args.repo, args.pr, args.round, args.run_key, args.bot_login,
                          args.head_sha)
+        elif args.command == "round-claim":
+            charge_round_claim(args.registry_repo, args.target_repo, args.pr, args.round,
+                               args.head_sha, args.run_key)
         elif args.command == "round-void":
             void_round_on_outage(args.repo, args.pr, args.round, args.run_key, args.bot_login,
                                  args.exit_class)

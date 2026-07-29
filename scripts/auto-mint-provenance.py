@@ -1814,16 +1814,23 @@ def _self_test():                                                       # noqa: 
     mint_provenance = _load_mint_provenance()
 
     # ---- THE SWEEP IS WIRED TO THE THIRD LAST MILE (mint_provenance.review_run_refusal) --------
-    # The shared writer refuses this whole class today, because review-fix.yml's `run` job rejects
-    # any PR this App did not author and every enrolled author is a human login by construction.
-    # ASSERTED FIRST, unpatched, so the sweep's own composition is proven to carry that refusal —
-    # then stood down for the rest of the suite, because every row below is about some OTHER
-    # predicate and would otherwise pass for this reason and stop testing what it names.
+    # [registry #1288] review-fix.yml's `run` job now ADMITS the self-attested class — into a job
+    # that holds no target App token, which is what replaced the App-author check — so the shared
+    # writer no longer refuses it and this sweep mints again.
+    #
+    # Both directions are asserted UNPATCHED and through the sweep's OWN composition, because the
+    # thing being proved is the wiring, not the answer: a sweep that stopped consulting the run
+    # gate would satisfy the live row alone. Only then is the refusal stood down for the rest of
+    # the suite, where every row is about some OTHER predicate and would otherwise pass for this
+    # reason and stop testing what it names.
     _live_run_refusal = mint_provenance.review_run_refusal(
         mint_provenance._load_dispatch_claim().review_fix_identity_admits_orchestrator_class)
-    check("the shared writer refuses the class on the live identity gate",
-          isinstance(_live_run_refusal, str) and "target-App identity gate" in _live_run_refusal,
-          True)
+    check("the shared writer ADMITS the class on the live identity gate",
+          _live_run_refusal, None)
+    _refused_run_refusal = mint_provenance.review_run_refusal(lambda: False)
+    check("...and still refuses it when the identity gate does, naming that gate",
+          isinstance(_refused_run_refusal, str)
+          and "target-App identity gate" in _refused_run_refusal, True)
     mint_provenance.review_run_refusal = lambda _probe: None
 
     # ---- THE RENDERED ORACLE, AND THE INSTRUMENT THAT MEASURES IT -----------------------------

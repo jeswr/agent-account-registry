@@ -6157,6 +6157,57 @@ def count_ledger_rounds(ledger_root, registry_root, worker_pr, repo, pr_number):
     return len(charged)
 
 
+def ledger_review_completed(ledger_root, registry_root, worker_pr, repo, pr_number, head_sha):
+    """Has a review of THIS head already completed end to end, per the REGISTRY's own records?
+
+    The delivery-layer twin of `count_ledger_rounds`, and the replacement for an author-editable
+    gate input (registry #1288). review-fix.yml's `resolve` derives `already_done` — the fact the
+    `claim` job uses to skip a duplicate dispatch without burning a reviewer slot — from the
+    `<!-- sparq-reviewed-sha:... -->` marker in the PULL REQUEST BODY. For the worker class that is
+    sound: the PR is authored by the App that writes the marker. For the #657 self-attested class
+    it is NOT — the author is a human, the body is theirs to edit, and after the token drop this
+    lane writes nothing to the target from the job that would need to trust it.
+
+    So for that class the question is asked of the one surface only the registry's own workflows
+    write: the verdict records on the `ledger` branch, whose HOST envelope (issue #156) binds each
+    verdict to the exact commit it reviewed. A verdict record exists only because a review ran, was
+    schema-validated twice, and was recorded by the `outcome` job — none of which the PR author can
+    forge or erase.
+
+    Note the FAILURE DIRECTIONS are not symmetric, and this reads toward the safe one. Reading
+    `False` when a review did happen costs one redundant resolve+claim pair, which then re-derives
+    and skips. Reading `True` when it did not would strand the PR unreviewed forever. So an
+    unreadable root, a malformed record or a missing envelope all contribute NOTHING — never a
+    completion — and the head sha must match exactly.
+
+    TOTAL: never raises. It runs inside a `run:` script whose exception aborts the whole resolve
+    job."""
+    if not re.fullmatch(r"[0-9a-f]{40}", str(head_sha or "")):
+        return False
+    pattern = worker_pr.verdict_glob(repo, pr_number)
+    for root in (ledger_root, registry_root):
+        if not root:
+            continue
+        directory = Path(root) / worker_pr.VERDICT_DIR
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.glob(pattern)):
+            try:
+                document = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            envelope = document.get("host_envelope") if isinstance(document, dict) else None
+            # A legacy pre-#156 bare-document record carries NO envelope and therefore no sha
+            # binding. It cannot answer this question, so it does not get to: unbound records
+            # contribute nothing rather than being read as a completion of whatever head is live.
+            if not isinstance(envelope, dict):
+                continue
+            if (envelope.get("repo") == repo and envelope.get("pr") == pr_number
+                    and envelope.get("reviewed_sha") == head_sha):
+                return True
+    return False
+
+
 def record_file_path(ledger_root, registry_root, relative):
     """Resolve a provenance/verdict record file: the `ledger` data-plane branch checkout is the
     PRIMARY location (issue #96 — master's required `gate` check rejects every direct
@@ -9174,9 +9225,40 @@ def review_fix_identity_admits_orchestrator_class(source=None):
          #570's author gate exists to prevent — so a probe that cannot see that difference must
          never read True.
 
+    [registry #1288] THE GATE FLIPPED, AND SO DID WHAT THIS HAS TO PROVE. The class is now
+    admitted, and the property that replaces the App-author check is that the run holds NO TARGET
+    AUTHORITY — the App token is not minted for it, and the block REFUSES if one exists anyway. So
+    a two-fact probe is no longer enough: "admits the class" is satisfied by simply deleting the
+    author test, which is the authority escalation #570's gate exists to prevent. FIVE facts are
+    demanded, and the probe is driven as a COMPOSITION of the two jobs rather than as a reading of
+    one, because "an admission proof is not a delivery proof" (§11.2) is the error this whole issue
+    is made of:
+
+      1. ADMITS THE CLASS. An enrolled orchestrator author — with `self_attested` DERIVED by
+         calling `resolve`'s own `review_fix_pr_admission`, never asserted — reaches the success
+         path and binds `verified`.
+      2. STILL REFUSES A STRANGER. An arbitrary third-party author gets `self_attested=False` from
+         that same shared function, therefore holds a token, therefore meets the unchanged author
+         check, and is refused. A gate widened by admitting EVERYONE reds here.
+      3. REFUSES A TARGET TOKEN ON THE SELF-ATTESTED PATH. This is the token drop, executed: the
+         class is admitted only into a job with no target authority, so a run that has one is
+         refused even though its author is enrolled. Re-adding the mint without restoring the
+         author gate reds here rather than silently re-opening the hole.
+      4. REFUSES A PRIVATE TARGET on that path — the affordability argument is that everything the
+         review path reads is readable without target authority.
+      5. STILL DELIVERS THE WORKER CLASS. The probe must be able to SEE a normal admission happen,
+         or an always-refusing block would satisfy 2/3/4 while delivering nothing at all. This is
+         also the row that reds if the self-attested branch is made unconditional.
+      6. STILL REFUSES A FOREIGN APP BOT on the tokened path. The stranger in 2 is a HUMAN login,
+         and the gate's own comment names the other half of the threat: "a spoofed bot-suffixed
+         author from some other App". Before #1288 that half was covered only by ACCIDENT — a gate
+         widened to `endswith("[bot]")` also stopped admitting the (human-login) enrolled class,
+         so fact 1 caught it. Now that the class no longer reaches this branch at all, that
+         coincidence is gone and the case has to be probed on its own.
+
     POSITIVE PROOF ONLY. Any extraction failure, exception or ambiguity reads False, which leaves
     the mint refusing. This function is the SELF-REMOVING half of the interlock: it re-derives its
-    answer from the workflow on every call, so the day the identity gate is widened it flips True
+    answer from the workflow on every call, so the day the identity gate changes again it follows
     by itself and nothing has to be remembered and deleted."""
     try:
         block = _review_fix_step_python(_RF_IDENTITY_ANCHOR, _RF_IDENTITY_END,
@@ -9185,38 +9267,57 @@ def review_fix_identity_admits_orchestrator_class(source=None):
     except Exception:            # noqa: BLE001 — an unreadable seam is NOT proof of wiring
         return False
 
-    def _run(pr_author):
-        """Execute the workflow's own identity block. Returns the bound `bot_login`, or None when
-        it refused. A temp file stands in for GITHUB_OUTPUT so the block's real `refuse()` write
-        path executes rather than a stub of it."""
+    def _run(pr_author, *, self_attested, target_app_token, private=False):
+        """Execute the workflow's own identity block. True iff it reached the success path. A temp
+        file stands in for GITHUB_OUTPUT so the block's real `refuse()` write path executes rather
+        than a stub of it."""
         handle, path = tempfile.mkstemp(prefix="rf-identity-probe-")
         os.close(handle)
         try:
             namespace = {
                 "os": types.SimpleNamespace(environ={
-                    "TARGET_REPO": PROBE_REPO, "PR_AUTHOR": pr_author, "GITHUB_OUTPUT": path}),
+                    "TARGET_REPO": PROBE_REPO, "PR_AUTHOR": pr_author, "GITHUB_OUTPUT": path,
+                    "SELF_ATTESTED": "true" if self_attested else "false",
+                    "TARGET_APP_TOKEN": "true" if target_app_token else "false"}),
                 "re": re, "json": json, "sys": sys,
-                "repo": {"full_name": PROBE_REPO, "default_branch": "master"},
-                "user": {"login": PROBE_BOT_LOGIN, "id": 12345},
+                "repo": {"full_name": PROBE_REPO, "default_branch": "master",
+                         "private": private},
+                # The App-identity read only happens when a token was minted; with none, the
+                # workflow writes an EMPTY object, and the probe must feed the block the same
+                # thing rather than a convenient fabrication.
+                "user": {"login": PROBE_BOT_LOGIN, "id": 12345} if target_app_token else {},
             }
             try:
                 exec(compiled, namespace)   # noqa: S102 — repository-owned workflow source
             except SystemExit:
-                return None
+                return False
             except Exception:    # noqa: BLE001 — a block that crashes admits nothing provable
-                return None
+                return False
             with open(path, encoding="utf-8") as written:
-                for line in written:
-                    if line.startswith("bot_login="):
-                        return line.split("=", 1)[1].strip()
-            return None
+                return any(line.strip() == "verified=yes" for line in written)
         finally:
             with contextlib.suppress(OSError):
                 os.unlink(path)
 
-    admits_class = _run(PROBE_ENROLLED_LOGIN) is not None
-    refuses_stranger = _run("some-unrelated-third-party") is None
-    return admits_class and refuses_stranger
+    def _delivers(login):
+        """Drive the WHOLE path for one author: `resolve` decides `self_attested` (by executing
+        the shared admission, not by assertion), the mint's own `if:` couples the token to that
+        answer, and the `run` block then decides. This is the composition the #657 defect lived in
+        the gap of."""
+        admitted, admission_error = review_fix_pr_admission(
+            PROBE_REPO, dict(orchestrator_probe_pull(), user={"login": login}),
+            orchestrator_probe_record(), (PROBE_ENROLLED_LOGIN,), "review")
+        self_attested = admitted is True and admission_error is None
+        return _run(login, self_attested=self_attested, target_app_token=not self_attested)
+
+    return (_delivers(PROBE_ENROLLED_LOGIN) is True
+            and _delivers("some-unrelated-third-party") is False
+            and _run(PROBE_ENROLLED_LOGIN, self_attested=True, target_app_token=True) is False
+            and _run(PROBE_ENROLLED_LOGIN, self_attested=True, target_app_token=False,
+                     private=True) is False
+            and _run(PROBE_BOT_LOGIN, self_attested=False, target_app_token=True) is True
+            and _run("some-other-app[bot]", self_attested=False,
+                     target_app_token=True) is False)
 
 
 def _probe_worker_pr():
@@ -12834,43 +12935,77 @@ def _self_test():
          "than subsumed by default-off")
     #      (iii-b) THE SIXTH CONSUMER — the target-App IDENTITY gate in the `run` job. Everything
     #      above concerns `resolve`, which is why all four of enrolment_enable_error's facts read
-    #      True while the class receives no review at all: the run dies one job later. The probe is
-    #      validated in BOTH directions, because a constant-False guard is indistinguishable from a
-    #      working one on the live tree (the live answer is False, and that is the POINT).
-    assert review_fix_identity_admits_orchestrator_class() is False, \
-        ("the LIVE identity gate must read as NOT admitting the orchestrator class — it refuses "
-         "`author-not-app-bot` for every enrolled author by construction (policy-resolve refuses "
-         "a `[bot]` login in review_enrolment_authors, so an enrolled author can never equal the "
-         "App bot's login). If this ever reads True, mint-provenance.review_run_refusal stands "
-         "down by itself and the class starts minting again")
-    #      ...and it is NOT a constant: a gate widened to admit the enrolled class — and ONLY it —
-    #      flips the probe True. Without this row the assertion above is satisfied by `return
-    #      False`, which is exactly the vacuity that would silently keep minting disabled forever.
-    _rf_ident_widened = _rf_live.replace(
-        '          if os.environ["PR_AUTHOR"] != login:',
-        '          if os.environ["PR_AUTHOR"] not in (login, "probe-enrolled-login"):')
-    assert _rf_ident_widened != _rf_live
-    assert review_fix_identity_admits_orchestrator_class(source=_rf_ident_widened) is True, \
-        ("a gate widened to admit the enrolled orchestrator author must read True — otherwise the "
-         "probe is a constant and the mint refusal it drives can never be lifted")
-    #      ...and the LOAD-BEARING direction: a widening that admits the class by admitting
-    #      EVERYONE is an authority escalation, not a fix, and must still read False.
+    #      True while the class received no review at all: the run died one job later.
+    #
+    #      [registry #1288] THIS ROW FLIPPED, AND IT IS THE ASSERTION UPDATE THAT HAD TO LAND IN
+    #      THE SAME COMMIT AS THE GATE. It read `is False` and carried the note "if this ever reads
+    #      True, mint-provenance.review_run_refusal stands down by itself and the class starts
+    #      minting again". That is exactly what this commit does, on purpose: the gate now admits
+    #      the class, the mint refusal self-removes, and the lane delivers. Landing the flip in a
+    #      separate commit from the gate would have left the tree red in between and, worse, would
+    #      have let one of them ship alone.
+    assert review_fix_identity_admits_orchestrator_class() is True, \
+        ("the LIVE identity gate must now ADMIT the orchestrator class — and must do so on all "
+         "five facts: it admits an enrolled author with no target token, still refuses a "
+         "stranger, refuses the class when a target App token exists anyway, refuses a private "
+         "target, and still delivers the worker class. Reading False here means the mint refusal "
+         "in mint-provenance.review_run_refusal is live again and the lane delivers nothing")
+    #      ...and it is NOT a constant. The rows below are the whole reason a bare `is True` above
+    #      is not enough: every one of them is a way to make the class "admitted" that this probe
+    #      must refuse to call wiring.
+    #
+    #      FIRST, the direction the pre-#1288 tree tested: an authority ESCALATION that admits the
+    #      class by admitting EVERYONE. The mutations below reach the author test on the TOKENED
+    #      branch — the branch that still holds a target App token — so a stranger with a token
+    #      reaches the model. That is what #570's gate exists to prevent and it must read False.
     for _why, _escalation in (
             ("the author test is deleted outright",
-             _rf_live.replace('          if os.environ["PR_AUTHOR"] != login:',
-                              '          if False:')),
+             _rf_live.replace('              if os.environ["PR_AUTHOR"] != login:',
+                              '              if False:')),
             ("the author test is made vacuous by comparing a value to itself",
-             _rf_live.replace('          if os.environ["PR_AUTHOR"] != login:',
-                              '          if os.environ["PR_AUTHOR"] != os.environ["PR_AUTHOR"]:')),
+             _rf_live.replace(
+                 '              if os.environ["PR_AUTHOR"] != login:',
+                 '              if os.environ["PR_AUTHOR"] != os.environ["PR_AUTHOR"]:')),
             ("any bot-suffixed author is accepted, not this exact App",
-             _rf_live.replace('          if os.environ["PR_AUTHOR"] != login:',
-                              '          if not os.environ["PR_AUTHOR"].endswith("[bot]"):'))):
+             _rf_live.replace(
+                 '              if os.environ["PR_AUTHOR"] != login:',
+                 '              if not os.environ["PR_AUTHOR"].endswith("[bot]"):'))):
         assert _escalation != _rf_live, _why
         assert review_fix_identity_admits_orchestrator_class(source=_escalation) is False, \
             (f"an identity gate that admits a STRANGER must read False even though it also admits "
-             f"the enrolled class ({_why}) — the probe exists to tell a scoped widening from an "
-             f"authority escalation, and #570's author gate is the only thing standing between a "
-             f"target-scoped App token and any pushable branch")
+             f"the enrolled class ({_why}) — the probe exists to tell a scoped admission from an "
+             f"authority escalation, and on the tokened branch #570's author gate is still the "
+             f"only thing standing between a target-scoped App token and any pushable branch")
+    #      SECOND, and new: the SECURITY PROPERTY THAT REPLACES THAT GATE for the admitted class.
+    #      The class is admitted only into a job that holds no target authority. Each mutation
+    #      below keeps the class admitted while destroying that property, and each must read
+    #      False — otherwise "admitted" would be provable without "and with nothing to protect",
+    #      which is precisely the trade this change refuses to make.
+    for _why, _dropped in (
+            ("the no-target-token refusal is deleted, so re-adding the mint silently hands a "
+             "model a target-scoped token on a PR this App did not author",
+             _rf_live.replace('              if target_app_token:\n'
+                              '                  refuse("self-attested-run-holds-a-target-token")',
+                              '              if False:\n'
+                              '                  refuse("self-attested-run-holds-a-target-token")')),
+            ("the no-target-token refusal is made vacuous by testing the wrong environment fact",
+             _rf_live.replace('          target_app_token = os.environ.get("TARGET_APP_TOKEN") == "true"',
+                              '          target_app_token = False')),
+            ("the public-target refusal is deleted, so the class could be admitted against a "
+             "repository whose contents need authority to read at all",
+             _rf_live.replace('              if repo.get("private") is not False:\n'
+                              '                  refuse("self-attested-target-is-not-public")',
+                              '              if False:\n'
+                              '                  refuse("self-attested-target-is-not-public")')),
+            ("the self-attested branch is made unconditional, which refuses the WORKER class "
+             "(whose token is legitimate) and turns the whole review lane off",
+             _rf_live.replace('          self_attested = os.environ.get("SELF_ATTESTED") == "true"',
+                              '          self_attested = True'))):
+        assert _dropped != _rf_live, _why
+        assert review_fix_identity_admits_orchestrator_class(source=_dropped) is False, \
+            (f"admitting the class WITHOUT the property that replaces the author check must read "
+             f"False ({_why}) — a probe that cannot see this difference cannot tell the token "
+             f"drop from a plain widening of who may get a model run against them")
     #      ...and the extraction fails CLOSED rather than guessing when the seam moves.
     for _why, _broken in (("the workflow does not parse", "not: [valid yaml"),
                           ("the anchor was renamed",
@@ -22614,7 +22749,27 @@ def _starvation_yaml_seam_self_test():
 # module's own AST and reds if any pin in this section reaches a containment operator over a
 # workflow script — the negation of the claim, grepped by the code that makes it.
 _IDENTITY_SEAM_RUN_OUTPUT = "${{ steps.target.outputs.refusal }}"
-_IDENTITY_SEAM_REFUSE_IF = "${{ steps.target.outputs.bot_login == '' }}"
+# [registry #1288] Was `steps.target.outputs.bot_login == ''`. `bot_login` is legitimately EMPTY on
+# the self-attested path (no App token, therefore no App identity to resolve), so the fail-closed
+# token moved to one that means "every predicate passed" rather than "an App identity was
+# resolved". The invariant it pins is unchanged and so is the equality comparison: `!= 'yes'` with
+# an added `&& false`, an `always()`, or a re-point at a neighbouring output all change this string.
+_IDENTITY_SEAM_REFUSE_IF = "${{ steps.target.outputs.verified != 'yes' }}"
+# [registry #1288] THE TOKEN DROP, pinned at the YAML seam. This is the `if:` that decides whether
+# a target-scoped App token exists in the job that runs the model, and it is the security property
+# that REPLACES the App-author check for the #657 self-attested class. Equality, so widening it
+# back to a bare `inputs.mode == 'review'` — which would re-mint the token for a class the author
+# gate no longer covers — is a named violation rather than a silent regression. (The identity
+# block ALSO refuses at runtime when a token exists on that path, so this pin is the second of two
+# independent guards, not the only one.)
+_IDENTITY_SEAM_REVIEW_MINT_IF = (
+    "${{ inputs.mode == 'review' && needs.resolve.outputs.self_attested != 'true' }}")
+# ...and the one remaining TARGET WRITE on the review path, which the class must never reach: it
+# needs the token the class does not hold, and the ledger attempt store it replaces is deliberately
+# eraser-free so nothing downstream of the model can extend its own round budget.
+_IDENTITY_SEAM_ROUND_VOID_IF = (
+    "${{ always() && inputs.mode == 'review' && needs.resolve.outputs.self_attested != 'true' "
+    "&& steps.round.outcome == 'success' }}")
 _IDENTITY_SEAM_RECORD_IF = "${{ needs.run.outputs.identity_refusal != '' }}"
 _IDENTITY_SEAM_REVERIFY_IF = (
     "${{ inputs.mode == 'review' && needs.run.outputs.identity_refusal == '' }}")
@@ -22638,7 +22793,8 @@ def _identity_step(steps):
 
 def _identity_block_run(script, *, full_name="o/r", default_branch="main",
                         login="registry-admin[bot]", user_id="42",
-                        pr_author="registry-admin[bot]", target_repo="o/r"):
+                        pr_author="registry-admin[bot]", target_repo="o/r",
+                        self_attested=False, target_app_token=True, private=False):
     """EXECUTE review-fix.yml's target-identity python over one shaped input; return the outputs
     the WORKFLOW's own code bound.
 
@@ -22654,13 +22810,21 @@ def _identity_block_run(script, *, full_name="o/r", default_branch="main",
         user_json = Path(tmp) / "app-user.json"
         out_file = Path(tmp) / "github-output"
         repo_json.write_text(json.dumps(
-            {"full_name": full_name, "default_branch": default_branch}), encoding="utf-8")
-        user_json.write_text(json.dumps({"login": login, "id": user_id}), encoding="utf-8")
+            {"full_name": full_name, "default_branch": default_branch, "private": private}),
+            encoding="utf-8")
+        # [registry #1288] With no App token minted the workflow writes an EMPTY object here, so
+        # the harness must feed the block the same thing. Fabricating an App identity the run
+        # could not have obtained would prove a property the production job does not have.
+        user_json.write_text(
+            json.dumps({"login": login, "id": user_id} if target_app_token else {}),
+            encoding="utf-8")
         out_file.write_text("", encoding="utf-8")
         saved_argv, saved_env = sys.argv, dict(os.environ)
         sys.argv = ["-", str(repo_json), str(user_json)]
         os.environ.update({"TARGET_REPO": target_repo, "PR_AUTHOR": pr_author,
-                           "GITHUB_OUTPUT": str(out_file)})
+                           "GITHUB_OUTPUT": str(out_file),
+                           "SELF_ATTESTED": "true" if self_attested else "false",
+                           "TARGET_APP_TOKEN": "true" if target_app_token else "false"})
         try:
             exec(compile(block, "<review-fix.yml target identity>", "exec"),  # noqa: S102
                  {"__name__": "__rf_identity__"})
@@ -22832,6 +22996,10 @@ _IDENTITY_SEAM_DECLARED_CONTAINMENT = {
     # Membership in the dict of OUTPUTS the workflow's own python actually BOUND (parsed from the
     # step's GITHUB_OUTPUT file), not in its source text.
     ("_identity_block_violations", "'refusal' in ok_bound"),
+    # ...and the same thing for the [registry #1288] self-attested admission row: `sa_bound` is
+    # the dict of outputs the workflow's own python BOUND on a tokenless self-attested run, so
+    # this is membership in a runtime result, not in workflow source.
+    ("_identity_block_violations", "'refusal' in sa_bound"),
     # Membership in the ARGV the recorder was actually INVOKED with — a runtime value produced by
     # executing the step, not a substring of the step.
     ("_identity_record_violations", "'identity-refusal' in argv"),
@@ -22883,14 +23051,45 @@ def _identity_block_violations(step):
             return ["jobs.run step `target` has no `run:` script"]
         ok_code, ok_bound = _identity_block_run(script)
         no_code, no_bound = _identity_block_run(script, pr_author="some-human")
+        # [registry #1288] The self-attested path, driven three ways: the admission, and the two
+        # refusals that ARE the property replacing the author check on it.
+        sa_code, sa_bound = _identity_block_run(
+            script, pr_author="jeswr", self_attested=True, target_app_token=False)
+        sa_tok_code, sa_tok_bound = _identity_block_run(
+            script, pr_author="jeswr", self_attested=True, target_app_token=True)
+        sa_priv_code, sa_priv_bound = _identity_block_run(
+            script, pr_author="jeswr", self_attested=True, target_app_token=False, private=True)
     except Exception as exc:      # noqa: BLE001 — an unrunnable seam proves nothing
         return [f"jobs.run step `target` could not be executed ({exc!r}), so the #972 exit "
                 "cannot be proved — treated as broken"]
     out = []
     if ok_code != 0 or ok_bound.get("bot_login") != "registry-admin[bot]" \
-            or "refusal" in ok_bound:
+            or ok_bound.get("verified") != "yes" or "refusal" in ok_bound:
         out.append(f"the identity block no longer ADMITS a genuine App-bot-authored PR "
                    f"(exit={ok_code!r}, bound={ok_bound!r})")
+    # [registry #1288] The three self-attested rows. The first is the delivery this change exists
+    # to buy; the second and third are the ONLY things standing where the App-author check used to.
+    if sa_code != 0 or sa_bound.get("verified") != "yes" or "refusal" in sa_bound:
+        out.append(f"the identity block no longer ADMITS the #657 self-attested class on a "
+                   f"tokenless run (exit={sa_code!r}, bound={sa_bound!r}) — the lane delivers "
+                   "nothing again")
+    if sa_bound.get("bot_login"):
+        out.append(f"the identity block BINDS a bot_login on the self-attested path "
+                   f"(bound={sa_bound!r}) — there is no App identity there to bind, and a "
+                   "non-empty value would be a fabrication downstream steps then trust")
+    if sa_tok_code != 0 or sa_tok_bound.get("verified") == "yes" \
+            or not sa_tok_bound.get("refusal"):
+        out.append(f"the identity block ADMITS the self-attested class WHILE A TARGET APP TOKEN "
+                   f"EXISTS (exit={sa_tok_code!r}, bound={sa_tok_bound!r}) — that token is "
+                   "exactly the authority the App-author check was guarding, and this refusal is "
+                   "what replaces it. Re-adding the mint would silently hand a model a "
+                   "target-scoped token on a PR this App did not author")
+    if sa_priv_code != 0 or sa_priv_bound.get("verified") == "yes" \
+            or not sa_priv_bound.get("refusal"):
+        out.append(f"the identity block ADMITS the self-attested class against a PRIVATE target "
+                   f"(exit={sa_priv_code!r}, bound={sa_priv_bound!r}) — the whole affordability "
+                   "argument for dropping the token is that everything the review path reads is "
+                   "readable without target authority")
     if no_bound.get("bot_login"):
         out.append(f"the identity block BINDS bot_login on a refused PR (bound={no_bound!r}) — "
                    "the fail-closed stop would not fire and the run would continue past an "
@@ -22952,6 +23151,36 @@ def _identity_refusal_seam_violations(document):
         # ...and it must actually FAIL, proved by EXECUTING it — never by looking for `exit 1` in
         # its text, which four independently green mutants satisfy while the stop is inert.
         out.extend(_identity_stop_violations(stop))
+
+    # (3b) [registry #1288] THE TOKEN DROP, at the YAML seam. The two `if:` expressions below are
+    #      what make "this job holds no target authority for the self-attested class" true in
+    #      production, and both are compared for EQUALITY: widening the mint back to a bare
+    #      `inputs.mode == 'review'` would re-create precisely the state the author gate used to
+    #      cover and this admission rule no longer does.
+    run_steps = run_job.get("steps") if isinstance(run_job.get("steps"), list) else []
+    mint = next((s for s in run_steps if isinstance(s, dict)
+                 and s.get("id") == "app-token-review"), None)
+    if mint is None:
+        out.append("jobs.run has no step with id `app-token-review` — the token drop has no "
+                   "anchor, so nothing pins which runs hold a target-scoped App token")
+    elif mint.get("if") != _IDENTITY_SEAM_REVIEW_MINT_IF:
+        out.append(f"jobs.run step `app-token-review` `if:` must be EXACTLY "
+                   f"{_IDENTITY_SEAM_REVIEW_MINT_IF!r} (found {mint.get('if')!r}) — the #657 "
+                   "self-attested class is admitted to the review lane WITHOUT the App-author "
+                   "check, and what replaces that check is that no target-scoped token exists in "
+                   "the job running the model")
+    void = next((s for s in run_steps if isinstance(s, dict) and s.get("id") == "round-void"),
+                None)
+    if void is None:
+        out.append("jobs.run has no step with id `round-void` — the review path's remaining "
+                   "target write is unpinned")
+    elif void.get("if") != _IDENTITY_SEAM_ROUND_VOID_IF:
+        out.append(f"jobs.run step `round-void` `if:` must be EXACTLY "
+                   f"{_IDENTITY_SEAM_ROUND_VOID_IF!r} (found {void.get('if')!r}) — it is a TARGET "
+                   "write, so it cannot run for a class that holds no target token, and the "
+                   "ledger attempt store that replaces its accounting is deliberately "
+                   "eraser-free: nothing downstream of the model may extend the round budget "
+                   "that bounds it")
 
     # (4) The outcome job must ADMIT the refusal path...
     if outcome_job.get("if") != _IDENTITY_SEAM_OUTCOME_IF:

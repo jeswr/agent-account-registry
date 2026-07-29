@@ -1488,20 +1488,33 @@ def _self_test():                                                       # noqa: 
                             ("'yes'", "yes"), ("[]", []), ("a truthy object", MintError("x"))):
         check(f"a non-True probe answer ({_label}) is a refusal",
               review_run_refusal(lambda v=_answer: v) is not None, True)
-    # THE KNOWN NEGATIVE, BY EXECUTION against the REAL workflow file. The live gate refuses this
-    # class today, so the live mint must refuse too. This row goes RED the day the identity gate is
-    # widened — which is exactly the day this whole refusal should disappear.
-    check("the LIVE identity gate does not admit the orchestrator class",
-          dispatch_claim.review_fix_identity_admits_orchestrator_class(), False)
+    # THE KNOWN POSITIVE, BY EXECUTION against the REAL workflow file.
+    #
+    # [registry #1288] THIS ROW FLIPPED, AND THAT IS THE DESIGN WORKING, NOT AN EXEMPTION. It read
+    # `False` and carried the note "this row goes RED the day the identity gate is widened — which
+    # is exactly the day this whole refusal should disappear". That day is this commit: the `run`
+    # job now admits the self-attested class (into a job holding no target token), so the refusal
+    # self-removes and the class mints again. The predicate above is untouched — every injected-
+    # probe row still proves it refuses when the gate does — and only the LIVE answer moved.
+    check("the LIVE identity gate ADMITS the orchestrator class",
+          dispatch_claim.review_fix_identity_admits_orchestrator_class(), True)
     # AND IT IS WIRED, driven by the LIVE probe rather than an injected one: a run-gate predicate
     # nothing calls is the vacuity shape this repo keeps measuring.
     decision, written = run_mint(apply_changes=True, identity_admits=None)
-    check("mint() REFUSES on the live identity gate and writes NOTHING",
-          (decision.action, written), (ACTION_REFUSE, []))
+    check("mint() MINTS on the live identity gate — the class is deliverable again",
+          (decision.action, written), (ACTION_MINT, ["put"]))
+    # ...and the WIRING is still proved, by the direction that is now the injected one: a refusing
+    # gate must still stop the write at this exact call site. Without this row the live row above
+    # would be satisfied by a `mint()` that stopped consulting the run gate at all — which is
+    # precisely the vacuity the flip could otherwise smuggle in.
+    _refused, _refused_written = run_mint(apply_changes=True, identity_admits=lambda: False)
+    check("...and a REFUSING gate still stops mint() dead, writing nothing",
+          (_refused.action, _refused_written), (ACTION_REFUSE, []))
     check("...naming the run, not the record and not the enumerator",
-          "target-App identity gate" in decision.reason, True)
+          "target-App identity gate" in _refused.reason, True)
     # ...and BOTH upstream gates passed on this very PR, which is precisely why neither could catch
-    # it. Without these two rows the refusal above could be any of the three gates firing.
+    # the run-layer refusal while it stood. They are what made "enumerability is not deliverability"
+    # measurable, and they must keep passing now that delivery works.
     check("...while the record itself was admissible",
           admissible_by_the_review_lane(minted.document, 41,
                                         dispatch_claim.provenance_admission_error), None)
@@ -1649,18 +1662,36 @@ def _self_test():                                                       # noqa: 
                          enumerate_review_items=dispatch_claim.enumerate_review_items,
                          now=1_800_000_000, identity_admits=lambda: True)[0],
           CENSUS_NO_ISSUE)
-    # THE CENSUS CANNOT DRIFT FROM THE MINT. With the LIVE identity gate — no injection — the row
-    # that reads MINTABLE above becomes MINTABLE-BUT-DEAD, and says why. A census still offering
-    # `mint with --issue <n>` for a PR `mint()` refuses is the exact divergence census_verdict's
-    # contract forbids, and this is the row that measures it.
+    # THE CENSUS CANNOT DRIFT FROM THE MINT, and the contract is symmetric: it must not offer a
+    # mint the writer would refuse, and it must not report DEAD a class the writer would mint.
+    #
+    # [registry #1288] These rows flipped with the gate. Under the LIVE gate the census now agrees
+    # with the LIVE mint that row 41 is MINTABLE — and the DEAD direction is preserved directly
+    # below by INJECTING a refusing gate, so the branch keeps its coverage instead of losing it to
+    # the flip.
     _live_verdicts, _live_lines = run_census(census_mods=modules)
-    check("with the LIVE identity gate the census reports the class DEAD, not MINTABLE",
-          [row[1] for row in _live_verdicts if row[0] == 41], [CENSUS_DEAD])
-    check("...and the row names the gate that refuses, and the issue that did bind",
-          all(needle in next(line for line in _live_lines if line.startswith("census o/r#41:"))
+    check("with the LIVE identity gate the census reports the class MINTABLE, matching mint()",
+          [row[1] for row in _live_verdicts if row[0] == 41], [CENSUS_MINTABLE])
+    check("...and the row again offers the operator the exact issue to pass",
+          any("mint with --issue 7" in line for line in _live_lines), True)
+
+    class _RefusingClaim:
+        def __getattr__(self, name):                     # delegate everything else, unchanged
+            return getattr(dispatch_claim, name)
+
+        @staticmethod
+        def review_fix_identity_admits_orchestrator_class(*_a, **_k):
+            return False
+
+    _dead_verdicts, _dead_lines = run_census(
+        census_mods=(worker_pr, _RefusingClaim(), lease_schema))
+    check("...and a REFUSING identity gate still reports the class DEAD, not MINTABLE",
+          [row[1] for row in _dead_verdicts if row[0] == 41], [CENSUS_DEAD])
+    check("...naming the gate that refuses, and the issue that did bind",
+          all(needle in next(line for line in _dead_lines if line.startswith("census o/r#41:"))
               for needle in ("target-App identity gate", "issue #7 binds")), True)
     check("...so no census line offers a mint the writer would refuse",
-          any("mint with --issue" in line for line in _live_lines), False)
+          any("mint with --issue" in line for line in _dead_lines), False)
     # ...and the property that keeps that true for a caller that does not exist yet. The rows above
     # all drive the ONE current call site, which passes the probe explicitly — so giving the
     # parameter a permissive default survived every one of them (measured: mutant M17). The
