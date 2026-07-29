@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1093,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7b0afa49f10d753cd317cc069fb69f0c1ba0a5a3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly replaces both hard-coded `task` inputs with the issue's real GitHub type while preserving fail-closed behavior. Event triage passes the payload value through a quoted environment variable; retriage reads the mutable type live, distinguishes the legitimate null/untyped representation from absent or malformed schema, and forwards it to the single normalizer. Role precedence still protects trust-surface, explicit-role, kind, UI, and infrastructure routes before type/area fallback. The added tests are non-vacuous at the important seams: they pin the workflow binding and exact forwarded argv value, exercise the real apply call paths, reject malformed live documents without writes, and demonstrate different written roles for typed versus untyped `area:docs` issues. No reviewer-directed instruction was found in the diff.",
+  "verdict": "approve"
+ }
+}
