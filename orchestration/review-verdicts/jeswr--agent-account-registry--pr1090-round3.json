@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1090,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8e1d56f1ad7830d022cf184b075d2d2e408a09a2",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 major finding is addressed. The rewrite guard resolves the operator-supplied spelling to its final full ref before checking the `refs/heads/` boundary, then consistently passes that validated full name to the pre-scan, filter-branch, and post-scan. The added real Git fixture creates a `refs/heads/ledger-purge` symbolic ref targeting `refs/remotes/origin/ledger`, verifies that resolution refuses it at the namespace guard, confirms neither the target nor alias moved, and confirms no `refs/original/` backup was created. A direct local branch remains covered as the positive control. I found no new correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
