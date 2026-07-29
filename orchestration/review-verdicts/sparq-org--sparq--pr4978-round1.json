@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4978,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d732010c05dc999ee0ba00f7e68145c1df724be5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The draft-only skip is correctly limited to the cargo-fuzz corpus-replay job, preserves non-PR runs and the existing fail-closed selection guard, and allows standing ci-full/fuzz-full labels to override the skip. The existing ready_for_review trigger ensures the same PR head is replayed after leaving draft state, while differential-smoke remains active on drafts. The behavioral tests exercise unlabelled and unrelated-labelled drafts, both override labels, non-draft and non-PR events, and composition with label-flip suppression. The test expression evaluator's object-filter support is appropriately scoped and handles absent paths without raising. Documentation matches the workflow behavior.",
+  "verdict": "approve"
+ }
+}
