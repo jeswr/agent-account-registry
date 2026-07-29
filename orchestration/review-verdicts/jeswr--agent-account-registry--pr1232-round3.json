@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1232,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a3b478a2b29b52bb08809f6e2a27f067221e26da",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 remains sound under the adversarial trust-plane review. Artifact names are treated only as claims and are admitted as evidence solely after exact workflow-path, default-branch, scheduled-event, and run-ID provenance checks. Run creation time prevents late reruns from reordering history, and one record per run prevents duplicate rerun uploads from inflating a streak. Refused or malformed evidence cannot page or close alerts; owner gaps remain isolated; all write paths are limited to owner-keyed ops-alert issues. The workflow preserves the mint-to-marker-to-upload-to-sweep ordering, uses SHA-pinned actions and least-privilege permissions, keeps the watchdog ungated from groom, and runs its non-vacuous self-test before the live detector. The producer/consumer grammar, exact per-owner outcome mapping, deletion mutants, live subprocess readers, failure return codes, sparse inputs, cadence/retention bounds, and suite enrollment are directly covered. No blocker, major, minor, or nit finding is supported by the diff. With round 2 also approved with zero findings, progress is stagnant by the required scale.",
+  "verdict": "approve"
+ }
+}
