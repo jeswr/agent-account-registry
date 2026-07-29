@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5014,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "83896dd3edbfdb4d05936ba6b620b33d652ff401",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`build_field` sets `iri_only` for only the singleton `sh:IRI` case, then applies it solely in the `None if iri_only` match arm. When the same property has `sh:datatype`, `sh:class`, or `sh:node`, the node-kind requirement is discarded. For example, `sh:datatype xsd:string; sh:nodeKind sh:IRI` is unsatisfiable, but lowering emits a scalar String field whose generated loader accepts an `xsd:string` literal. Other node-kind sets fall through the wildcard arm and become unconstrained when no other source exists. This is the same wrong-acceptance defect reported in round 5 and contradicts the documented guarantee that constraints which cannot be modeled faithfully produce `SchemaError`.",
+    "file": "crates/sparq-wrapper-shacl/src/lower.rs",
+    "fix_hint": "Represent node-kind requirements in the lowering constraint accumulator and conjoin them with datatype/class/node requirements. Return a typed `SchemaError` whenever the conjunction cannot be faithfully enforced; do not discard it. Add an end-to-end generated-loader test for contradictory `sh:datatype xsd:string` plus `sh:nodeKind sh:IRI` that proves lowering fails closed (or that nonconforming values are rejected), and add coverage for supported or explicitly rejected non-IRI node-kind constraints.",
+    "severity": "major",
+    "title": "Combined sh:nodeKind constraints are still silently dropped"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 6 is stagnant: the round-5 major correctness issue remains. `build_field` records only the singleton `sh:nodeKind sh:IRI` case in `iri_only`, and uses it only when no datatype/class/node source exists. Consequently a combined constraint such as `sh:datatype xsd:string; sh:nodeKind sh:IRI` lowers to a String scalar and the generated loader accepts a literal even though the conjunction is unsatisfiable. Other node-kind sets are still ignored as well. The new tests cover only standalone `sh:nodeKind sh:IRI`; none exercises conjunction or non-IRI node kinds, so the advertised fail-closed faithful-lowering contract is not established.",
+  "verdict": "request_changes"
+ }
+}
