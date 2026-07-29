@@ -1541,8 +1541,9 @@ def classify_records(records, provider_accounts, now, open_alerts=()):
       provider-capped    : EVERY enabled account's LATEST limit/success outcome is limit-class.
       account-auth-cooldown: >=AUTH_COOLDOWN_MIN consecutive `auth` outcomes put one or more of the
                            provider's accounts in a bounded credential cooldown (registry #596).
-      zero-dispatch      : >=3 consecutive zero-dispatch ticks (provider == 'fleet'), and the
-                           newest fleet tick is not `idle` (an empty ready frontier — issue #341).
+      zero-dispatch      : >=3 consecutive zero-dispatch ticks (provider == 'fleet'). An `idle`
+                           tick (an empty ready frontier — issue #341) BREAKS the run, so a newest
+                           `idle` recovers at once and re-entry needs a fresh threshold-length run.
     """
     records, _ = _no_change_limit_view(records, now)
     # Live per-account credential cooldowns (registry #596), derived from the SAME window. Keyed by
@@ -1564,31 +1565,33 @@ def classify_records(records, provider_accounts, now, open_alerts=()):
         # record on every productive planned>0 tick (review defect #5), so the tail run below
         # resets on a real dispatch and the fire=False action closes an open alert.
         if provider == "fleet":
-            # [#341] An `idle` tick (empty ready frontier) is TRANSPARENT to the consecutive run:
-            # it neither extends nor breaks it, which is EXACTLY the pre-#341 semantics, when such
-            # a tick recorded nothing at all. Letting it break the run would quietly desensitise
-            # the alert — `zd, idle, zd, zd` fires today and must keep firing.
+            # [#341] An `idle` tick (empty ready frontier) is a BOUNDARY, exactly as a productive
+            # dispatch-success is. The condition being counted is "the dispatcher launched nothing
+            # WHILE WORK WAS READY"; an `idle` tick is a POSITIVE observation that no work was
+            # ready, so it is not absence of evidence (which is what an unrecorded pre-#341 empty
+            # tick was) — it is evidence that the condition did not hold on that tick, and a tick
+            # where the condition did not hold cannot sit inside a run of consecutive ticks where
+            # it did.
             #
-            # What `idle` DOES decide is the present tense. The condition is "the dispatcher
-            # launched nothing WHILE WORK WAS READY", so once the newest fleet tick reports an
-            # empty frontier that claim is no longer true and the alert recovers on the spot,
-            # instead of waiting up to WINDOW_HOURS for the stale zero-dispatch records to age out
-            # into #205's orphan path.
+            # This is also what keeps recovery from FLAPPING. Treating `idle` as transparent while
+            # still recovering on a newest-`idle` tick is asymmetric: `zd, zd, zd, idle` closes the
+            # alert, and then a single `zd` reopens it on the spot because all three pre-idle
+            # records are still in the tail — the threshold would mean nothing on re-entry. As a
+            # boundary, the run restarts at the empty frontier and ZERO_DISPATCH_MIN fresh failing
+            # ticks are required to page again.
             #
-            # `quiet` is read ONLY alongside a threshold-length run below, so `not quiet` and
-            # `not (quiet and zd_tail)` are the same predicate — that second form is a declared
-            # EQUIVALENT mutant, not a hole in the suite.
+            # Immediate recovery falls out of the same rule rather than needing its own guard: a
+            # newest `idle` breaks the scan at the first record, so the tail is empty and the alert
+            # closes on the spot instead of waiting up to WINDOW_HOURS for the stale zero-dispatch
+            # records to age out into #205's orphan path. `quiet` therefore only selects the reason
+            # text — it says WHY the alert closed (nothing to launch vs. dispatch resumed).
             quiet = prov_records[-1].get("exit_class") == CLASS_IDLE
             zd_tail = []
             for r in reversed(prov_records):
-                cls = r.get("exit_class")
-                if cls == CLASS_ZERO_DISPATCH:
-                    zd_tail.append(r)
-                elif cls == CLASS_IDLE:
-                    continue
-                else:
+                if r.get("exit_class") != CLASS_ZERO_DISPATCH:
                     break
-            fire = len(zd_tail) >= ZERO_DISPATCH_MIN and not quiet
+                zd_tail.append(r)
+            fire = len(zd_tail) >= ZERO_DISPATCH_MIN
             actions.append({
                 "condition": "zero-dispatch",
                 "provider": "fleet",
@@ -2107,7 +2110,9 @@ def fleet_idle_is_redundant(records, now):
     would evict the real per-provider health signal the outage/transient/capped conditions are
     derived from — a recovery mechanism that blinds the detectors it shares a window with is a net
     loss. Suppressing the redundant repeat bounds the fleet's idle records at ONE PER TRANSITION
-    into quiet, which is exactly the evidence classify_records reads (the NEWEST fleet record).
+    into quiet, which is exactly the evidence classify_records needs: it reads an `idle` record as
+    a BOUNDARY that ends the consecutive zero-dispatch run, and a run of idle ticks collapses into
+    a single boundary, so the suppressed repeats carry no information the first record does not.
 
     It costs no extra API call: append_record already reads the ledger before its CAS write, so
     this runs on records that are in hand. The suppressed case skips the WRITE outright.
@@ -3064,33 +3069,43 @@ def _self_test():
     chk("zero-dispatch ACT (claim-abort completes the run)",
         fires(classify_records(zd_abort, {}, now + 300), "zero-dispatch", "fleet"), True)
 
-    # ---- [#341] the EMPTY-FRONTIER (`idle`) tick: recovery without desensitising the alert -----
+    # ---- [#341] the EMPTY-FRONTIER (`idle`) tick: a boundary, so recovery cannot flap -----------
     # (i) RECOVERY. A firing run followed by one empty-frontier tick recovers immediately, because
     #     "launched nothing WHILE WORK WAS READY" stops being true the moment the frontier empties.
     #     Before #341 this window fired for up to WINDOW_HOURS (the run's records are all still
-    #     here — only their staleness changed). Deleting `and not quiet` flips this red.
+    #     here — only their staleness changed).
     zd_idle = zd + [zrec(CLASS_IDLE, 400)]
     chk("zero-dispatch RECOVERS on an empty-frontier (idle) tick",
         fires(classify_records(zd_idle, {}, now + 500), "zero-dispatch", "fleet"), False)
     chk("the idle recovery says WHY it recovered (empty frontier, not 'placing work again')",
         _action(classify_records(zd_idle, {}, now + 500), "zero-dispatch", "fleet")["reason"],
         "the ready frontier is empty — there is no work to launch")
-    # (ii) NON-DESENSITISATION, the half that makes (i) safe. An idle tick is TRANSPARENT to the
-    #      consecutive run — exactly as it was when an empty tick recorded nothing at all. These
-    #      four ticks contain THREE zero-dispatch ticks with one idle tick interleaved, so the run
-    #      still reaches the threshold and still pages. Making `idle` BREAK the run (the obvious
-    #      simplification) leaves only two and flips this red — a real stall that flaps through one
-    #      quiet tick would then never page.
+    # (ii) NO FLAPPING, the half that makes (i) safe. `idle` BREAKS the run, so the recovered
+    #      window above does NOT reopen on the first zero-dispatch tick after it: the three
+    #      pre-idle records are behind the boundary and only ONE failing tick has been observed
+    #      since the frontier was seen empty. Skipping `idle` in the reverse scan (`continue`
+    #      instead of `break`) leaves a 4-long tail here and flips this red.
+    zd_reentry = zd_idle + [zrec(CLASS_ZERO_DISPATCH, 460, "i9")]
+    chk("zero-dispatch does NOT reopen on the first zero tick after an idle boundary",
+        fires(classify_records(zd_reentry, {}, now + 500), "zero-dispatch", "fleet"), False)
+    # ...and the threshold is genuinely re-armed, not permanently disarmed: ZERO_DISPATCH_MIN
+    # fresh failing ticks after the boundary page again.
+    zd_rearm = zd_idle + [zrec(CLASS_ZERO_DISPATCH, 460 + i * 60, f"i{i}")
+                          for i in range(ZERO_DISPATCH_MIN)]
+    chk("zero-dispatch RE-ARMS: a full fresh run after the idle boundary pages again",
+        fires(classify_records(zd_rearm, {}, now + 900), "zero-dispatch", "fleet"), True)
+    # (iii) the same boundary mid-window: these four ticks hold THREE zero-dispatch ticks, but one
+    #       idle tick splits them 1 + 2, so no run reaches the threshold and nothing pages.
     zd_interleaved = [zrec(CLASS_ZERO_DISPATCH, 0, "i0"), zrec(CLASS_IDLE, 60, "i1"),
                       zrec(CLASS_ZERO_DISPATCH, 120, "i2"), zrec(CLASS_ZERO_DISPATCH, 180, "i3")]
-    chk("zero-dispatch ACT: an interleaved idle tick does NOT reset the consecutive run",
-        fires(classify_records(zd_interleaved, {}, now + 300), "zero-dispatch", "fleet"), True)
-    # (iii) a fleet that has only ever been idle pages nothing at all...
+    chk("zero-dispatch DO-NOTHING: an interleaved idle tick RESETS the consecutive run",
+        fires(classify_records(zd_interleaved, {}, now + 300), "zero-dispatch", "fleet"), False)
+    # (iv) a fleet that has only ever been idle pages nothing at all...
     chk("an idle-only fleet window never fires",
         fires(classify_records([zrec(CLASS_IDLE, i * 60, f"q{i}") for i in range(4)], {},
                                now + 300), "zero-dispatch", "fleet"), False)
-    # (iv) ...and a productive tick AFTER the quiet stretch still breaks the run outright, so the
-    #      idle records cannot resurrect a stale run once real dispatch resumes.
+    # (v) ...and a productive tick AFTER the quiet stretch still breaks the run outright, so the
+    #     idle records cannot resurrect a stale run once real dispatch resumes.
     chk("a dispatch-success after an idle stretch still breaks the run",
         fires(classify_records(zd_idle + [zrec(SUCCESS, 460)], {}, now + 500),
               "zero-dispatch", "fleet"), False)
