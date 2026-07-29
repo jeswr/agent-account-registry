@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4976,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "09bcba21885acff487e7bffad0a22e2133c3f24e",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 finds no correctness, soundness, test-validity, or security issue. Enforcement consistently keys sensitive detection, test-leg coverage, and the documented escape hatch by (crate, feature); blank reasons do not exempt a leg. The focused 59-test suite passes, and the cross-crate regression exercises the real cmd_enforce path with detector preconditions rather than a mock. The sparq-py/arrow exception remains narrowly scoped and documented. Because round 2 also had no findings, progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
