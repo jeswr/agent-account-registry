@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1111,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "488c731b056838171c7a584876850da4a85e10e8",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Both ownership probes pass `is_human=lambda login: login.casefold() == args.maintainer.casefold()`. `label_application_machine_owned` defines every non-App label event whose actor fails that probe as machine-owned. Consequently, a direct `review:needs-user` or source `needs:user` application by any human maintainer/collaborator other than the single configured login authorizes this sweep to clear the hold. The workflow does not supply `--maintainer`, so the only recognized human is the default `jeswr`, including on `sparq-org` targets. This contradicts the receipt's promise that a human can reapply the label and no automation may override it, and opens an automatic transition based on author identity without a real permission/association check.",
+    "file": "scripts/adjudicate-stuck.py",
+    "fix_hint": "Use the repository's strict collaborator-permission human probe (the same permission-based predicate used by the existing worker flow) for every timeline actor, with lookup failures resolving to human-owned/not-clearable. Add entry-point tests with a non-default authorized human applying each of the PR and issue holds and assert that no comment or label write occurs; keep separate bot/App-driven controls proving the machine-owned path remains reachable.",
+    "severity": "major",
+    "title": "Human holds from every maintainer except one are treated as machine-owned"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe two prior operational findings are materially addressed: population payloads are validated, write failures are distinguished and fatal, all-row operational failure exits nonzero, and the workflow consumes those statuses. However, the new automatic-unpark path does not actually prove that the label actor was non-human. It recognizes only one configured login as human, so a label applied directly by any other human maintainer/collaborator is classified as machine-owned and may be removed. Because this is a new major trust-boundary finding in round 2, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
