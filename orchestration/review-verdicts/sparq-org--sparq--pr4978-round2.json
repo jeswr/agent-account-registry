@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4978,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d732010c05dc999ee0ba00f7e68145c1df724be5",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and complete. The draft-only guard is confined to the cargo-fuzz corpus-replay job, preserves push/schedule/workflow_dispatch and non-draft execution, retains the fail-closed selection condition, and lets standing ci-full/fuzz-full labels override the draft skip. The existing label-event guard still suppresses unrelated label flips. The ready_for_review trigger described in the workflow ensures replay after undrafting, while differential-smoke remains active on drafts. The behavioral tests exercise the live combined expression across draft, label-override, unrelated-label, non-draft, and non-PR cases; the object-filter evaluator supports the exact labels.*.name syntax and safely handles an absent labels path. Documentation matches the workflow. No embedded reviewer-directed instruction was detected in the diff. Findings are unchanged from round 1 (none).",
+  "verdict": "approve"
+ }
+}
