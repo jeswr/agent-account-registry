@@ -734,16 +734,73 @@ def owned_by_review_rebase_lane(pr, repo, claim):
 
     FORK GATE FIRST. It is hoisted out of the middle of the `and` chain — order inside a boolean
     chain is irrelevant, so the point is not sequencing but that the one predicate no waiver may
-    ever reach is not fused with the two that #657 waives elsewhere."""
+    ever reach is not fused with the two that #657 waives elsewhere.
+
+    THE HOLD GATES ARE THE LANE'S, NOT COPIES (issue #1301). The three predicates above test the
+    PRODUCER shape — "did the worker lane make this PR?" — and the paragraph at the top says the
+    cede is sound only while the lane will TAKE it. Those are different questions, and for the
+    whole live population they gave different answers. MEASURED 2026-07-29 against the live fleet:
+    conflict-resolver run 30479952962 ceded 20 CONFLICTING PRs as `review-lane-owned`, and
+    dispatch run 30480407955 — seven minutes later, same board — printed a `review-enumeration:
+    exclude` line for ALL TWENTY, plus `::warning:: 17 worker PR(s) have a conflicting base but
+    ZERO needs-rebase repair item(s) were enumerated` for sparq-org/sparq and the same at 5 for
+    this repository. Every one of the 20 carried `needs:user`, `review:needs-user` or
+    `review:parked`; `review_items` drops the first two at `HUMAN_HOLD_PR_LABELS` and the third at
+    `MACHINE_PARK_PR_LABEL`, both BEFORE any state is emitted. So the hand-over had no receiver,
+    and a CONFLICTING PR gets no `pr-gate` run at all — 20 PRs with no machine exit on either
+    side, which is the mutual-deferral shape, not conservatism.
+
+    The three labels are READ FROM `claim`, never re-spelled here. A local copy is how the two
+    halves drift back apart: the lane adding a fourth hold would silently re-open the hole, and
+    with the sets shared it cannot. `--self-test` iterates `claim.HUMAN_HOLD_PR_LABELS |
+    {claim.MACHINE_PARK_PR_LABEL}` rather than a literal list for the same reason.
+
+    NOT A WEAKENING OF ANY HUMAN HOLD. `_process_pr` reaches this predicate only AFTER
+    `_classify_holds` has proven every live `HARD_EXCLUDE_LABELS` member MACHINE-applied — a
+    human-applied one returns at `hard-exclusion-label` and never arrives here. Refusing to cede
+    therefore hands the PR to this program's OWN bounded path (one attempt marker, one mechanical
+    rebase, then the two-head/grace escalations), which is the strongest thing reachable past this
+    gate: never a merge, never an arm.
+
+    WHAT IS DELIBERATELY *NOT* MIRRORED. `review_items` also refuses on registry provenance, on a
+    `needs:*` label on the SOURCE issue, and on a live sibling package lease. Those need the
+    registry ledger and the lease store, which this program does not read, so the predicate stays
+    a NECESSARY-condition test: everything it still cedes may yet be refused downstream for one of
+    those reasons. That residual is real and is tracked, not papered over — but on the live
+    population it is empty, because the label gates alone account for all 20."""
     head = pr.get("head") or {}
     if (head.get("repo") or {}).get("full_name") != repo:
         return False
     login = str((pr.get("user") or {}).get("login", ""))
-    return bool(
+    if not (
         claim.FIX_KIND_OF_STATE.get("needs-rebase") == "rebase"
         and claim.HEAD_REF_RE.match(str(head.get("ref", "")))
         and login.endswith("[bot]")
-    )
+    ):
+        return False
+    return not (_label_names(pr) & review_lane_refusing_labels(claim))
+
+
+def review_lane_refusing_labels(claim):
+    """The hold labels on which `review_items` refuses a PR outright, read from the LANE.
+
+    One accessor so the cede predicate and its self-test consume the same set — a test that
+    re-spells the labels would keep passing on the day the lane grows a fourth one. Fail-closed on
+    a malformed export: anything that is not a non-empty string is dropped, and a set that ends up
+    EMPTY raises rather than silently ceding everything, because "the lane refuses nothing" is not
+    a state this program may infer from a broken import."""
+    labels = {
+        value
+        for value in set(getattr(claim, "HUMAN_HOLD_PR_LABELS", ()) or ())
+        | {getattr(claim, "MACHINE_PARK_PR_LABEL", None)}
+        if isinstance(value, str) and value
+    }
+    if not labels:
+        raise ResolverError(
+            "dispatch-claim exports no review-lane hold labels, so which PRs that lane will "
+            "refuse cannot be determined and none may be ceded to it"
+        )
+    return labels
 
 
 def validate_syntax_blob(path, content):
@@ -2306,6 +2363,67 @@ def _self_test():
         api_worker, snapshot, claim, [repo], bot_login, True, 5, worker_rebaser
     ).run()
     check("needs-rebase worker lane is never double-owned", worker_rebaser.calls, [])
+
+    # --- [registry #1301] THE CEDE IS ONLY SOUND WHERE THE LANE ADMITS ------------------------
+    # The row directly above proves the hand-over HAPPENS. Nothing proved it happened only to PRs
+    # the lane takes, and on the live fleet it did not: 20 of 20 ceded PRs carried a label
+    # `review_items` refuses outright, so `--max-rebases 5` was being spent on nobody while the
+    # dispatcher warned "ZERO needs-rebase repair item(s) were enumerated" on the same board.
+    #
+    # DRIVEN FROM THE LANE'S OWN SET, not a literal list. A test that re-spelled the three labels
+    # would keep passing on the day `review_items` grows a fourth hold — the exact drift that
+    # produced this defect. Every label the lane refuses is asserted in BOTH directions: carrying
+    # it must reach the rebaser (this program owns the PR), and the identical PR without it must
+    # be ceded (the hand-over still works). A one-directional row passes for a predicate that
+    # simply stopped ceding anything.
+    refusing = review_lane_refusing_labels(claim)
+    check("[#1301] the refusing set is the lane's own three hold labels",
+          sorted(refusing), sorted({"needs:user", "review:needs-user", "review:parked"}))
+    ceded, owned = [], []
+    for index, hold in enumerate(sorted(refusing)):
+        held_pull = pull(700 + index, f"{index}" * 40, author=bot_login,
+                         ref=f"sparq-agent/issue-{700 + index}-1-1", labels=(hold,))
+        clean_pull = pull(750 + index, f"{index}" * 40, author=bot_login,
+                          ref=f"sparq-agent/issue-{750 + index}-1-1")
+        if owned_by_review_rebase_lane(held_pull, repo, claim):
+            ceded.append(hold)
+        if not owned_by_review_rebase_lane(clean_pull, repo, claim):
+            owned.append(hold)
+    check("[#1301] NO label the review lane refuses is ceded to it", ceded, [])
+    check("[#1301] ...and removing that label restores the hand-over", owned, [])
+    # END TO END, because the predicate is not the behaviour. A worker-shaped PR carrying a
+    # MACHINE-applied `needs:user` — the live shape of 11 of the 20 — must now reach the rebaser
+    # through the whole `run()` path (hold classification, ownership attribution, cede decision),
+    # and its skip must NOT be `review-lane-owned`. `labelled_by(bot_login, ...)` is what makes
+    # the hold machine-applied; a human-applied one still returns at `hard-exclusion-label`, which
+    # the (a) block above pins.
+    held_worker = pull(8, "8" * 40, author=bot_login, ref="sparq-agent/issue-8-1-1",
+                       labels=("needs:user",))
+    held_api = FakeAPI([held_worker], timelines={8: labelled_by(bot_login, "needs:user")})
+    held_rebaser = FakeRebaser()
+    held_resolver = ConflictResolver(
+        held_api, snapshot, claim, [repo], bot_login, True, 5, held_rebaser
+    )
+    with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+        held_resolver.run()
+    check("[#1301] a machine-held worker PR the lane refuses is REBASED here, not ceded",
+          (held_rebaser.calls,
+           held_resolver.census[0]["skipped"].get("review-lane-owned"),
+           held_resolver.census[0]["held_released"]),
+          ([(repo, 8, "8" * 40)], None, 1))
+    # FAIL-CLOSED ON A BROKEN IMPORT. An empty refusing set would silently cede everything again —
+    # the failure mode is indistinguishable from "the lane refuses nothing", so it raises.
+    class _NoLabels:
+        HUMAN_HOLD_PR_LABELS = frozenset()
+        MACHINE_PARK_PR_LABEL = None
+
+    try:
+        review_lane_refusing_labels(_NoLabels)
+        empty_export = "returned"
+    except ResolverError:
+        empty_export = "raised"
+    check("[#1301] a lane exporting no hold labels raises rather than ceding everything",
+          empty_export, "raised")
 
     # --- [registry #657 §7.4 step 2b] THE CEDE PREDICATE AND THE ORCHESTRATOR CLASS -----------
     # `owned_by_review_rebase_lane` is a HAND-OVER: True means this resolver walks away. That is
