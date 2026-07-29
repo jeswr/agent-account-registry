@@ -4084,27 +4084,28 @@ def _self_test():
     # repo already carries one such regex, groom.py's `WORKER_RUN_NAME` (`worker claim=<id>`), which
     # a later `run-name` change to `worker <target_repo> claim=<id>` left unable to match ANY real
     # worker run. So render review-fix.yml's ACTUAL run-name expression and require a match.
+    # The RENDERER is imported, not written here (#1144). This block used to hand-roll its own —
+    # the second copy in the repo, after groom.py's — and its `_render_expr` fell back to "?" for
+    # an unrecognised expression, so a NEW input could render to something a `\S+` still matched.
+    # `run_name_grammar.py` is the one definition, it REPORTS an expression it has no sample for,
+    # and its self-test reds if this file ever re-declares a reader of its own.
+    _grammar_spec = importlib.util.spec_from_file_location(
+        "registry_run_name_grammar",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_name_grammar.py"))
+    assert _grammar_spec and _grammar_spec.loader, "run_name_grammar.py is missing"
+    run_name_grammar = importlib.util.module_from_spec(_grammar_spec)
+    _grammar_spec.loader.exec_module(run_name_grammar)
+    review_fix_lane = run_name_grammar.REVIEW_FIX_LANE
     try:
-        review_fix_yml = open(
-            os.path.join(os.path.dirname(__file__), "..", ".github", "workflows",
-                         "review-fix.yml"), encoding="utf-8").read()
-    except OSError as exc:
-        review_fix_yml = ""
-        print(f"  FAIL review-fix.yml is unreadable: {exc}")
+        rendering = run_name_grammar.render_lane(review_fix_lane)
+    except run_name_grammar.RunNameError as exc:
+        rendering = run_name_grammar.Rendering("", ("unreadable",), ())
+        print(f"  FAIL review-fix.yml run-name is unreadable: {exc}")
         ok = False
-
-    def _render_expr(match):
-        body = match.group(0)
-        for needle, value in (("inputs.mode", "fix"), ("inputs.target_repo", "o/r"),
-                              ("inputs.pr_number", "1102"), ("inputs.claim_id", "f" * 32)):
-            if needle in body:
-                return value
-        return "?"
-
-    run_name_line = next((line[len("run-name:"):].strip()
-                          for line in review_fix_yml.splitlines()
-                          if line.startswith("run-name:")), "")
-    rendered_run_name = re.sub(r"\$\{\{[^}]*\}\}", _render_expr, run_name_line)
+    rendered_run_name = rendering.text
+    check("[#1128 YAML seam] every review-fix.yml run-name expression has a known rendering — an "
+          "unsampled one renders to a sentinel rather than to something `\\S+` still matches",
+          rendering.unknown, ())
     check("[#1128 YAML seam] review-fix.yml's OWN run-name expression, rendered, is matched by "
           "the correlation regex — the check groom.py's equivalent never had",
           (rendered_run_name,

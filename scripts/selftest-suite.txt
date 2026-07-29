@@ -41,6 +41,7 @@ regate-sweep.py
 resolve-conflicts.py
 retriage.py
 route-resolve.py
+run_name_grammar.py
 select-and-claim.py
 triage-stock-alert.py
 triage.py

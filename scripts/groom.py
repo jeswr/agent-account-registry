@@ -3401,39 +3401,34 @@ def _self_test() -> int:
     # checks below (which rendered their OWN title) stayed green. Render worker.yml's own
     # `run-name:` and require a match. A missing/unparsable workflow raises — fail closed, never
     # a skipped check.
-    _run_name_path = (
-        Path(__file__).resolve().parents[1] / ".github" / "workflows" / "worker.yml"
+    #
+    # The RENDERER is imported, not written here (#1144): select-and-claim.py needed the identical
+    # seam for review-fix.yml and hand-wrote a second copy, and metrics.py — which reads the same
+    # two run-names for target attribution — had none at all. `run_name_grammar.py` is the one
+    # definition all three now share, and its own self-test reds if any of them re-declares a
+    # reader locally. Imported HERE rather than at module scope: groom's production sweep must not
+    # gain a new import-time dependency for a check only the self-test runs.
+    _grammar_spec = importlib.util.spec_from_file_location(
+        "registry_run_name_grammar", Path(__file__).resolve().with_name("run_name_grammar.py")
     )
-    assert _run_name_path.is_file(), (
-        f"worker.yml not found for run-name sync check: {_run_name_path}"
-    )
-    _run_name_m = re.search(
-        r"(?m)^run-name:[ \t]*(?P<value>[^\r\n]+?)[ \t]*$",
-        _run_name_path.read_text(encoding="utf-8"),
-    )
-    assert _run_name_m, "worker.yml has no top-level run-name:"
-    # Sample renderings for the expressions worker.yml interpolates. An expression NOT in this
-    # table renders to a sentinel that fails every assertion below, so a new or renamed
-    # expression reds the seam rather than quietly rendering to nothing.
-    _WF_UNRENDERED = "<<unrendered-expression>>"
-    _WF_SAMPLE = {
-        "inputs.target_repo": "sparq-org/sparq",
-        "inputs.claim_id || 'self'": "e" * 32,
-    }
-    _rendered = re.sub(
-        r"\$\{\{\s*(.*?)\s*\}\}",
-        lambda m: _WF_SAMPLE.get(m.group(1), _WF_UNRENDERED),
-        _run_name_m.group("value"),
-    )
+    assert _grammar_spec and _grammar_spec.loader, "run_name_grammar.py is missing"
+    run_name_grammar = importlib.util.module_from_spec(_grammar_spec)
+    _grammar_spec.loader.exec_module(run_name_grammar)
+    _lane = run_name_grammar.WORKER_LANE
+    # An expression with no registered sample is REPORTED here and also renders to a sentinel that
+    # matches no grammar, so a new or renamed workflow input reds the seam twice over rather than
+    # quietly rendering to nothing.
+    _rendering = run_name_grammar.render_lane(_lane)
+    _rendered = _rendering.text
     check(
         "[#1130] every worker.yml run-name expression has a known rendering",
-        _WF_UNRENDERED in _rendered,
-        False,
+        _rendering.unknown,
+        (),
     )
     check(
         "[#1130] the render is not vacuous — every sample value reached the title",
-        sorted(v for v in _WF_SAMPLE.values() if v in _rendered),
-        sorted(_WF_SAMPLE.values()),
+        _rendering.reached,
+        tuple(sorted(_lane.samples.values())),
     )
 
     def _matched_claim(title: str) -> str | None:
@@ -3444,7 +3439,7 @@ def _self_test() -> int:
     _seam = WORKER_RUN_NAME.fullmatch(_rendered)
     check(
         "[#1130] WORKER_RUN_NAME fullmatches worker.yml's OWN rendered run-name",
-        _seam is not None and _seam.group("claim") == "e" * 32,
+        _seam is not None and _seam.group("claim") == _lane.claim,
         True,
     )
     # Second anchor: display_title values measured off the live runs API (#1130). Independent of
