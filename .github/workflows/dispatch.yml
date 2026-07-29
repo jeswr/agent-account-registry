@@ -210,22 +210,6 @@ jobs:
           path: registry-snapshot
           persist-credentials: false
 
-      # AUTHENTICATED, registry-inline snapshot — runs BEFORE any target code executes, so the
-      # token (repo-scoped github.token, read-only against the public targets) never coexists
-      # with hostile target planner code; the planner step below consumes only the local JSON
-      # files this writes. Authenticated reads remove the 60/hr shared-runner-IP unauthenticated
-      # ceiling. plan-snapshot.py scopes every per-PR failure to the ITEM (an oversized
-      # check-run listing skips THAT PR with a recorded reason instead of failing the sweep —
-      # the run-29617040167 fix) and reads check runs gate-filtered (check_name=gate, the
-      # d2c0dd0 pattern) so merge-queue churn heads with hundreds of runs stay one small page.
-      # [sparq#4819 round 2] `id:` so scripts/dispatch-plan.py --self-test can LOCATE this step and
-      # refuse the ways it can stop producing while every assertion downstream stays green. The
-      # readiness (consumer) seam has been pinned since #4329; this PRODUCER seam was not, and the
-      # round-1 review measured four survivors here — the step disabled with `if: false`, its
-      # failure swallowed by `continue-on-error:`, its invocation neutralised with `|| true`, and
-      # the output file renamed. Each degrades to the fail-safe every-PR-reserves path WITH a
-      # warning, so none of them is a correctness hole; all four are silent throughput loss, which
-      # is the same class as the defect this whole change closes.
       # THE CROSS-TICK ETag STORE (issue #1207). 77% of a 613-request tick was per-PR check-runs
       # reads, and MEASURED against the live targets 213 of 222 of them are unchanged from the
       # previous tick — an authenticated conditional request that answers 304 does not decrement
@@ -257,6 +241,22 @@ jobs:
           restore-keys: |
             dispatch-etags-
 
+      # AUTHENTICATED, registry-inline snapshot — runs BEFORE any target code executes, so the
+      # token (repo-scoped github.token, read-only against the public targets) never coexists
+      # with hostile target planner code; the planner step below consumes only the local JSON
+      # files this writes. Authenticated reads remove the 60/hr shared-runner-IP unauthenticated
+      # ceiling. plan-snapshot.py scopes every per-PR failure to the ITEM (an oversized
+      # check-run listing skips THAT PR with a recorded reason instead of failing the sweep —
+      # the run-29617040167 fix) and reads check runs gate-filtered (check_name=gate, the
+      # d2c0dd0 pattern) so merge-queue churn heads with hundreds of runs stay one small page.
+      # [sparq#4819 round 2] `id:` so scripts/dispatch-plan.py --self-test can LOCATE this step and
+      # refuse the ways it can stop producing while every assertion downstream stays green. The
+      # readiness (consumer) seam has been pinned since #4329; this PRODUCER seam was not, and the
+      # round-1 review measured four survivors here — the step disabled with `if: false`, its
+      # failure swallowed by `continue-on-error:`, its invocation neutralised with `|| true`, and
+      # the output file renamed. Each degrades to the fail-safe every-PR-reserves path WITH a
+      # warning, so none of them is a correctness hole; all four are silent throughput loss, which
+      # is the same class as the defect this whole change closes.
       - name: Snapshot target issues and pull requests (authenticated, registry-inline only)
         id: snapshot
         env:
