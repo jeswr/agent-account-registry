@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5018,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f80c737fed9f64023b81bb38095bb908611a4a3c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The status caveat is correctly anchored in README.md and included from the mdBook introduction, eliminating the previously divergent copy. The existing link-fixup preprocessor rewrites the remaining repo-relative crates/ and research/ links after inclusion, while the lowercase root-level inference report is deliberately absolute, so all links remain valid at both mounts. The include markers use the repository's established mdBook anchor syntax, and the docs workflow already treats README.md as an embedded source and fails on broken include errors. The accompanying design record accurately scopes this PR to the single-sourcing change and labels the remaining work as follow-up specification. No correctness, soundness, security, or vacuous-test issue was found.",
+  "verdict": "approve"
+ }
+}
