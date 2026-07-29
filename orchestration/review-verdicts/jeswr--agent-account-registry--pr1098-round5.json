@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1098,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "57cdda3f3cb322118762235938977a43fd929561",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 5 remains sound. The refusal receipt is bot-authored, run-key idempotent, distinct from model-attempt accounting, and included only in the durable dispatch-cycle budget. Both worker-side and deferred-claim gates consume the combined, readmission-windowed count while void, health, cost, and approval-staleness semantics remain attempt-only. The workflow charges only a claimed, live, in-budget dispatch whose trust step actually failed; the post-charge exhaustion output takes precedence and safely falls back to the pre-charge budget output when refusal is skipped. The terminal refusal therefore reaches the existing parked convergence path, and the claim-side budget prevents immediate readmission. Timestamp failures charge fail-closed. Tests exercise counter separation, authorship, idempotency, void isolation, readmission, real recorder outputs, workflow output joining, final-state shell execution, claim-side consumption, and targeted non-crashing mutations. The regate entry-point tests explicitly pin both sides of the time window and include a positive authorship control. I found no correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
