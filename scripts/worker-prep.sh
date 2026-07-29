@@ -65,10 +65,12 @@ CREDENTIAL_ROTATED_MARKER="$WORKER_ROOT/.credential-rotated"
 REFRESH_CLASS_FILE="$WORKER_ROOT/.credential-refresh-class"
 # The credential FORMAT, recorded host-side at the same instant as the rotation marker
 # (retro-review of #614). write_back needs the format to validate the durable material before it
-# reaches the central secret, and normally reads it from $GITHUB_ENV — but that export happens at the
-# very END of this script, long after the pre-flight has already consumed the one-time-use grant. If
-# prepare dies in between, the rotated credential exists and the format does not, so the write-back
-# could not persist it. This file closes that window: it lands with the marker, not with the export.
+# reaches the central secret, and this file is where the live lanes get it (issue #232: the format
+# used to ride the job-wide $GITHUB_ENV export at the very END of this script, long after the
+# pre-flight has already consumed the one-time-use grant — so a prepare that died in between left the
+# rotated credential with no format and the write-back unable to persist it). Written INSIDE the
+# rotation branch and BEFORE the marker, so a marker without its format is a shape this script cannot
+# produce: whenever write_back has something to persist, it has the format to validate it with.
 CREDENTIAL_FORMAT_FILE="$WORKER_ROOT/.credential-format"
 
 mkdir -p "$WORKER_ROOT" "$HOME_DIR" "$CLI_ROOT" "$NPM_HOME"
@@ -219,7 +221,7 @@ elif credential_format == "codex-auth-json":
         # one-time-use grant by the time this branch runs, so from here on the ONLY copy of the new
         # grant is on this runner. The durable material, the FORMAT write_back needs to validate it,
         # and the rotation marker therefore all land NOW — before the mount is materialized, before
-        # the pinned CLI install, before the $GITHUB_ENV export — so that every later failure in this
+        # the pinned CLI install, before the step-output export — so that every later failure in this
         # script still leaves the write-back a complete, self-describing job to do. Marker LAST: it
         # is the receipt write_back keys on, so it must not exist before its inputs do.
         write_private(durable_path, preflight["durable"])
@@ -293,21 +295,32 @@ if [[ ! -x "$BIN_DIR/$BINARY" ]]; then
 fi
 [[ -x "$BIN_DIR/$BINARY" ]] || die "pinned $HARNESS CLI installation did not produce $BINARY"
 
-export HOME="$HOME_DIR"
-export CODEX_HOME="$HOME_DIR/.codex"
-export PATH="$BIN_DIR:$PATH"
-
-if [[ -n ${GITHUB_ENV:-} ]]; then
+# STEP OUTPUTS, NEVER $GITHUB_ENV (issue #232). $GITHUB_ENV is JOB-WIDE: everything this script
+# used to write there persisted into EVERY later step of the worker job — including the policy gate,
+# which executes the TARGET's own build scripts and tests on this runner. That handed
+# target-controlled code the isolated HOME (whose .cargo the model itself can write), the raw
+# account handle, and direct pointers to the live credential and its rotation baseline, for the
+# whole span between this step and the end of the job.
+#
+# Step OUTPUTS are inert data the workflow must ROUTE deliberately, so the credential paths now
+# reach exactly the two consumers that need them — the model run and the rotation write-back — as
+# step-level `env:`, and nothing else. There is no exposure window to scrub afterwards and no
+# dependence on a later purge step running in the right order (the defense-in-depth follow-up to
+# #124). The account handle, provider, harness and credential format are NOT re-exported at all:
+# the workflow already resolved them in its account-SELECTION step and passes them straight from
+# there to the steps that need them, so this script is no longer a second source for them.
+#
+# Nothing emitted here is derived from the credential VALUE: these are paths under WORKER_ROOT. And
+# nothing is emitted that no lane routes — CODEX_HOME in particular is NOT exported, because the only
+# process that needs it is the model container, which worker-live.sh gives its own (`--env
+# CODEX_HOME=/home/worker/.codex`); an unrouted export would be exactly the job-wide surface this
+# change removes, one indirection later.
+if [[ -n ${GITHUB_OUTPUT:-} ]]; then
   {
-    printf 'HOME=%s\n' "$HOME"
-    printf 'CODEX_HOME=%s\n' "$CODEX_HOME"
-    printf 'WORKER_ACCOUNT=%s\n' "$ACCOUNT"
-    printf 'WORKER_PROVIDER=%s\n' "$PROVIDER"
-    printf 'WORKER_HARNESS=%s\n' "$HARNESS"
-    printf 'WORKER_CREDENTIAL_FORMAT=%s\n' "$CREDENTIAL_FORMAT"
-    printf 'WORKER_CREDENTIAL_PATH=%s\n' "$CREDENTIAL_PATH"
-    printf 'WORKER_CREDENTIAL_BASELINE=%s\n' "$CREDENTIAL_BASELINE"
-  } >> "$GITHUB_ENV"
+    printf 'home=%s\n' "$HOME_DIR"
+    printf 'credential_path=%s\n' "$CREDENTIAL_PATH"
+    printf 'credential_baseline=%s\n' "$CREDENTIAL_BASELINE"
+  } >> "$GITHUB_OUTPUT"
 fi
 if [[ -n ${GITHUB_PATH:-} ]]; then
   printf '%s\n' "$BIN_DIR" >> "$GITHUB_PATH"

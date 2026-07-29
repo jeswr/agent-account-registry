@@ -1204,6 +1204,15 @@ jobs:
           WORKER_MODEL_ALIAS: ${{ steps.selected.outputs.model }}
           WORKER_PROVIDER_MODEL: ${{ steps.selected.outputs.provider_model }}
           WORKER_AGENT: ${{ needs.resolve.outputs.agent }}
+          # [issue #232] The reviewer's own account credential reaches the harness HERE and only
+          # here (plus the write-back below) — worker-prep no longer persists the path, the account
+          # handle or the isolated HOME into the job-wide $GITHUB_ENV, where the fix-mode gate's
+          # target-controlled cargo would inherit them. WORKER_PROVIDER is the REVIEWER's provider:
+          # worker-live.sh refuses the run unless it differs from the implementer's.
+          WORKER_PROVIDER: ${{ steps.selected.outputs.provider }}
+          WORKER_HARNESS: ${{ steps.selected.outputs.harness }}
+          WORKER_CREDENTIAL_FORMAT: ${{ steps.selected.outputs.credential_format }}
+          WORKER_CREDENTIAL_PATH: ${{ steps.prepare.outputs.credential_path }}
         run: bash ../registry/scripts/worker-live.sh review
 
       - name: Schema-validate the lifted verdict (host-side, no tokens)
@@ -1287,6 +1296,13 @@ jobs:
           WORKER_MODEL_ALIAS: ${{ steps.selected.outputs.model }}
           WORKER_PROVIDER_MODEL: ${{ steps.selected.outputs.provider_model }}
           WORKER_AGENT: ${{ needs.resolve.outputs.agent }}
+          # [issue #232] As in the review step above: the credential path is scoped to this step
+          # rather than persisted job-wide. WORKER_PROVIDER is the FIXER's provider — worker-live.sh
+          # refuses the run unless it EQUALS the implementer's (same-provider fix).
+          WORKER_PROVIDER: ${{ steps.selected.outputs.provider }}
+          WORKER_HARNESS: ${{ steps.selected.outputs.harness }}
+          WORKER_CREDENTIAL_FORMAT: ${{ steps.selected.outputs.credential_format }}
+          WORKER_CREDENTIAL_PATH: ${{ steps.prepare.outputs.credential_path }}
         run: bash ../registry/scripts/worker-live.sh fix
 
       # Persist a HOST-SIDE-rotated account credential so the next claim still authenticates
@@ -1310,6 +1326,11 @@ jobs:
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
           WORKER_ACCOUNT: ${{ steps.selected.outputs.account }}
           WORKER_SECRET_REF: ${{ steps.selected.outputs.secret_ref }}
+          # [issue #232] See the same step in worker.yml: the mount-containment inputs are
+          # step-scoped `env:` (never the `if:`), and are empty on the rescued no-mount path exactly
+          # as they were when they rode the job-wide $GITHUB_ENV export.
+          WORKER_CREDENTIAL_PATH: ${{ steps.prepare.outputs.credential_path }}
+          WORKER_CREDENTIAL_BASELINE: ${{ steps.prepare.outputs.credential_baseline }}
           REGISTRY_REPO: ${{ github.repository }}
           REGISTRY_SECRETS_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
         run: bash registry/scripts/worker-live.sh write-back

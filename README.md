@@ -360,11 +360,11 @@ titles).
   - **The write-back is reachable from the pre-flight's FAILURE path.** The exchange consumes the
     one-time-use grant early inside the credential-prepare step, so the write-back step is keyed to
     `always()` plus the account selection — never to that step succeeding. Any later failure in
-    prepare (the no-leak assertion, the tamper baseline, the pinned CLI install, the `$GITHUB_ENV`
+    prepare (the no-leak assertion, the tamper baseline, the pinned CLI install, the step-output
     export) would otherwise discard a grant the provider had already rotated, leaving the account
     permanently unable to authenticate. `worker-prep.sh` writes the durable material, the credential
     format, and the rotation marker at the moment the rotation happens, so a write-back reached with
-    no mount and no exported environment still knows what to persist and how to validate it;
+    no mount and no exported paths still knows what to persist and how to validate it;
     `dispatch-secrets-guard.rotation_writeback_reachable_verdict` asserts that reachability in both
     worker lanes, and the obligation is **universal, not existential**: the step's `if:` must evaluate
     TRUE on every path where a rotation may already have happened, and may reference only facts settled
@@ -395,6 +395,15 @@ titles).
     `::error::` line for `credential-remint-required` must not assert the grant "is dead": the class
     covers both a provider-confirmed dead grant and an indeterminate outcome whose fate is unknown and
     which was deliberately not re-sent.
+  - **The credential never becomes job-wide environment.** `worker-prep.sh` emits the isolated `HOME`,
+    the materialized credential path and its rotation baseline as **step outputs**, not as
+    `$GITHUB_ENV` (#232). Each lane then routes them by hand to the only steps that need them — the
+    model/review/fix run and the rotation write-back — so the policy gate, which executes the target's
+    own build scripts and tests on that runner, never inherits a pointer to the account credential,
+    the raw account handle, or a `HOME` the model itself could write. There is no exposure window and
+    no dependence on a later scrub step running in the right order; `worker-live.sh`'s self-test
+    asserts the routing on both live workflows and that a successful prepare writes **nothing** to
+    `$GITHUB_ENV`.
 - On this work box, pre-provisioned Anthropic setup-tokens already exist as files
   `~/.claude-acctN-token` (one per account). Read the file; do not echo it.
 

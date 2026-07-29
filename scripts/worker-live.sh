@@ -1583,6 +1583,32 @@ _tokens_after_gate() {
   ' "$1"
 }
 
+# PURE (self-tested): print the `- name:` of every workflow step whose text references NEEDLE, in
+# file order. [issue #232] worker-prep no longer persists the account handle, the isolated HOME or
+# the credential paths into the JOB-WIDE $GITHUB_ENV — it emits them as step OUTPUTS, which are
+# inert until a workflow deliberately routes them. That turns "which steps can see the account
+# credential" from an implicit consequence of step ORDER into an explicit, greppable routing
+# decision, and this is what lets the suite assert the answer. The needle is matched literally
+# (index(), not a regex), and the job boundary — a two-space-indented key — closes a step exactly as
+# in _workflow_step_if, so a last-in-job step cannot swallow the next job's steps.
+_workflow_steps_referencing() {
+  local file="$1" needle="$2"
+  [[ -f "$file" ]] || { printf 'worker-live: workflow file missing: %s\n' "$file" >&2; return 1; }
+  awk -v needle="$needle" '
+    function flush() { if (started && hit) print name }
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { flush(); started=0; hit=0; name=""; next }
+    /^[[:space:]]*-[[:space:]]+name:/ {
+      flush(); started=1; hit=0
+      name=$0
+      sub(/^[[:space:]]*-[[:space:]]+name:[[:space:]]*/, "", name)
+      sub(/[[:space:]]+$/, "", name)
+      next
+    }
+    started && index($0, needle) { hit=1 }
+    END { flush() }
+  ' "$file"
+}
+
 # [issue #140 review r1] The gate below FAILS CLOSED when a workflow changed and actionlint is
 # unavailable — so the worker lane must be able to provision actionlint itself, or every legitimate
 # workflow change dies at `command -v`. Provisioning mirrors .github/workflows/pr-gate.yml: the
@@ -2952,7 +2978,9 @@ write_back() {
   # `steps.prepare.outcome == 'success'`: the pre-flight consumes the ONE-TIME-USE grant EARLY inside
   # prepare, so a later failure there used to discard the rotated replacement and leave the account
   # permanently dead. But an early prepare abort ALSO means there is no mounted credential and no
-  # $GITHUB_ENV export, so WORKER_CREDENTIAL_PATH / _BASELINE / _FORMAT are simply absent —
+  # prepare step-output export (issue #232 — these are wired into this step's `env:` from
+  # `steps.prepare.outputs.*`, and were a job-wide $GITHUB_ENV export before that), so
+  # WORKER_CREDENTIAL_PATH / _BASELINE / _FORMAT are simply absent or empty —
   # validating them first turned the rescued case into `die 'credential paths escaped WORKER_ROOT'`,
   # i.e. the same lost grant one error message further on. So: first decide whether anything needs
   # persisting, then assert the contract that actually applies. ---
@@ -2991,10 +3019,12 @@ write_back() {
   else
     printf '%s\n' '::warning::The credential pre-flight rotated this account host-side and worker-prep then aborted before materializing the container mount. Persisting the rotated credential anyway: the provider has already consumed the previous refresh token, so discarding its replacement would leave the account permanently unable to authenticate (registry #614). No container ran, so no mount-containment assertion applies.'
   fi
-  # The FORMAT normally arrives through $GITHUB_ENV, which worker-prep exports at the very END — long
-  # after the pre-flight consumed the grant. Fall back to the host-side record worker-prep writes
-  # alongside the rotation marker, so an early prepare abort still knows how to validate the material
-  # it is persisting.
+  # The FORMAT comes from the host-side record worker-prep writes ALONGSIDE the rotation marker, so
+  # the material can always be validated no matter where prepare died. The env var is still honoured
+  # first (a caller that already knows the format may state it), but the live lanes deliberately do
+  # NOT pass one: it used to ride worker-prep's job-wide $GITHUB_ENV export, written at the very END
+  # of prepare — long after the pre-flight consumed the grant — so on exactly the paths this rescue
+  # exists for it was absent anyway (issue #232 removed that export; the record is what remains).
   #
   # READ VERBATIM, NEVER SANITISED (post-merge retro-review of #629, F6). This was
   # `head -n1 | tr -cd 'a-z-'`, and `tr -cd` DELETES the offending characters rather than rejecting
@@ -4326,6 +4356,45 @@ WFFIX
     "$(_worker_mints_missing_revoke_skip "$wf" | grep -c 'app-token-pub' || true)" "0"
   chk "#126: ...and that publish-job mint really does exist to be skipped (control)" \
     "$(grep -Ec '^        id: app-token-pub$' "$wf" || true)" "1"
+
+  # --- [issue #232] WHERE THE ACCOUNT CREDENTIAL IS VISIBLE, asserted on both LIVE lanes. The path
+  # used to arrive through worker-prep's job-wide $GITHUB_ENV export, so every later step inherited
+  # it — including the policy gate, which runs the TARGET's own build scripts and tests as the runner
+  # user. It is now a prepare step OUTPUT that each lane routes by hand, and these lines pin the
+  # routing: exactly the steps that run the model on that credential, the step that writes a rotated
+  # one back, and (worker.yml only) the dry-run boundary check that asserts the wiring without ever
+  # reading the file. A future edit that hands it to the gate — or to any other step — is a red tick.
+  local rf_wf="$SCRIPT_DIR/../.github/workflows/review-fix.yml"
+  chk "#232 (LIVE worker.yml): the credential path reaches EXACTLY the boundary/model/write-back steps" \
+    "$(_workflow_steps_referencing "$wf" 'steps.prepare.outputs.credential_path' | tr '\n' '|')" \
+    "Confirm dry-run boundary|Run routed model headless on a fresh target branch|Write back a rotated full account credential|"
+  chk "#232 (LIVE review-fix.yml): ...and EXACTLY the review/fix/write-back steps in the review lane" \
+    "$(_workflow_steps_referencing "$rf_wf" 'steps.prepare.outputs.credential_path' | tr '\n' '|')" \
+    "Run cross-provider review (read-only, verdict file lifted out-of-tree)|Run same-provider fix (findings framed as untrusted data)|Write back a rotated full account credential|"
+  # The write-back ALSO needs the rotation BASELINE: without it #134's tamper check — the mounted
+  # credential must come back byte-identical, or the containment that stops a prompt-injected model
+  # from poisoning the central ACCTNN_TOKEN secret has failed — degrades to the no-mount WARNING path
+  # and writes back anyway. That degradation is silent, which is why it is asserted here per lane
+  # rather than left to fail loudly at runtime.
+  local baseline_wiring='WORKER_CREDENTIAL_BASELINE: ${{ steps.prepare.outputs.credential_baseline }}'
+  chk "#232 (LIVE): both write-back steps keep the mount-containment BASELINE wired" \
+    "$(grep -Fc "$baseline_wiring" "$wf" || true):$(grep -Fc "$baseline_wiring" "$rf_wf" || true)" \
+    "1:1"
+  # NON-VACUITY: the scan must actually report a step that was handed the credential. THE MUTANT is
+  # the shape this issue exists to prevent — the target-controlled gate given the credential path.
+  local wf_leak="$tmp/worker-credential-leak.yml"
+  awk '/^      - name: Run policy-selected local gate$/ { ingate=1 }
+       { print }
+       ingate && /^        env:$/ {
+         print "          WORKER_CREDENTIAL_PATH: ${{ steps.prepare.outputs.credential_path }}"
+         ingate=0
+       }' "$wf" > "$wf_leak"
+  chk "#232: the routing scan CATCHES a credential path handed to the hostile gate (non-vacuous)" \
+    "$(_workflow_steps_referencing "$wf_leak" 'steps.prepare.outputs.credential_path' \
+        | grep -Fc 'Run policy-selected local gate' || true)" "1"
+  # ...and it is needle-specific rather than matching every step it walks past.
+  chk "#232: an expression no step references matches nothing (the scan is not a blanket hit)" \
+    "$(_workflow_steps_referencing "$wf" 'steps.prepare.outputs.no_such_output' | wc -l | tr -d ' ')" "0"
   local verify_ln mint_ln
   verify_ln=$(_first_match_line 'worker-live\.sh verify-bundle' < "$wf")
   mint_ln=$(_first_match_line '^        id: app-token-pub$' < "$wf")
@@ -5362,6 +5431,7 @@ PY
 
   # (a) VALID stored access token: no exchange, and the MOUNTED file carries NO refresh material.
   local pfroot="$tmp/pf-valid" pf_cred pf_rc pf_env="$tmp/pf-valid.env"
+  local pf_out="$tmp/pf-valid.out"
   pf_cred=$(_preflight_fixture "$pfroot" 864000 'REFRESH-TOKEN-SENTINEL-VALID')
   # [issue #704] Pin the shape the hoisted builder above must keep producing: a three-segment JWT
   # whose header decodes to exactly {"alg":"RS256"} and whose payload carries the requested exp.
@@ -5378,10 +5448,11 @@ print(len(seg), dec(seg[0]), seg[2], "in-window" if 863990 <= delta <= 864000 el
       "$pf_cred" "$(date +%s)" 2>&1)" \
     '3 {"alg":"RS256"} sig in-window'
   : > "$pf_env"
+  : > "$pf_out"
   if (
     export WORKER_ROOT="$pfroot" WORKER_ACCOUNT=acctexample WORKER_PROVIDER=openai \
            WORKER_HARNESS=codex WORKER_CREDENTIAL_FORMAT=codex-auth-json \
-           WORKER_ACCOUNT_CREDENTIAL="$pf_cred" GITHUB_ENV="$pf_env"
+           WORKER_ACCOUNT_CREDENTIAL="$pf_cred" GITHUB_ENV="$pf_env" GITHUB_OUTPUT="$pf_out"
     unset GITHUB_PATH
     bash "$SCRIPT_DIR/worker-prep.sh"
   ) > "$tmp/pf-valid.log" 2>&1; then pf_rc=0; else pf_rc=$?; fi
@@ -5414,6 +5485,51 @@ print(repr(json.load(open(sys.argv[1]))["tokens"]["refresh_token"]))' "$pfroot/h
     "${pf_mount[*]}" \
     "--mount type=bind,src=$pfroot/home/.codex/auth.json,dst=/home/worker/.codex/auth.json,readonly"
 
+  # --- [issue #232] THE HAND-OFF. worker-prep used to append HOME, CODEX_HOME, the raw account
+  # handle, the credential path and the rotation baseline to $GITHUB_ENV, which is JOB-WIDE: every
+  # later step of the worker job inherited them, the policy gate included — and that gate executes
+  # the TARGET's own build scripts and tests as the runner user. #124 answered that by deleting the
+  # credential tree and blanking those vars in a purge step placed before the gate; this is the
+  # defense-in-depth follow-up, which never persists them job-wide in the first place. They are step
+  # OUTPUTS now, inert until the workflow routes them to the two steps that need them (asserted on
+  # the live workflows in the workflow-contract section above). ---
+  # The expected set is EXACT, not a containment check: an export nothing routes is the job-wide
+  # surface this issue removes, one indirection later.
+  chk "(#232) prep hands the paths to the workflow as STEP OUTPUTS, and exports nothing else" \
+    "$(sed "s#$pfroot#ROOT#g" "$pf_out" | sort | tr '\n' ' ')" \
+    "credential_baseline=ROOT/.credential-baseline credential_path=ROOT/home/.codex/auth.json home=ROOT/home "
+  # ...and the exported path is the file that was really materialized, not a value reconstructed
+  # from the format (a drifting export would hand the harness a path that cannot be mounted).
+  local pf_out_cred
+  pf_out_cred=$(sed -n 's/^credential_path=//p' "$pf_out")
+  chk "(#232) the exported credential_path IS the materialized mode-600 credential" \
+    "$(stat -c '%a' "$pf_out_cred" 2>/dev/null):$([[ "$pf_out_cred" == "$pfroot/home/.codex/auth.json" ]] \
+      && printf same || printf drift)" "600:same"
+  # THE PROPERTY: a successful prepare leaves the JOB-WIDE environment untouched. Asserted as
+  # "nothing at all", so a differently-spelled key cannot slip past a keyword list. (The FAILURE path
+  # still writes WORKER_EXIT_CLASS there for the health machinery — cases (e)/(f) below pin that, and
+  # it names neither an account nor a credential.)
+  chk "(#232) a successful prepare writes NOTHING to the job-wide \$GITHUB_ENV" \
+    "$(wc -c < "$pf_env" | tr -d ' ')" "0"
+  local pf_jobwide_re='^(HOME|CODEX_HOME|WORKER_ACCOUNT|WORKER_PROVIDER|WORKER_HARNESS|WORKER_CREDENTIAL_FORMAT|WORKER_CREDENTIAL_PATH|WORKER_CREDENTIAL_BASELINE)='
+  chk "(#232) ...in particular none of the account/credential keys reach it" \
+    "$(grep -Ec "$pf_jobwide_re" "$pf_env" || true)" "0"
+  # NON-VACUITY: the same scan over the shape that shipped BEFORE #232 must report every key, so the
+  # zero above is a property of the script rather than of a pattern that matches nothing.
+  local pf_pre232="$tmp/pf-pre-232.env"
+  {
+    printf 'HOME=%s\n' "$pfroot/home"
+    printf 'CODEX_HOME=%s\n' "$pfroot/home/.codex"
+    printf 'WORKER_ACCOUNT=%s\n' acctexample
+    printf 'WORKER_PROVIDER=%s\n' openai
+    printf 'WORKER_HARNESS=%s\n' codex
+    printf 'WORKER_CREDENTIAL_FORMAT=%s\n' codex-auth-json
+    printf 'WORKER_CREDENTIAL_PATH=%s\n' "$pfroot/home/.codex/auth.json"
+    printf 'WORKER_CREDENTIAL_BASELINE=%s\n' "$pfroot/.credential-baseline"
+  } > "$pf_pre232"
+  chk "(#232) ...and that scan really does catch the pre-#232 job-wide export (non-vacuous)" \
+    "$(grep -Ec "$pf_jobwide_re" "$pf_pre232" || true)" "8"
+
   # (e) a DEAD stored grant (nothing to exchange) => the maintainer-action class, NOT `auth`.
   local pfroot2="$tmp/pf-remint" pf2_rc pf2_env="$tmp/pf-remint.env"
   pf_cred=$(_preflight_fixture "$pfroot2" -3600 '')
@@ -5421,7 +5537,8 @@ print(repr(json.load(open(sys.argv[1]))["tokens"]["refresh_token"]))' "$pfroot/h
   if (
     export WORKER_ROOT="$pfroot2" WORKER_ACCOUNT=acctexample WORKER_PROVIDER=openai \
            WORKER_HARNESS=codex WORKER_CREDENTIAL_FORMAT=codex-auth-json \
-           WORKER_ACCOUNT_CREDENTIAL="$pf_cred" GITHUB_ENV="$pf2_env"
+           WORKER_ACCOUNT_CREDENTIAL="$pf_cred" GITHUB_ENV="$pf2_env" \
+           GITHUB_OUTPUT="$tmp/pf-remint.out"
     unset GITHUB_PATH
     bash "$SCRIPT_DIR/worker-prep.sh"
   ) > "$tmp/pf-remint.log" 2>&1; then pf2_rc=0; else pf2_rc=$?; fi
@@ -5457,6 +5574,7 @@ print(repr(json.load(open(sys.argv[1]))["tokens"]["refresh_token"]))' "$pfroot/h
     export WORKER_ROOT="$pfroot3" WORKER_ACCOUNT=acctexample WORKER_PROVIDER=openai \
            WORKER_HARNESS=codex WORKER_CREDENTIAL_FORMAT=codex-auth-json \
            WORKER_ACCOUNT_CREDENTIAL="$pf_cred" GITHUB_ENV="$pf3_env" \
+           GITHUB_OUTPUT="$tmp/pf-transient.out" \
            REGISTRY_TOKEN_ENDPOINT_OVERRIDE='http://127.0.0.1:1/oauth/token'
     unset GITHUB_PATH
     bash "$SCRIPT_DIR/worker-prep.sh"
@@ -5543,6 +5661,7 @@ PY
     export WORKER_ROOT="$pfroot5" WORKER_ACCOUNT=acctexample WORKER_PROVIDER=openai \
            WORKER_HARNESS=codex WORKER_CREDENTIAL_FORMAT=codex-auth-json \
            WORKER_ACCOUNT_CREDENTIAL="$pf_cred" GITHUB_ENV="$pf5_env" \
+           GITHUB_OUTPUT="$tmp/pf-rotate.out" \
            REGISTRY_TOKEN_ENDPOINT_OVERRIDE="http://127.0.0.1:$pf5_port/oauth/token"
     unset GITHUB_PATH
     bash "$SCRIPT_DIR/worker-prep.sh"
@@ -5598,6 +5717,44 @@ print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcapg/std
   chk "(h) write_back never echoes either token" \
     "$(grep -c 'REFRESH-TOKEN-SENTINEL' "$tmp/wb-g.log" || true)" "0"
 
+  # --- [issue #232] ...and now the SUCCESS-path wiring the live lanes actually produce, over the
+  # same real artifacts. It is a DIFFERENT env shape from the rescue above: the workflow hands this
+  # step WORKER_CREDENTIAL_PATH/_BASELINE from prepare's step OUTPUTS (so #134's mount-containment
+  # tamper check RUNS instead of degrading to the no-mount warning), and passes NO format at all —
+  # the format used to ride worker-prep's job-wide $GITHUB_ENV export, and now comes only from the
+  # host-side record written beside the rotation marker. Nothing else in the suite exercises
+  # "both mount paths declared, format absent", which is the ONLY shape a live rotation now takes. ---
+  local wb_live_out="$tmp/wb-live-github-output" wb_live_rc
+  local pf5_cred_path pf5_cred_baseline
+  pf5_cred_path=$(sed -n 's/^credential_path=//p' "$tmp/pf-rotate.out")
+  pf5_cred_baseline=$(sed -n 's/^credential_baseline=//p' "$tmp/pf-rotate.out")
+  chk "(#232) prepare exported BOTH mount paths for the write-back to bind (control)" \
+    "$([[ "$pf5_cred_path" == "$pfroot5/home/.codex/auth.json" ]] && printf path || printf drift):$([[ "$pf5_cred_baseline" == "$pfroot5/.credential-baseline" ]] && printf baseline || printf drift)" \
+    "path:baseline"
+  mkdir -p "$tmp/wbcaplive"
+  : > "$wb_live_out"
+  if (
+    export WORKER_ROOT="$pfroot5" \
+           WORKER_CREDENTIAL_PATH="$pf5_cred_path" \
+           WORKER_CREDENTIAL_BASELINE="$pf5_cred_baseline" \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+           REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+           GITHUB_OUTPUT="$wb_live_out" WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$tmp/wbcaplive"
+    unset WORKER_CREDENTIAL_FORMAT
+    write_back
+  ) > "$tmp/wb-live.log" 2>&1; then wb_live_rc=0; else wb_live_rc=$?; fi
+  chk "(#232) write_back persists the rotation from the STEP-OUTPUT wiring, with NO format in env" \
+    "$wb_live_rc:$(grep -c '^rotated=true$' "$wb_live_out" || true)" "0:1"
+  chk "(#232) ...the ROTATED durable document is what reaches the account secret" \
+    "$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcaplive/stdin" 2>&1)" \
+    "REFRESH-TOKEN-SENTINEL-ROTATED"
+  # ...and it took the TAMPER-CHECKED branch, not the no-mount rescue: with both paths declared the
+  # containment assertion is mandatory, and its warning must NOT appear.
+  chk "(#232) ...and #134's mount-containment check RAN (not the no-mount rescue warning)" \
+    "$(grep -c 'no mount-containment assertion applies' "$tmp/wb-live.log" || true)" "0"
+
   # HONESTY of the classification: a prep failure that is NOT a refresh failure (here a malformed
   # stored credential) must classify NOTHING — downstream then records the truthful `unknown`
   # rather than a refresh class nobody observed.
@@ -5607,7 +5764,8 @@ print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcapg/std
   if (
     export WORKER_ROOT="$pfroot4" WORKER_ACCOUNT=acctexample WORKER_PROVIDER=openai \
            WORKER_HARNESS=codex WORKER_CREDENTIAL_FORMAT=codex-auth-json \
-           WORKER_ACCOUNT_CREDENTIAL='not json at all' GITHUB_ENV="$pf4_env"
+           WORKER_ACCOUNT_CREDENTIAL='not json at all' GITHUB_ENV="$pf4_env" \
+           GITHUB_OUTPUT="$tmp/pf-malformed.out"
     unset GITHUB_PATH
     bash "$SCRIPT_DIR/worker-prep.sh"
   ) > "$tmp/pf-malformed.log" 2>&1; then pf4_rc=0; else pf4_rc=$?; fi
@@ -5624,6 +5782,12 @@ print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcapg/std
     "$(grep -rlc 'REFRESH-TOKEN-SENTINEL' \
         "$tmp/pf-valid.log" "$tmp/pf-remint.log" "$tmp/pf-transient.log" \
         "$pf_env" "$pf2_env" "$pf3_env" 2>/dev/null | wc -l | tr -d ' ')" "0"
+  # ...and none in the STEP OUTPUTS either (issue #232): they are the new hand-off channel, they are
+  # echoed into the workflow log by the runner, and they must stay paths-only.
+  chk "(g) no refresh-token material in any captured pre-flight STEP OUTPUT" \
+    "$(grep -rlc 'REFRESH-TOKEN-SENTINEL' \
+        "$pf_out" "$tmp/pf-remint.out" "$tmp/pf-transient.out" "$tmp/pf-rotate.out" \
+        2>/dev/null | wc -l | tr -d ' ')" "0"
   chk "(g) no credential material in any captured write-back output" \
     "$(grep -rlc 'ROTATED-SENTINEL\|POISONED-BY-THE-MODEL' \
         "$tmp/wb.log" "$tmp/wb-fail.log" "$tmp/wb2.log" "$tmp/wb3.log" "$tmp/wb4.log" \
