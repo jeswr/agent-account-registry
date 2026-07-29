@@ -91,8 +91,9 @@ FRESH = "fresh"              # the graded base IS the live tip — nothing to co
 CLEAN = "composes-clean"     # stale, merges cleanly, the overlap suite passes
 CONFLICT = "conflict"        # stale, TEXTUAL conflict — the author's routine problem, not a red
 BROKEN = "composes-broken"   # stale, merges cleanly, the composition FAILS — the invisible mode
+PREEXISTING = "pre-existing-red"  # it fails on the GRADED tree too, so the base move did not do it
 UNPROVABLE = "unprovable"    # an operand could not be established
-STATES = (FRESH, CLEAN, CONFLICT, BROKEN, UNPROVABLE)
+STATES = (FRESH, CLEAN, CONFLICT, BROKEN, PREEXISTING, UNPROVABLE)
 
 # Only BROKEN reds the gate. See "THE TWO FAILURE MODES REPORT DIFFERENTLY" in the header.
 BLOCKING_STATES = (BROKEN,)
@@ -158,15 +159,24 @@ def overlap_entries(enrolled, pr_paths, base_paths, prefix="scripts/"):
     return sorted(entry for entry in (enrolled or []) if entry in touched)
 
 
-def classify(graded_base, live_tip, merge_rc=None, conflicted=(), failures=(), entries=()):
+def classify(graded_base, live_tip, merge_rc=None, conflicted=(), failures=(), entries=(),
+             preexisting=()):
     """PURE: the composition verdict.
 
     `graded_base` is the base tip the recorded verdict was computed against (HEAD^1 of the merge
     ref). `live_tip` is the base branch tip now. Every unresolvable operand is UNPROVABLE — never
-    FRESH and never CLEAN, because both of those are readings that would let the arm proceed."""
+    FRESH and never CLEAN, because both of those are readings that would let the arm proceed.
+
+    ⚠️ `failures` must ALREADY be the DIFFERENTIAL — entries that pass on the graded tree and fail
+    on the composition. `preexisting` are the ones that were red before the base ever moved; they
+    are reported, never blamed on the composition. Measured on #1277, which composes cleanly and
+    fails `ci-latency-alert.py` — and fails it identically on its own graded merge ref, so the base
+    move did not do it. Calling that a composition break is a false attribution, and false
+    attributions are how a check earns a reputation for crying wolf."""
     result = {"state": UNPROVABLE, "reason": "", "graded_base": graded_base or "",
               "live_tip": live_tip or "", "conflicted": list(conflicted or []),
-              "failures": list(failures or []), "entries": list(entries or [])}
+              "failures": list(failures or []), "entries": list(entries or []),
+              "preexisting": list(preexisting or [])}
     if not SHA_RE.fullmatch(graded_base or ""):
         result["reason"] = ("the base tip this run's merge ref was composed from is unresolvable, "
                            "so which tree the verdict grades cannot be established")
@@ -191,7 +201,15 @@ def classify(graded_base, live_tip, merge_rc=None, conflicted=(), failures=(), e
         result["state"] = BROKEN
         result["reason"] = (f"the verdict graded {graded_base[:12]}; composed with the current tip "
                             f"{live_tip[:12]} the merge is CLEAN but {len(failures)} enrolled "
-                            f"self-test(s) FAIL: {', '.join(sorted(failures))}")
+                            f"self-test(s) that PASS on the graded tree FAIL on the composition: "
+                            f"{', '.join(sorted(failures))}")
+        return result
+    if result["preexisting"]:
+        result["state"] = PREEXISTING
+        result["reason"] = (f"{len(result['preexisting'])} enrolled self-test(s) fail on the "
+                            f"composition, but fail on the GRADED tree {graded_base[:12]} too, so "
+                            f"the base move to {live_tip[:12]} did not cause them: "
+                            f"{', '.join(sorted(result['preexisting']))}")
         return result
     result["state"] = CLEAN
     result["reason"] = (f"the verdict graded {graded_base[:12]}, which is superseded by "
@@ -208,6 +226,7 @@ def receipt(result, base_ref=""):
             f"live_tip={(result.get('live_tip') or 'none')[:12]} "
             f"entries={len(result.get('entries') or [])} "
             f"failures={len(result.get('failures') or [])} "
+            f"preexisting={len(result.get('preexisting') or [])} "
             f"conflicts={len(result.get('conflicted') or [])} "
             f"blocking={'true' if result.get('state') in BLOCKING_STATES else 'false'}")
 
@@ -229,6 +248,11 @@ def annotation(result):
         return (f"::warning::textual conflict with the current base tip ({paths}) — {reason}. "
                 "This is the ordinary rebase, NOT a composition break; it is not failing this "
                 "gate, and the conflict-resolver lane already sees it.")
+    if state == PREEXISTING:
+        listed = ", ".join(sorted(result.get("preexisting") or []))
+        return (f"::warning::{listed} fail(s) on the composition, but fail(s) on the tree this gate "
+                "already graded too — so this is NOT a composition break and the base move did not "
+                "cause it. The self-test suite step above owns it.")
     if state == UNPROVABLE:
         return (f"::error::compose-gate could not establish its operands — {reason}. This run's "
                 "green is NOT evidence about the tree this PR would land on.")
@@ -330,10 +354,38 @@ def compose(base_ref, cwd, full=False, manifest=SUITE_MANIFEST, git=_git, run_su
                              check=False)[1].splitlines()
             chosen = (sorted(enrolled) if full
                       else overlap_entries(enrolled, pr_paths, base_paths))
-            failures = (run_suite or _run_suite)(tree, chosen)
-            return classify(graded_base, live_tip, merge_rc, failures=failures, entries=chosen)
+            runner = run_suite or _run_suite
+            failures = runner(tree, chosen)
+            # ---- THE DIFFERENTIAL. A failure is only a COMPOSITION break if it PASSES on the tree
+            # `pr-gate` already graded. Paid only on failure, and only for the entries that failed.
+            preexisting = _baseline_failures(cwd, failures, runner) if failures else []
+            return classify(graded_base, live_tip, merge_rc,
+                            failures=[e for e in failures if e not in preexisting],
+                            preexisting=preexisting, entries=chosen)
         finally:
             git(["worktree", "remove", "--force", tree], cwd, check=False)
+
+
+def _baseline_failures(cwd, entries, runner, manifest=SUITE_MANIFEST):
+    """Which of `entries` were ALREADY failing on the tree pr-gate graded?
+
+    ⚠️ FAIL CLOSED, and this is the whole subtlety. An entry with NO establishable baseline — one
+    master ADDED, so it is absent or unenrolled in the graded tree — must NOT be excused as
+    pre-existing. Doing so would mask exactly the break this check exists for: master lands a new
+    enrolled self-test, the composition fails it, and "it is not in my tree" reads as innocence.
+    Only an entry that demonstrably EXISTS, is ENROLLED, and FAILS on the graded tree is
+    pre-existing; everything else stays attributed to the composition."""
+    try:
+        with open(os.path.join(cwd, manifest), encoding="utf-8") as handle:
+            enrolled = set(suite_entries(handle.read()))
+    except OSError:
+        return []          # no graded manifest -> nothing can be PROVEN pre-existing -> fail closed
+    testable = [e for e in entries
+                if e in enrolled and os.path.exists(os.path.join(cwd, "scripts", e))]
+    if not testable:
+        return []
+    print(f"== baseline: re-running {len(testable)} failing entr(y/ies) on the GRADED tree ==")
+    return runner(cwd, testable)
 
 
 def _run_suite(tree, entries):
@@ -435,6 +487,21 @@ def _self_test():
     chk("a clean merge with a failure is BROKEN",
         classify(A, B, 0, failures=["dispatch-claim.py"])["state"], BROKEN)
     chk("a non-zero merge is CONFLICT", classify(A, B, 1, conflicted=["a"])["state"], CONFLICT)
+
+    # ---- THE DIFFERENTIAL: a failure that was ALREADY red is not blamed on the base move -------
+    chk("a failure that also fails on the GRADED tree is PREEXISTING, not BROKEN",
+        classify(A, B, 0, failures=[], preexisting=["ci-latency-alert.py"])["state"], PREEXISTING)
+    chk("...and does NOT block", PREEXISTING in BLOCKING_STATES, False)
+    chk("...and its annotation says the base move did not cause it",
+        "did not" in annotation(classify(A, B, 0, preexisting=["x.py"])), True)
+    chk("a MIXED result still BLOCKS on the composition-attributable one",
+        classify(A, B, 0, failures=["new.py"], preexisting=["old.py"])["state"], BROKEN)
+    chk("the BROKEN reason names the differential, not merely 'fails'",
+        "PASS on the graded tree" in classify(A, B, 0, failures=["n.py"])["reason"], True)
+    chk("the receipt reports both populations separately",
+        ("failures=1" in receipt(classify(A, B, 0, failures=["a"], preexisting=["b", "c"])),
+         "preexisting=2" in receipt(classify(A, B, 0, failures=["a"], preexisting=["b", "c"]))),
+        (True, True))
     chk("a stale pair whose composition was never attempted is UNPROVABLE",
         classify(A, B, None)["state"], UNPROVABLE)
     for label, bad in (("empty", ""), ("short", "abc"), ("None", None),
@@ -518,6 +585,28 @@ def _self_test():
                                                 ("rev-parse", 0, A)]))
     chk("a graded base equal to the live tip short-circuits to FRESH", fresh["state"], FRESH)
     chk("...having run NO self-tests at all (the zero-cost path)", fresh["entries"], [])
+
+    # ---- _baseline_failures FAILS CLOSED. An entry master ADDED has no baseline in the graded
+    # tree, and excusing it as pre-existing would mask exactly the break this check exists for.
+    with tempfile.TemporaryDirectory() as _bt:
+        os.makedirs(os.path.join(_bt, "scripts"))
+        with open(os.path.join(_bt, SUITE_MANIFEST), "w", encoding="utf-8") as handle:
+            handle.write("enrolled.py\n")
+        open(os.path.join(_bt, "scripts", "enrolled.py"), "w").close()
+        every = lambda _cwd, entries: list(entries)     # noqa: E731 — every entry "fails"
+        chk("an enrolled+present entry that fails on the graded tree IS pre-existing",
+            _baseline_failures(_bt, ["enrolled.py"], every), ["enrolled.py"])
+        chk("an entry master ADDED (absent from the graded tree) is NOT excused",
+            _baseline_failures(_bt, ["added-by-master.py"], every), [])
+        chk("an entry present but NOT enrolled in the graded tree is NOT excused",
+            _baseline_failures(_bt, ["unenrolled.py"], every), [])
+        chk("a mixed set only excuses the one with a real baseline",
+            _baseline_failures(_bt, ["enrolled.py", "added-by-master.py"], every), ["enrolled.py"])
+        chk("an entry that PASSES on the graded tree is not pre-existing either",
+            _baseline_failures(_bt, ["enrolled.py"], lambda _c, _e: []), [])
+    chk("an unreadable graded manifest excuses NOTHING (fail closed)",
+        _baseline_failures(os.path.join(tempfile.gettempdir(), "compose-gate-nonexistent"),
+                           ["x.py"], lambda _c, e: list(e)), [])
 
     # ---- THE WORKFLOW SEAM, mutation-tested. Each mutant leaves a step that LOOKS wired. ----
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
