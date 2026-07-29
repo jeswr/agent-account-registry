@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5112,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2b39553e487c59cce85788ce42d19a3fc3656144",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete on the supplied diff. The production path preserves the decompressor-derived effectiveName, uses it for both parser format selection and the displayed preview, and leaves outer-name deduplication and status keys intact. The ZIP regression test exercises the real browser upload/decompression path with an N-Quads member whose named-graph syntax cannot be successfully parsed through the former Turtle fallback, then verifies the imported named-graph result. The zstd test likewise verifies decoded data is queryable. The comments accurately exclude unsupported tar-gzip archives. No new correctness, soundness, security, or test-validity issue is apparent. Because round 2 also had no findings and approved the same material behavior, progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
