@@ -207,6 +207,12 @@ ARTIFACT_PAGE_SIZE = 100
 DISPATCH_WORKFLOW = ".github/workflows/dispatch.yml"
 FLOOR_JOB = "tick-floor"
 GATED_JOB = "plan"
+# Every job that must OBEY `proceed`. `plan` is the original (#819). `secrets-guard` joined it in
+# #1208: on a held tick it verifies settings that gate jobs which are already skipped — pure
+# observation — while spending an authenticated read from the bucket the floor is protecting, and
+# when that bucket is the thing that is gone it also goes red for it. Listing them here rather than
+# hard-coding `plan` is what makes the seam assertion cover both without two copies of it.
+GATED_JOBS = (GATED_JOB, "secrets-guard")
 FLOOR_STEP_ID = "floor"
 
 # Every file the self-test asserts against. The floor job sparse-checks-out exactly this set and
@@ -543,18 +549,24 @@ def _eval_job_if(expr, needs):
     return (got == want) if operator == "==" else (got != want)
 
 
-def _plan_runs(workflow, proceed):
-    """Does `plan` execute when the floor job succeeds with `proceed`? Models BOTH seams at once —
-    the `needs:` edge AND the `if:`. A gate expressed only as an `if:` is defeated by cutting
+def _gated_job_runs(workflow, job_name, proceed):
+    """Does `job_name` execute when the floor job succeeds with `proceed`? Models BOTH seams at
+    once — the `needs:` edge AND the `if:`. A gate expressed only as an `if:` is defeated by cutting
     `needs:` (the output then reads as the empty string, which happens to hold, but the job also
     stops WAITING for the floor, so it can run before the anchor is written); a gate expressed only
     as a `needs:` edge is defeated by deleting the `if:`."""
-    plan = _job(workflow, GATED_JOB)
-    if FLOOR_JOB not in _declared_needs(plan):
-        return True  # no dependency at all: `plan` starts regardless of the floor
-    needs = {name: {"result": "success", "outputs": {}} for name in _declared_needs(plan)}
+    job = _job(workflow, job_name)
+    if FLOOR_JOB not in _declared_needs(job):
+        return True  # no dependency at all: the job starts regardless of the floor
+    needs = {name: {"result": "success", "outputs": {}} for name in _declared_needs(job)}
     needs[FLOOR_JOB] = {"result": "success", "outputs": {"proceed": proceed}}
-    return _eval_job_if(plan.get("if"), needs)
+    return _eval_job_if(job.get("if"), needs)
+
+
+def _plan_runs(workflow, proceed):
+    """`_gated_job_runs` for `plan`, kept as a name because the floor's whole reason for existing
+    is that PLAN is the expensive half."""
+    return _gated_job_runs(workflow, GATED_JOB, proceed)
 
 
 def _invocations(step, script):
@@ -987,6 +999,41 @@ def _test_workflow_seam(chk):
     # unset job output as the empty string, so this is the shape a deleted `_emit` produces.
     chk("seam: PLAN does NOT run when the floor emits NOTHING (an unset output is the empty "
         "string, and admitting on it is fail-open)", _plan_runs(workflow, ""), False)
+
+    # --- #1208: EVERY job that must obey `proceed`, same three directions -------------------
+    # A held tick that still pays for GUARD's authenticated settings reads is spending the bucket
+    # the hold exists to protect. Measured: 41 rings/h, 5 dispatches, 69% of executable ticks
+    # budget-deferred — each deferred ring paid GUARD anyway. Delete either half of that job's
+    # gate and one of these three rows goes red.
+    for job_name in GATED_JOBS:
+        chk(f"seam[#1208]: `{job_name}` runs when the floor says proceed",
+            _gated_job_runs(workflow, job_name, "true"), True)
+        chk(f"seam[#1208]: `{job_name}` does NOT run when the floor says hold (delete the `if:` "
+            "or cut the `needs:` edge and this goes red)",
+            _gated_job_runs(workflow, job_name, "false"), False)
+        chk(f"seam[#1208]: `{job_name}` does NOT run when the floor emits NOTHING",
+            _gated_job_runs(workflow, job_name, ""), False)
+    # ...and the list is not vacuous. A `GATED_JOBS` quietly trimmed back to `("plan",)` would make
+    # every row above pass while GUARD went back to paying on every deferred ring.
+    chk("seam[#1208]: the gated-job list still names BOTH halves of a tick's fixed cost",
+        tuple(sorted(GATED_JOBS)), ("plan", "secrets-guard"))
+    # THE SAFETY DIRECTION, which is the reason gating a fail-closed guard is admissible at all:
+    # a SKIPPED guard must not admit any job the guard exists to gate.
+    #
+    # `claim` is modelled here because it carries NO `if:` — GitHub's implicit needs-must-succeed,
+    # which a skipped dependency fails. `plan-alert` is NOT modelled here on purpose: its
+    # `always() && needs.secrets-guard.result == 'success'` is outside this harness's deliberately
+    # restricted grammar, and the owner of that polarity question is
+    # dispatch-secrets-guard.if_condition_admits — which already answers it for EVERY non-success
+    # result, `skipped` included, over the live file (guard_gate_verdict property 3, plus the
+    # explicit skipped-guard row in that module's self-test). Re-deciding it here with a substring
+    # test is exactly the vacuous shape #621 caught: an `||` satisfies a substring test and inverts
+    # the gate.
+    claim = _job(workflow, "claim")
+    assert "secrets-guard" in _declared_needs(claim), "claim must need secrets-guard"
+    chk("seam[#1208]: `claim` carries NO job-level `if:`, so a SKIPPED guard skips it via the "
+        "implicit needs-must-succeed gate — gating the guard on the floor can only ever skip "
+        "MORE, never admit more", claim.get("if"), None)
 
     # --- the floor job's own shape ----------------------------------------------------------
     chk("seam: the floor job exposes `proceed` as a job output",
