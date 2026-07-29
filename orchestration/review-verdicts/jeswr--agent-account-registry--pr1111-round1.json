@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1111,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "342f8868a989d5a2a12eafa55123f1d03f15ee54",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`main()` converts any non-list result from the open-PR query into `rows = []` and exits 0 with a zero census. A malformed/null API payload is not evidence that the backlog is empty. The workflow's `swept` counter is incremented merely because the script was invoked, so its final guard does not detect this condition. This violates the sweep's fail-closed contract and allows an API/schema failure to look exactly like a healthy quiet tick.",
+    "file": "scripts/adjudicate-stuck.py",
+    "fix_hint": "Validate the complete `--paginate --slurp` response shape and raise/exit nonzero unless it is a list of list pages containing valid rows. Add an entry-point test with malformed/null payloads that asserts a nonzero result; do not derive success from invocation count alone.",
+    "severity": "major",
+    "title": "Malformed population responses are silently treated as an empty backlog"
+   },
+   {
+    "body": "The loop catches every exception from `_sweep_one`, records each as `refused`, and still returns 0. If authentication, timeline pagination, pull reads, or writes fail for every parked PR, the job remains green and the next scheduled tick has no enforced signal that the control delivered nothing. The summary also merges operational exceptions with policy refusals, obscuring the distinction. There is no self-test of this production path.",
+    "file": "scripts/adjudicate-stuck.py",
+    "fix_hint": "Track operational errors separately from genuine adjudication refusals and fail the process when any write fails, or at minimum when all eligible rows error. Add tests that drive `main()`/`_sweep_one` with failing readers and writers and assert both nonzero exit status and an always-emitted zero/error census.",
+    "severity": "major",
+    "title": "Per-PR failures are swallowed even when the entire sweep is inoperative"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe adjudication rules are generally conservative, but the production sweep can report success when it has not obtained a trustworthy population or has failed every candidate. That makes the scheduled control fail open operationally: parked PRs can remain untouched indefinitely while the workflow stays green. The self-test exercises pure classification and marker helpers but does not cover these entry-point failure paths.",
+  "verdict": "request_changes"
+ }
+}
