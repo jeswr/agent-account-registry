@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1165,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e9b33f7c45a02e479ccc12737d63401a848c326b",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_supersede_fallback_alert` calls `_gh([\"issue\", \"comment\", ...])` without checking `returncode`, then unconditionally prints success and returns `True`. If the close succeeds but the comment fails, `decide` exits green even though the promised still-firing supersede explanation was never delivered. The next tick cannot repair this partial transition because `_find_marker_issue(..., \"open\")` no longer sees the closed issue and returns the already-reconciled success path. The test fake always returns success for comments and only asserts successful comment content, so it does not exercise or detect this failure.",
+    "file": "scripts/model-health.py",
+    "fix_hint": "Make close-plus-explanation a confirmed, retryable transition whose incomplete state remains discoverable after close success and comment failure. Add a non-crashing fake comment failure, assert the run does not certify success, then prove a later tick completes the missing explanation without falsely posting recovery wording or creating another alert.",
+    "severity": "major",
+    "title": "Supersede still succeeds when its required explanation is not delivered"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 major remains unchanged. `_supersede_fallback_alert` still discards the comment command's return code and returns success immediately after a confirmed close. A comment failure therefore leaves a closed, still-firing fallback alert with no supersede explanation, while later ticks cannot retry because the helper searches only open issues. The added fake cannot fail comments and the assertions cover only the successful comment path. The same finding remains at the same severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
