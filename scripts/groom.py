@@ -1516,7 +1516,13 @@ def claim_ref_slots(refs: Any) -> dict[int, str]:
     FAIL CLOSED on a malformed payload instead of returning whatever parsed. A silently short
     CLAIM listing under-reports burned slots; a silently short issue/secret listing OVER-reports
     them, and naming a live credential's slot as burned is what would invite a maintainer to
-    "clean up" the very ref protecting it."""
+    "clean up" the very ref protecting it.
+
+    An AMBIGUOUS listing fails closed for the same reason (review round 1 of #1167). Refs are
+    distinct as STRINGS but this map — like every allocation reader in the estate — keys on the
+    NUMBER, so `acct1` and `acct01` are two real claims and one key. Keeping the last writer would
+    silently drop the other from `claims=`, from `burned=` and from the named rows, which is
+    exactly the short claim listing this function exists to refuse."""
     if not isinstance(refs, list):
         raise GroomError("acct-claims ref listing is malformed")
     slots: dict[int, str] = {}
@@ -1526,7 +1532,15 @@ def claim_ref_slots(refs: Any) -> dict[int, str]:
             raise GroomError("acct-claims ref listing is malformed")
         match = ACCT_CLAIM_REF_RE.match(ref)
         if match:
-            slots[int(match.group(1))] = ref
+            slot = int(match.group(1))
+            if slot in slots:
+                # Deliberately names NEITHER ref NOR slot number, matching the messages above:
+                # locked decision 22b keeps account-backed slots counted, never named.
+                raise GroomError(
+                    "acct-claims ref listing is ambiguous — two distinct refs name the same "
+                    "account slot number"
+                )
+            slots[slot] = ref
     return slots
 
 
@@ -7800,6 +7814,23 @@ def _self_test() -> int:
           [_orphan_raises(claim_ref_slots, payload)
            for payload in ("not-a-list", None, [{"ref": 7}], ["refs/acct-claims/acct01"])],
           [True] * 4)
+    check("orphan-claims: DISTINCT refs colliding on one slot NUMBER refuse — alternate padding "
+          "(`acct1` vs `acct01`) and a repeated ref are two claims and one key, so keying by the "
+          "number would silently drop one from claims=/burned= and from the named rows",
+          [_orphan_raises(claim_ref_slots, payload)
+           for payload in ([{"ref": "refs/acct-claims/acct1"},
+                            {"ref": "refs/acct-claims/acct01"}],
+                           [{"ref": "refs/acct-claims/acct007"},
+                            {"ref": "refs/acct-claims/acct07"}],
+                           [{"ref": "refs/acct-claims/acct07"},
+                            {"ref": "refs/acct-claims/acct07"}])],
+          [True] * 3)
+    check("orphan-claims: the collision guard is EXACT — unpadded and padded numbers that DIFFER "
+          "are still two ordinary slots, so the refusal cannot swallow a normal inventory",
+          claim_ref_slots([{"ref": "refs/acct-claims/acct1"},
+                           {"ref": "refs/acct-claims/acct01x"},
+                           {"ref": "refs/acct-claims/acct10"}]),
+          {1: "refs/acct-claims/acct1", 10: "refs/acct-claims/acct10"})
 
     check("orphan-claims: acctNN issues in ANY state count, and a PULL REQUEST titled acctNN does "
           "NOT (an /issues page carries both)",
@@ -7945,6 +7976,18 @@ def _self_test() -> int:
           "and reads NOTHING — `could not tell` must never read as `nothing is burned`",
           (orphan_unproven_code, "ORPHAN-CLAIM" in orphan_unproven_text, orphan_unproven_calls),
           (1, False, []))
+    orphan_ambiguous_code, orphan_ambiguous_text, _ = _orphan_cli(
+        {"REGISTRY_GH_TOKEN": "registry-token", ACCT_SECRET_NAMES_ENV: '["ACCT07_TOKEN"]'},
+        {**orphan_pages,
+         f"/repos/{orphan_repo}/git/matching-refs/acct-claims/": [
+             {"ref": "refs/acct-claims/acct1"},
+             {"ref": "refs/acct-claims/acct01"},
+             {"ref": "refs/acct-claims/acct09"},
+         ]})
+    check("orphan-claims CLI: an AMBIGUOUS claim inventory exits NON-ZERO and emits NO report — a "
+          "count that quietly dropped a real claim ref must never be published as the fleet's "
+          "burned-slot truth",
+          (orphan_ambiguous_code, "ORPHAN-CLAIM" in orphan_ambiguous_text), (1, False))
     orphan_untoken_code, orphan_untoken_text, _ = _orphan_cli(
         {"REGISTRY_GH_TOKEN": None, ACCT_SECRET_NAMES_ENV: '["ACCT07_TOKEN"]'}, orphan_pages)
     check("orphan-claims CLI: a missing registry token is a REFUSAL, not an empty report",
