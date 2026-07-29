@@ -18721,8 +18721,11 @@ agent = "impl"
         print("  ok   legacy-migration: an unprovable park is DEFERRED, never converted into a "
               "state it could not leave")
 
-        # ONE-SHOT: the reason marker it wrote makes the PR no longer legacy.
-        posted, converted = migrate_sweep([budget_body, budget_body
+        # ONE-SHOT: the reason marker it wrote makes the PR no longer legacy. The marker sits on
+        # its OWN LINE, byte-for-byte as `legacy_migration_body` emits it (`"...changed.\n\n" +
+        # marker`) — since registry #1096 the receipt parser is line-anchored, so a marker glued
+        # onto the end of a prose line is ECHOED text and deliberately not a receipt.
+        posted, converted = migrate_sweep([budget_body, budget_body + "\n\n"
                                            + _park_policy.park_reason_marker("budget")])
         assert (posted, converted) == ([], []), (posted, converted)
         print("  ok   legacy-migration: a PR that already carries a reason marker is never "
@@ -19441,8 +19444,10 @@ agent = "impl"
             healthy_window, comments=age_comments + [bot_at(ladder_body, 3000)],
             timeline=park_at(old))
         assert tied == (0, [], []), tied
-        # A park-REASON receipt (the legacy migration / the starvation park) closes it too.
-        reason_body = f"x {_park_policy.park_reason_marker(STARVATION_PARK_CAUSE)}"
+        # A park-REASON receipt (the legacy migration / the starvation park) closes it too. On its
+        # own line, as both of those writers emit it — registry #1096 line-anchored the parser, so
+        # a marker trailing prose on one line is echoed text rather than an assertion.
+        reason_body = f"x\n\n{_park_policy.park_reason_marker(STARVATION_PARK_CAUSE)}"
         assert readmit_sweep(healthy_window,
                              comments=age_comments + [bot_at(reason_body, 2000)],
                              timeline=park_at(old))[0] == 1
