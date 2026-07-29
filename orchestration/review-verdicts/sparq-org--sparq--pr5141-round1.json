@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5141,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b88c8955ee4418b0e0390e2812ee7bc8586dd798",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The record says the first phase is scoped to the base McpServer, identifies take_notifications and resources/subscribe on SolidMcpServer as the queue needing a delivery channel, and explicitly places SolidMcpServer over HTTP out of scope. Nevertheless, the endpoint contract, phase 4, and out-of-scope section claim the GET stream will drain/deliver that queue. A transport around McpServer cannot consume a SolidMcpServer-only queue, and merely existing in-process does not bridge the two server types. This invalidates a central motivation and leaves the phase-4 API/ownership design unspecified.",
+    "file": "research/mcp-streamable-http-transport-design.md",
+    "fix_hint": "Choose and document one coherent scope: either define a notification-source abstraction implemented by the base and Solid servers and include the required Solid integration in the transport scope, or state that phase-1/base-server HTTP has no current server-initiated notifications and move Solid queue delivery to the separate Solid authorization/session design. Update the endpoint contract, phase 4, and all claims that the queue becomes deliverable accordingly.",
+    "severity": "major",
+    "title": "The proposed GET stream cannot deliver the notification queue within the stated server scope"
+   },
+   {
+    "body": "The record says no new dependency is needed because getrandom, rand, and uuid are already in sparq-mcp's resolved closure via sparq-engine. Rust crates cannot import a transitive dependency merely because it appears in the closure; sparq-mcp must declare whichever generator it uses as a direct dependency (presumably optional under http). Its presence in Cargo.lock supports the narrower claim that this adds no new locked package or audit target, not that no dependency declaration is needed.",
+    "file": "research/mcp-streamable-http-transport-design.md",
+    "fix_hint": "Specify the exact direct optional dependency and feature wiring for session ID generation, and rephrase the claim as 'no new package/version enters Cargo.lock' rather than 'no new dependency is needed.'",
+    "severity": "minor",
+    "title": "Session ID generation still requires a direct sparq-mcp dependency"
+   }
+  ],
+  "progress": null,
+  "summary": "The reassessment is generally careful about opt-in dependency cost and HTTP security, but the proposed notification/SSE motivation is not implementable within its stated scope. The document repeatedly presents Streamable HTTP GET as the delivery channel for SolidMcpServer notifications while explicitly limiting phase 1 to the base McpServer and excluding SolidMcpServer from HTTP. This is a load-bearing design contradiction, not a minor wording issue. The dependency plan also needs to distinguish a crate already present in the lock/closure from a direct Rust dependency usable by sparq-mcp.",
+  "verdict": "request_changes"
+ }
+}
