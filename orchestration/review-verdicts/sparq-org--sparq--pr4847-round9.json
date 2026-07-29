@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4847,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bc24dbaab4865d89a21ea87de1a98a36c4c58a71",
+  "round": 9
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 9 finds no correctness, soundness, test-validity, or security defect. The diagnostic remains confined to the failed-parse path, preserves the rejected SPARQL byte-for-byte, and cannot alter execution. Candidate ranking and emitted hints are capped and deterministic; lexical scanning excludes strings, IRIs, comments, variables, numeric literals, and the Unicode, escaped, empty-prefix, and dotted prefixed-name cases that motivated earlier fixes. The public error-contract tests exercise the real transpilation/canary path, prove non-application, cover hint-free failures, and reproduce the prefixed-name regressions. The keyword drift guard and the documentation's explicitly unmeasured, diagnostic-only framing remain consistent with the implementation. Round 8 likewise had no findings, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
