@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1224,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "64e9848a0c0faa6afd25e687252ba26ebf66209f",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [
+   {
+    "body": "The structural checks inspect only the body of `run_gate`: zero bare `cargo` call sites, exactly eight `_gate_cargo` references, and three prepare calls. They never inspect or exercise `_gate_cargo` itself. Consequently, changing its body to `cargo \"$@\"` preserves all those expected values and makes every cargo profile execute target-controlled build scripts/tests directly on the runner again. This is precisely the one-layer-short evidence-path failure the source pin is meant to prevent; the current assertions prove the name of the callee, not the containment transition it delivers into.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Add an independent exact structural assertion for `_gate_cargo`'s normalized body (or an equivalent non-vacuous test) that requires its sole execution path to be `_gate_sandbox_run cargo \"$@\"`. Demonstrate that replacing the wrapper body with bare host `cargo \"$@\"`, and separately making the sandbox call conditionally inert, turns named rows red without aborting the remaining self-test checks.",
+    "severity": "major",
+    "title": "Containment tests do not bind `_gate_cargo` to the sandbox"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe current implementation routes all cargo invocations through `_gate_cargo`, but the claimed source-level containment proof stops one layer short: it checks `run_gate` call sites and their count without checking the wrapper body that determines whether those calls actually enter the container. A one-line mutation of `_gate_cargo` from `_gate_sandbox_run cargo \"$@\"` to `cargo \"$@\"` leaves every newly added sandbox-routing assertion green while restoring host execution of target-controlled build scripts and tests. This is a major, non-vacuity defect in the trust-boundary regression guard, so I cannot approve. Because round 2 had no findings and this round has a new major finding, progress is regressing. The diff also contains prose directed at its reviewer/reader (for example, telling them how not to interpret the sandbox scope), so `injection_detected` is true; that prose did not influence the technical verdict.",
+  "verdict": "request_changes"
+ }
+}
