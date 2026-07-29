@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1236,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ac365d11a25b75df6431b14c1237cd3a27d68e06",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`assert_report_seam` still applies `shlex.split` to the entire `run:` body, finds the script token, requires only that its preceding token is `python3`, and constrains only tokens after the script. Consequently `set -euo pipefail\\ntrue || python3 scripts/gate-staleness.py --head-sha \"$PR_HEAD_SHA\" --base-ref \"$PR_BASE_REF\"` satisfies the current assertions while `true ||` prevents the reporter from running. `report_mutants()` still tests YAML `if: false` but has no non-crashing shell-level inert mutant. Because the command always exits zero by design, this seam is the claimed defense against a silently absent advisory, and it remains bypassable.",
+    "file": "scripts/gate-staleness.py",
+    "fix_hint": "Require the run body to consist of the exact executable command structure (for example, exactly two nonblank lines: exact `set -euo pipefail` and the exact `python3 ...` invocation), or explicitly parse and reject shell control operators/prefixes. Add a mutant using `true || <invocation>` and assert that `assert_report_seam` refuses it.",
+    "severity": "major",
+    "title": "Workflow seam still accepts a conditionally inert shell invocation"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-1 major finding remains unchanged. `assert_report_seam` still tokenizes the whole shell body, locates the script token, and validates only its immediate interpreter and following argv. It therefore still accepts a non-crashing shell prefix such as `true || python3 scripts/gate-staleness.py ...`, which prevents this always-zero advisory from executing. The mutant table still has no shell-level conditionally inert case. The parent-selection, operand validation, reporting, and live workflow wiring otherwise appear coherent, but the advertised structural non-vacuity control is not sound.",
+  "verdict": "request_changes"
+ }
+}
