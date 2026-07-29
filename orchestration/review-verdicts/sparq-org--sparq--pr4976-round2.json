@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4976,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "09bcba21885acff487e7bffad0a22e2133c3f24e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major finding is resolved. Enforcement now keys both sensitive features and test-leg coverage by (crate, feature), so a same-named feature in another crate cannot satisfy the guard. The new hermetic regression test exercises the real cmd_enforce path, checks the detector preconditions, proves the cross-crate collision fails, and covers both nonblank and blank test-reason behavior. The sparq-py/arrow exception is narrowly documented and corresponds to the existing gating maturin-built Arrow pytest job. The focused 59-test feature-matrix-tier suite passes.",
+  "verdict": "approve"
+ }
+}
