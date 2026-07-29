@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5049,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6a067df5408888c6f8fe00d4d8019040eb10073a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 1.2 says the deterministic gates include \u201ca prefix-diverse adversarial input showing no regression (memo miss cost \u2248 one short memcmp).\u201d A no-regression cost claim is not inherently deterministic when established by wall time or profiling, and no deterministic counter or structural assertion is identified. This leaves the acceptance criterion ambiguous and partially repeats the classification problem from round 1, though at lower severity because EC2 timing is now correctly labeled advisory.",
+    "file": "research/engine-performance-review.md",
+    "fix_hint": "Either identify the exact deterministic assertion used for the adversarial input (for example, a comparison/probe-count bound enforced by a test), or move the no-regression check into the advisory evidence and require corroborated repeated same-box readings. Keep only differential equivalence and genuinely deterministic counters/ratchets under \u201cdeterministic gates.\u201d",
+    "severity": "minor",
+    "title": "Prefix-diverse performance check is mislabeled as deterministic"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 is improving: the prior major issue is substantially corrected across the document by explicitly classifying EC2 and parse-rate timings as advisory and non-canonical. One remaining correctness-of-documentation issue persists in section 1.2: a prefix-diverse input's performance regression check is grouped under \u201cdeterministic gates,\u201d even though the text defines it through memo-miss cost and the surrounding policy recognizes timing as noisy. Clarify whether this is a deterministic structural/counting assertion or advisory repeated timing evidence.",
+  "verdict": "request_changes"
+ }
+}
