@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1184,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "20f7773617ae01cc1cae6aea64cb059127bc8635",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe observability lease-label validator is correctly tightened from the obsolete 8-hex shape to the repository-wide canonical 16-hex account fingerprint. The implementation remains fail-closed for malformed labels, uses full-match validation, and does not weaken the existing privacy or rows-first precedence controls. The self-test covers the real canonical producer output, verifies that the accepted row is consumed, rejects the former 8-hex format plus adjacent-width near misses, and preserves full-suite diagnostics by converting unexpected normalization refusals into named check failures. The documentation matches the implemented contract. No blocking correctness, soundness, security, or test-validity issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
