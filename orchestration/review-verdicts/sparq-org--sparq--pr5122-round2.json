@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5122,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "230bf76c1f1feb8a0a616bc1eaf59dd25b2dbd76",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major test-validity issue. The GROUP_CONCAT test no longer requires an incidental cross-engine disagreement for an order-unspecified raw concatenation. Instead, it structurally rejects the unsafe raw multi-member shape, verifies the two emitted shapes classify as order-invariant, checks all generated categories and seeds against that invariant, and positively compares the safe singleton and STRLEN-wrapped shapes on a genuinely multi-member fixture. The added typed-literal and non-SELECT coverage is coherently routed through value, boolean, and graph comparators, with non-vacuity checks for datatype-family reachability, ASK true/false outcomes, graph non-emptiness, and mutation sensitivity. No correctness, soundness, security, or test-validity issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
