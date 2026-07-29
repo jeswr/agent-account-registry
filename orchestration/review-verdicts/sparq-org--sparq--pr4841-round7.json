@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4841,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d6da975631c437bedae641a9bef7ef42238bfa30",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "parseShapeRows still deduplicates solely by (targetClass, path) using a seen set and retains the first result row. Multiple shapes may constrain the same class/path differently; a later minCount >= 1, sh:class, sh:datatype, or sh:name is silently lost, and shapesQuery has no ordering that makes the retained row deterministic. The test in gui/app/src/lib/query-builder.test.ts duplicates an already-required compatible row, so it remains vacuous against the reported failure.",
+    "file": "gui/app/src/lib/query-builder.ts",
+    "fix_hint": "Merge all rows for each (targetClass, path) deterministically: at minimum OR required across rows and define a deterministic policy for class/datatype/name conflicts, or retain all constraints and merge them explicitly downstream. Add a regression test whose first row is optional and whose later duplicate has minCount=1; also cover differing metadata if the representation continues to expose only one value.",
+    "severity": "major",
+    "title": "Duplicate SHACL constraints are still discarded in arbitrary result order"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 7 is stagnant: the round-6 major correctness issue remains unchanged. parseShapeRows still keeps the first row for each (targetClass, path), so later constraints can be silently discarded according to unspecified SPARQL result order. The updated test still uses two compatible required rows and therefore does not exercise the reported optional-first/required-later failure.",
+  "verdict": "request_changes"
+ }
+}
