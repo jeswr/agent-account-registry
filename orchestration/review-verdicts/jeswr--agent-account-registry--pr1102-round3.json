@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1102,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "436cac0ae252f3d383a8cdb6e293ccdac27c9e74",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 resolves the remaining major finding. `_dispatch_lane_rows` now preserves the observed dictionary insertion order and compares the required-lane subsequence against the literal authoritative `worker, review, fix, disarm` tuple, so a complete block with the required rows permuted fails closed while unknown future lanes remain compatible wherever they appear. The self-test includes two literal reordered complete blocks whose inputs and expected refusal do not derive from the production constant, plus positive cases for appended and interleaved unknown lanes. The implementation matches `dispatch-claim.py`'s current fixed emission order and retains the prior whole-block, anchor, truncation, duplication, syntax, and cap protections. I found no remaining correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
