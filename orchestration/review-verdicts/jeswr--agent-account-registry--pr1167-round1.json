@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1167,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e7c7fe498095313cceaf51f3c4b982cc5a45f27a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`claim_ref_slots()` stores refs in a `dict[int, str]`, so distinct valid matches such as `refs/acct-claims/acct1` and `refs/acct-claims/[redacted-account]` both become key `1`; the latter silently overwrites the former. The accepted grammar and the existing allocation readers allow any `[0-9]+`, while git refs themselves are distinct. Consequently `claims=`, `burned=`, and the named rows can omit a real claim ref. This is especially problematic because the function explicitly promises to fail closed on malformed listings and the README says each claim is counted/named. The self-test only supplies unique numeric slots, so it cannot detect the overwrite.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Reject duplicate numeric slot keys (including alternate zero-padding) as an inconsistent/malformed claim inventory, or preserve and report every distinct ref with semantics that cannot silently undercount. Add a test containing both `acct1` and `[redacted-account]` and assert the chosen fail-closed behavior; also verify the CLI exits nonzero and emits no burned-slot report for that inventory.",
+    "severity": "major",
+    "title": "Numerically equivalent claim refs are silently collapsed"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe report is read-only and generally fail-closed, but its claim parser silently collapses distinct claim refs that encode the same integer slot. That contradicts the marquee promise to count/name every burned claim and turns an inconsistent claim namespace into an under-report instead of a refusal. Round 1, so progress is null.",
+  "verdict": "request_changes"
+ }
+}
