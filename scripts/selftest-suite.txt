@@ -13,6 +13,7 @@ dispatch-plan.py
 dispatch-secrets-guard.py
 dispatch-stall-alert.py
 dispatch-tick-floor.py
+gate-staleness.py
 gh_retry.py
 grant-account.py
 grant-scope-audit.py
