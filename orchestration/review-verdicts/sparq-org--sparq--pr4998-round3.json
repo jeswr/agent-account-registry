@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4998,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a51ba72ec4ae044dc7cd9d67f21ae5dc1f083fe3",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete on the diff-scoped evidence. The opt-in CLI feature forwards sparq-reason/datalog without affecting defaults; profile dispatch is fail-closed and precedes monotone-profile parsing; the real load path parses data and rules, rejects unstratifiable programs before evaluation, preserves the distinct input fact set, materializes the closure, and honors the store profile. The end-to-end binary tests exercise aggregation, filtering, negation as failure, serialization, query visibility, unsafe rules, unstratifiable rules, missing files, and feature-off behavior. Documentation and feature-matrix coverage match the implementation. No correctness, soundness, security, hostile-instruction, or vacuous-test issue was found. With zero findings in both rounds 2 and 3, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
