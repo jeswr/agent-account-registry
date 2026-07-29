@@ -16486,6 +16486,47 @@ agent = "impl"
     # a disk error or the schema drifts).
     assert tick_state(None, "success") == "none"
     assert tick_state({"planned": None, "dispatched": 0, "defer_reasons": {}}) == "none"
+    # ...and — the round-1 review defect — neither may an INCOMPLETE summary. The parser defaults
+    # above fill an absent planned/dispatched/defer_reasons with 0/0/{}, which is the right
+    # conservative reading for the zero/degraded classes but is an ABSENCE of information, so
+    # `idle` must not be assembled out of them. Each shape below reached `idle` before the fix and
+    # would have recovered an open zero-dispatch alert off a summary that observed nothing.
+    assert tick_state({}) == "none"
+    assert tick_state([]) == "none"                      # valid JSON, not a summary mapping
+    assert tick_state({"planned": 0}) == "none"          # dispatched + histogram omitted
+    assert tick_state({"planned": 0, "dispatched": 0}) == "none"       # histogram omitted
+    assert tick_state({"planned": 0, "defer_reasons": {}}) == "none"   # dispatched omitted
+    assert tick_state({"dispatched": 0, "defer_reasons": {}}) == "none"  # planned omitted
+    # a non-mapping histogram is a schema violation, not an empty one (`reasons` sanitises it to
+    # {} for the degraded read; that sanitised value may not become positive evidence here)
+    assert tick_state({"planned": 0, "dispatched": 0, "defer_reasons": "nope"}) == "none"
+    assert tick_state({"planned": 0, "dispatched": 0, "defer_reasons": []}) == "none"
+    # `bool` is an `int` subclass, so a plain isinstance(..., int) count check reads
+    # `planned: false` as a count of zero. It is a schema violation and observes nothing.
+    assert tick_state({"planned": False, "dispatched": False, "defer_reasons": {}}) == "none"
+    assert tick_state({"planned": 0, "dispatched": False, "defer_reasons": {}}) == "none"
+    assert tick_state({"planned": False, "dispatched": 0, "defer_reasons": {}}) == "none"
+    # ...while the counts the real writer emits are still read as the counts they are. Drive the
+    # PRODUCER, not a hand-written literal: requiring the exact field names above means a rename in
+    # _write_dispatch_summary would make `idle` unreachable in production — silently, and
+    # fail-closed, so no alarm — while every literal-fed assertion here stayed green. This is the
+    # one assertion whose input comes from the same place the workflow reads it (pre-flight 2c).
+    with tempfile.TemporaryDirectory() as _quiet_dir:
+        _quiet_prior = os.environ.get("DISPATCH_SUMMARY_FILE")
+        os.environ["DISPATCH_SUMMARY_FILE"] = os.path.join(_quiet_dir, "summary.json")
+        try:
+            _write_dispatch_summary(0, 0, Counter(), _new_lane_counts())
+            with open(os.environ["DISPATCH_SUMMARY_FILE"], encoding="utf-8") as _qh:
+                _quiet_summary = json.load(_qh)
+        finally:
+            if _quiet_prior is None:
+                del os.environ["DISPATCH_SUMMARY_FILE"]
+            else:
+                os.environ["DISPATCH_SUMMARY_FILE"] = _quiet_prior
+    assert tick_state(_quiet_summary) == "idle", _quiet_summary
+    # ...and the SAME real summary with one planned item is not quiet — so the assertion above is
+    # pinning the empty frontier, not merely "any summary the writer produces".
+    assert tick_state(dict(_quiet_summary, planned=1)) == "zero"
     # ...and an empty frontier does NOT mask a lane stall: the safety-disarm failure still wins,
     # because `zero` is evaluated first. Reordering the chain would let a dead disarm lane report
     # itself healthy on every quiet tick.

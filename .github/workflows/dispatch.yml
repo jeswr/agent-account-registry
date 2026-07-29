@@ -2035,14 +2035,26 @@ jobs:
           # ("there was nothing to launch"), which is why it is derived from the claim step's own
           # outcome rather than from the fallback below: a claim that FAILED, or a summary that
           # never landed, is an absence of information and must stay unrecorded.
-          # HONESTY NOTE on `not reasons`: it is DELIBERATELY redundant with `degraded` (a nonempty
-          # histogram with dispatched == 0 is already classified `zero` one line down, which wins).
-          # It is kept because this predicate must state its OWN precondition — a later narrowing of
-          # `degraded` must not silently turn a deferring tick into a quiet one — but it is not an
-          # independently reachable branch, and the self-test does not pretend it is.
-          quiet = summary is not None and os.environ.get("CLAIM_OUTCOME") == "success" \
-              and isinstance(planned, int) and planned == 0 \
-              and isinstance(dispatched, int) and dispatched == 0 and not reasons
+          # HONESTY NOTE on `not observed_reasons`: it is DELIBERATELY redundant with `degraded` (a
+          # nonempty histogram with dispatched == 0 is already classified `zero` one line down,
+          # which wins). It is kept because this predicate must state its OWN precondition — a later
+          # narrowing of `degraded` must not silently turn a deferring tick into a quiet one — but
+          # it is not an independently reachable branch, and the self-test does not pretend it is.
+          # ROUND 1 REVIEW: `idle` must be built from the RAW summary, never from the defaulted
+          # `planned`/`dispatched`/`reasons` above. Those defaults (0/0/{}) exist to keep the
+          # zero/degraded classes conservative when a field is missing, but they are absences of
+          # information — reusing them here made `{}`, `[]`, `{"planned": 0}` and a non-mapping
+          # histogram all fabricate a positive empty-frontier observation that recovers an open
+          # zero-dispatch alert. So require a MAPPING that actually CARRIES the schema
+          # (_write_dispatch_summary always emits all three), with real counts: `bool` is an `int`
+          # subclass and `planned: false` is a schema violation, not a count of zero.
+          def _observed_count(field):
+              value = summary.get(field) if isinstance(summary, dict) else None
+              return value if isinstance(value, int) and not isinstance(value, bool) else None
+          observed_reasons = summary.get("defer_reasons") if isinstance(summary, dict) else None
+          quiet = os.environ.get("CLAIM_OUTCOME") == "success" \
+              and _observed_count("planned") == 0 and _observed_count("dispatched") == 0 \
+              and isinstance(observed_reasons, dict) and not observed_reasons
           # Emit a marker file the record step reads (keeps the record invocation out of this
           # inline python so the salted-hash discipline stays in model-health.py). A lane stall or a
           # failed safety disarm counts as a zero-dispatch tick even when the fleet dispatched>0.
