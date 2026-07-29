@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5076,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3466bc48448942ec110630e0b8025e76505946ac",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new crate-level documentation says `research/lws-design-records.md` is the durable in-repo home and that its \u00a71 maps the omitted RSS/PSS documents. At the PR head, that file is absent, and it is not present anywhere in this diff. Nearly every other changed file now points to sections of this missing document, so readers still cannot inspect the cited rationale; this is particularly material for the security-sensitive identity-host, existence-nondisclosure, public-read skip, TLS, and proof-of-possession claims.",
+    "file": "crates/sparq-lws-core/src/lib.rs",
+    "fix_hint": "Add `research/lws-design-records.md` to this PR with the promised source-path map and the referenced \u00a7\u00a73\u20137 content, or redirect every changed citation to an existing, durable in-repo document. Verify all referenced section numbers and namespace mappings resolve before merging.",
+    "severity": "major",
+    "title": "The new durable design-record target does not exist"
+   }
+  ],
+  "progress": null,
+  "summary": "The citation cleanup is incomplete: the diff redirects the crate's design and security references to research/lws-design-records.md and describes that file as their durable in-repo home, but that file is absent from the PR-head checkout and is not added by this diff. Consequently the changed documentation replaces missing source-tree references with another missing reference, including for security-sensitive identity, public-read-skip, existence-nondisclosure, and PoP rationale.",
+  "verdict": "request_changes"
+ }
+}
