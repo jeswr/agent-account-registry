@@ -28,12 +28,29 @@
 #     cross-checked against the raw source. Leading zeros are refused; a second closing pair
 #     ANYWHERE — including inside a fenced code block, which the raw side does not strip — refuses
 #     the whole pull as `ambiguous-issue-reference`.
-#   * groom.LINKED_ISSUE — the same keywords but `\s+` before the `#`, so `Closes: #929` (which
-#     auto-mint accepts) is INVISIBLE to groom.
+#   * groom.LINKED_ISSUE — the same keywords, but `\s+` before the `#`.
 #   * GitHub's own auto-close, which is what actually closes the issue on merge.
 #
-# `Closes #<n>`, one ASCII space, no colon, alone in its own paragraph, is the only form in the
-# intersection. That is the single thing this file exists to guarantee.
+# THE SEPARATOR IS THE WHOLE CONSTRAINT, and the two readers disagree in BOTH directions — neither
+# grammar contains the other, so a form that satisfies one can be invisible to the other. Measured
+# against both regexes and GitHub's live renderer:
+#
+#     Closes #929      space(s) or tab   auto-mint YES   groom YES   binds   <- the safe form
+#     Closes: #929     colon             auto-mint YES   groom NO    binds   <- groom is blind
+#     Closes\n#929     newline           auto-mint NO    groom YES   no bind <- auto-mint is blind
+#     Closes#929       nothing           auto-mint YES   groom NO    no bind
+#
+# So: one or more SPACES OR TABS, and nothing else, between the keyword and the `#`.
+#
+# WHAT IS *NOT* CONSTRAINED, also measured — stated because an over-tight rule gets cited later as
+# a reason to rework something that was always fine:
+#
+#   * the KEYWORD is free. close/closes/closed/fix/fixes/fixed/resolve/resolves/resolved, any case,
+#     all clear both regexes and all bind live. `worker-live.sh` emits `Fixes #<n>` and is 24/24
+#     compliant. `Closes` is this file's arbitrary pick, not a requirement.
+#   * PLACEMENT is free. Inline mid-sentence, end of a sentence, inside a list item, bold-wrapped,
+#     or alone in a paragraph all bind. This file appends a paragraph because appending is the
+#     only edit that cannot disturb an existing body, not because the reader wants a paragraph.
 #
 # IT NEVER RE-IMPLEMENTS THE GRAMMAR. `CLOSING_REF_RE`, `derivation_texts` and `closing_references`
 # are IMPORTED from auto-mint-provenance. A second copy of a regex is a second grammar, and the two
@@ -100,9 +117,9 @@ closing_references = _auto_mint.closing_references
 _groom = _load_sibling_module("registry_groom", "groom.py")
 LINKED_ISSUE_RE = _groom.LINKED_ISSUE
 
-# The one emitted form. `Closes` (not `Fixes`) because it is the keyword GitHub's own documentation
-# leads with and the one AGENTS.md already asks for; the keyword choice is otherwise free — all
-# nine of auto-mint's keywords and all of groom's are equivalent here.
+# An ARBITRARY pick among nine equivalent keywords — see the header table. Nothing downstream reads
+# this constant's value, only the separator that follows it, so changing it to `Fixes` would be
+# equally correct. It is a constant so the emitted form is uniform, not because the form is forced.
 CLOSING_KEYWORD = "Closes"
 ISSUE_NUMBER_RE = re.compile(r"^[1-9][0-9]*$")
 
@@ -313,18 +330,35 @@ def _self_test():  # noqa: C901 — a flat sequence of assertions, deliberately 
     oracle = json.loads(ORACLE_PATH.read_text(encoding="utf-8"))
     documents = oracle["documents"]
 
+    requested = []
+
     def frozen_render(text):
         """GitHub's REAL rendering of `text`, recorded by `--refresh-oracle`.
 
         A document the corpus has never seen RAISES rather than returning something plausible: a
         renderer stub that invents HTML is a second grammar, which is the thing this file exists
-        not to have."""
+        not to have.
+
+        Every request is RECORDED. The corpus-agreement assertion below reads this list — what the
+        suite actually asked for — rather than re-walking `_oracle_documents()`. Checking the
+        hand-kept list against the corpus cannot detect a document the suite renders but the list
+        forgot, which is precisely the gap that assertion is named for."""
+        requested.append(text)
         if text not in documents:
             raise ComposeError(f"no recorded rendering for {text!r} — refresh the oracle")
         return documents[text]
 
     def declared(title, body):
-        return binds_to(title, body, frozen_render, ORACLE_REPO)
+        """`binds_to`, but an unrecorded document becomes a VALUE, not a traceback.
+
+        A mutant that changes the emitted string renders a document the corpus lacks. If that
+        escapes as an exception the mutant dies on the oracle rather than on an assertion, which
+        is not evidence that anything was detected — three mutants in this file's first battery
+        died exactly that way."""
+        try:
+            return binds_to(title, body, frozen_render, ORACLE_REPO)
+        except ComposeError as exc:
+            return f"UNRECORDED-DOCUMENT ({exc})"
 
     # ---- CONTROL: the instrument answers a KNOWN POSITIVE and a KNOWN NEGATIVE ----------------
     # Run BEFORE anything this file emits is asserted on. An instrument that cannot say "yes" to a
@@ -461,17 +495,27 @@ def _self_test():  # noqa: C901 — a flat sequence of assertions, deliberately 
         resolve_source_issue(None, lambda n: (_ for _ in ()).throw(AssertionError("read!"))),
         (None, REASON_NO_PROVEN_ISSUE))
     chk("the oracle fails LOUDLY on a document it never recorded (never silently 'no match')",
-        isinstance(_capture_raise(lambda: frozen_render("unrecorded")), ComposeError), True)
+        isinstance(_capture_raise(lambda: frozen_render(UNRECORDED_PROBE)), ComposeError), True)
     chk("main() with no subcommand exits 2 rather than doing something", main([]), 2)
     chk("_capture_raise reports None when nothing raises — it can say 'no'",
         _capture_raise(lambda: None), None)
-    # Corpus/fixture agreement. Without this, adding a document to `_oracle_documents` and
-    # forgetting to re-record leaves the gap to be discovered by a mutant dying for the wrong
-    # reason — which is how three mutants in this file's own first battery died.
-    chk("every document the suite renders has a recorded rendering",
-        [t for t in _oracle_documents() if t not in documents], [])
-    chk("...and the oracle carries no document the suite never renders",
-        [t for t in documents if t not in _oracle_documents()], [])
+
+    # ---- Bodies that SWALLOW an appended reference ----------------------------------------------
+    # The case that justifies verifying the composed body instead of trusting the string. A body
+    # ending inside an unterminated construct absorbs whatever follows it, so the appended line is
+    # present and correct in the raw text, reads correctly to a human, and binds to NOTHING.
+    # Measured: of six shapes, exactly these two swallow. An unterminated inline code span, a
+    # trailing blockquote and an indented code block all bind normally — appending a blank line and
+    # a new paragraph escapes them.
+    for label, body in (("an unterminated fenced block", UNTERMINATED_FENCE),
+                        ("an unclosed HTML comment", UNCLOSED_COMMENT)):
+        swallowed, reason = compose(body, ORACLE_ISSUE)
+        chk(f"{label}: the reference IS present in the raw text", f"Closes #{ORACLE_ISSUE}"
+            in swallowed and reason is None, True)
+        chk(f"{label}: ...but the reader binds NOTHING — the string was never the guarantee",
+            declared("", swallowed), [])
+        chk(f"{label}: so the entry point writes NOTHING",
+            run_cmd(ORACLE_ISSUE, body=body)[0::2], ("ComposeError", body))
 
     # ---- The grammar is IMPORTED, not copied ----------------------------------------------------
     # If this ever fails, someone has re-declared the regex locally and the two will drift.
@@ -494,8 +538,36 @@ def _self_test():  # noqa: C901 — a flat sequence of assertions, deliberately 
     chk("...and the AST scan is not vacuous: it DOES see this file's own patterns",
         local_patterns, [r"^[1-9][0-9]*$"])
 
+    # ---- Corpus/fixture agreement — LAST, because it reads what was actually rendered ----------
+    # `requested` is only complete once every assertion above has run. Placed anywhere earlier it
+    # silently under-reports, which is the failure mode the earlier hand-kept version had by
+    # construction: it could not see a document the suite renders but the list forgot.
+    asked = sorted(set(requested) - {UNRECORDED_PROBE})
+    chk("every document the suite ACTUALLY rendered has a recorded rendering",
+        [d[:48] for d in asked if d not in documents], [])
+    # ONE direction only. Everything the suite renders must be in the recorder's list, or
+    # `--refresh-oracle` would not record it and the gap would surface as a mutant dying on the
+    # oracle. The REVERSE is intentional: the list also carries near-miss forms (`Closing`,
+    # `Closes:`, zero-padded, prepended) that only a MUTANT renders, so that a mutant dies on an
+    # assertion rather than on a missing document.
+    chk("everything the suite renders is in the recorder's list, so a refresh records it",
+        [d[:48] for d in asked if d not in _oracle_documents()], [])
+    chk("...and the check is not vacuous: the suite really did render documents",
+        len(asked), EXPECTED_RENDERED_DOCUMENTS)
+
     print("pr-body-ref self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
+
+
+# Bodies ending inside an unterminated construct: the appended reference is swallowed by it, so it
+# reads correctly and binds to nothing. These are inputs to the self-test, not forms this file emits.
+UNTERMINATED_FENCE = "> 🤖 SPARQ agent\n\nEarlier diff:\n\n```\nsome code\n"
+UNCLOSED_COMMENT = "> 🤖 SPARQ agent\n\n<!-- sparq-impl-provider:anthropic\n"
+# Deliberately absent from the corpus: the input that proves the oracle refuses loudly.
+UNRECORDED_PROBE = "a document the oracle has deliberately never recorded"
+# The number of DISTINCT documents a clean run renders. Pinned so that deleting an assertion that
+# renders one is caught here rather than silently shrinking the corpus check.
+EXPECTED_RENDERED_DOCUMENTS = 9
 
 
 def _oracle_documents():
@@ -521,6 +593,9 @@ def _oracle_documents():
         composed.replace(reference, f"Closes #{ORACLE_ISSUE:04d}"),
         composed.replace(reference, "Closes #1"),
         f"{reference}\n\n{kept}\n",
+        # bodies that swallow the appended reference
+        compose(UNTERMINATED_FENCE, ORACLE_ISSUE)[0],
+        compose(UNCLOSED_COMMENT, ORACLE_ISSUE)[0],
     ]
 
 

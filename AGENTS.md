@@ -120,23 +120,45 @@ unkillable.
     test?"* — is what turned up real defects in the same authors' own patches that night,
     including one author catching its **own fix** one layer short.
 
-13. **Declare the source issue your PR closes — and compose the line, don't hand-write it.** The
-    cross-provider review lane can only enumerate a PR that has a provenance record, and
-    `auto-mint-provenance.py` derives its one hard input — the source issue — from the PR's own
-    closing reference. Measured on the live board the night **#937** merged: of **15**
-    enrolled-class pulls, **12** refused `no-issue-reference` and **1** `reference-is-a-pull-request`
-    (#710 declared `fixed #729`, which is a pull request). Every body this repo composes **in code**
-    already declares one; **every refusal was a body composed by hand.** The form is not free:
-    `Closes #<n>`, one ASCII space, no colon, alone in its paragraph, is the only form all three
-    consumers accept — `auto-mint-provenance.CLOSING_REF_RE` tolerates a colon, `groom.LINKED_ISSUE`
-    requires `\s+` and would not see it, and GitHub's auto-close needs both. A **second** closing
-    pair anywhere — including inside a fenced block, which the raw side does **not** strip — refuses
-    the whole PR as `ambiguous-issue-reference`. So run
-    `scripts/pr-body-ref.py compose --issue <n> --repo <owner/name> --body-file <f>`: it emits that
-    form, and verifies its own output against the reader's *imported* grammar before writing.
+13. **Declare the source issue your PR closes.** The cross-provider review lane can only enumerate a
+    PR that has a provenance record, and `auto-mint-provenance.py` derives its one hard input — the
+    source issue — from the PR's own closing reference. Measured on the live board the night
+    **#937** merged: of **15** enrolled-class pulls, **12** refused `no-issue-reference` and **1**
+    resolved its reference to a pull request rather than an issue. Every body this repo composes
+    **in code** already declares one; **every refusal was a body composed by hand.**
+
+    **What is required is one closing keyword, then one or more spaces or tabs, then `#<n>`** —
+    that is the whole rule. (Every example on this page writes the number as `<n>` on purpose:
+    `#<n>` cannot match the reader's `#[1-9][0-9]*`, so an example pasted verbatim into a PR body
+    declares nothing instead of silently binding that PR to an issue named in this file.)
+
+    ⚠️ **The separator is the hazard, and it is the ONLY part that is fragile**, because two
+    consumers read these bodies with grammars where *neither contains the other* — so a form one
+    accepts can be invisible to the other. Measured against both regexes and GitHub's live renderer:
+
+    | separator | `auto-mint` | `groom` | binds |
+    |---|---|---|---|
+    | `Closes #n` — space(s) or tab | yes | yes | **yes** |
+    | `Closes: #n` — colon | yes | **no** | yes |
+    | `Closes\n#n` — newline | **no** | yes | no |
+    | `Closes#n` — nothing | yes | **no** | no |
+
+    **What is NOT constrained** — stated because an over-tight rule gets followed anyway and then
+    cited as a reason to rework something that was always fine. The **keyword is free**:
+    close/closes/closed/fix/fixes/fixed/resolve/resolves/resolved, any case, all work —
+    `worker-live.sh` emits `Fixes #<n>` and is 24/24 compliant. **Placement is free**: inline
+    mid-sentence, ending a sentence, in a list item, bold-wrapped, or alone in a paragraph all bind.
+
+    Two things still bite. A **second** closing pair anywhere — including inside a fenced block,
+    which the raw side does **not** strip — refuses the whole PR as `ambiguous-issue-reference`. And
+    a body ending inside an **unterminated fence or unclosed HTML comment** swallows an appended
+    reference: it reads correctly and binds to nothing. `scripts/pr-body-ref.py compose --issue <n>
+    --repo <owner/name> --body-file <f>` handles both — it verifies its output against the reader's
+    *imported* grammar and writes nothing if the reader would not bind it.
+
     ⚠️ **The number is the issue you were DISPATCHED against — never the branch name, never a number
-    the body happens to mention.** If you cannot prove one, emit **nothing**: a missing reference is
-    a visible, censused, one-edit-recoverable refusal; a wrong one silently binds your PR to
+    the body happens to mention.** If you cannot prove one, declare **nothing**: a missing reference
+    is a visible, censused, one-edit-recoverable refusal; a wrong one silently binds your PR to
     someone else's issue, mis-partitions the review lease, and points the human-hold at the wrong
     object.
 
