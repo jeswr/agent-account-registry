@@ -337,4 +337,9 @@ if [[ -n ${GITHUB_PATH:-} ]]; then
   printf '%s\n' "$BIN_DIR" >> "$GITHUB_PATH"
 fi
 
-printf 'worker-prep: prepared isolated HOME for %s with the pinned %s CLI\n' "$ACCOUNT" "$HARNESS"
+# PRIVACY (locked decision 22b, issue #91): names the HARNESS, never the account handle. This log
+# is public and retained, and `acctNN` reverses directly to the `ACCTNN_TOKEN` secret reference —
+# the same identifier write_back already keeps out of its own success line. The account attribution
+# belongs to the no-target-code model_health job, which holds PROVENANCE_SALT and records a salted
+# hash instead. The handle is still validated above; it is only not printed.
+printf 'worker-prep: prepared isolated HOME with the pinned %s CLI\n' "$HARNESS"

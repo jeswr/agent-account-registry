@@ -1431,6 +1431,21 @@ jobs:
           TARGET_DIR: ${{ github.workspace }}/target
           GATE_PROFILE: ${{ needs.resolve.outputs.gate_profile }}
           WORKER_PACKAGES: ${{ needs.resolve.outputs.packages }}
+          # [issue #91] Same quarantine as worker.yml's gate step, which this lane had not
+          # inherited. The fix lane runs the SAME `worker-live.sh gate` on the SAME target
+          # checkout, so it executes the same target-controlled build scripts and tests as the
+          # runner user — and it is the WEAKER position of the two, because a write-capable
+          # GH_TOKEN step (`push`) still follows the gate in this job. So the runner command files
+          # go: $GITHUB_ENV / $GITHUB_PATH are the cross-step primitives (BASH_ENV, LD_PRELOAD,
+          # an attacker binary ahead of the system python3), and $GITHUB_STEP_SUMMARY /
+          # $GITHUB_OUTPUT are the exfiltration ones ($GITHUB_STEP_SUMMARY is retained and
+          # rendered on the run page, and base64 defeats GitHub's exact-secret masking). Nothing
+          # legitimate is lost: the gate reports through its exit status alone, and only
+          # `steps.gate.outcome` is read downstream — never `steps.gate.outputs`.
+          GITHUB_ENV: ${{ runner.temp }}/gate-quarantine/env
+          GITHUB_PATH: ${{ runner.temp }}/gate-quarantine/path
+          GITHUB_OUTPUT: ${{ runner.temp }}/gate-quarantine/output
+          GITHUB_STEP_SUMMARY: ${{ runner.temp }}/gate-quarantine/step-summary
         run: bash ../registry/scripts/worker-live.sh gate
 
       - name: Commit and push the fix to the PR head branch

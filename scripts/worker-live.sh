@@ -3108,9 +3108,25 @@ PY
   printf 'worker-live: wrote the full refreshed credential back to the account secret (env dispatch-secrets)\n'
 }
 
+# [issue #91] The WITHHELD MODEL TRANSCRIPT artifacts, all sitting DIRECTLY under WORKER_ROOT (not
+# under `home`, so the subtree removal below does not reach them). They carry no account credential,
+# but the gate makes them the same class of target: it executes the TARGET's own build scripts and
+# tests as the runner user at a $RUNNER_TEMP path every step knows, and a hostile one that
+# base64-encodes `model-output.log` into the retained job log has published exactly what this script
+# promises to withhold ("raw model output withheld to protect credentials"; the run's diagnostics
+# artifact was DROPPED for the same reason — worker.yml names `error-signals.log` as raw CLI stderr).
+# Encoded output also defeats GitHub's exact-secret masking, so "the credential itself is already
+# purged" is not an answer here.
+#
+# Every one of these is consumed ONLY inside run_model / run_fix — the exit classification and the
+# usage-telemetry lift both run there — which is strictly before the purge step in both live lanes.
+# Nothing after the purge reads them, so removing them costs no signal.
+WORKER_TRANSCRIPT_ARTIFACTS=(model-output.log cli-stderr.log error-signals.log)
+
 # PURE (self-tested): print every path under WORKER_ROOT that can still hold account credential
-# material — the isolated HOME subtree in full, plus the host-side pre-flight artifacts that sit
-# directly under the root — in sorted order. Expected output after `purge-credentials` is EMPTY.
+# material or the withheld model transcript — the isolated HOME subtree in full, plus the host-side
+# pre-flight artifacts and the transcript artifacts that sit directly under the root — in sorted
+# order. Expected output after `purge-credentials` is EMPTY.
 #
 # It is a DISCOVERY scan and takes ONLY the root, deliberately: that is exactly what
 # target-controlled code in the gate has to work with. GitHub hands $RUNNER_TEMP to every step
@@ -3122,9 +3138,15 @@ _credential_residue() {
   local root=$1
   [[ -n "$root" && "$root" != / ]] || die 'unsafe credential-residue root'
   [[ -d "$root" ]] || return 0
+  local -a transcript_pred=()
+  local artifact
+  for artifact in "${WORKER_TRANSCRIPT_ARTIFACTS[@]}"; do
+    transcript_pred+=(-o -name "$artifact")
+  done
   {
     find "$root/home" -print 2>/dev/null || true
-    find "$root" -maxdepth 1 \( -name '.credential-*' -o -name '.selected-credential' \) -print \
+    find "$root" -maxdepth 1 \
+      \( -name '.credential-*' -o -name '.selected-credential' "${transcript_pred[@]}" \) -print \
       2>/dev/null || true
   } | sort
 }
@@ -3143,10 +3165,17 @@ _credential_residue() {
 # implicit `success()` admit the gate. Idempotent (a re-run, or a prepare that never materialized
 # anything, is a clean no-op) because both live lanes call it under `always()`.
 #
+# [issue #91] IT TAKES THE WITHHELD MODEL TRANSCRIPT WITH IT. The credential files were only the
+# most valuable thing the gate could read off this tree, never the only one: `model-output.log` and
+# its siblings sit directly under the root, survive the HOME removal, and are reachable by the same
+# $RUNNER_TEMP walk. Removing them here — rather than trying to redact the gate's own stdout — is
+# what actually closes the channel, because a hostile build script chooses its own encoding and no
+# output filter downstream of it can be relied on to recognise base64 of an arbitrary file.
+#
 # What is deliberately NOT removed: `$WORKER_ROOT/cli` (the pinned harness install, on $GITHUB_PATH)
 # and the plain data files the post-gate steps still read — the fix lane's `followups.jsonl` among
-# them. Those carry no account credential; widening this into the job's whole scratch tree would
-# break the lanes without closing anything.
+# them. Those carry no account credential and no transcript; widening this into the job's whole
+# scratch tree would break the lanes without closing anything.
 purge_credentials() {
   local worker_root=${WORKER_ROOT:-}
   [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
@@ -3156,11 +3185,15 @@ purge_credentials() {
   fi
   rm -rf -- "$worker_root/home" || true
   rm -f -- "$worker_root"/.credential-* "$worker_root"/.selected-credential || true
+  local artifact
+  for artifact in "${WORKER_TRANSCRIPT_ARTIFACTS[@]}"; do
+    rm -f -- "$worker_root/$artifact" || true
+  done
   local residue
   residue=$(_credential_residue "$worker_root")
   [[ -z "$residue" ]] ||
-    die "credential purge left readable account material under WORKER_ROOT: $(printf '%s' "$residue" | tr '\n' ' ')"
-  printf 'worker-live: purged the isolated account credential tree before any target-controlled code\n'
+    die "purge left readable account material or withheld model transcript under WORKER_ROOT: $(printf '%s' "$residue" | tr '\n' ' ')"
+  printf 'worker-live: purged the isolated account credential tree and the withheld model transcript before any target-controlled code\n'
 }
 
 # PURE (self-tested): verdict on whether a live worker lane purges the account credential tree
@@ -4901,6 +4934,47 @@ YAML
   chk "the target-controlled gate step cannot persist environment into later steps (quarantine)" \
     "$(_workflow_step_body "$wf" gate \
        | grep -Ec '^ +GITHUB_(ENV|PATH): \$\{\{ runner.temp \}\}/gate-quarantine/(env|path)$' || true)" "2"
+  # --- [issue #91] ...and it cannot PUBLISH either, in EITHER lane. Persisting environment is only
+  # half of what a runner command file gives target-controlled cargo. $GITHUB_STEP_SUMMARY is
+  # RETAINED and rendered on the run page and takes arbitrary markdown; $GITHUB_OUTPUT is the same
+  # primitive one indirection out (a target-authored `steps.gate.outputs.*` a later step expands).
+  # An exfiltrator wants those, not $GITHUB_ENV — and GitHub's secret masking does not stop it,
+  # because masking matches the LITERAL secret string and base64 of it is a different string.
+  #
+  # Per lane, because the fix lane had NO quarantine at all while running the same
+  # `worker-live.sh gate` on the same target checkout — and from the weaker position, since a
+  # write-capable GH_TOKEN `push` step still follows its gate. Asserted on the EXACT
+  # variable-to-path pairing (8 = 4 files x 2 lanes): an ERE alternation over both halves would
+  # count `GITHUB_ENV: .../step-summary` as a hit. ---
+  local q_line q_have=0
+  for q_line in 'GITHUB_ENV: ${{ runner.temp }}/gate-quarantine/env' \
+                'GITHUB_PATH: ${{ runner.temp }}/gate-quarantine/path' \
+                'GITHUB_OUTPUT: ${{ runner.temp }}/gate-quarantine/output' \
+                'GITHUB_STEP_SUMMARY: ${{ runner.temp }}/gate-quarantine/step-summary'; do
+    # `grep -Fc` and never `grep -Fq` (#879): -q exits on the first match, SIGPIPEs the producer,
+    # and under `pipefail` the pipeline reports 141 — read here as "quarantine present" only by
+    # accident of which branch the shell takes. -c drains its input.
+    q_have=$(( q_have + $(_workflow_step_body "$wf" gate | grep -Fc -- "$q_line" || true) ))
+    q_have=$(( q_have + $(_workflow_step_body "$rf_wf" gate | grep -Fc -- "$q_line" || true) ))
+  done
+  chk "(#91) BOTH lanes quarantine all FOUR runner command files on the gate step (exact paths)" \
+    "$q_have" "8"
+  # ...over a body the extractor really found: a count read off an empty body proves nothing (#941).
+  # Matched on the exact `run:` LINE, not the bare command: both step bodies discuss
+  # `worker-live.sh gate` in their own quarantine rationale, and a containment match would be
+  # satisfied by the comment alone.
+  local gate_run='run: bash ../registry/scripts/worker-live.sh gate'
+  chk "(#91) ...and that count is read off the REAL gate step body in each lane (non-vacuous)" \
+    "$(_workflow_step_body "$wf" gate | grep -Fc -- "$gate_run" || true):$(_workflow_step_body "$rf_wf" gate | grep -Fc -- "$gate_run" || true)" \
+    "1:1"
+  # Quarantining $GITHUB_OUTPUT is only safe while nothing CONSUMES `steps.gate.outputs`: a future
+  # consumer would read an empty value from a path the runner never reads back, and silently. So the
+  # absence of a consumer is asserted, not assumed. Comment lines are excluded — worker.yml's own
+  # quarantine rationale says the words `steps.gate.outputs`, and matching that would make this row
+  # fail for the wrong reason. Both lanes read `steps.gate.outcome` instead, which is host-derived.
+  chk "(#91) ...safe to quarantine \$GITHUB_OUTPUT: neither lane consumes steps.gate.outputs" \
+    "$(grep -F 'steps.gate.outputs' "$wf" | grep -Evc '^[[:space:]]*#' || true):$(grep -F 'steps.gate.outputs' "$rf_wf" | grep -Evc '^[[:space:]]*#' || true)" \
+    "0:0"
 
   # --- [issue #568] the re-check must accept the workflow's OWN label lifecycle, and the claim
   # step must establish ownership BEFORE it takes the shared label. The claim step moves the issue
@@ -5971,6 +6045,37 @@ print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcaplive/
   chk "(#232 r2) the residue scan sees both regions BEFORE the purge (its post-purge zero is earned)" \
     "$(_credential_residue "$purge_root" | sed "s#^$purge_root/##" | tr '\n' '|')" \
     ".credential-baseline|home|home/.claude|home/.claude/worker-token|"
+  # --- [issue #91] THE WITHHELD MODEL TRANSCRIPT is the other thing reachable at this path. It sits
+  # DIRECTLY under the root, so the `home` subtree removal never touched it, and `model-output.log`
+  # is exactly what the gate's target-controlled build scripts would base64 into the RETAINED job
+  # log — past GitHub's masking, which only ever matched the literal secret string. Given its OWN
+  # sentinel so the credential rows above keep measuring precisely what they measured before. ---
+  local transcript_sentinel='TRANSCRIPT-SENTINEL-00000000' ta
+  for ta in "${WORKER_TRANSCRIPT_ARTIFACTS[@]}"; do
+    printf '%s\n' "$transcript_sentinel" > "$purge_root/$ta"
+    chmod 600 "$purge_root/$ta"
+  done
+  chk "(#91) BEFORE the purge a gate-shaped reader finds the withheld transcript via \$RUNNER_TEMP" \
+    "$(_gate_shaped_reader "$purge_rt" "$transcript_sentinel")" \
+    "registry-worker/cli-stderr.log|registry-worker/error-signals.log|registry-worker/model-output.log|"
+  # ...and the residue scan the purge FAILS CLOSED on has to see all three, or its post-purge zero is
+  # again a property of a blind scan: deleting the removal loop from purge_credentials while leaving
+  # the scan narrow would report a clean purge over a transcript still sitting on the runner.
+  chk "(#91) the residue scan sees every transcript artifact BEFORE the purge (zero is earned)" \
+    "$(_credential_residue "$purge_root" | sed "s#^$purge_root/##" \
+       | grep -Fc -e model-output.log -e cli-stderr.log -e error-signals.log || true)" "3"
+  # RENAME-DRIFT GUARD. WORKER_TRANSCRIPT_ARTIFACTS is a list of literal basenames and run_model
+  # builds the same paths from its OWN literals, so renaming one side alone silently un-covers the
+  # transcript while every row above stays green — the exact failure shape this suite keeps finding.
+  # Derived from the declarations themselves: every `local x="$worker_root/<name>.log"` in this
+  # script must appear in the purge list, and vice versa. Renaming model-output.log in run_model
+  # only, or dropping an entry from the array, turns this red.
+  local declared_logs
+  declared_logs="$(grep -oE 'local [a-z_]+="\$worker_root/[A-Za-z0-9._-]+\.log"' \
+      "$SCRIPT_DIR/worker-live.sh" | sed -E 's#.*/([A-Za-z0-9._-]+\.log)"$#\1#' | sort -u \
+    | tr '\n' '|')"
+  chk "(#91) the purge list is EXACTLY the \$worker_root logs run_model declares (no rename drift)" \
+    "$declared_logs" "$(printf '%s\n' "${WORKER_TRANSCRIPT_ARTIFACTS[@]}" | sort -u | tr '\n' '|')"
   # The fix lane reads followups.jsonl AFTER the gate; the purge must not take it (or the pinned CLI)
   # with it. Written here so the survival assertion below is about the purge, not about absence.
   printf '{"title": "t", "body": "b", "labels": ["kind:bug"]}\n' > "$purge_root/followups.jsonl"
@@ -5983,6 +6088,13 @@ print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcaplive/
   chk "(#232 r2) the purge succeeds on a real prepared tree" "$purge_rc" "0"
   chk "(#232 r2) AFTER the purge the SAME reader finds nothing — no \$RUNNER_TEMP path to it" \
     "$(_gate_shaped_reader "$purge_rt" "$purge_sentinel")" ""
+  chk "(#91) ...and neither does the transcript reader — the exfil payload is gone, not redacted" \
+    "$(_gate_shaped_reader "$purge_rt" "$transcript_sentinel")" ""
+  # PRIVACY (locked decision 22b, issue #91). The prep log above is public and retained, and
+  # `acctNN` reverses directly to the `ACCTNN_TOKEN` secret reference the write-back already keeps
+  # out of its own success line. Restoring the handle to worker-prep's final printf turns this red.
+  chk "(#91, 22b) worker-prep's public log names no account handle" \
+    "$(grep -Eic 'acctexample' "$tmp/pf-purge.log" || true)" "0"
   chk "(#232 r2) ...the isolated HOME is gone and the residue scan agrees (nothing left to find)" \
     "$([[ -e "$purge_root/home" ]] && printf home-survives || printf gone):$(_credential_residue "$purge_root" | wc -l | tr -d ' ')" \
     "gone:0"
@@ -6049,6 +6161,21 @@ print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcaplive/
   chk "(#232 r2) ...and DOES report host-side artifacts with no mounted HOME beside them" \
     "$(_credential_residue "$res_root" | sed "s#^$res_root/##" | sort | tr '\n' '|')" \
     ".credential-durable|.selected-credential|"
+  # [issue #91] The transcript arm's own edge, and it is the one the rows above cannot reach: a run
+  # whose credential purge is otherwise complete still leaves `model-output.log` behind. The scan
+  # must report it ALONE — with no credential artifact and no mounted HOME beside it — or a purge
+  # that dropped only the transcript removal would go green.
+  rm -f -- "$res_root/.credential-durable" "$res_root/.selected-credential"
+  printf 'x\n' > "$res_root/model-output.log"
+  chk "(#91) ...and reports a transcript artifact ALONE (no credential, no HOME, beside it)" \
+    "$(_credential_residue "$res_root" | sed "s#^$res_root/##" | sort | tr '\n' '|')" \
+    "model-output.log|"
+  # SELECTIVITY, the direction that keeps the scan usable: `model-image.id` and `followups.jsonl`
+  # are still sitting in this root and are still not reported. A scan that matched by proximity or
+  # by "anything log-shaped" would make every purge look broken and get relaxed away.
+  rm -f -- "$res_root/model-output.log"
+  chk "(#91) ...but the widened scan stays SELECTIVE (model-image.id/followups still not residue)" \
+    "$(_credential_residue "$res_root" | tr '\n' '|')" ""
   chk "(#232 r2) ...an absent root is empty-and-clean, not an error (prepare never ran)" \
     "$(_credential_residue "$tmp/no-such-worker-root"; printf '|%s' "$?")" "|0"
   chk "(#232 r2) ...but the scan itself refuses an empty or root path (fail closed)" \
