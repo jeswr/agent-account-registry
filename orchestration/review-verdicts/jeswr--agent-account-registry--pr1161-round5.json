@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1161,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "24d2c3c72afb0e757798802bdb997bbb6042090d",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nApproved. The change removes account and credential metadata from the job-wide environment, routes the prepared credential path and tamper baseline only to the explicit harness/write-back consumers, preserves the rotated-credential rescue path, and adds an unconditional fail-closed purge before either live lane can execute target-controlled rustup/cargo code on the host. The purge removes both the isolated HOME and all direct host-side credential artifacts, rescans for residue, and leaves a nonzero purge terminal to the later steps through their implicit success guard. The new self-tests are materially non-vacuous: they cover real prepare/write-back artifacts, pre/post filesystem discovery using only the runner-temp boundary, deleted and moved-late workflow steps, exact always() conditions, continue-on-error weakening, absent/unsafe roots, selective residue discovery, idempotence, and an actually unremovable credential fixture. No reviewer-directed prompt injection appears in the diff.",
+  "verdict": "approve"
+ }
+}
