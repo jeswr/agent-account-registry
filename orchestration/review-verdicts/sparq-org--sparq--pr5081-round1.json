@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5081,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3073f7663681a071eb347a10716ffab70d617b1f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`paired_ids` is defined solely by the presence of token rows. Outcome grading then uses `answers.get(...)`, so a missing answer becomes `None` instead of blocking the verdict. For citations, only arm-side instrumentation is required; therefore a run with all token pairs, arm answers/records, and no baseline answers can remain `honest=true`, with the missing baselines graded as zero and the arm potentially producing a statistically significant `outcome_win` and `recommend_adopt=true`. This contradicts the stated requirement that every paired task have complete evidence and can positively bias the adoption decision. The current incomplete-pair test removes token rows, so it does not exercise this path.",
+    "file": "bench/pkg-dogfood/analyze_prov.py",
+    "fix_hint": "Require both `(task, base)` and `(task, arm)` to be present in `answers` (and any required records) for every relevant task; report missing answer pairs as a blocking reason rather than grading them as `None`. Add a refusal-path test that keeps all token pairs but removes one or all baseline answer entries and asserts `honest == false` and `recommend_adopt == false`.",
+    "severity": "major",
+    "title": "Missing baseline answers can still yield an honest adoption verdict"
+   }
+  ],
+  "progress": null,
+  "summary": "The refusal-path tests pass, but the analyzer does not require a complete pair of answer records before treating a task as paired. Since missing answers are silently graded via `None`, incomplete experimental evidence can still produce an honest adoption verdict. This violates the pre-registration's completeness requirement and needs a real answer-pair guard plus a regression test.",
+  "verdict": "request_changes"
+ }
+}
