@@ -50,6 +50,23 @@ jobs:
         with:
           python-version: '3.12'
 
+      # [issue #920] BEFORE any assertion runs, say WHICH TREE is about to be graded. GitHub does
+      # not recompute `refs/pull/N/merge` when the base branch moves, so a green here can be
+      # evidence about a composition that no longer exists — #888 (a stricter check) and #900 (a
+      # violation of it) were both graded green against pre-#888 trees and composed red on master
+      # for over an hour. The report is deliberately first: the stale-base reading is most needed
+      # on the runs that go on to FAIL, and a later step never prints. Report-only by design (see
+      # the script header); the hard-gate options are repository settings and the maintainer's.
+      # The name is QUOTED: an unquoted plain scalar ends at ` #`, so the issue reference would be
+      # parsed as a trailing comment and the step would render under a truncated name.
+      - name: "Report whether this run graded the tree the PR will land on (#920)"
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          python3 scripts/gate-staleness.py --head-sha "$PR_HEAD_SHA" --base-ref "$PR_BASE_REF"
+
       - name: Install PyYAML for the workflow-yaml lint (version + hash locked)
         run: |
           set -euo pipefail
