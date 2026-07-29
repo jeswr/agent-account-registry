@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4930,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7ec6c4ebdf9893a6ec99c4046dd189163102ea85",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The round-4 restart defect remains. pit_lineage prevents stale cache reuse across online lineage replacement, but a newly started AppState still creates a ring at generation 0 while an existing change log may contain generations 1..N. base_generation(records, current=0) returns 0; resolve_generation can return a target > 0; rewind then immediately returns Uncovered because target_generation > base_generation. This contradicts the repeated claims that the durable CDC log extends reach beyond restart-losing in-memory history. The added restore/cache test does not restart the server or establish a base snapshot corresponding to the retained log.",
+    "file": "crates/sparq-server/src/pit.rs",
+    "fix_hint": "Persist and restore a sound lineage plus generation/base-state mapping across process restart, or load a durable base snapshot whose generation is proven to correspond to the log, then add an end-to-end stop/start test using the same durable store/log that successfully queries a pre-restart instant. If restart reconstruction is intentionally unsupported, remove or qualify the durable/restart-spanning claims consistently in Cargo.toml, README, module docs, feature matrix, and HTTP skill.",
+    "severity": "blocker",
+    "title": "Durable pre-restart history still cannot be reconstructed"
+   },
+   {
+    "body": "at_accepts_an_xsd_datetime_lexical still truncates the recorded nanosecond timestamp to seconds, adds one second, never queries the original integer form, and permits either generation 1 or 2. It proves only that a constructed dateTime lexical receives a successful response, not that the exact recorded instant has identical lexical and integer resolution or that fractional nanoseconds are parsed correctly.",
+    "file": "crates/sparq-server/tests/point_in_time.rs",
+    "fix_hint": "Render the exact recorded timestamp as RFC 3339 UTC with nine fractional digits, query both that lexical and the original commitTimestampNanos integer, and assert identical Sparq-Generation headers and bindings.",
+    "severity": "minor",
+    "title": "The dateTime test still does not prove equivalence to the nanosecond instant"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant: both prior findings remain. The new lineage epoch protects only the reconstruction cache across online restore/rebase; it does not establish a restart-spanning generation/base mapping. On a fresh AppState opened over an existing durable log, the ring is generation 0 while retained records can end at generation N. base_generation(records, 0) therefore returns 0, resolve_generation can select a historical generation greater than 0, and rewind rejects target_generation > base_generation as Uncovered. Thus the advertised durable-log reach still cannot serve pre-restart history, and no stop/start integration test witnesses that headline claim. The xsd:dateTime test also remains permissive: it changes the recorded instant by truncating and adding a second, does not query the equivalent integer, and accepts either generation, so it still does not prove lexical/integer equivalence or fractional-second correctness.",
+  "verdict": "request_changes"
+ }
+}
