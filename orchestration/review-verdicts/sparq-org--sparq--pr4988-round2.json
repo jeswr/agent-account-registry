@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4988,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e34c77394cf4f898c672c5b39fa993fe3f634689",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Scratch::new derives all paths from the public process ID and a sequence counter in the shared system temp directory. SubprocessOracle::eval then uses fs::write, and run uses fs::File::create; all follow existing symlinks. Another local user can predict sparq-oracle2-<pid>-0.{ttl,rq,out,err}, pre-create a symlink to a file writable by the fuzz-runner, and have the runner truncate or replace that target. Drop only removes the symlink afterward and does not prevent the overwrite.",
+    "file": "crates/sparq-bench/src/oracle.rs",
+    "fix_hint": "Create a private per-run temporary directory with an unpredictable name and owner-only permissions using a well-reviewed tempfile facility, then place all four files inside it. Alternatively, atomically create every file with create_new(true), reject any pre-existing path, and ensure restrictive permissions; add a test that pre-creates a candidate path/symlink and verifies evaluation fails without modifying the target.",
+    "severity": "major",
+    "title": "Predictable temporary paths permit symlink overwrite attacks"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-1 error-collapsing defect is fixed: Backend/Data now become Broken, are counted separately, and force a non-zero exit. However, the subprocess adapter creates predictable files in the shared temporary directory with ordinary create/write operations. A local attacker can pre-place symlinks at the PID/sequence-derived paths and cause a fuzz run to truncate or overwrite arbitrary files writable by the runner. Because this is a new major security finding relative to round 1, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
