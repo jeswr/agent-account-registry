@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5044,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0d36e1a596d60b2c97ed1a7374e7268d198949e4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The documentation-only change is internally consistent and accurately distinguishes the face repository's v0.3.0 release from the v0.2.0 tag actually exercised by this repository's XPath differential lane. The cited workflow and harness both still pin XPATH_TAG to v0.2.0, so the revised audit-evidence scope is correct. The change makes no new ZK soundness or privacy claim, does not alter executable behavior, and appropriately leaves the pin bump as separate work requiring a green CI run.",
+  "verdict": "approve"
+ }
+}
