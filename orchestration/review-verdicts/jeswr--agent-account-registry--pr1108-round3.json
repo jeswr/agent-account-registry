@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1108,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d19a3e5d4581dc4b65d9893c789e61825b11d9ea",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-2 major finding is fixed correctly. `CLASS_IDLE` now acts as a boundary in the reverse zero-dispatch tail scan, so an empty-frontier observation closes the alert without allowing pre-idle failures to contribute to re-entry. The regression coverage exercises immediate recovery, one- and two-sided interleavings, no reopening after one fresh failure, and re-arming only after a full fresh threshold-length run. The change also keeps idle distinct from success, validates the raw dispatch summary fail-closed, restricts idle records to the fleet pseudo-provider, suppresses only redundant consecutive idle writes, pins the workflow's complete recording commands, and verifies delivery through the real alert-closing path. No reviewer-directed instruction or other prompt-injection text was detected in the diff.",
+  "verdict": "approve"
+ }
+}
