@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1081,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0e72aa40c284ab319770aa0ad445f6ae029c9ff5",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The workflow creates `BINDING_REF` at lines 978\u2013986 and only afterward runs `gh secret set` at line 991. If that write fails without storing the credential, the binding survives. A later out-of-band write to the same environment-secret name makes `probe_secret` succeed, and reconciliation then emits `resume=true` / `stage=register`, registering an account around a credential this enrollment never captured. Moving the absence probes before the binding excludes only writes visible before binding creation; it cannot distinguish a successful store from a failed store followed by a later write. The added tests exercise binding followed by an absence-probe refusal, but that probe now necessarily precedes the binding; they still omit the provenance-breaking transition required in round 4.",
+    "file": ".github/workflows/set-up-account.yml",
+    "fix_hint": "Add durable protocol state that distinguishes capture intent from capture completion and permit `stage=register` only when completion is attributable to this enrollment. Add an executable test for `binding created -> gh secret set fails -> secret absent -> out-of-band secret created -> retry` and require refusal. If the secret API cannot provide an atomic or identity-bound completion proof, make the ambiguous pre-store-binding state manual-recovery-only instead of inferring completion from secret existence.",
+    "severity": "major",
+    "title": "The pre-store binding still cannot attribute a later secret to this enrollment"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 5 hardens the binding parser and correctly moves both absence probes ahead of binding creation, but it still does not resolve round 4's credential-provenance defect. The durable binding remains published before `gh secret set`, and reconciliation still treats later secret existence as proof that this enrollment completed the write. If `gh secret set` fails after the binding is created and an out-of-band writer subsequently creates the named secret, the next retry emits `resume=true` and `stage=register` around that unrelated credential. The new tests call a probe-before-binding refusal \u201cthe transition,\u201d but they do not execute the prior round's required sequence: binding created, store fails, secret is absent, out-of-band secret appears, retry. The same major finding remains, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
