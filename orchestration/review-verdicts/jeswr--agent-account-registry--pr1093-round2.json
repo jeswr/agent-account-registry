@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1093,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7b0afa49f10d753cd317cc069fb69f0c1ba0a5a3",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 confirms the approved round-1 result. The event workflow passes the issue type through a quoted environment variable, and retriage obtains the mutable type from the same fail-closed live read as body and state. Untyped (`null`) is distinguished from absent or malformed schema, while display-cased names are normalized once at the classifier boundary. Existing trust-surface, kind, UI, and infrastructure precedence remains ahead of type/area fallback, so author selection of an org-defined type cannot move trust-plane work off its protected lane. The tests exercise the real workflow binding and forwarding seams, malformed live documents, typed versus untyped end-to-end label writes, and trust-surface precedence across the visible type space; their expected values are independently discriminating rather than tautological. No reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
