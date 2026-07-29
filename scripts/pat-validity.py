@@ -73,7 +73,7 @@
 # run also warns loud that the private route is absent. A verified private route whose token then
 # fails at lookup/write time RETRIES a separately rendered redacted alert on the registry (never
 # the detailed body), so a stale ALERT_TOKEN cannot drop the rolling credential signal. The
-# probe-unavailable page (#207) and the streak variable carry no validity/expiry, so they stay on
+# probe-unavailable page (#207) and the streak counter carry no validity/expiry, so they stay on
 # the registry with the ambient token.
 # The lookup is the PAGINATED Issues REST API (authoritative — no fixed --limit window that an
 # old closed alert could fall out of), and a FAILED lookup raises instead of writing: a blind
@@ -89,6 +89,7 @@
 # (--self-test, every verdict path exercised — including a read-only PAT: reads 200 + write 403,
 # and an Environments-only PAT: env read 200 + repo-scope listing 403); the CLI wraps them over
 # urllib + `gh`.
+import base64
 import json
 import os
 import re
@@ -116,19 +117,40 @@ EXPIRY_WARN_DAYS = 14
 # Persistent-unknown alerting (issue #207). network-unknown is deliberately no-op for the
 # CREDENTIAL alert (an unreachable API is not evidence about the PAT), but a PERMANENT unknown
 # would then leave the probe green-and-silent forever. So CONSECUTIVE network-unknown verdicts
-# are counted in the PAT_PROBE_UNKNOWN_STREAK repository variable, and a DISTINCT rolling
-# `from:agent` issue is created/reopened ONLY once the streak reaches UNKNOWN_STREAK_THRESHOLD —
-# that is the page. The counter lives in a VARIABLE, not an issue body, because GitHub creates
-# every issue OPEN: even a create-then-immediately-close "silent counter" notifies subscribers,
-# fires issue-created automation, and flashes in open-alert views — exactly the false page the
-# threshold exists to prevent. A variable write notifies nobody, so below the threshold NO issue
+# are COUNTED, and a DISTINCT rolling `from:agent` issue is created/reopened ONLY once the streak
+# reaches UNKNOWN_STREAK_THRESHOLD — that is the page. The counter must live in SILENT state, not
+# an issue body, because GitHub creates every issue OPEN: even a create-then-immediately-close
+# "silent counter" notifies subscribers, fires issue-created automation, and flashes in open-alert
+# views — exactly the false page the threshold exists to prevent. Below the threshold NO issue
 # operation happens at all. ANY definitive verdict (valid/invalid/insufficient-scope/
-# expiring-soon, all of which prove the probe itself completed) zeroes the variable and closes an
+# expiring-soon, all of which prove the probe itself completed) zeroes the counter and closes an
 # open page; the PAT is NEVER reclassified as invalid.
+#
+# WHERE the counter lives (issue #1139). It used to be the PAT_PROBE_UNKNOWN_STREAK *repository
+# variable* — and that made this whole half of the control INERT for its entire life: the
+# repository-variables REST API sits under the fine-grained `variables` permission, which
+# GITHUB_TOKEN simply does not have (no `variables:` key exists for it, and `actions: write` does
+# not stand in), so the write could never create the variable and the read then failed non-404 and
+# raised. Measured over all 2 runs ever: 2/2 red, 0 alerts, max attainable streak 0. The counter
+# now lives on the `ledger` DATA-PLANE BRANCH as a tiny JSON document written through the contents
+# API with the ambient token (`contents: write`) — the same store groom-leases/model-health/
+# select-and-claim already use, and one a commit on an unprotected non-default branch keeps just
+# as silent as a variable write. A MISSING document is the state every fresh deployment starts in,
+# so it bootstraps to 0 on a GREEN run; a missing ledger BRANCH does not, because no write could
+# ever land there — that raises.
 PROBE_ALERT_TITLE = ("🛰️ REGISTRY_SECRETS_PAT validity probe cannot complete — "
                      "verification has stalled")
 UNKNOWN_STREAK_THRESHOLD = 3
-STREAK_VAR = "PAT_PROBE_UNKNOWN_STREAK"
+# The data plane lives off the protected default branch (issue #28) — master's required checks
+# and branch protection reject the bot's contents-API PUTs, so both the streak read and the streak
+# write pin this ref. Keep in sync with select-and-claim.py / groom.py / model-health.py LEDGER_REF.
+LEDGER_REF = os.environ.get("REGISTRY_LEDGER_REF", "ledger")
+# WHO can write what this reads: the ledger branch is repo-write-only (this registry is PUBLIC, and
+# this workflow is schedule/workflow_dispatch — never pull_request_target — so no fork token can
+# reach it). The counter is still read type-strictly: a document that is not a non-negative,
+# non-bool int raises rather than being coerced, so a corrupted/forged value cannot silently
+# suppress the page by reading as 0.
+STREAK_PATH = "data/pat-probe-streak.json"
 
 VALID = "valid"
 EXPIRING = "expiring-soon"
@@ -588,43 +610,95 @@ def upsert_alert(verdict, body, repo, token=None, redact=False):
     return ops
 
 
+def _not_found(result, payload):
+    """Whether a FAILED `gh api` call is a DEFINITIVE 404, read from EVERY shape gh emits it in
+    (issue #1139). The old reader accepted only a relayed body whose `status` was the literal
+    string `"404"`; any other not-found shape fell through to the raise, which is how the very
+    first (bootstrap) read of a never-written counter turned into a hard failure. gh relays the
+    server's JSON error body on stdout when there is one — `{"message": "Not Found", "status":
+    "404"}` — and otherwise prints `gh: Not Found (HTTP 404)` on stderr. stderr is MATCHED here
+    and never echoed: under GH_DEBUG=api it can carry request material."""
+    if isinstance(payload, dict):
+        if str(payload.get("status")) == "404":
+            return True
+        if str(payload.get("message", "")).strip().lower() == "not found":
+            return True
+    return bool(re.search(r"\(HTTP 404\)", result.stderr or ""))
+
+
 def _read_streak(repo):
-    """The persisted consecutive-unknown count from the STREAK_VAR repository variable. A 404
-    means the variable has never been written -> 0 (the one benign miss). ANY other failure —
-    network, auth, an unparseable response, a non-numeric value — raises AlertLookupError:
-    degrading a failed read to 0 would hold the streak below threshold forever and permanently
-    silence the very page this state exists to trigger."""
-    result = _gh(["api", f"repos/{repo}/actions/variables/{STREAK_VAR}"])
+    """(streak, blob_sha) — the persisted consecutive-unknown count from the `ledger` data-plane
+    branch, plus the sha the next write compare-and-swaps against (None when the document does not
+    exist yet, i.e. the create case).
+
+    A MISSING DOCUMENT on a LIVE ledger branch is the one benign miss and reads as (0, None):
+    "the counter does not exist yet" is the state EVERY fresh deployment starts in, so it must
+    bootstrap on a GREEN run rather than raise (issue #1139 — this is exactly the state the alarm
+    was stuck in for its whole life). A MISSING LEDGER BRANCH is NOT benign and raises even though
+    it 404s identically: no write could ever land there, so degrading it to 0 would pin the count
+    below threshold forever — the same closed loop #1139 measured. Every other failure — network,
+    auth, an unparseable document, a non-integer count, a response carrying no blob sha to CAS
+    against — raises AlertLookupError for the same reason: a failed read that reads as 0
+    permanently silences the very page this state exists to trigger."""
+    result = _gh(["api", f"repos/{repo}/contents/{STREAK_PATH}"
+                         f"?ref={urllib.parse.quote(LEDGER_REF, safe='')}"])
     try:
         payload = json.loads(result.stdout or "")
     except ValueError:
         payload = None
     if result.returncode != 0:
-        # gh api relays the server's JSON error body on stdout; only a definitive 404 (variable
-        # never created) may read as zero.
-        if isinstance(payload, dict) and str(payload.get("status")) == "404":
-            return 0
-        raise AlertLookupError(
-            f"probe-streak variable read failed (gh api rc={result.returncode})")
-    value = payload.get("value") if isinstance(payload, dict) else None
-    if not (isinstance(value, str) and value.strip().isdigit()):
-        raise AlertLookupError("probe-streak variable holds a non-numeric value")
-    return int(value.strip())
+        if not _not_found(result, payload):
+            raise AlertLookupError(
+                f"probe-streak ledger read failed (gh api rc={result.returncode})")
+        branch = _gh(["api", f"repos/{repo}/git/ref/heads/"
+                             f"{urllib.parse.quote(LEDGER_REF, safe='')}"])
+        if branch.returncode != 0:
+            raise AlertLookupError(
+                f"probe-streak ledger branch '{LEDGER_REF}' is missing or unreadable "
+                f"(gh api rc={branch.returncode}) — the counter could never be written")
+        return 0, None
+    content = payload.get("content") if isinstance(payload, dict) else None
+    encoding = payload.get("encoding") if isinstance(payload, dict) else None
+    if not (isinstance(content, str) and encoding == "base64"):
+        raise AlertLookupError("probe-streak ledger read returned no inline base64 blob")
+    try:
+        document = json.loads(base64.b64decode(content, validate=False).decode("utf-8"))
+    except ValueError as exc:  # binascii.Error / UnicodeDecodeError both subclass ValueError
+        raise AlertLookupError("probe-streak ledger document is unparseable") from exc
+    value = document.get("streak") if isinstance(document, dict) else None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise AlertLookupError("probe-streak ledger document holds a non-numeric count")
+    sha = payload.get("sha")
+    if not (isinstance(sha, str) and sha):
+        raise AlertLookupError("probe-streak ledger read returned no blob sha to CAS against")
+    return value, sha
 
 
-def _write_streak(repo, streak):
-    """Persist the consecutive-unknown count. `gh variable set` upserts (creates on the first
-    write). This write is SILENT — a repository variable notifies nobody and appears in no
-    issue/alert view — which is the whole reason the counter lives here and not in an issue:
-    GitHub creates every issue OPEN, so an issue-body counter pages on its own creation."""
-    _gh(["variable", "set", STREAK_VAR, "-R", repo, "--body", str(streak)], check=True)
+def _write_streak(repo, streak, sha):
+    """Persist the consecutive-unknown count to `STREAK_PATH` on the `ledger` data-plane branch
+    (issue #1139). This write is SILENT — a commit on an unprotected, non-default data branch
+    notifies nobody and appears in no issue/alert view — which is the whole reason the counter
+    lives here and not in an issue: GitHub creates every issue OPEN, so an issue-body counter
+    pages on its own creation. `sha` is the blob the count was READ from and is sent as the
+    contents-API compare-and-swap token; None means "the document does not exist yet" and the PUT
+    creates it (the bootstrap write). A stale sha fails the PUT, which raises — losing a race must
+    never silently overwrite a higher count with a lower one."""
+    document = json.dumps({"streak": streak}, sort_keys=True) + "\n"
+    args = ["api", f"repos/{repo}/contents/{STREAK_PATH}", "-X", "PUT",
+            # Pin the data-plane branch, never the protected default (issue #28).
+            "-f", f"branch={LEDGER_REF}",
+            "-f", f"message=chore(pat-validity): consecutive-unknown streak -> {streak}",
+            "-f", "content=" + base64.b64encode(document.encode("utf-8")).decode("ascii")]
+    if sha is not None:
+        args += ["-f", f"sha={sha}"]
+    _gh(args, check=True)
 
 
 def render_probe_alert(streak, threshold, repo):
     """Body for the probe-unavailable alert (issue #207): a human explanation that this is a
     PROBE-health page, NOT a credential verdict — the PAT is explicitly not reclassified. Only
-    rendered at/above the page threshold; the authoritative counter is the STREAK_VAR repository
-    variable, never this body."""
+    rendered at/above the page threshold; the authoritative counter is the ledger-branch document
+    at STREAK_PATH, never this body."""
     return "\n".join([
         "> 🤖 SPARQ agent — scheduled REGISTRY_SECRETS_PAT validity check "
         "(issue #37; probe health #207).\n",
@@ -648,13 +722,13 @@ def render_probe_alert(streak, threshold, repo):
 def upsert_probe_alert(verdict, repo, threshold=UNKNOWN_STREAK_THRESHOLD):
     """Rolling 'probe unavailable' alert for CONSECUTIVE network-unknown verdicts (issue #207),
     kept DISTINCT from the credential alert and never reclassifying the PAT. Returns
-    {"ops", "streak", "paging"} (self-tested). The counter is the STREAK_VAR repository variable
-    (silent writes); the issue is created/reopened ONLY once the streak reaches `threshold` —
-    that is the page. Below the threshold NO issue operation happens: GitHub creates every issue
-    OPEN, so even a created-then-closed counter would notify subscribers and flash in open-alert
-    views — a false page on a single transient blip, and one an output-parse failure between the
+    {"ops", "streak", "paging"} (self-tested). The counter is the ledger-branch document at
+    STREAK_PATH (silent writes); the issue is created/reopened ONLY once the streak reaches
+    `threshold` — that is the page. Below the threshold NO issue operation happens: GitHub creates
+    every issue OPEN, so even a created-then-closed counter would notify subscribers and flash in
+    open-alert views — a false page on a single transient blip, and one a parse failure between the
     create and the close would leave stranded open. ANY definitive verdict proves the probe
-    itself completed, so it zeroes the variable and closes an open page. Lookup/write failures
+    itself completed, so it zeroes the counter and closes an open page. Lookup/write failures
     propagate (AlertLookupError/AlertWriteError) exactly like upsert_alert — a swallowed failure
     here would re-hide the very stall this alert exists to surface."""
     if verdict != NETWORK_UNKNOWN:
@@ -668,18 +742,20 @@ def upsert_probe_alert(verdict, repo, threshold=UNKNOWN_STREAK_THRESHOLD):
                 check=True)
             _gh(["issue", "close", str(number), "-R", repo], check=True)
             ops += ["comment", "close"]
-        if _read_streak(repo) != 0:
+        persisted, sha = _read_streak(repo)
+        if persisted != 0:
             # Zero the counter so a future unknown restarts from 1, not from the stale streak
             # (which would re-cross the threshold and re-page after a single unknown).
-            _write_streak(repo, 0)
+            _write_streak(repo, 0, sha)
             ops.append("reset-streak")
         return {"ops": ops, "streak": 0, "paging": False}
     # network-unknown: extend the streak, then page only once it crosses the threshold. The
     # count is persisted BEFORE any issue work: it is silent state, and if a later issue write
     # fails red, the outage run still counted — the next unknown resumes instead of undercounting.
-    streak = _read_streak(repo) + 1
+    persisted, sha = _read_streak(repo)
+    streak = persisted + 1
     paging = streak >= threshold
-    _write_streak(repo, streak)
+    _write_streak(repo, streak, sha)
     ops = ["set-streak"]
     number, state = _find_alert(repo, PROBE_ALERT_TITLE)
     if paging:
@@ -700,6 +776,42 @@ def upsert_probe_alert(verdict, repo, threshold=UNKNOWN_STREAK_THRESHOLD):
         _gh(["issue", "close", str(number), "-R", repo], check=True)
         ops.append("close")
     return {"ops": ops, "streak": streak, "paging": paging}
+
+
+def workflow_contract(workflow_text):
+    """Pure: {"permissions": {...} | None, "crons": [...]} as DECLARED by pat-validity.yml.
+    `permissions` is None when no top-level block could be located; the caller ALSO treats an
+    unreadable file as a failure (fail closed) rather than as "nothing to check".
+
+    WHY this is asserted at all (issue #1139): both halves of this alarm's failure lived in the
+    YAML, not the Python. The counter's store was unwritable because the job's `permissions:` map
+    could not grant it, and the page's latency was 21 days because the cron was weekly — and no
+    test looked at either, so both survived every green self-test the module ever ran. Following
+    dispatch-secrets-guard.py's dispatch.yml permission pin: dependency-free (the runner image and
+    the offline gate host need not share a PyYAML install), so this is a NARROW line parser over
+    the two-space-indented block this repo controls, not a general YAML reader; reshaping the file
+    in a way that confuses it goes red in the self-test rather than silently passing."""
+    lines = workflow_text.splitlines()
+    permissions = None
+    for line in lines:
+        stripped = line.split("#", 1)[0].rstrip()
+        if not stripped:
+            continue
+        if permissions is None:
+            if stripped == "permissions:":
+                permissions = {}
+            continue
+        if line.startswith("  ") and ":" in stripped:
+            key, _, value = stripped.strip().partition(":")
+            permissions[key.strip()] = value.strip()
+            continue
+        break  # dedented out of the top-level permissions mapping
+    crons = []
+    for line in lines:
+        stripped = line.split("#", 1)[0].strip()
+        if stripped.startswith("- cron:"):
+            crons.append(stripped.partition(":")[2].strip().strip("'\""))
+    return {"permissions": permissions, "crons": crons}
 
 
 def main(argv):
@@ -739,7 +851,7 @@ def main(argv):
         # hardened #432 round 1): distinct from the registry AND confirmed `"private": true`
         # under ALERT_TOKEN. Resolved here — not before the probe — because the verification is
         # a live API call the --probe-only path must not make. The probe-unavailable page (#207)
-        # and the streak variable carry no validity/expiry, so they stay on the registry with
+        # and the streak counter carry no validity/expiry, so they stay on the registry with
         # the ambient token.
         alert_repo, alert_token, redact = _alert_route(
             os.environ.get("ALERT_REPO"), os.environ.get("ALERT_TOKEN"), repo)
@@ -1261,11 +1373,12 @@ def _self_test():
             (ALERT_TITLE in created, ALERT_LABEL in created), (True, True))
 
         # --- upsert_probe_alert: consecutive-unknown tracking (issue #207). The counter is a
-        # repository variable (SILENT writes); the DISTINCT rolling issue is created/reopened
-        # ONLY at threshold. Below it NO issue operation may run: GitHub creates every issue
-        # OPEN, so even create-then-close would notify subscribers and flash in open-alert
-        # views — the tests therefore assert on the RAW gh call list, not just the summarized
-        # ops, to prove ABSENCE of issue writes. Never reclassifies the PAT.
+        # JSON document on the `ledger` data-plane branch (SILENT writes — issue #1139); the
+        # DISTINCT rolling issue is created/reopened ONLY at threshold. Below it NO issue
+        # operation may run: GitHub creates every issue OPEN, so even create-then-close would
+        # notify subscribers and flash in open-alert views — the tests therefore assert on the
+        # RAW gh call list, not just the summarized ops, to prove ABSENCE of issue writes.
+        # Never reclassifies the PAT.
         def probe_issue(number, state):
             return {"number": number, "title": PROBE_ALERT_TITLE, "state": state, "body": "page"}
 
@@ -1278,27 +1391,78 @@ def _self_test():
                                     "body": "page",
                                     "pull_request": {"url": "https://example.invalid"}}]])
 
-        def stub_probe_gh(list_json, streak=None, list_rc=0, var_read="ok", fail_op=None):
-            # streak None -> STREAK_VAR never written (gh api answers 404). var_read: "ok" |
-            # "down" (a non-404 read failure) | "garbage" (a non-numeric value). fail_op:
-            # "variable-set" or an `issue` subcommand to fail.
+        # A blob sha that appears NOWHERE else in this harness, so a write that fails to thread
+        # the sha it READ cannot accidentally collide with some other fixture value.
+        STREAK_SHA = "5f1e0c0ffee0" + "0" * 28
+
+        def streak_blob(text, sha=STREAK_SHA):
+            """A contents-API GET response in the shape gh relays: inline base64 + blob sha."""
+            return json.dumps({"content": base64.b64encode(text.encode("utf-8")).decode("ascii"),
+                               "encoding": "base64", "sha": sha, "path": STREAK_PATH})
+
+        def field_of(call, prefix):
+            """The value of the `prefix…` argument of a gh call, or None. ⚠️ TOTAL on purpose: a
+            bare `next(...)` raises StopIteration under any mutant that drops the field, which
+            ABORTS the suite — every row below then never runs while the aborted run still reads
+            like a detection (AGENTS pre-flight item 4, crash-after-partial-run)."""
+            return next((a[len(prefix):] for a in call if a.startswith(prefix)), None)
+
+        def find_call(calls, predicate):
+            """The first gh call satisfying `predicate`, or [] — total, for the same reason."""
+            return next((c for c in calls if predicate(c)), [])
+
+        def is_put(call):
+            return len(call) > 1 and call[1] == "api" and "PUT" in call
+
+        def streak_writes(calls):
+            """The DOCUMENTS the contents-API PUTs actually carried, decoded from the request
+            body — not the summarized ops. Reads the value from the wire, never from the code
+            under test."""
+            out = []
+            for call in calls:
+                if not is_put(call):
+                    continue
+                raw = field_of(call, "content=")
+                out.append(None if raw is None
+                           else json.loads(base64.b64decode(raw).decode("utf-8")))
+            return out
+
+        def stub_probe_gh(list_json, streak=None, list_rc=0, store_read="ok", fail_op=None,
+                          branch_missing=False, missing_shape="status"):
+            # streak None -> the ledger document has never been written (the contents GET 404s).
+            # missing_shape selects WHICH 404 shape gh relays: "status" (JSON body with
+            # status:"404"), "message" (JSON body with only message:"Not Found"), or "stderr"
+            # (no body at all — gh's own `gh: Not Found (HTTP 404)` line). store_read: "ok" |
+            # "down" (a non-404 read failure) | "garbage" (a non-integer count). fail_op:
+            # "streak-write" or an `issue` subcommand to fail.
             calls = []
 
             def run(args, **_kw):
                 calls.append(list(args))
-                if args[1] == "api" and any("actions/variables" in a for a in args):
-                    if var_read == "down":
+                if args[1] == "api" and any(STREAK_PATH in a for a in args):
+                    if "PUT" in args:
+                        return (_Run("", 1, stderr="gh: LEAKY-STDERR-NEVER-IN-ERRORS")
+                                if fail_op == "streak-write" else _Run())
+                    if store_read == "down":
                         return _Run("", 1, stderr="gh: LEAKY-STDERR-NEVER-IN-ERRORS")
-                    if var_read == "garbage":
-                        return _Run(json.dumps({"name": STREAK_VAR, "value": "not-a-number"}))
+                    if store_read == "garbage":
+                        return _Run(streak_blob('{"streak": "not-a-number"}'))
                     if streak is None:
+                        if missing_shape == "message":
+                            return _Run(json.dumps({"message": "Not Found"}), 1)
+                        if missing_shape == "stderr":
+                            return _Run("", 1, stderr="gh: Not Found (HTTP 404)")
                         return _Run(json.dumps({"message": "Not Found", "status": "404"}), 1)
-                    return _Run(json.dumps({"name": STREAK_VAR, "value": str(streak)}))
+                    return _Run(streak_blob(json.dumps({"streak": streak})))
+                if args[1] == "api" and any("git/ref/heads/" in a for a in args):
+                    # The ledger BRANCH probe that separates "no counter yet" (benign) from "no
+                    # store at all" (fatal). Its stderr carries the leak marker too: a missing
+                    # branch must raise without echoing gh's output.
+                    return (_Run("", 1, stderr="gh: LEAKY-STDERR-NEVER-IN-ERRORS")
+                            if branch_missing
+                            else _Run(json.dumps({"ref": f"refs/heads/{LEDGER_REF}"})))
                 if args[1] == "api":
                     return _Run(list_json, list_rc)
-                if args[1] == "variable":
-                    return (_Run("", 1, stderr="gh: LEAKY-STDERR-NEVER-IN-ERRORS")
-                            if fail_op == "variable-set" else _Run())
                 if fail_op and args[2] == fail_op:
                     return _Run("", 1, stderr="gh: LEAKY-STDERR-NEVER-IN-ERRORS")
                 return _Run()
@@ -1306,27 +1470,45 @@ def _self_test():
 
         def run_probe(verdict, listing, streak=None, threshold=UNKNOWN_STREAK_THRESHOLD):
             calls, subprocess.run = stub_probe_gh(listing, streak=streak)
-            with contextlib.redirect_stdout(io.StringIO()):
-                res = upsert_probe_alert(verdict, "o/r", threshold=threshold)
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    res = upsert_probe_alert(verdict, "o/r", threshold=threshold)
+            except Exception as exc:  # noqa: BLE001 — see field_of: an escaping exception here
+                # would decapitate every row below instead of failing this one.
+                res = {"streak": type(exc).__name__, "paging": type(exc).__name__, "ops": []}
             issue_ops = [c[2] for c in calls if c[1] == "issue"]
-            streak_writes = [c[c.index("--body") + 1] for c in calls if c[1] == "variable"]
-            return res, issue_ops, streak_writes
+            return res, issue_ops, streak_writes(calls)
+
+        def probe_quietly(verdict, repo="o/r"):
+            """upsert_probe_alert against the CURRENT stub, swallowing both stdout and any
+            exception — the caller asserts on the recorded gh calls, and an escape here would
+            decapitate the suite rather than fail one row (see field_of)."""
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    upsert_probe_alert(verdict, repo)
+            except Exception:  # noqa: BLE001
+                pass
 
         calls, subprocess.run = stub_probe_gh(PA_CLOSED)
         chk("_find_alert locates the probe issue by its DISTINCT title across states",
             _find_alert("o/r", PROBE_ALERT_TITLE), (50, "CLOSED"))
 
         # network-unknown streak progression (threshold 3): below it, ZERO issue-touching gh
-        # calls — the load-bearing absence — and only the silent variable is written.
+        # calls — the load-bearing absence — and only the silent ledger document is written.
+        # ⚠️ #1139's regression case is the FIRST row: no counter exists yet (the contents GET
+        # 404s), which is the state every fresh deployment starts in and the state this alarm
+        # was stuck in for its entire life. It must bootstrap to 1 and NOT raise.
         res, iops, wrote = run_probe(NETWORK_UNKNOWN, PA_EMPTY)
-        chk("unknown #1 (no state) -> streak 1: variable=1 and NO issue operation at all",
-            (res["streak"], res["paging"], iops, wrote), (1, False, [], ["1"]))
+        chk("unknown #1 (NO counter document yet — #1139 bootstrap) -> streak 1 written and NO "
+            "issue operation at all",
+            (res["streak"], res["paging"], iops, wrote), (1, False, [], [{"streak": 1}]))
         res, iops, wrote = run_probe(NETWORK_UNKNOWN, PA_EMPTY, streak=1)
-        chk("unknown #2 -> streak 2: variable=2, STILL no issue operation",
-            (res["streak"], res["paging"], iops, wrote), (2, False, [], ["2"]))
+        chk("unknown #2 -> streak 2 written, STILL no issue operation",
+            (res["streak"], res["paging"], iops, wrote), (2, False, [], [{"streak": 2}]))
         res, iops, wrote = run_probe(NETWORK_UNKNOWN, PA_EMPTY, streak=2)
         chk("unknown #3 crosses threshold -> PAGES: create, left OPEN (no close after it)",
-            (res["streak"], res["paging"], iops, wrote), (3, True, ["create"], ["3"]))
+            (res["streak"], res["paging"], iops, wrote),
+            (3, True, ["create"], [{"streak": 3}]))
         res, iops, wrote = run_probe(NETWORK_UNKNOWN, PA_CLOSED, streak=2)
         chk("unknown #3 with a prior outage's closed page -> REOPEN + edit, never a duplicate",
             (res["streak"], res["paging"], iops), (3, True, ["reopen", "edit"]))
@@ -1343,9 +1525,8 @@ def _self_test():
 
         # The page create carries the rolling label + distinct title (what find-by-title keys on).
         calls, subprocess.run = stub_probe_gh(PA_EMPTY, streak=2)
-        with contextlib.redirect_stdout(io.StringIO()):
-            upsert_probe_alert(NETWORK_UNKNOWN, "o/r")
-        pcreate = next(c for c in calls if c[1:3] == ["issue", "create"])
+        probe_quietly(NETWORK_UNKNOWN)
+        pcreate = find_call(calls, lambda c: c[1:3] == ["issue", "create"])
         chk("page create carries the distinct title + from:agent label",
             (PROBE_ALERT_TITLE in pcreate, ALERT_LABEL in pcreate), (True, True))
 
@@ -1357,55 +1538,188 @@ def _self_test():
         for name, verdict in [("valid", VALID), ("invalid", INVALID),
                               ("insufficient", INSUFFICIENT), ("expiring", EXPIRING)]:
             res, iops, wrote = run_probe(verdict, PA_OPEN, streak=3)
-            chk(f"definitive({name}) + open page -> comment + close + variable zeroed",
+            chk(f"definitive({name}) + open page -> comment + close + counter zeroed",
                 (res["streak"], res["paging"], iops, wrote),
-                (0, False, ["comment", "close"], ["0"]))
+                (0, False, ["comment", "close"], [{"streak": 0}]))
         res, iops, wrote = run_probe(VALID, PA_EMPTY, streak=2)
-        chk("definitive + stale sub-threshold count -> variable zeroed only, no issue op",
-            (res["streak"], iops, wrote), (0, [], ["0"]))
+        chk("definitive + stale sub-threshold count -> counter zeroed only, no issue op",
+            (res["streak"], iops, wrote), (0, [], [{"streak": 0}]))
+        # #1139's other bootstrap direction: a definitive verdict on a deployment whose counter
+        # document has never been created must be a QUIET, SUCCESSFUL no-op — not a raise. This
+        # is the exact shape both live runs died on.
         res, iops, wrote = run_probe(VALID, PA_EMPTY)
-        chk("definitive + no state at all -> no writes (no churn)", (iops, wrote), ([], []))
+        chk("definitive + NO counter document yet (#1139) -> no writes, no raise (no churn)",
+            (res["streak"], iops, wrote), (0, [], []))
         res, iops, wrote = run_probe(VALID, PA_CLOSED, streak=0)
-        chk("definitive + closed page + zero variable -> no writes (no churn)",
+        chk("definitive + closed page + zero counter -> no writes (no churn)",
             (iops, wrote), ([], []))
 
+        # --- #1139: the counter STORE itself. The write must pin the data-plane branch and CAS
+        # against the sha it READ; the read must bootstrap on a missing DOCUMENT and fail closed
+        # on a missing BRANCH (identical 404s, opposite verdicts — a branch that cannot be
+        # written is the closed loop that made this alarm inert).
+        calls, subprocess.run = stub_probe_gh(PA_EMPTY, streak=2)
+        probe_quietly(NETWORK_UNKNOWN)
+        put = find_call(calls, is_put)
+        chk("streak PUT targets the ledger path, pins branch=LEDGER_REF, and CASes against the "
+            "sha the read returned",
+            (put[2:3], f"branch={LEDGER_REF}" in put, f"sha={STREAK_SHA}" in put),
+            ([f"repos/o/r/contents/{STREAK_PATH}"], True, True))
+        chk("the streak READ is scoped to the ledger ref too (never the protected default)",
+            find_call(calls, lambda c: c[1] == "api" and STREAK_PATH in c[2]
+                                       and not is_put(c))[2:3],
+            [f"repos/o/r/contents/{STREAK_PATH}?ref={LEDGER_REF}"])
+        calls, subprocess.run = stub_probe_gh(PA_EMPTY)   # no document -> the CREATE case
+        probe_quietly(NETWORK_UNKNOWN)
+        bootstrap = find_call(calls, is_put)
+        chk("the bootstrap PUT sends NO sha (a create must not CAS against a blob that does not "
+            "exist) while still pinning the branch",
+            ([a for a in bootstrap if a.startswith("sha=")], f"branch={LEDGER_REF}" in bootstrap),
+            ([], True))
+
+        def read_outcome():
+            """((streak, sha), None) or (None, "<ExceptionClass>") — NOTHING escapes into the
+            harness. A mutant that makes _read_streak raise where it must not would otherwise
+            ABORT the suite: every row below it never runs, while the aborted run still records
+            as "failed" and reads like a kill (AGENTS pre-flight item 4, crash-after-partial-run).
+            Returning the class name also makes the assertions distinguish the RIGHT exception
+            from any exception — a TypeError out of a dropped type guard is not a fail-closed
+            AlertLookupError."""
+            try:
+                return _read_streak("o/r"), None
+            except Exception as exc:  # noqa: BLE001 — the class name IS what is asserted
+                return None, type(exc).__name__
+
+        # EVERY not-found shape gh emits bootstraps to (0, None) — the old reader accepted only
+        # the literal status:"404" body, which is why the first read raised (#1139).
+        for shape in ("status", "message", "stderr"):
+            calls, subprocess.run = stub_probe_gh(PA_EMPTY, missing_shape=shape)
+            chk(f"missing counter relayed as a {shape}-shaped 404 -> (0, None), no raise",
+                read_outcome(), ((0, None), None))
+        # ...but a missing ledger BRANCH 404s the same way and must NOT read as 0: no write could
+        # ever land, so the streak would be pinned below threshold forever.
+        calls, subprocess.run = stub_probe_gh(PA_EMPTY, branch_missing=True)
+        raised = None
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                upsert_probe_alert(NETWORK_UNKNOWN, "o/r")
+        except AlertLookupError as exc:
+            raised = str(exc)
+        chk("missing ledger BRANCH -> AlertLookupError (sanitized), zero writes of any kind",
+            (raised is not None and "LEAKY-STDERR" not in (raised or ""),
+             [c for c in calls if c[1] == "issue" or (c[1] == "api" and "PUT" in c)]),
+            (True, []))
+
+        # #1139's ACTUAL closed loop: the count _write_streak PUTs must be the count
+        # _read_streak reads back. Every check above builds the request shape and the response
+        # shape SEPARATELY, so a producer/consumer disagreement about the document (a renamed
+        # key, a differently-encoded body) could hide between two individually-green halves —
+        # which is the exact shape of the loop that made this alarm inert. This feeds the
+        # WRITER's own request body back to the READER as the contents-API response.
+        put_calls = []
+        subprocess.run = lambda args, **_kw: put_calls.append(list(args)) or _Run()
+        _write_streak("o/r", 11, None)
+        emitted = field_of(put_calls[0] if put_calls else [], "content=")
+        subprocess.run = lambda args, _c=emitted, **_kw: _Run(
+            json.dumps({"content": _c, "encoding": "base64", "sha": STREAK_SHA}))
+        chk("ROUND TRIP: the document _write_streak PUTs reads back as the SAME count — the "
+            "producer and the consumer must agree, not merely each match a fixture (#1139)",
+            read_outcome(), ((11, STREAK_SHA), None))
+
+        # --- #1139 at the YAML SEAM. Both halves of this alarm's inertness lived here, not in the
+        # Python above: the job could not grant the counter's store a writable permission, and the
+        # cron made three consecutive unknowns a 21-day page. Nothing asserted either, so both
+        # survived every green self-test this module ever ran. Pinned EXACT-match (never
+        # containment) against the shipped workflow; an unreadable file fails closed.
+        workflow_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     os.pardir, ".github", "workflows", "pat-validity.yml")
+        try:
+            with open(workflow_path, encoding="utf-8") as handle:
+                contract = workflow_contract(handle.read())
+        except OSError:
+            contract = None
+        chk("workflow: pat-validity.yml grants EXACTLY {contents: write, issues: write} — "
+            "contents:write is what makes the ledger counter store writable at all (#1139), and "
+            "an exact map also refuses a silent widening",
+            contract and contract["permissions"],
+            {"contents": "write", "issues": "write"})
+        cron_fields = [c.split() for c in ((contract or {}).get("crons") or [])]
+        chk("workflow: exactly ONE schedule and it fires DAILY — day-of-month/month/day-of-week "
+            "all '*' with an explicit (non-wildcard) minute and hour; at the old weekly cadence "
+            "UNKNOWN_STREAK_THRESHOLD consecutive unknowns could not page for 21 days (#1139)",
+            [(len(f), f[2], f[3], f[4], f[0].isdigit(), f[1].isdigit())
+             for f in cron_fields if len(f) == 5],
+            [(5, "*", "*", "*", True, True)])
+
         # A failed (non-404) streak READ must RAISE, never degrade to 0 — degrading would hold
-        # the count below threshold forever and permanently silence the page. Sanitized.
+        # the count below threshold forever and permanently silence the page. Sanitized. Every
+        # malformed-document shape raises too: the count is read out of the wire, so a document
+        # that does not parse as a non-negative int is not a zero.
         for mode, name in [("down", "read failure"), ("garbage", "non-numeric value")]:
-            calls, subprocess.run = stub_probe_gh(PA_EMPTY, var_read=mode)
+            calls, subprocess.run = stub_probe_gh(PA_EMPTY, store_read=mode)
             raised = False
             try:
                 with contextlib.redirect_stdout(io.StringIO()):
                     upsert_probe_alert(NETWORK_UNKNOWN, "o/r")
             except AlertLookupError as exc:
                 raised = "LEAKY-STDERR" not in str(exc)
-            chk(f"streak-variable {name} -> AlertLookupError (sanitized), zero writes",
-                (raised, [c for c in calls if c[1] in ("issue", "variable")]), (True, []))
+            chk(f"streak-store {name} -> AlertLookupError (sanitized), zero writes",
+                (raised, [c for c in calls if c[1] == "issue"
+                          or (c[1] == "api" and "PUT" in c)]), (True, []))
+        # Every malformed-document shape must fail CLOSED with AlertLookupError — never a silent
+        # 0, and never some other exception class either. ⚠️ Each fixture is chosen so the guard
+        # it targets is INDIVIDUALLY killable: the obvious `{"content": "", "encoding": "none"}`
+        # blob is masked by the json.loads guard below it (both reject it), so the encoding
+        # fixture instead carries a PERFECTLY DECODABLE payload under a non-base64 encoding —
+        # dropping the `encoding == "base64"` half then returns a streak, and dropping the
+        # `isinstance(content, str)` half raises TypeError, both of which this loop names.
+        for name, response in [
+                ("decodable payload declared with a NON-base64 encoding",
+                 _Run(json.dumps({"content": base64.b64encode(b'{"streak": 9}').decode("ascii"),
+                                  "encoding": "none", "sha": "d" * 40}))),
+                ("no content field at all (the >1 MB blob shape)",
+                 _Run(json.dumps({"encoding": "base64", "sha": "d" * 40}))),
+                ("undecodable base64", _Run(json.dumps({"content": "!!!!", "encoding": "base64",
+                                                        "sha": "d" * 40}))),
+                ("document is not an object", _Run(streak_blob("[3]"))),
+                ("count is a bool, not an int", _Run(streak_blob('{"streak": true}'))),
+                ("count is negative", _Run(streak_blob('{"streak": -1}'))),
+                ("no blob sha to CAS against",
+                 _Run(streak_blob('{"streak": 2}', sha=""))),
+        ]:
+            subprocess.run = lambda args, _r=response, **_kw: _r
+            chk(f"malformed counter document ({name}) -> AlertLookupError, never a silent 0 and "
+                "never another exception class", read_outcome()[1], "AlertLookupError")
         # A failed streak WRITE raises before any issue op (fail red, the count is never
         # silently lost); a failed page write raises too — both sanitized (never gh stderr).
-        for fail_op, want_issue_ops, name in [
-                ("variable-set", [], "failed streak write"),
-                ("reopen", ["reopen"], "failed page reopen")]:
-            calls, subprocess.run = stub_probe_gh(PA_CLOSED, streak=2, fail_op=fail_op)
-            raised = False
+        def probe_raise():
+            """("<ExceptionClass>" | None, message) for upsert_probe_alert against the current
+            stub. Catching the BASE class (not the expected one) is deliberate: a narrow
+            `except AlertWriteError` lets any OTHER class escape and abort the suite, and the
+            row below would then never run (see field_of). Naming the class also makes these
+            rows assert the RIGHT failure mode rather than merely "something raised"."""
             try:
                 with contextlib.redirect_stdout(io.StringIO()):
                     upsert_probe_alert(NETWORK_UNKNOWN, "o/r")
-            except AlertWriteError as exc:
-                raised = "LEAKY-STDERR" not in str(exc)
+            except Exception as exc:  # noqa: BLE001
+                return type(exc).__name__, str(exc)
+            return None, ""
+
+        for fail_op, want_issue_ops, name in [
+                ("streak-write", [], "failed streak write"),
+                ("reopen", ["reopen"], "failed page reopen")]:
+            calls, subprocess.run = stub_probe_gh(PA_CLOSED, streak=2, fail_op=fail_op)
+            cls, message = probe_raise()
             chk(f"{name} raises AlertWriteError, sanitized; ops after it never run",
-                (raised, [c[2] for c in calls if c[1] == "issue"]), (True, want_issue_ops))
+                (cls, "LEAKY-STDERR" in message,
+                 [c[2] for c in calls if c[1] == "issue"]),
+                ("AlertWriteError", False, want_issue_ops))
         # A failed page LOOKUP raises before any ISSUE write. The streak was already persisted —
         # deliberate: the outage run must still count even when the Issues API is down too.
         calls, subprocess.run = stub_probe_gh("", streak=2, list_rc=1)
-        raised = False
-        try:
-            with contextlib.redirect_stdout(io.StringIO()):
-                upsert_probe_alert(NETWORK_UNKNOWN, "o/r")
-        except AlertLookupError:
-            raised = True
         chk("failed page lookup -> AlertLookupError, zero issue writes",
-            (raised, [c for c in calls if c[1] == "issue"]), (True, []))
+            (probe_raise()[0], [c for c in calls if c[1] == "issue"]),
+            ("AlertLookupError", []))
 
         # End-to-end through main(): a persistent unknown at threshold goes RED and pages; a
         # single transient unknown stays GREEN with ZERO issue operations (nothing is created,
@@ -1534,8 +1848,13 @@ def _self_test():
         def cap_gh(args, **_kw):
             r = args[args.index("-R") + 1] if "-R" in args else None
             env = _kw.get("env") or {}
-            if args[1] == "api" and any("actions/variables" in a for a in args):
-                return _Run(json.dumps({"message": "Not Found", "status": "404"}), 1)
+            if args[1] == "api" and any(STREAK_PATH in a for a in args):
+                # A fresh deployment: no counter document yet. The read bootstraps to 0 and the
+                # PUT succeeds — the definitive verdicts under test must never touch it anyway.
+                return (_Run() if "PUT" in args
+                        else _Run(json.dumps({"message": "Not Found", "status": "404"}), 1))
+            if args[1] == "api" and any("git/ref/heads/" in a for a in args):
+                return _Run(json.dumps({"ref": f"refs/heads/{LEDGER_REF}"}))
             if args[1] == "api" and args[2] in visibility:
                 return _Run(*visibility[args[2]])
             if args[1] == "api":
@@ -1543,8 +1862,6 @@ def _self_test():
                         and any("repos/org/private/issues" in a for a in args)):
                     return _Run("", 1)
                 return _Run("[]")
-            if args[1] == "variable":
-                return _Run()
             if args[1:3] == ["issue", "create"]:
                 captured.append({"repo": r, "token": env.get("GH_TOKEN"),
                                  "body": args[args.index("--body") + 1]})
