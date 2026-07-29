@@ -108,6 +108,11 @@ BASE_REF_ENV = "PR_BASE_REF"
 BASE_REF_EXPR = "${{ github.event.pull_request.base.ref }}"
 CHECKOUT_ACTION = "actions/checkout@"
 SUITE_MANIFEST = "scripts/selftest-suite.txt"
+# The sandboxed runner pr-gate.yml's own suite loop uses, and the case arm that proves a given tree
+# implements it. Never invoke a self-test directly: the sandbox puts a REFUSING `gh` shim first on
+# PATH, and a composition run must not be the one place that control is skipped.
+RUNNER_SCRIPT = "scripts/worker-live.sh"
+RUNNER_ARM = "run-selftest)"
 
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 # Deliberately narrower than git's own ref grammar, for gate-staleness.py's reason: this value
@@ -354,6 +359,13 @@ def compose(base_ref, cwd, full=False, manifest=SUITE_MANIFEST, git=_git, run_su
                              check=False)[1].splitlines()
             chosen = (sorted(enrolled) if full
                       else overlap_entries(enrolled, pr_paths, base_paths))
+            # ⚠️ An absent runner in the COMPOSED tree must not read as "the suite passed" — that is
+            # the same usage-error-as-test-result confusion, in the direction that greens the gate.
+            if chosen and not runner_available(tree):
+                return dict(classify(graded_base, live_tip, None),
+                            reason=(f"the composed tree's {RUNNER_SCRIPT} has no sandboxed "
+                                    f"`{RUNNER_ARM[:-1]}` arm, so the composition cannot be graded "
+                                    "without bypassing the gh sandbox"))
             runner = run_suite or _run_suite
             failures = runner(tree, chosen)
             # ---- THE DIFFERENTIAL. A failure is only a COMPOSITION break if it PASSES on the tree
@@ -366,15 +378,36 @@ def compose(base_ref, cwd, full=False, manifest=SUITE_MANIFEST, git=_git, run_su
             git(["worktree", "remove", "--force", tree], cwd, check=False)
 
 
+def runner_available(tree):
+    """Does THIS tree's worker-live.sh implement the sandboxed `run-selftest` arm?
+
+    ⚠️ MEASURED, and it is why this function exists. #756's head tree (2026-07-28) has a
+    worker-live.sh with NO `run-selftest` arm — that arm landed on master later. Invoking it there
+    exits 1 with `worker-live: usage: ...`, i.e. a USAGE error indistinguishable, to a bare exit
+    code, from a failing self-test. Consuming that as "the baseline fails too" excused every
+    composition failure as pre-existing and the check FAILED OPEN — on PRs based on an older
+    master, which is precisely the stale population it exists for. Structural check, no execution:
+    a usage error must never be readable as a test result."""
+    try:
+        with open(os.path.join(tree, RUNNER_SCRIPT), encoding="utf-8") as handle:
+            return RUNNER_ARM in handle.read()
+    except OSError:
+        return False
+
+
 def _baseline_failures(cwd, entries, runner, manifest=SUITE_MANIFEST):
     """Which of `entries` were ALREADY failing on the tree pr-gate graded?
 
-    ⚠️ FAIL CLOSED, and this is the whole subtlety. An entry with NO establishable baseline — one
-    master ADDED, so it is absent or unenrolled in the graded tree — must NOT be excused as
-    pre-existing. Doing so would mask exactly the break this check exists for: master lands a new
-    enrolled self-test, the composition fails it, and "it is not in my tree" reads as innocence.
-    Only an entry that demonstrably EXISTS, is ENROLLED, and FAILS on the graded tree is
-    pre-existing; everything else stays attributed to the composition."""
+    ⚠️ FAIL CLOSED, and this is the whole subtlety. An entry with NO establishable baseline must NOT
+    be excused as pre-existing. Three ways a baseline fails to exist, all measured or reachable:
+    the entry is one MASTER ADDED (absent or unenrolled in the graded tree); or the graded tree's
+    harness cannot run it at all (`runner_available` above). Excusing any of them would mask exactly
+    the break this check exists for. Only an entry that demonstrably EXISTS, is ENROLLED, and FAILS
+    on the graded tree under a WORKING runner is pre-existing."""
+    if not runner_available(cwd):
+        print("== baseline UNAVAILABLE: the graded tree has no sandboxed run-selftest arm, so no "
+              "failure can be shown pre-existing — attributing all of them to the composition ==")
+        return []
     try:
         with open(os.path.join(cwd, manifest), encoding="utf-8") as handle:
             enrolled = set(suite_entries(handle.read()))
@@ -594,6 +627,18 @@ def _self_test():
             handle.write("enrolled.py\n")
         open(os.path.join(_bt, "scripts", "enrolled.py"), "w").close()
         every = lambda _cwd, entries: list(entries)     # noqa: E731 — every entry "fails"
+
+        # ⚠️ THE MEASURED FAIL-OPEN. #756's graded tree has a worker-live.sh with no run-selftest
+        # arm; invoking it exits 1 with a USAGE error, which as a bare exit code is
+        # indistinguishable from a failing test. Read as a baseline it excused every composition
+        # failure and the check blocked NOTHING — on exactly the stale PRs it targets.
+        chk("a graded tree with NO run-selftest arm excuses NOTHING (the measured fail-open)",
+            _baseline_failures(_bt, ["enrolled.py"], every), [])
+        chk("...and runner_available says why", runner_available(_bt), False)
+        with open(os.path.join(_bt, RUNNER_SCRIPT), "w", encoding="utf-8") as handle:
+            handle.write("case $1 in\n  run-selftest)\n    :\n    ;;\nesac\n")
+        chk("...while a tree that DOES implement the arm is usable as a baseline",
+            runner_available(_bt), True)
         chk("an enrolled+present entry that fails on the graded tree IS pre-existing",
             _baseline_failures(_bt, ["enrolled.py"], every), ["enrolled.py"])
         chk("an entry master ADDED (absent from the graded tree) is NOT excused",
