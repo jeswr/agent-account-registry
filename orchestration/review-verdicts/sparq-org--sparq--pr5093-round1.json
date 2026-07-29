@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5093,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "cfa750eabbe51eaf20cc630e53a12737c0d18cd4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The added row says \u201cneither name appears anywhere in this repository,\u201d but this new README text itself contains both `lws-spec` and `lws-ucs` multiple times. That makes the stated in-tree evidence false as soon as the change lands, and a repository search will contradict the documentation. The useful claim appears to be that there are no code, configuration, or dependency references establishing shipped behavior, which is narrower and remains supportable.",
+    "file": "crates/sparq-lws-core/README.md",
+    "fix_hint": "Replace the repository-wide occurrence claim with a scoped statement such as: \u201cNo code, configuration, or dependency reference outside this specification-estate note establishes a dependency on either name.\u201d Keep the `None` evidence wording aligned with that narrower claim.",
+    "severity": "minor",
+    "title": "The claim that neither unresolved spec name appears in the repository is false"
+   }
+  ],
+  "progress": null,
+  "summary": "The new specification table is largely supported by the referenced source and manifest: the DPoP-SK tests pin the exporter label and Appendix-A outputs, and Cargo.toml pins the stated Solid-OIDC revision. However, the unresolved-spec evidence contains a directly self-invalidating repository-wide claim. The documentation should describe the absence of code/config dependencies without claiming the names do not occur anywhere.",
+  "verdict": "request_changes"
+ }
+}
