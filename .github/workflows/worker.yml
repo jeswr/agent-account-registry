@@ -1236,22 +1236,17 @@ jobs:
           REGISTRY_SECRETS_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
         run: bash registry/scripts/worker-live.sh write-back
 
-      - name: Ensure a Rust toolchain for the crate-scoped gate
-        # [OPUS-4.8] The gate runs `cargo clippy/test` directly on the runner; a stock ubuntu-latest may
-        # have rustup with NO default toolchain set (and the target may pin one via rust-toolchain.toml),
-        # which fails the gate with "rustup could not choose a version of cargo". Set one up in the target
-        # dir so a rust-toolchain.toml pin is honoured; harmless for non-cargo gate profiles.
-        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
-        working-directory: target
-        run: |
-          set -uo pipefail
-          command -v rustup >/dev/null 2>&1 || { echo '::error::rustup not found on the runner'; exit 1; }
-          rustup show active-toolchain >/dev/null 2>&1 || rustup default stable
-          rustup show >/dev/null 2>&1 || true      # installs a rust-toolchain.toml-pinned toolchain if present
-          rustup component add clippy rustfmt >/dev/null 2>&1 || true
-          cargo --version; rustc --version
+      # [issue #242] The runner-side "Ensure a Rust toolchain for the crate-scoped gate" step that
+      # used to sit here is GONE. It provisioned `rustup default stable` + clippy/rustfmt on the
+      # runner because the gate ran `cargo clippy/test` directly there. The gate no longer does:
+      # toolchain provisioning moved INSIDE the sandbox. containers/worker-gate.Dockerfile carries
+      # clippy/rustfmt for the image's own toolchain, and worker-live.sh `_gate_sandbox_prepare`
+      # materialises a target `rust-toolchain.toml` pin and adds those two components FOR THAT
+      # PINNED TOOLCHAIN, in-container, before any target code runs. Re-adding a host rustup step
+      # would not restore host execution, but it would signal that the gate still runs on the
+      # runner — it does not.
 
-      - name: Run policy-selected local gate
+      - name: Run policy-selected local gate (SANDBOXED — target code never runs on the runner)
         id: gate
         if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
         working-directory: target
@@ -1259,6 +1254,27 @@ jobs:
           TARGET_DIR: ${{ github.workspace }}/target
           GATE_PROFILE: ${{ needs.resolve.outputs.gate_profile }}
           WORKER_PACKAGES: ${{ needs.resolve.outputs.packages }}
+          # [issue #242] The cargo gate profiles now execute inside a container (worker-live.sh
+          # `_gate_sandbox_args`), for the same reason the model step does: `cargo clippy`/`cargo
+          # test` run the TARGET's own build scripts and tests, which is arbitrary target-controlled
+          # code, and content-scanning the tree for token shapes is a tripwire rather than
+          # containment — a steered model can base64/split/compress a credential into the writable
+          # target tree and walk past any pattern scan. Only the target checkout (writable, .git
+          # read-only) and the scratch cache below are mounted; nothing from the runner temp tree,
+          # nothing from the sibling registry checkout, and NO job environment (docker inherits none,
+          # and the argv builder only ever emits the value-bearing `--env NAME=VALUE` form).
+          #
+          # WORKER_ROOT is declared here purely so the sandbox's containment REFUSAL has a concrete
+          # path to assert against: it is the credential + sealed-bundle tree, and the gate refuses
+          # to start if it would be reachable through either mount. It is a path, not a secret, and
+          # it is never forwarded into the container.
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+          # The cargo cache lives in its OWN leaf directory, a sibling of WORKER_ROOT rather than the
+          # runner temp root: bind-mounting a leaf exposes nothing above it, and the refusal above
+          # turns that from an assumption into a check. Sharing one dir across every cargo invocation
+          # of the gate is the cache strategy — the crates.io index and dependency sources are
+          # fetched once per job instead of once per container.
+          GATE_SANDBOX_CACHE: ${{ runner.temp }}/registry-gate-sandbox
           # [OPUS-4.8] Credential-safety (security review, finding #3): do NOT `tee` the gate's own
           # stdout+stderr — which is target-CONTROLLED cargo output (build scripts / tests) — into a
           # runner-local file. An earlier revision did that to feed a diagnostics artifact; a hostile
@@ -1267,10 +1283,13 @@ jobs:
           # GitHub job log (streamed off-runner, not a local file), which is a sufficient and safe
           # crash signal. The failure-class annotation below reads only host-derived step outcomes.
           #
-          # [issue #568 review r2] QUARANTINE the runner command files for this step. A build
-          # script / test that this gate executes is TARGET-CONTROLLED code running on the runner
-          # host, and $GITHUB_ENV / $GITHUB_PATH are cross-step primitives: an append to the former
-          # persists BASH_ENV, LD_PRELOAD or PYTHON* into EVERY later step (a BASH_ENV startup file
+          # [issue #568 review r2] QUARANTINE the runner command files for this step. Since #242 the
+          # cargo profiles run the target's build scripts and tests inside the sandbox, so they can
+          # no longer reach these files at all — but this stays as defence in depth (the
+          # registry-selftest profile is still host-side, and a quarantine is only load-bearing on
+          # the run where some other layer has failed). $GITHUB_ENV / $GITHUB_PATH are cross-step
+          # primitives: an append to the former persists BASH_ENV, LD_PRELOAD or PYTHON* into EVERY
+          # later step (a BASH_ENV startup file
           # containing `exit 0` makes the next `run:` block succeed having executed none of it),
           # and an append to the latter puts an attacker binary ahead of the system bash / python3 /
           # sha256sum the pre-publish verifier below depends on. Pointing both at a path the runner
@@ -1316,7 +1335,11 @@ jobs:
         if: ${{ always() }}
         env:
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
-        run: rm -rf -- "$WORKER_ROOT"
+          # [issue #242] The gate sandbox's scratch cache is target-WRITTEN (cargo ran as the runner
+          # user inside the container against a mount of this directory), so it is removed on the
+          # same always() path as the credential tree rather than left for a later step to trip over.
+          GATE_SANDBOX_CACHE: ${{ runner.temp }}/registry-gate-sandbox
+        run: rm -rf -- "$WORKER_ROOT" "$GATE_SANDBOX_CACHE"
 
       # [OPUS-4.8] Fail-SOFT failure-class annotation (security review, finding #2). This step ONLY
       # annotates; it must NEVER become the terminal failure signal or mask the real cause, so it is
