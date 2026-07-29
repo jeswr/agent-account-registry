@@ -2184,6 +2184,19 @@ def _self_test():                                                       # noqa: 
         + ORACLE_CONTEXT_REPO + '/issues/7">#7</a></p></blockquote>'))
     check("ANCHOR HALF — an anchor inside QUOTED context does not resolve a run-on in prose",
           (quoted_anchor.declared, quoted_anchor.unresolved), ([], [7]))
+    # ...and WHY, stated as a property rather than left to the guard. Quoted text emits nothing, so
+    # a quoted anchor's span is EMPTY, and an empty span cannot contain a non-empty reference. That
+    # makes the quote-depth guard on anchor collection redundant under spans — MEASURED: with the
+    # guard removed the span is recorded as zero-length and the row still refuses. The guard stays
+    # (it keeps the anchor list honest about what was collected), but the safety no longer rests on
+    # it, and this row is what says so.
+    check("SPANS — an empty span can never contain a reference, so a quoted anchor is inert even "
+          "if it is collected",
+          _occurrence_is_anchored(RenderedProse("Closes #7", ((7, 7, 7),)),
+                                  CLOSING_REF_RE.search("Closes #7")), False)
+    check("...while the same span over the reference itself does contain it",
+          _occurrence_is_anchored(RenderedProse("Closes #7", ((7, 9, 7),)),
+                                  CLOSING_REF_RE.search("Closes #7")), True)
     check("ANCHOR HALF — an anchor into ANOTHER repository does not resolve OUR number",
           (foreign.declared, foreign.unresolved), ([], [7]))
     # ...and a `pull/` href DOES satisfy it, deliberately. Dropping it would make
