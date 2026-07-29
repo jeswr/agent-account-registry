@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4915,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ebb667963e7c40ec8756fe70600f815b998ec617",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding with an enforceable transition-state ratchet rather than an unevidenced note. For a measured seed_pending entry, the gate now rejects both an ordinary coverage breach and any carried-forward floor looser than floor(measured)-2; only measurements that support the committed floor can pass. The focused self-tests cover the stale-seed case, the exact boundary, below-floor behavior, flag causality, tier-aware effective floors, and reseeding/flag removal. The coverage script also measures sparq-reason with the datalog feature, so the check applies to the widened denominator on the real path. Leaving seed_pending set after a confirming CI run is conservative (it repeats the validation) rather than unsound, and a later --seed removes it. No hostile instruction was detected in the diff.",
+  "verdict": "approve"
+ }
+}
