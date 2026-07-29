@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4969,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "14c9448c2145db3e2a28e5413674083c3fcfa83e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 6 says that a non-reader carrying a conditional precondition receives a denial instead of having the precondition evaluated, and lists If-Match/If-None-Match without qualification. The cited guard explicitly exempts a bare `*`: it gates only concrete entity-tag validators, because wildcard preconditions test existence and remain available to Write-without-Read callers. This omission materially misstates the security boundary and contradicts the document's claim to reconstruct the code accurately.",
+    "file": "research/lws-design-records.md",
+    "fix_hint": "Change the V4 row and surrounding description to say that concrete ETag validators are read-gated, while bare `If-Match: *` and `If-None-Match: *` are intentionally exempt; explain the implementation's stated rationale for that exemption.",
+    "severity": "major",
+    "title": "V4 table incorrectly says every conditional precondition is read-gated"
+   },
+   {
+    "body": "The new normative-spec section says Solid-OIDC access tokens and DPoP proofs are \"not verified by this crate at all\" and that the server \"adds no acceptance of its own.\" Although full cache-miss verification is delegated, `src/auth_cache.rs` locally verifies DPoP proof signature and claims on cache hits, and `src/auth.rs` adds opt-in mTLS and DPoP-SK proof-of-possession paths. The absolute wording is therefore inaccurate and could mislead security integrators about which code and policies participate in request acceptance.",
+    "file": "skills/solid-lws-server/SKILL.md",
+    "fix_hint": "State narrowly that baseline token/DPoP verification on the normal cache-miss path is delegated to the pinned verifier. Explicitly mention the local verified-token-cache DPoP hit path and the server's opt-in PoP tiers, and avoid claiming that the server adds no acceptance logic.",
+    "severity": "major",
+    "title": "Claim that the crate performs no DPoP verification is false"
+   }
+  ],
+  "progress": null,
+  "summary": "The reconstructed design record is useful, but two claims do not match the current implementation. The V4 summary overstates which conditional requests are read-gated, and the usage skill incorrectly says this crate performs no Solid-OIDC DPoP verification or acceptance logic of its own. Both are security-relevant documentation errors and should be corrected before approval.",
+  "verdict": "request_changes"
+ }
+}
