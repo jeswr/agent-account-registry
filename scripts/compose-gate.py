@@ -44,6 +44,20 @@
 #     every open PR at once. So: `::warning::`, the conflicted paths named, EXIT 0. NOT blocking.
 #   BROKEN — the merge is clean and the composition FAILS the suite. This is the mode nothing in
 #     the estate currently sees. So: `::error::`, EXIT 1.
+#   PREEXISTING — it fails on the tree this gate ALREADY graded, so the base move did not cause it.
+#     Reported, never blamed on the composition, and non-blocking so the two steps do not
+#     double-report one tree. See `annotation` for why that reading INVERTS in production.
+#   UNPROVABLE — an operand or a verdict could not be established. ⚠️ THIS BLOCKS, and that is a
+#     RETRACTION: it first exited 0 behind an `::error::` no gate consults, which let the arm proceed
+#     exactly as a green would. Every runtime path to it is a violated PINNED invariant.
+#
+# ⚠️ AND A VERDICT IS NOT AN EXIT CODE. worker-live.sh exits a bare `1` for manifest-validation
+# failure, a usage error, a not-enrolled entry, ENV-BLOCKED, an mktemp failure and a sandbox that is
+# not intercepting `gh` — none of which is a test result. Read as one on the BASELINE side, each
+# silently converts a real `composes-broken` into `pre-existing-red blocking=false`. Faults are
+# therefore detected by MARKER, the way a gh-escape already was, and a marker-bearing run is NOT
+# GRADEABLE: not a pass, not a failure. `runner_available` proving the arm's TEXT exists was one
+# layer too shallow — the same defect class, twice, which is why both are pinned by self-test rows.
 #
 # HOW EXIT 1 ENFORCES WITHOUT A REPOSITORY SETTING. This runs as a step of the `gate` job, and
 # `gate` is ALREADY the one required status check the arming latch waits on. So a composition break
@@ -56,8 +70,12 @@
 # suite is restricted to the OVERLAP: enrolled entries that EITHER side touched since the merge
 # base. That set grows with staleness, which is the right shape — a PR one commit behind pays for
 # almost nothing, and #756 at 24 commits behind selects 41 of 55, where the full suite is what you
-# would want anyway. `--full` overrides. NO API CALLS AT ALL: every operand comes from the local
-# object store that `fetch-depth: 0` already fetched, so this adds nothing to any rate-limit route.
+# would want anyway. `--full` overrides. A FAILURE additionally costs a baseline re-run of just the
+# failing entries, so the stale worst case approaches 2x the suite step rather than 1x. The real
+# bound is the job's own `timeout-minutes: 15`, and ⚠️ its overrun mode is a RED GATE — i.e. a false
+# block — which is the cost that actually matters here. NO API CALLS AT ALL: every operand comes from
+# the local object store that `fetch-depth: 0` already fetched, so nothing lands on any rate-limit
+# route.
 #
 # ⚠️ THE RESIDUAL, NAMED, BECAUSE IT IS THE HALF THIS CANNOT CLOSE. This grades the composition at
 # RUN TIME. It does not make the verdict self-invalidating afterwards: master can move one second
@@ -95,8 +113,17 @@ PREEXISTING = "pre-existing-red"  # it fails on the GRADED tree too, so the base
 UNPROVABLE = "unprovable"    # an operand could not be established
 STATES = (FRESH, CLEAN, CONFLICT, BROKEN, PREEXISTING, UNPROVABLE)
 
-# Only BROKEN reds the gate. See "THE TWO FAILURE MODES REPORT DIFFERENTLY" in the header.
-BLOCKING_STATES = (BROKEN,)
+# ⚠️ WHAT REDS THE GATE. BROKEN, plainly. And UNPROVABLE — which is a RETRACTION of this file's
+# first cut, where it exited 0 behind an `::error::` annotation no gate consults. `classify`'s own
+# docstring already said an unresolvable operand must never read FRESH or CLEAN "because both of
+# those are readings that would let the arm proceed"; exiting 0 lets the arm proceed IDENTICALLY, so
+# the annotation was the whole consequence and the reading was decorative. Every runtime path to
+# UNPROVABLE is also a VIOLATED PINNED INVARIANT — the seam assertions pin `fetch-depth: 0`, no
+# `ref:` override and a two-parent HEAD, so a non-merge HEAD, an unresolvable `origin/<base>`, a
+# deleted base ref or a harness that will not run are all "the thing that was supposed to be
+# impossible happened", which is precisely the case that must not be waved through.
+# CONFLICT and PREEXISTING deliberately do NOT block; see the header.
+BLOCKING_STATES = (BROKEN, UNPROVABLE)
 
 RECEIPT_PREFIX = "compose-gate:"
 
@@ -113,6 +140,21 @@ SUITE_MANIFEST = "scripts/selftest-suite.txt"
 # PATH, and a composition run must not be the one place that control is skipped.
 RUNNER_SCRIPT = "scripts/worker-live.sh"
 RUNNER_ARM = "run-selftest)"
+# ⚠️ THE HARNESS'S OWN FAULT MARKERS, and the second half of a lesson learned twice. Proving the
+# `run-selftest` ARM EXISTS (`runner_available`) is not proving the harness RAN: worker-live.sh's
+# `die()` prints `worker-live: <msg>` and exits a bare **1** for manifest-validation failure, a
+# usage error, a not-enrolled entry, and ENV-BLOCKED (whose own message says it is "NOT a test
+# failure and NOT a pass"); `run_enrolled_selftest` prints `::error::self-test sandbox: mktemp
+# failed` and `::error::self-test sandbox is NOT intercepting `gh`` and returns 1 likewise. Every
+# one of those is INDISTINGUISHABLE from a failing self-test by exit code alone — which on the
+# BASELINE side silently converts a real `composes-broken` into `pre-existing-red blocking=false`.
+# So a fault is detected the way `_run_suite` already detects a gh-escape: by the marker in the
+# output, never by the status. A marker-bearing run is NOT GRADEABLE, which is a third outcome —
+# not a pass, not a failure.
+HARNESS_FAULT_MARKERS = ("worker-live: ", "::error::self-test sandbox")
+# An escape is NOT a harness fault: the sandbox worked and caught a self-test reaching the real gh.
+# That is a genuine failure of the entry and stays one.
+ESCAPE_MARKER = "::error::gh-escape "
 
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 # Deliberately narrower than git's own ref grammar, for gate-staleness.py's reason: this value
@@ -266,9 +308,18 @@ def annotation(result):
                 "gate, and the conflict-resolver lane already sees it.")
     if state == PREEXISTING:
         listed = ", ".join(sorted(result.get("preexisting") or []))
+        # ⚠️ THE PRODUCTION SEMANTICS, stated because they INVERT the local reading. This step runs
+        # only AFTER the suite step passed on the graded tree, so any entry excusable here either was
+        # never in that step's BASE-derived manifest (legitimate — a PR's own new self-test is not in
+        # the base copy) or passed there minutes ago and fails now, which is NONDETERMINISM, not a
+        # pre-existing failure. It stays non-blocking so the two steps do not double-report the same
+        # tree, but "already red" is the weaker of the two readings and must not be the only one
+        # offered.
         return (f"::warning::{listed} fail(s) on the composition, but fail(s) on the tree this gate "
                 "already graded too — so this is NOT a composition break and the base move did not "
-                "cause it. The self-test suite step above owns it.")
+                "cause it. The self-test suite step above owns it. NOTE: that step already passed on "
+                "this tree, so unless these entries are absent from its base-derived manifest, this "
+                "is a FLAKE report — the same tree gave two different answers minutes apart.")
     if state == UNPROVABLE:
         return (f"::error::compose-gate could not establish its operands — {reason}. This run's "
                 "green is NOT evidence about the tree this PR would land on.")
@@ -378,7 +429,16 @@ def compose(base_ref, cwd, full=False, manifest=SUITE_MANIFEST, git=_git, run_su
                                     f"`{RUNNER_ARM[:-1]}` arm, so the composition cannot be graded "
                                     "without bypassing the gh sandbox"))
             runner = run_suite or _run_suite
-            failures = runner(tree, chosen)
+            failures, ungradeable = runner(tree, chosen, "composition")
+            # An entry the harness could not grade on the COMPOSED side leaves the composition
+            # unverified. Fail closed: `unprovable`, which blocks — never "the suite passed".
+            if ungradeable:
+                return dict(classify(graded_base, live_tip, None),
+                            reason=("the harness faulted rather than returning a verdict for "
+                                    f"{len(ungradeable)} composed entr(y/ies) "
+                                    f"({', '.join(sorted(ungradeable))}), so the composition is "
+                                    "unverified — this is transient, and re-running the job clears "
+                                    "it (unlike a staleness refusal, which it cannot)"))
             # ---- THE DIFFERENTIAL. A failure is only a COMPOSITION break if it PASSES on the tree
             # `pr-gate` already graded. Paid only on failure, and only for the entries that failed.
             baseline_ok = runner_available(cwd)
@@ -421,7 +481,7 @@ def _baseline_failures(cwd, entries, runner, manifest=SUITE_MANIFEST):
         print("== baseline UNAVAILABLE: the graded tree has no sandboxed run-selftest arm, so no "
               "failure can be shown pre-existing — attributing all of them to the composition ==")
         return []
-    try:
+    try:  # noqa: SIM105 — the manifest read below is the second unestablishable-baseline case
         with open(os.path.join(cwd, manifest), encoding="utf-8") as handle:
             enrolled = set(suite_entries(handle.read()))
     except OSError:
@@ -431,27 +491,46 @@ def _baseline_failures(cwd, entries, runner, manifest=SUITE_MANIFEST):
     if not testable:
         return []
     print(f"== baseline: re-running {len(testable)} failing entr(y/ies) on the GRADED tree ==")
-    return runner(cwd, testable)
+    baseline_failures, ungradeable = runner(cwd, testable, "baseline")
+    # ⚠️ THE THIRD UNESTABLISHABLE-BASELINE CASE, and the one that reads as a verdict. An entry whose
+    # baseline run hit a HARNESS fault has no baseline — it is not "failing here too". Excusing it
+    # is exactly the fail-open this whole function exists to prevent, one layer deeper.
+    return [entry for entry in baseline_failures if entry not in ungradeable]
 
 
-def _run_suite(tree, entries):
-    """Run each enrolled entry on the COMPOSED tree, through the same sandbox pr-gate.yml uses.
+def harness_fault(output):
+    """PURE: did the HARNESS fail, rather than the self-test returning a verdict?
 
-    `worker-live.sh run-selftest` puts a refusing `gh` shim first on PATH; a self-test that reached
-    the real binary is exactly the escape that control exists for, and a composition run must not
-    be the one place it is skipped. A non-zero exit is a failure; so is the escape row."""
-    failures = []
+    See HARNESS_FAULT_MARKERS. An infrastructure fault and a failing test are the same bare `1`, so
+    the exit status cannot answer this and only the output can."""
+    return any(marker in (output or "") for marker in HARNESS_FAULT_MARKERS)
+
+
+def _run_suite(tree, entries, label="composition"):
+    """Run each enrolled entry through the same sandbox pr-gate.yml uses.
+
+    Returns `(failures, ungradeable)`. `worker-live.sh run-selftest` puts a refusing `gh` shim first
+    on PATH; a self-test that reached the real binary is exactly the escape that control exists for,
+    and a composition run must not be the one place it is skipped. THREE outcomes, not two: a pass,
+    a failure (non-zero, or an escape row), and NOT GRADEABLE (the harness itself faulted)."""
+    failures, ungradeable = [], []
     for entry in entries:
         proc = subprocess.run(["bash", "scripts/worker-live.sh", "run-selftest", entry],
                               cwd=tree, capture_output=True, text=True)
-        escaped = "::error::gh-escape " in (proc.stdout + proc.stderr)
-        if proc.returncode != 0 or escaped:
-            failures.append(entry)
-            tail = (proc.stdout or proc.stderr or "").strip().splitlines()[-6:]
-            print(f"== composition FAILURE: {entry} ==")
+        output = proc.stdout + proc.stderr
+        tail = (proc.stdout or proc.stderr or "").strip().splitlines()[-6:]
+        if harness_fault(output):
+            ungradeable.append(entry)
+            print(f"== {label} NOT GRADEABLE (harness fault, not a verdict): {entry} ==")
             for line in tail:
                 print(f"   {line}")
-    return failures
+            continue
+        if proc.returncode != 0 or ESCAPE_MARKER in output:
+            failures.append(entry)
+            print(f"== {label} FAILURE: {entry} ==")
+            for line in tail:
+                print(f"   {line}")
+    return failures, ungradeable
 
 
 # ---------------------------------------------------------------------------------------------
@@ -470,6 +549,14 @@ def assert_compose_seam(job):
     """The gate job runs this script, unconditionally, fed from base.ref, able to fail the job."""
     assert isinstance(job, dict), f"the {GATE_JOB!r} job is absent or not a mapping"
     assert not job.get("if"), f"the {GATE_JOB!r} job is conditional, so the check can be skipped"
+    # ⚠️ JOB scope as well as step scope. A step-level `continue-on-error` is the obvious mutant and
+    # was covered; `continue-on-error` on the JOB makes the whole required check advisory while every
+    # other assertion here still passes — a structure-preserving survivor. dispatch-plan.py refuses
+    # it at BOTH scopes (:820, :887) and documents it as one of three measured survivors; this was
+    # one clause short of the pattern this repository already established.
+    assert not job.get("continue-on-error"), (
+        f"the {GATE_JOB!r} JOB carries continue-on-error, so the required check reports success "
+        "however this step exits — the enforcement is gone while the receipt keeps printing")
     steps = job.get("steps")
     assert isinstance(steps, list), f"the {GATE_JOB!r} job has no steps list"
     matches = [s for s in steps if isinstance(s, dict) and INVOCATION in str(s.get("run", ""))]
@@ -503,14 +590,22 @@ def assert_merge_ref_inputs(job):
     assert isinstance(steps, list), f"the {GATE_JOB!r} job has no steps list"
     checkouts = [s for s in steps if isinstance(s, dict) and CHECKOUT_ACTION in str(s.get("uses"))]
     assert checkouts, "the gate job has no checkout step, so there is no tree to compose"
-    with_block = checkouts[0].get("with")
-    assert isinstance(with_block, dict), "the checkout step has no with: block"
-    assert with_block.get("fetch-depth") == 0, (
-        f"fetch-depth is {with_block.get('fetch-depth')!r}, not 0 — without full history "
-        "refs/remotes/origin/<base> is not fetched and the live tip cannot be read")
-    assert "ref" not in with_block, (
-        "the checkout pins a ref: override, so HEAD is not refs/pull/N/merge and HEAD^1 is not a "
-        "base tip at all")
+    # ⚠️ EVERY checkout, not `checkouts[0]`. Inspecting only the first is a structure-preserving
+    # survivor: a LATER checkout into the workspace pinning `head.sha` leaves this assertion passing
+    # while HEAD becomes single-parent, so the check reads `unprovable` forever with its receipt
+    # still printing. The last write to the workspace is what HEAD is, so all of them are pinned.
+    for index, checkout in enumerate(checkouts):
+        with_block = checkout.get("with")
+        assert isinstance(with_block, dict), f"checkout step #{index} has no with: block"
+        assert with_block.get("fetch-depth") == 0, (
+            f"checkout step #{index} has fetch-depth {with_block.get('fetch-depth')!r}, not 0 — "
+            "without full history refs/remotes/origin/<base> is not fetched and the live tip "
+            "cannot be read")
+        # A checkout into a SEPARATE `path:` does not redefine the workspace HEAD, so it is free to
+        # pin a ref; one into the workspace is not.
+        assert "ref" not in with_block or with_block.get("path"), (
+            f"checkout step #{index} pins a ref: override into the workspace, so HEAD is not "
+            "refs/pull/N/merge and HEAD^1 is not a base tip at all")
 
 
 def _self_test():
@@ -566,8 +661,16 @@ def _self_test():
             UNPROVABLE)
 
     # ⚠️ THE HEADLINE CLAIM: exactly ONE state blocks, and it is the invisible one.
-    chk("ONLY the semantic composition break blocks", sorted(BLOCKING_STATES), [BROKEN])
+    chk("the blocking set is EXACTLY the break and the unverifiable",
+        sorted(BLOCKING_STATES), sorted([BROKEN, UNPROVABLE]))
     chk("a textual CONFLICT does NOT block", CONFLICT in BLOCKING_STATES, False)
+    chk("a PRE-EXISTING red does NOT block", PREEXISTING in BLOCKING_STATES, False)
+    chk("FRESH and CLEAN never block",
+        [FRESH in BLOCKING_STATES, CLEAN in BLOCKING_STATES], [False, False])
+    # ⚠️ THE RETRACTION, pinned: unprovable used to exit 0 behind an ::error:: nothing consults.
+    chk("an UNPROVABLE state BLOCKS — an annotation is not a consequence",
+        UNPROVABLE in BLOCKING_STATES, True)
+    chk("...and its receipt says blocking=true", "blocking=true" in receipt(classify("", "")), True)
     chk("...and its receipt says so", "blocking=false" in receipt(classify(A, B, 1)), True)
     chk("...while a BROKEN receipt says blocking=true",
         "blocking=true" in receipt(classify(A, B, 0, failures=["x"])), True)
@@ -647,7 +750,34 @@ def _self_test():
         with open(os.path.join(_bt, SUITE_MANIFEST), "w", encoding="utf-8") as handle:
             handle.write("enrolled.py\n")
         open(os.path.join(_bt, "scripts", "enrolled.py"), "w").close()
-        every = lambda _cwd, entries: list(entries)     # noqa: E731 — every entry "fails"
+        # The runner contract is (failures, ungradeable). `every` = a real verdict of FAIL for each.
+        every = lambda _cwd, entries, _label="x": (list(entries), [])   # noqa: E731
+
+        # ⚠️ THE SECOND FAIL-OPEN OF THE SAME CLASS, found by review. `runner_available` proves the
+        # ARM'S TEXT, not that the harness RAN. worker-live.sh exits a bare 1 with a `worker-live: `
+        # line for manifest-validation failure, usage, not-enrolled and ENV-BLOCKED, and with an
+        # `::error::self-test sandbox` line for mktemp failure and a non-intercepting sandbox. Read
+        # as a baseline verdict, EVERY one of those excused a genuine break as pre-existing.
+        for marker, why in (("worker-live: registry-selftest gate: self-test manifest validation "
+                             "failed (fail closed)", "manifest validation"),
+                            ("worker-live: usage: worker-live.sh run-selftest <x>", "a usage error"),
+                            ("worker-live: registry-selftest gate: ENV-BLOCKED -- a dependency",
+                             "ENV-BLOCKED"),
+                            ("::error::self-test sandbox: mktemp failed", "mktemp failure"),
+                            ("::error::self-test sandbox is NOT intercepting `gh`", "a blind sandbox")):
+            chk(f"{why} is a HARNESS FAULT, never a verdict", harness_fault(marker), True)
+        chk("a plain failing self-test is NOT a harness fault",
+            harness_fault("  FAIL something: 1 (want 2)\ndispatch-claim self-test FAILED"), False)
+        chk("a gh-escape is NOT a harness fault — the sandbox WORKED and caught a real escape",
+            harness_fault("::error::gh-escape dispatch-claim.py reached the real gh"), False)
+        chk("clean output is not a fault", harness_fault(""), False)
+
+        # ⚠️ THE REVIEWER'S ATTACK, end to end: a tree that PASSES runner_available and still exits
+        # non-zero from an infrastructure fault must excuse NOTHING.
+        def faulting(_cwd, entries, _label="x"):
+            return list(entries), list(entries)      # every entry faulted, so none is a verdict
+        chk("a baseline whose harness FAULTS excuses nothing (the review finding)",
+            _baseline_failures(_bt, ["enrolled.py"], faulting), [])
 
         # ⚠️ THE MEASURED FAIL-OPEN. #756's graded tree has a worker-live.sh with no run-selftest
         # arm; invoking it exits 1 with a USAGE error, which as a bare exit code is
@@ -669,10 +799,10 @@ def _self_test():
         chk("a mixed set only excuses the one with a real baseline",
             _baseline_failures(_bt, ["enrolled.py", "added-by-master.py"], every), ["enrolled.py"])
         chk("an entry that PASSES on the graded tree is not pre-existing either",
-            _baseline_failures(_bt, ["enrolled.py"], lambda _c, _e: []), [])
+            _baseline_failures(_bt, ["enrolled.py"], lambda _c, _e, _l="x": ([], [])), [])
     chk("an unreadable graded manifest excuses NOTHING (fail closed)",
         _baseline_failures(os.path.join(tempfile.gettempdir(), "compose-gate-nonexistent"),
-                           ["x.py"], lambda _c, e: list(e)), [])
+                           ["x.py"], lambda _c, e, _l="x": (list(e), [])), [])
 
     # ---- THE WORKFLOW SEAM, mutation-tested. Each mutant leaves a step that LOOKS wired. ----
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
@@ -716,6 +846,11 @@ def _self_test():
             yield ("the JOB is made conditional", lambda j: j.update({"if": "false"}))
             yield ("the step may fail silently — the ONLY enforcement is disabled",
                    lambda j: _step(j).update({"continue-on-error": True}))
+            # ⚠️ THE STRUCTURE-PRESERVING SURVIVOR found by review: JOB scope, not step scope.
+            yield ("the JOB may fail silently, which no other assertion here notices",
+                   lambda j: j.update({"continue-on-error": True}))
+            yield ("the JOB's continue-on-error is the string 'true'",
+                   lambda j: j.update({"continue-on-error": "true"}))
             yield ("`set -euo pipefail` is dropped",
                    lambda j: _sub(j, "set -euo pipefail\n", ""))
             yield ("the failure is swallowed by `|| true`",
@@ -756,10 +891,27 @@ def _self_test():
                    lambda j: [s for s in j["steps"]
                               if CHECKOUT_ACTION in str(s.get("uses"))][0]["with"].update(
                                   {"ref": "${{ github.head_ref }}"}))
+            # ⚠️ THE SECOND STRUCTURE-PRESERVING SURVIVOR: a LATER checkout into the workspace.
+            # checkouts[0] stays perfect; HEAD becomes single-parent; the check reads `unprovable`
+            # forever with its receipt still printing.
+            yield ("a SECOND workspace checkout pins head.sha",
+                   lambda j: j["steps"].insert(
+                       1, {"uses": "actions/checkout@abc", "with": {"fetch-depth": 0,
+                                                                    "ref": "${{ github.event.pull_request.head.sha }}"}}))
+            yield ("a SECOND workspace checkout is shallow",
+                   lambda j: j["steps"].insert(
+                       1, {"uses": "actions/checkout@abc", "with": {"fetch-depth": 1}}))
 
         for name, mutation in checkout_mutants():
             chk(f"the checkout check REFUSES when {name}",
                 bool(_refused(assert_merge_ref_inputs, mutate(mutation))), True)
+
+        # ...and does NOT over-block: a checkout into a SEPARATE `path:` cannot redefine the
+        # workspace HEAD, so pinning a ref there is legitimate (regate-sweep.yml does exactly this).
+        chk("a path-scoped sibling checkout pinning a ref is ALLOWED",
+            _refused(assert_merge_ref_inputs, mutate(lambda j: j["steps"].insert(
+                1, {"uses": "actions/checkout@abc",
+                    "with": {"fetch-depth": 0, "path": "other", "ref": "master"}}))), "")
 
     for shape, job in (("an absent job", None), ("a step-less job", {}),
                        ("a malformed steps: block", {"steps": "not-a-list"})):
