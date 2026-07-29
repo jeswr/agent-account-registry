@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1262,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f3d4ecc06f73df8b9330e0e2fc175f353c6abf42",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 approval remains supported. The held-stall correction is gated by the same strict shared-writer recency proof as convergence, so later parks, unreadable timelines, malformed grant timestamps, and timestamp ties cannot produce a misleading alert or comment. Correction dedupe is bot-authored and keyed to the full grant fingerprint, while the persistent stall census still emits on replay. The unpark path now verifies that the exact machine park label left: it accepts a well-formed DELETE post-state, otherwise performs a strict read-back, and treats malformed or still-live state as a per-PR deferral without incrementing grant/convergence counts. Tests cover the response/read-back precedence, both presence directions, malformed payloads, production call-site behavior, dedupe, and ambiguity controls. The human-hold invariant continues to prohibit every label mutation. I found no remaining correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
