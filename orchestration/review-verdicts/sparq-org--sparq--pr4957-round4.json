@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4957,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e163f298f57cd277d91d9f4e88b03c8f78b8a1fc",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`route_post` decides that a body is a handshake solely from its method/id shape, dispatches it, and then creates a session whenever `handle_message` returns any response. It never verifies that the response is a successful initialize result. Thus an initialize request with invalid JSON-RPC metadata or invalid initialize parameters can receive an error object while still getting `Mcp-Session-Id`; subsequent calls with that ID pass the session check. This contradicts the documented \"successful handshake mints one\" lifecycle and admits clients that never completed initialization.",
+    "file": "crates/sparq-mcp/src/http/mod.rs",
+    "fix_hint": "Mint only after confirming the initialize dispatch produced a successful JSON-RPC result for the admitted initialize request (not an error response). Prefer exposing a typed dispatch outcome rather than heuristically inspecting arbitrary serialized JSON. Add a regression test that sends an invalid initialize request, asserts the error response has no `mcp-session-id`, asserts `session_count() == 0`, and proves the would-be session cannot make a later request.",
+    "severity": "major",
+    "title": "Failed initialize requests can mint live sessions"
+   },
+   {
+    "body": "`read_request` stores every header but `lookup(\"content-length\")` selects only the first value. A request containing multiple different Content-Length fields is therefore parsed using whichever value appears first, while an upstream proxy may reject it, combine it, or choose another value. That disagreement is a classic HTTP request-framing ambiguity; closing the backend connection reduces some exploitation shapes but does not make ambiguous framing safe behind intermediaries. The module explicitly claims to refuse rather than guess on smuggling-sensitive framing, so accepting this case also violates its stated invariant.",
+    "file": "crates/sparq-mcp/src/http/wire.rs",
+    "fix_hint": "Collect all Content-Length occurrences before reading the body. Reject multiple fields unless every parsed value is identical (the safest small-server policy is to reject any duplicate), reject comma-joined/malformed forms, and keep rejecting every Transfer-Encoding occurrence. Add parser tests for conflicting duplicates and duplicate-equal fields that pin the chosen policy.",
+    "severity": "major",
+    "title": "Conflicting duplicate Content-Length headers are accepted"
+   }
+  ],
+  "progress": null,
+  "summary": "The transport is thoughtfully bounded and well tested, but two correctness/security gaps remain in load-bearing protocol paths. A syntactically classified initialize request mints a session whenever dispatch returns any JSON-RPC response, including an error response, so unsuccessful initialization can create a live session. The HTTP parser also accepts conflicting duplicate Content-Length fields and uses the first one, leaving an avoidable request-framing ambiguity at proxy boundaries. Both require fixes and focused regression tests before approval.",
+  "verdict": "request_changes"
+ }
+}
