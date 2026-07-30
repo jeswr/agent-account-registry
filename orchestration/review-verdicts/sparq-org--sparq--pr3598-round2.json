@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3598,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "69d8460824d8d4386946e36741b620a24ed05c3a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's sole major finding is resolved: the public selective-disclosure ingest API is now documented in skills/zk-query-proofs/SKILL.md and the crate README with the feature gate, exact provenance-only behavior, separation from the verified VcCryptosuite path, empty-input and commit-only failure modes, and the sq-qhy4 external-audit caveat. The implementation remains deliberately type-separated and honestly named, and the load-bearing test exercises the real commit_triples and registry_entry paths while asserting that SD verification is always false. The changes are consistent with the design record's treatment of BBS selective disclosure as an interoperability/commitment-bridge seam rather than an in-circuit verification claim.",
+  "verdict": "approve"
+ }
+}
