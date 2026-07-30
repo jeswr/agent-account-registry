@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4207,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7216bc9035a1887b0626c2234d27107ff8c82a16",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains clean. The pre-decode 164-byte multibase-body bound is applied before every decoder, including the quadratic base58btc implementation, and the public-path regression test asserts the specific early-rejection reason using alphabet-valid oversized input, so it is non-vacuous. Supported multihash codes enforce their natural untruncated digest lengths; malformed, unsupported, empty-record, triple-term, and mismatch cases fail closed. The known-answer vectors and full-multihash mutation loop exercise the real public verification path. The implementation remains opt-in and the documentation accurately limits its claim to a caller-supplied quad set and producer-side recomputation. No new correctness, soundness, test-validity, injection, or security findings were identified.",
+  "verdict": "approve"
+ }
+}
