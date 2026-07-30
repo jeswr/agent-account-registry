@@ -11763,6 +11763,98 @@ def _self_test():
           "in-flight PRs) while non-ladder pins are still rejected; deleting the migration is "
           "caught")
 
+    # L3b-route. [#283] THE EIGHTH SITE — and the one the seven above deliberately do NOT
+    # reach: the SELF-CLAIM entry into review-fix.yml. #578/#103 constrained the fix chain to the
+    # PR's own trust-tier route on the DISPATCHER path, and carried that constraint in as
+    # `model_pin`. But `model_pin` is a workflow INPUT: on the `claim_id == ''` path (a manual or
+    # re-run workflow_dispatch that never went through the dispatcher) it is whatever the caller
+    # typed, so an omitted pin left the fix chain at the provider-wide walk and a trust-surface PR
+    # could be fixed by a tier its route excludes. The workflow now re-derives the route itself.
+    #
+    # EXECUTE that constraint out of the workflow rather than trusting the comment on it — the L3
+    # lesson. The resolver is INJECTED so this drives the workflow's real control flow (which
+    # branch runs, what it does with a refusal) without needing a routing table on disk.
+    _RF_ROUTE_ANCHOR = r'(?m)^[ \t]*route_error = ""$'
+    _RF_ROUTE_END = r'(?m)^[ \t]*models = routing\.get\("models", \{\}\)$'
+
+    def _workflow_route_constraint(mode, wanted, route_chain=(), raises=None, source=None):
+        """Run review-fix.yml's own route constraint. Returns (wanted, route_error)."""
+        src = _review_fix_step_python(_RF_ROUTE_ANCHOR, _RF_ROUTE_END,
+                                      "fix-lane route constraint", job="resolve", source=source)
+
+        def _resolve(repo, labels, policy_doc, routing_doc):
+            if raises is not None:
+                raise raises
+            return {"model_chain": list(route_chain)}
+
+        ns = {"mode": mode, "wanted": list(wanted), "target_repo": PROBE_REPO,
+              "issue_labels": ["role:impl", "area:sparq-zk"], "policy_doc": {}, "routing": {},
+              "policy_resolve": types.SimpleNamespace(resolve=_resolve),
+              # The REAL helper object the dispatcher constrains its own claim with, so the two
+              # sides of the adopt comparison cannot disagree about what a route authorises.
+              "dispatch_claim": types.SimpleNamespace(
+                  _route_constrained_fix_chain=_route_constrained_fix_chain)}
+        exec(src, ns)  # noqa: S102 — repository-owned workflow source
+        return ns["wanted"], ns["route_error"]
+
+    # 1. THE BUG, in the shape it actually takes. An openai-implemented PR whose source issue
+    #    routes to a restricted soundness chain: the provider-wide fix walk offers sol+luna, the
+    #    route authorises only luna. A ladder FLOOR over ESCALATION_LADDERS["openai"] would readmit
+    #    sol; only the intersection refuses it.
+    assert _workflow_route_constraint("fix", FIX_CHAIN["openai"], route_chain=["luna"]) \
+        == (["luna"], ""), _workflow_route_constraint("fix", FIX_CHAIN["openai"],
+                                                      route_chain=["luna"])
+    # 2. NO same-provider fixer at all -> EMPTY, never a fall-through to the provider default.
+    #    An empty chain is what routes the run to the `unresolvable` job and a human.
+    assert _workflow_route_constraint("fix", FIX_CHAIN["anthropic"], route_chain=["sol"]) \
+        == ([], ""), "a route sharing no model with the fix walk must empty the chain"
+    # 3. A RESOLVER REFUSAL fails the fix lane closed — captured (so it can be reported), not
+    #    swallowed into an unconstrained chain.
+    _rf_route_err = _workflow_route_constraint("fix", FIX_CHAIN["openai"],
+                                               raises=ValueError("routing is unreadable"))
+    assert _rf_route_err[0] == [] and "routing is unreadable" in _rf_route_err[1], (
+        "an unresolvable route must empty the fix chain and name why", _rf_route_err)
+    # 4. ...and it must NOT take down the cross-provider REVIEW of the same PR: the review chain is
+    #    the INVERSE of the implementer's provider (REVIEW_CHAIN), never routing.toml's implementor
+    #    chain, so review mode consumes no route and never calls the resolver.
+    assert _workflow_route_constraint("review", REVIEW_CHAIN["anthropic"],
+                                      raises=ValueError("routing is unreadable")) \
+        == (list(REVIEW_CHAIN["anthropic"]), ""), (
+        "review mode must not consume the source issue's route — a routing refusal there would "
+        "strand every cross-provider review behind a fix-lane concern")
+    # NON-VACUITY: neuter the constraint in the LIVE workflow text and require row 1 to stop
+    # narrowing. Without this every assertion above would still pass against a workflow that
+    # dropped the intersection, which is exactly the state this issue found.
+    _rf_route_line = "wanted = dispatch_claim._route_constrained_fix_chain(wanted, route_chain)"
+    assert _rf_route_line in _rf_live, f"the route-constraint fixture is stale: {_rf_route_line}"
+    _rf_route_mutants = (
+        # (a) the constraint deleted outright
+        _rf_live.replace(_rf_route_line, "route_chain = list(route_chain)"),
+        # (b) the shape PR #282 proposed and #578 refused: a ladder FLOOR, which readmits every
+        #     tier ABOVE the route's own — indistinguishable from (1) unless the pin is on
+        #     MEMBERS.
+        _rf_live.replace(
+            _rf_route_line,
+            "_lad = ['luna', 'sol']\n"
+            "              _fl = min([a for a in wanted if a in route_chain] or _lad,\n"
+            "                        key=_lad.index)\n"
+            "              wanted = _lad[_lad.index(_fl):]"),
+    )
+    for _index, _mutant in enumerate(_rf_route_mutants):
+        assert _mutant != _rf_live, f"route-constraint mutant {_index} is vacuous"
+        try:
+            _got = _workflow_route_constraint("fix", FIX_CHAIN["openai"], route_chain=["luna"],
+                                              source=_mutant)[0]
+        except AssertionError:            # the anchor is gone -> also a caught mutant
+            continue
+        assert _got != ["luna"], (
+            "review-fix.yml's fix chain was still constrained to the route after mutant "
+            f"{_index} — this pin is vacuous", _got)
+    print("  ok   adopt-loop L3b-route: review-fix.yml's SELF-CLAIM fix chain is EXECUTED out "
+          "of the workflow and INTERSECTED with the source issue's own route (not floored, not "
+          "model_pin-dependent); an empty intersection and a resolver refusal both fail closed, "
+          "review mode is untouched, and both deleting and floor-ifying the constraint are caught")
+
     # L3c. [OPUS-5] THE SEVENTH SITE, and the one that is not in this repository at all: the
     # TARGET-side PLAN resolver. Every layer above pins two derivations that live in the registry.
     # This one pins the derivation that crosses the repository boundary — `dispatch-plan` running

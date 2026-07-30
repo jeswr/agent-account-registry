@@ -123,6 +123,10 @@ jobs:
       max_review_rounds: ${{ steps.policy.outputs.max_review_rounds }}
       security_paths: ${{ steps.policy.outputs.security_paths }}
       unresolvable: ${{ steps.policy.outputs.unresolvable }}
+      # [#283] WHICH of the three causes emptied the chain (no concrete provider model / the
+      # source issue's route authorises no same-provider fixer / that route is unresolvable).
+      # Read ONLY by the `unresolvable` job, whose park sentence is what a human acts on.
+      unresolvable_reason: ${{ steps.policy.outputs.unresolvable_reason }}
     steps:
       - name: Validate dispatch inputs
         id: inputs
@@ -440,6 +444,14 @@ jobs:
           import base64 as _b64
           security_keywords_b64 = _b64.b64encode(
               json.dumps(sorted(keywords)).encode("utf-8")).decode("ascii")
+          # [#283] The SOURCE ISSUE's LIVE labels ride to the `policy` step in the same shape and
+          # for the same reason (a label may hold any character). That step intersects the fix
+          # chain with the route THESE labels resolve to, so the fix lane cannot be handed a wider
+          # chain than the PR's own trust tier authorises — see the route constraint there. They
+          # are read ONCE, here, alongside the needs:* hold and the security classification that
+          # already consume them.
+          issue_labels_b64 = _b64.b64encode(
+              json.dumps(issue_labels).encode("utf-8")).decode("ascii")
           packages = sorted(label[5:] for label in issue_labels if label.startswith("area:"))
           if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", p) for p in packages):
               raise SystemExit("source issue has an unsafe area:* label")
@@ -470,6 +482,7 @@ jobs:
               "issue": str(issue),
               "security": "true" if security else "false",
               "security_keywords": security_keywords_b64,
+              "issue_labels": issue_labels_b64,
               "packages": ",".join(packages),
               "package": package,
           }
@@ -488,6 +501,9 @@ jobs:
           MODE: ${{ inputs.mode }}
           MODEL_PIN: ${{ inputs.model_pin }}
           IMPL_PROVIDER: ${{ steps.pr.outputs.impl_provider }}
+          # [#283] The SOURCE ISSUE's LIVE labels (base64 JSON), re-read below into the PR's OWN
+          # trust-tier route so the fix chain cannot exceed what that route authorises.
+          ISSUE_LABELS: ${{ steps.pr.outputs.issue_labels }}
         run: |
           set -euo pipefail
           role=review
@@ -498,6 +514,7 @@ jobs:
             --target-root target-routing \
             --role "$role" > "$RUNNER_TEMP/policy.json"
           python3 - "$RUNNER_TEMP/policy.json" <<'PY'
+          import base64
           import json
           import os
           from pathlib import Path, PurePosixPath
@@ -562,6 +579,64 @@ jobs:
               wanted = ladder[ladder.index(model_pin):]
           else:
               wanted = (review_chain if mode == "review" else fix_chain)[impl_provider]
+          # The registry-owned resolver + the canonical intersection helper are loaded HERE,
+          # OUTSIDE the constrained block below, so dispatch-claim's cross-script self-test can
+          # EXECUTE that block verbatim against injected modules instead of re-implementing it
+          # (the `_review_fix_step_python` idiom — a prose "mirrors X" comment is not a test).
+          import importlib.util as _ilu
+
+          def _load_registry_module(name, path):
+              spec = _ilu.spec_from_file_location(name, path)
+              module = _ilu.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              return module
+
+          policy_resolve = _load_registry_module(
+              "registry_policy_resolve_route", "registry/scripts/policy-resolve.py")
+          dispatch_claim = _load_registry_module(
+              "registry_dispatch_claim_route", "registry/scripts/dispatch-claim.py")
+          with open("registry/policy/repos.toml", "rb") as handle:
+              policy_doc = tomllib.load(handle)
+          target_repo = os.environ["TARGET_REPO"]
+          issue_labels = json.loads(
+              base64.b64decode(os.environ["ISSUE_LABELS"]).decode("utf-8"))
+          if (not isinstance(issue_labels, list)
+                  or any(not isinstance(label, str) for label in issue_labels)):
+              raise SystemExit("source issue labels are unreadable (fail closed)")
+          # ---- [#283] DEFENCE IN DEPTH: THE FIX CHAIN HONOURS THE SOURCE ISSUE'S OWN ROUTE ----
+          # `wanted` above is a PROVIDER-wide preference walk, narrowed only by `model_pin`. On the
+          # DISPATCHER path that is already constrained: dispatch-claim intersects the same walk
+          # with the PR's route and carries the result in AS `model_pin` (#578/#103). But
+          # `model_pin` is an INPUT. A SELF-claim (`claim_id == ''` — a manual or re-run
+          # workflow_dispatch that never went through the dispatcher) can arrive with it empty or
+          # simply lower than the route allows, and then NOTHING bounded this chain: a
+          # trust-surface PR whose source issue routes to a restricted soundness chain would be
+          # FIXED by a tier that route deliberately excludes, and the route's `escalate = true`
+          # (defer, never degrade) would never have applied to the fix leg at all.
+          #
+          # So the run re-derives the route ITSELF — LIVE, from the SOURCE ISSUE's own labels,
+          # through the registry-owned resolver — and intersects. `_route_constrained_fix_chain`
+          # is IMPORTED, never re-implemented: the dispatcher's claim and this run must agree about
+          # which tiers a route authorises or the adopt step's `model not in models` guard fires on
+          # every tick forever (the #112/#702 drift shape). It is an INTERSECTION and not a ladder
+          # floor for the reason documented on that function — a floor readmits every ladder
+          # member ABOVE it, including ones the route omits, so a route naming a single
+          # mid-ladder tier would still leak its successors.
+          #
+          # REVIEW MODE NEVER CONSUMES THIS. The review chain is the INVERSE of the implementer's
+          # provider (REVIEW_CHAIN), not routing.toml's implementor chain, so a resolver refusal
+          # must fail the FIX lane closed WITHOUT taking down the cross-provider review of the same
+          # PR. An empty result is never a fallback to the provider-wide chain: it empties `chain`,
+          # which routes this run to the `unresolvable` job and a human.
+          route_error = ""
+          if mode == "fix":
+              try:
+                  route_chain = list(policy_resolve.resolve(
+                      target_repo, list(issue_labels), policy_doc, routing)["model_chain"])
+              except (ValueError, TypeError, KeyError) as exc:
+                  route_error = f"{exc.__class__.__name__}: {exc}"
+                  route_chain = []
+              wanted = dispatch_claim._route_constrained_fix_chain(wanted, route_chain)
           models = routing.get("models", {})
           chain = []
           for alias in wanted:
@@ -576,12 +651,39 @@ jobs:
               if concrete or codex_default:
                   chain.append(alias)
           unresolvable = not chain
+          # [#283] WHY the chain is empty, in the words of the surface that emptied it. The
+          # `unresolvable` job parks a HUMAN on this sentence, and it used to be a fixed string
+          # ending "no concrete provider model" — which sends the maintainer to the target's
+          # [models] catalog even when the real cause is a route that authorises no same-provider
+          # fixer at all, or a routing table the resolver could not read. Same three causes, same
+          # wording, as dispatch-claim's own route-refusal park.
+          if route_error:
+              unresolvable_reason = (
+                  "the fix lane cannot honour the source issue's trust-tier route: that route "
+                  f"could not be resolved from the issue's LIVE labels ({route_error}); a human "
+                  "must reconcile the routing table with the fix chain")
+          elif mode == "fix" and not wanted:
+              unresolvable_reason = (
+                  f"the {impl_provider} fix chain and the source issue's own trust-tier route "
+                  "share no model, so that route authorises no same-provider fixer; a human must "
+                  "reconcile the routing table with the fix chain")
+          else:
+              unresolvable_reason = (
+                  f"the {mode} model chain for a {impl_provider}-implemented PR is unresolvable "
+                  "in the target routing (no concrete provider model)")
+          # The sentence reaches a PUBLIC pull-request comment as the `--reason` of the park the
+          # `unresolvable` job writes, and the route-error branch embeds a resolver message built
+          # from routing and policy text. Flatten to single-line printable ASCII and cap it, so it
+          # can neither break the GITHUB_OUTPUT `key=value` line nor carry control characters into
+          # that comment. (Do not name that CLI subcommand here: worker-pr.py's #869 seam guard
+          # requires EXACTLY ONE step in this workflow to mention it, and that step is the park.)
+          unresolvable_reason = "".join(
+              c if " " <= c <= "~" else " " for c in unresolvable_reason)[:500]
           # [OPUS-4.8] B3: the policy row's security_paths ride to the outcome/arm steps as a
           # single-line base64 JSON list (paths may contain any char; base64 keeps the output
           # single-line + injection-safe). "W10=" is base64("[]") — a non-empty, valid empty list.
-          import base64 as _b64
           security_paths = policy.get("security_paths", [])
-          security_paths_b64 = _b64.b64encode(
+          security_paths_b64 = base64.b64encode(
               json.dumps(security_paths).encode("utf-8")).decode("ascii")
           values = {
               "routing": policy["routing"],
@@ -593,6 +695,7 @@ jobs:
               "max_review_rounds": str(policy["max_review_rounds"]),
               "security_paths": security_paths_b64,
               "unresolvable": str(unresolvable).lower(),
+              "unresolvable_reason": unresolvable_reason,
           }
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               for key, value in values.items():
@@ -601,6 +704,10 @@ jobs:
                   if key != "model_chain" and not value:
                       raise SystemExit(f"missing resolved value: {key}")
                   output.write(f"{key}={value}\n")
+          if mode == "fix":
+              print(f"fix chain constrained by the source issue's route: "
+                    f"{','.join(route_chain) or 'NONE'}"
+                    f"{f' (resolver refusal: {route_error})' if route_error else ''}")
           print(f"{mode} chain for {impl_provider}-implemented PR: {','.join(chain) or 'UNRESOLVABLE'}")
           PY
 
@@ -2090,6 +2197,10 @@ jobs:
           ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
           MAINTAINER_HANDLE: jeswr
+          # [#283] Via env, never a `${{ }}` expansion in the shell source: the route-refusal
+          # branch of this sentence embeds a resolver message built from routing/policy text.
+          # The resolve step already flattened it to capped single-line printable ASCII.
+          UNRESOLVABLE_REASON: ${{ needs.resolve.outputs.unresolvable_reason }}
         run: |
           # [registry #869] --park-cause makes this park's stop reason MACHINE-READABLE. Without
           # it the only record of why this PR sits on the human terminal is the English --reason
@@ -2102,7 +2213,7 @@ jobs:
             --pr "${{ inputs.pr_number }}" \
             --issue "${{ needs.resolve.outputs.issue }}" \
             --park-cause routing-unresolvable \
-            --reason "the ${{ inputs.mode }} model chain for a ${{ needs.resolve.outputs.impl_provider }}-implemented PR is unresolvable in the target routing (no concrete provider model)"
+            --reason "$UNRESOLVABLE_REASON"
 
   # Model-access health record (registry #32): consumes the review/fix model exit CLASS (success OR
   # any failure) into the registry health ledger. A SEPARATE always()-guarded job — like the worker
