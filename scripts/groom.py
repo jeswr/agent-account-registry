@@ -1248,7 +1248,8 @@ class GitHubAPI:
                     exc.code, detail, create=_is_create_put(method, body)
                 ):
                     raise GroomConflict("lease ledger compare-and-swap conflict") from exc
-                if retryable and exc.code in _TRANSIENT_HTTP and attempt < _TRANSIENT_RETRIES:
+                if (retryable and _is_transient_status(exc.code)
+                        and attempt < _TRANSIENT_RETRIES):
                     _sleep_transient(attempt, _retry_after_seconds(exc.headers))
                     continue
                 raise GroomError(
@@ -1537,10 +1538,11 @@ def _is_cas_conflict(code: int, detail: str, *, create: bool) -> bool:
 # A scheduled sweep died on a raw http.client.RemoteDisconnected out of api.paginate -> request():
 # one transient TCP hiccup killed the ENTIRE hygiene pass, and groom's O(issues) comment fetches
 # (#36) maximise the exposure. request() now retries only genuinely TRANSIENT failures — the
-# RemoteDisconnected / ConnectionReset / timeout family and 502/503/504 — with bounded full-jitter
-# backoff, honouring a (capped) Retry-After. It still fails closed on every 4xx (auth/permission)
-# and on a CAS conflict (409, or the create-race 422 above), which has its own caller-owned ledger
-# re-read loop.
+# RemoteDisconnected / ConnectionReset / timeout family and every 5xx (issue #291 — this was a
+# {502, 503, 504} allow-list, so a plain HTTP 500 killed two sweeps in 4.5h) — with bounded
+# full-jitter backoff, honouring a (capped) Retry-After. It still fails closed on every 4xx
+# (auth/permission) and on a CAS conflict (409, or the create-race 422 above), which has its own
+# caller-owned ledger re-read loop.
 #
 # Retries apply ONLY to reads. A dropped connection or gateway 5xx on a mutation does not prove
 # GitHub skipped the attempt — replaying a POST duplicates comments and replaying a PATCH/PUT can
@@ -1551,13 +1553,35 @@ def _is_cas_conflict(code: int, detail: str, *, create: bool) -> bool:
 #
 # The loop/sleep MECHANICS (attempt bound, exponential-jitter schedule, Retry-After cap) are the
 # fleet-shared gh_retry policy (registry #563 adoption item 4 — one tuned copy, not N drifting
-# ones); the CLASSIFICATION predicates below (_is_transient_network, _TRANSIENT_HTTP,
+# ones); the CLASSIFICATION predicates below (_is_transient_network, _is_transient_status,
 # _retry_after_seconds, the GET/HEAD-only guard) stay groom-owned exactly as reviewed in #494.
 _gh_retry = _load_module(Path(__file__).resolve().with_name("gh_retry.py"), "registry_gh_retry")
 _IDEMPOTENT_METHODS = {"GET", "HEAD"}
 _TRANSIENT_RETRIES = _gh_retry.MAX_ATTEMPTS  # total attempts before a transient failure fails loud
-_TRANSIENT_HTTP = {502, 503, 504}
 _RETRY_AFTER_CAP = _gh_retry.RETRY_AFTER_CAP  # never let a hostile Retry-After stall the sweep
+
+
+def _is_transient_status(code: int) -> bool:
+    """True for the 5xx server-error family, which is safe to replay on an IDEMPOTENT read.
+
+    THE WHOLE 5xx RANGE, not the {502, 503, 504} allow-list this replaced (issue #291). That
+    allow-list named the three gateway codes #494 happened to observe, so GitHub's plain internal
+    error fell straight through to the loud raise: two sweeps died inside 4.5h on
+    ``target sparq-org GitHub API GET failed with HTTP 500`` — the same one-blip-kills-the-run class
+    #494 exists to remove, surviving only because 500 was not in the enumeration.
+
+    An allow-list is the wrong shape for this decision, and its failure direction is the bad one:
+    forgetting a code does not make a permanent failure retryable, it makes a TRANSIENT one fatal,
+    and each omission costs a whole scheduled sweep. The fleet-shared classifier groom already
+    borrows its schedule from (``gh_retry.classify_read_failure``) has always treated
+    ``status.startswith("5")`` as transient, so this also removes groom's silent drift from it.
+
+    4xx is NEVER transient here — INCLUDING 429, deliberately narrower than gh_retry. A 4xx is a
+    refusal (auth/permission/validation), and the fail-closed posture on it is the point: this
+    change must widen the class that gets a bounded replay, not the class that gets one at all.
+    The retry it feeds is additionally gated on ``_IDEMPOTENT_METHODS``, so no mutation reaches it.
+    """
+    return 500 <= code < 600
 
 
 def _is_transient_network(exc: BaseException) -> bool:
@@ -6426,7 +6450,20 @@ def _self_test() -> int:
           _is_transient_network(URLError("Name or service not known")), False)
     check("an HTTPError is not a network-transient (handled by code branch)",
           _is_transient_network(HTTPError("https://x", 503, "u", {}, None)), False)
-    check("transient HTTP codes are exactly 502/503/504", sorted(_TRANSIENT_HTTP), [502, 503, 504])
+    # [issue #291] The transient HTTP class is the WHOLE 5xx range, not the {502,503,504} allow-list
+    # that let `... GET failed with HTTP 500` kill two sweeps in 4.5h. Both directions are pinned:
+    # every 5xx retries, and NOTHING outside 5xx does — restoring the allow-list reds the 500/507
+    # legs, and widening to 4xx reds the refusal legs (429 included, deliberately).
+    check("#291 the 500 that killed the sweep is transient", _is_transient_status(500), True)
+    check("#291 the whole 5xx range is transient (not a three-code allow-list)",
+          [code for code in range(500, 600) if not _is_transient_status(code)], [])
+    check("#291 the pre-existing gateway codes still retry (no regression)",
+          [_is_transient_status(code) for code in (502, 503, 504)], [True, True, True])
+    check("#291 no 4xx is transient — a refusal must fail closed, 429 INCLUDED",
+          [code for code in range(400, 500) if _is_transient_status(code)], [])
+    check("#291 success/redirect statuses are not transient either",
+          [_is_transient_status(code) for code in (200, 201, 301, 304, 600)],
+          [False, False, False, False, False])
     check("Retry-After is honoured and capped",
           (_retry_after_seconds({"Retry-After": "2"}),
            _retry_after_seconds({"Retry-After": "9999"}),
@@ -6496,6 +6533,62 @@ def _self_test() -> int:
         throttled = api.request("GET", "/repos/o/r/issues?state=open")
         check("503 retried, honouring the Retry-After header",
               (throttled, calls["n"], transient_sleeps), ([], 2, [(1, 2.0)]))
+
+        # [issue #291] THE PRODUCTION LEG, end to end. Asserting only `_is_transient_status(500)`
+        # would stay green if the call site still consulted the old allow-list, and "500 is in a
+        # set" is not the property that killed two sweeps. This drives the REAL request() through
+        # the REAL retry loop with the REAL status those runs emitted, and counts urlopen
+        # INVOCATIONS: pre-fix this was 1 call and a GroomError.
+        calls["n"] = 0
+        transient_sleeps.clear()
+
+        def _internal_error(_request, timeout=None):   # plain 500 once, then the real page
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise HTTPError("https://api.github.com/x", 500, "Internal Server Error", {}, None)
+            return _FakeResp(json.dumps({"number": 7}).encode())
+
+        globals()["urlopen"] = _internal_error
+        try:
+            recovered: Any = api.request("GET", "/repos/sparq-org/sparq/issues/7")
+        except GroomError as exc:
+            # The pre-fix behaviour, reported as a FAIL rather than propagating: an abort here
+            # would skip the fail-closed legs below, which are the ones that prove the widening
+            # did not go too far.
+            recovered = f"LOUD-FAILED: {exc}"
+        check("#291 a transient HTTP 500 on a target GET is retried and the sweep completes",
+              (recovered, calls["n"], transient_sleeps), ({"number": 7}, 2, [(1, None)]))
+
+        # FAIL-CLOSED IS PRESERVED: widening the class must not turn a persistent 500 into a silent
+        # success or an unbounded loop. It still dies loud, after the bounded attempts, naming 500.
+        calls["n"] = 0
+        transient_sleeps.clear()
+
+        def _always_500(_request, timeout=None):
+            calls["n"] += 1
+            raise HTTPError("https://api.github.com/x", 500, "Internal Server Error", {}, None)
+
+        globals()["urlopen"] = _always_500
+        persistent_500 = ""
+        try:
+            api.request("GET", "/repos/sparq-org/sparq/issues/7")
+        except GroomError as exc:
+            persistent_500 = str(exc)
+        check("#291 a PERSISTENT 500 still fails loud after the bounded attempts",
+              ("HTTP 500" in persistent_500, calls["n"]), (True, _TRANSIENT_RETRIES))
+
+        # ...and the newly-widened class does NOT leak past the mutation guard: a 500 on a POST is
+        # ambiguous (GitHub may have applied it), so it fails loud on attempt 1 exactly as before.
+        calls["n"] = 0
+        transient_sleeps.clear()
+        globals()["urlopen"] = _internal_error   # a GET recovers on this stub; a POST must not
+        post_500_loud = False
+        try:
+            api.request("POST", "/repos/o/r/issues/7/comments", {"body": "x"})
+        except GroomError:
+            post_500_loud = True
+        check("#291 a 500 on a POST is still never replayed (fails loud, one attempt)",
+              (post_500_loud, calls["n"], transient_sleeps), (True, 1, []))
 
         calls["n"] = 0
         transient_sleeps.clear()
