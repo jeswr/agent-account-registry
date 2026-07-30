@@ -1823,15 +1823,24 @@ def _self_test():                                                       # noqa: 
     # gate would satisfy the live row alone. Only then is the refusal stood down for the rest of
     # the suite, where every row is about some OTHER predicate and would otherwise pass for this
     # reason and stop testing what it names.
+    _amp_claim = mint_provenance._load_dispatch_claim()
     _live_run_refusal = mint_provenance.review_run_refusal(
-        mint_provenance._load_dispatch_claim().review_fix_identity_admits_orchestrator_class)
+        _amp_claim.review_fix_identity_admits_orchestrator_class,
+        shell_admits=_amp_claim.worker_live_admits_orchestrator_class)
     check("the shared writer ADMITS the class on the live identity gate",
           _live_run_refusal, None)
-    _refused_run_refusal = mint_provenance.review_run_refusal(lambda: False)
+    _refused_run_refusal = mint_provenance.review_run_refusal(
+        lambda: False, shell_admits=lambda: True)
     check("...and still refuses it when the identity gate does, naming that gate",
           isinstance(_refused_run_refusal, str)
           and "target-App identity gate" in _refused_run_refusal, True)
-    mint_provenance.review_run_refusal = lambda _probe: None
+    # [registry #1288] ...and when the FOURTH consumer refuses while the identity gate admits. The
+    # sweep must carry every conjunct, not the one that happened to be live when it was written.
+    _refused_by_shell = mint_provenance.review_run_refusal(
+        lambda: True, shell_admits=lambda: False)
+    check("...and refuses when worker-live.sh's own head-ref gate would refuse the head branch",
+          isinstance(_refused_by_shell, str) and "worker-live.sh" in _refused_by_shell, True)
+    mint_provenance.review_run_refusal = lambda _probe, **_kw: None
 
     # ---- THE RENDERED ORACLE, AND THE INSTRUMENT THAT MEASURES IT -----------------------------
     # ROUND 6 REDESIGN. Rounds 3-5 stripped quoted markdown constructs from the SOURCE and were
