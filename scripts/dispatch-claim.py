@@ -9320,6 +9320,119 @@ def review_fix_identity_admits_orchestrator_class(source=None):
                      target_app_token=True) is False)
 
 
+# [registry #1288] THE FOURTH LAST MILE — worker-live.sh's own copy of the worker head-ref gate.
+# `unsafe pull request head branch` appears at THREE `die` sites in that script (run_review,
+# run_fix, push_fix) and had ZERO test coverage, because every worker-live.sh fixture uses a
+# worker-shaped branch. That is why the full suite was green while this gate refused the entire
+# #657 class one layer below every probe that existed.
+_WORKER_LIVE_HEAD_REFUSAL = "unsafe pull request head branch"
+
+
+def _worker_live_head_gate(subcommand, head_branch, *, self_attested, script=None):
+    """EXECUTE worker-live.sh's real head-branch gate and report whether it refused.
+
+    Controlled differential execution, not text inspection: the gate is three `[[ ... ]] || die`
+    lines in a shell script, and a regex read of them cannot tell a live line from a commented one.
+    The script is invoked for real with an environment shaped so the head-branch check is the FIRST
+    thing that can fail — WORKER_ROOT and the PR number are valid, everything after the gate
+    (`expected_head`) is not — so the exit message discriminates cleanly:
+
+      refused at the gate      -> 'unsafe pull request head branch'
+      passed the gate          -> 'unsafe expected head sha' (the very next check)
+
+    Returns True when the gate REFUSED this head. Never raises: an unrunnable script reads as
+    refused, which keeps the interlock armed rather than reporting wiring it cannot see."""
+    import shutil
+    root = Path(__file__).resolve().parent
+    path = root / "worker-live.sh"
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "target"
+        (target / ".git").mkdir(parents=True)
+        worker_root = Path(tmp) / "worker"
+        worker_root.mkdir()
+        # The script validates its OWN self-test manifest at load time — every enrolled sibling
+        # must exist beside it — before it dispatches any subcommand. So the probe needs a
+        # complete scripts directory, not a lone copy. (Found by running it: without the siblings
+        # every invocation died at the manifest gate and the differential read "not refused" for
+        # EVERY input, including the ones that must refuse. That is precisely the false green a
+        # differential catches only when it is checked against a known answer in both directions.)
+        scripts = Path(tmp) / "scripts"
+        scripts.mkdir()
+        for sibling in sorted(root.iterdir()):
+            if sibling.is_file():
+                (scripts / sibling.name).symlink_to(sibling)
+        path = scripts / "worker-live.sh"
+        if script is not None:
+            path.unlink()
+            path.write_text(script, encoding="utf-8")
+        env = dict(os.environ)
+        env.update({
+            "TARGET_DIR": str(target),
+            "TARGET_REPO": "o/r",
+            "WORKER_ROOT": str(worker_root),
+            "WORKER_PR_NUMBER": "41",
+            "WORKER_PR_HEAD_BRANCH": head_branch,
+            # Deliberately INVALID, so passing the head gate lands on the next check and the two
+            # outcomes are distinguishable by message rather than by exit status alone.
+            "WORKER_PR_HEAD_SHA": "not-a-sha",
+            "WORKER_REVIEW_FILE": str(worker_root / "review-verdict.json"),
+            "WORKER_FIX_ROUND": "1",
+            # `push_fix` refuses a missing token BEFORE it reaches the head gate, so without this
+            # the push-fix row of the differential read "not refused" for every input — a false
+            # negative that would have let the fix-lane asymmetry go unmeasured. The value is
+            # deliberately not token-shaped and never leaves the process: the script dies at the
+            # head gate, which is the whole point of the probe.
+            "GH_TOKEN": "probe-only-not-a-token",
+        })
+        env.pop("WORKER_SELF_ATTESTED", None)
+        if self_attested:
+            env["WORKER_SELF_ATTESTED"] = "true"
+        try:
+            proc = subprocess.run(["bash", str(path), subcommand], capture_output=True, text=True,
+                                  timeout=120, env=env, cwd=tmp)
+        except Exception:        # noqa: BLE001 — an unrunnable script proves nothing
+            return True
+        return _WORKER_LIVE_HEAD_REFUSAL in (proc.stderr or "") + (proc.stdout or "")
+
+
+def worker_live_admits_orchestrator_class(script=None):
+    """BEHAVIOURAL: does worker-live.sh's `review` path admit the #657 class's head-branch shape?
+
+    FIVE facts, because "admits the class" alone is satisfied by deleting the gate — and this gate
+    guards a value that is interpolated straight into `git fetch origin "refs/heads/$head_branch"`:
+
+      1. ADMITS an ordinary branch when the class is self-attested (the delivery this buys).
+      2. STILL REFUSES that same branch when it is NOT self-attested (the worker lane is unchanged).
+      3. STILL REFUSES an injection-shaped ref even when self-attested — a waiver that accepts
+         anything is a refspec injection, not an admission.
+      4. `fix` STILL REFUSES an ordinary branch even when self-attested, and
+      5. `push-fix` too. Those two PUSH COMMITS, and design record §3 says a self-attested record
+         must never buy write access to its own branch. The asymmetry is the point.
+
+    POSITIVE PROOF ONLY: any inconclusive answer reads False."""
+    try:
+        admits = not _worker_live_head_gate("review", "fix/ordinary-branch", self_attested=True,
+                                           script=script)
+        refuses_unenrolled = _worker_live_head_gate("review", "fix/ordinary-branch",
+                                                   self_attested=False, script=script)
+        refuses_injection = all(
+            _worker_live_head_gate("review", bad, self_attested=True, script=script)
+            for bad in ("--upload-pack=touch /tmp/x", "fix/a..b", "fix/a b", "fix/a@{0}",
+                        "-fix/dash", "fix/a:b", "", "fix/a*b"))
+        refuses_fix = _worker_live_head_gate("fix", "fix/ordinary-branch", self_attested=True,
+                                            script=script)
+        refuses_push = _worker_live_head_gate("push-fix", "fix/ordinary-branch",
+                                             self_attested=True, script=script)
+        # ...and the probe must be able to SEE the worker lane still work, or an
+        # always-refusing gate would satisfy 2-5 while delivering nothing at all.
+        admits_worker = not _worker_live_head_gate("review", "sparq-agent/issue-657-99-1",
+                                                  self_attested=False, script=script)
+        return (admits and refuses_unenrolled and refuses_injection and refuses_fix
+                and refuses_push and admits_worker)
+    except Exception:            # noqa: BLE001
+        return False
+
+
 def _probe_worker_pr():
     """Load worker-pr.py for the #657 wiring probes. Separate from `dispatch()`'s own load so a
     probe can never mutate the dispatcher's module instance."""
@@ -13104,6 +13217,56 @@ def _self_test():
                            _rf_live.replace('print(f"target token verified', 'print(f"verified'))):
         assert review_fix_identity_admits_orchestrator_class(source=_broken) is False, \
             f"an unreadable identity seam must read False ({_why}), never as wiring"
+    #      (iii-c) [registry #1288] THE FOURTH CONSUMER — worker-live.sh's OWN copy of the worker
+    #      head-ref gate, in `run_review`, 29 lines above the `git fetch` that design record §11.4
+    #      wrongly described as the only thing on that path. It refused the ENTIRE class (§1
+    #      defines the class by having an ordinary branch), it had ZERO test coverage because every
+    #      worker-live.sh fixture uses a worker-shaped branch, and it is why a green 55/55 suite
+    #      coexisted with a lane that delivers nothing. Found in independent review, not here —
+    #      the lesson being that "which operations need a credential" and "which predicates refuse
+    #      this class" are different questions, and only the first was asked.
+    #
+    #      Driven by CONTROLLED DIFFERENTIAL EXECUTION of the real script, then validated against
+    #      four known positives, because a probe over three `[[ ]] || die` lines that has never
+    #      reported a refusal has not been shown to be able to.
+    assert worker_live_admits_orchestrator_class() is True, \
+        ("worker-live.sh's `review` path must ADMIT the #657 class's ordinary head branch while "
+         "still refusing it unenrolled, still refusing an injection-shaped ref, still refusing "
+         "`fix` and `push-fix`, and still admitting the worker lane — reading False here means "
+         "the reviewer dies in the shell after every other layer admitted, `outcome` is skipped, "
+         "and each enrolled PR buys three wasted dispatches and a terminal park")
+    _wl_live = (Path(__file__).resolve().parent / "worker-live.sh").read_text(encoding="utf-8")
+    for _why, _wl_broken in (
+            ("the waiver is deleted — the shipped defect this row exists to catch",
+             _wl_live.replace(
+                 '  if [[ "$self_attested" != true ]]; then\n'
+                 '    [[ "$head_branch" =~ ^sparq-agent/issue-[1-9][0-9]*-[A-Za-z0-9._-]+$ ]] ||\n'
+                 "      die 'unsafe pull request head branch'\n  fi",
+                 '  [[ "$head_branch" =~ ^sparq-agent/issue-[1-9][0-9]*-[A-Za-z0-9._-]+$ ]] ||\n'
+                 "    die 'unsafe pull request head branch'")),
+            ("the waiver is made unconditional, so the WORKER lane loses its namespace check",
+             _wl_live.replace('  if [[ "$self_attested" != true ]]; then', "  if false; then")),
+            ("the safe-ref predicate is dropped, so the waiver becomes refspec injection into "
+             "`git fetch origin refs/heads/$head_branch`",
+             _wl_live.replace(
+                 "    -*|*..*|*@{*|*//*|*/|*.lock) die 'unsafe pull request head branch' ;;\n"
+                 "    *[!A-Za-z0-9._/-]*|'') die 'unsafe pull request head branch' ;;\n", "")),
+            ("the waiver LEAKS into run_fix, which pushes commits to the PR head",
+             _wl_live.replace(
+                 '  [[ "$head_branch" =~ ^sparq-agent/issue-[1-9][0-9]*-[A-Za-z0-9._-]+$ ]] ||\n'
+                 "    die 'unsafe pull request head branch'\n"
+                 '  [[ "$expected_head" =~ ^[0-9a-f]{40}$ ]] || die \'unsafe expected head sha\'\n'
+                 '  [[ "$fix_round" =~ ^[1-9][0-9]*$ ]] || die \'unsafe fix round\'',
+                 '  [[ "$expected_head" =~ ^[0-9a-f]{40}$ ]] || die \'unsafe expected head sha\'\n'
+                 '  [[ "$fix_round" =~ ^[1-9][0-9]*$ ]] || die \'unsafe fix round\''))):
+        assert _wl_broken != _wl_live, f"the worker-live mutant did not apply ({_why})"
+        assert worker_live_admits_orchestrator_class(script=_wl_broken) is False, \
+            (f"the fourth-last-mile probe FAILED ITS KNOWN POSITIVE ({_why}) — a clean report "
+             "from it would prove nothing, and this is the exact gate that had no coverage at all")
+    print("  ok   #1288 FOURTH last mile: worker-live.sh's own head-ref gate admits the #657 "
+          "class in `review` ONLY, still refuses it unenrolled, refuses eight injection-shaped "
+          "refs, refuses `fix`/`push-fix` (which push commits), still admits the worker lane — "
+          "and the probe REDS on all four ways of breaking that")
     #      (iv) the ARM probe requires BOTH refusals. A state machine that stops routing the class
     #      to the arm, while the arm itself would still accept it, is one deleted branch away from
     #      a merge on a self-attested record.

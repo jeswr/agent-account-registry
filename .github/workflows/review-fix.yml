@@ -1399,6 +1399,18 @@ jobs:
           WORKER_HARNESS: ${{ steps.selected.outputs.harness }}
           WORKER_CREDENTIAL_FORMAT: ${{ steps.selected.outputs.credential_format }}
           WORKER_CREDENTIAL_PATH: ${{ steps.prepare.outputs.credential_path }}
+          # [registry #1288] THE FOURTH LAST MILE. worker-live.sh's `run_review` carries its OWN
+          # copy of the worker head-ref gate — a fourth copy, 29 lines above the `git fetch` that
+          # design record §11.4 wrongly described as the only thing on this path — and the #657
+          # class is DEFINED by not matching it. Without this the reviewer dies in the shell after
+          # `resolve`, CLAIM and the identity gate have all admitted, `outcome`'s `if:` goes
+          # unsatisfied, nothing durable is written, and each enrolled PR buys three wasted
+          # dispatches and a terminal park.
+          #
+          # Resolved host-side in `resolve` like every other use of this fact, never from a
+          # workflow input. `run_fix` and `push_fix` are deliberately NOT given it: they push
+          # commits, and a self-attested record must never buy write access to its own branch.
+          WORKER_SELF_ATTESTED: ${{ needs.resolve.outputs.self_attested }}
         run: bash ../registry/scripts/worker-live.sh review
 
       - name: Schema-validate the lifted verdict (host-side, no tokens)
