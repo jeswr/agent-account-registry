@@ -18635,6 +18635,7 @@ agent = "impl"
         "[G5] END-TO-END" block below for the two argument-only mutants that survived because of
         it."""
         posted, cleared = [], []
+        readmit_sweep.voided = []
         readmit_sweep.log = []
         count = _readmit_capacity_parks(
             "example/repo", rows if rows is not None else [[parked_row]],
@@ -18647,6 +18648,10 @@ agent = "impl"
             timeline_fn=lambda _repo, number: list((timeline or park_timeline).get(number, [])),
             post_comment=lambda _repo, number, body: posted.append((number, body)),
             clear_labels=lambda pr, issue: cleared.append((pr, issue)),
+            # [#1309] The VOID's label write is a SEPARATE seam from clear_labels, because it is a
+            # separate operation (strip that one label; never transition through the #138 ambiguity
+            # rule). Captured so the void handler's body can be asserted end to end.
+            void_labels=lambda pr, issue, plan: readmit_sweep.voided.append((pr, issue, plan)),
             log=readmit_sweep.log.append, enrolled_authors=enrolled_authors)
         return count, posted, cleared
 
@@ -19906,6 +19911,140 @@ agent = "impl"
     finally:
         globals()["_target_is_human_maintainer"] = prev_target_probe
 
+    # ---- [#1309, review round 1 finding B3] THE VOID, EXECUTED THROUGH THE REAL SWEEP ----------
+    #
+    # A sentinel probe measured the void-mint / void-receipt handler bodies executing ZERO times
+    # across the whole suite (instrument-validated against `auto-mint` at 28 hits). So three
+    # STRUCTURE-PRESERVING mutants survived with identical ok-counts and all AST assertions green:
+    # `self_id_rows=[]` (permanently inert — the +17-local/+0-production shape), `void_marker_count=0`
+    # (unlimited voids), and a `void_labels` that never runs. An AST guard cannot see a reader that
+    # returns the wrong VALUE; only an executing fixture can.
+    #
+    # Everything below rides the SAME `readmit_sweep` harness the capacity rows use, so the void goes
+    # through the real candidate filter, the real foreign-episode check, the real admission and the
+    # real handler bodies.
+    void_park_stamp = model_health_mod._iso_z(park_epoch)
+    void_row = dict(parked_row, labels=[{"name": MACHINE_PARK_PR_LABEL}])
+    void_timeline = {
+        41: [{"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
+              "created_at": void_park_stamp, "actor": {"login": "jeswr"},
+              "performed_via_github_app": None}],
+        7: [],
+    }
+    # The orchestrator's own shape: the self-ID comment 2 seconds BEFORE the label (receipt-first),
+    # authored by the SAME account that applied the park, in the EMPHASISED spelling the live
+    # population actually uses.
+    void_comments = [{"user": {"login": "jeswr"},
+                      "created_at": model_health_mod._iso_z(park_epoch - 2),
+                      "body": "> 🤖 **SPARQ agent** — parking to restore worker dispatch. "
+                              "**Nothing is wrong with this PR.**"}]
+    prev_probe_void = globals()["_target_is_human_maintainer"]
+    globals()["_target_is_human_maintainer"] = lambda _repo, login: login == "jeswr"
+    try:
+        # (1) THE HEADLINE: a receipt-less hand-applied park is voided, RECEIPT FIRST, the label
+        # write goes through `void_labels` (never `clear_labels`), and it carries the PLAN.
+        v_count, v_posted, v_cleared = readmit_sweep(
+            still_broken_window, rows=[[void_row]], comments=void_comments,
+            timeline=void_timeline)
+        assert v_count == 1, (v_count, readmit_sweep.log)
+        assert readmit_sweep.voided == [(41, 7, "strip-and-needs")], readmit_sweep.voided
+        assert v_cleared == [], f"the void must NOT route through clear_labels: {v_cleared}"
+        assert len(v_posted) == 1 and v_posted[0][0] == 41, v_posted
+        assert "sparq-park-receiptless-void:v1" in v_posted[0][1], v_posted[0][1]
+        assert "No cause has been reconstructed" in v_posted[0][1], v_posted[0][1]
+        print("  ok   [#1309] EXECUTING: the sweep voids a receipt-less hand-applied park, "
+              "receipt-first, through void_labels (never clear_labels), carrying the label plan")
+
+        # (2) THE +0-IN-PRODUCTION MUTANT, caught by VALUE. With no self-ID comment the provenance
+        # proof fails closed and NOTHING is voided — which is exactly what `self_id_rows=[]` would
+        # produce on every PR forever, and what no AST assertion can distinguish.
+        n_count, n_posted, _n_cleared = readmit_sweep(
+            still_broken_window, rows=[[void_row]], comments=[], timeline=void_timeline)
+        assert (n_count, n_posted, readmit_sweep.voided) == (0, [], []), \
+            (n_count, n_posted, readmit_sweep.voided)
+        assert any("no bot park-reason receipt exists" in line for line in readmit_sweep.log), \
+            readmit_sweep.log
+        print("  ok   [#1309] EXECUTING: with NO self-ID the sweep voids NOTHING and says why — the "
+              "value-level control an AST guard cannot express")
+
+        # (3) THE ONE-SHOT BUDGET, THROUGH THE REAL COUNTER. A prior void marker on the bot's own
+        # comment must refuse a SECOND void for a LATER park. `void_marker_count=0` mints again here.
+        # The marker is deliberately NOT the first comment: a `comments[:1]` slice must not hide it.
+        spent_park = model_health_mod._iso_z(park_epoch + 1800)
+        spent_timeline = {41: [void_timeline[41][0],
+                               {"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
+                                "created_at": spent_park, "actor": {"login": "jeswr"},
+                                "performed_via_github_app": None}], 7: []}
+        spent_comments = [
+            {"user": {"login": "jeswr"}, "created_at": model_health_mod._iso_z(park_epoch + 1798),
+             "body": "> 🤖 **SPARQ agent** — parking again."},
+            {"user": {"login": readmit_bot}, "created_at": model_health_mod._iso_z(park_epoch + 60),
+             "body": _park_policy.receiptless_void_comment(
+                 {"key": _park_policy.receiptless_void_key(void_park_stamp),
+                  "park_at": void_park_stamp, "prover": "jeswr",
+                  "prover_at": model_health_mod._iso_z(park_epoch - 2)},
+                 model_health_mod._iso_z(park_epoch + 60), pr_number=41)},
+        ]
+        s_count, s_posted, _s_cleared = readmit_sweep(
+            still_broken_window, rows=[[void_row]], comments=spent_comments,
+            timeline=spent_timeline)
+        assert (s_count, s_posted, readmit_sweep.voided) == (0, [], []), \
+            (s_count, s_posted, readmit_sweep.voided)
+        assert any("receipt-less void REFUSED" in line for line in readmit_sweep.log), \
+            readmit_sweep.log
+        print("  ok   [#1309] EXECUTING: a spent one-shot budget refuses a SECOND void through the "
+              "real marker counter, with the receipt in a NON-first comment")
+
+        # (4) CONVERGENCE, EXECUTED: a standing void receipt for the LIVE park re-admits without
+        # posting anything new — the crash residue a one-shot exit would otherwise strand forever.
+        conv_comments = [spent_comments[1]]
+        c_count, c_posted, _c_cleared = readmit_sweep(
+            still_broken_window, rows=[[void_row]], comments=conv_comments,
+            timeline=void_timeline)
+        assert (c_count, c_posted) == (1, []), (c_count, c_posted, readmit_sweep.log)
+        assert readmit_sweep.voided == [(41, 7, None)], readmit_sweep.voided
+        print("  ok   [#1309] EXECUTING: a standing void receipt converges the label write with no "
+              "new receipt posted and no new budget consumed")
+
+        # (5) B1, END TO END: an AMBIGUOUS review namespace is refused by the SWEEP — the void is
+        # never minted, so the one-shot budget is not spent to move the PR into a stricter hold.
+        amb_row = dict(void_row, labels=[{"name": MACHINE_PARK_PR_LABEL},
+                                         {"name": "review:changes"},
+                                         {"name": "review:needs"}])
+        a_count, a_posted, _a_cleared = readmit_sweep(
+            still_broken_window, rows=[[amb_row]], comments=void_comments,
+            timeline=void_timeline)
+        assert (a_count, a_posted, readmit_sweep.voided) == (0, [], []), \
+            (a_count, a_posted, readmit_sweep.voided)
+        assert any("ambiguous independently of the park" in line
+                   for line in readmit_sweep.log), readmit_sweep.log
+        print("  ok   [#1309] EXECUTING: an ambiguous review:* namespace refuses at the SWEEP; the "
+              "one-shot budget is never spent on a write that cannot land cleanly")
+
+        # (6) A LABEL WRITE THAT REFUSES IS NOT A RE-ADMISSION. The receipt stands (receipt-first),
+        # but the census must NOT read healthy over an untouched PR.
+        def refusing_void(_pr, _issue, _plan):
+            raise DispatchError("receipt-less void wrote nothing (refused)")
+
+        r_posted, r_census = [], []
+        r_count = _readmit_capacity_parks(
+            "example/repo", [[void_row]], {7: ["status:in-progress-review"]},
+            {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+            _capacity_recovery_probe(model_health_mod, still_broken_window, readmit_now),
+            comments_fn=lambda _r, _n: list(void_comments),
+            timeline_fn=lambda _r, number: list(void_timeline.get(number, [])),
+            post_comment=lambda _r, number, body: r_posted.append((number, body)),
+            clear_labels=lambda pr, issue: None, void_labels=refusing_void,
+            log=r_census.append, enrolled_authors=())
+        assert r_count == 0, (r_count, r_census)
+        assert len(r_posted) == 1, r_posted          # receipt-first: the receipt DID land
+        assert any("the label write did NOT land" in line and "not counted as a re-admission" in line
+                   for line in r_census), r_census
+        print("  ok   [#1309] EXECUTING: a refused label write is reported as a NON-event — the "
+              "receipt stands, the count does not, and the census cannot read healthy")
+    finally:
+        globals()["_target_is_human_maintainer"] = prev_probe_void
+
     # ---- [registry #835] THE CALL SITE, on the PARSED module. A behavioural test of the sweep
     # cannot see `dispatch()` passing a hard-coded `()` — the sweep would keep passing while the
     # feature was off in production, which is exactly the vacuity shape #827's review found
@@ -20960,7 +21099,8 @@ def _starvation_sweep_self_test():
     # pre-#1309 behaviour EXACTLY, which is the right fail direction but makes a forgotten argument
     # SILENT: the sweep would keep passing its self-test, keep logging "park stands", and clear
     # nothing. That is precisely the shape of a fix measured at +17 locally and +0 in production.
-    _void_kwargs = {"self_id_rows", "void_receipts", "void_marker_count", "void_offered"}
+    _void_kwargs = {"self_id_rows", "void_receipts", "void_marker_count", "void_offered",
+                    "pr_review_labels"}
     _void_wired = [
         call for call in _ast.walk(_sweep_tree)
         if isinstance(call, _ast.Call) and isinstance(call.func, _ast.Attribute)
@@ -20978,23 +21118,142 @@ def _starvation_sweep_self_test():
             and _void_offered[0].value.value is True), \
         "the sweep must pass void_offered=True as a literal — it is the ONLY call site permitted " \
         "to mint a void, and a falsy value would make the exit inert while looking wired"
-    # The MINT must be RECEIPT-FIRST. Asserted on the tree rather than on a comment: within the
-    # `action == "void-mint"` branch the post_comment call must precede the clear_labels call. For a
-    # ONE-SHOT exit the reverse order spends the PR's only void and leaves no public record of why
-    # the park was cleared.
+    # [review round 1, B4] EVERY EVIDENCE ARGUMENT MUST BE A CALL TO ITS OWN READER, not a literal.
+    # Measured: `self_id_rows=[]` and `void_marker_count=0` are structure-PRESERVING — they keep the
+    # keyword, satisfy the membership check above, keep all three AST assertions green and keep the
+    # ok-count identical, while making the exit permanently inert (`[]`) or granting unlimited voids
+    # (`0`). That is the +17-local/+0-production shape this guard exists to prevent, so the guard has
+    # to look at the VALUE. The executing fixture below is the other half; a structural check alone
+    # cannot see a reader that returns the wrong thing.
+    _expected_readers = {"self_id_rows": "self_identified_machine_comments",
+                         "void_receipts": "receiptless_void_records",
+                         "void_marker_count": "receiptless_void_marker_count"}
+    for _kw in _void_wired[0].keywords:
+        _want = _expected_readers.get(_kw.arg)
+        if not _want:
+            continue
+        assert (isinstance(_kw.value, _ast.Call)
+                and isinstance(_kw.value.func, _ast.Attribute)
+                and _kw.value.func.attr == _want), \
+            f"{_kw.arg}= must be a call to _park_policy.{_want}(...), never a literal — a literal " \
+            "keeps every wiring assertion green while making the exit inert"
+    # ...and `pr_review_labels` must derive from the live label set the sweep read, not a literal.
+    _pr_labels_kw = [kw for kw in _void_wired[0].keywords if kw.arg == "pr_review_labels"][0]
+    assert any(isinstance(node, _ast.Name) and node.id == "labels"
+               for node in _ast.walk(_pr_labels_kw.value)), \
+        "pr_review_labels= must derive from the sweep's live `labels` read — a literal would make " \
+        "the label-plan gate decide about a PR that does not exist"
+    # [review round 1, B3/M14] THE READ-ONLY GATE'S WIRING. The guard above matches only calls
+    # carrying ALL of _void_kwargs, and the read-only CLAIM proof gate deliberately carries four of
+    # the five (no `void_offered`) — so NOTHING referenced its wiring and deleting it passed the
+    # whole suite while re-creating the #614 defer-forever state. That was M14, and it survived.
+    _review_tree = _ast.parse(textwrap.dedent(inspect.getsource(_dispatch_review_items)))
+    _readonly_kwargs = {"self_id_rows", "void_receipts", "void_marker_count", "pr_review_labels"}
+    _readonly_wired = [
+        call for call in _ast.walk(_review_tree)
+        if isinstance(call, _ast.Call) and isinstance(call.func, _ast.Attribute)
+        and call.func.attr == "capacity_park_admission"
+        and _readonly_kwargs <= {kw.arg for kw in call.keywords}]
+    assert len(_readonly_wired) == 1, \
+        f"_dispatch_review_items' read-only proof gate must pass all of " \
+        f"{sorted(_readonly_kwargs)} to capacity_park_admission exactly once; found " \
+        f"{len(_readonly_wired)} — without them a receipt-less void the sweep already receipted is " \
+        "invisible here and the PR defers forever (#614)"
+    assert not any(kw.arg == "void_offered" for kw in _readonly_wired[0].keywords), \
+        "the READ-ONLY proof gate must NOT pass void_offered — it may converge an already-receipted " \
+        "void but must never mint one"
+    # The MINT must be RECEIPT-FIRST, asserted on STATEMENT ORDER rather than on `_ast.walk` order.
+    # `walk` is breadth-first over the whole subtree, so it still yields `post_comment` first for
+    # `post_comment(repo, n, (void_labels(...), body)[1])` — where the label write actually happens
+    # FIRST. Review round 1 defeated the previous form exactly that way. So: find the statement index
+    # of each, and separately forbid the label writer from appearing anywhere inside the receipt
+    # call's own arguments.
+    # Selected as "the void branch that contains BOTH the receipt and the label write", not merely
+    # "an If mentioning void-mint": the handler is a nested pair (an outer `action in (...)` that owns
+    # the label write, an inner `action == "void-mint"` that owns the receipt), so a bare
+    # constant-mention filter matches both and cannot say which one the ordering claim is about.
     _void_branch = [
         node for node in _ast.walk(_sweep_tree)
-        if isinstance(node, _ast.If) and any(
-            isinstance(sub, _ast.Constant) and sub.value == "void-mint"
-            for sub in _ast.walk(node.test))]
-    assert len(_void_branch) == 1, f"expected exactly one void-mint branch, found {len(_void_branch)}"
-    _void_calls = [node.func.id for node in _ast.walk(_void_branch[0])
-                   if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name)
-                   and node.func.id in {"post_comment", "clear_labels"}]
-    assert _void_calls[:2] == ["post_comment", "clear_labels"], \
-        f"the void mint must be RECEIPT-FIRST (post_comment before clear_labels); got {_void_calls}"
-    print("  ok   [#1309] the receipt-less VOID is WIRED (AST-asserted: all four keywords, "
-          "void_offered=True as a LITERAL, and the mint is receipt-first)")
+        if isinstance(node, _ast.If)
+        and any(isinstance(sub, _ast.Constant) and sub.value == "void-mint"
+                for sub in _ast.walk(node.test))
+        and {"post_comment", "void_labels"} <= {
+            call.func.id for call in _ast.walk(_ast.Module(body=node.body, type_ignores=[]))
+            if isinstance(call, _ast.Call) and isinstance(call.func, _ast.Name)}]
+    assert len(_void_branch) == 1, \
+        f"expected exactly one void branch owning BOTH the receipt and the label write, found " \
+        f"{len(_void_branch)}"
+    # ONLY THE BRANCH BODY. `_ast.walk` on an `If` also traverses its `orelse`, i.e. the whole
+    # `elif auto-mint / elif auto-receipt / else` chain — so a check written against the If node
+    # would see the CAPACITY path's `clear_labels` and either pass or fail for the wrong reason.
+    _void_body = _ast.Module(body=_void_branch[0].body, type_ignores=[])
+
+    def _stmt_index(tree, name):
+        """The index of the first STATEMENT (in source order) that contains a call to `name`."""
+        found = [node.lineno for node in _ast.walk(tree)
+                 if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name)
+                 and node.func.id == name]
+        return min(found) if found else None
+
+    _receipt_line = _stmt_index(_void_body, "post_comment")
+    _write_line = _stmt_index(_void_body, "void_labels")
+    assert _receipt_line is not None and _write_line is not None, \
+        f"the void-mint branch must both receipt and write labels; got {_receipt_line}/{_write_line}"
+    assert _receipt_line < _write_line, \
+        f"the void mint must be RECEIPT-FIRST: post_comment at line {_receipt_line} must precede " \
+        f"the label write at line {_write_line}"
+    _receipt_calls = [node for node in _ast.walk(_void_body)
+                      if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name)
+                      and node.func.id == "post_comment"]
+    for _call in _receipt_calls:
+        for _arg in list(_call.args) + [kw.value for kw in _call.keywords]:
+            assert not any(isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name)
+                           and node.func.id in {"void_labels", "clear_labels"}
+                           for node in _ast.walk(_arg)), \
+                "a label write nested inside the receipt call's ARGUMENTS runs BEFORE the receipt " \
+                "is posted — argument evaluation order defeats a line-order check"
+    # The void must NOT route through `clear_labels` at all: that helper transitions through
+    # worker-pr's `review-state set --state needs`, whose #138 ambiguity rule converges a split
+    # namespace to the HUMAN terminal (review round 1, B1 — 5 of 8 live candidates).
+    assert not any(
+        isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name)
+        and node.func.id == "clear_labels" for node in _ast.walk(_void_body)), \
+        "the void branch must never call clear_labels — it converges a split review namespace to " \
+        "review:needs-user, spending the one-shot exit to move the PR into a STRICTER hold"
+    # [review round 1] THE DEFAULT `void_labels`' ARGV, because an injected test seam cannot see it.
+    # Every self-test passes its own `void_labels`, so the production implementation's command line is
+    # unexercised — and dropping `--expect-plan` from it SURVIVED the whole suite: the plan then
+    # defaults to None at the writer, which silently disables the stand-down that stops the writer
+    # improvising when labels moved in the gap. Measured, not hypothesised.
+    _void_labels_def = [node for node in _ast.walk(_sweep_tree)
+                        if isinstance(node, _ast.FunctionDef) and node.name == "void_labels"]
+    assert len(_void_labels_def) == 1, \
+        f"expected exactly one default void_labels implementation, found {len(_void_labels_def)}"
+    _plan_param = _void_labels_def[0].args.args[-1].arg
+    _worker_calls = [
+        call for call in _ast.walk(_void_labels_def[0])
+        if isinstance(call, _ast.Call) and isinstance(call.func, _ast.Name)
+        and call.func.id == "_run_target_helper"
+        and any(isinstance(a, _ast.Constant) and a.value == "worker-pr.py" for a in call.args)]
+    assert len(_worker_calls) == 1, \
+        f"void_labels must invoke worker-pr.py exactly once; found {len(_worker_calls)}"
+    _argv = [node for node in _ast.walk(_worker_calls[0].args[-1])]
+    _argv_literals = [n.value for n in _argv if isinstance(n, _ast.Constant)]
+    for _needed in ("review-state", "void-receiptless", "--expect-plan"):
+        assert _needed in _argv_literals, \
+            f"the default void_labels argv must contain {_needed!r} — got {_argv_literals}; a " \
+            "missing --expect-plan silently disables the writer's stand-down"
+    assert "--state" not in _argv_literals and "set" not in _argv_literals, \
+        f"void_labels must NOT invoke `review-state set` — that is the #138 ambiguity path this " \
+        f"whole finding is about; got {_argv_literals}"
+    assert any(isinstance(n, _ast.Name) and n.id == _plan_param for n in _argv), \
+        f"the argv must pass the {_plan_param!r} PARAMETER after --expect-plan, not a literal — " \
+        "otherwise the writer validates against a plan nobody decided"
+    print("  ok   [#1309] the receipt-less VOID is WIRED (AST-asserted: five keywords on the "
+          "minting sweep with non-literal readers, four on the read-only gate with NO void_offered, "
+          "receipt-first by statement order AND against argument-order defeat, and never through "
+          "clear_labels)")
+
 
     # RECEIPT-FIRST: a crash between the two leaves an explained PR with no label, never a
     # mysterious label with no explanation.
