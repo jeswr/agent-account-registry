@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5150,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "710ca4641da82674a6e48f1c6e7d8ff331f134e1",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 confirms the prior approval. The advisory step remains internally consistent: the exact jscpd version is pinned, threshold failure is deliberately contained, missing and vacuous reports are explicitly distinguished from clean results, and the summary separates markdown-class findings from fenced-code formats. The configuration scope, nested-target exclusion, advisory registry promotion rule, and area label agree with the workflow. No correctness, soundness, test-validity, or security issue is present in the diff.",
+  "verdict": "approve"
+ }
+}
