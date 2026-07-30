@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1277,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7678156acf5725704ce002eabf0385097e1894ff",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change replaces the stale hand-maintained regate collision list with a tree-derived schedule map, moves regate-sweep off the live latch-watchdog collision, and preserves fail-closed behavior for missing workflow trees, import failures, parse failures, and thin checkouts. The workflow sparse checkout includes both the owning module and the complete workflows directory with exact-membership assertions. The new fixture and live-seam checks exercise cron expansion, map coverage, lane-count evidence, self-lane agreement, positive and negative collision cases, and the production call site. I found no diff-supported correctness, soundness, test-validity, or security issue requiring changes.",
+  "verdict": "approve"
+ }
+}
