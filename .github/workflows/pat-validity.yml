@@ -1,16 +1,16 @@
-# [FABLE-5] Weekly REGISTRY_SECRETS_PAT validity probe (issue #37): a rotated/expired PAT used to
+# [FABLE-5] Daily REGISTRY_SECRETS_PAT validity probe (issue #37): a rotated/expired PAT used to
 # be discovered only when set-up-account or the rotation write-back actually ran `gh secret set` —
 # i.e. while a human was waiting on onboarding. This probes ahead of time: GET /user, the
 # dispatch-secrets ENVIRONMENT secrets public-key read, then an AUTHORITATIVE
 # `gh secret set --env dispatch-secrets` on the disposable canary secret
 # REGISTRY_PAT_PROBE_CANARY (review r3: the public-key read needs only read access, so it alone
 # would bless a read-only PAT that onboarding's write still breaks on; the canary holds no secret
-# material and is overwritten weekly). Post-#101 both probes target the ENVIRONMENT: the
-# pipeline's real writes are env-scope, and a weekly repo-scope canary write would re-trip the
+# material and is overwritten on every run). Post-#101 both probes target the ENVIRONMENT: the
+# pipeline's real writes are env-scope, and a repo-scope canary write would re-trip the
 # dispatch secrets-guard (repo scope must stay empty). Upserts ONE rolling `from:agent` alert issue on
 # invalid/insufficient-scope/near-expiry; a single network-unknown never touches that credential
-# alert (no false alarms, no false recoveries). But CONSECUTIVE network-unknowns are counted in
-# the PAT_PROBE_UNKNOWN_STREAK repository variable (silent state — below the threshold NO issue
+# alert (no false alarms, no false recoveries). But CONSECUTIVE network-unknowns are counted in a
+# JSON document on the `ledger` data-plane branch (silent state — below the threshold NO issue
 # is touched, since GitHub creates every issue OPEN and even a create-then-close would notify)
 # and page via a SEPARATE rolling issue once a small threshold is crossed (issue #207), so a
 # permanently-stalled probe cannot stay green-and-silent — without ever reclassifying the PAT.
@@ -18,25 +18,32 @@
 name: pat-validity
 on:
   schedule:
-    # Weekly is enough — fine-grained PAT expiry is calendar-scale. Explicit off-peak minute
-    # (not a wildcard or :00) per repo convention: wildcard/top-of-hour schedules are throttled
-    # hardest under load.
-    - cron: '41 6 * * 1'
+    # DAILY, not weekly (issue #1139). Calendar expiry alone would be fine weekly, but two other
+    # signals are not: a REJECTED worker credential took the fleet down within hours on
+    # 2026-07-25 (registry#622), and the probe-health page needs UNKNOWN_STREAK_THRESHOLD = 3
+    # CONSECUTIVE unknown runs — at a weekly cadence that is a 21-day detection latency, which is
+    # not a useful alarm no matter how correct the counter is. Daily puts both inside 24 h / 3 d.
+    # Explicit off-peak minute (not a wildcard or :00) per repo convention: wildcard/top-of-hour
+    # schedules are throttled hardest under load.
+    - cron: '41 6 * * *'
   workflow_dispatch: {}
 
 permissions:
   # An explicit permissions block zeroes every grant not listed, so the checkout of the probe
-  # script has to name contents:read here. This repo is PUBLIC (README line 1), so today an
+  # script has to name a contents grant here. This repo is PUBLIC (README line 1), so today an
   # anonymous clone would succeed on its own — the grant is declared rather than relied on from
   # visibility, so the job keeps working if the repo is ever flipped private instead of dying
-  # before the probe runs.
-  contents: read
+  # before the probe runs. It is `write` because the consecutive-unknown streak (issue #207) is
+  # persisted as a JSON document on the unprotected `ledger` DATA-PLANE branch via the contents
+  # API — the silent cross-run store, exactly as groom-leases/model-health persist theirs: a
+  # commit on a non-default data branch notifies nobody, whereas an issue-body counter would page
+  # on its own creation (GitHub creates every issue OPEN). It used to be a repository VARIABLE,
+  # which made the whole probe-health alarm INERT (issue #1139): the variables REST API sits under
+  # the fine-grained `variables` permission, which GITHUB_TOKEN does not have and `actions: write`
+  # does not stand in for, so the counter could never be created and the streak could never leave
+  # 0 — 2/2 runs red, 0 alerts, for the alarm's entire life.
+  contents: write
   issues: write   # rolling alert upsert only
-  # The consecutive-unknown streak (issue #207) is persisted in a repository variable — the
-  # silent cross-run store: a variable write notifies nobody, whereas an issue-body counter
-  # would page on its own creation (GitHub creates every issue OPEN). The variables REST API
-  # sits under the `actions` permission (no narrower `variables:` key exists for GITHUB_TOKEN).
-  actions: write
 
 concurrency:
   group: pat-validity
