@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5126,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "aca8f54e606fe2b00c1ccb225a01c5c0b46bbf30",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "crate_labels_to_provision still builds manifests from bare path strings and accepts an exact crates/<name>/Cargo.toml match. The changed-file model remains statusless and includes previous_filename, so the old side of a rename or a deleted manifest can qualify; likewise, an added file at that path need not be a valid Cargo crate manifest. This does not establish that the crate exists on the resulting PR head, despite the load-bearing claim, and can create permanent area-label state for a nonexistent crate. The new tests do not exercise deletion, rename-away/previous_filename, or invalid manifest content.",
+    "file": "scripts/pr-area-labels.py",
+    "fix_hint": "Preserve change status in the changed-file model and accept only an added or renamed-to crate-root manifest. Fetch the PR-head manifest as inert data, parse it without executing PR code, and verify that its package/workspace crate identity is consistent with the directory. Add tests proving deleted manifests and previous_filename never provision, malformed or identity-mismatched manifests never provision, and a valid newly added manifest still provisions.",
+    "severity": "major",
+    "title": "Manifest-path evidence still accepts deleted, renamed-away, or invalid manifests"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is stagnant. The round-3 major finding remains materially unchanged: provisioning still infers that a crate exists solely from a normalized changed-path string equal to crates/<name>/Cargo.toml. The input still discards file status and includes previous_filename for renames, and no PR-head manifest content is fetched or validated. Consequently, deletion, rename-away, or a malformed/non-crate file at that path can still create durable area-label repository state. The added tests cover stray and nested paths but not the reported deletion, previous_filename, or manifest-validity cases.",
+  "verdict": "request_changes"
+ }
+}
