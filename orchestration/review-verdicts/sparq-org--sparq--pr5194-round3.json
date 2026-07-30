@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5194,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1afe518a3740846d625c147b87d3d8eab65dff41",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains clean. The prior major concern stays resolved: hedging quality now reports structured abstention TP/FP/FN, precision, recall, and false-positive rate for both arms; KILL 3 fires when treatment increases false-positive abstention or lowers defined precision; and the focused synthetic regression test demonstrates that this guard catches over-abstention even when trap superiority is established and ordinary mean accuracy is unchanged. The analyzer also continues to fail closed on missing honesty prerequisites, fabricated citations, inadequate power, placebo arm wiring, and excessive cost. No new correctness, soundness, test-validity, security, or instruction-injection issue is evident in the supplied diff.",
+  "verdict": "approve"
+ }
+}
