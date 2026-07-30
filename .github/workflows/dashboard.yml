@@ -478,7 +478,26 @@ jobs:
           # This leg is NOT retired in favour of that watchdog: dispatch-stall-alert PAGES A HUMAN,
           # the keepalive RE-DISPATCHES. Losing it would turn every cron-delivery gap on the
           # busiest workflow in the fleet into a manual recovery.
-          for spec in metrics.yml:1200 conflict-resolver.yml:1500 curate.yml:2400 dispatch.yml:1200:dispatch-tick groom.yml:1800 retriage.yml:3600; do
+          #
+          # THRESHOLD SIZING (#680). Measured over the 7 days to 2026-07-25, GitHub delivered only
+          # ~60% of this fleet's scheduled fires (metrics.yml nominally */15, effective p50 25.2
+          # min; dashboard.yml nominally */15, effective p50 26.8 min) and THIS leg supplied the
+          # rest — ~46% of metrics runs and ~38% of dashboard runs arrive as dispatches, not as
+          # schedule events. A threshold here is therefore a PRIMARY cadence control, not a
+          # courtesy fallback, and every RUN-ANCHORED one is sized to sit strictly between one and
+          # two nominal cadences of the workflow it WATCHES:
+          #   > 1 cadence  — a punctually delivered cron is never kicked behind its own fire, which
+          #                  is the #559 duplicate-dispatch storm.
+          #   < 2 cadences — ONE dropped fire is recovered inside the cycle it was dropped from,
+          #                  rather than after a whole extra cycle of nothing.
+          # groom.yml (1800 -> 1200) and retriage.yml (3600 -> 2400) sat exactly AT 2x their own
+          # cadence, so a single dropped fire cost each of them a full extra cycle — the widest
+          # residual in the fleet on the delivery rate above. dashboard-gen.py's self-test derives
+          # each cadence from the watched workflow's OWN `on: schedule:` block and goes red on
+          # either side of the bound, so re-timing a cron without re-sizing its threshold (or the
+          # reverse) cannot land silently. dispatch.yml is exempt: it is marker-anchored and its
+          # threshold is governed by the tick floor, asserted separately.
+          for spec in metrics.yml:1200 conflict-resolver.yml:1500 curate.yml:2400 dispatch.yml:1200:dispatch-tick groom.yml:1200 retriage.yml:2400; do
             wf="${spec%%:*}"; rest="${spec#*:}"; limit="${rest%%:*}"
             if [ "$rest" != "$limit" ]; then marker="${rest#*:}"; else marker=""; fi
             # LIVE-RUN GUARD (#559): a QUEUED or IN_PROGRESS run of the target counts as FRESH —

@@ -778,6 +778,100 @@ def _strip_yaml_comments(text):
     return "\n".join(line for line in text.split("\n") if not line.lstrip().startswith("#"))
 
 
+def _cron_minutes(expression):
+    """The set of minutes-past-the-hour one `on: schedule:` cron fires at.
+
+    Only pure minute-field schedules are expressible; any other field carrying a value is a
+    REFUSAL. A cadence this reader silently mis-derives would make the #680 threshold bound it
+    feeds satisfiable by any threshold at all, so it must fail rather than guess."""
+    fields = expression.split()
+    if len(fields) != 5 or any(field != "*" for field in fields[1:]):
+        raise DashboardError(
+            f"cron {expression!r} is not a pure minute-field schedule — refusing to derive a "
+            "nominal cadence from it (fail closed)")
+    minutes = set()
+    for term in fields[0].split(","):
+        base, _, raw_step = term.partition("/")
+        if raw_step:
+            if not raw_step.isdigit() or int(raw_step) < 1:
+                raise DashboardError(f"cron {expression!r}: unreadable step in {term!r} — refusing")
+            step = int(raw_step)
+        else:
+            step = 1
+        if base == "*":
+            low, high = 0, 59
+        else:
+            low_text, dash, high_text = base.partition("-")
+            high_text = high_text if dash else low_text
+            if not (low_text.isdigit() and high_text.isdigit()):
+                raise DashboardError(
+                    f"cron {expression!r}: unreadable minute term {term!r} — refusing")
+            low, high = int(low_text), int(high_text)
+        if not 0 <= low <= high <= 59:
+            raise DashboardError(
+                f"cron {expression!r}: minute term {term!r} out of range — refusing")
+        minutes.update(range(low, high + 1, step))
+    if not minutes:
+        # Unreachable under the grammar above (an accepted term always has low <= high, so it
+        # contributes at least one minute) and kept as the structural backstop for a future term
+        # form that does not: an empty firing set would otherwise reach the wrap-around gap in
+        # _cron_cadence_seconds as an IndexError rather than as a named refusal.
+        raise DashboardError(f"cron {expression!r} fires at no minute at all — refusing")
+    return minutes
+
+
+def _cron_cadence_seconds(*expressions):
+    """The NOMINAL gap, in seconds, between consecutive fires of a set of hourly crons.
+
+    The WIDEST gap in the union of their firing minutes (the wrap-around gap from the last minute
+    of one hour to the first of the next included) — that is the interval a keepalive threshold has
+    to clear, so the widest is the only safe reading."""
+    if not expressions:
+        raise DashboardError("no cron expression supplied — refusing to invent a cadence")
+    minutes = set()
+    for expression in expressions:
+        minutes.update(_cron_minutes(expression))
+    fires = sorted(minutes)
+    gaps = [later - earlier for earlier, later in zip(fires, fires[1:])]
+    gaps.append(fires[0] + 60 - fires[-1])
+    return max(gaps) * 60
+
+
+def _schedule_cadence_seconds(text, label):
+    """The nominal cadence of one workflow YAML's `on: schedule:` block.
+
+    Split from the file read below purely so its two refusal branches are reachable from the
+    self-test: a refusal nothing ever executes is a refusal nothing has checked. The scan is
+    bounded to the top-level `on:` block, so a `cron:` in prose or in some other mapping cannot
+    supply the cadence a keepalive threshold is then sized against."""
+    lines = _strip_yaml_comments(text).split("\n")
+    heads = [index for index, line in enumerate(lines) if line.rstrip() == "on:"]
+    if len(heads) != 1:
+        raise DashboardError(
+            f"{label} has {len(heads)} top-level `on:` blocks, expected exactly 1 — refusing")
+    end = len(lines)
+    for index in range(heads[0] + 1, len(lines)):
+        if lines[index].strip() and not lines[index][:1].isspace():
+            end = index
+            break
+    crons = re.findall(r"^\s*-\s*cron:\s*['\"]?([^'\"\n]+?)['\"]?\s*$",
+                       "\n".join(lines[heads[0]:end]), re.MULTILINE)
+    if not crons:
+        raise DashboardError(
+            f"{label} declares no `on: schedule:` cron — refusing to size a keepalive threshold "
+            "against a workflow that has no schedule for the keepalive to be a fallback to")
+    return _cron_cadence_seconds(*crons)
+
+
+def _workflow_cadence_seconds(workflow):
+    """The nominal cadence of `.github/workflows/<workflow>`, read out of THAT file's own
+    `on: schedule:` block.
+
+    Never restated here: the whole point of the #680 bound is that a re-timed cron and the
+    keepalive threshold sized against it cannot drift apart silently."""
+    return _schedule_cadence_seconds(_repo_file(".github", "workflows", workflow), workflow)
+
+
 def _workflow_step(text, step_id):
     """The full YAML text of the ONE step whose `id:` is `step_id`, comments stripped.
 
@@ -3237,6 +3331,98 @@ def _self_test():
           "(a threshold at or under the floor would kick a perfectly healthy held dispatcher)",
           keepalive_specs["dispatch.yml"][0] >= 2 * tick_floor.MIN_TICK_INTERVAL_SECONDS, True)
 
+    # --- #680: a keepalive threshold is a CADENCE CONTROL, not a courtesy. Measured over the 7
+    # days to 2026-07-25 GitHub delivered only ~60% of this fleet's scheduled fires, and this leg
+    # supplied the rest, so each threshold is what actually decides how often its target runs.
+    # Every run-anchored one is bounded strictly between one and two nominal cadences of the
+    # WATCHED workflow — above one so a punctual cron is never kicked behind its own fire (#559),
+    # below two so a single dropped fire is recovered inside the cycle it was dropped from. Both
+    # sides come from the watched workflow's OWN `on: schedule:` block rather than from anything
+    # restated here, so the rows fail when a cron is re-timed as well as when a threshold is
+    # re-sized: two files that must agree, which is the one shape a tautological assertion cannot
+    # take. dispatch.yml is exempt — it is marker-anchored and bounded by the tick floor above.
+    # ------------------------------------------------------------------------------------------
+    # Three of these shapes are what separate a real reader from a plausible one, and each answer
+    # appears nowhere else in this block. `0,5,10` is BUNCHED: its widest gap is the wrap-around
+    # from :10 to the next hour's :00 (3000s), so a reader that drops the wrap reads 300 and one
+    # that takes the narrowest gap reads 300 too — a tenth of the truth in both cases, which would
+    # call every threshold in the fleet compliant. `5` fires once an hour, where the wrap gap is the
+    # ONLY gap. The last row is a UNION over a workflow's crons, not a per-cron maximum.
+    check("[#680] the cron reader derives a nominal cadence from the minute field, wrap-around gap "
+          "included, taking the WIDEST gap over the union of a workflow's crons — a reader that "
+          "cannot tell 5 minutes from 50 makes the bound below satisfiable by any threshold",
+          [_cron_cadence_seconds("*/15 * * * *"), _cron_cadence_seconds("11-59/15 * * * *"),
+           _cron_cadence_seconds("1,21,41 * * * *"), _cron_cadence_seconds("17,47 * * * *"),
+           _cron_cadence_seconds("0,5,10 * * * *"), _cron_cadence_seconds("5 * * * *"),
+           _cron_cadence_seconds("*/20 * * * *", "10-59/20 * * * *")],
+          [900, 900, 1200, 1800, 3000, 3600, 600])
+    check("[#680] ...and a schedule it cannot read is a REFUSAL, never a default cadence that the "
+          "bound would then be measured against",
+          [_raises_dashboard(lambda text=text: _cron_cadence_seconds(text))
+           for text in ("*/15 * * * 1", "*/0 * * * *", "60 * * * *", "15-5 * * * *",
+                        "a,5 * * * *", "not-a-cron")]
+          + [_raises_dashboard(lambda: _cron_cadence_seconds())],
+          [True] * 7)
+    # The refusals on the FILE side, driven as text so both branches actually execute: a workflow
+    # with no `on:` block at all, and one whose `on:` block carries no cron. Both must refuse rather
+    # than yield a cadence, because a cadence invented here is one the bound below would then find
+    # any threshold compliant with.
+    #
+    # The positive control does the other half of the work, and its schedule is chosen so that
+    # every leak CHANGES THE ANSWER — a union can only ever NARROW the widest gap, so a fixture
+    # whose real cron is dense (`*/15`) reads the same whether or not a stray `- cron:` leaks in.
+    # The real schedule here is therefore the SPARSE one (hourly, 3600s) and each decoy is chosen
+    # against it. A scan that runs past the top-level `on:` block picks up the job-level `- cron:`
+    # and reads 2700; a scan that stops stripping comments takes the column-0 comment between the
+    # triggers for the end of the block, never reaches `schedule:`, and refuses a workflow that
+    # plainly has one. That comment is the shape every workflow in this repo is written in.
+    hourly_with_decoys = ("# - cron: '20 * * * *'   <- this file's schedule, discussed in prose\n"
+                          "on:\n"
+                          "  workflow_dispatch:\n"
+                          "# Column-0 commentary between the triggers, as every workflow here has.\n"
+                          "  schedule:\n"
+                          "    - cron: '0 * * * *'\n"
+                          "\n"
+                          "jobs:\n"
+                          "  a:\n"
+                          "    steps:\n"
+                          "      - uses: some/scheduling-action\n"
+                          "        with:\n"
+                          "          entries:\n"
+                          "            - cron: '45 * * * *'\n")
+
+    def _cadence_or_refusal(text, label):
+        """`_schedule_cadence_seconds` with a refusal reported as a VALUE rather than raised. A
+        leak that makes the reader refuse would otherwise abort the suite from inside a row and
+        register as a kill while every check below it never ran."""
+        try:
+            return _schedule_cadence_seconds(text, label)
+        except DashboardError:
+            return "REFUSED"
+
+    check("[#680] a workflow YAML the cadence reader cannot resolve a schedule from REFUSES, and on "
+          "one it can it reads the top-level `on: schedule:` block ONLY — neither a `- cron:` in a "
+          "job nor a column-0 comment mid-block may change the number a threshold is sized against",
+          [_cadence_or_refusal("jobs:\n  a:\n", "no-on.yml"),
+           _cadence_or_refusal("on:\n  workflow_dispatch:\n\njobs:\n  a:\n", "no-cron.yml"),
+           _cadence_or_refusal(hourly_with_decoys, "hourly-with-decoys.yml")],
+          ["REFUSED", "REFUSED", 3600])
+    keepalive_cadences = {name: _workflow_cadence_seconds(name)
+                          for name, (_limit, marker) in keepalive_specs.items() if not marker}
+    check("[#680] the run-anchored watch list these rows drive, pinned by equality — a leg that "
+          "quietly stops watching a workflow must go red here rather than silently narrow the "
+          "bound below to whatever is left",
+          sorted(keepalive_cadences),
+          ["conflict-resolver.yml", "curate.yml", "groom.yml", "metrics.yml", "retriage.yml"])
+    check("[#680] every run-anchored threshold sits strictly between ONE and TWO nominal cadences "
+          "of the workflow it watches (offenders listed as workflow -> (threshold, cadence)): at "
+          "or under one cadence it kicks a punctual cron behind its own fire; at or over two, one "
+          "dropped fire costs a whole extra cycle on a fleet losing ~40% of its fires",
+          {name: (keepalive_specs[name][0], cadence)
+           for name, cadence in keepalive_cadences.items()
+           if not cadence < keepalive_specs[name][0] < 2 * cadence},
+          {})
+
     keepalive_gh_stub = r'''#!/usr/bin/env bash
 # Hermetic `gh` for dashboard.yml's cron-keepalive body. Every argv is recorded; the three reads
 # the body makes are served from fixture files; an argv this stub does not model exits 64, so a
@@ -3419,6 +3605,27 @@ esac
     keepalive_check(
         "[#559] FAIL-OPEN: an unreadable live-run check still consults age, and still kicks a "
         "stale target", (code, kicked), (0, ["dispatch.yml"]), log)
+
+    # #680: the bound above is arithmetic across two files; these two rows are the BEHAVIOUR it
+    # buys, driven through the real leg. Every age is derived from the watched workflow's OWN
+    # cadence and never from the spec list the leg reads, so moving a threshold to either side of
+    # the bound flips one of them: at 2x cadence (where groom.yml and retriage.yml sat) the
+    # missed-a-fire row goes quiet for exactly those two, and at 1x cadence the punctual row starts
+    # kicking. The pair is deliberately one row per direction — a single-direction row is satisfied
+    # by a leg that kicks everything, or by one that kicks nothing.
+    punctual = {name: [_ka_run(cadence + 60)] for name, cadence in keepalive_cadences.items()}
+    code, kicked, log = run_keepalive_step(artifacts=[_ka_marker(60)], runs=punctual)
+    keepalive_check(
+        "[#680] a workflow whose last fire was DELIVERED one cadence ago is not kicked behind it — "
+        "a threshold tightened to or under the cadence is the #559 storm on every healthy tick",
+        (code, kicked), (0, []), log)
+    missed = {name: [_ka_run(2 * cadence - 60)] for name, cadence in keepalive_cadences.items()}
+    code, kicked, log = run_keepalive_step(artifacts=[_ka_marker(60)], runs=missed)
+    keepalive_check(
+        "[#680] ...and EVERY run-anchored workflow that has missed exactly one fire is kicked "
+        "inside that same cycle — the 2x-cadence thresholds groom.yml and retriage.yml carried "
+        "before leave both of them unkicked here",
+        (code, kicked), (0, sorted(keepalive_cadences)), log)
 
     # --- #559: the CROSS-REPO leg. It kicks sparq-org/sparq, where a dup-dispatch storm shows up in
     # ANOTHER repo's telemetry entirely, and until now nothing executed it: the live-run guard, the
