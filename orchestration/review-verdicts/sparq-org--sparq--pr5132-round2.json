@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5132,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3e663b564be70a77d0e72e0feb267279ef5e09ab",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. Receipt comments now require both a machine-account signal and a normalized login in the explicit sparq-orchestrator allowlist, so an unrelated bot quoting or posting a class= token cannot revoke a genuine human hold. The focused tests exercise the real hold_ownership and classify_pr paths for the allowlisted orchestrator, unrelated bots, human commenters, login spelling variants, a colliding human login, receipt timing, unresolved events, and live finding propagation. The event-fetch integration is wired into run() only for held candidates and preserves the conservative unknown-owner behavior. No correctness, soundness, security, or hostile-instruction issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
