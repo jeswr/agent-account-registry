@@ -401,8 +401,13 @@ jobs:
           })
           # A needs:*-parked SOURCE issue is human-owned: no autonomous review/fix/rebase may
           # run against its PR until the human clears the label (mirrors CLAIM admission).
-          if any(label.startswith("needs:") for label in issue_labels):
-              raise SystemExit("source issue is human-owned (needs:*)")
+          # [#1311] Through the ONE shared predicate, and NAMING the labels: a local copy of the
+          # glob is how this leg would keep refusing a population the dispatcher had started
+          # admitting, and an unnamed refusal here is invisible in the run log.
+          _source_holds = dispatch_claim.source_issue_holds(issue_labels)
+          if _source_holds:
+              raise SystemExit(
+                  "source issue carries a hold (" + ", ".join(_source_holds) + ")")
           merged = set(labels) | set(issue_labels)
           # [OPUS-4.8] defect #3: the arm-side security classifier must be PER-TARGET. The builtin
           # keyword set (zk/mpc/crypto/auth/e2ee) did not cover the registry's own trust areas
