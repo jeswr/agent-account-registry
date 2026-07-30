@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-30T03:30:12Z",
+  "generated_at": "2026-07-30T03:43:57Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
@@ -15,8 +15,8 @@
       "prs_merged_24h": 38,
       "review_changes_backlog": 12,
       "needs_user_parked": 23,
-      "review_lane_health": "ok",
-      "review_lane_runs_1h": 5,
+      "review_lane_health": "idle",
+      "review_lane_runs_1h": 0,
       "worker_attempts_1h": 1,
       "worker_success_rate_1h": 1.0,
       "pr_open_rate": 1.0,
@@ -27,13 +27,13 @@
       "issues_open": 606,
       "issues_ready": 211,
       "issues_closed_1h": 0,
-      "issues_closed_24h": 52,
+      "issues_closed_24h": 50,
       "prs_open": 39,
       "prs_draft": 29,
       "prs_opened_1h": 1,
       "prs_closed_1h": 0,
-      "prs_merged_1h": 1,
-      "prs_merged_24h": 43,
+      "prs_merged_1h": 0,
+      "prs_merged_24h": 42,
       "review_changes_backlog": 3,
       "needs_user_parked": 11,
       "review_lane_health": "idle",
@@ -41,9 +41,42 @@
       "worker_attempts_1h": 0,
       "worker_success_rate_1h": null,
       "pr_open_rate": 1.0,
-      "pr_close_rate": 1.0,
-      "net_pr_flow": 0.0
+      "pr_close_rate": 0.0,
+      "net_pr_flow": 1.0
     }
   },
-  "alerts": []
+  "alerts": [
+    {
+      "target": "sparq-org/sparq",
+      "classification": "backlog-growing",
+      "fire": true,
+      "summary": "open PRs 93 > 40 and net PR flow +1.0/hr (open 1.0 > close 0.0) sustained over 2 snapshots",
+      "metrics": {
+        "prs_open": 93,
+        "net_pr_flow": 1.0,
+        "pr_open_rate": 1.0,
+        "pr_close_rate": 0.0
+      }
+    },
+    {
+      "target": "sparq-org/sparq",
+      "classification": "ready-starved",
+      "fire": true,
+      "summary": "ready frontier 369 > 60 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
+      "metrics": {
+        "issues_ready": 369,
+        "issues_closed_1h": 0
+      }
+    },
+    {
+      "target": "jeswr/agent-account-registry",
+      "classification": "ready-starved",
+      "fire": true,
+      "summary": "ready frontier 211 > 30 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
+      "metrics": {
+        "issues_ready": 211,
+        "issues_closed_1h": 0
+      }
+    }
+  ]
 }
