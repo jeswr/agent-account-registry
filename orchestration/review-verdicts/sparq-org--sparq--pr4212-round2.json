@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4212,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c145686ff41f8b9ac816c350dc77b6686e638063",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The round-1 issue is materially unchanged. The comment labels HASH-BEFORE-MEMCMP as verified on EVERY DEDUP PATH, but its own description says self.table relies on hashbrown's 7-bit h2 tag. An h2 match may invoke the equality/string comparison even when the other 57 hash bits differ, so this is not a stored full-64-bit-hash-before-equality gate. Shard routing by hash modulo a leaf count likewise does not establish full-hash equality. The mapped_find_compares_full_hash_before_eq test exercises only the mmap path and therefore cannot substantiate the every-path statement or completion of a requirement covering all dedup paths.",
+    "file": "crates/sparq-core/src/dict.rs",
+    "fix_hint": "Either implement and test a full 64-bit hash prefilter before equality on every dedup path covered by the requirement, or narrow the source documentation and PR claim to say that only mapped_find has the full 64-bit gate and that the in-memory/hashbrown path intentionally retains an h2-only prefilter. Add tests matching the precise invariant ultimately claimed.",
+    "severity": "major",
+    "title": "Every-path full-hash prefilter claim remains unsupported"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 is stagnant. The UTF-8 validation and boundary tests provide substantive support for the new unchecked conversion, but the prior major dictionary finding remains unchanged: the source still claims HASH-BEFORE-MEMCMP is present on every deduplication path while explicitly describing the ordinary hashbrown path as using only the 7-bit h2 tag. The sole added regression test covers mapped_find and cannot verify the broader every-path claim or a full 64-bit prefilter for in-memory, sharded, and spill deduplication.",
+  "verdict": "request_changes"
+ }
+}
