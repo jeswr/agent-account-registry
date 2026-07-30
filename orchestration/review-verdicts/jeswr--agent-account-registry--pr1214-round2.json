@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1214,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "11523738ee249a93ea41c33f8dc0bccd0339bb57",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The contextual-reader step runs `gh api repos/jeswr/agent-account-registry/environments/<env>/secrets --jq '.secrets[].name'` with no account-token filter, then says to \"add each one\" to the sink. The live `dispatch-secrets` environment is a trust boundary, not an account-token inventory; copying every returned name can place unrelated credentials into the diagnostic sink. This is especially dangerous because fingerprint-accounts.yml deliberately receives `toJSON(secrets)`: its current inline filter limits what reaches the later probe, but it does not prevent a changed workflow on the admitted default branch from reading every environment secret. The sink should hold only the account tokens required for fingerprinting plus the separately derived named requirements, not an unfiltered clone of the registry environment.",
+    "file": "scripts/diagnostic-sink.py",
+    "fix_hint": "Filter the authoritative source listing to the probe's exact account-token allowlist (currently `^ACCT[A-Z0-9]+_TOKEN$`) before telling the maintainer what to copy, and make the sink read-back/assertion reject unexpected names rather than merely print all names. Keep separately derived named requirements such as PROVENANCE_SALT explicit. Add a test fixture containing an unrelated token-shaped trust credential and prove it is neither selected nor requested for the sink.",
+    "severity": "blocker",
+    "title": "Fleet provisioning instructs copying every dispatch-secrets credential into the sink"
+   },
+   {
+    "body": "The same step unconditionally emits `gh repo view ...` followed by `gh repo create ... --private`. For the documented existing sink, the create command fails because the repository already exists. For a missing sink, the view command fails before creation, and there is no post-create visibility read-back. In addition, `--jq .visibility` only prints a value; it does not make a PUBLIC result fail. Thus the advertised ordered runbook is not executable as written and its claimed visibility read-back is advisory rather than an enforced check.",
+    "file": "scripts/diagnostic-sink.py",
+    "fix_hint": "Render distinct existing-repository and creation paths, or emit one conditional command sequence that creates only when absent and then performs a mandatory read-back. Make the read-back exit nonzero unless the exact value is PRIVATE. Add end-to-end assertions for both pre-existing and absent sink states, including rejection of a PUBLIC result.",
+    "severity": "major",
+    "title": "Step 0's ordered command list always fails for one of the supported repository states"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round two fixes both prior findings: the visibility comparison is now matched as a whole canonical atom and the self-test covers both prefix and suffix collisions; the fleet step no longer creates a literal placeholder secret and adds source/sink name read-backs. The change is still unsafe to approve. The new source read-back enumerates every secret in the registry's dispatch-secrets environment and the accompanying instruction tells the maintainer to add each one to the sink, unnecessarily copying unrelated trust-plane credentials into a repository whose diagnostic job receives the whole secrets context. Separately, step 0 always prints both the view and create commands for a sink documented as already existing, so the ordered runbook necessarily includes a failing create and does not machine-check the visibility result. Because these are new findings despite resolving the old ones, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
