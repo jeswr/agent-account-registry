@@ -9221,6 +9221,14 @@ _RF_ADMISSION_ANCHOR = (
     r"(?m)^[ \t]*self_attested, admission_error = dispatch_claim\.review_fix_pr_admission\(")
 _RF_ADMISSION_END = r"(?m)^[ \t]*impl_provider = record\["
 
+# [#1311] The SOURCE-ISSUE hold decision inside review-fix.yml's `resolve` step. Line-anchored
+# (#584 finding 3) on the SHARED-predicate call, so a step that reverts to a local glob loses the
+# anchor and fails LOUDLY with an actionable message rather than passing a substring check that a
+# COMMENT can satisfy — the failure mode the re-review of #1313 demonstrated on this exact leg.
+_RF_SOURCE_HOLD_ANCHOR = (
+    r"(?m)^[ \t]*_source_holds = dispatch_claim\.source_issue_holds\(")
+_RF_SOURCE_HOLD_END = r"(?m)^[ \t]*merged = set\(labels\)"
+
 
 def review_fix_admits_orchestrator_class(source=None):
     """BEHAVIOURAL: does review-fix.yml's resolve step ADMIT the #657 orchestrator class?
@@ -24369,12 +24377,26 @@ def _python_sentinel_block(path, marker):
 # re-admission for as long as the label lived, an exit those PRs could not previously reach. A
 # cheap refusal became an expensive one with the same outcome.
 #
-# So: every site that decides a hold by globbing the `needs:` namespace is inventoried HERE, with
-# its layer. Narrowing any PROPER SUBSET of the review-loop layers reintroduces that defect, and
-# this test is what makes a future author see the whole set instead of the one they are editing.
-# The inventory is derived STRUCTURALLY (AST: a `.startswith()` call whose argument is the literal
-# `"needs:"` or `SOURCE_ISSUE_HOLD_PREFIX`), so a comment naming the idiom cannot satisfy it and a
-# reformat cannot break it.
+# WHAT THIS MAP IS, EXACTLY — and what it is NOT. It is a SITE-INVENTORY DRIFT DETECTOR: it lists
+# every place in the THREE review-loop files that decides a hold using the CANONICAL spelling of
+# the glob (AST: a `.startswith()` call whose argument is the literal `"needs:"` or
+# `SOURCE_ISSUE_HOLD_PREFIX`), and it fails when that set changes. That is genuinely useful and it
+# is genuinely narrow. Three things it CANNOT do, each demonstrated by mutation in the re-review of
+# PR #1313 rather than reasoned about here:
+#   * It cannot see SEMANTICS. Adding a waiver to an already-mapped site changes no site, so a
+#     narrowing that also updates the surrounding guards leaves this test GREEN. That is the defect
+#     class itself, so it is covered by a separate, spelling-independent guard:
+#     `_cross_layer_hold_agreement_self_test` below, plus the arity assertions in it.
+#   * It cannot see a RESPELLING. `l[:6] == "needs:"`, or a local alias of the pinned constant,
+#     both evade the detector. Same backstop applies: a respelled glob that changes a verdict makes
+#     the three layers disagree.
+#   * It does not cover the whole repository. MEASURED 2026-07-30 over `scripts/*.py`: there are 11
+#     production sites across 8 files; this map pins 5 keys / 6 sites across 3. The other five —
+#     `mint-provenance.py`, `retriage.py`, `triage.py`, `worker-issue.py`, and
+#     `groom.py:_area_terminally_parked` — are ISSUE-lane or issue-lease deciders, not review-loop
+#     legs: a resource gate SHOULD stop the work it names, and groom's is short-circuited for a
+#     PR-backed row anyway (dispatch's coherent proof owns it). So no review-loop site is missing
+#     from the map; the SCOPE is three files by intent.
 SOURCE_ISSUE_HOLD_LAYER_MAP = {
     # file                     enclosing function          layer
     ("dispatch-claim.py", "source_issue_holds"):        "enumeration+claim+workflow (THE shared "
@@ -24456,17 +24478,134 @@ def _source_issue_hold_layer_map_self_test():
     assert set(claim_sites) == {"source_issue_holds", "_current_issue_matches"}, (
         "a review-loop leg in dispatch-claim.py grew its own `needs:` glob instead of calling "
         f"source_issue_holds — found {sorted(claim_sites)}")
-    workflow = (scripts.parent / ".github" / "workflows" / "review-fix.yml").read_text(
-        encoding="utf-8")
-    assert "dispatch_claim.source_issue_holds(issue_labels)" in workflow, \
-        "review-fix.yml's resolve step no longer decides the source-issue hold through the shared "
-    assert 'startswith("needs:")' not in _strip_script_comments(workflow), (
-        "review-fix.yml grew a LOCAL `needs:` glob again — that local copy is exactly how the "
-        "last leg kept refusing a population the dispatcher had started admitting")
-    print(f"  ok   [#1311/#1316] the `needs:` source-issue hold layer map is pinned at "
-          f"{len(observed)} site(s) across 3 files, every review-loop leg reaches the namespace "
-          "only through source_issue_holds, and review-fix.yml holds no local copy "
-          "(AST-derived, so a comment naming the idiom cannot satisfy it)")
+    # ---- THE LAST LEG, PINNED BEHAVIOURALLY (not by substring) --------------------------------
+    # This replaced a pair of whole-file substring checks, and the re-review of #1313 demonstrated
+    # why that was a downgrade: a mutant that DELETED the real call, substituted a slice-glob, and
+    # left the exact searched-for string in a COMMENT satisfied both checks. So extract the real
+    # decision block by line anchor and EXECUTE it, as the withdrawn revision did.
+    _rf_block = _review_fix_step_python(
+        _RF_SOURCE_HOLD_ANCHOR, _RF_SOURCE_HOLD_END, "source-issue hold decision")
+
+    def _rf_refusal(labels, block=None, claim=None):
+        """Run review-fix.yml's own decision block. Returns its SystemExit message, or None."""
+        namespace = {"dispatch_claim": claim or sys.modules[__name__],
+                     "issue_labels": list(labels)}
+        try:
+            exec(compile(block if block is not None else _rf_block,   # noqa: S102 — repo-owned
+                         "<review-fix.yml resolve source hold>", "exec"), namespace)
+        except SystemExit as exc:
+            return str(exc)
+        return None
+
+    assert _rf_refusal([]) is None, "a source issue with no hold must not stand the run down"
+    for _label in ("needs:ec2", "needs:user", "needs:external-audit"):
+        _msg = _rf_refusal(["area:crate-a", _label])
+        assert _msg is not None and _label in _msg, (_label, _msg)
+    # SEMANTIC MUTANT: prove the SHARED predicate's answer is load-bearing. Stub it to report NO
+    # hold; a block that still refuses is deciding with its own copy of the glob, which is exactly
+    # how this leg drifts from PLAN and CLAIM.
+    _stubbed = _rf_refusal(
+        ["needs:ec2"], claim=types.SimpleNamespace(source_issue_holds=lambda _labels: []))
+    assert _stubbed is None, (
+        "review-fix.yml's resolve step still refuses when the SHARED predicate reports no hold — "
+        f"so it is not deciding through that predicate. Got: {_stubbed!r}")
+    print(f"  ok   [#1311/#1316] the `needs:` glob SITE INVENTORY is pinned at {len(observed)} "
+          "key(s) across the 3 review-loop files (canonical `.startswith` spelling only; see the "
+          "map's own note for what it cannot see), and review-fix.yml's resolve block is pinned "
+          "BEHAVIOURALLY — extracted, exec'd, and proven to decide through the shared predicate")
+    _cross_layer_hold_agreement_self_test()
+
+
+def _cross_layer_hold_agreement_self_test():
+    """[#1311 re-review / #1315] THE PROPERTY, not the spelling.
+
+    The site inventory above is a DRIFT DETECTOR over one canonical spelling in three named files.
+    It cannot see semantics, and the re-review of #1313 proved the gap by mutation: narrowing the
+    ENUMERATION predicate while updating the guards around it — which is what any real author would
+    do — left the inventory printing "pinned at 5 site(s)" GREEN, because adding a waiver to an
+    already-mapped site changes no site. Mutants that respell the glob (`l[:6] == "needs:"`, or an
+    alias of the pinned constant) evade it for the same reason.
+
+    This test is the backstop that does not depend on spelling at all: over a fixed label matrix,
+    the THREE layers that decide this hold must return the SAME verdict.
+
+      * ENUMERATION — dispatch-claim.source_issue_holds  (PLAN, the occupancy leg, CLAIM's live
+        re-derivation, and review-fix.yml's resolve step all reach the namespace through it)
+      * WRITE       — worker_pr.live_human_holds's source-issue half (review-outcome, fix-outcome
+        AND ready-and-arm)
+      * PARK        — park_policy.human_owned_holds, minus the PR-side park label (a different
+        surface, which legitimately differs)
+
+    WHY THIS IS THE GUARD THE ESTATE NEEDS. The measured defect was not a missing site — it was the
+    three layers DISAGREEING: the enumerator admitted a PR, the write side dropped its outcome
+    after a real review round had been charged, and the park side then refused re-admission
+    forever. Any narrowing that produces that state makes two of these three disagree here,
+    whatever idiom it is written in and whichever file it lives in. A site inventory can always be
+    evaded by respelling; an agreement test cannot.
+
+    Paired with the arity assertions: a waiver knob added to either pure predicate reds even before
+    it is used, because every pure caller would keep passing its default while production passed
+    the waiver — which is how a defaulted parameter hides a live divergence."""
+    scripts = Path(__file__).resolve().parent
+    worker_pr = _load_module("registry_worker_pr_holdmap", scripts / "worker-pr.py")
+    park = _load_module("registry_park_policy_holdmap", scripts / "park_policy.py")
+
+    # (1) ARITY. A narrowing needs somewhere to put the waiver, and a DEFAULTED extra parameter is
+    #     invisible to every pure call below. Pin the shape of both pure hold deciders.
+    for _module, _name in ((sys.modules[__name__], "source_issue_holds"),
+                           (park, "human_owned_holds")):
+        _spec = inspect.signature(getattr(_module, _name))
+        assert len(_spec.parameters) == 1 and all(
+                p.default is inspect.Parameter.empty for p in _spec.parameters.values()), (
+            f"{_name} must take exactly ONE parameter and no defaults — a defaulted extra argument "
+            "is exactly where a waiver goes, and the pure agreement calls below would keep passing "
+            f"the default while production passed the waiver. Found: {_spec}")
+
+    # (2) AGREEMENT over a matrix spanning the whole live namespace (2026-07-29 census) plus
+    #     non-members, a resource gate and a human question together, and the empty set.
+    matrix = (
+        [], ["area:crate-a"], ["area:crate-a", "status:parked"],
+        ["needs:ec2"], ["needs:user"], ["needs:maintainer"], ["needs:area"], ["needs:docker"],
+        ["needs:zk"], ["needs:design"], ["needs:upstream"], ["needs:external-audit"],
+        ["needs:external-subject"],
+        ["area:crate-a", "needs:ec2", "needs:user"], ["needs:ec2", "needs:external-audit"],
+    )
+    # The write side reads the SOURCE ISSUE over the network. Drive it with the PR-side surface
+    # CLEAN (so it cannot short-circuit on a PR label) and the issue read stubbed to the matrix row.
+    live_pr = {"number": 41, "labels": [], "state": "open", "draft": True,
+               "head": {"ref": "sparq-agent/issue-7-1-1"}}
+    real_gh = worker_pr._gh_json
+    disagreements = []
+    try:
+        for labels in matrix:
+            worker_pr._gh_json = (
+                lambda _args, _labels=labels: {"labels": [{"name": n} for n in _labels]})
+            enumeration = source_issue_holds(labels)
+            write = worker_pr.live_human_holds("o/r", 41, issue=7, live=live_pr)
+            # `human_owned_holds` returns exactly {HUMAN_PR_PARK_LABEL} | the needs:* set, so
+            # dropping that one PR-side label IS the source-issue projection. A set-difference, not
+            # a prefix test: a glob here would add a site to the very inventory this test backstops,
+            # defining the projection by the idiom under audit.
+            park_side = [label for label in park.human_owned_holds(labels)
+                         if label != park.HUMAN_PR_PARK_LABEL]
+            if not enumeration == write == park_side:
+                disagreements.append((labels, enumeration, write, park_side))
+    finally:
+        worker_pr._gh_json = real_gh
+    assert not disagreements, (
+        "the ENUMERATION, WRITE and PARK layers disagree about which source-issue labels hold:\n"
+        + "\n".join(f"  labels={row[0]} enumeration={row[1]} write={row[2]} park={row[3]}"
+                    for row in disagreements)
+        + "\nThat divergence IS the withdrawn #1313 defect: the enumerator admits a PR, the write "
+          "side drops its outcome after a real review round has already been charged (round-record "
+          "runs before the model; round-void fires only on a credential outage), and the park side "
+          "then refuses automatic re-admission for as long as the label lives. If you are "
+          "narrowing this hold, move all three together — see registry #1316, which also carries "
+          "the decision this cannot settle: whether the waived label may gate the ARM.")
+    print(f"  ok   [#1311/#1315/#1316] CROSS-LAYER AGREEMENT: the enumeration, write and park hold "
+          f"deciders return the identical verdict over {len(matrix)} label sets spanning the whole "
+          "live `needs:*` namespace, and neither pure predicate may grow a defaulted policy knob — "
+          "spelling-independent, so a respelled or relocated glob cannot evade it")
 
 
 def main():
