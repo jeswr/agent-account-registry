@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1192,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "303158307419a923ddf2a5cf07e65aa71f6bad48",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`render_probe_alert()` still says both \"The weekly validity probe\" and \"updates itself on the weekly probe\", although this PR changes the schedule and documentation to daily. This is the same unresolved round-1 finding and gives responders an incorrect expectation of alert cadence and detection latency.",
+    "file": "scripts/pat-validity.py",
+    "fix_hint": "Change both operator-facing occurrences of \"weekly\" in `render_probe_alert()` to \"daily\", and add a rendering assertion tied to the daily cadence so this message cannot drift again.",
+    "severity": "minor",
+    "title": "Probe-health alert still describes the daily probe as weekly"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe ledger-branch counter implementation remains sound: it distinguishes a missing document from an unavailable branch, validates the stored document and blob SHA, pins reads and writes to the ledger ref, and uses the read SHA for compare-and-swap updates. The workflow contract tests exact permissions and daily scheduling. However, round 1's minor operator-facing cadence defect is unchanged: the alert still tells responders that the now-daily probe is weekly. Because the same minor finding remains at the same severity, progress is stagnant. No blocker or major issue found.",
+  "verdict": "approve"
+ }
+}
