@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1289,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d2f2047e2054a3f38b62d7c3275568dae232fe64",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly widens transient HTTP read retries from a three-code allow-list to the complete 500\u2013599 server-error range while preserving the existing GET/HEAD-only replay guard, bounded attempt count, Retry-After handling, loud exhaustion behavior, CAS-conflict precedence, and immediate failure for all 4xx responses and mutations. The added self-tests are non-vacuous: they pin both classifier boundaries and the production request call site, including recovery from a one-shot 500, bounded failure for a persistent 500, and no replay of a POST. No trust check, audit binding, permission boundary, or credential handling is weakened.",
+  "verdict": "approve"
+ }
+}
