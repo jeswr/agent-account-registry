@@ -5418,9 +5418,17 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
             # `void_receiptless_park` removes THAT ONE LABEL and re-derives the plan from a FRESH
             # read via the same park_policy predicate the admission used; it exits non-zero rather
             # than improvising if the plan moved, and this sweep reports that as a NON-event.
-            _run_target_helper(script_dir, repo, "worker-pr.py", [
-                "review-state", "void-receiptless", "--repo", repo, "--pr", str(pr_number),
-                "--expect-plan", str(plan)])
+            # [round 2 BLOCKER, second half — belt and braces] `--expect-plan` is passed ONLY when
+            # there IS a plan. `str(plan)` on a missing plan yields the STRING "None", which the
+            # writer's `expect_plan is not None` test reads as a real expectation and stands down on,
+            # writing nothing. Round 1 shipped exactly that on the convergence path. The evidence now
+            # carries the plan (park_policy), so this branch should never be taken for a mintable
+            # PR — but a stringified None must be UNREPRESENTABLE here, not merely unlikely, because
+            # the failure is silent and permanent.
+            argv = ["review-state", "void-receiptless", "--repo", repo, "--pr", str(pr_number)]
+            if plan:
+                argv += ["--expect-plan", str(plan)]
+            _run_target_helper(script_dir, repo, "worker-pr.py", argv)
             if issue_number:
                 _run_target_helper(script_dir, repo, "worker-issue.py", [
                     "status", "--repo", repo, "--issue", str(issue_number),
@@ -20002,7 +20010,11 @@ agent = "impl"
             still_broken_window, rows=[[void_row]], comments=conv_comments,
             timeline=void_timeline)
         assert (c_count, c_posted) == (1, []), (c_count, c_posted, readmit_sweep.log)
-        assert readmit_sweep.voided == [(41, 7, None)], readmit_sweep.voided
+        # [round 2 BLOCKER] Round 1 asserted `(41, 7, None)` here — it PINNED THE UNUSABLE VALUE.
+        # The injected seam swallows None silently, so nothing ever reached `str(None)` and the
+        # inert convergence looked correct. The plan must be REAL, and the argv-level fixture below
+        # proves what is actually sent on the wire.
+        assert readmit_sweep.voided == [(41, 7, "strip-and-needs")], readmit_sweep.voided
         print("  ok   [#1309] EXECUTING: a standing void receipt converges the label write with no "
               "new receipt posted and no new budget consumed")
 
@@ -20042,6 +20054,82 @@ agent = "impl"
                    for line in r_census), r_census
         print("  ok   [#1309] EXECUTING: a refused label write is reported as a NON-event — the "
               "receipt stands, the count does not, and the census cannot read healthy")
+
+        # (7) [round 2] THE DEFAULT `void_labels` ARGV, EXECUTED. Round 1 guarded this only
+        # STRUCTURALLY, on the stated reason that "no self-test may run a real subprocess" — which was
+        # wrong: injecting `_run_target_helper` executes the argv-building code with NO subprocess at
+        # all. That gap is not academic. It is the reason the round-2 BLOCKER shipped: the structural
+        # guard proved the `plan` PARAMETER was forwarded after `--expect-plan`, and could not see
+        # that the value bound to it was None on the convergence branch, nor that `str(None)` was then
+        # compared as a real expectation so the writer stood down and NOTHING WAS EVER WRITTEN.
+        #
+        # So: run the sweep with NO `void_labels` seam — the real default implementation — and assert
+        # the argv actually built, on BOTH branches.
+        helper_argv = []
+        prev_helper = globals()["_run_target_helper"]
+        globals()["_run_target_helper"] = (
+            lambda _sd, _repo, script, args: helper_argv.append((script, list(args))))
+        try:
+            argv_posted = []
+            argv_count = _readmit_capacity_parks(
+                "example/repo", [[void_row]], {7: ["status:in-progress-review"]},
+                {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+                _capacity_recovery_probe(model_health_mod, still_broken_window, readmit_now),
+                comments_fn=lambda _r, _n: list(void_comments),
+                timeline_fn=lambda _r, number: list(void_timeline.get(number, [])),
+                post_comment=lambda _r, number, body: argv_posted.append((number, body)),
+                log=lambda _m: None, enrolled_authors=())
+            mint_argv = [args for script, args in helper_argv if script == "worker-pr.py"]
+            assert argv_count == 1 and len(mint_argv) == 1, (argv_count, helper_argv)
+            assert mint_argv[0] == ["review-state", "void-receiptless", "--repo", "example/repo",
+                                    "--pr", "41", "--expect-plan", "strip-and-needs"], mint_argv[0]
+            # THE CONVERGENCE BRANCH, which is the one that was inert. Its argv must carry a REAL
+            # plan — never the string "None", which the writer reads as an expectation and stands
+            # down on.
+            helper_argv.clear()
+            conv_argv_count = _readmit_capacity_parks(
+                "example/repo", [[dict(void_row, labels=[{"name": MACHINE_PARK_PR_LABEL},
+                                                         {"name": "review:changes"}])],
+                                 ], {7: ["status:in-progress-review"]},
+                {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+                _capacity_recovery_probe(model_health_mod, still_broken_window, readmit_now),
+                comments_fn=lambda _r, _n: [spent_comments[1]],
+                timeline_fn=lambda _r, number: list(void_timeline.get(number, [])),
+                post_comment=lambda _r, number, body: argv_posted.append((number, body)),
+                log=lambda _m: None, enrolled_authors=())
+            conv_argv = [args for script, args in helper_argv if script == "worker-pr.py"]
+            assert conv_argv_count == 1 and len(conv_argv) == 1, (conv_argv_count, helper_argv)
+            assert conv_argv[0][-2:] == ["--expect-plan", "strip-only"], conv_argv[0]
+            assert "None" not in conv_argv[0], \
+                f"the convergence argv must never carry a stringified None: {conv_argv[0]}"
+            # ...and the REACHABLE no-plan case: an AMBIGUOUS namespace with a STANDING void receipt.
+            # The admission still answers `void-receipt` (so a read-only gate admits, #614/M14) but
+            # with plan=None, so the sweep calls void_labels(..., None). The flag must be OMITTED, not
+            # stringified: `--expect-plan None` makes the writer stand down as `plan-changed` instead
+            # of refusing honestly, and a stringified None must be UNREPRESENTABLE rather than merely
+            # unlikely. Without this leg, reverting the argv guard alone survives the whole suite.
+            helper_argv.clear()
+            amb_conv_row = dict(void_row, labels=[{"name": MACHINE_PARK_PR_LABEL},
+                                                  {"name": "review:changes"},
+                                                  {"name": "review:needs"}])
+            _readmit_capacity_parks(
+                "example/repo", [[amb_conv_row]], {7: ["status:in-progress-review"]},
+                {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+                _capacity_recovery_probe(model_health_mod, still_broken_window, readmit_now),
+                comments_fn=lambda _r, _n: [spent_comments[1]],
+                timeline_fn=lambda _r, number: list(void_timeline.get(number, [])),
+                post_comment=lambda _r, number, body: argv_posted.append((number, body)),
+                log=lambda _m: None, enrolled_authors=())
+            amb_argv = [args for script, args in helper_argv if script == "worker-pr.py"]
+            assert len(amb_argv) == 1, (amb_argv, helper_argv)
+            assert "--expect-plan" not in amb_argv[0], amb_argv[0]
+            assert "None" not in amb_argv[0], \
+                f"a stringified None must be unrepresentable in the argv: {amb_argv[0]}"
+            print("  ok   [#1309] EXECUTING the DEFAULT void_labels ARGV (no subprocess): the mint "
+                  "sends --expect-plan strip-and-needs, the CONVERGENCE sends strip-only, and a "
+                  "stringified None is never sent on any branch")
+        finally:
+            globals()["_run_target_helper"] = prev_helper
     finally:
         globals()["_target_is_human_maintainer"] = prev_probe_void
 
@@ -21237,7 +21325,12 @@ def _starvation_sweep_self_test():
         and any(isinstance(a, _ast.Constant) and a.value == "worker-pr.py" for a in call.args)]
     assert len(_worker_calls) == 1, \
         f"void_labels must invoke worker-pr.py exactly once; found {len(_worker_calls)}"
-    _argv = [node for node in _ast.walk(_worker_calls[0].args[-1])]
+    # Walked over the WHOLE function, not the call's last argument: the argv is assembled in a local
+    # (`--expect-plan` is appended conditionally, so a stringified None is unrepresentable), which
+    # makes the call site's last argument a Name. This guard is now belt-and-braces beside the
+    # EXECUTING argv fixture in _self_test — and that fixture is the one that can see a VALUE, which
+    # is what round 2's blocker turned on.
+    _argv = list(_ast.walk(_void_labels_def[0]))
     _argv_literals = [n.value for n in _argv if isinstance(n, _ast.Constant)]
     for _needed in ("review-state", "void-receiptless", "--expect-plan"):
         assert _needed in _argv_literals, \

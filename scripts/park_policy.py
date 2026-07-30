@@ -1494,6 +1494,27 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
     live_void_key = (receiptless_void_key(canonical_ts(latest_park.isoformat()))
                      if latest_park is not None else None)
     if live_void_key:
+        # [registry #1309, review round 2 BLOCKER] THE CONVERGENCE MUST CARRY THE PLAN.
+        #
+        # It did not, and the branch was therefore INERT — the one defect in this change that
+        # re-created, through its own recovery path, exactly the permanent strand the exit exists to
+        # remove. The evidence dict omitted "plan", so the sweep passed `evidence.get("plan")` =
+        # None into `void_labels`, whose argv built `"--expect-plan", str(None)` = the STRING
+        # "None"; and `expect_plan is not None and plan != expect_plan` treats that string as a real
+        # expectation, so the writer stood down on EVERY convergence. Executed against the real
+        # writer: `{changes, parked}` with expect_plan="None" -> `plan-changed`, nothing written, for
+        # both plan shapes. Any transient failure of the label write after the receipt landed — 403,
+        # secondary rate limit, 503, all attested in this estate — would have left that PR with a
+        # SPENT one-shot budget and a LIVE park, forever, healing on no later tick.
+        #
+        # The plan is derived HERE rather than reused from the mint branch below because the mint
+        # branch is not reached on this path. It is deliberately allowed to be None: the ACTION stays
+        # `void-receipt` regardless, so a read-only proof gate still ADMITS a PR whose void is
+        # publicly receipted (a None-plan refusal at the ADMISSION would re-create the #614
+        # defer-forever state M14 exists to guard). What a None plan changes is only the WRITE: the
+        # sweep omits `--expect-plan` and the writer re-derives on its own fresh read, refusing and
+        # censusing rather than improvising.
+        converge_plan, converge_plan_detail = receiptless_void_label_plan(pr_review_labels)
         for receipt in void_receipts:
             if not isinstance(receipt, dict) or receipt.get("key") != live_void_key:
                 continue                  # a void of a DIFFERENT, closed park episode
@@ -1501,9 +1522,11 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
                 continue                  # malformed receipts prove nothing (they still count
                 # toward RECEIPTLESS_VOID_MAX below, so they can never buy an extra void)
             return _answer(
-                "void-receipt", {"key": live_void_key, "at": canonical_ts(receipt["at"])}, None,
+                "void-receipt", {"key": live_void_key, "at": canonical_ts(receipt["at"]),
+                                 "plan": converge_plan}, None,
                 f"this receipt-less park was already voided at {canonical_ts(receipt['at'])} "
-                f"(void evidence {live_void_key!r}); no new budget consumed")
+                f"(void evidence {live_void_key!r}); no new budget consumed; "
+                f"{converge_plan_detail}")
     # [registry #1309] Set iff the RECEIPT-LESS VOID exit is earned. The decision is TAKEN in the
     # human-applied branch below (that is where the population dies today) but RETURNED after the
     # auto-receipt convergence and the AUTO_READMISSION_MAX cap, so the void inherits every one of
@@ -2719,13 +2742,37 @@ def receiptless_void_comment(evidence, voided_at, pr_number=None):
     THE SENTENCE IS THE POINT. This receipt states what is actually known — that no cause was ever
     recorded — and explicitly refuses to claim the thing the neighbouring auto-readmission receipt
     claims, that a cause recovered. A receipt is the durable public record of why automation acted,
-    and overclaiming here would launder a guess into the taxonomy."""
+    and overclaiming here would launder a guess into the taxonomy.
+
+    THE DESTINATION SENTENCE IS DERIVED FROM `evidence["plan"]`, not asserted (review round 2). It
+    used to say unconditionally that the PR "returns to `review:needs`", which is FALSE for the
+    `strip-only` plan — three of the seven live rows (#4212 #4222 #4318) return to `review:changes`,
+    their own pre-park verdict. The harm was only a labelling one (no exit is burned, and
+    `review:changes` is the right state), but a false statement in a durable receipt on three live
+    PRs is exactly the overclaiming this docstring forbids two paragraphs up."""
     if not isinstance(evidence, dict):
         raise ValueError("a receipt-less void receipt needs the void evidence")
     body = receiptless_void_marker(evidence.get("key"), voided_at,
                                    evidence.get("prover"), evidence.get("prover_at"))
     where = f" on #{pr_number}" if isinstance(pr_number, int) and not isinstance(
         pr_number, bool) else ""
+    # The DESTINATION, derived from the plan rather than asserted. An unknown plan says nothing about
+    # a destination at all — silence is the honest fallback, and it is the same fail direction the
+    # rest of this module takes on an unknown value.
+    plan = evidence.get("plan")
+    if plan == RECEIPTLESS_VOID_PLAN_STRIP_AND_NEEDS:
+        _where = (f"The park was the ONLY live `review:` label, so the PR returns to "
+                  f"`{MACHINE_PARK_PR_LABEL.split(':', 1)[0]}:needs` — which puts it back in the "
+                  "review lane's candidate set and census. That is **not** a claim that a review "
+                  "has been scheduled.")
+    elif plan == RECEIPTLESS_VOID_PLAN_STRIP:
+        _where = ("Only the park label is removed, so the PR returns to **the review state it held "
+                  "before the park** — its own pre-park verdict, restored rather than replaced. No "
+                  "review state is invented, and this is **not** a claim that a review or fix has "
+                  "been scheduled.")
+    else:
+        _where = ("The park label is removed and no review state is written or asserted by this "
+                  "receipt.")
     return (
         f"> 🤖 SPARQ agent — VOIDING a receipt-less machine park{where}. **No cause has been "
         "reconstructed, because none was ever recorded.**\n\n"
@@ -2741,10 +2788,8 @@ def receiptless_void_comment(evidence, voided_at, pr_number=None):
         "of a receipt**, not because anything is known to have recovered. Nothing here asserts why "
         "the PR was parked, and the park comment's prose was not read.\n\n"
         "This exit is one-shot: `RECEIPTLESS_VOID_MAX` is spent for this PR now, and any future "
-        "machine park will carry its own cause receipt and take its own cause-gated exit. The PR "
-        f"returns to `{HUMAN_PR_PARK_LABEL.rsplit(':', 1)[0]}:needs` — which puts it back in the "
-        "review lane's candidate set and census; it is not a claim that a review has been "
-        "scheduled.\n\n"
+        f"machine park will carry its own cause receipt and take its own cause-gated exit. {_where}"
+        "\n\n"
         f"{body}")
 
 
@@ -4446,7 +4491,29 @@ def _self_test():
           "spends no new budget, and does so WITH the one-shot budget already spent",
           void_admit(void_receipts=standing_void,
                      void_marker_count=RECEIPTLESS_VOID_MAX)[:2],
-          ("void-receipt", {"key": receiptless_void, "at": "2026-07-26T19:00:00Z"}))
+          ("void-receipt", {"key": receiptless_void, "at": "2026-07-26T19:00:00Z",
+                            # [round 2 BLOCKER] THE PLAN, and this is the whole repair. Without it
+                            # the sweep passed `evidence.get("plan")` = None into the writer's
+                            # `str(plan)`, producing the STRING "None", which the writer's
+                            # `expect_plan is not None` test read as a real expectation and stood
+                            # down on — so the convergence NEVER WROTE. A transient failure of the
+                            # label write after the receipt landed would then have left the PR with a
+                            # spent one-shot budget and a live park FOREVER: the exact strand this
+                            # exit removes, re-created through its own recovery path.
+                            "plan": RECEIPTLESS_VOID_PLAN_STRIP_AND_NEEDS}))
+    check("(e5) ...and the convergence's plan tracks the LIVE namespace, so it writes what THIS "
+          "PR now needs rather than what the mint decided at some earlier instant",
+          [void_admit(pr_review_labels=labels, void_receipts=standing_void,
+                      void_marker_count=RECEIPTLESS_VOID_MAX)[1]["plan"]
+           for labels in ([MACHINE_PARK_PR_LABEL],
+                          [MACHINE_PARK_PR_LABEL, "review:changes"],
+                          [MACHINE_PARK_PR_LABEL, "review:changes", "review:needs"])],
+          [RECEIPTLESS_VOID_PLAN_STRIP_AND_NEEDS, RECEIPTLESS_VOID_PLAN_STRIP, None])
+    check("(e5) ...and an un-writable convergence STILL returns void-receipt, so a read-only proof "
+          "gate admits a publicly-receipted void rather than deferring forever (#614 / M14)",
+          void_admit(pr_review_labels=[MACHINE_PARK_PR_LABEL, "review:changes", "review:needs"],
+                     void_offered=False, void_receipts=standing_void,
+                     void_marker_count=RECEIPTLESS_VOID_MAX)[0], "void-receipt")
     check("(e5) ...and the READ-ONLY proof gate converges it too, so the machine's own void is "
           "never invisible to the gate that reads it (the #614 deadlock, not re-created)",
           void_admit(void_offered=False, void_receipts=standing_void,
@@ -4540,8 +4607,30 @@ def _self_test():
               "> 🤖 SPARQ agent", "No cause has been reconstructed, because none was ever recorded",
               "for want of a receipt",
               "not because anything is known to have recovered",
-              "the park comment's prose was not read",
-              "not a claim that a review has been scheduled")], [True] * 6)
+              "the park comment's prose was not read")], [True] * 5)
+    # [round 2] THE DESTINATION SENTENCE IS DERIVED, NOT ASSERTED. Round 1's receipt said
+    # unconditionally that the PR "returns to review:needs" — FALSE for the `strip-only` plan, i.e.
+    # for three of the seven live rows (#4212 #4222 #4318), which return to `review:changes`. The
+    # harm was a labelling one, but a false statement in a durable receipt on three live PRs is
+    # precisely the overclaiming this receipt exists to avoid.
+    def void_body_for(plan):
+        return receiptless_void_comment(
+            {"key": receiptless_void, "park_at": receiptless_park_at, "prover": "jeswr",
+             "prover_at": receiptless_self_id, "plan": plan}, "2026-07-26T19:00:00Z", pr_number=41)
+
+    check("(e5) the receipt's DESTINATION sentence follows the plan: only strip-and-needs may claim "
+          "review:needs, and strip-only says the PRE-PARK state is restored",
+          [("returns to `review:needs`" in void_body_for(RECEIPTLESS_VOID_PLAN_STRIP_AND_NEEDS),
+            "review:needs" in void_body_for(RECEIPTLESS_VOID_PLAN_STRIP)),
+           ("the review state it held before the park" in void_body_for(
+               RECEIPTLESS_VOID_PLAN_STRIP),
+            "no review state is written or asserted" in void_body_for(None))],
+          [(True, False), (True, True)])
+    check("(e5) ...and NO plan may claim a review was scheduled",
+          [("not** a claim that a review" in void_body_for(plan)
+            or "no review state is written or asserted" in void_body_for(plan))
+           for plan in (RECEIPTLESS_VOID_PLAN_STRIP_AND_NEEDS, RECEIPTLESS_VOID_PLAN_STRIP, None)],
+          [True] * 3)
     check("(e5) the marker is ANCHORED to a whole line, so a marker ECHOED inside another line is "
           "structurally not a receipt (#1096's rule, inherited not re-derived)",
           receiptless_void_records([{"user": {"login": "bot"}, "body": f"- x: \"{void_body}\""}],
