@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-30T12:05:19Z",
+  "generated_at": "2026-07-30T12:14:10Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
@@ -27,7 +27,7 @@
       "issues_open": 608,
       "issues_ready": 211,
       "issues_closed_1h": 0,
-      "issues_closed_24h": 22,
+      "issues_closed_24h": 21,
       "prs_open": 39,
       "prs_draft": 29,
       "prs_opened_1h": 0,
