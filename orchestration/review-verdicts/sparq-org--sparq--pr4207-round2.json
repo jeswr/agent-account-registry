@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4207,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c6f5474b08aecee6a03d012338eb4e5ccd8c65b3",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The prior major denial-of-service finding is resolved. Multibase decoding now enforces a documented 164-byte body limit before dispatching to any decoder, bounding the quadratic base58btc path and allocation. The bound is conservatively derived from the maximum structurally accepted multihash size and still admits the longest supported SHA-512/base16 representation. Both unit and public-path regression tests use oversized alphabet-valid inputs and assert the specific pre-decode rejection, so the test is not vacuous. No new correctness, soundness, test-validity, or security issues were found in the round-2 diff.",
+  "verdict": "approve"
+ }
+}
