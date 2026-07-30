@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1195,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "da236831baa787c5863285d7e2a7313168bc6733",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 diff remains correct and complete. The changed groom and retriage limits are strictly between one and two independently derived nominal cadences. The cadence reader fails closed for unsupported schedules, includes the hourly wrap-around gap, unions multiple cron expressions, and confines extraction to the workflow's top-level `on:` block. The tests are non-vacuous: they pin independent parser results and refusal cases, exact-match the run-anchored watch set, enforce both strict bounds, and exercise the real keepalive leg in both directions with ages derived from the watched workflows rather than the thresholds under test. No trust check or audit binding is weakened, and the diff contains no reviewer-directed instruction.",
+  "verdict": "approve"
+ }
+}
