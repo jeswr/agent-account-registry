@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5161,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1971d8b6e3ec9f89601a8f921dbbb760dfd51c6d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The documentation-only change is internally consistent with the cited design record and GitHub merge-queue field semantics. It clearly distinguishes dated snapshot values from live-verified settings, keeps the proposed 3-to-5 build-capacity change conditional and unapplied, correctly explains that the minimum-entry wait cannot bind when the minimum is one, and accurately reconciles the historical CodeQL measurement with its currently disabled workflow state. No executable behavior or test surface is changed, and no vacuous test claim is introduced.",
+  "verdict": "approve"
+ }
+}
