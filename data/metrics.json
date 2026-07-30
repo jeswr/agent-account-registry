@@ -1,18 +1,18 @@
 {
-  "generated_at": "2026-07-30T21:42:02Z",
+  "generated_at": "2026-07-30T21:48:18Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 1820,
-      "issues_ready": 369,
-      "issues_closed_1h": 0,
-      "issues_closed_24h": 10,
-      "prs_open": 95,
+      "issues_open": 1815,
+      "issues_ready": 366,
+      "issues_closed_1h": 5,
+      "issues_closed_24h": 15,
+      "prs_open": 94,
       "prs_draft": 78,
       "prs_opened_1h": 3,
       "prs_closed_1h": 1,
-      "prs_merged_1h": 0,
-      "prs_merged_24h": 6,
+      "prs_merged_1h": 1,
+      "prs_merged_24h": 7,
       "review_changes_backlog": 11,
       "needs_user_parked": 23,
       "review_lane_health": "ok",
@@ -20,11 +20,11 @@
       "worker_attempts_1h": 5,
       "worker_success_rate_1h": 0.4,
       "pr_open_rate": 3.0,
-      "pr_close_rate": 1.0,
-      "net_pr_flow": 2.0
+      "pr_close_rate": 2.0,
+      "net_pr_flow": 1.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 612,
+      "issues_open": 613,
       "issues_ready": 211,
       "issues_closed_1h": 1,
       "issues_closed_24h": 6,
@@ -48,12 +48,24 @@
   "alerts": [
     {
       "target": "sparq-org/sparq",
-      "classification": "ready-starved",
+      "classification": "backlog-growing",
       "fire": true,
-      "summary": "ready frontier 369 > 60 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
+      "summary": "open PRs 94 > 40 and net PR flow +1.0/hr (open 3.0 > close 2.0) sustained over 2 snapshots",
       "metrics": {
-        "issues_ready": 369,
-        "issues_closed_1h": 0
+        "prs_open": 94,
+        "net_pr_flow": 1.0,
+        "pr_open_rate": 3.0,
+        "pr_close_rate": 2.0
+      }
+    },
+    {
+      "target": "sparq-org/sparq",
+      "classification": "worker-failing",
+      "fire": true,
+      "summary": "worker success rate 40% < 50% floor over 2 snapshots (5 attempts this hour)",
+      "metrics": {
+        "worker_success_rate_1h": 0.4,
+        "worker_attempts_1h": 5
       }
     }
   ]
