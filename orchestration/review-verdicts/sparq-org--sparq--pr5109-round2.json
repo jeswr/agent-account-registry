@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5109,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "add8fd3abf56dcdfb104f1b2d8ad2f96870a3b92",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains clean. The external differential is confined to test-only Rust code and an optional scheduled workflow, with no runtime dependency or default-path impact. Translation rejects unsupported constructs, does not reuse the implementation's stratification result, compares the full closure projected onto modeled relations, and correctly represents correlated, grouped, and nullary negation. The tests are substantive: they pin generated source, exercise accepted and rejected programs, witness both outcomes of nullary negation, validate fail-closed fragment boundaries, and cover process-spawn failure. Required mode prevents the scheduled lane from silently skipping when Souffle is unavailable. No actionable correctness, soundness, security, or test-validity defect was found; this is materially unchanged from the clean prior review.",
+  "verdict": "approve"
+ }
+}
