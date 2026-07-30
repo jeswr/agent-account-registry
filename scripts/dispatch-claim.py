@@ -1807,7 +1807,7 @@ def source_issue_holds(source_labels):
 
     WHY THE RULE IS UNCHANGED, having measured that. Waiving a resource gate here looks like the
     obvious next step and is a NET LOSS, proven by execution on this estate (registry #1311 review,
-    and #1314 for the layer map):
+    and #1316 for the layer map):
       * `worker_pr.live_human_holds` — the WRITE side — globs the same namespace and is the gate on
         review-outcome, fix-outcome AND ready-and-arm. `live_human_holds('sparq-org/sparq', 4053,
         issue=3027)` returns `['needs:ec2']`, so the outcome step takes `if holds:` and prints
@@ -3728,7 +3728,7 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         # only two are human questions; on the measured tick it attributed three `needs:ec2`
         # resource-gate refusals to a human decision, which is why they sat unexamined for days.
         # The RULE is unchanged — see source_issue_holds for why narrowing it here alone is a net
-        # loss, and #1314 for what a real narrowing has to move.
+        # loss, and #1316 for what a real narrowing has to move.
         held_by = source_issue_holds(source_labels)
         if held_by:
             # Counted UNCONDITIONALLY (not inside exclude_signalled, which is signalled-only): an
@@ -24357,7 +24357,7 @@ def _python_sentinel_block(path, marker):
     return "\n".join(line[pad:] for line in body)
 
 
-# [#1311 / #1314] THE SOURCE-ISSUE HOLD LAYER MAP, PINNED AS AN EXECUTABLE INVENTORY.
+# [#1311 / #1316] THE SOURCE-ISSUE HOLD LAYER MAP, PINNED AS AN EXECUTABLE INVENTORY.
 #
 # WHY THIS EXISTS. The first attempt at narrowing this hold (PR #1313, withdrawn) changed the
 # ENUMERATION layer and left the WRITE and PARK layers globbing. The measured consequence was not a
@@ -24444,7 +24444,7 @@ def _source_issue_hold_layer_map_self_test():
         f"  newly present:     {sorted(unknown)}\n"
         "If you are NARROWING this hold (e.g. to let a resource gate such as `needs:ec2` stop "
         "holding a review), you must move the ENUMERATION, WRITE and PARK layers in ONE change — "
-        "see registry #1314. Narrowing the enumeration layer alone was measured to charge a real "
+        "see registry #1316. Narrowing the enumeration layer alone was measured to charge a real "
         "review round per tick and discard its entire product, then terminate in a park with no "
         "automatic exit: strictly worse than the refusal it replaced.")
     for key, count in sorted(observed.items()):
@@ -24463,7 +24463,7 @@ def _source_issue_hold_layer_map_self_test():
     assert 'startswith("needs:")' not in _strip_script_comments(workflow), (
         "review-fix.yml grew a LOCAL `needs:` glob again — that local copy is exactly how the "
         "last leg kept refusing a population the dispatcher had started admitting")
-    print(f"  ok   [#1311/#1314] the `needs:` source-issue hold layer map is pinned at "
+    print(f"  ok   [#1311/#1316] the `needs:` source-issue hold layer map is pinned at "
           f"{len(observed)} site(s) across 3 files, every review-loop leg reaches the namespace "
           "only through source_issue_holds, and review-fix.yml holds no local copy "
           "(AST-derived, so a comment naming the idiom cannot satisfy it)")
