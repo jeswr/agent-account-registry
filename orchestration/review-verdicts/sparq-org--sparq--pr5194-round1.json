@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5194,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "87536c0ce9dab45fb2fda6e9abb9ab8bac0fe4fc",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The pre-registration says KILL 3 fires when hedging regresses abstention precision, but `verdict_for` only tests trap-subset recall-like scores plus mean ordinary-task answer accuracy. `acc_non_regression` is not equivalent to abstention precision: if baseline ordinary accuracy is low, the treatment may add false-positive abstentions on answerable tasks while keeping mean ordinary score at or above baseline, and can still satisfy `quality_superior` and be recommended. The output also exposes no abstention precision/recall values, despite declaring that axis. The current synthetic success fixture has no false-positive abstentions, so it does not catch this omission.",
+    "file": "bench/pkg-dogfood/prov_ab.py",
+    "fix_hint": "For the hedging capability, compute TP/FP/FN from structured abstention decisions across trap and ordinary tasks, report treatment and baseline precision/recall, and add an explicit no-regression precision condition to KILL 3 and `recommend_adopt`. Add a synthetic test where treatment trap recall improves but false-positive abstentions make precision worse; it must fire KILL 3 and refuse adoption.",
+    "severity": "major",
+    "title": "Hedging adoption does not measure or gate abstention precision"
+   }
+  ],
+  "progress": null,
+  "summary": "The analyzer is thoughtfully structured and its synthetic tests cover most declared honesty gates and kill paths, but the hedging decision does not implement one of the pre-registered load-bearing quality criteria. It can recommend adoption even when abstention precision regresses, so the emitted verdict is not yet sound as scoped.",
+  "verdict": "request_changes"
+ }
+}
