@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5154,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4c378ca83ab10c6cbfa53fdb4a8c807274d0c18a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The read-only verification path correctly reconciles planned beads against unambiguous issue mappings, detects duplicate mappings and missing dependency/parent markers, treats unresolved endpoints fail-closed through the corresponding duplicate/unmigrated conditions, and returns a failing exit status for live gaps. The tests exercise complete, interrupted, wrong-target, wrong-kind, duplicate, unmigrated, closed-endpoint, native-summary, report-rendering, and parser-sync cases on the real verification functions. The CLI rejects conflicting write/read modes and short-circuits verification before all mutation paths. No correctness, soundness, test-validity, or security defect requiring changes was found.",
+  "verdict": "approve"
+ }
+}
