@@ -11,16 +11,6 @@
    "expires_at": 1785451106
   },
   {
-   "account": "efb4eb2781de6958",
-   "claim_id": "bf140466a58c47de8fef49b57e263154",
-   "holder": "fix:sparq-org/sparq#4207@dispatch-30580699996.1",
-   "package": "sparq-canon",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785444838,
-   "expires_at": 1785451138
-  },
-  {
    "account": "9e13ea21abf27e68",
    "claim_id": "4247b4b757204cf3baf313ed17f0c024",
    "holder": "fix:sparq-org/sparq#4318@dispatch-30580699996.1",
