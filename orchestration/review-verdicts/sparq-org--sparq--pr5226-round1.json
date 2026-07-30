@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5226,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "16dc2b5870723be2ec9f235dd0de9a64e96f1eef",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The opt-in DualLeafV1 host commitment builder is correct and complete for its explicitly limited host-only scope. It reuses the established RDFC10 canonicalization and canonical triple order, preserves the flat graph sponge and salt-scoped blank-node encoding, routes the three declared hookable datatypes through their existing same-leaf encoders, and fails the whole commitment on rejected hookable lexicals or uncommittable RDF 1.2 terms. The load-bearing fail-closed test exercises the real commit_triples_dual path and distinguishes the forbidden downgrade from a valid canonical sibling; the ordering test compares against the existing commitment pipeline and independently recomputes leaves and the sponge. Public documentation accurately describes the parallel-builder scope, unrouted datatype seams, absent circuit/verifier integration, INV-VL downgrade, research-grade status, and pending external audit. No uncaveated soundness/privacy claim or security regression was found.",
+  "verdict": "approve"
+ }
+}
