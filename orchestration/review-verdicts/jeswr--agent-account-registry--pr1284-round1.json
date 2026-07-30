@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1284,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "29c4b0f93ae591ef9231c07c44e00d4bec4f009d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The gate's target-controlled build scripts/tests run as the runner user and receive RUNNER_TEMP. Rebinding GITHUB_ENV, GITHUB_PATH, GITHUB_OUTPUT, and GITHUB_STEP_SUMMARY only hides their original path strings; it does not make the runner-created files inaccessible. Cargo can enumerate the readable `_runner_file_commands` directory (for example by filename prefixes such as `set_env_`, `add_path_`, and `step_summary_`) and append directly to the real files that the runner consumes after the step. In this lane that can poison the following `push` step, where a write-capable GH_TOKEN is introduced. The new self-tests only verify YAML text and absence of `steps.gate.outputs`; they never exercise or disprove this filesystem bypass, so the marquee quarantine claim is unsupported.",
+    "file": ".github/workflows/review-fix.yml",
+    "fix_hint": "Put the target-controlled gate behind an actual isolation boundary that cannot access the host runner command-file directory (for example, a container with only the required target inputs mounted), or otherwise implement and adversarially test a trusted mechanism that prevents writes to the real runner command files. Add a test using gate-shaped target code that searches RUNNER_TEMP for the original command files and attempts to poison a later sentinel step; approval requires that attempt to fail.",
+    "severity": "blocker",
+    "title": "Environment-variable redirection does not quarantine same-user runner command files"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe transcript purge is carefully fail-closed and well exercised, but the runner-command-file quarantine does not provide the claimed security boundary. Target-controlled code runs as the runner user and can rediscover the real command files under RUNNER_TEMP, bypassing the substituted environment paths. Because the fix lane subsequently runs a token-bearing push step, this leaves the principal cross-step attack path open.",
+  "verdict": "request_changes"
+ }
+}
