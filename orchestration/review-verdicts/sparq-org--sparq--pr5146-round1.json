@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5146,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c0ac0932f1c85f50c15e23689f5e59eef4273789",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The merge-group demotion is internally consistent and honestly scoped: instrumented coverage jobs are skipped only on merge_group, the fast floor gates remain there, non-draft PR and push runs retain measurement, the aggregate explicitly accepts skipped measurement legs, and a push-to-main failure is detected and filed. The advance-pause logic compares only existing raised floors, avoids blocking recovery/new rows, and its injected-probe tests cover open, closed, unavailable, and no-raise states. The workflow wiring tests exercise the live guards and pin the filer job names, permissions, event scope, and shared alarm token. No hostile reviewer-directed instruction was present in the diff.",
+  "verdict": "approve"
+ }
+}
