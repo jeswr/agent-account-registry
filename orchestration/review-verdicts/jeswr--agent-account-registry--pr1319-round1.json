@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1319,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7c539c6e6a504f90b57597faf45bbdfaa3eb74e6",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_park_blocks_review_repair` treats `owned_by_review_rebase_lane(detail_without_park, ...)` as proof that this park is the only refusal and then permanently removes the park. But that predicate's own contract says it is only a necessary-condition test: `review_items` can still refuse the PR for registry provenance, a `needs:*` label on the source issue, or a live sibling package lease, none of which this resolver reads. In any of those states the new branch clears the park, mutates the current detail, and cedes this tick; later sweeps also cede because the park is gone. The downstream lane continues refusing, leaving the conflicting PR with no owner. This is especially unsafe because the new comment and action assert that the receiving lane owns the PR when that has not been established. The added self-tests exercise author/ref/fork and local hard-exclusion labels only, so they cannot detect this case.",
+    "file": "scripts/resolve-conflicts.py",
+    "fix_hint": "Require positive, authoritative admission evidence from the receiving lane before clearing the park (including provenance, source-issue holds, and lease state), or use a handoff/acknowledgement protocol in which the park remains until the repair lane durably accepts the item. Add an end-to-end negative test for each downstream-only refusal showing that the park label remains and no handover receipt/action is emitted.",
+    "severity": "major",
+    "title": "Park is cleared without proving that the repair lane will admit the PR"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new exit is not fail-closed: it describes the machine park as the only refusal after consulting a predicate that intentionally checks only PR shape and PR labels, even though the receiving lane has additional admission refusals that this resolver cannot observe. Clearing the durable park on that evidence can recreate the ownerless state the change is intended to repair. The tests cover visible PR-label and shape refusals but not the unobservable downstream refusals.",
+  "verdict": "request_changes"
+ }
+}
