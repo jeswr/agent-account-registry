@@ -1355,7 +1355,7 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
                             auto_marker_count=None, auto_evidence=None, live_holds=(),
                             census=None, reason_records=(), attestations=(),
                             self_id_rows=(), void_receipts=(), void_marker_count=None,
-                            void_offered=False):
+                            void_offered=False, pr_review_labels=()):
     """Whether a MACHINE capacity park may be re-admitted now, and on WHOSE authority
     (invariant 3). Returns (action, evidence, detail), where `evidence` is None or
     {"key", "at"} — the recovery event's durable identity plus its canonical recovery stamp, i.e.
@@ -1580,10 +1580,15 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
             void_evidence = {"key": void_key,
                              "park_at": canonical_ts(latest_park.isoformat()),
                              "prover": str(prover_row.get("login")),
-                             "prover_at": canonical_ts(prover_row.get("at"))}
+                             "prover_at": canonical_ts(prover_row.get("at")),
+                             # [B1] The EXACT label write the caller is authorised to perform. It
+                             # travels WITH the evidence rather than being re-derived at the call
+                             # site, so the decision that spent the one-shot budget and the write
+                             # that follows it cannot be about two different plans.
+                             "plan": void_plan}
             void_detail = (f"no park-reason receipt of any kind exists, and {how} — voiding this "
                            f"park FOR WANT OF A RECEIPT (no cause is claimed to have recovered, "
-                           f"and none was reconstructed)")
+                           f"and none was reconstructed); {plan_detail}")
             log(f"receipt-less MACHINE park on {repo}#{pr_number} "
                 f"({'/'.join(human_park_labels)} at "
                 f"{canonical_ts(latest_park.isoformat())}): {void_detail}")
@@ -4252,6 +4257,9 @@ def _self_test():
         kwargs.setdefault("reason_records", ())          # the receipt-less population, by definition
         kwargs.setdefault("self_id_rows", orchestrator_self_id)
         kwargs.setdefault("void_offered", True)
+        # [B1] The park is the only live review:* label unless a row says otherwise, so these rows
+        # isolate their own axis; the LABEL-PLAN axis gets its own block below.
+        kwargs.setdefault("pr_review_labels", [MACHINE_PARK_PR_LABEL])
         return admit(**kwargs)
 
     timelines[41] = [receiptless_park]
@@ -4264,7 +4272,9 @@ def _self_test():
           "the SAME account 2s earlier, ZERO park-reason receipts) earns the one-shot VOID",
           void_admit(log=logs.append, auto_evidence=None)[:2],
           ("void-mint", {"key": receiptless_void, "park_at": receiptless_park_at,
-                         "prover": "jeswr", "prover_at": receiptless_self_id}))
+                         "prover": "jeswr", "prover_at": receiptless_self_id,
+                         # [B1] the exact label write the caller is authorised to perform
+                         "plan": RECEIPTLESS_VOID_PLAN_STRIP_AND_NEEDS}))
     # THE CLAIM THE RECEIPT MAKES is the whole reason this exit is allowed to exist. It must state
     # what is known and must NOT claim a cause — a fabricated cause would be worse than none.
     check("(e5) the detail states WHAT IS KNOWN and explicitly refuses to claim a cause",
@@ -4316,6 +4326,14 @@ def _self_test():
                       auto_evidence=post_park_evidence)[0],
            void_admit(self_id_rows=({"login": "jeswr", "at": "2026-07-26T18:34:01Z"},))[0]],
           [None, "void-mint"])
+    # THE BOUNDARY ITSELF, because the row above cannot see `<=` weakened to `<`: at 18:33:58 both
+    # spellings exclude. Review round 1 predicted this survivor and it did. A self-ID landing EXACTLY
+    # at the previous park instant belongs to that closed episode — receipt-first ordering means the
+    # earlier park's own narration sits at or just before it — so the bound must be INCLUSIVE.
+    check("(e5) ...and the closed-episode bound is INCLUSIVE: a self-ID exactly AT the previous "
+          "park instant belongs to that episode, not to this one",
+          void_admit(self_id_rows=({"login": "jeswr", "at": "2026-07-26T18:34:00Z"},),
+                     auto_evidence=post_park_evidence)[0], None)
     timelines[41] = [receiptless_park]
     timelines[7] = []
     # THE DISCRIMINATION THAT PROVES THE GATE WAS NARROWED, NOT WIDENED. An OFF-CLASS receipt is not
@@ -4379,6 +4397,25 @@ def _self_test():
     check("(e5) TERMINATION bound 1: exactly RECEIPTLESS_VOID_MAX voids are granted, then the exit "
           "is closed for the PR's whole lifetime",
           void_walk_actions, ["void-mint"] * RECEIPTLESS_VOID_MAX + [None])
+    # ⚠️ THE WALK ABOVE IS TAUTOLOGICAL ON ITS OWN, and review round 1 measured exactly that:
+    # `RECEIPTLESS_VOID_MAX = 2` and `= 3` both SURVIVED the whole suite, and `= 99` "died" only to
+    # fixture overflow (the hour field reaching 24), which is a FALSE KILL. The loop bound and the
+    # expected list BOTH derive from the constant, so the walk proves the counter is HONOURED and
+    # can never prove it is ONE. The headline claim ("<=1 void per PR, ever") therefore needs a
+    # check whose expected value does NOT come from the symbol under test.
+    #
+    # AGENTS.md pre-flight item 2(c) is the general rule: an input derived from the constant the code
+    # reads cannot falsify that constant.
+    check("(e5) TERMINATION bound 1, PINNED INDEPENDENTLY: the one-shot budget is literally ONE — "
+          "the walk above cannot express this, because its expected value is derived from the very "
+          "symbol whose value is the claim",
+          RECEIPTLESS_VOID_MAX, 1)
+    timelines[41] = [receiptless_park]          # the walk above left its own park behind
+    timelines[7] = []
+    check("(e5) ...and ONE void is what a PR with ONE prior void marker gets refused for, on a "
+          "fixture whose count is a LITERAL rather than the constant",
+          [void_admit(void_receipts=(), void_marker_count=1)[0],
+           void_admit(void_receipts=(), void_marker_count=0)[0]], [None, "void-mint"])
     check("(e5) ...and the spent refusal is HUMAN-TERMINAL, so the cohort is named rather than "
           "quietly re-counted as self-healing every tick",
           park_refusal_exit_class(PARK_REFUSAL_RECEIPTLESS_SPENT), "human-terminal")
@@ -4541,6 +4578,24 @@ def _self_test():
           [contains_reserved_marker(RECEIPTLESS_VOID_MARKER),
            RECEIPTLESS_VOID_MARKER in neutralize_reserved_markers(
                f"echo {RECEIPTLESS_VOID_MARKER} -->")], [True, False])
+    # EVERY comment is counted, not just the first. Review round 1 predicted this survivor and it
+    # did: every cap fixture was a SINGLE-element list, so `comments[:1]` was invisible — and that
+    # mutant hands a PR unlimited voids the moment its receipt is not the newest comment, which is
+    # the normal case (the conflict resolver comments on these PRs constantly).
+    check("(e5) the cap counter scans EVERY comment, not merely the first — a fixture of one can "
+          "never see a slice",
+          [receiptless_void_marker_count(
+              [{"user": {"login": "bot"}, "body": "an ordinary earlier comment"},
+               {"user": {"login": "bot"}, "body": void_body}], "bot"),
+           receiptless_void_marker_count(
+               [{"user": {"login": "drive-by"}, "body": "noise"},
+                {"user": {"login": "bot"}, "body": void_body},
+                {"user": {"login": "bot"}, "body": "a later unrelated comment"}], "bot")],
+          [1, 1])
+    check("(e5) ...and the RECORD reader does too, for the same reason",
+          [row["key"] for row in receiptless_void_records(
+              [{"user": {"login": "bot"}, "body": "earlier"},
+               {"user": {"login": "bot"}, "body": void_body}], "bot")], [receiptless_void])
     check("(e5) the cap counts MARKERS, well-formed or not",
           [receiptless_void_marker_count([{"user": {"login": "bot"}, "body": void_body}], "bot"),
            receiptless_void_marker_count(
@@ -4566,6 +4621,85 @@ def _self_test():
           [receiptless_void_key(receiptless_park_at), receiptless_void_key("not-a-timestamp"),
            receiptless_void_key(None)],
           [receiptless_void, None, None])
+    # ---- [B1] THE LABEL-PLAN AXIS: what the void is ALLOWED to write. ----
+    #
+    # Review round 1's serious finding. `clear_labels` transitions through worker-pr's
+    # `review-state set --state needs`, whose issue-#138 ambiguity rule converges a split `review:*`
+    # namespace to the HUMAN-owned `review:needs-user` — so voiding through it would have spent each
+    # PR's one-shot exit to move it into a STRICTER hold. Five of the eight live candidates.
+    #
+    # The plan predicate is pinned here on the REAL live label sets, and the WRITER's half (through
+    # the real set_review_state) is pinned in worker-pr's own self-test — the two must agree, which
+    # is why both call this one function rather than each carrying a rule.
+    live_label_sets = {
+        3577: ["area:site", MACHINE_PARK_PR_LABEL],
+        3598: ["area:deps", "area:sparq-zk", MACHINE_PARK_PR_LABEL],
+        3641: ["area:bench", "review:needs", "review:changes", MACHINE_PARK_PR_LABEL],
+        4197: [MACHINE_PARK_PR_LABEL],
+        4207: ["review:needs", MACHINE_PARK_PR_LABEL],
+        4212: ["review:changes", MACHINE_PARK_PR_LABEL],
+        4222: ["review:changes", MACHINE_PARK_PR_LABEL],
+        4318: ["area:site", "review:changes", "area:ci", "area:docs", MACHINE_PARK_PR_LABEL],
+    }
+    check("(e5/B1) the plan over the 8 REAL live label sets: 3 strip-and-stamp, 4 strip-only (back "
+          "to their pre-park state), and the one ambiguous independently of the park REFUSES",
+          {number: receiptless_void_label_plan(labels)[0]
+           for number, labels in sorted(live_label_sets.items())},
+          {3577: RECEIPTLESS_VOID_PLAN_STRIP_AND_NEEDS,
+           3598: RECEIPTLESS_VOID_PLAN_STRIP_AND_NEEDS,
+           3641: None,
+           4197: RECEIPTLESS_VOID_PLAN_STRIP_AND_NEEDS,
+           4207: RECEIPTLESS_VOID_PLAN_STRIP,
+           4212: RECEIPTLESS_VOID_PLAN_STRIP,
+           4222: RECEIPTLESS_VOID_PLAN_STRIP,
+           4318: RECEIPTLESS_VOID_PLAN_STRIP})
+    check("(e5/B1) NON-review labels never make a namespace ambiguous — only the review: prefix "
+          "counts, so an area:/trust-surface pile-up cannot refuse a clean void",
+          [receiptless_void_label_plan([MACHINE_PARK_PR_LABEL, "area:ci", "area:docs",
+                                        "trust-surface"])[0],
+           receiptless_void_label_plan([MACHINE_PARK_PR_LABEL, "review:changes", "area:ci"])[0]],
+          [RECEIPTLESS_VOID_PLAN_STRIP_AND_NEEDS, RECEIPTLESS_VOID_PLAN_STRIP])
+    check("(e5/B1) every ambiguity refuses: no live park, a live human terminal, a malformed or "
+          "unreadable label surface",
+          [receiptless_void_label_plan(["review:needs"])[0],
+           receiptless_void_label_plan([MACHINE_PARK_PR_LABEL, HUMAN_PR_PARK_LABEL])[0],
+           receiptless_void_label_plan([MACHINE_PARK_PR_LABEL, 7])[0],
+           receiptless_void_label_plan(MACHINE_PARK_PR_LABEL)[0],
+           receiptless_void_label_plan(None)[0],
+           receiptless_void_label_plan(7)[0]],
+          [None] * 6)
+    check("(e5/B1) an unknown review:* label the writer's closed list does not name STILL counts "
+          "here — the two disagree in the REFUSING direction only",
+          receiptless_void_label_plan(
+              [MACHINE_PARK_PR_LABEL, "review:changes", "review:something-new"])[0], None)
+    # THE ADMISSION REFUSES BEFORE SPENDING THE BUDGET. This is the row that makes the finding
+    # structural: an un-writable void must never be minted, because burning the one-shot exit to
+    # move a PR into a stricter hold is worse than leaving it parked.
+    ambiguous_census = []
+    check("(e5/B1) the admission REFUSES an un-writable void rather than spending the one-shot "
+          "budget on it",
+          void_admit(pr_review_labels=live_label_sets[3641], census=ambiguous_census)[:2],
+          (None, None))
+    check("(e5/B1) ...censused under its OWN code, HUMAN-TERMINAL (nothing de-ambiguates a split "
+          "review namespace, and issue #138 resolves one toward the human terminal)",
+          [(row["code"], row["exit"]) for row in ambiguous_census],
+          [(PARK_REFUSAL_RECEIPTLESS_AMBIGUOUS, "human-terminal")])
+    check("(e5/B1) ...and the refusal NAMES the labels that made it ambiguous",
+          all(token in void_admit(pr_review_labels=live_label_sets[3641])[2]
+              for token in ("review:changes", "review:needs", "ambiguous")), True)
+    check("(e5/B1) the plan TRAVELS with the evidence, so the decision that spent the budget and "
+          "the write that follows cannot be about two different plans",
+          [void_admit(pr_review_labels=live_label_sets[number])[1]["plan"]
+           for number in (4197, 4212)],
+          [RECEIPTLESS_VOID_PLAN_STRIP_AND_NEEDS, RECEIPTLESS_VOID_PLAN_STRIP])
+    check("(e5/B1) a caller that forgets pr_review_labels gets a REFUSAL, never a write",
+          capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted, log=lambda *_a: None,
+                                  reason_records=(), self_id_rows=orchestrator_self_id,
+                                  void_offered=True)[0], None)
+    check("(e5/B1) every declared plan is one the writer knows how to execute",
+          sorted(RECEIPTLESS_VOID_PLANS),
+          sorted({RECEIPTLESS_VOID_PLAN_STRIP, RECEIPTLESS_VOID_PLAN_STRIP_AND_NEEDS}))
+
     # ---- THE REMAINING FAIL-CLOSED LINES, reached DIRECTLY. ----
     #
     # Added because line-granular coverage (AGENTS.md pre-flight item 1) found them at 0 % after the
