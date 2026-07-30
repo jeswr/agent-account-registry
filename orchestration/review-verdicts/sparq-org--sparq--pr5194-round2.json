@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5194,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1afe518a3740846d625c147b87d3d8eab65dff41",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major finding is resolved. The analyzer now computes structured TP/FP/FN abstention statistics for both arms, reports precision and recall, treats increased false-positive abstention rate or lower defined precision as a KILL 3 quality regression, and excludes that capability from adoption. The new synthetic regression test exercises the previously missed case: trap recall improves and ordinary mean accuracy remains unchanged while treatment adds false-positive abstentions; it verifies KILL 3 fires and adoption is refused. The complete synthetic analyzer suite passes (19 tests). No new correctness, soundness, test-validity, or security issues were found in the diff.",
+  "verdict": "approve"
+ }
+}
