@@ -1813,6 +1813,35 @@ def _self_test():                                                       # noqa: 
 
     mint_provenance = _load_mint_provenance()
 
+    # ---- THE SWEEP IS WIRED TO THE THIRD LAST MILE (mint_provenance.review_run_refusal) --------
+    # [registry #1288] review-fix.yml's `run` job now ADMITS the self-attested class — into a job
+    # that holds no target App token, which is what replaced the App-author check — so the shared
+    # writer no longer refuses it and this sweep mints again.
+    #
+    # Both directions are asserted UNPATCHED and through the sweep's OWN composition, because the
+    # thing being proved is the wiring, not the answer: a sweep that stopped consulting the run
+    # gate would satisfy the live row alone. Only then is the refusal stood down for the rest of
+    # the suite, where every row is about some OTHER predicate and would otherwise pass for this
+    # reason and stop testing what it names.
+    _amp_claim = mint_provenance._load_dispatch_claim()
+    _live_run_refusal = mint_provenance.review_run_refusal(
+        _amp_claim.review_fix_identity_admits_orchestrator_class,
+        shell_admits=_amp_claim.worker_live_admits_orchestrator_class)
+    check("the shared writer ADMITS the class on the live identity gate",
+          _live_run_refusal, None)
+    _refused_run_refusal = mint_provenance.review_run_refusal(
+        lambda: False, shell_admits=lambda: True)
+    check("...and still refuses it when the identity gate does, naming that gate",
+          isinstance(_refused_run_refusal, str)
+          and "target-App identity gate" in _refused_run_refusal, True)
+    # [registry #1288] ...and when the FOURTH consumer refuses while the identity gate admits. The
+    # sweep must carry every conjunct, not the one that happened to be live when it was written.
+    _refused_by_shell = mint_provenance.review_run_refusal(
+        lambda: True, shell_admits=lambda: False)
+    check("...and refuses when worker-live.sh's own head-ref gate would refuse the head branch",
+          isinstance(_refused_by_shell, str) and "worker-live.sh" in _refused_by_shell, True)
+    mint_provenance.review_run_refusal = lambda _probe, **_kw: None
+
     # ---- THE RENDERED ORACLE, AND THE INSTRUMENT THAT MEASURES IT -----------------------------
     # ROUND 6 REDESIGN. Rounds 3-5 stripped quoted markdown constructs from the SOURCE and were
     # found permissive three times running, always in the minting direction, because the strip was

@@ -27,6 +27,7 @@ import json
 import os
 from pathlib import Path
 import random
+import fnmatch
 import re
 import subprocess
 import sys
@@ -283,6 +284,23 @@ IDENTITY_REFUSAL_REASONS = {
     "unsafe-default-branch": "the target repository's default branch is not a safe ref name",
     "not-an-app-bot": "the target App token did not identify a GitHub App bot",
     "author-not-app-bot": "the pull request author is not the registry App bot",
+    # [registry #1288] The two refusals that guard the #657 self-attested path. The App-author
+    # check does not apply there — what replaces it is that the run holds NO target authority at
+    # all — so these are the executable statements of that property. Both are as deterministic as
+    # the four above: whether a token was minted and whether the target is public are facts about
+    # the workflow and the repository, not about the attempt.
+    "self-attested-run-holds-a-target-token":
+        "the self-attested review path minted a target App token, which is the authority its "
+        "admission rule exists to remove",
+    "self-attested-target-is-not-public":
+        "the self-attested review path requires a public target, because everything it reads "
+        "must be readable without target authority",
+    # [registry #1288] The replacement for master's `[[ -n "$GH_TOKEN" ]] || exit 1`, which became
+    # vacuous once GH_TOKEN legitimately falls back to the registry's own token. A run that is NOT
+    # self-attested must hold a target App token, or the App-author comparison compares against an
+    # identity that confers nothing over the target.
+    "target-token-not-minted":
+        "the run is not self-attested, so it requires a target App token, and none was minted",
 }
 # The window key for the initial no-cutoff window — mirrors park_policy.PARK_WINDOW_NONE
 # (kept literal here so the pure marker parser needs no module load; never valid ISO-8601, so
@@ -2379,6 +2397,90 @@ def provenance_path(target_repo, pr_number):
 def verdict_path(target_repo, pr_number, round_n):
     owner, name = target_repo.split("/", 1)
     return f"{VERDICT_DIR}/{owner}--{name}--pr{pr_number}-round{round_n}.json"
+
+
+def verdict_glob(target_repo, pr_number):
+    """The filename glob matching every recorded review verdict for one PR, at any round.
+
+    Exists because the DELIVERY-layer readers ask "has any round ever produced a verdict bound to
+    this head?" and cannot know the round number in advance. Kept beside `verdict_path` so the two
+    can never disagree about the naming — the same reason `round_claim_glob` sits beside
+    `round_claim_path`."""
+    owner, name = target_repo.split("/", 1)
+    return f"{owner}--{name}--pr{pr_number}-round*.json"
+
+
+# ---- the review ATTEMPT store (registry #1288) --------------------------------------------------
+# WHY IT IS IN `data/` AND NOT BESIDE THE VERDICTS. `orchestration/review-verdicts/` is the record
+# of DECISIONS — what a reviewer concluded. An attempt is not a decision; it is operational state,
+# and `data/` is where this ledger already keeps operational state (leases, model-health, metrics).
+# Keeping them apart is what lets each surface mean exactly one thing.
+#
+# WHY IT IS CHARGED FROM THE `claim` JOB AND NOT FROM `run`. `run` is `contents: read` *because the
+# model executes there*. Charging the attempt from `run` would require giving a job that executes
+# prompt-injectable target code write access to the registry ledger — a far worse trade than the
+# target token this whole change removes. `claim` already holds `contents: write`, already performs
+# ledger writes, runs BEFORE the model, and executes no target code.
+#
+# WHY CREATE-ONLY RATHER THAN READ-MODIFY-WRITE. One file per (target, PR, round) needs no CAS and
+# has no contention: the path IS the idempotency key. A re-run of the same claim re-writes the same
+# document (`claimed_at_run` is volatile, exactly as provenance's stamp is); a DIFFERENT run trying
+# to claim a round that is already charged is a genuine double-dispatch and fails loud.
+ROUND_CLAIM_PREFIX = "data/review-round--"
+
+
+def round_claim_path(target_repo, pr_number, round_n):
+    """The ledger path charging one review ATTEMPT. Single `data/` path segment ending `.json`, so
+    it is already inside ledger-invariant.py's data-only allowlist — this store adds no new file
+    KIND to the trust guard."""
+    owner, name = target_repo.split("/", 1)
+    return f"{ROUND_CLAIM_PREFIX}{owner}--{name}--pr{pr_number}--r{round_n}.json"
+
+
+def round_claim_glob(target_repo, pr_number):
+    """The filename glob matching every attempt charged for one PR."""
+    owner, name = target_repo.split("/", 1)
+    return f"review-round--{owner}--{name}--pr{pr_number}--r*.json"
+
+
+def record_round_claim(registry_repo, target_repo, pr_number, round_n, head_sha, run_key):
+    """Charge one review attempt, BEFORE the model runs. Returns True when this call wrote it.
+
+    THE ORDERING IS THE WHOLE TERMINATION ARGUMENT and it is unchanged from the target-side marker
+    it replaces: charged pre-model, so a run that crashes before producing any verdict has still
+    consumed a round. Relocating the store must not relocate that property — see the executed
+    crash-loop proof in dispatch-claim's self-test."""
+    if not re.fullmatch(r"[0-9a-f]{40}", str(head_sha or "")):
+        raise WorkerPrError("review round claim requires a 40-hex head sha (fail closed)")
+    if not isinstance(round_n, int) or isinstance(round_n, bool) or round_n < 1:
+        raise WorkerPrError("review round claim requires a positive integer round")
+    document = {"repo": target_repo, "pr_number": pr_number, "round": round_n,
+                "head_sha_at_claim": head_sha, "claimed_at_run": str(run_key or "")}
+    return _registry_put_file(
+        registry_repo, round_claim_path(target_repo, pr_number, round_n), document,
+        f"charge review round {round_n} for {target_repo}#{pr_number}",
+        volatile_fields=frozenset({"claimed_at_run"}))
+
+
+def charge_round_claim(registry_repo, target_repo, pr_number, round_n, head_sha, run_key):
+    """CLI leg for `round-claim`. Prints what it did; raises on a genuine write failure.
+
+    THERE IS DELIBERATELY NO ERASER. `round-record`'s target-side twin has one (`round-void`,
+    issue #596), and its input is `WORKER_EXIT_CLASS` — a value derived from the model launch,
+    written into `$GITHUB_ENV` by a step in the same job the model runs in. For the worker class
+    that trade was made knowingly. This store must NOT inherit it: the whole point of moving the
+    accounting here is that the round budget bounding a prompt-injectable model's re-dispatch
+    loop must have no writer downstream of that model. One writer (`claim`, pre-model), no
+    eraser — so nothing the model can influence can extend its own budget.
+
+    The cost is named rather than hidden: a credential-outage launch failure (#596's case) stays
+    CHARGED for this class. That is bounded and self-healing — `max_review_rounds` of them route
+    the PR into the CAPACITY `budget` park, which has automatic re-admission — where the target
+    marker's forever-charge was not. Tracked as its own follow-up, not smuggled in here."""
+    created = record_round_claim(registry_repo, target_repo, pr_number, round_n, head_sha,
+                                 run_key)
+    print(f"review attempt {'charged' if created else 'already charged'} on the ledger for "
+          f"{target_repo}#{pr_number} round {round_n} @ {head_sha[:12]}")
 
 
 def _probe_registry_file(registry_repo, path, ref=None):
@@ -6156,6 +6258,81 @@ def _self_test():
         {"user": {"login": bot}, "body": f"x {MARKER_KINDS['nochange']} round=2 run=13.1 -->"},
         {"user": {"login": bot}, "body": f"x {MARKER_KINDS['missed']} round=2 run=14.1 -->"},
     ]
+    # ---- [registry #1288] the review ATTEMPT store ------------------------------------------
+    # The path IS the idempotency key AND the round index, so losing the round component would
+    # collapse every attempt onto one file and silently un-bound the crash loop (mutant M24).
+    check("the round claim path carries the round",
+          round_claim_path("o/r", 41, 2), "data/review-round--o--r--pr41--r2.json")
+    check("...and distinct rounds are distinct files",
+          round_claim_path("o/r", 41, 2) != round_claim_path("o/r", 41, 3), True)
+    check("...and it stays a single `data/` segment ending .json, so the ledger data-only "
+          "allowlist already admits it without a new file KIND",
+          bool(re.fullmatch(r"data/[^/]+\.json", round_claim_path("o/r", 41, 7))), True)
+    check("the glob matches this PR's claims and only this PR's",
+          (fnmatch.fnmatch("review-round--o--r--pr41--r3.json", round_claim_glob("o/r", 41)),
+           fnmatch.fnmatch("review-round--o--r--pr410--r3.json", round_claim_glob("o/r", 41))),
+          (True, False))
+
+    def _claim_raises(**over):
+        args = {"registry_repo": "reg/istry", "target_repo": "o/r", "pr_number": 41,
+                "round_n": 1, "head_sha": "a" * 40, "run_key": "9.1", **over}
+        try:
+            record_round_claim(**args)
+        except WorkerPrError as exc:
+            return str(exc)
+        return None
+
+    # FAIL CLOSED on the head sha: the claim binds the head it was charged for, and a claim that
+    # will accept anything is a claim that cannot be audited (mutant M23).
+    for _why, _bad in (("empty", ""), ("none", None), ("short", "a" * 39),
+                       ("non-hex", "z" * 40), ("uppercase", "A" * 40)):
+        check(f"a {_why} head sha is refused before anything is written",
+              "40-hex" in (_claim_raises(head_sha=_bad) or ""), True)
+    for _why, _bad in (("zero", 0), ("negative", -1), ("boolean", True), ("float", 1.0)):
+        check(f"a {_why} round is refused", "positive integer" in (_claim_raises(round_n=_bad) or ""),
+              True)
+    # The run key is VOLATILE: a re-run of the same claim must be idempotent, not a loud failure
+    # (mutant M25). Asserted at the call, by inspecting what the writer is told.
+    _put_calls = []
+    _saved_put = globals()["_registry_put_file"]
+    try:
+        globals()["_registry_put_file"] = lambda *a, **k: _put_calls.append((a, k)) or True
+        record_round_claim("reg/istry", "o/r", 41, 2, "b" * 40, "77.1")
+    finally:
+        globals()["_registry_put_file"] = _saved_put
+    check("the claim is written create-only to the ledger path for its round",
+          _put_calls[0][0][1], "data/review-round--o--r--pr41--r2.json")
+    check("...with `claimed_at_run` marked VOLATILE, so a re-run is idempotent not a hard failure",
+          "claimed_at_run" in _put_calls[0][1]["volatile_fields"], True)
+    check("...and the document binds the head sha it charged",
+          _put_calls[0][0][2]["head_sha_at_claim"], "b" * 40)
+    # [registry #1288] ...AND THE CLI LEG ACTUALLY CHARGES (mutant N15). `charge_round_claim` is
+    # the thin wrapper the `claim` job invokes, and a thin wrapper whose one job is to call the
+    # writer is exactly the shape that survives every test of the writer beneath it. Asserted at
+    # the CALL, the same idiom as the volatile-fields row above.
+    _cli_calls = []
+    _saved_record = globals()["record_round_claim"]
+    try:
+        globals()["record_round_claim"] = lambda *a: _cli_calls.append(a) or True
+        charge_round_claim("reg/istry", "o/r", 41, 2, "c" * 40, "78.1")
+    finally:
+        globals()["record_round_claim"] = _saved_record
+    check("the round-claim CLI leg CHARGES — it invokes the writer with its own arguments",
+          _cli_calls, [("reg/istry", "o/r", 41, 2, "c" * 40, "78.1")])
+    # [registry #1288] THE VERDICT GLOB IS PR-SCOPED (mutant N16). It answers "has any round ever
+    # produced a verdict for THIS pull request?", so a glob that also matches a NEIGHBOUR's
+    # records would let one PR's completed review read as another's — and `already_done` skipping
+    # a review is a silent non-delivery, which is this whole issue.
+    check("the verdict glob matches this PR's records at any round",
+          [fnmatch.fnmatch(name, verdict_glob("o/r", 41)) for name in
+           ("o--r--pr41-round1.json", "o--r--pr41-round7.json")], [True, True])
+    check("...and matches NO other PR's, and no other repo's",
+          [fnmatch.fnmatch(name, verdict_glob("o/r", 41)) for name in
+           ("o--r--pr410-round1.json", "o--r--pr4-round1.json",
+            "other--repo--pr41-round1.json")], [False, False, False])
+    check("...and it agrees with verdict_path, which is the thing readers actually resolve",
+          fnmatch.fnmatch(Path(verdict_path("o/r", 41, 3)).name, verdict_glob("o/r", 41)), True)
+
     check("rounds count bot-only markers", count_rounds(comments, bot), 2)
     check("non-bot marker is ignored", count_rounds(comments, "mallory[bot]"), 0)
     check("nochange runs per round", len(marker_runs(comments, bot, "nochange", 2)), 2)
@@ -12557,6 +12734,19 @@ def main():
                        help="worker-live.sh exit class for THIS run; only a credential-outage "
                             "class voids the round (every other value is a no-op)")
 
+    # [registry #1288] The LEDGER twin of round-record, for the #657 self-attested class, whose
+    # review path holds no target token and therefore cannot write a target-side marker. Charged
+    # from review-fix.yml's `claim` job — pre-model, and in a job that executes no target code.
+    rclaim = subparsers.add_parser("round-claim")
+    rclaim.add_argument("--registry-repo", required=True)
+    rclaim.add_argument("--target-repo", required=True)
+    rclaim.add_argument("--pr", required=True, type=int)
+    rclaim.add_argument("--round", required=True, type=int)
+    rclaim.add_argument("--head-sha", required=True,
+                        help="the head this attempt is charged against; a malformed value fails "
+                             "closed rather than charging an unbound attempt")
+    rclaim.add_argument("--run-key", required=True)
+
     rchk = subparsers.add_parser("round-check", parents=[common])
     rchk.add_argument("--max-rounds", required=True, type=int)
     rchk.add_argument("--bot-login", required=True)
@@ -12840,6 +13030,9 @@ def main():
         elif args.command == "round-record":
             record_round(args.repo, args.pr, args.round, args.run_key, args.bot_login,
                          args.head_sha)
+        elif args.command == "round-claim":
+            charge_round_claim(args.registry_repo, args.target_repo, args.pr, args.round,
+                               args.head_sha, args.run_key)
         elif args.command == "round-void":
             void_round_on_outage(args.repo, args.pr, args.round, args.run_key, args.bot_login,
                                  args.exit_class)
