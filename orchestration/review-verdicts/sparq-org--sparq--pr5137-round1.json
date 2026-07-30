@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5137,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b0aa00051d7851f7daa9ceaa1c100998c17e59d6",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new feature-matrix leg correctly enables the default-off `odrl-authz` feature and therefore makes the cfg-gated ODRL integration suite executable while retaining the crate's default features, which the tests rely on. The golden leg-name update matches the added gating leg. The coverage-presence ratchet is supported by the repository scanner's current count of 1014 tests and leaves a valid floor of 1000. The release documentation accurately describes the existing LWS container workflow, including its tag trigger, native smoke/scan sequence, multi-architecture publish, tags, SBOM, and provenance settings. No correctness, soundness, test-validity, or security defect is evident in the changed lines.",
+  "verdict": "approve"
+ }
+}
