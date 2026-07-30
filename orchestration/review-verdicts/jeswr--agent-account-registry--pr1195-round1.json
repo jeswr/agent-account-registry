@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1195,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "da236831baa787c5863285d7e2a7313168bc6733",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly tightens groom.yml and retriage.yml keepalive thresholds to values strictly between one and two of their respective nominal cadences. The cadence reader fails closed on unsupported schedules, includes the hourly wrap-around gap, unions multiple cron expressions, and scopes extraction to the workflow's top-level on block. The self-tests are non-vacuous: they pin independently derived cron results and refusal cases, pin the exact run-anchored watch set, enforce both strict arithmetic bounds, and execute the real keepalive leg with ages derived from the watched schedules to catch either boundary regression. No trust check is weakened, and no hostile reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
