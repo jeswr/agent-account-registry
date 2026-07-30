@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1289,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d2f2047e2054a3f38b62d7c3275568dae232fe64",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change remains correct and complete on round 2. The request call site retries the full 500\u2013599 class only when the method is GET or HEAD, retains the bounded attempt limit and Retry-After handling, gives CAS-conflict handling precedence, and continues to fail immediately on 4xx responses and all mutations. The tests independently pin classifier boundaries and the production call site: a one-shot 500 recovers, a persistent 500 exhausts loudly with the expected call count, and a POST is not replayed. No trust check, audit binding, permission boundary, or credential handling is weakened. No reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
