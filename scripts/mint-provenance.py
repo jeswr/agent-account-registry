@@ -47,6 +47,7 @@ and this script never prints the login it hashed alongside the hash.
 import argparse
 from collections import Counter
 import copy
+import inspect
 import json
 import os
 from pathlib import Path
@@ -602,6 +603,67 @@ def _delivery_hint(pull, source_labels, hold_labels, park_label):
             "labels and state as the enumerator reads them")
 
 
+def review_run_refusal(identity_admits, *, shell_admits):
+    """Why the review RUN this record would dispatch cannot reach a reviewer at all, or None.
+
+    THE THIRD LAST MILE, and the one the first two cannot see. `admissible_by_the_review_lane`
+    proves the RECORD is admissible; `delivery_refusal` proves the ENUMERATOR emits a review item.
+    Both are true today for the orchestrator class, and the class still receives NO review — the
+    dispatched run dies in review-fix.yml's `run` job, at a target-App identity gate that admits
+    only pull requests authored by the registry App bot. MEASURED end to end on the enrolled repo:
+    the first orchestrator-class mint in the registry's history reached CLAIM and resolve green and
+    then failed with `pull request author is not the registry App bot`.
+
+    ENUMERABILITY IS NOT DELIVERABILITY. That distinction is the whole content of this function,
+    and it is the same lesson `delivery_refusal` learned one layer up: a predicate that stops at
+    the consumer it happens to know about writes records whose only effect is a terminal park.
+
+    THE POLARITY IS DELIBERATE, and it differs from `delivery_refusal`'s. That one is documented as
+    permissive in exactly one direction so no input can make minting impossible. This one CAN
+    refuse the whole class at once, on purpose: the identity gate refuses the whole class at once,
+    by construction rather than by snapshot (an enrolled author is never a `[bot]` login, so it can
+    never equal the App bot's), so a per-PR refusal would be the lie. Refusing costs nothing that
+    is not already lost — nothing is written and the pull request stays exactly as it is — while
+    minting anyway spends a runner, a claim and an account lease to reach a park.
+
+    FAIL CLOSED on an unreadable probe, matching `delivery_refusal`'s own exception contract: a
+    seam that cannot be read is not proof that a reviewer would start.
+
+    SELF-REMOVING. Both probes re-derive their answer from the live workflow and the live shell
+    script on every call, so the day a gate admits the class its refusal disappears with no code
+    change here.
+
+    [registry #1288] ``shell_admits`` IS THE FOURTH CONSUMER, and its absence was this function
+    failing its own docstring. It consulted the identity gate ALONE — so once that gate was widened
+    it went quiet and cheerfully authorised minting for a class that dies 29 lines later, in
+    worker-live.sh's own copy of the worker head-ref gate. That is verbatim the failure this
+    function is named for: "a predicate that stops at the consumer it happens to know about writes
+    records whose only effect is a terminal park." Three of the four copies had been found.
+
+    It is KEYWORD-ONLY and REQUIRED — no default — for exactly the reason `census_verdict`'s
+    `identity_admits` is (mutant M17): a defaulted conjunct is the one a future caller omits, and
+    the omission is invisible because the remaining conjunct still reads True. The consumer list is
+    now the thing a new caller cannot forget rather than the thing a docstring asks it to
+    remember."""
+    for what, probe, refusal in (
+            ("target-App identity gate", identity_admits,
+             "review-fix.yml's target-App identity gate would refuse this run before any reviewer "
+             "starts"),
+            ("worker-live.sh head-ref gate", shell_admits,
+             "worker-live.sh's `run_review` would refuse this pull request's head branch before "
+             "the reviewer launches — it carries its own copy of the worker-namespace gate, and "
+             "this class is defined by not matching it")):
+        try:
+            admitted = probe()
+        except Exception as exc:                        # noqa: BLE001 — any probe failure refuses
+            return (f"the review lane's {what} could not be read ({exc}), so it cannot be shown "
+                    "that a reviewer would ever start")
+        if admitted is not True:
+            return (f"{refusal}. Until that is fixed, a record here buys one terminal park "
+                    "instead of a review")
+    return None
+
+
 # ---- I/O ---------------------------------------------------------------------------------------
 def _run_gh(args, *, check=True):
     result = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
@@ -634,7 +696,7 @@ def effective_record_body(probe, ledger_ref):
 def mint(repo, pr_number, issue_number, impl_alias, registry_repo, routing, enrolled_authors,
          *, apply_changes=False, allow_global_partition=False, env=None,
          read_pull=None, read_issue=None, read_record=None, write_record=None,
-         modules=None, log=print):
+         identity_admits=None, shell_admits=None, modules=None, log=print):
     """Read everything, decide once, and write at most one record. Returns the MintDecision.
 
     Every reader/writer is injectable so `--self-test` drives this exact orchestration — the call
@@ -707,6 +769,19 @@ def mint(repo, pr_number, issue_number, impl_alias, registry_repo, routing, enro
                   "refusing to write a record nothing acts on")
         log(f"REFUSE {repo}#{pr_number}: {reason}")
         return MintDecision(ACTION_REFUSE, reason, None)
+    # ...and the THIRD last mile. The two checks above prove the record is admissible and that the
+    # ENUMERATOR emits an item; neither can see the review-fix.yml `run` job, which refuses this
+    # whole class at its target-App identity gate. Refused on the DRY RUN too, for the same reason
+    # the delivery gate is: the operator should learn it from the cheap gesture.
+    run_error = review_run_refusal(
+        identity_admits or dispatch_claim.review_fix_identity_admits_orchestrator_class,
+        shell_admits=(shell_admits
+                      or dispatch_claim.worker_live_admits_orchestrator_class))
+    if run_error:
+        reason = (f"the record this run would write would deliver NO review ({run_error}); "
+                  "refusing to write a record nothing acts on")
+        log(f"REFUSE {repo}#{pr_number}: {reason}")
+        return MintDecision(ACTION_REFUSE, reason, None)
     document = decision.document
     if not apply_changes:
         log(f"DRY-RUN {repo}#{pr_number}: would mint {record_path} — "
@@ -736,13 +811,18 @@ def census_verdict(repo, pull, open_issues, enrolled_authors, routing, stamp, sa
                    recorded=(), impl_alias=DEFAULT_IMPL_ALIAS, allow_global_partition=False,
                    attestation_class, orchestrator_class, plan_package, global_package,
                    account_hash, json_type_exact, enumerate_review_items, now, hold_labels=(),
-                   park_label=None):
+                   park_label=None, identity_admits, shell_admits):
     """ONE disjoint census verdict for ONE open PR: `(verdict, detail)`.
 
     Every branch is decided by the PRODUCTION functions this file already ships — `pr_mint_refusal`
     for the shape, `mint_decision` for the binding, `delivery_refusal` for whether the lane would
-    act. The census therefore cannot drift from what a real `--apply` would do: to change the
-    census you have to change the mint."""
+    act, `review_run_refusal` for whether a reviewer would ever start. The census therefore cannot
+    drift from what a real `--apply` would do: to change the census you have to change the mint.
+
+    `identity_admits` is keyword-only and REQUIRED — no default — precisely because this is the
+    conjunct a census would otherwise be able to omit and go on reporting MINTABLE for a PR that
+    `mint()` refuses. That divergence is the defect this docstring's last sentence promises cannot
+    happen, so the parameter is made impossible to forget rather than merely documented."""
     number = pull.get("number") if isinstance(pull, dict) else None
     shape_error = pr_mint_refusal(repo, pull, enrolled_authors)
     if shape_error:
@@ -773,6 +853,13 @@ def census_verdict(repo, pull, open_issues, enrolled_authors, routing, stamp, sa
             # Keep looking: a SECOND candidate issue can be live where the first is not, and
             # returning the first dead binding would under-report the population.
             dead = dead or (CENSUS_DEAD, f"issue #{candidate} binds, but {delivery}")
+            continue
+        # ...and the THIRD last mile, asked AFTER the binding so the row still tells the operator
+        # which issue bound. A class-global refusal reported as MINTABLE would be the census
+        # drifting from the mint — the one thing this function's contract forbids.
+        run_error = review_run_refusal(identity_admits, shell_admits=shell_admits)
+        if run_error:
+            dead = dead or (CENSUS_DEAD, f"issue #{candidate} binds, but {run_error}")
             continue
         return CENSUS_MINTABLE, f"mint with --issue {candidate}"
     if dead:
@@ -867,7 +954,9 @@ def census(repo, registry_repo, routing, enrolled_authors, *, impl_alias=DEFAULT
             account_hash=worker_pr.account_hash, json_type_exact=worker_pr._json_type_exact,
             enumerate_review_items=dispatch_claim.enumerate_review_items, now=time.time(),
             hold_labels=dispatch_claim.HUMAN_HOLD_PR_LABELS,
-            park_label=dispatch_claim.MACHINE_PARK_PR_LABEL)
+            park_label=dispatch_claim.MACHINE_PARK_PR_LABEL,
+            identity_admits=dispatch_claim.review_fix_identity_admits_orchestrator_class,
+            shell_admits=dispatch_claim.worker_live_admits_orchestrator_class)
         tally[verdict] += 1
         out.append((pull.get("number"), verdict, detail))
         log(f"census {repo}#{pull.get('number')}: {verdict} — {detail}")
@@ -1256,8 +1345,19 @@ def _self_test():                                                       # noqa: 
     good_env = _Env({"GITHUB_RUN_ID": "555", "GITHUB_RUN_ATTEMPT": "1", "PROVENANCE_SALT": "s"})
     modules = (worker_pr, dispatch_claim, lease_schema)
 
+    # The identity gate refuses this whole class TODAY (review_run_refusal), so every row below
+    # that is about some OTHER predicate injects an admitting probe — otherwise each of them would
+    # pass for the new reason and stop testing what it names. The live probe, and both of its
+    # failure directions, are driven by their own rows further down.
+    def _identity_admits():
+        return True
+
+    def _shell_admits():
+        return True
+
     def run_mint(*, apply_changes=False, env=None, record=None, allow_global=False,
-                 pull_over=None, issue_over=None, record_reader=None):
+                 pull_over=None, issue_over=None, record_reader=None,
+                 identity_admits=_identity_admits, shell_admits=_shell_admits):
         written = []
         decision = mint(repo, 41, 7, "opus5", "reg/istry", routing, enrolled,
                         apply_changes=apply_changes, allow_global_partition=allow_global,
@@ -1266,6 +1366,8 @@ def _self_test():                                                       # noqa: 
                         read_issue=lambda: issue(**(issue_over or {})),
                         read_record=record_reader or (lambda: record),
                         write_record=lambda: written.append("put"),
+                        identity_admits=identity_admits,
+                        shell_admits=shell_admits,
                         modules=modules, log=lambda *_a, **_k: None)
         return decision, written
 
@@ -1386,6 +1488,100 @@ def _self_test():                                                       # noqa: 
     check("a machine-parked SOURCE ISSUE is refused before the record check even needs to run",
           decision.action, ACTION_REFUSE)
 
+    # ---- THE THIRD LAST MILE: enumerability is NOT deliverability ------------------------------
+    # THE MEASURED DEFECT: the first orchestrator-class mint in the registry's history passed both
+    # checks above and still delivered no review — the dispatched run died in review-fix.yml's
+    # `run` job at the target-App identity gate ("pull request author is not the registry App
+    # bot"). Both gates above answer about the RECORD and the ENUMERATOR; neither can see the run.
+    check("the run gate PASSES when the identity probe admits the class",
+          review_run_refusal(lambda: True, shell_admits=lambda: True), None)
+    rejects("...and REFUSES when it does not, naming the gate that refuses",
+            "target-App identity gate", lambda: review_run_refusal(lambda: False, shell_admits=lambda: True))
+    rejects("...and names whose decision would unblock it, not a fake operator action",
+            "terminal park", lambda: review_run_refusal(lambda: False, shell_admits=lambda: True))
+    # FAIL-CLOSED, matching delivery_refusal's own exception contract: a seam that cannot be read
+    # is not proof that a reviewer would start.
+    def _exploding_identity():
+        raise RuntimeError("review-fix.yml could not be parsed")
+
+    rejects("an identity probe that RAISES is a refusal, never a pass", "could not be read",
+            lambda: review_run_refusal(_exploding_identity, shell_admits=lambda: True))
+    # ...and ONLY True admits. A probe that returns None, "" or a truthy non-True value must never
+    # read as admission — `if admitted is True` is what makes that so, and this is what reds if it
+    # is loosened to a bare truthiness test.
+    for _label, _answer in (("None", None), ("empty string", ""), ("0", 0), ("1", 1),
+                            ("'yes'", "yes"), ("[]", []), ("a truthy object", MintError("x"))):
+        check(f"a non-True probe answer ({_label}) is a refusal",
+              review_run_refusal(lambda v=_answer: v, shell_admits=lambda: True) is not None, True)
+    # [registry #1288] THE FOURTH CONSUMER, isolated. The identity gate admits and the SHELL gate
+    # does not: this must still refuse, or `review_run_refusal` authorises minting for a class that
+    # dies 29 lines past the gate it does check — verbatim the failure its own name warns about,
+    # and what it actually did before the shell conjunct was added.
+    rejects("a refusing SHELL gate refuses the run even when the identity gate ADMITS",
+            "worker-live.sh", lambda: review_run_refusal(lambda: True, shell_admits=lambda: False))
+    rejects("...and names the terminal park it would otherwise buy",
+            "terminal park", lambda: review_run_refusal(lambda: True, shell_admits=lambda: False))
+    rejects("an exploding SHELL probe is a refusal, never a pass", "could not be read",
+            lambda: review_run_refusal(lambda: True, shell_admits=_exploding_identity))
+    for _label, _answer in (("None", None), ("empty string", ""), ("1", 1), ("'yes'", "yes")):
+        check(f"a non-True SHELL probe answer ({_label}) is a refusal",
+              review_run_refusal(lambda: True,
+                                 shell_admits=lambda v=_answer: v) is not None, True)
+    # ...and the CONJUNCT IS IMPOSSIBLE TO FORGET rather than merely documented. Mutant M17 was
+    # exactly this shape one parameter over: the single current call site always passes the probe,
+    # so a permissive DEFAULT never bites and every behavioural row stays green. The claim is a fact
+    # about the SIGNATURE, so the signature is what is asserted.
+    for _fn, _param in ((review_run_refusal, "shell_admits"),
+                        (census_verdict, "shell_admits"),
+                        (census_verdict, "identity_admits")):
+        check(f"{_fn.__name__}'s {_param} is REQUIRED — a default is what lets a future caller "
+              "silently drop a consumer from the interlock",
+              inspect.signature(_fn).parameters[_param].default, inspect.Parameter.empty)
+        check(f"...and {_fn.__name__}'s {_param} is keyword-ONLY, so it cannot be satisfied by "
+              "positional accident",
+              inspect.signature(_fn).parameters[_param].kind, inspect.Parameter.KEYWORD_ONLY)
+    # THE LIVE SHELL GATE, by execution against the real script — the row that flips the day
+    # worker-live.sh stops admitting the class.
+    check("the LIVE worker-live.sh head-ref gate ADMITS the orchestrator class",
+          dispatch_claim.worker_live_admits_orchestrator_class(), True)
+
+    # THE KNOWN POSITIVE, BY EXECUTION against the REAL workflow file.
+    #
+    # [registry #1288] THIS ROW FLIPPED, AND THAT IS THE DESIGN WORKING, NOT AN EXEMPTION. It read
+    # `False` and carried the note "this row goes RED the day the identity gate is widened — which
+    # is exactly the day this whole refusal should disappear". That day is this commit: the `run`
+    # job now admits the self-attested class (into a job holding no target token), so the refusal
+    # self-removes and the class mints again. The predicate above is untouched — every injected-
+    # probe row still proves it refuses when the gate does — and only the LIVE answer moved.
+    check("the LIVE identity gate ADMITS the orchestrator class",
+          dispatch_claim.review_fix_identity_admits_orchestrator_class(), True)
+    # AND IT IS WIRED, driven by the LIVE probe rather than an injected one: a run-gate predicate
+    # nothing calls is the vacuity shape this repo keeps measuring.
+    decision, written = run_mint(apply_changes=True, identity_admits=None)
+    check("mint() MINTS on the live identity gate — the class is deliverable again",
+          (decision.action, written), (ACTION_MINT, ["put"]))
+    # ...and the WIRING is still proved, by the direction that is now the injected one: a refusing
+    # gate must still stop the write at this exact call site. Without this row the live row above
+    # would be satisfied by a `mint()` that stopped consulting the run gate at all — which is
+    # precisely the vacuity the flip could otherwise smuggle in.
+    _refused, _refused_written = run_mint(apply_changes=True, identity_admits=lambda: False)
+    check("...and a REFUSING gate still stops mint() dead, writing nothing",
+          (_refused.action, _refused_written), (ACTION_REFUSE, []))
+    check("...naming the run, not the record and not the enumerator",
+          "target-App identity gate" in _refused.reason, True)
+    # ...and BOTH upstream gates passed on this very PR, which is precisely why neither could catch
+    # the run-layer refusal while it stood. They are what made "enumerability is not deliverability"
+    # measurable, and they must keep passing now that delivery works.
+    check("...while the record itself was admissible",
+          admissible_by_the_review_lane(minted.document, 41,
+                                        dispatch_claim.provenance_admission_error), None)
+    check("...and the enumerator WOULD have emitted a review item for it", delivers(), None)
+    # The refusal text is posted VERBATIM onto a pull request by auto-mint's `mint-refused`
+    # comment, so it must carry no `#N`: a rendered reference is a live payload that a later
+    # derivation can read back as a binding (the reason REASON_HINTS carries no literal numbers).
+    check("the refusal text names no issue number, so pasting it back binds nothing",
+          re.search(r"#\d", review_run_refusal(lambda: False, shell_admits=lambda: True)), None)
+
     # THE SOURCE-LABEL CHANNEL, asserted at the CALL SITE (mutation round 1: `issue_label_names`
     # returning [] killed nothing, because every label state the enumerator excludes on is already
     # refused upstream). So the property is wiring, and it is measured as wiring: a spy over the
@@ -1435,15 +1631,30 @@ def _self_test():                                                       # noqa: 
     census_issues = [issue(), {"number": 8, "state": "open", "pull_request": {"url": "x"},
                                "labels": []}]
 
+    # The census consults the SAME third last mile `mint()` does, so with the live identity gate
+    # every enrollable row reads MINTABLE-BUT-DEAD. That is the truth, and it is asserted by its
+    # own row below; the rows about the OTHER census branches inject an admitting gate so each
+    # keeps testing the branch it names instead of passing for this one reason.
+    class _AdmittingClaim:
+        def __getattr__(self, name):                     # delegate everything else, unchanged
+            return getattr(dispatch_claim, name)
+
+        @staticmethod
+        def review_fix_identity_admits_orchestrator_class(*_a, **_k):
+            return True
+
+    census_modules = (worker_pr, _AdmittingClaim(), lease_schema)
+
     def run_census(*, env=None, pulls=None, issues=None, recorded=frozenset({46}),
-                   authors=None):
+                   authors=None, census_mods=None):
         rows = []
         result = census(
             repo, "reg/istry", routing, enrolled if authors is None else authors,
             env=good_env if env is None else env,
             read_pulls=lambda: census_pulls if pulls is None else pulls,
             read_issues=lambda: census_issues if issues is None else issues,
-            read_recorded=lambda: recorded, modules=modules, log=rows.append)
+            read_recorded=lambda: recorded,
+            modules=census_mods or census_modules, log=rows.append)
         return result, rows
 
     verdicts, lines = run_census()
@@ -1506,8 +1717,51 @@ def _self_test():                                                       # noqa: 
                          account_hash=worker_pr.account_hash,
                          json_type_exact=worker_pr._json_type_exact,
                          enumerate_review_items=dispatch_claim.enumerate_review_items,
-                         now=1_800_000_000)[0],
+                         now=1_800_000_000, identity_admits=lambda: True,
+                         shell_admits=lambda: True)[0],
           CENSUS_NO_ISSUE)
+    # THE CENSUS CANNOT DRIFT FROM THE MINT, and the contract is symmetric: it must not offer a
+    # mint the writer would refuse, and it must not report DEAD a class the writer would mint.
+    #
+    # [registry #1288] These rows flipped with the gate. Under the LIVE gate the census now agrees
+    # with the LIVE mint that row 41 is MINTABLE — and the DEAD direction is preserved directly
+    # below by INJECTING a refusing gate, so the branch keeps its coverage instead of losing it to
+    # the flip.
+    _live_verdicts, _live_lines = run_census(census_mods=modules)
+    check("with the LIVE identity gate the census reports the class MINTABLE, matching mint()",
+          [row[1] for row in _live_verdicts if row[0] == 41], [CENSUS_MINTABLE])
+    check("...and the row again offers the operator the exact issue to pass",
+          any("mint with --issue 7" in line for line in _live_lines), True)
+
+    class _RefusingClaim:
+        def __getattr__(self, name):                     # delegate everything else, unchanged
+            return getattr(dispatch_claim, name)
+
+        @staticmethod
+        def review_fix_identity_admits_orchestrator_class(*_a, **_k):
+            return False
+
+    _dead_verdicts, _dead_lines = run_census(
+        census_mods=(worker_pr, _RefusingClaim(), lease_schema))
+    check("...and a REFUSING identity gate still reports the class DEAD, not MINTABLE",
+          [row[1] for row in _dead_verdicts if row[0] == 41], [CENSUS_DEAD])
+    check("...naming the gate that refuses, and the issue that did bind",
+          all(needle in next(line for line in _dead_lines if line.startswith("census o/r#41:"))
+              for needle in ("target-App identity gate", "issue #7 binds")), True)
+    check("...so no census line offers a mint the writer would refuse",
+          any("mint with --issue" in line for line in _dead_lines), False)
+    # ...and the property that keeps that true for a caller that does not exist yet. The rows above
+    # all drive the ONE current call site, which passes the probe explicitly — so giving the
+    # parameter a permissive default survived every one of them (measured: mutant M17). The
+    # docstring claims the conjunct is impossible to forget; that claim is a fact about the
+    # SIGNATURE, so the signature is what is asserted.
+    check("census_verdict's identity_admits is REQUIRED — a default is what would let a future "
+          "caller silently omit the run gate",
+          inspect.signature(census_verdict).parameters["identity_admits"].default,
+          inspect.Parameter.empty)
+    check("...and it is keyword-ONLY, so it cannot be satisfied by positional accident",
+          inspect.signature(census_verdict).parameters["identity_admits"].kind,
+          inspect.Parameter.KEYWORD_ONLY)
     # The census must never print a hash — it is the ONE surface that walks the whole population,
     # and the record's privacy decision (22a) is that a login's hash is only ever written, never
     # reported alongside anything that identifies it.

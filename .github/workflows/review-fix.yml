@@ -371,6 +371,27 @@ jobs:
               if compare.get("status") not in {"identical", "ahead"}:
                   raise SystemExit("PR head does not descend from the worker-opened commit")
 
+          # [registry #1288] `already_done` FOR THE SELF-ATTESTED CLASS COMES FROM THE LEDGER, NOT
+          # THE PR BODY. The marker read above is written by the App into the pull request body;
+          # for a worker PR the App is also its author, so the marker is the App's own record. For
+          # this class the author is a human and the body is theirs to edit — and after the token
+          # drop in `run` this lane holds no target authority at all, so a body marker is simply
+          # not a registry statement. `claim` consumes this fact to skip a duplicate dispatch
+          # WITHOUT burning a reviewer slot, so leaving it author-editable would leave the one
+          # cheap bound on redundant dispatch in the hands of the party it bounds. The verdict
+          # records on the `ledger` branch are written only by the `outcome` job and bind the
+          # exact reviewed commit (issue #156), so that is what is asked instead. Fails toward
+          # NOT-done: an unreadable or unbound record costs one redundant resolve+claim pair,
+          # where a false `True` would strand the PR unreviewed forever.
+          if mode == "review" and self_attested:
+              spec_wp = importlib.util.spec_from_file_location(
+                  "registry_worker_pr_resolve", Path("registry", "scripts", "worker-pr.py"))
+              worker_pr_mod = importlib.util.module_from_spec(spec_wp)
+              spec_wp.loader.exec_module(worker_pr_mod)
+              already_done = dispatch_claim.ledger_review_completed(
+                  "ledger", "registry", worker_pr_mod, repo, pull["number"], head_sha)
+              print(f"self-attested already_done re-derived from the ledger: {already_done}")
+
           issue_data = json.loads(subprocess.run(
               ["gh", "api", f"repos/{repo}/issues/{issue}"],
               capture_output=True, text=True, check=True).stdout)
@@ -848,6 +869,39 @@ jobs:
             exit 1
           fi
 
+      # [registry #1288] CHARGE THE REVIEW ATTEMPT — the self-attested class's replacement for the
+      # target-side round marker `run` can no longer write (it holds no target token; see the
+      # token drop on the `run` job).
+      #
+      # WHY HERE AND NOWHERE ELSE. `run` is `contents: read` PRECISELY BECAUSE THE MODEL EXECUTES
+      # THERE. Charging from `run` would hand a prompt-injectable model a write into the registry
+      # ledger — worse than the target token this whole change removes. This job already holds
+      # `contents: write`, already writes the ledger, runs strictly BEFORE the model, and executes
+      # no target code.
+      #
+      # WHY LAST IN THE JOB, AND WHY NO `continue-on-error`. The charge is what bounds a
+      # deterministic pre-verdict crash loop (proved by execution in dispatch-claim's self-test),
+      # so a run must never reach the model with its round unaccounted for. Failing here fails the
+      # `claim` job; `run` requires `needs.claim` and is therefore SKIPPED, while the `release`
+      # job (`if: always()`) still frees the lease. So the ordering property is structural: either
+      # the attempt is charged or no reviewer launches.
+      #
+      # Idempotent by path: one file per (target, PR, round), so a re-run of this job re-writes an
+      # equivalent document and reports "already charged".
+      - name: Charge the review attempt on the ledger (self-attested class, pre-model)
+        if: ${{ inputs.mode == 'review' && needs.resolve.outputs.self_attested == 'true' && (steps.adopt.outputs.acquired || steps.claim.outputs.acquired) == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+        run: |
+          python3 registry/scripts/worker-pr.py round-claim \
+            --registry-repo "$GITHUB_REPOSITORY" \
+            --target-repo "$TARGET_REPO" \
+            --pr "${{ inputs.pr_number }}" \
+            --round "${{ inputs.review_round }}" \
+            --head-sha "${{ needs.resolve.outputs.head_sha }}" \
+            --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+
   run:
     name: Run ${{ inputs.mode }} on PR ${{ inputs.pr_number }}
     needs: [resolve, claim]
@@ -929,9 +983,30 @@ jobs:
       # reviewer never pushes); the FIX token can (it pushes the fix commit). The ARM path mints
       # its own token in the separate `outcome` job only when the verdict approves. No token
       # ever enters the model container in any mode.
+      # [registry #1288] THE TOKEN DROP — the property that REPLACES the App-author check for the
+      # #657 self-attested class, rather than merely widening it.
+      #
+      # The author gate below exists because this job runs a model over target content while
+      # holding a target-scoped App token. Design record §11.4 names two shapes; this is shape 2,
+      # the narrower trust boundary: for the self-attested class the token is NOT MINTED, so the
+      # question "may a model run against a PR this App did not author while a write-capable token
+      # is in the job" does not arise — there is nothing in the job to protect.
+      #
+      # It is affordable because NOTHING on the review path needs it. `worker-live.sh review` makes
+      # no `gh`/API call at all and its one remote git op is ALREADY anonymous (the target checkout
+      # is `persist-credentials: false`, so no credential survives into `.git/config`); the target
+      # is public, and this workflow already reads it twice with the registry's own GITHUB_TOKEN
+      # (the `resolve` job's PR snapshot and its `target-routing` checkout). The only two steps
+      # that genuinely used the App token in review mode — `round-record` and `round-void` — wrote
+      # to the TARGET, and their accounting moved to the registry's own ledger attempt store.
+      #
+      # `self_attested` is resolved HOST-SIDE in `resolve` from the master-protected allowlist and
+      # the ledger provenance record (never from a workflow input), and the identity step below
+      # REFUSES the run if a target token exists on this path — so this `if:` is asserted by
+      # execution, not trusted.
       - name: Mint review-scoped App token (no target contents write)
         id: app-token-review
-        if: ${{ inputs.mode == 'review' }}
+        if: ${{ inputs.mode == 'review' && needs.resolve.outputs.self_attested != 'true' }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
@@ -959,17 +1034,38 @@ jobs:
       - name: Verify target App identity and default branch
         id: target
         env:
-          GH_TOKEN: ${{ steps.app-token-review.outputs.token || steps.app-token-fix.outputs.token }}
+          # The metadata read below runs on WHICHEVER token this run legitimately holds. On the
+          # tokened path that is the target App token just minted. On the self-attested path no
+          # App token exists, so it falls through to the REGISTRY's own GITHUB_TOKEN — the same
+          # token the `resolve` job reads this pull request with and the same one its
+          # `target-routing` checkout uses. It carries `contents: read` on the REGISTRY and no
+          # authority whatsoever over the target; it reads the target only because the target is
+          # public.
+          GH_TOKEN: ${{ steps.app-token-review.outputs.token || steps.app-token-fix.outputs.token || github.token }}
+          # The SECURITY FACT, as a boolean rather than a second copy of the secret: does a
+          # TARGET-scoped App token exist in this job at all? The python block below refuses the
+          # run when this is true on the self-attested path, so re-adding the mint without also
+          # restoring the author gate FAILS THE RUN instead of quietly re-opening the hole.
+          TARGET_APP_TOKEN: ${{ (steps.app-token-review.outputs.token || steps.app-token-fix.outputs.token) != '' }}
           TARGET_REPO: ${{ inputs.target_repo }}
           APP_SLUG: ${{ steps.app-token-review.outputs.app-slug || steps.app-token-fix.outputs.app-slug }}
           PR_AUTHOR: ${{ needs.resolve.outputs.pr_author }}
+          # [#657] Resolved HOST-SIDE in `resolve` from the master-protected allowlist + the ledger
+          # provenance record — never from a workflow input.
+          SELF_ATTESTED: ${{ needs.resolve.outputs.self_attested }}
         run: |
           set -euo pipefail
-          [[ -n "$GH_TOKEN" ]] || { echo '::error::target App token was not minted'; exit 1; }
-          [[ -n "$APP_SLUG" ]] || { echo '::error::app slug was not resolved'; exit 1; }
           printf '::add-mask::%s\n' "$GH_TOKEN"
           gh api "repos/$TARGET_REPO" > "$RUNNER_TEMP/target.json"
-          gh api "/users/${APP_SLUG}[bot]" > "$RUNNER_TEMP/app-user.json"
+          if [[ "$TARGET_APP_TOKEN" == "true" ]]; then
+            [[ -n "$APP_SLUG" ]] || { echo '::error::app slug was not resolved'; exit 1; }
+            gh api "/users/${APP_SLUG}[bot]" > "$RUNNER_TEMP/app-user.json"
+          else
+            # No App token, so there is no App identity to resolve. An EMPTY object, never a
+            # fabricated one: every predicate that reads it is on the tokened branch below, and
+            # this way a mis-branch reads as "not an App bot" rather than as a pass.
+            printf '{}\n' > "$RUNNER_TEMP/app-user.json"
+          fi
           python3 - "$RUNNER_TEMP/target.json" "$RUNNER_TEMP/app-user.json" <<'PY'
           import json
           import os
@@ -1001,6 +1097,9 @@ jobs:
               print(f"::error::target identity refused: {code}")
               raise SystemExit(0)
 
+          self_attested = os.environ.get("SELF_ATTESTED") == "true"
+          target_app_token = os.environ.get("TARGET_APP_TOKEN") == "true"
+
           if repo.get("full_name") != os.environ["TARGET_REPO"]:
               refuse("wrong-target")
           default_branch = repo.get("default_branch")
@@ -1008,35 +1107,83 @@ jobs:
           user_id = str(user.get("id", ""))
           if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", str(default_branch)):
               refuse("unsafe-default-branch")
-          if not re.fullmatch(r"[A-Za-z0-9_.-]+\[bot\]", str(login)) or not user_id.isdigit():
-              refuse("not-an-app-bot")
-          # Authoritative authorship check: the PR must be authored by THIS App bot — a spoofed
-          # bot-suffixed author from some other App never reaches the model. DELIBERATELY NOT
-          # WIDENED for the #657 self-attested class (research/657-orchestrator-pr-admission.md
-          # §9.5 item 1): handing a target-scoped App token to a model on a PR this App did not
-          # author is a security-posture decision, not a shape widening. #972 fixes the missing
-          # EXIT, not the gate.
-          if os.environ["PR_AUTHOR"] != login:
-              refuse("author-not-app-bot")
+          if self_attested:
+              # [registry #1288] THE #657 SELF-ATTESTED PATH. The App-author check below does not
+              # apply here, and what replaces it is NOT a wider author rule — it is the removal of
+              # the authority that check was guarding. Two things are asserted, and both are
+              # refusals rather than comments so a later edit cannot quietly undo them:
+              #
+              #   1. NO TARGET APP TOKEN EXISTS IN THIS JOB. The mint steps are skipped for this
+              #      class; this is the execution that PROVES it. Re-adding the mint without
+              #      restoring the author gate stops the run instead of handing a model a
+              #      target-scoped token on a PR this App did not author.
+              #   2. THE TARGET IS PUBLIC. The whole affordability argument is that everything the
+              #      review path reads is readable without target authority. A private target
+              #      would mean the checkout needs a token, which is precisely the state (1)
+              #      refuses — so it is refused HERE, by name, instead of failing obscurely later.
+              #
+              # What still bounds who reaches this point is applied UPSTREAM and is not waivable
+              # here: the fork gate (`resolve`, hoisted above every waiver — the head must be a
+              # branch in the target repo itself), the MASTER-protected `review_enrolment_authors`
+              # allowlist read from the master checkout rather than the ledger the record came
+              # from, an `orchestrator`-attested provenance record naming THIS pull request, and
+              # `mode == "review"` alone — a `fix` run pushes commits and keeps every pre-#657
+              # gate. The arm refuses this class outright (worker-pr.ready_and_arm), so the review
+              # it now delivers is advisory and buys no merge.
+              if target_app_token:
+                  refuse("self-attested-run-holds-a-target-token")
+              if repo.get("private") is not False:
+                  refuse("self-attested-target-is-not-public")
+              login = ""
+              user_id = ""
+          else:
+              # [registry #1288] THE REPLACEMENT for master's `[[ -n "$GH_TOKEN" ]] || exit 1`.
+              # That shell check had to go: GH_TOKEN now legitimately falls back to the registry's
+              # own token, so it can never be empty and the check became vacuous. The property it
+              # protected is real and belongs on THIS branch — a run that is not self-attested MUST
+              # hold a target App token, or the reads above were performed with an identity that
+              # confers nothing over the target and the App-author comparison below is meaningless.
+              # Stated as its own refusal so a failed mint is diagnosed as a failed mint rather
+              # than surfacing as the misleading `not-an-app-bot`.
+              if not target_app_token:
+                  refuse("target-token-not-minted")
+              if not re.fullmatch(r"[A-Za-z0-9_.-]+\[bot\]", str(login)) or not user_id.isdigit():
+                  refuse("not-an-app-bot")
+              # Authoritative authorship check, BYTE-FOR-BYTE UNCHANGED for every run that holds a
+              # target App token: the PR must be authored by THIS App bot, so a spoofed
+              # bot-suffixed author from some other App never reaches the model. The self-attested
+              # branch above does not widen this — it removes the token, and this is the only
+              # branch on which one exists.
+              if os.environ["PR_AUTHOR"] != login:
+                  refuse("author-not-app-bot")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"default_branch={default_branch}\n")
               output.write(f"bot_login={login}\n")
               output.write(f"bot_id={user_id}\n")
+              # THE fail-closed token, written LAST and on the success path of BOTH branches only.
+              # `bot_login` used to carry this role, but it is legitimately EMPTY on the
+              # self-attested path, so the refusal step keys on this instead — the invariant is
+              # unchanged: the only value that lets the run continue is one written after every
+              # predicate passed.
+              output.write("verified=yes\n")
           print(f"target token verified for {repo['full_name']} at {default_branch}")
           PY
 
       # [registry #972] THE REFUSAL, made to fail the job from a step whose predecessor SUCCEEDED
       # — which is what makes `steps.target.outputs.refusal` reliably readable as a job output.
       #
-      # FAIL-CLOSED BY CONSTRUCTION: the only value that lets the run continue is a NON-EMPTY
-      # `bot_login`, and the step above writes that on its success path alone, after every
-      # predicate has passed. So this condition cannot become an admission hole in the direction
+      # FAIL-CLOSED BY CONSTRUCTION: the only value that lets the run continue is `verified=yes`,
+      # and the step above writes that on its success path alone, after every predicate has
+      # passed. ([registry #1288] it was `bot_login` until the self-attested path made that
+      # legitimately empty; the invariant is the same one, moved to a token that means "every
+      # predicate passed" rather than "an App identity was resolved".) So this condition cannot
+      # become an admission hole in the direction
       # that matters — getting it wrong stops the run, it never starts one. No `always()`: a step
       # above that CRASHED (a network read, a malformed payload) is a TRANSIENT, the job is
       # already failing, and a transient must keep its retry-next-tick behaviour rather than
       # earning a terminal park.
       - name: Refuse the run when the target App identity did not verify
-        if: ${{ steps.target.outputs.bot_login == '' }}
+        if: ${{ steps.target.outputs.verified != 'yes' }}
         env:
           REFUSAL: ${{ steps.target.outputs.refusal }}
         run: |
@@ -1044,13 +1191,18 @@ jobs:
                "the outcome job records it as a terminal, counted refusal"
           exit 1
 
-      - name: Checkout target default branch with scoped App token (pinned, no persisted token)
+      # `token` falls through to the registry's own GITHUB_TOKEN when no App token was minted
+      # ([registry #1288] the self-attested class), exactly as the `resolve` job's `target-routing`
+      # checkout of this same public repository already does. `persist-credentials: false` means
+      # NEITHER path leaves a credential in `.git/config`, so `worker-live.sh review`'s one remote
+      # git op has always been anonymous and is unchanged by the drop.
+      - name: Checkout target default branch (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: ${{ inputs.target_repo }}
           ref: ${{ steps.target.outputs.default_branch }}
           path: target
-          token: ${{ steps.app-token-review.outputs.token || steps.app-token-fix.outputs.token }}
+          token: ${{ steps.app-token-review.outputs.token || steps.app-token-fix.outputs.token || github.token }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -1147,19 +1299,63 @@ jobs:
       # as stale (the live head moved off this commit) is voided by the outcome step and not
       # charged — legitimate head churn no longer burns the global round budget. A crash (no
       # outcome step) records no void and stays charged, so the crash bound is unchanged.
+      #
+      # [registry #1288] TWO STORES, ONE GATE, ONE ORDERING. The marker below is a TARGET write (a
+      # PR comment), and the token drop above means this job holds no target token for the
+      # self-attested class. That class's attempt is charged in the `claim` job instead, against
+      # the registry's own ledger attempt store — `claim` already holds `contents: write` on the
+      # registry, runs before the model, and executes no target code, whereas charging it from
+      # HERE would hand a job that runs a prompt-injectable model a write into the registry
+      # ledger: a strictly worse trade than the target token this change removes.
+      #
+      # This step keeps ONE id and ONE `if:` across both stores deliberately, so `steps.round`
+      # still means exactly "the round for this run is charged" to every consumer below and no
+      # downstream gate had to learn about the class. On the self-attested path it does not charge
+      # — it PROVES the charge, by finding the attempt file in this job's own `ledger` checkout.
+      # An unproven charge FAILS the step and the reviewer never launches, which is the correct
+      # direction: the charge is what bounds a deterministic crash loop, so running the model
+      # without being able to see one would be exactly the unbounded burn the store exists to
+      # stop. (It is belt-and-braces: a failed charge already fails the whole `claim` job, and
+      # `run` is skipped when `claim` fails.)
       - name: Record the review round before the model runs (bounded-crash accounting)
         id: round
         if: ${{ inputs.mode == 'review' && steps.prepare.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ steps.app-token-review.outputs.token }}
+          SELF_ATTESTED: ${{ needs.resolve.outputs.self_attested }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REVIEW_ROUND: ${{ inputs.review_round }}
         run: |
-          python3 registry/scripts/worker-pr.py round-record \
-            --repo "${{ inputs.target_repo }}" \
-            --pr "${{ inputs.pr_number }}" \
-            --round "${{ inputs.review_round }}" \
-            --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
-            --head-sha "${{ needs.resolve.outputs.head_sha }}" \
-            --bot-login "${{ steps.target.outputs.bot_login }}"
+          set -euo pipefail
+          if [[ "$SELF_ATTESTED" == "true" ]]; then
+            python3 - <<'PY'
+          import importlib.util
+          import os
+          from pathlib import Path
+
+          spec = importlib.util.spec_from_file_location(
+              "registry_worker_pr_round", Path("registry", "scripts", "worker-pr.py"))
+          worker_pr = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(worker_pr)
+          charged = Path("ledger") / worker_pr.round_claim_path(
+              os.environ["TARGET_REPO"], int(os.environ["PR_NUMBER"]),
+              int(os.environ["REVIEW_ROUND"]))
+          if not charged.is_file():
+              raise SystemExit(
+                  f"the review attempt was not charged on the ledger ({charged}); refusing to "
+                  "launch a reviewer whose round is unaccounted for")
+          print(f"review attempt charge confirmed on the ledger: {charged}")
+          PY
+          else
+            python3 registry/scripts/worker-pr.py round-record \
+              --repo "$TARGET_REPO" \
+              --pr "$PR_NUMBER" \
+              --round "$REVIEW_ROUND" \
+              --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
+              --head-sha "${{ needs.resolve.outputs.head_sha }}" \
+              --bot-login "${{ steps.target.outputs.bot_login }}"
+          fi
 
       # Prior-round context for the progress grade (maintainer directive 2026-07-17): the
       # reviewer must compare this round's findings against the PRIOR round's recorded findings
@@ -1218,6 +1414,18 @@ jobs:
           WORKER_HARNESS: ${{ steps.selected.outputs.harness }}
           WORKER_CREDENTIAL_FORMAT: ${{ steps.selected.outputs.credential_format }}
           WORKER_CREDENTIAL_PATH: ${{ steps.prepare.outputs.credential_path }}
+          # [registry #1288] THE FOURTH LAST MILE. worker-live.sh's `run_review` carries its OWN
+          # copy of the worker head-ref gate — a fourth copy, 29 lines above the `git fetch` that
+          # design record §11.4 wrongly described as the only thing on this path — and the #657
+          # class is DEFINED by not matching it. Without this the reviewer dies in the shell after
+          # `resolve`, CLAIM and the identity gate have all admitted, `outcome`'s `if:` goes
+          # unsatisfied, nothing durable is written, and each enrolled PR buys three wasted
+          # dispatches and a terminal park.
+          #
+          # Resolved host-side in `resolve` like every other use of this fact, never from a
+          # workflow input. `run_fix` and `push_fix` are deliberately NOT given it: they push
+          # commits, and a self-attested record must never buy write access to its own branch.
+          WORKER_SELF_ATTESTED: ${{ needs.resolve.outputs.self_attested }}
         run: bash ../registry/scripts/worker-live.sh review
 
       - name: Schema-validate the lifted verdict (host-side, no tokens)
@@ -1390,9 +1598,23 @@ jobs:
       # accounting is unchanged. The review-scoped App token already present in this job (issues +
       # pull-requests write, NO target contents write) is exactly what round-record used, so no new
       # capability is introduced, and in review mode this job executes no target code.
+      #
+      # [registry #1288] NOT WIRED FOR THE SELF-ATTESTED CLASS, and the omission is deliberate
+      # rather than pending. This is a TARGET write, so it cannot run without the token that class
+      # does not hold — but the ledger store must not simply grow an equivalent eraser either. Its
+      # input is `WORKER_EXIT_CLASS`, a value derived from the model launch and passed through
+      # `$GITHUB_ENV` in the job the model runs in. For the target-side marker that trade was made
+      # knowingly. The ledger store exists to bound a prompt-injectable model's re-dispatch loop,
+      # so it is built with ONE writer (`claim`, pre-model) and NO eraser: nothing downstream of
+      # the model can extend the budget that bounds it.
+      #
+      # The cost is named, not hidden: for this class a credential-outage launch failure stays
+      # CHARGED. That is bounded and self-healing — `max_review_rounds` of them route the PR into
+      # the CAPACITY `budget` park, which has automatic re-admission — where the pre-#596
+      # target-marker behaviour was a forever-charge. Tracked as its own follow-up.
       - name: Void the review round on a credential-outage exit (never a decline)
         id: round-void
-        if: ${{ always() && inputs.mode == 'review' && steps.round.outcome == 'success' }}
+        if: ${{ always() && inputs.mode == 'review' && needs.resolve.outputs.self_attested != 'true' && steps.round.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ steps.app-token-review.outputs.token }}
           EXIT_CLASS: ${{ steps.exit-class.outputs.class }}

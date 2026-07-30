@@ -2655,10 +2655,35 @@ run_review() {
   local default_branch=${TARGET_DEFAULT_BRANCH:-}
   local review_round=${WORKER_REVIEW_ROUND:-1}
   local prior_file=${WORKER_PRIOR_REVIEW_FILE:-}
+  local self_attested=${WORKER_SELF_ATTESTED:-}
   [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
   [[ "$pr_number" =~ ^[1-9][0-9]*$ ]] || die 'unsafe pull request number'
-  [[ "$head_branch" =~ ^sparq-agent/issue-[1-9][0-9]*-[A-Za-z0-9._-]+$ ]] ||
-    die 'unsafe pull request head branch'
+  # [registry #1288] THE FOURTH COPY OF THE SHAPE GATE, and the one that made every earlier last
+  # mile worthless. The #657 class is DEFINED by having an ordinary head branch (design record §1),
+  # so this line refused all of it — 29 lines above the `git fetch` that §11.4 wrongly described as
+  # the only thing on this path. Without the waiver: the mint refusal self-removes, the record
+  # mints, dispatch runs, the identity gate passes, no token is minted, and the reviewer dies HERE
+  # — with `outcome`'s `if:` unsatisfied, so nothing durable is written and each enrolled PR buys
+  # three wasted dispatches and a terminal park. Exactly what review_run_refusal's own docstring
+  # warns about: a predicate that stops at the consumer it happens to know about.
+  #
+  # The waiver is REVIEW-ONLY and lives here alone: run_fix and push_fix keep this line
+  # byte-for-byte, because they PUSH COMMITS and a self-attested record must never buy write
+  # access to its own branch (design record §3). That asymmetry is asserted, not assumed.
+  #
+  # WHAT REPLACES THE NAMESPACE CHECK IS NOT "ANYTHING". This value is interpolated into
+  # `git fetch origin "refs/heads/$head_branch"`, so the relaxed form is a strict safe-ref
+  # predicate: printable ASCII, no leading `-` (an option, not a ref), and none of git's own
+  # refspec metacharacters or the `..`/`@{` sequences git-check-ref-format rejects. It is applied
+  # to BOTH paths, so the worker namespace is now checked by two predicates rather than one.
+  case "$head_branch" in
+    -*|*..*|*@{*|*//*|*/|*.lock) die 'unsafe pull request head branch' ;;
+    *[!A-Za-z0-9._/-]*|'') die 'unsafe pull request head branch' ;;
+  esac
+  if [[ "$self_attested" != true ]]; then
+    [[ "$head_branch" =~ ^sparq-agent/issue-[1-9][0-9]*-[A-Za-z0-9._-]+$ ]] ||
+      die 'unsafe pull request head branch'
+  fi
   [[ "$expected_head" =~ ^[0-9a-f]{40}$ ]] || die 'unsafe expected head sha'
   [[ -n "$review_file" && "$review_file" == "$worker_root"/* ]] ||
     die 'review verdict destination must live under WORKER_ROOT'
