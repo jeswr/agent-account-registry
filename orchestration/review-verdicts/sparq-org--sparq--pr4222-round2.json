@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4222,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5f1f226649748cc0cf2008563b7e4f1b4ef16467",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "register_grant checks g.is_valid_at(now), but TopicState still retains only publisher public keys in a BTreeSet. dispatch calls on_publish without now, and on_publish authorizes solely by publisher set membership. Consequently, once a publisher opens with a valid grant, correctly signed publications continue to succeed after validity.not_after, contrary to the documented validity-bounded admission model. The session tests still use only unbounded grants and contain no real-path expiry regression.",
+    "file": "crates/sparq-e2ee-ng-broker/src/broker.rs",
+    "fix_hint": "Store each admitted publisher's authorization validity (with well-defined replacement/overlap semantics), pass now through dispatch into on_publish, and reject when no active grant covers publication time. Add a behavioral test that opens during a short validity window, uploads a root, then submits a correctly signed publication after not_after and expects NotAdmitted.",
+    "severity": "major",
+    "title": "Publisher grant expiry is still forgotten after OpenRepo"
+   },
+   {
+    "body": "on_put still computes topic usage and rejects when used + encoded length exceeds max_topic_bytes before BlockStore::put determines whether the block is already attributed to this topic. Repeating an existing topic attribution consumes zero additional bytes, yet it can return LimitExceeded at the quota boundary. The existing idempotence test uses the default large budget, while the quota test uses distinct blocks, so neither exposes this acceptance-set mismatch.",
+    "file": "crates/sparq-e2ee-ng-broker/src/broker.rs",
+    "fix_hint": "Before charging quota, determine whether this block is already attributed to the current topic; charge encoded bytes only for a new topic attribution while preserving first-seen-byte behavior. Add a test whose budget permits exactly one envelope, repeat that same envelope, and require Stored { stored: 0, duplicate: 1 }.",
+    "severity": "major",
+    "title": "Quota check still makes duplicate puts non-idempotent"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 is stagnant: both major correctness/security findings from round 1 remain in the PR head. AdmissionGrant validity is checked only when opening a repository; the broker stores only an unbounded publisher-key set and on_publish has neither a current-time argument nor a validity-window check, so expired grants still authorize publication. BlocksPut also still charges every envelope against quota before determining whether it is already attributed to the topic, so a storage-neutral duplicate can be rejected at the byte ceiling despite the documented idempotent semantics. No targeted regression tests for either invariant were added.",
+  "verdict": "request_changes"
+ }
+}
