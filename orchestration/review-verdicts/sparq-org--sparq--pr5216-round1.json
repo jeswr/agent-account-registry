@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5216,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "843c459f8535b943a0529175fb7eb654ecf4c742",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is a documentation-only citation migration from absent source-repository design paths to the in-repository research/lws-design-records.md sections. The updated references consistently preserve RSS/PSS provenance where source paths remain named, and the design record accurately describes the migration. No runtime behavior, security boundary, public API, or test logic is changed, and no hostile instruction was detected in the diff.",
+  "verdict": "approve"
+ }
+}
