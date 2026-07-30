@@ -1260,8 +1260,9 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
         _alert_route(None, None, "reg/reg") == ("reg/reg", None))
 
     # --- exit codes + the empty-scan-set fail-loud ---
-    import tempfile
-
+    # `tempfile` is imported at module scope (the schedule-map rows above use it too). A local
+    # `import tempfile` here would rebind the name for the WHOLE function, so the earlier use
+    # would raise UnboundLocalError before this line ever ran.
     def _rc(lanes, live=()):
         state = {"repo": "o/r",
                  "lanes": [dict(x, schedule_run_times=[
