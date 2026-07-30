@@ -229,6 +229,39 @@ jobs:
           fi
           echo "ran $n self-tests"
 
+      # [issue #1304] The suite above graded `refs/pull/N/merge` — a real composition ref, but one
+      # GitHub does NOT recompute when the base moves. On #756 that ref was composed from a base tip
+      # 24 commits and 12 hours behind master, and the recorded green was never invalidated: the
+      # check-run binds to the PR HEAD sha, which does not move when the base does, and
+      # `rulesets: []` + `strict: false` mean nothing requires a re-run. #920's gate-staleness step
+      # above REPORTS that; #940's arm-side guard REFUSES on it. Both compare SHAs. Neither answers
+      # the question that decides whether the staleness matters — does the composition still PASS?
+      #
+      # MEASURED on the real #756 against the real tip 45ada45a4: the merge is textually CLEAN, both
+      # sides pass their self-tests ALONE, and the composition fails two of them. That mode is
+      # invisible today — `git merge` succeeding is exactly what hides it.
+      #
+      # This step is the ENFORCEMENT, and it needs no repository setting: `gate` is already the one
+      # required context the arming latch waits on, so a composition break redding this step reds a
+      # REQUIRED check and `enablePullRequestAutoMerge` cannot fire. `strict: true` and a merge queue
+      # (#920's options (1) and (2)) remain the maintainer's calls and are NOT taken here.
+      #
+      # ⚠️ ONLY a SEMANTIC break reds. A textual conflict with the moved base is the author's routine
+      # problem — already visible as `mergeable_state: DIRTY`, already the conflict-resolver's lane —
+      # and redding every open PR the moment master moves textually is how a check gets switched off
+      # in a day. It is a `::warning::` and exits 0. The two modes are never one red.
+      #
+      # COST: zero when the graded base already IS the live tip (one `rev-parse`, no tests). When
+      # stale it re-runs only the OVERLAP — enrolled entries either side touched since the merge base
+      # — from the local object store. NO API CALL on any route, which matters while `groom` is
+      # shedding ~22% of its runs to `403 rate limit exceeded`.
+      - name: "Grade the composition PR ⊕ the CURRENT base tip, not the frozen merge ref (#1304)"
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          python3 scripts/compose-gate.py --base-ref "$PR_BASE_REF"
+
       - name: bash -n every shell script
         run: |
           set -euo pipefail
