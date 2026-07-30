@@ -9234,9 +9234,10 @@ def review_fix_identity_admits_orchestrator_class(source=None):
     one, because "an admission proof is not a delivery proof" (§11.2) is the error this whole issue
     is made of:
 
-      1. ADMITS THE CLASS. An enrolled orchestrator author — with `self_attested` DERIVED by
-         calling `resolve`'s own `review_fix_pr_admission`, never asserted — reaches the success
-         path and binds `verified`.
+      1. ADMITS THE CLASS — **every member of it**, driven against a TWO-member allowlist, with
+         `self_attested` DERIVED by calling `resolve`'s own `review_fix_pr_admission` rather than
+         asserted. A singleton fixture cannot tell "admits the enrolled class" from "admits one
+         login", and a separate fleet identity is coming, so the plural is load-bearing here.
       2. STILL REFUSES A STRANGER. An arbitrary third-party author gets `self_attested=False` from
          that same shared function, therefore holds a token, therefore meets the unchanged author
          check, and is refused. A gate widened by admitting EVERYONE reds here.
@@ -9299,6 +9300,12 @@ def review_fix_identity_admits_orchestrator_class(source=None):
             with contextlib.suppress(OSError):
                 os.unlink(path)
 
+    # [registry #1288] A TWO-MEMBER allowlist, not a singleton, and it is load-bearing here rather
+    # than in a separate row: a fleet machine identity is coming, and an interlock proved against
+    # one login cannot distinguish "admits the enrolled CLASS" from "admits jeswr". Both members
+    # must deliver and a non-member must not.
+    _PROBE_ENROLLED_CLASS = (PROBE_ENROLLED_LOGIN, "probe-fleet-machine-account")
+
     def _delivers(login):
         """Drive the WHOLE path for one author: `resolve` decides `self_attested` (by executing
         the shared admission, not by assertion), the mint's own `if:` couples the token to that
@@ -9306,11 +9313,11 @@ def review_fix_identity_admits_orchestrator_class(source=None):
         the gap of."""
         admitted, admission_error = review_fix_pr_admission(
             PROBE_REPO, dict(orchestrator_probe_pull(), user={"login": login}),
-            orchestrator_probe_record(), (PROBE_ENROLLED_LOGIN,), "review")
+            orchestrator_probe_record(), _PROBE_ENROLLED_CLASS, "review")
         self_attested = admitted is True and admission_error is None
         return _run(login, self_attested=self_attested, target_app_token=not self_attested)
 
-    return (_delivers(PROBE_ENROLLED_LOGIN) is True
+    return (all(_delivers(member) is True for member in _PROBE_ENROLLED_CLASS)
             and _delivers("some-unrelated-third-party") is False
             and _run(PROBE_ENROLLED_LOGIN, self_attested=True, target_app_token=True) is False
             and _run(PROBE_ENROLLED_LOGIN, self_attested=True, target_app_token=False,
@@ -12369,6 +12376,22 @@ def _self_test():
                 (f"the crash loop must terminate after exactly max_review_rounds iterations; "
                  f"got {_iterations}")
             assert count_ledger_rounds(_bound_root, "", _bound_wp, "o/r", 41) == _max_rounds
+            # [review finding, mutant P6] ...and the COUNTER is PR-scoped and REPO-scoped, the same
+            # class N16 closed for the verdict glob. A reader that sweeps up a NEIGHBOUR's charged
+            # attempts budgets this PR for work done on another one — which exhausts an innocent
+            # PR's budget and parks it — and one that misses its own is the unbounded loop again.
+            # Both directions asserted, because only checking the first is satisfied by a counter
+            # that returns 0.
+            (_data / "review-round--o--r--pr410--r1.json").write_text("{}")
+            (_data / "review-round--o--r--pr4--r1.json").write_text("{}")
+            (_data / "review-round--other--repo--pr41--r1.json").write_text("{}")
+            assert count_ledger_rounds(_bound_root, "", _bound_wp, "o/r", 41) == _max_rounds, \
+                ("the attempt counter must ignore other PRs' and other repos' charged attempts — "
+                 "counting them budgets this PR for work done on another one")
+            assert count_ledger_rounds(_bound_root, "", _bound_wp, "o/r", 410) == 1, \
+                "...while still counting the neighbour's own attempt for the neighbour"
+            assert count_ledger_rounds(_bound_root, "", _bound_wp, "other/repo", 41) == 1, \
+                "...and the other repo's for the other repo"
         # ...and the bound is LOAD-BEARING, not incidental: a reader that cannot see the charged
         # attempts (the pre-#1288 behaviour, and what `count_rounds` over PR comments would give a
         # class with no target writes) never terminates. This is the row that reds if the ledger
@@ -23761,6 +23784,80 @@ def _ledger_seam_exec(block, *, charged_rounds=(), verdicts=(), namespace):
             os.chdir(saved)
 
 
+def _ledger_charge_argv_violations(step):
+    """The ATTEMPT CHARGE's argv, proved by RUNNING the step with `python3` shimmed.
+
+    [review finding, mutant Y19] Pinning the step's `if:` says WHEN it runs, not WHAT it charges.
+    Replacing `--round "${{ inputs.review_round }}"` with `--round "1"` collapses every attempt of
+    every round onto one ledger file, so `count_ledger_rounds` returns 1 forever, the budget never
+    exhausts, and the unbounded crash loop the store exists to prevent is silently restored — with
+    the step still present, still correctly gated, and the whole suite green.
+
+    Each `${{ ... }}` is substituted with a marker DERIVED FROM ITS OWN TEXT before execution, so
+    the assertion is equality between a flag and the runtime value the runner would have put there
+    — never a containment test on workflow source, which `echo python3 …` and `false && python3 …`
+    both survive."""
+    out = []
+    script = step.get("run")
+    if not isinstance(script, str):
+        return ["the round-claim step has no `run:` script, so nothing is ever charged"]
+    if step.get("shell") is not None:
+        out.append(f"the round-claim step declares its own `shell:` ({step.get('shell')!r}); the "
+                   "invocation is pinned by EXECUTION under the runner's default `bash -e`")
+    if step.get("continue-on-error"):
+        out.append("the round-claim step declares `continue-on-error:` — a failed charge must fail "
+                   "the `claim` job so `run` is skipped, which is what makes the ordering "
+                   "structural rather than hopeful")
+    seen = {}
+
+    def _marker(match):
+        expr = match.group(0)
+        seen[expr] = f"GHA-{len(seen)}-{abs(hash(expr)) % 10**8}"
+        return seen[expr]
+
+    marked = _IDENTITY_SEAM_GHA_EXPR_RE.sub(_marker, script)
+    with tempfile.TemporaryDirectory() as shim_dir:
+        argv_log = Path(shim_dir) / "argv.json"
+        shim = Path(shim_dir) / "python3"
+        shim.write_text(
+            f"#!{sys.executable}\n"
+            "import json, sys\n"
+            f"open({str(argv_log)!r}, 'a', encoding='utf-8').write("
+            "json.dumps(sys.argv[1:]) + '\\n')\n",
+            encoding="utf-8")
+        shim.chmod(0o755)
+        try:
+            _identity_shell_step(marked, env={"TARGET_REPO": "o/r", "GH_TOKEN": "t",
+                                              "GITHUB_REPOSITORY": "reg/istry"},
+                                 path_prefix=shim_dir)
+        except Exception as exc:  # noqa: BLE001
+            return out + [f"the round-claim step could not be executed ({exc!r}) — treated as "
+                          "broken"]
+        invocations = ([json.loads(line) for line in
+                        argv_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+                       if argv_log.exists() else [])
+    charge = next((argv for argv in invocations if "round-claim" in argv), None)
+    if charge is None:
+        out.append(f"the round-claim step EXECUTES without ever INVOKING `worker-pr.py "
+                   f"round-claim` (saw {invocations!r}) — nothing is charged, so nothing bounds "
+                   "the crash loop")
+        return sorted(out)
+    # Each flag must carry the RUNNER-SUBSTITUTED value of the expression that belongs to it.
+    for flag, expr in (("--round", "${{ inputs.review_round }}"),
+                       ("--pr", "${{ inputs.pr_number }}"),
+                       ("--head-sha", "${{ needs.resolve.outputs.head_sha }}")):
+        want = seen.get(expr)
+        got = charge[charge.index(flag) + 1] if flag in charge else None
+        if want is None:
+            out.append(f"the round-claim step no longer references {expr} at all, so {flag} "
+                       "cannot be carrying it")
+        elif got != want:
+            out.append(f"the round-claim step's {flag} must be {expr} (got {got!r}) — a constant "
+                       "or a neighbouring input here collapses every attempt onto one ledger file "
+                       "and silently un-bounds the crash loop the store exists to prevent")
+    return sorted(out)
+
+
 def _ledger_seam_violations(document, source=None):
     """Every way the #1288 ledger accounting can be silently disabled, as NAMED violations."""
     out = []
@@ -23778,11 +23875,14 @@ def _ledger_seam_violations(document, source=None):
         out.append("jobs.claim has no step invoking `worker-pr.py round-claim` — the "
                    "self-attested class's review attempts are never charged, so its round budget "
                    "never exhausts and a deterministic crash loop is unbounded")
-    elif charge.get("if") != _LEDGER_SEAM_CHARGE_IF:
-        out.append(f"jobs.claim's round-claim step `if:` must be EXACTLY "
-                   f"{_LEDGER_SEAM_CHARGE_IF!r} (found {charge.get('if')!r}) — inverting or "
-                   "widening it either stops charging the class or charges a class whose rounds "
-                   "are counted from PR comments instead")
+    else:
+        if charge.get("if") != _LEDGER_SEAM_CHARGE_IF:
+            out.append(f"jobs.claim's round-claim step `if:` must be EXACTLY "
+                       f"{_LEDGER_SEAM_CHARGE_IF!r} (found {charge.get('if')!r}) — inverting or "
+                       "widening it either stops charging the class or charges a class whose "
+                       "rounds are counted from PR comments instead")
+        # ...and WHAT it charges, not just when (mutant Y19): pinned by EXECUTION.
+        out.extend(_ledger_charge_argv_violations(charge))
 
     # (2) The tokenless target CHECKOUT must keep its registry-token fallback (mutant N9): with
     #     no App token minted for the class, dropping it leaves the checkout with no token at all.

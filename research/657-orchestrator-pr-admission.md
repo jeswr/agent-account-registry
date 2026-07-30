@@ -740,10 +740,10 @@ investment above this layer returns zero.** Two live consequences:
    arise — "the narrower trust boundary and the better shape *if it holds*, but a real change to
    the review path that must be measured, not assumed."
 
-It holds, and it was measured. `worker-live.sh review` — the only thing in that job that touches
-target content — makes **no** `gh`, API or `curl` call at all, performs **no** target write, and
-its single remote git operation (`git fetch origin refs/heads/<head>`, worker-live.sh:2663) is
-**already anonymous**: the target checkout is `persist-credentials: false`, so no credential has
+It holds, and it was measured — but the first version of this section was **wrong about that
+script in a way that would have delivered zero**, and the correction is §12.8. `worker-live.sh
+review` makes **no** `gh`, API or `curl` call at all, performs **no** target write, and its single
+remote git operation (`git fetch origin refs/heads/<head>`) is **already anonymous**: the target checkout is `persist-credentials: false`, so no credential has
 ever survived into `.git/config` for it to use. The model container additionally cannot receive a
 GitHub token by construction — `_run_headless_harness` dies on any argv element beginning
 `GH_TOKEN`/`GITHUB_` (worker-live.sh:403-407).
@@ -779,10 +779,16 @@ stand where it stood:
    App token exists on that path anyway (`self-attested-run-holds-a-target-token`), and refuses a
    non-public target (`self-attested-target-is-not-public`). Re-adding the mint without restoring
    the author gate therefore **stops the run**; it does not quietly re-open the hole.
-4. **No gate input is author-editable any more.** Round accounting moved off App-written PR
-   comments onto the ledger attempt store, and `already_done` moved off the
-   `<!-- sparq-reviewed-sha -->` PR-body marker onto the ledger verdict record's #156 host
-   envelope. This is not cosmetic: for a worker PR the App authors both the pull request and the
+4. **No gate input is *model*-influenceable any more, and the author's reach is narrowed rather
+   than eliminated — stated precisely, because the first version of this section overstated it.**
+   Round accounting moved off App-written PR comments onto the ledger attempt store, and
+   `already_done` moved off the `<!-- sparq-reviewed-sha -->` PR-body marker onto the ledger
+   verdict record's #156 host envelope. The `ledger` branch is `protected: false` with zero
+   rulesets, and the sole enrolled author is also the sole collaborator with admin — so a
+   *determined author* can still write there. What the move buys is real but bounded: it removes
+   the surface from the **model** (the actual threat, which has no registry credential at all) and
+   from anything that can only edit a pull request body. A trusted author who writes the ledger can
+   strand their own PR; they cannot obtain a review they did not earn. This is not cosmetic: for a worker PR the App authors both the pull request and the
    marker, so a body marker is the App's own record; for this class the author is a human and the
    body is theirs. Leaving `already_done` there would have left the one cheap bound on redundant
    dispatch in the hands of the party it bounds.
@@ -862,8 +868,10 @@ attestation **and** master allowlist), and this change sits strictly downstream 
 
 ### 12.5 Evidence
 
-- Full enrolled self-test suite green: **54/54** (`worker-live.sh print-selftest-suite` +
-  `run-selftest`, the exact CI enumeration).
+- Full enrolled self-test suite green (`worker-live.sh print-selftest-suite` + `run-selftest`,
+  the exact CI enumeration). The count moves with master: **55/55** at the time of writing, after
+  rebasing onto a master that had added a script. A green suite is necessary and — see §12.8 — was
+  demonstrably not sufficient.
 - **M22 is CLOSED.** The `orchestrator_admitted → count_ledger_rounds` routing at the production
   `_dispatch_review_items` call site now has a red test, driven end to end through the real
   dispatch loop, with the difference observable where it matters — whether a reviewer **launches**
@@ -932,18 +940,77 @@ hand-applied or hand-removed hold carries no cause receipt.
 
 So the first delivery will come from the hold-free part of the class. Of 12 open non-draft
 `jeswr`-authored PRs, **9 are held** (`review:parked` ×5, `needs:user` ×3, `review:needs-user` ×1 —
-#1275) and **3 are free**: **#756, #1308, #1309**. All three pass the shared writer's
+#1275) and the rest are free: **#756, #1308, #1309**, and **#1313** which joined after that count.
+The set is a moving target; the predicate, not the list, is the durable part. All three pass the shared writer's
 `pr_mint_refusal` (`NONE`) and all three name a source issue (#758, #1304, #835), so auto-mint can
 record provenance for them once the mint refusal self-removes — which it does the moment the
 identity gate admits, with no edit anywhere.
 
 **Verification recipe for whoever merges this:** after the merge, the first delivery is a file
-matching `orchestration/review-verdicts/jeswr--agent-account-registry--pr{756,1308,1309}-round1.json`
-on `ledger`, read via `/git/trees/ledger?recursive=1`. Until such a file exists, this lane's
-delivery is still **zero**.
+matching `orchestration/review-verdicts/jeswr--agent-account-registry--pr<N>-round1.json` for any
+hold-free enrolled PR, read via `/git/trees/ledger?recursive=1`. Until such a file exists, this
+lane's delivery is still **zero**. ⚠️ Before §12.8's fix this prediction was simply WRONG — no such
+file could ever have appeared, because the reviewer died in the shell first.
 
 One live example of a hazard worth not leaning on: PR #1275 already contains a comment in which a
 **human** quotes `<!-- sparq-identity-refusal:v1 ... -->` inside a blockquote. It is harmless here
 only because the receipt reader filters on the App login — but it is exactly the shape a
 marker-scanner without fence/quote stripping would misread, so nothing in this change reads a
 marker without an author filter.
+
+### 12.8 The FOURTH consumer — found in review, and the question I failed to ask
+
+> 🤖 **SPARQ agent** — this section corrects §11.4 and §12.1. Both described
+> `worker-live.sh review`'s only relevant property as *"the one remote git op is already
+> anonymous"*. That was true and it was not the point.
+
+`worker-live.sh` `run_review` carries its **own** copy of the worker head-ref gate:
+
+```bash
+[[ "$head_branch" =~ ^sparq-agent/issue-[1-9][0-9]*-[A-Za-z0-9._-]+$ ]] ||
+  die 'unsafe pull request head branch'
+```
+
+It sits **29 lines above** the `git fetch` those sections cite, and §1 *defines* the #657 class by
+having an ordinary head branch. So the merge outcome, before this fix, was: `review_run_refusal`
+self-removes, the record mints, dispatch runs, the identity gate admits, no token is minted — **and
+the reviewer dies in the shell.** `outcome`'s `if:` is then unsatisfied (`identity_refusal` empty,
+`verdict_ok` skipped), so **nothing durable is written**; the ledger charge bounds it to three
+attempts and then a `review:parked` hold with no capacity-recovery evidence to consume. Three
+wasted dispatches and a terminal park per enrolled PR, and **zero verdicts**.
+
+`unsafe pull request head branch` appears at **three** `die` sites in that script (`run_review`,
+`run_fix`, `push_fix`) and had **zero** test coverage, because every `worker-live.sh` fixture uses a
+worker-shaped branch. **That is how a 55/55 green suite coexisted with a lane that delivers
+nothing** — and it is the mechanism behind `review_run_refusal`'s own warning that *"a predicate
+that stops at the consumer it happens to know about writes records whose only effect is a terminal
+park"*. §8.1's consumer table enumerates two and stops; `claim_review_pr_admission` even notes
+CLAIM's duplicate shape gates. Three of four copies were found.
+
+**The generalisable error is narrower than "I missed a file", and worth writing down.** The
+investigation was briefed to answer *which operations on this path need a credential*. It answered
+that correctly and completely. It was never asked *which predicates on this path refuse this class*.
+Those are different questions over the same code, and only the second one finds a gate that costs
+nothing and refuses everything. **When removing an authority, enumerate the ADMISSION predicates of
+every layer the work will newly reach — not the authority's consumers.**
+
+**The fix.** The waiver is threaded to the shell, `review`-only. `run_fix` and `push_fix` keep the
+namespace check byte-for-byte, because they push commits and §3 forbids a self-attested record
+buying write access to its own branch. What replaces the namespace check is **not "anything"**: the
+value is interpolated into `git fetch origin "refs/heads/$head_branch"`, so a strict safe-ref
+predicate (no leading `-`, no `..`/`@{`/`//`/trailing `/`/`.lock`, nothing outside
+`[A-Za-z0-9._/-]`) now applies to **both** paths — the worker namespace is checked by two
+predicates where it used to have one.
+
+**The probe** (`worker_live_admits_orchestrator_class`) drives the real script by **controlled
+differential execution**: the environment is shaped so the head gate is the first thing that can
+fail, so `unsafe pull request head branch` versus `unsafe expected head sha` discriminates cleanly.
+Six facts — admits the class in `review`; refuses it unenrolled; refuses **eight**
+injection-shaped refs; refuses `fix`; refuses `push-fix`; still admits the worker lane — and it is
+validated against four known positives, every one of which reds it.
+
+Two false negatives surfaced while building that probe, both of which would have made it report
+"not refused" for **every** input: the script validates its self-test manifest and every enrolled
+sibling at load time, and `push_fix` refuses a missing token before reaching the head gate. A
+differential that had not been checked against a known answer in both directions would have shipped
+green and proved nothing — the same failure mode as the gate it was written to catch.
