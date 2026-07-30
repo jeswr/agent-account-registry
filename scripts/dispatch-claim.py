@@ -23157,6 +23157,22 @@ _IDENTITY_SEAM_REVIEW_MINT_IF = (
 _IDENTITY_SEAM_ROUND_VOID_IF = (
     "${{ always() && inputs.mode == 'review' && needs.resolve.outputs.self_attested != 'true' "
     "&& steps.round.outcome == 'success' }}")
+# [registry #1288, review finding 2] THE INTERLOCK'S INPUT. The identity block refuses when
+# `TARGET_APP_TOKEN` is true on the self-attested path, and that refusal is executed by six probe
+# facts — but NOTHING guarded the expression that COMPUTES it. Both
+# `${{ steps.app-token-fix.outputs.token != '' }}` and `${{ false }}` are valid YAML,
+# actionlint-clean, and leave the whole suite green while permanently defeating the refusal. A
+# guard whose input is unpinned is a guard that reads its own stub, so the expression is pinned by
+# equality and the MINT COUNT is pinned too: this expression names exactly two step ids, so a
+# THIRD `create-github-app-token` step in the `run` job would evade it entirely.
+_IDENTITY_SEAM_TOKEN_FACT = (
+    "${{ (steps.app-token-review.outputs.token || steps.app-token-fix.outputs.token) != '' }}")
+_IDENTITY_SEAM_RUN_MINT_IDS = ("app-token-review", "app-token-fix")
+_IDENTITY_SEAM_MINT_ACTION = "actions/create-github-app-token"
+# ...and the env var that carries the waiver to the FOURTH consumer (worker-live.sh's own head-ref
+# gate). Deleting this one line silently restores the shipped defect: every layer admits and the
+# reviewer dies in the shell.
+_IDENTITY_SEAM_WORKER_SELF_ATTESTED = "${{ needs.resolve.outputs.self_attested }}"
 _IDENTITY_SEAM_RECORD_IF = "${{ needs.run.outputs.identity_refusal != '' }}"
 _IDENTITY_SEAM_REVERIFY_IF = (
     "${{ inputs.mode == 'review' && needs.run.outputs.identity_refusal == '' }}")
@@ -23390,6 +23406,17 @@ _IDENTITY_SEAM_DECLARED_CONTAINMENT = {
     # Membership in the ARGV the recorder was actually INVOKED with — a runtime value produced by
     # executing the step, not a substring of the step.
     ("_identity_record_violations", "'identity-refusal' in argv"),
+    # [registry #1288] Step FINDERS, not pins. Each ADDRESSES a step by the command it runs so the
+    # pin can then compare its `env` for EQUALITY on a parsed node. A mutant that renames the
+    # command away makes the finder find nothing, which is its own named violation — and the thing
+    # actually pinned (env.WORKER_SELF_ATTESTED) is never a substring test.
+    ("_identity_refusal_seam_violations", "'worker-live.sh review' in s['run']"),
+    ("_identity_refusal_seam_violations", "_fix_cmd in s['run']"),
+    # The MINT CENSUS. `uses:` is a parsed node and an action reference is `owner/repo@sha`, so a
+    # prefix test is how you name the action without pinning the SHA — which is bumped by
+    # dependabot and is not the fact being guarded. The census then compares the resulting id
+    # tuple for EQUALITY.
+    ("_identity_refusal_seam_violations", "s['uses'].startswith(_IDENTITY_SEAM_MINT_ACTION)"),
 }
 
 
@@ -23446,6 +23473,10 @@ def _identity_block_violations(step):
             script, pr_author="jeswr", self_attested=True, target_app_token=True)
         sa_priv_code, sa_priv_bound = _identity_block_run(
             script, pr_author="jeswr", self_attested=True, target_app_token=False, private=True)
+        # [registry #1288] The replacement for the deleted `[[ -n "$GH_TOKEN" ]]` check: a run that
+        # is NOT self-attested and holds NO target token must be refused, not compared.
+        no_tok_code, no_tok_bound = _identity_block_run(
+            script, pr_author="registry-admin[bot]", self_attested=False, target_app_token=False)
     except Exception as exc:      # noqa: BLE001 — an unrunnable seam proves nothing
         return [f"jobs.run step `target` could not be executed ({exc!r}), so the #972 exit "
                 "cannot be proved — treated as broken"]
@@ -23471,6 +23502,12 @@ def _identity_block_violations(step):
                    "exactly the authority the App-author check was guarding, and this refusal is "
                    "what replaces it. Re-adding the mint would silently hand a model a "
                    "target-scoped token on a PR this App did not author")
+    if no_tok_code != 0 or no_tok_bound.get("verified") == "yes" \
+            or no_tok_bound.get("refusal") != "target-token-not-minted":
+        out.append(f"a NON-self-attested run holding NO target App token must be refused as "
+                   f"`target-token-not-minted` (exit={no_tok_code!r}, bound={no_tok_bound!r}) — "
+                   "this is the replacement for the deleted `[[ -n \"$GH_TOKEN\" ]]` shell check, "
+                   "which became vacuous once GH_TOKEN falls back to the registry's own token")
     if sa_priv_code != 0 or sa_priv_bound.get("verified") == "yes" \
             or not sa_priv_bound.get("refusal"):
         out.append(f"the identity block ADMITS the self-attested class against a PRIVATE target "
@@ -23568,6 +23605,52 @@ def _identity_refusal_seam_violations(document):
                    "ledger attempt store that replaces its accounting is deliberately "
                    "eraser-free: nothing downstream of the model may extend the round budget "
                    "that bounds it")
+
+    # (3c) [registry #1288, review finding 2] THE INTERLOCK'S INPUT, and the MINT CENSUS. Claim 3
+    #      of this change's security argument is "the identity block refuses if a target token
+    #      exists on that path anyway". The refusal is executed by the probe; the VALUE it reads
+    #      was unguarded, so a one-token edit to the expression below defeated it while leaving
+    #      every test green. Equality on the expression, plus a census of the mint steps, because
+    #      the expression names exactly two step ids and a third mint would evade it.
+    got_fact = ((step.get("env") or {}).get("TARGET_APP_TOKEN") if step else None)
+    if got_fact != _IDENTITY_SEAM_TOKEN_FACT:
+        out.append(f"jobs.run step `target` env.TARGET_APP_TOKEN must be EXACTLY "
+                   f"{_IDENTITY_SEAM_TOKEN_FACT!r} (found {got_fact!r}) — this is the INPUT to the "
+                   "refusal that replaces the App-author check for the self-attested class. "
+                   "Re-pointing it at one mint, or at a constant, leaves the refusal in place and "
+                   "permanently unsatisfiable")
+    mint_ids = [s.get("id") for s in run_steps if isinstance(s, dict)
+                and isinstance(s.get("uses"), str)
+                and s["uses"].startswith(_IDENTITY_SEAM_MINT_ACTION)]
+    if tuple(mint_ids) != _IDENTITY_SEAM_RUN_MINT_IDS:
+        out.append(f"jobs.run must mint target App tokens in EXACTLY the steps "
+                   f"{list(_IDENTITY_SEAM_RUN_MINT_IDS)!r} (found {mint_ids!r}) — "
+                   "TARGET_APP_TOKEN is computed from those two ids alone, so a third mint step "
+                   "would put a target-scoped token in the job that the self-attested refusal "
+                   "cannot see")
+
+    # (3d) [registry #1288] The waiver must REACH the fourth consumer. worker-live.sh's own
+    #      head-ref gate refuses the whole class without it, and deleting one env line is enough.
+    review_step = next((s for s in run_steps if isinstance(s, dict)
+                        and isinstance(s.get("run"), str)
+                        and "worker-live.sh review" in s["run"]), None)
+    if review_step is None:
+        out.append("jobs.run has no step invoking `worker-live.sh review`")
+    else:
+        got_wsa = (review_step.get("env") or {}).get("WORKER_SELF_ATTESTED")
+        if got_wsa != _IDENTITY_SEAM_WORKER_SELF_ATTESTED:
+            out.append(f"the `worker-live.sh review` step's env.WORKER_SELF_ATTESTED must be "
+                       f"EXACTLY {_IDENTITY_SEAM_WORKER_SELF_ATTESTED!r} (found {got_wsa!r}) — "
+                       "worker-live.sh `run_review` carries a FOURTH copy of the worker head-ref "
+                       "gate and refuses the entire #657 class without this, after every other "
+                       "layer has admitted")
+    for _fix_cmd in ("worker-live.sh fix", "worker-live.sh push-fix"):
+        leaked = [s for s in run_steps if isinstance(s, dict) and isinstance(s.get("run"), str)
+                  and _fix_cmd in s["run"] and (s.get("env") or {}).get("WORKER_SELF_ATTESTED")]
+        if leaked:
+            out.append(f"a `{_fix_cmd}` step carries WORKER_SELF_ATTESTED — those paths PUSH "
+                       "COMMITS, and a self-attested record must never buy write access to its "
+                       "own branch (design record §3)")
 
     # (4) The outcome job must ADMIT the refusal path...
     if outcome_job.get("if") != _IDENTITY_SEAM_OUTCOME_IF:
@@ -23829,6 +23912,34 @@ def _identity_refusal_seam_self_test():
         assert any(_needle in item for item in _found), (
             f"the ledger-seam checker FAILED ITS KNOWN POSITIVE ({_why}): expected a violation "
             f"naming {_needle!r}, got {_found!r} — a clean report from it would prove nothing")
+    # ...and the same discipline for [review finding 2] — the interlock's INPUT and the mint
+    # census. Every one of these is valid YAML that leaves the whole suite green.
+    for _why, _needle, _broken in (
+            ("TARGET_APP_TOKEN is re-pointed at one mint", "env.TARGET_APP_TOKEN must be EXACTLY",
+             text.replace(
+                 "          TARGET_APP_TOKEN: ${{ (steps.app-token-review.outputs.token || "
+                 "steps.app-token-fix.outputs.token) != '' }}",
+                 "          TARGET_APP_TOKEN: ${{ steps.app-token-fix.outputs.token != '' }}")),
+            ("TARGET_APP_TOKEN is pinned to a constant", "env.TARGET_APP_TOKEN must be EXACTLY",
+             text.replace(
+                 "          TARGET_APP_TOKEN: ${{ (steps.app-token-review.outputs.token || "
+                 "steps.app-token-fix.outputs.token) != '' }}",
+                 "          TARGET_APP_TOKEN: ${{ false }}")),
+            ("the waiver never reaches worker-live.sh", "env.WORKER_SELF_ATTESTED must be EXACTLY",
+             text.replace(
+                 "          WORKER_SELF_ATTESTED: ${{ needs.resolve.outputs.self_attested }}\n"
+                 "        run: bash ../registry/scripts/worker-live.sh review",
+                 "        run: bash ../registry/scripts/worker-live.sh review"))):
+        assert _broken != text, _why
+        _found = _identity_refusal_seam_violations(yaml.safe_load(_broken))
+        assert any(_needle in item for item in _found), (
+            f"the identity-seam checker FAILED ITS KNOWN POSITIVE ({_why}): expected a violation "
+            f"naming {_needle!r}, got {_found!r}")
+    print("  ok   #1288 review finding 2: the refusal's INPUT (env.TARGET_APP_TOKEN), the `run` "
+          "job's MINT CENSUS, and the env line carrying the waiver to worker-live.sh are each "
+          "pinned by equality and shown to RED on an injected known positive — a guard whose "
+          "input is unpinned reads its own stub")
+
     _ledger_violations = _ledger_seam_violations(live)
     assert _ledger_violations == [], _ledger_violations
     print("  ok   #1288 the LEDGER-accounting seam is intact — the charge is wired into `claim` "

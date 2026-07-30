@@ -1132,6 +1132,16 @@ jobs:
               login = ""
               user_id = ""
           else:
+              # [registry #1288] THE REPLACEMENT for master's `[[ -n "$GH_TOKEN" ]] || exit 1`.
+              # That shell check had to go: GH_TOKEN now legitimately falls back to the registry's
+              # own token, so it can never be empty and the check became vacuous. The property it
+              # protected is real and belongs on THIS branch — a run that is not self-attested MUST
+              # hold a target App token, or the reads above were performed with an identity that
+              # confers nothing over the target and the App-author comparison below is meaningless.
+              # Stated as its own refusal so a failed mint is diagnosed as a failed mint rather
+              # than surfacing as the misleading `not-an-app-bot`.
+              if not target_app_token:
+                  refuse("target-token-not-minted")
               if not re.fullmatch(r"[A-Za-z0-9_.-]+\[bot\]", str(login)) or not user_id.isdigit():
                   refuse("not-an-app-bot")
               # Authoritative authorship check, BYTE-FOR-BYTE UNCHANGED for every run that holds a

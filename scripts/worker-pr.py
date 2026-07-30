@@ -295,6 +295,12 @@ IDENTITY_REFUSAL_REASONS = {
     "self-attested-target-is-not-public":
         "the self-attested review path requires a public target, because everything it reads "
         "must be readable without target authority",
+    # [registry #1288] The replacement for master's `[[ -n "$GH_TOKEN" ]] || exit 1`, which became
+    # vacuous once GH_TOKEN legitimately falls back to the registry's own token. A run that is NOT
+    # self-attested must hold a target App token, or the App-author comparison compares against an
+    # identity that confers nothing over the target.
+    "target-token-not-minted":
+        "the run is not self-attested, so it requires a target App token, and none was minted",
 }
 # The window key for the initial no-cutoff window — mirrors park_policy.PARK_WINDOW_NONE
 # (kept literal here so the pure marker parser needs no module load; never valid ISO-8601, so
