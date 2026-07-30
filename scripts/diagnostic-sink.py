@@ -81,6 +81,11 @@ WORKFLOW_DIR = os.path.join(".github", "workflows")
 
 # The registry's EXISTING private destination for account-enumerating output (ALERT_REPO).
 DEFAULT_SINK_REPO = "jeswr/agent-account-data"
+# THIS registry — the repo the runbook is executed from, and the AUTHORITATIVE holder of the
+# concrete per-account secret names. `ACCTNN_TOKEN` is the family notation used throughout this
+# repo's prose; no secret is called that, so the runbook enumerates the real names from here rather
+# than printing a name-shaped literal for a human to expand.
+REGISTRY_REPO = "jeswr/agent-account-registry"
 DEFAULT_SINK_DEFAULT_BRANCH = "master"
 
 # The guard atom, in the canonical (space-free) form `_if_atom_map` reduces a parsed comparison to
@@ -88,7 +93,17 @@ DEFAULT_SINK_DEFAULT_BRANCH = "master"
 # genuinely parsed COMPARISON against `true` is recognised: `if: ${{ ...private }}` used bare is
 # semantically equivalent to a human and is REFUSED here, because it is not a comparison this
 # procedure can pin, and refusing an unrecognised spelling is the safe direction.
-PRIVATE_GUARD_RE = re.compile(r"github\.event\.repository\.private==(?:true|['\"]true['\"])")
+#
+# ANCHORED WHOLE-CANONICAL (\A..\Z), because `if_condition_admits` matches this with `re.search`
+# against the canonical text and PINS EVERY MATCH FALSE. Unanchored, the accepted text is a
+# SUBSTRING test, and a substring match pins an atom that is not this guard: `...private ==
+# truefoo` contains `...private==true`, so it would be pinned false and the job reported provably
+# unreachable — while at runtime `truefoo` is an undefined path (null -> 0) and `false == null` is
+# TRUE, so the probe runs and enumerates the fleet on a PUBLIC repo. The same shape on the left
+# (`needs.x.outputs.github.event.repository.private == true`) pins a comparison against a
+# different, unrelated path. An atom that is not character-for-character the guard is not the
+# guard: it stays FREE, the expression comes back reachable, and the bundle is refused.
+PRIVATE_GUARD_RE = re.compile(r"\Agithub\.event\.repository\.private==(?:true|['\"]true['\"])\Z")
 PRIVATE_GUARD_TEXT = "github.event.repository.private == true"
 
 
@@ -384,15 +399,26 @@ def runbook(requirements, sink_repo, sink_default_branch, outdir="<dir>"):
              for name in requirements.secrets]))
     if requirements.context_readers:
         steps.append(Step(
-            "3. The account tokens the fleet fingerprint covers",
+            "3. The account tokens the fleet fingerprint covers — enumerate them, then read back",
             "One probe reads the WHOLE secrets context and filters it with its own allowlist, so "
             "its coverage is exactly the account tokens present in the environment above — it "
-            "cannot be listed here without restating that allowlist. Add each `ACCTNN_TOKEN` you "
-            "want a 7d-reset fingerprint for, the same way as step 2.\n"
+            "cannot be listed here without restating that allowlist.\n"
             + "\n".join(f"  - {filename} job `{job}` reads `{read}`"
-                        for filename, job, read in requirements.context_readers),
-            [f"gh secret set ACCTNN_TOKEN -R {sink_repo} --env {environment}"
-             for environment in requirements.environments]))
+                        for filename, job, read in requirements.context_readers)
+            + "\n\nNo `gh secret set` line is printed for these, deliberately. This repo's prose "
+            "writes the family as `ACCTNN_TOKEN`, but that is NOTATION — no secret is called "
+            "that, `gh secret set` would take it literally, and the probe's allowlist ACCEPTS the "
+            "literal name, so a pasted placeholder installs one empty slot and the sweep then "
+            "runs GREEN having fingerprinted nothing. Instead: read the concrete names out of the "
+            "registry environment that already holds them (first command), add each one with the "
+            "step-2 command under ITS OWN name, then read the sink environment back (second "
+            "command). Every account you meant to cover must appear in that read-back — it is the "
+            "only thing that distinguishes a provisioned fleet from an empty one, and step 5 "
+            "cannot tell them apart.",
+            [f"gh api repos/{REGISTRY_REPO}/environments/{environment}/secrets "
+             "--jq '.secrets[].name'" for environment in requirements.environments]
+            + [f"gh api repos/{sink_repo}/environments/{environment}/secrets "
+               "--jq '.secrets[].name'" for environment in requirements.environments]))
     steps.append(Step(
         "4. The workflows themselves",
         "Emitted byte-for-byte from the registry, guard included. Commit them to the sink's "
@@ -571,6 +597,16 @@ def _test_guard_polarity(chk):
         ("an `if:` interleaving literal text with an expression (undecidable)",
          "probe-${{ " + PRIVATE_GUARD_TEXT + " }}"),
         ("an unbalanced expression (unparseable)", "${{ " + PRIVATE_GUARD_TEXT + " && ( }}"),
+        # The two SUBSTRING collisions around the recognised atom. Both are spelled literally (not
+        # composed from PRIVATE_GUARD_TEXT) so they keep colliding with whatever the constant says.
+        # The first is the dangerous one and is why the pattern is anchored: `truefoo` is an
+        # undefined path, so it is null, and GitHub compares `false == null` as `0 == 0` — the
+        # condition is TRUE exactly when the repository is PUBLIC. An unanchored pattern pinned it
+        # false and reported the job provably unreachable.
+        ("a SUFFIX on the right operand — reaches on a PUBLIC repo, so it is the opposite of the "
+         "guard", "${{ github.event.repository.private == truefoo }}"),
+        ("a PREFIX on the left operand — a comparison against an entirely different path",
+         "${{ needs.x.outputs.github.event.repository.private == true }}"),
     ]
     for label, condition in refused:
         chk(f"guard: REFUSES {label}", _verdict({"probe": _job(condition)}), False)
@@ -737,10 +773,31 @@ def _test_runbook_is_derived(chk):
 
     contextual = Requirements(("SINK_ODD_SECRET",), (("f.yml", "j", "toJSON(secrets)"),),
                               ("sink-odd-env",))
-    titles = [step.title for step in runbook(contextual, "owner/sink", "trunk")]
+    ctx_steps = runbook(contextual, "owner/sink", "trunk")
+    titles = [step.title for step in ctx_steps]
     chk("runbook: a whole-context reader adds the account-token step; no reader, no step",
         (any("fleet fingerprint" in title for title in titles),
          any("fleet fingerprint" in step.title for step in steps)), (True, False))
+
+    # The fleet step is the one whose subject CANNOT be enumerated offline, so it is the one that
+    # invites a name-shaped placeholder — and `gh secret set` has no placeholder syntax: whatever
+    # is written there is the secret that gets created. These two rows are what stop that.
+    ctx_argv = [shlex.split(command) for step in ctx_steps for command in step.commands]
+    chk("runbook: EVERY `gh secret set` names a DERIVED secret — a name-shaped placeholder would "
+        "be run verbatim and install a slot with no account behind it",
+        sorted({argv[3] for argv in ctx_argv if argv[:3] == ["gh", "secret", "set"]}),
+        ["SINK_ODD_SECRET"])
+    fleet_reads = [(index, token) for index, argv in enumerate(ctx_argv) for token in argv
+                   if token.endswith("/environments/sink-odd-env/secrets")]
+    fleet_repos = sorted({token.split("/environments/", 1)[0] for _index, token in fleet_reads})
+    dispatch = next(index for index, argv in enumerate(ctx_argv) if argv[:2] == ["gh", "workflow"])
+    chk("runbook: the secret NAMES are read from TWO repos — the one that already holds them (the "
+        "sink is empty at that point, so it cannot be their source) and the sink itself, read "
+        "BACK before the probes are dispatched: a fleet that was never provisioned must be "
+        "visible, not a green run over one slot",
+        (len(fleet_repos), "repos/owner/sink" in fleet_repos,
+         max([index for index, _token in fleet_reads] or [dispatch + 1]) < dispatch),
+        (2, True, True))
     chk("runbook: every command tokenises (a step whose command cannot be run is not a runbook)",
         all(step.tokens() is not None for step in steps), True)
     chk("runbook: the rendered text carries every command verbatim",
