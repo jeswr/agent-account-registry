@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1214,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "dcc9561e5073fbc151f77ebd6d89b2927f784e14",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "PRIVATE_GUARD_RE is passed to if_condition_admits, which applies regex.search to a parsed comparison's canonical text. The pattern has no start/end boundaries. Consequently an atom such as `github.event.repository.private == truefoo` contains the accepted `...private==true` substring and is pinned false as though it were the required guard. On a public repository, however, `private` is false and a false-valued `truefoo` makes that equality true, so the job can run while the repository is public. guard_verdict would report the job proven unreachable. This invalidates the script's core safety proof. The self-test covers different operators and values but not prefix/suffix collisions around the recognized atom.",
+    "file": "scripts/diagnostic-sink.py",
+    "fix_hint": "Require an exact canonical comparison match (for example, anchor the regex with `^` and `$`, preserving only the explicitly supported boolean/quoted-boolean spellings). Add non-crashing rejection tests for both left-operand prefixes and right-operand suffixes, including a case whose real expression can be true when repository.private is false.",
+    "severity": "blocker",
+    "title": "Guard atom regex accepts non-equivalent comparisons by substring"
+   },
+   {
+    "body": "For a whole-context reader, runbook() emits the executable command `gh secret set [redacted-account]_TOKEN ...`. `gh` treats [redacted-account]_TOKEN as the actual secret name; it is not placeholder syntax. The fingerprint workflow's allowlist also accepts that name, so following the ordered runbook can install one empty/irrelevant slot while none of the real [redacted-account]_TOKEN secrets are provisioned. The resulting workflow may run green yet fail to fingerprint the fleet, so the transition does not deliver the advertised diagnostic. The test only checks that the contextual step exists and never validates its commands or coverage.",
+    "file": "scripts/diagnostic-sink.py",
+    "fix_hint": "Do not emit [redacted-account]_TOKEN as an executable literal. Derive the concrete required account secret names from an authoritative source, or render an unmistakably non-executable template plus a verification/read-back step that proves the intended concrete token names are present before dispatch. Add an end-to-end assertion that the contextual-reader commands cannot create the literal placeholder and that the runbook verifies actual fleet coverage.",
+    "severity": "major",
+    "title": "Fleet runbook creates literal [redacted-account]_TOKEN instead of provisioning fleet tokens"
+   }
+  ],
+  "progress": null,
+  "summary": "The change is not safe to approve. The new verifier can falsely prove a non-equivalent visibility comparison because its guard regex is an unanchored substring match, defeating the central fail-closed claim. Separately, the generated fleet provisioning command uses [redacted-account]_TOKEN as a literal secret name, so following the runbook does not provision the actual account tokens and can produce a misleadingly incomplete fingerprint run. The extensive self-test does not exercise either failure.",
+  "verdict": "request_changes"
+ }
+}
