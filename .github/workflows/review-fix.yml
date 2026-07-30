@@ -1442,6 +1442,20 @@ jobs:
           # rendered on the run page, and base64 defeats GitHub's exact-secret masking). Nothing
           # legitimate is lost: the gate reports through its exit status alone, and only
           # `steps.gate.outcome` is read downstream — never `steps.gate.outputs`.
+          #
+          # [issue #91 review r1] AND IT IS NOT A BOUNDARY — least of all here. Rebinding these
+          # four variables is ENV-LEVEL only: the gate's code runs as the SAME runner user, the
+          # runner's REAL command files still sit under $RUNNER_TEMP/_runner_file_commands/
+          # (set_env_*, add_path_*, step_summary_*), and code that enumerates that directory can
+          # append to them directly — the runner consumes them at step end whatever this step's
+          # environment said. A workflow cannot prevent a same-uid write. worker.yml carries this
+          # same redirection behind a real boundary (#575: nothing token-bearing follows its gate,
+          # the publisher is a separate job on a clean runner); THIS lane does not have that yet —
+          # the `push` and follow-up steps below still hold a write-capable GH_TOKEN after the gate
+          # has run target code. So this is a channel removed, not the hole closed: the residual is
+          # bounded — and turns red if a third token-bearing post-gate step appears — by the
+          # `(#91 r1) fix lane` rows in `worker-live.sh self-test`, and the lane's own #575-shaped
+          # job split is tracked separately.
           GITHUB_ENV: ${{ runner.temp }}/gate-quarantine/env
           GITHUB_PATH: ${{ runner.temp }}/gate-quarantine/path
           GITHUB_OUTPUT: ${{ runner.temp }}/gate-quarantine/output

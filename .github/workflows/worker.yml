@@ -1377,6 +1377,19 @@ jobs:
           # by `worker-live.sh gate`, and `steps.gate.outputs` has no consumer, so quarantining
           # them removes a channel and costs nothing. Encoding is why quarantine beats redaction:
           # GitHub masks the exact secret string, and base64 of it is not that string.
+          #
+          # [issue #91 review r1] WHAT THIS IS NOT. Rebinding these four variables is ENV-LEVEL
+          # only: it removes the channel from every actor that reaches a command file the
+          # documented way (the environment), which is every build script, test harness and action
+          # that writes one. It is NOT an isolation boundary. The gate's target-controlled code
+          # runs as the SAME runner user, the runner's REAL command files still sit under
+          # $RUNNER_TEMP/_runner_file_commands/ (set_env_*, add_path_*, step_summary_*), and code
+          # that enumerates that directory can append to them directly — the runner consumes them
+          # at step end whatever this step's environment said. No workflow-level mechanism prevents
+          # a same-uid write; only a real boundary does. In THIS job that boundary already exists
+          # and is what the security property rests on: NOTHING TOKEN-BEARING FOLLOWS THE GATE
+          # (#575, asserted live by `_tokens_after_gate`). Read the four lines below as
+          # defence-in-depth behind that, never as containment.
           GITHUB_ENV: ${{ runner.temp }}/gate-quarantine/env
           GITHUB_PATH: ${{ runner.temp }}/gate-quarantine/path
           GITHUB_OUTPUT: ${{ runner.temp }}/gate-quarantine/output

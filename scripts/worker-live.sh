@@ -4931,11 +4931,15 @@ YAML
     "$(_workflow_step_body "$wf" republish-trust | grep -Ec "^ +(BASH_ENV|ENV): ''$" || true)" "2"
   chk "the pre-publish block runs the pinned driver in python isolated mode" \
     "$(_workflow_step_run "$wf" republish-trust | grep -Fc 'python3 -I "$driver" reverify' || true)" "1"
-  chk "the target-controlled gate step cannot persist environment into later steps (quarantine)" \
+  # [#91 review r1] Named for what it MEASURES. The redirection is env-level: it removes the
+  # channel from every actor that reaches a command file the documented way, and does not stop a
+  # same-uid write to the runner's real files under $RUNNER_TEMP/_runner_file_commands/ (see the
+  # step's own comment, and the blast-radius rows below).
+  chk "the gate step redirects \$GITHUB_ENV/\$GITHUB_PATH away from the runner's own (env-level)" \
     "$(_workflow_step_body "$wf" gate \
        | grep -Ec '^ +GITHUB_(ENV|PATH): \$\{\{ runner.temp \}\}/gate-quarantine/(env|path)$' || true)" "2"
-  # --- [issue #91] ...and it cannot PUBLISH either, in EITHER lane. Persisting environment is only
-  # half of what a runner command file gives target-controlled cargo. $GITHUB_STEP_SUMMARY is
+  # --- [issue #91] ...and the same for the PUBLISHING pair, in EITHER lane. Persisting environment
+  # is only half of what a runner command file gives target-controlled cargo. $GITHUB_STEP_SUMMARY is
   # RETAINED and rendered on the run page and takes arbitrary markdown; $GITHUB_OUTPUT is the same
   # primitive one indirection out (a target-authored `steps.gate.outputs.*` a later step expands).
   # An exfiltrator wants those, not $GITHUB_ENV — and GitHub's secret masking does not stop it,
@@ -4957,7 +4961,7 @@ YAML
     q_have=$(( q_have + $(_workflow_step_body "$wf" gate | grep -Fc -- "$q_line" || true) ))
     q_have=$(( q_have + $(_workflow_step_body "$rf_wf" gate | grep -Fc -- "$q_line" || true) ))
   done
-  chk "(#91) BOTH lanes quarantine all FOUR runner command files on the gate step (exact paths)" \
+  chk "(#91) BOTH lanes REDIRECT all four runner command-file variables on the gate step (exact paths)" \
     "$q_have" "8"
   # ...over a body the extractor really found: a count read off an empty body proves nothing (#941).
   # Matched on the exact `run:` LINE, not the bare command: both step bodies discuss
@@ -4975,6 +4979,38 @@ YAML
   chk "(#91) ...safe to quarantine \$GITHUB_OUTPUT: neither lane consumes steps.gate.outputs" \
     "$(grep -F 'steps.gate.outputs' "$wf" | grep -Evc '^[[:space:]]*#' || true):$(grep -F 'steps.gate.outputs' "$rf_wf" | grep -Evc '^[[:space:]]*#' || true)" \
     "0:0"
+  # --- [issue #91 review r1] WHAT THE REDIRECTION ABOVE DOES NOT BUY, measured instead of claimed.
+  # Rebinding those four variables is ENV-LEVEL: the gate's target-controlled code runs as the SAME
+  # runner user, the runner's real command files stay under $RUNNER_TEMP/_runner_file_commands/
+  # (set_env_*, add_path_*, step_summary_*), and code that enumerates that directory appends to
+  # them directly — consumed at step end whatever the step's environment said. A workflow cannot
+  # prevent a same-uid write, so no assertion here may be read as containment.
+  #
+  # What CAN be held is the blast radius, and it is the thing that differs between the lanes.
+  # worker.yml's is zero and is asserted above (#575: `_tokens_after_gate` on the live file). The
+  # fix lane's is not zero — `push` and the follow-up step still hold a write-capable GH_TOKEN
+  # after the gate — so its exposure is INVENTORIED here: exactly two, both the fix App token.
+  # A third post-gate token-bearing step, or a different (e.g. PAT-shaped) credential appearing
+  # among them, is how this exposure would grow silently; either turns this row red. The lane's own
+  # #575-shaped job split is the fix and is tracked as separate work, not asserted as done. ---
+  chk "(#91 r1) fix lane: EXACTLY the two known app-token-fix steps hold a token after its gate" \
+    "$(_tokens_after_gate "$rf_wf" | wc -l | tr -d ' '):$(_tokens_after_gate "$rf_wf" | sed 's/^[[:space:]]*//' | sort -u | tr '\n' '|')" \
+    '2:GH_TOKEN: ${{ steps.app-token-fix.outputs.token }}|'
+  # NON-VACUITY, both directions, so the count above cannot be a property of a scan that reads an
+  # empty region: one added post-gate token step is reported (3), and a lane with none is reported
+  # (0). The grow mutant is the exact shape the exposure takes if someone adds a step here.
+  local rf_grow="$tmp/review-fix-token-grow.yml" rf_none="$tmp/review-fix-token-none.yml"
+  awk '{ print }
+       /worker-live\.sh gate$/ {
+         print "      - name: an added post-gate step carrying a write-capable token"
+         print "        env:"
+         print "          GH_TOKEN: ${{ steps.app-token-fix.outputs.token }}"
+       }' "$rf_wf" > "$rf_grow"
+  grep -v '^          GH_TOKEN: ${{ steps.app-token-fix.outputs.token }}$' "$rf_wf" > "$rf_none"
+  chk "(#91 r1) ...a THIRD post-gate token-bearing step is REPORTED (the scan is not blind)" \
+    "$(_tokens_after_gate "$rf_grow" | wc -l | tr -d ' ')" "3"
+  chk "(#91 r1) ...and a lane with no post-gate token reads 0 (the count tracks the region)" \
+    "$(_tokens_after_gate "$rf_none" | wc -l | tr -d ' ')" "0"
 
   # --- [issue #568] the re-check must accept the workflow's OWN label lifecycle, and the claim
   # step must establish ownership BEFORE it takes the shared label. The claim step moves the issue
