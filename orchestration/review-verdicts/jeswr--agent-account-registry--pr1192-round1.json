@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1192,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "303158307419a923ddf2a5cf07e65aa71f6bad48",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`render_probe_alert()` says both \"The weekly validity probe\" and \"updates itself on the weekly probe\", while this PR changes the schedule and documentation to daily. During an outage this gives the operator an incorrect expectation of the alert cadence and detection latency.",
+    "file": "scripts/pat-validity.py",
+    "fix_hint": "Change both operator-facing occurrences of \"weekly\" in `render_probe_alert()` to \"daily\", and add or update a rendering assertion so the alert cannot drift from the declared cadence again.",
+    "severity": "minor",
+    "title": "Probe-health alert still describes the daily probe as weekly"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly replaces the unusable repository-variable store with a ledger-branch contents document, distinguishes a missing document from a missing/unreadable branch, validates the stored type, and uses the blob SHA for compare-and-swap updates. The workflow grants the required permission and changes the cadence to daily, with self-tests that inspect the actual wire shapes and the shipped YAML contract. I found no blocker or major issue. One minor operator-facing message still calls the now-daily probe weekly.",
+  "verdict": "approve"
+ }
+}
