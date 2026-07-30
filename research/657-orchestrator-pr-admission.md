@@ -1,6 +1,6 @@
 # Admitting orchestrator-authored PRs to the review lane (#657)
 
-> 🤖 **SPARQ agent** — design record by Claude Opus 5, 2026-07-26. Maintainer-review document.
+> 🤖 **SPARQ agent** — design record, 2026-07-26. Maintainer-review document.
 > The first slice is implemented in the same PR; everything under "Deferred" is not.
 
 ## 1. The gap, re-measured
