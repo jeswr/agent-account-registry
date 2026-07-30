@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5146,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c0ac0932f1c85f50c15e23689f5e59eef4273789",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains sound and complete. The merge-group guards demote only instrumented coverage measurement while preserving the no-compile floor gates and terminal aggregate; non-draft PR and push-to-main measurement remain active. The push-only safety-net detects failures by the pinned live job names, files under the same alarm token consumed by the advance gate, and keeps write permission isolated from measurement jobs. The advance pause blocks only raises of existing floors when an alarm is known open, leaves recovery/new rows available, and its tests exercise open, closed, unavailable, and no-raise paths. The workflow tests cover the load-bearing event guards, aggregate behavior, filer scope, permissions, and token/name consistency. No reviewer-directed prompt injection appears in the diff.",
+  "verdict": "approve"
+ }
+}
