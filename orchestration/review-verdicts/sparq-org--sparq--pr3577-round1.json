@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3577,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "beb34d79e290c04536fed6bfbce05d62080c0cd5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "deriveCoverage combines every successful `<suite>` and `<suite>-http` gather into one cell, but `canonical` is OR-combined while `host` and `gitCommit` are overwritten by the last successful comparison. Thus a canonical CLI gather plus a non-canonical HTTP gather becomes `mode: \"both\"` and `canonical: true`, with only the non-canonical HTTP gather's host/commit displayed. Even when both are canonical, differing commits or hosts are silently collapsed. This contradicts the component's claim that hovering exposes the cell's host/commit/mode provenance and can label the combined baseline more strongly than the underlying data supports.",
+    "file": "site/src/lib/baseline-coverage.ts",
+    "fix_hint": "Preserve provenance per successful mode/gather (for example, a provenance array rendered in the tooltip), or define conservative aggregate semantics: canonical only if every represented successful gather is canonical and omit singular host/commit unless they are identical. Add a test with CLI and HTTP successes having different canonical flags, hosts, and commits that asserts the rendered data cannot attribute one gather's provenance to both.",
+    "severity": "major",
+    "title": "Aggregated cells can misrepresent canonical status and provenance"
+   }
+  ],
+  "progress": null,
+  "summary": "The coverage-state derivation is generally clear and the tests exercise measured, failed, pending, and mode-union behavior. However, the load-bearing provenance claim is not sound when multiple successful gathers contribute to one cell: the implementation unions modes and canonical status while retaining only the last gather's host and commit. This can present a mixed CLI/HTTP cell as one canonical baseline with provenance that belongs to only one constituent gather. The current fixtures use identical provenance and therefore do not expose the problem.",
+  "verdict": "request_changes"
+ }
+}
