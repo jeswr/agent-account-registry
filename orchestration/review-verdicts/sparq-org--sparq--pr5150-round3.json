@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5150,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "710ca4641da82674a6e48f1c6e7d8ff331f134e1",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 confirms the prior approval. The diff remains internally consistent: jscpd is exactly pinned, threshold failure is deliberately contained for the advisory lane, missing and vacuous reports are clearly distinguished from clean results, and fenced-code findings are separated from the acknowledged low-precision markdown class. The registry promotion rule matches that split, the configuration scope and nested-target exclusion match the workflow commentary, and the CI area mapping is appropriate. No correctness, soundness, test-validity, security, or completeness issue is evident.",
+  "verdict": "approve"
+ }
+}
