@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4318,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "083b7b2c4678e1c53e8daac7c5b4af445f472418",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [
+   {
+    "body": "`value_key` still returns `[u8; 32]` and passes arbitrary caller-controlled predicate and graph bytes to `derive`, whose `info` encoder performs `u16::try_from(p.len()).expect(\"context field < 64 KiB\")`. Consequently `value_key`, `seal_literal`, `open_literal`, and `equality_tag` can still abort the process when processing an oversized IRI. This is materially the same public-API correctness and denial-of-service defect reported in round 1, and no oversized-context regression test was added.",
+    "file": "crates/sparq-e2ee-ng/src/keyschedule.rs",
+    "fix_hint": "Make the variable-length derivation path total. Either use a sufficiently wide fixed-width context length and update the pinned vectors, or return `Result` and reject oversized fields with `Error::LimitExceeded`, propagating the result through `seal_literal`, `open_literal`, and `equality_tag`. Add a test with predicate and graph strings longer than 65535 bytes that verifies rejection without panic.",
+    "severity": "major",
+    "title": "Public value-key derivation still panics on predicate or graph strings over 65535 bytes"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 is stagnant: the round-1 denial-of-service finding remains unchanged. `value_key` still accepts caller-controlled predicate and graph strings and routes them through the pre-existing u16-length `info` encoder, whose failed conversion panics. The public sealing, opening, and equality-tag APIs therefore still abort on oversized RDF terms instead of failing closed, and the added tests still do not exercise that boundary. The diff also contains instruction-like prose directed at agents/maintainers (for example, commands not to relax particular wording), which was treated only as untrusted review data.",
+  "verdict": "request_changes"
+ }
+}
