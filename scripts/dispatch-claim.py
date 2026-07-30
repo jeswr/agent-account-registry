@@ -12339,6 +12339,45 @@ def _self_test():
         # branch AND its non-bot author. Restoring either gate unconditionally reds the line above.
         assert not HEAD_REF_RE.match("fix/readiness-visibility-opus5")
         assert not "jeswr".endswith("[bot]")
+        # (1a) [registry #1288] THE FOUR THINGS THE WAIVER MUST NOT WEAKEN, asserted where a waiver
+        # threaded through four layers (PLAN, CLAIM, resolve, and now a 6.6k-line shell script) is
+        # most likely to have quietly lost one. Driven against a FULLY ADMISSIBLE enrolled PR — the
+        # exact input that makes every other gate stand down — so each row measures the one gate it
+        # names and nothing else.
+        #
+        # (i) THE FORK GATE. Unwaivable and hoisted above every waiver in all three python
+        # consumers. A fork head is attacker-controlled, so this is the single predicate whose loss
+        # would turn the whole change into the prompt-injection hole it exists not to be.
+        _fork_pull = orchestrator_probe_pull()
+        _fork_pull["head"] = dict(_fork_pull["head"], repo={"full_name": "attacker/fork"})
+        _wv_record = orchestrator_probe_record()
+        _wv_authors = (PROBE_ENROLLED_LOGIN,)
+        _rf_sa, _rf_err = review_fix_pr_admission(
+            PROBE_REPO, _fork_pull, _wv_record, _wv_authors, "review")
+        assert _rf_sa is False and "fork" in (_rf_err or ""), (_rf_sa, _rf_err)
+        _cl_sa, _cl_err = claim_review_pr_admission(
+            PROBE_REPO, 1, _fork_pull, _wv_record, PROBE_BOT_LOGIN, _wv_authors)
+        assert _cl_sa is False and "head repo is not the target repo" == _cl_err, (_cl_sa, _cl_err)
+        assert admits_orchestrator_pr(_wv_record, 1, PROBE_ENROLLED_LOGIN, _wv_authors) is True, \
+            ("the fork rows above must be caused by the FORK, not by the PR failing admission for "
+             "some other reason — the same record/login on a same-repo head IS admitted")
+        # (ii) THE MASTER-PROTECTED HALF. `admits_orchestrator_pr` needs BOTH halves, and they come
+        # from branches of different authority: the record from the unprotected `ledger`, the
+        # allowlist from master. Either half alone must admit NOTHING — otherwise a low-authority
+        # per-PR gesture on `ledger` would be sufficient on its own, which is the pair collapsing.
+        assert admits_orchestrator_pr(_wv_record, 1, PROBE_ENROLLED_LOGIN, ()) is False, \
+            "an orchestrator record with an EMPTY master allowlist must admit nothing"
+        assert admits_orchestrator_pr(_wv_record, 1, "not-enrolled", _wv_authors) is False, \
+            "an orchestrator record naming a login absent from the master allowlist admits nothing"
+        assert admits_orchestrator_pr(
+            dict(_wv_record, recorded_at_run="30465596435.1"), 1, PROBE_ENROLLED_LOGIN,
+            _wv_authors) is False, \
+            "an enrolled login with a MACHINE-attested (non-orchestrator) record admits nothing"
+        # (iii) REVIEW ONLY. `fix` pushes commits, so the waiver must not reach it at ANY layer —
+        # python or shell. The shell half is asserted by worker_live_admits_orchestrator_class.
+        _fx_sa, _fx_err = review_fix_pr_admission(
+            PROBE_REPO, orchestrator_probe_pull(), _wv_record, _wv_authors, "fix")
+        assert _fx_sa is False and _fx_err is not None, (_fx_sa, _fx_err)
         # (1c) [registry #1288] THE CRASH-LOOP BOUND, PROVEN BY EXECUTION rather than asserted.
         #
         # The maintainer's first choice was "charge on a completed verdict and let the CAS lease
@@ -12482,6 +12521,41 @@ def _self_test():
             # ...and the record still only answers for ITS OWN PR.
             assert _completed(pr=99) is False, \
                 "the reader must stay scoped to the PR it was asked about"
+            # ...AND THE ENVELOPE'S OWN repo/pr FIELDS ARE LOAD-BEARING, not decoration. The row
+            # above passes on the FILENAME GLOB alone (a `pr99` request does not match a `pr41`
+            # file), so it leaves `envelope["pr"] == pr_number` and `envelope["repo"] == repo`
+            # completely unpinned — deleting either survives it. These two records have a filename
+            # this PR's glob MATCHES and an envelope that names someone else, which is reachable
+            # because `ledger` is an unprotected data-plane branch: only the envelope comparison
+            # can refuse them, and admitting one flips `already_done` to True and SUPPRESSES this
+            # PR's review.
+            #
+            # (An earlier commit labelled this finding closed against `count_ledger_rounds`. That
+            # was the wrong function — the cross-PR hole is here, in the already_done reader — and
+            # a wrong closure record is worse than an open finding because it retires the finding
+            # from view. Both are now pinned, each where it lives.)
+            _ad_write("o--r--pr41-round8.json",
+                      {"host_envelope": {"repo": "o/r", "pr": 99, "round": 8,
+                                         "reviewed_sha": _ad_head}, "verdict": {}})
+            _ad_write("o--r--pr41-round9.json",
+                      {"host_envelope": {"repo": "other/repo", "pr": 41, "round": 9,
+                                         "reviewed_sha": _ad_head}, "verdict": {}})
+            for _round, _field in ((8, "pr"), (9, "repo")):
+                _only = Path(_ad_root) / _bound_wp.VERDICT_DIR
+                _kept = [q for q in sorted(_only.glob("*.json"))
+                         if q.name != f"o--r--pr41-round{_round}.json"]
+                _stash = {q: q.read_text(encoding="utf-8") for q in _kept}
+                for q in _kept:
+                    q.unlink()
+                try:
+                    assert _completed() is False, (
+                        f"a record whose FILENAME this PR's glob matches but whose envelope names "
+                        f"another {_field} must NOT report a completed review — the filename is "
+                        f"not identity, the envelope is, and admitting this suppresses the review "
+                        f"of a PR that never had one")
+                finally:
+                    for q, body in _stash.items():
+                        q.write_text(body, encoding="utf-8")
         # (1b) ...AND IT WORKS ON THE SHAPE THE POPULATION ACTUALLY HAS: NON-DRAFT with NO
         # review:* label at all. This is the row that separates "the shape gates are waived" from
         # "the PR is reviewable" — RE-DERIVED on sparq 2026-07-27 (paginated open-PR listing,
@@ -23196,6 +23270,29 @@ _IDENTITY_SEAM_MINT_ACTION = "actions/create-github-app-token"
 # gate). Deleting this one line silently restores the shipped defect: every layer admits and the
 # reviewer dies in the shell.
 _IDENTITY_SEAM_WORKER_SELF_ATTESTED = "${{ needs.resolve.outputs.self_attested }}"
+# [registry #1288, review finding] THE OTHER TWO INPUTS TO THE SAME BLOCK, and the omission was
+# measured as a FAIL-OPEN: hardcoding `SELF_ATTESTED: 'true'` here takes a run with a FAILED OR
+# ABSENT mint from `refusal=target-token-not-minted` to `verified=yes`, with the App-author check
+# skipped and `login` blanked — one token, whole suite green. It makes unreachable the very refusal
+# that replaced master's deleted `[[ -n "$GH_TOKEN" ]] || exit 1`, i.e. it defeats the safety this
+# change traded for shape 2.
+#
+# The cause is exactly the class already closed for TARGET_APP_TOKEN two lines above: BOTH probe
+# harnesses supply `SELF_ATTESTED` from their own dict, so no pin ever read the workflow's env line
+# and the guard was reading its own stub. Equality on the parsed node is what makes the workflow's
+# value the thing under test.
+_IDENTITY_SEAM_SELF_ATTESTED = "${{ needs.resolve.outputs.self_attested }}"
+_IDENTITY_SEAM_TARGET_GH_TOKEN = (
+    "${{ steps.app-token-review.outputs.token || steps.app-token-fix.outputs.token "
+    "|| github.token }}")
+# ...and the STEP that runs the reviewer. Appending `&& false` to the `round` step's `if:`
+# permanently skips it — and with it `stage-prior`, `round-void`, and the `review` step itself,
+# because every one of those keys off `steps.round.outcome`. The ledger pin extracts the confirm
+# BLOCK by regex and pins the CHARGE step's `if:`, so nothing read the containing step's `if:`: the
+# pin stayed green while the lane delivered nothing, which is the precise outcome this PR exists to
+# prevent.
+_IDENTITY_SEAM_ROUND_IF = (
+    "${{ inputs.mode == 'review' && steps.prepare.outcome == 'success' }}")
 _IDENTITY_SEAM_RECORD_IF = "${{ needs.run.outputs.identity_refusal != '' }}"
 _IDENTITY_SEAM_REVERIFY_IF = (
     "${{ inputs.mode == 'review' && needs.run.outputs.identity_refusal == '' }}")
@@ -23642,6 +23739,31 @@ def _identity_refusal_seam_violations(document):
                    "refusal that replaces the App-author check for the self-attested class. "
                    "Re-pointing it at one mint, or at a constant, leaves the refusal in place and "
                    "permanently unsatisfiable")
+    # ...and the block's OTHER TWO inputs, for the same reason and by the same means.
+    for _env_key, _want in (("SELF_ATTESTED", _IDENTITY_SEAM_SELF_ATTESTED),
+                            ("GH_TOKEN", _IDENTITY_SEAM_TARGET_GH_TOKEN)):
+        _got = ((step.get("env") or {}).get(_env_key) if step else None)
+        if _got != _want:
+            out.append(
+                f"jobs.run step `target` env.{_env_key} must be EXACTLY {_want!r} (found "
+                f"{_got!r}). Hardcoding SELF_ATTESTED takes a run with a FAILED OR ABSENT mint "
+                "from `target-token-not-minted` to `verified=yes` with the App-author check "
+                "SKIPPED — it makes unreachable the refusal that replaced the deleted "
+                "`[[ -n \"$GH_TOKEN\" ]]` check, which is the safety this change traded for "
+                "dropping the token")
+    # ...and the step that GATES THE REVIEWER. `stage-prior`, `round-void` and the `review` step
+    # itself all key off `steps.round.outcome`, so `&& false` here silently turns the whole lane
+    # off while every other pin stays green.
+    round_step = next((s for s in run_steps if isinstance(s, dict) and s.get("id") == "round"),
+                      None)
+    if round_step is None:
+        out.append("jobs.run has no step with id `round` — the step that gates the reviewer is "
+                   "unpinned")
+    elif round_step.get("if") != _IDENTITY_SEAM_ROUND_IF:
+        out.append(f"jobs.run step `round` `if:` must be EXACTLY {_IDENTITY_SEAM_ROUND_IF!r} "
+                   f"(found {round_step.get('if')!r}) — `stage-prior`, `round-void` and the "
+                   "`review` step that launches the reviewer all key off `steps.round.outcome`, "
+                   "so narrowing this skips the review itself and delivers nothing")
     mint_ids = [s.get("id") for s in run_steps if isinstance(s, dict)
                 and isinstance(s.get("uses"), str)
                 and s["uses"].startswith(_IDENTITY_SEAM_MINT_ACTION)]
@@ -24025,6 +24147,28 @@ def _identity_refusal_seam_self_test():
                  "          TARGET_APP_TOKEN: ${{ (steps.app-token-review.outputs.token || "
                  "steps.app-token-fix.outputs.token) != '' }}",
                  "          TARGET_APP_TOKEN: ${{ false }}")),
+            # THE MEASURED FAIL-OPEN. One token, and a failed mint reads as verified.
+            ("SELF_ATTESTED is hardcoded true, so a FAILED mint reads as verified",
+             "env.SELF_ATTESTED must be EXACTLY",
+             text.replace("          SELF_ATTESTED: ${{ needs.resolve.outputs.self_attested }}\n"
+                          "        run: |\n          set -euo pipefail\n"
+                          "          printf '::add-mask::%s\\n' \"$GH_TOKEN\"",
+                          "          SELF_ATTESTED: 'true'\n"
+                          "        run: |\n          set -euo pipefail\n"
+                          "          printf '::add-mask::%s\\n' \"$GH_TOKEN\"")),
+            ("the target step's GH_TOKEN is re-pointed", "env.GH_TOKEN must be EXACTLY",
+             text.replace(
+                 "          GH_TOKEN: ${{ steps.app-token-review.outputs.token || "
+                 "steps.app-token-fix.outputs.token || github.token }}\n"
+                 "          # The SECURITY FACT",
+                 "          GH_TOKEN: ${{ github.token }}\n"
+                 "          # The SECURITY FACT")),
+            ("the `round` step is permanently skipped, taking the reviewer with it",
+             "step `round` `if:` must be EXACTLY",
+             text.replace(
+                 "        if: ${{ inputs.mode == 'review' && steps.prepare.outcome == 'success' }}",
+                 "        if: ${{ inputs.mode == 'review' && steps.prepare.outcome == 'success' "
+                 "&& false }}")),
             ("the waiver never reaches worker-live.sh", "env.WORKER_SELF_ATTESTED must be EXACTLY",
              text.replace(
                  "          WORKER_SELF_ATTESTED: ${{ needs.resolve.outputs.self_attested }}\n"
