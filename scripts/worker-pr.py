@@ -2066,6 +2066,59 @@ def set_review_state(repo, pr_number, state, abort_on_machine_park=False, live_r
     return "converged" if converged else "applied"
 
 
+def void_receiptless_park(repo, pr_number, expect_plan=None):
+    """[registry #1309, review round 1 finding B1] Clear a RECEIPT-LESS machine park by removing
+    THAT ONE LABEL — never by transitioning through set_review_state's ambiguity rule.
+
+    WHY THIS PRIMITIVE EXISTS RATHER THAN A `review-state set --state needs` CALL. A hand-applied
+    `review:parked` is ADDED ALONGSIDE the PR's existing review state instead of replacing it, so
+    the namespace is routinely split. set_review_state CONVERGES a split namespace to the
+    HUMAN-owned `review:needs-user` (issue #138) — which, for a void, would burn the PR's one-shot
+    exit in order to move it into a STRICTER hold. Measured on the 8 live candidates: 5 of them.
+
+    Returns WHAT ACTUALLY HAPPENED, never the caller's intent:
+      "stripped"            — the park label was removed and the PR is back in its pre-park state.
+      "stripped-and-needs"  — the park was the only review:* label, so `review:needs` was stamped
+                              into an EMPTY namespace (which cannot trip the ambiguity rule).
+      "refused"             — nothing was written; the plan is not deterministic on the LIVE read.
+      "plan-changed"        — nothing was written; the live plan disagrees with `expect_plan`, i.e.
+                              labels moved between the admission's decision and this write.
+
+    EVERY DECISION RIDES park_policy.receiptless_void_label_plan — the SAME function
+    capacity_park_admission consulted before spending the budget. A hand-copied second rule here is
+    precisely how a gate and its write come to disagree about what is deterministic.
+
+    The `review:needs` stamp is gated on a SECOND, post-strip read being EMPTY. Handing the
+    pre-strip snapshot to set_review_state would be faster and wrong: a `review:needs-user` landing
+    in the strip-to-stamp gap would then be invisible, and the stamp would create exactly the
+    split-with-a-human-hold state this function exists to avoid. An unexpected post-strip namespace
+    reports and writes nothing further — the park is already gone, which is the whole point, and
+    inventing a state on top of a surprise is what fails closed here."""
+    policy = _park_policy()
+    live = _live_review_labels(repo, pr_number)
+    plan, detail = policy.receiptless_void_label_plan(live)
+    if plan is None:
+        print(f"receipt-less void REFUSED on the live read: {detail}; no label mutation applied")
+        return "refused"
+    if expect_plan is not None and plan != expect_plan:
+        print(f"receipt-less void STOOD DOWN: the live plan is {plan!r} but the admission decided "
+              f"{expect_plan!r} — labels moved in the gap; no label mutation applied")
+        return "plan-changed"
+    _remove_label(repo, pr_number, MACHINE_PARK_PR_LABEL)
+    if plan == policy.RECEIPTLESS_VOID_PLAN_STRIP:
+        print(f"receipt-less void: {MACHINE_PARK_PR_LABEL} removed; {detail}")
+        return "stripped"
+    after = _live_review_labels(repo, pr_number)
+    if after:
+        print(f"::warning::receipt-less void: {MACHINE_PARK_PR_LABEL} removed, but the review "
+              f"namespace is no longer empty ({sorted(after)}) — a label landed in the gap, so no "
+              "review:needs stamp was applied (the park is already gone)")
+        return "stripped"
+    set_review_state(repo, pr_number, "needs", live_review=after)
+    print(f"receipt-less void: {MACHINE_PARK_PR_LABEL} removed and review:needs stamped; {detail}")
+    return "stripped-and-needs"
+
+
 def get_review_state(repo, pr_number):
     current = _live_review_labels(repo, pr_number)
     if "review:needs-user" in current or len(current) > 1:
@@ -6867,6 +6920,137 @@ def _self_test():
         except WorkerPrError:
             malformed_failed_closed = True
         check("malformed live labels fail closed", malformed_failed_closed, True)
+
+        # ---- [registry #1309, review round 1 finding B1] void_receiptless_park, through the REAL
+        # set_review_state. ----
+        #
+        # THE DEFECT THIS BLOCK EXISTS FOR. #1309's first cut cleared a receipt-less park with
+        # `review-state set --state needs`. A hand-applied `review:parked` is ADDED ALONGSIDE the
+        # PR's existing review state, so the namespace is routinely split — and the #138 ambiguity
+        # rule two blocks above CONVERGES a split namespace to `review:needs-user`. Measured against
+        # the LIVE label sets of the 8 candidate PRs, 5 of them would have been converted into a
+        # HUMAN-owned terminal hold with the PR's ONE-SHOT void already spent: strictly worse than
+        # doing nothing. Every #1309 self-test STUBBED the label writer, so nothing could catch it.
+        #
+        # So this block stubs only the HTTP seam. `_live_review_labels`, the plan predicate, and
+        # `set_review_state` itself all run for real, and `_remove_label` MUTATES the live set so the
+        # post-strip re-read sees what a real strip would leave behind.
+        def srs_gh_stateful(args, **kwargs):
+            if "-X" in args and "POST" in args:
+                labels = kwargs.get("input_doc", {}).get("labels")
+                srs_state["posted"].append(labels)
+                srs_state["live"] = srs_state["live"] + [{"name": n} for n in labels or []]
+                return {}
+            return srs_state["live"]
+
+        def srs_remove_stateful(_repo, _pr, other):
+            srs_state["removed"].append(other)
+            srs_state["live"] = [row for row in srs_state["live"] if row["name"] != other]
+
+        def run_void(live, expect_plan=None):
+            srs_globals["_gh_json"] = srs_gh_stateful
+            srs_globals["_remove_label"] = srs_remove_stateful
+            srs_state["live"] = [{"name": name} for name in live]
+            srs_state["posted"], srs_state["removed"] = [], []
+            try:
+                outcome = void_receiptless_park("o/r", 5, expect_plan=expect_plan)
+            finally:
+                srs_globals["_gh_json"] = srs_gh
+                srs_globals["_remove_label"] = (
+                    lambda repo, pr, other: srs_state["removed"].append(other))
+            return (outcome, srs_state["posted"], srs_state["removed"],
+                    sorted(row["name"] for row in srs_state["live"]))
+
+        # THE HEADLINE GUARD, and it is a TABLE over the REAL live label sets of all 8 candidate
+        # PRs, read from sparq-org/sparq on 2026-07-29. `review:needs-user` must appear in NOT ONE
+        # posted payload.
+        live_sets = {
+            3577: ["area:site", MACHINE_PARK_PR_LABEL],
+            3598: ["area:deps", "area:sparq-zk", MACHINE_PARK_PR_LABEL],
+            3641: ["area:bench", "review:needs", "review:changes", MACHINE_PARK_PR_LABEL],
+            4197: [MACHINE_PARK_PR_LABEL],
+            4207: ["review:needs", MACHINE_PARK_PR_LABEL],
+            4212: ["review:changes", MACHINE_PARK_PR_LABEL],
+            4222: ["review:changes", MACHINE_PARK_PR_LABEL],
+            4318: ["area:site", "review:changes", "area:ci", "area:docs", MACHINE_PARK_PR_LABEL],
+        }
+        void_table = {number: run_void(labels) for number, labels in sorted(live_sets.items())}
+        check("[#1309 B1] LIVE label sets: `review:needs-user` is posted for NOT ONE of the 8 "
+              "candidate PRs — the pre-fix path converged FIVE of them into that human terminal",
+              sorted(number for number, row in void_table.items()
+                     if any("review:needs-user" in (payload or []) for payload in row[1])), [])
+        check("[#1309 B1] the three parked-ONLY PRs are stripped and stamped review:needs",
+              {number: (void_table[number][0], void_table[number][1])
+               for number in (3577, 3598, 4197)},
+              {number: ("stripped-and-needs", [["review:needs"]])
+               for number in (3577, 3598, 4197)})
+        check("[#1309 B1] the four split PRs are stripped ONLY, landing back in their PRE-PARK "
+              "review state, with NOTHING posted and no invented state",
+              {number: (void_table[number][0], void_table[number][1], void_table[number][2])
+               for number in (4207, 4212, 4222, 4318)},
+              {4207: ("stripped", [], [MACHINE_PARK_PR_LABEL]),
+               4212: ("stripped", [], [MACHINE_PARK_PR_LABEL]),
+               4222: ("stripped", [], [MACHINE_PARK_PR_LABEL]),
+               4318: ("stripped", [], [MACHINE_PARK_PR_LABEL])})
+        check("[#1309 B1] ...and the residual namespace is exactly the pre-park review state",
+              {number: [n for n in void_table[number][3] if n.startswith("review:")]
+               for number in (4207, 4212, 4222, 4318)},
+              {4207: ["review:needs"], 4212: ["review:changes"],
+               4222: ["review:changes"], 4318: ["review:changes"]})
+        # #3641 carries review:needs AND review:changes: ambiguous INDEPENDENTLY of the park, so no
+        # strip leaves a determinate state. It writes NOTHING rather than guessing.
+        check("[#1309 B1] the one PR whose namespace is ambiguous independently of the park is "
+              "REFUSED with nothing written at all",
+              void_table[3641][:3], ("refused", [], []))
+        check("[#1309 B1] ...and the park it refused to void is still live (no partial write)",
+              MACHINE_PARK_PR_LABEL in void_table[3641][3], True)
+        # A live human terminal is never cleared by this primitive, on top of the upstream refusal.
+        check("[#1309 B1] a live review:needs-user refuses, and no label is removed",
+              run_void(["review:needs-user", MACHINE_PARK_PR_LABEL])[:3], ("refused", [], []))
+        check("[#1309 B1] no live park is nothing to void (never a silent success)",
+              run_void(["review:needs"])[:3], ("refused", [], []))
+        check("[#1309 B1] a malformed live label surface refuses rather than writing",
+              [void_receiptless_park.__doc__ is not None,
+               _park_policy().receiptless_void_label_plan("review:parked")[0],
+               _park_policy().receiptless_void_label_plan([MACHINE_PARK_PR_LABEL, 7])[0]],
+              [True, None, None])
+        # THE PLAN MUST MATCH THE ADMISSION'S. If labels moved in the gap the write stands DOWN
+        # rather than improvising — the admission spent the budget on a different plan.
+        check("[#1309 B1] a live plan that disagrees with the admission's stands down, unwritten",
+              [run_void([MACHINE_PARK_PR_LABEL], expect_plan="strip-only")[:3],
+               run_void(["review:changes", MACHINE_PARK_PR_LABEL],
+                        expect_plan="strip-and-needs")[:3]],
+              [("plan-changed", [], [])] * 2)
+        check("[#1309 B1] ...while the matching plan proceeds",
+              [run_void([MACHINE_PARK_PR_LABEL], expect_plan="strip-and-needs")[0],
+               run_void(["review:changes", MACHINE_PARK_PR_LABEL],
+                        expect_plan="strip-only")[0]],
+              ["stripped-and-needs", "stripped"])
+        # THE STRIP-TO-STAMP RACE. A `review:needs-user` landing after the strip must NOT be joined
+        # by a `review:needs` stamp — that would build the split-with-a-human-hold state this whole
+        # primitive exists to avoid. The stamp is gated on a SECOND read being empty.
+        def srs_gh_racing_after_strip(args, **kwargs):
+            if "-X" in args and "POST" in args:
+                srs_state["posted"].append(kwargs.get("input_doc", {}).get("labels"))
+                return {}
+            reads = srs_state.setdefault("reads", 0)
+            srs_state["reads"] = reads + 1
+            if reads >= 1:                       # the POST-STRIP re-read
+                return [{"name": "review:needs-user"}]
+            return srs_state["live"]
+
+        srs_globals["_gh_json"] = srs_gh_racing_after_strip
+        srs_globals["_remove_label"] = srs_remove_stateful
+        srs_state["live"] = [{"name": MACHINE_PARK_PR_LABEL}]
+        srs_state["posted"], srs_state["removed"], srs_state["reads"] = [], [], 0
+        racing_outcome = void_receiptless_park("o/r", 5)
+        srs_globals["_gh_json"] = srs_gh
+        srs_globals["_remove_label"] = (
+            lambda repo, pr, other: srs_state["removed"].append(other))
+        check("[#1309 B1] a human hold landing in the strip-to-stamp gap gets NO review:needs "
+              "stamped beside it — the park is gone and the hold owns the PR",
+              (racing_outcome, srs_state["posted"], srs_state["removed"]),
+              ("stripped", [], [MACHINE_PARK_PR_LABEL]))
 
         def run_get(live):
             srs_state["live"] = [{"name": name} for name in live]
@@ -12344,9 +12528,12 @@ def main():
     common.add_argument("--pr", required=True, type=int)
 
     state = subparsers.add_parser("review-state", parents=[common])
-    state.add_argument("action", choices=("get", "set"))
+    state.add_argument("action", choices=("get", "set", "void-receiptless"))
     state.add_argument("--state", choices=("needs", "changes", "pass", "needs-user",
                                           "parked"))
+    # [registry #1309 B1] The plan the ADMISSION decided. Passing it makes the write stand down
+    # rather than improvise when labels moved in the gap.
+    state.add_argument("--expect-plan", choices=("strip-only", "strip-and-needs"))
 
     rrec = subparsers.add_parser("round-record", parents=[common])
     rrec.add_argument("--round", required=True, type=int)
@@ -12640,6 +12827,14 @@ def main():
                 if not args.state:
                     parser.error("review-state set requires --state")
                 set_review_state(args.repo, args.pr, args.state)
+            elif args.action == "void-receiptless":
+                # [registry #1309 B1] A principled refusal EXITS NON-ZERO. The caller
+                # (dispatch-claim's re-admission sweep) must never read "the park stands, nothing
+                # written" as a completed re-admission — that is how a census comes to read healthy
+                # while the population is untouched.
+                outcome = void_receiptless_park(args.repo, args.pr, expect_plan=args.expect_plan)
+                if outcome not in ("stripped", "stripped-and-needs"):
+                    raise WorkerPrError(f"receipt-less void wrote nothing ({outcome})")
             else:
                 get_review_state(args.repo, args.pr)
         elif args.command == "round-record":
