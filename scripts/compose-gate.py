@@ -99,7 +99,9 @@ Usage:
   compose-gate.py --self-test
 """
 import argparse
+import contextlib
 import copy
+import io
 import os
 import re
 import subprocess
@@ -139,8 +141,19 @@ def exit_code(result):
     the receipt printed `blocking=true` and the process exited 0 — the exact drift the row was named
     after, and a one-token re-opening of the fail-open retracted in 4a3a3bfeb. A test that derives its
     expectation from the expression under test measures nothing. `main()` now returns THIS, the
-    receipt reads the same predicate, and the self-test pins both against a LITERAL table."""
-    return 1 if (result or {}).get("state") in BLOCKING_STATES else 0
+    receipt reads the same predicate, and the self-test pins both against a LITERAL table.
+
+    ⚠️ AN UNDECLARED STATE BLOCKS, and that clause is what makes `STATES` load-bearing rather than
+    decorative. Before it, `STATES` had exactly two references — its definition and one self-test row
+    comparing it to the fail-direction table — and NO functional consumer, so a new `classify` branch
+    returning e.g. "suite-too-large" was TRIPLE-silent: `exit_code` 0, `blocking=false`, and
+    `annotation()` "" — a fail-open reachable by adding a branch and forgetting a constant, with the
+    row named "so a new state cannot skip it" passing. A reading nothing declared cannot be known
+    safe, so it is treated exactly as `unprovable`."""
+    state = (result or {}).get("state")
+    if state not in STATES:
+        return 1
+    return 1 if state in BLOCKING_STATES else 0
 
 # The workflow seam this check is wired into, and the exact wiring the self-test pins.
 PR_GATE_WORKFLOW = ".github/workflows/pr-gate.yml"
@@ -317,7 +330,7 @@ def receipt(result, base_ref=""):
             f"preexisting={len(result.get('preexisting') or [])} "
             f"baseline={'ok' if result.get('baseline_established', True) else 'unestablished'} "
             f"conflicts={len(result.get('conflicted') or [])} "
-            f"blocking={'true' if result.get('state') in BLOCKING_STATES else 'false'}")
+            f"blocking={'true' if exit_code(result) else 'false'}")
 
 
 def annotation(result):
@@ -352,20 +365,27 @@ def annotation(result):
     if state == PREEXISTING:
         listed = ", ".join(sorted(result.get("preexisting") or []))
         # ⚠️ THE PRODUCTION SEMANTICS, stated because they INVERT the local reading. This step runs
-        # only AFTER the suite step passed on the graded tree, so any entry excusable here either was
-        # never in that step's BASE-derived manifest (legitimate — a PR's own new self-test is not in
-        # the base copy) or passed there minutes ago and fails now, which is NONDETERMINISM, not a
-        # pre-existing failure. It stays non-blocking so the two steps do not double-report the same
-        # tree, but "already red" is the weaker of the two readings and must not be the only one
-        # offered.
+        # only AFTER the suite step passed on the graded tree, so in production a `pre-existing-red`
+        # is ALWAYS a flake report. MEASURED: `print-selftest-suite` derives from the CURRENT
+        # manifest, not the base copy — handed a base copy with an entry removed it still printed all
+        # 56 including that entry (the base copy governs removal APPROVAL only) — so the "entry absent
+        # from the base-derived manifest" escape hatch this comment once claimed does not exist. It
+        # stays non-blocking because the flake argument alone carries it: the suite step owns that
+        # tree, and blocking would red a PR for something its author cannot fix.
         return (f"::warning::{listed} fail(s) on the composition, but fail(s) on the tree this gate "
                 "already graded too — so this is NOT a composition break and the base move did not "
                 "cause it. The self-test suite step above owns it. NOTE: that step already passed on "
-                "this tree, so unless these entries are absent from its base-derived manifest, this "
-                "is a FLAKE report — the same tree gave two different answers minutes apart.")
+                "this very tree in this very job, so this IS a flake report — the same tree gave two "
+                "different answers minutes apart.")
     if state == UNPROVABLE:
         return (f"::error::compose-gate could not establish its operands — {reason}. This run's "
                 "green is NOT evidence about the tree this PR would land on.")
+    if state not in STATES:
+        # The third of the three silences described in `exit_code`. FRESH and CLEAN reach here too,
+        # and legitimately need no annotation — an UNDECLARED state is the one that must speak.
+        return (f"::error::compose-gate produced the UNDECLARED state {str(state)[:64]!r}. It is "
+                "treated as unprovable and BLOCKS, because a reading nothing declared cannot be "
+                "known safe. Add it to STATES and to the fail-direction table in --self-test.")
     return ""
 
 
@@ -580,6 +600,21 @@ def _run_suite(tree, entries, label="composition"):
 # THE WORKFLOW SEAM. A composition check that is present but INERT is worse than none, because the
 # receipt keeps printing. These assertions are what make the wiring itself testable, and they are
 # mutation-tested below in the same shape gate-staleness.py established.
+def _quiet(fn, *args, **kwargs):
+    """Run a PRODUCTION function inside --self-test without letting its operational prints escape.
+
+    ⚠️ MEASURED HARM, not hypothetical. `receipt()` documents itself as "the one machine-readable
+    line; `grep '^compose-gate:'` is the whole measurement" — and the self-test's `main()` rows print
+    six SYNTHETIC receipts (`graded_base=aaaaaaaaaaaa`, one of them `state=composes-broken
+    blocking=true`) into the gate log, where the ONE real receipt is not even first. A reviewer pulling
+    receipts from run 90740570695 got fixtures. The self-test already pops `GITHUB_STEP_SUMMARY` to
+    avoid exactly this class of side effect; stdout needed the same treatment. This matters more than
+    tidiness: the receipt is the surface an operator reads to decide whether the gate is working, so a
+    fixture that outranks the real line makes the diagnostic unreliable."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        return fn(*args, **kwargs)
+
+
 def _refused(check, job):
     try:
         check(job)
@@ -749,6 +784,28 @@ def _self_test():
         chk(f"...and the receipt's blocking= field says the same thing for {_state!r}",
             f"blocking={'true' if _want else 'false'}" in receipt(_row), True)
 
+    # ⚠️ AN UNDECLARED STATE — the fourth layer, and the row above ("a new state cannot skip it") only
+    # observed a constant, so it could not catch this. A `classify` branch returning a state nobody
+    # declared was TRIPLE-silent: exit 0, blocking=false, annotation "". These three rows are also what
+    # give `STATES` a functional consumer, which it did not have.
+    _UNDECLARED = {"state": "suite-too-large", "reason": "invented"}
+    chk("an UNDECLARED state blocks, because a reading nothing declared cannot be known safe",
+        exit_code(_UNDECLARED), 1)
+    chk("...its receipt agrees", "blocking=true" in receipt(_UNDECLARED), True)
+    chk("...and it is NOT silent, unlike FRESH/CLEAN which legitimately are",
+        (annotation(_UNDECLARED)[:9], annotation({"state": FRESH}), annotation({"state": CLEAN})),
+        ("::error::", "", ""))
+    chk("a missing state key is undeclared too, not a pass", exit_code({}), 1)
+
+    # ⚠️ AND THE SELF-TEST MUST NOT WRITE OPERATIONAL OUTPUT INTO THE GATE LOG. `receipt()` is the one
+    # machine-readable line an operator greps; six synthetic receipts from the `main()` rows below
+    # outranked the real one in run 90740570695 and misled a reviewer within minutes.
+    _leak = io.StringIO()
+    with contextlib.redirect_stdout(_leak):
+        _rc = _quiet(lambda: (print(receipt({"state": BROKEN})), 7)[1])
+    chk("_quiet suppresses a production function's stdout while returning its value",
+        (_rc, _leak.getvalue()), (7, ""))
+
     # ...and the ENTRY POINT returns it. `compose` is stubbed at the module attribute `main` resolves
     # through, so this exercises the real argument parsing, the real receipt print and the real
     # return — the three things a pure-function assertion cannot reach.
@@ -759,14 +816,14 @@ def _self_test():
             _module.compose = (lambda *a, _s=_state, **k:
                                {"state": _s, "reason": "stub", "graded_base": "a" * 40,
                                 "live_tip": "b" * 40})
-            _got = main(["--base-ref", "master"])
+            _got = _quiet(main, ["--base-ref", "master"])
             chk(f"main() RETURNS the blocking status for {_state!r} (mutating it must red)",
                 _got, _want)
     finally:
         _module.compose = _real_compose
         if _real_summary is not None:
             os.environ["GITHUB_STEP_SUMMARY"] = _real_summary
-    chk("a usage error is neither of the two verdict statuses", main([]), 2)
+    chk("a usage error is neither of the two verdict statuses", _quiet(main, []), 2)
 
     # ---- the receipt must never let a small selection pass for a full one --------------------
     chk("the receipt prints the entry count so a vacuous selection is visible",
@@ -867,36 +924,36 @@ def _self_test():
         def faulting(_cwd, entries, _label="x"):
             return list(entries), list(entries)      # every entry faulted, so none is a verdict
         chk("a baseline whose harness FAULTS excuses nothing (the review finding)",
-            _baseline_failures(_bt, ["enrolled.py"], faulting), ([], False))
+            _quiet(_baseline_failures, _bt, ["enrolled.py"], faulting), ([], False))
         chk("...and reports the baseline as NOT established, so the receipt cannot say baseline=ok",
-            _baseline_failures(_bt, ["enrolled.py"], faulting)[1], False)
+            _quiet(_baseline_failures, _bt, ["enrolled.py"], faulting)[1], False)
 
         # ⚠️ THE MEASURED FAIL-OPEN. #756's graded tree has a worker-live.sh with no run-selftest
         # arm; invoking it exits 1 with a USAGE error, which as a bare exit code is
         # indistinguishable from a failing test. Read as a baseline it excused every composition
         # failure and the check blocked NOTHING — on exactly the stale PRs it targets.
         chk("a graded tree with NO run-selftest arm excuses NOTHING (the measured fail-open)",
-            _baseline_failures(_bt, ["enrolled.py"], every), ([], False))
+            _quiet(_baseline_failures, _bt, ["enrolled.py"], every), ([], False))
         chk("...and runner_available says why", runner_available(_bt), False)
         with open(os.path.join(_bt, RUNNER_SCRIPT), "w", encoding="utf-8") as handle:
             handle.write("case $1 in\n  run-selftest)\n    :\n    ;;\nesac\n")
         chk("...while a tree that DOES implement the arm is usable as a baseline",
             runner_available(_bt), True)
         chk("an enrolled+present entry that fails on the graded tree IS pre-existing",
-            _baseline_failures(_bt, ["enrolled.py"], every), (["enrolled.py"], True))
+            _quiet(_baseline_failures, _bt, ["enrolled.py"], every), (["enrolled.py"], True))
         chk("an entry master ADDED (absent from the graded tree) is NOT excused",
-            _baseline_failures(_bt, ["added-by-master.py"], every), ([], False))
+            _quiet(_baseline_failures, _bt, ["added-by-master.py"], every), ([], False))
         chk("an entry present but NOT enrolled in the graded tree is NOT excused",
-            _baseline_failures(_bt, ["unenrolled.py"], every), ([], False))
+            _quiet(_baseline_failures, _bt, ["unenrolled.py"], every), ([], False))
         chk("a mixed set only excuses the one with a real baseline, and is NOT established",
-            _baseline_failures(_bt, ["enrolled.py", "added-by-master.py"], every),
+            _quiet(_baseline_failures, _bt, ["enrolled.py", "added-by-master.py"], every),
             (["enrolled.py"], False))
         chk("an entry that PASSES on the graded tree is not pre-existing either",
-            _baseline_failures(_bt, ["enrolled.py"], lambda _c, _e, _l="x": ([], [])),
+            _quiet(_baseline_failures, _bt, ["enrolled.py"], lambda _c, _e, _l="x": ([], [])),
             ([], True))
     chk("an unreadable graded manifest excuses NOTHING (fail closed)",
-        _baseline_failures(os.path.join(tempfile.gettempdir(), "compose-gate-nonexistent"),
-                           ["x.py"], lambda _c, e, _l="x": (list(e), [])), ([], False))
+        _quiet(_baseline_failures, os.path.join(tempfile.gettempdir(), "compose-gate-nonexistent"),
+               ["x.py"], lambda _c, e, _l="x": (list(e), [])), ([], False))
 
     # ---- THE WORKFLOW SEAM, mutation-tested. Each mutant leaves a step that LOOKS wired. ----
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
