@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5076,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "83abf94e386b19f691729d463d6ea154ab3bbc1a",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 9 now says imported citations carry RSS/PSS namespaces and doc-comments point to `research/lws-design-records.md`, but `crates/sparq-lws-core/README.md` still says: \"Doc-comments here still cite source-repo paths; \u00a71 of that record maps each one.\" That stale public-facing statement directly contradicts this diff's migration description and the new crate-level documentation, so the citation migration is not consistently documented.",
+    "file": "research/lws-design-records.md",
+    "fix_hint": "Update `crates/sparq-lws-core/README.md` in this PR to say that citations are now namespaced and doc-comments point to `research/lws-design-records.md`, while preserving the caveat that the upstream ADR/design trees remain absent and the in-repo record is a reconstruction, not a transcription.",
+    "severity": "minor",
+    "title": "The rewritten-citation claim still conflicts with the crate README"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 rewrites the in-tree Rust citations and updates the design record's limitations accordingly, but the prior documentation-consistency finding remains: the crate README still tells readers that doc-comments cite source-repository paths, while this diff now says those citations were rewritten to resolve through the reconstructed in-repo record. Because that public entry point was not updated, the migration remains internally inconsistent. This is materially the same minor finding at the same severity as round 3, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
