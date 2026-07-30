@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5223,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "16503151df5fb4e9b2c9e8f6d5ca2da34307f056",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`open_object` indexes `blocks`, then marks the separately supplied `root.block_id` visited and traverses `root` directly without proving that the indexed block with that ID exists and is canonically identical. An attacker/caller can remove the real root from `blocks`, insert any unique same-object extra block to preserve `blocks.len() == root.chunk_count`, and pass the original root separately. Traversal visits the external root plus all authenticated descendants, so `visited.len() == chunk_count` and opening succeeds even though `blocks` is not exactly the object's block set. This contradicts the public API and SKILL claims that the root is included and every extra/missing block is rejected.",
+    "file": "crates/sparq-e2ee-ng/src/object.rs",
+    "fix_hint": "Before traversal, require `index.get(&root.block_id)` to exist and require that indexed envelope to equal the supplied root (or compare its canonical encoding/digest and all relevant fields), then traverse that indexed value. Add a regression test that removes `blocks[0]`, inserts a unique same-object extra envelope to keep the declared count, passes the original root separately, and asserts rejection. Also cover the same-block-id/different-envelope variant.",
+    "severity": "major",
+    "title": "open_object accepts a root that is absent from the claimed exact block set"
+   }
+  ],
+  "progress": null,
+  "summary": "The Merkle traversal and tamper checks are generally well structured and the disclosure remains appropriately research-grade, but the public `open_object` API does not enforce its load-bearing exact-set invariant: the separately supplied root need not actually be one of `blocks`. This permits an unrelated extra block to replace the root in the supplied set while verification still succeeds. The tests are non-vacuous for many mutation classes, but their helper always derives the root from `blocks[0]`, so they do not cover this API-level mismatch.",
+  "verdict": "request_changes"
+ }
+}
