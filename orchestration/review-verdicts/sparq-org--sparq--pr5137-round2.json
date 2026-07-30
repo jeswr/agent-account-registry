@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5137,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b0aa00051d7851f7daa9ceaa1c100998c17e59d6",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 confirms the prior approval. The added feature-matrix leg enables the default-off `odrl-authz` feature, matching the integration test's file-level cfg and making that suite executable. The golden leg-name update is consistent. The coverage-presence check reports 1014 tests for `sparq-lws-core`, so the raised floor of 1000 is valid. The release documentation remains consistent with the checked-in LWS container workflow's tag/dispatch triggers, native smoke and scan stages, multi-architecture publish, image tags, SBOM, and provenance configuration. No correctness, soundness, test-validity, security, or prompt-injection issue is evident. Progress is stagnant because the prior round also had no findings and the reviewed diff is materially unchanged.",
+  "verdict": "approve"
+ }
+}
