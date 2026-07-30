@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4222,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "44cb95112d23bfbeefb8c058cfef367c685fb498",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "handle_frame rejects oversized request frames, but after dispatch it unconditionally calls resp.encode(request_id) without checking the encoded response against limits.max_message_bytes. BlocksGet and CommitGet accept up to max_ids_per_request identifiers and may return that many envelopes, each near max_block_bytes, so a small legal request can make the broker construct and transmit a response many times larger than the advertised message ceiling. The TCP layer likewise writes the result without the negotiated bound (and only fails when the encoded size cannot fit u32). This violates the stated every-ceiling enforcement and permits response amplification and memory pressure from an authenticated or unauthenticated routed peer.",
+    "file": "crates/sparq-e2ee-ng-broker/src/broker.rs",
+    "fix_hint": "Bound response construction as well as request parsing. Page BlocksGet/CommitGet results or stop before adding an envelope that would make the canonical encoded response exceed max_message_bytes, returning an explicit continuation/typed limit outcome with deterministic semantics. Apply the same bound to unsolicited pushes/replays. Add a real handle_frame or daemon regression using small max_message_bytes and multiple individually valid envelopes, asserting that every emitted frame stays within the advertised ceiling and the connection has defined non-lossy continuation behavior.",
+    "severity": "major",
+    "title": "Negotiated message limit is not enforced on responses"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 fixes both round-2 majors: publication now re-checks the union of grant validity windows at dispatch time, with an in-window/post-expiry real-path test, and quota charging now skips an existing topic attribution, with an exact-boundary duplicate regression. However, the broker still does not enforce max_message_bytes on encoded responses. A legal BlocksGet/CommitGet request can select many near-max-size envelopes and produce a response far larger than the negotiated frame ceiling; the daemon then attempts to allocate/encode/write it (or disconnects only if it exceeds the u32 prefix). This contradicts the documented claim that every negotiated ceiling is enforced and leaves an amplification/resource-exhaustion path. Because this is a new major finding after a round with two different majors, progress is regressing by the mandated scale.",
+  "verdict": "request_changes"
+ }
+}
