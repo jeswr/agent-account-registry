@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1176,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2579cf69bc4f3d3a5d0e2146fb97c1bc62437bb0",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The three changes correctly remove hard-coded model identity from SPARQ design-record attribution while preserving the model-agnostic agent identity, document type, date, and surrounding meaning. This is complete for the diff's stated scope, introduces no executable or trust-plane behavior change, and contains no reviewer-directed instruction or other apparent prompt injection.",
+  "verdict": "approve"
+ }
+}
