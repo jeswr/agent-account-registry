@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1277,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0738f5e4259fbbde57b02960bb863bc7c07b9ba2",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 diff remains correct and complete. The schedule map is derived from every workflow file, rejects missing or unparseable inputs, conservatively reserves minutes regardless of wider cron fields, and is guarded against thin-checkout vacuity by independent lane-set and count evidence. Regate-sweep excludes only its own lane, verifies its parsed minutes against the map, checks exact sparse-checkout membership, and exercises positive, negative, partial, multi-lane, import-failure, and missing-tree cases. Moving the sweep to :04/:24/:44 removes its live watchdog collision without introducing a collision elsewhere. I found no diff-supported correctness, soundness, test-validity, or security issue requiring changes.",
+  "verdict": "approve"
+ }
+}
