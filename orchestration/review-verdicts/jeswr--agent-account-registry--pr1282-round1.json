@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1282,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a34f31f4c55fc28524fec98d27fd72e29ed72167",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe fix-lane self-claim path now independently resolves the source issue's live-label route and intersects that route with the provider/model-pin-derived fix walk before concrete-model resolution. Resolver failures and empty intersections remain fail-closed, while review mode is deliberately unaffected. The route input is transported as base64 JSON, type-checked after decoding, and the public park reason is passed through an environment variable after printable-ASCII normalization and length capping. The added self-test executes the workflow's actual constraint block with injected resolver behavior and includes meaningful delete and floor-substitution mutants, so the central authorization assertion is non-vacuous. I found no blocker or major correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
