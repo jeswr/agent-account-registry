@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1284,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "870910d0cc6c4b2d863835bfb57f35ba794a5a3e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The prior blocker remains: the gate executes target-controlled build scripts/tests as the same runner user, and the subsequent push and follow-up steps introduce a write-capable GH_TOKEN. Rebinding all four command-file environment variables does not prevent gate code from enumerating RUNNER_TEMP/_runner_file_commands and appending directly to the real set_env/add_path files consumed after the gate. The new test explicitly accepts exactly two post-gate token-bearing steps; that is an exposure census, not a security guard, and preserving the current count leaves both attack targets reachable. Purging credentials and transcripts before the gate does not prevent command-file poisoning aimed at credentials introduced later.",
+    "file": ".github/workflows/review-fix.yml",
+    "fix_hint": "Place the target-controlled gate across a real isolation boundary from the host runner command files, or move every token-bearing mutation after it into a separate job on a clean runner with trusted, SHA-bound inputs. Add an adversarial test in which gate-shaped target code searches RUNNER_TEMP for the real command files and attempts to influence a later sentinel; the attempt must be unable to affect any token-bearing execution.",
+    "severity": "blocker",
+    "title": "Target-controlled gate still precedes token-bearing steps without isolation"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 leaves the round-1 blocker materially unchanged. The new comments and self-tests now accurately acknowledge and inventory the exposure, but they do not enforce a security boundary: target-controlled gate code still runs as the runner user before two steps receive the write-capable fix App token. Such code can discover and append to the runner's real command files under RUNNER_TEMP, poisoning the later token-bearing steps. Counting the two exposed steps and turning red only if a third appears does not make either existing exposure safe. Transcript purging and the additional four-variable redirection are useful defense-in-depth, but neither closes this cross-step privilege path.",
+  "verdict": "request_changes"
+ }
+}
