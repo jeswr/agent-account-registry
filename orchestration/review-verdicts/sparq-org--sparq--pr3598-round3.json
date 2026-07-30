@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3598,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "69d8460824d8d4386946e36741b620a24ed05c3a",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 finds no correctness, soundness, test-validity, or security defect. The selective-disclosure API remains explicitly and consistently provenance-only: its name and return type distinguish it from verified VC ingest, the SD and verified cryptosuite enums are disjoint, and all outward documentation states that no BBS/ECDSA-SD proof is verified and that external audit sq-qhy4 remains pending. The load-bearing test exercises the real ingest, commit, and registry-entry paths, confirms the commitment matches the direct pipeline, confirms no issuer signature or sparq cryptosuite is asserted, and pins is_sd_verified() to false; companion tests cover enum separation, both suite tokens, empty input, and content binding. This remains consistent with research/zkp-query-proofs-plan.md section 5.3, which treats BBS+ as a future interoperability/commitment bridge rather than claiming this seam performs verification. No hostile reviewer-directed instruction was detected in the diff.",
+  "verdict": "approve"
+ }
+}
