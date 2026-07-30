@@ -45,16 +45,6 @@
 #                              verdict, or the re-review of a pushed pinned-floor fix that has
 #                              not been graded yet, before needs-user (2026-07-17)
 #   review_queue_ttl_minutes = positive integer (default 30) # review:needs age before alerting
-#   review_loop_nonhold_issue_labels = [string, ...] (default [])  # issue #1311: the `needs:*`
-#                              labels on a provenance-linked SOURCE ISSUE that do NOT stand the
-#                              review loop down. Every review-loop leg globs the whole `needs:`
-#                              prefix and calls the result "human-owned"; that is true of
-#                              `needs:user` and false of the resource gates that dominate the
-#                              namespace. Default [] reproduces the glob byte-for-byte. Entries
-#                              must be canonical `needs:<suffix>` names; `needs:user` is REFUSED
-#                              (it is the issue-side half of the human park pair). This never
-#                              waives a PR-side hold, a machine park, the round budget, or any
-#                              lease rule, and it deletes no label.
 #   cross_provider_fallback  = bool (default false)          # opt-in same-provider degrade when the
 #                                                            # opposite provider is starved; false =
 #                                                            # stay queued + alert (honest default)
@@ -117,13 +107,6 @@ allow_actions_bot_issues = true # own-workflow drift scanner opens dispatchable 
 max_review_rounds = 3         # BASE bound; decide_budget may extend to 6 total (see header)
 review_queue_ttl_minutes = 30 # surface a codex-starved review backlog after this age
 cross_provider_fallback = false  # honest default: stay queued + alert, never silently degrade
-# [#1311] `needs:*` labels on a SOURCE ISSUE that do NOT hold the review loop. `needs:ec2` says
-# the implementation wants a dedicated benchmark box; it says nothing about whether a diff already
-# sitting in review may be REVIEWED, and the reviewer container is read-only with no token and no
-# EC2 anything. It stays on the issue and keeps gating that issue out of the ready engine, so the
-# parked implementation work is not re-dispatched — only its existing PR re-enters review.
-# Every other member of the namespace still holds; `needs:user` can never be listed.
-review_loop_nonhold_issue_labels = ["needs:ec2"]
 
 # [FABLE-5] Throughput alert thresholds (scripts/metrics.py). sparq is a large, fast repo, so the
 # backlog bar sits above a healthy steady-state (dozens of open + draft PRs is normal); the alert
