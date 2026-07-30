@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3598,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "45052499e0b542fa027e5c518248cace9232ffbd",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "This diff exports SdCryptosuite, IngestedSdCredential, and ingest_sd_credential_unverified, but does not update skills/zk-query-proofs/SKILL.md. That skill currently describes bbs-2023 and ecdsa-sd-2023 as a deferred seam and explicitly lists selective disclosure as out of scope. Besides violating the repository's same-change maintenance rule for public APIs, the contradiction is security-relevant: users consulting the supported usage surface will not receive accurate instructions and caveats for this deliberately unverified ingest path.",
+    "file": "crates/sparq-zk/src/vc_bridge.rs",
+    "fix_hint": "Update skills/zk-query-proofs/SKILL.md in this PR to document the three new public items, feature gate, exact unverified/provenance-only semantics, separation from verify_source_proof, empty-input behavior, and the sq-qhy4 external-audit caveat. Replace the existing statements that the two SD suites are deferred/out of scope. Also update the crate README if it is the crate-level public API guide, as required by the shared maintenance contract.",
+    "severity": "major",
+    "title": "New public SD ingest API is absent from the required skill documentation"
+   }
+  ],
+  "progress": null,
+  "summary": "The implementation is unusually explicit and honest about the unverified selective-disclosure seam, keeps SD suites out of the verified-suite parser, and includes meaningful tests for type separation, provenance, empty input, and content binding. However, this adds a substantial public API while leaving the repository's required public-surface skill documentation stale: the existing zk-query-proofs skill still says bbs-2023/ecdsa-sd-2023 are deferred and out of scope. That makes the change incomplete and gives users contradictory guidance about a security-sensitive API.",
+  "verdict": "request_changes"
+ }
+}
