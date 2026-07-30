@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5109,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "add8fd3abf56dcdfb104f1b2d8ad2f96870a3b92",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The external differential arm is correctly isolated to test-only code and an optional scheduled workflow, with no new runtime dependency or default-path impact. The translation is fail-closed for unsupported constructs, delegates stratification to Souffle rather than consulting the implementation under test, compares complete projected closures, and handles grouped and nullary negation coherently. The tests are non-vacuous: they pin generated source, exercise accepted and rejected programs, witness both outcomes of the nullary-negation guard, validate fragment rejection, and cover process-spawn failure. The required-mode workflow prevents a missing external binary from silently turning the nightly differential into a pass. Documentation accurately limits the evidence to the relational fragment.",
+  "verdict": "approve"
+ }
+}
