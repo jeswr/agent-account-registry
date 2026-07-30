@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5154,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4c378ca83ab10c6cbfa53fdb4a8c807274d0c18a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "marker_index() indexes every issue containing a syntactically valid bd-id marker and verify_migration() treats a unique such issue as migrated, regardless of MIGRATION_LABEL, checkpoint ownership, author provenance, or migration title. This contradicts the file's stated trust model: apply_migration() explicitly fails closed when a marker-only issue lacks migration provenance because it may be an attacker-created decoy, and the module header says MIGRATION_LABEL authenticates the marker. An attacker can pre-create one issue per planned bead with the expected markers; --verify can then report PASSED although migration never created/authenticated those issues. The existing duplicate handling does not help when each forged bd-id is unique.",
+    "file": "scripts/bd-to-issues.py",
+    "fix_hint": "Build the verification index only from authenticated migration mappings, at minimum requiring MIGRATION_LABEL on each issue (the stable post-migration invariant), and report unique marker-only issues separately as unauthenticated/unmigrated so the verdict fails closed. Add a test with unique, correctly edged marker-only decoys that must fail, plus a corresponding labeled-board test that passes; update the _iss helper to model labels explicitly.",
+    "severity": "major",
+    "title": "--verify trusts unauthenticated bd-id markers that --apply rejects as decoys"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The verifier is read-only and its edge reconciliation is otherwise careful, but its mapping trust boundary is weaker than the migration path's: it accepts any shape-valid bd-id marker from any issue, without requiring the migration label or other provenance. That permits untrusted pre-created issues to satisfy the supposedly authoritative post-migration completion check even though --apply itself explicitly rejects those same issues as possible decoys. The tests construct every issue without labels, so they do not exercise or enforce the required authenticated mapping path. Compared with round 1's clean review, this is a newly identified major security/correctness finding, so progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
