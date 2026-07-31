@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4313,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e285c94e168eb97338b250388f00580c0788990f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The prior-round defect remains unchanged: a_closed_downstream_pipe_is_a_quiet_exit runs Command::new(\"sh\") while using ${PIPESTATUS[0]}, which is Bash-specific, and does not assert out.status.success() or an expected CLI status. A shell substitution failure, or another pipeline failure that never validates the intended CLI path, can therefore satisfy the sole assertion that stderr does not contain \"panicked\".",
+    "file": "crates/sparq-cli/tests/dump_streaming_cli.rs",
+    "fix_hint": "Use an explicitly supported Bash pipeline with pipefail and assert successful status, or preferably construct the closed-pipe condition without a shell and assert that the sparq-cli child exits with status 0. Also require stderr to be empty or to match the intended quiet behavior.",
+    "severity": "major",
+    "title": "Broken-pipe test still does not verify a successful CLI exit"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 does not address the prior major finding. The broken-pipe regression test still invokes a Bash-only PIPESTATUS array through Command::new(\"sh\"), and it still never asserts that the pipeline or CLI exited successfully. On common /bin/sh implementations such as dash, the shell can fail with a bad-substitution error while the test passes because it checks only that stderr lacks \"panicked\". Consequently the test remains unable to establish the documented quiet-success behavior for a closed downstream pipe.",
+  "verdict": "request_changes"
+ }
+}
