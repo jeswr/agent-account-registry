@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1332,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2bb06ecce50857e252eef7a3c9b2a96903b70ba0",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The prior finding is unresolved. Section 8.1 again says `record_partition_reservation`, `record_partition_defer`, and `assemble-census` already print everything needed, that no new code is required, and that the same historical log can classify global holders as `__global__`-only versus `__global__` plus narrow atoms. The cited reservation census describes candidate rows, and the defer census groups candidate deferrals by reason. Neither preserves each busy occupancy row's reserved-set shape jointly with its cause. Although `busy_packages_of_pulls` has `cause` and the reserved set in memory, Section 8.1 does not identify an emission that writes those row-level occupancy fields to historical logs. Thus existing runs cannot establish whether a global-reserving tick was narrow-free or reconstruct the requested holder-shape split.",
+    "file": "research/1011-global-partition-bounded-concurrency.md",
+    "fix_hint": "State explicitly that historical logs cannot answer these occupancy questions. Before any observation window, specify and add an always-emitted, zero-sealed occupancy census recording at least: whether any non-exempt busy occupant reserves a narrow atom; global-holder shape (`global-only` versus `global-plus-narrow`); and the joint breakdown of that shape by cause. Then require a fresh observation window. Alternatively, cite an existing emitted artifact and exact fields that actually preserve this joint occupancy evidence; candidate-row aggregates and in-memory values are insufficient.",
+    "severity": "major",
+    "title": "Section 8.1 still claims unavailable occupancy evidence exists in old logs"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 major evidence-path defect remains materially unchanged. Section 8.1 still claims that existing run logs contain enough information to recover both whether global-reserving ticks had any narrow busy occupant and the per-holder split of `__global__`-only versus `__global__`-plus-narrow, jointly with cause. But the cited reservation and defer emissions aggregate candidate rows, while the occupancy attributes cited from `busy_packages_of_pulls` exist only in memory at decision time. The document identifies no emitted historical artifact that preserves each busy holder's reserved-set shape and cause. Consequently, old logs cannot support the prescribed retrospective measurement, and a fresh, zero-sealed occupancy census plus a new observation window is still required. Because this measurement gates an overrule and determines whether reading (B)'s release population exists, the design record remains operationally incomplete.",
+  "verdict": "request_changes"
+ }
+}
