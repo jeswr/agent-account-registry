@@ -1,59 +1,6 @@
 {
  "records": [
   {
-   "ts": 1785475824,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "no_change",
-   "run_id": "30606898357.1",
-   "input_tokens": 201473,
-   "output_tokens": 869,
-   "wall_seconds": 26,
-   "issue": 2853,
-   "why_no_diff": "already_done"
-  },
-  {
-   "ts": 1785475885,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30606947636.1"
-  },
-  {
-   "ts": 1785475928,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30606979744.1"
-  },
-  {
-   "ts": 1785475935,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30606962987.1"
-  },
-  {
-   "ts": 1785475947,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30606971788.1"
-  },
-  {
-   "ts": 1785475948,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30607006764.1"
-  },
-  {
    "ts": 1785475972,
    "provider": "openai",
    "account": "dc2d751954080e13",
@@ -1907,6 +1854,14 @@
    "model_alias": "opus5",
    "exit_class": "success",
    "run_id": "30630316592.1"
+  },
+  {
+   "ts": 1785501166,
+   "provider": "anthropic",
+   "account": "9e13ea21abf27e68",
+   "model_alias": "opus5",
+   "exit_class": "success",
+   "run_id": "30629033250.1"
   }
  ]
 }
