@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5338,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "33c69bd2a2f43b057d513121b2711e609ce25d03",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The workflow correctly passes the selected sparq-server feature set through the existing FEATURES environment variable and shell array into cargo-mutants, preserving safe argument handling and the existing advisory/ratchet behavior. The listed features exist, their dependency relationships are compatible (including brtpf implying tpf and the authorization extensions implying solid-authz), and the feature-matrix provides test-enabled coverage for the selected surfaces. The exclusions and the operational risk of a more expensive mutation sweep are explicitly documented without weakening the current gate.",
+  "verdict": "approve"
+ }
+}
