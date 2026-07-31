@@ -11,16 +11,6 @@
    "expires_at": 1785526395
   },
   {
-   "account": "9e13ea21abf27e68",
-   "claim_id": "6de02a9e308645e095cfb5711fe01677",
-   "holder": "sparq-org/sparq#4802@30654858799.1",
-   "package": "ci",
-   "role": "ci",
-   "model": "opus5",
-   "issued_at": 1785522149,
-   "expires_at": 1785528449
-  },
-  {
    "account": "51bde6688e140866",
    "claim_id": "54cc6a4a425b440badd5c540ff182309",
    "holder": "fix:sparq-org/sparq#5380@30655098271.1",
