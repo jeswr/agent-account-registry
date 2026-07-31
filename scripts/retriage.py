@@ -57,6 +57,19 @@ asserts EXACTLY ONE role in a revision-bound post-read, and repairs — or demot
 `status:untriaged` so the next retriage tick owns the issue — instead of stranding it. The re-park
 and repair lanes ride the very same sequence: a repair ADDS the re-derived `role:*`, which is
 exactly the add-must-land-first shape #582 is about.
+
+EVERY SUGGESTED LABEL IS VALIDATED, NOT JUST THE ROLE (registry #510). #582 taught the classifier
+to check its target `role:*` against the target repo's LIVE label set; every OTHER label a decision
+writes — the derived `priority:P4` floor, the `status:*` lane attestations — still went to the API
+unchecked. GitHub fails the WHOLE `gh issue edit` when any one `--add-label` names a label the repo
+does not have, so a single unknown suggestion cost the entire mutation, exited the applier 1 and
+turned the sweep red — and, because nothing about the issue changed, it re-tripped on every
+subsequent tick (measured: run 29883925637, `'role:soundness' not found`, cleared only by a manual
+relabel). `validate_labels` now reduces the decision to labels that provably exist BEFORE any write
+and names each dropped label on its own log line; `drop_is_safe` then refuses to apply a REDUCED
+write that would no longer be the transition it claims to be. A dropped label is never an error
+exit: the tick is a no-op with a log, so the recurrence is a quiet, attributable no-op rather than a
+red run. Genuine write failures are unchanged — still recorded per issue, still red after the loop.
 """
 import argparse
 import importlib.util
@@ -96,6 +109,12 @@ CLAIM_OWNED = {"status:in-progress", "status:in-progress-review"}
 # The actions that WRITE. `--apply` mutates for each of them through the one shared applier; every
 # other verdict is a no-op skip (fail-closed: an unknown action never becomes a write).
 WRITING_ACTIONS = ("promote", "repark", "repair")
+# The two lane attestations this sweep moves an issue between. Exactly one of them must be on the
+# issue after ANY accepted action: an issue on NEITHER lane is invisible to the readiness engine
+# AND to this sweep's own board queries, i.e. terminally stranded (registry #510's lane invariant).
+LANE_LABELS = frozenset({"status:ready", "status:untriaged"})
+# The verdict a decision is downgraded to when its unknown-label reduction cannot be applied safely.
+UNSAFE_DROP_REASON = "unknown-label-unsafe-drop"
 NON_DISPATCHABLE = _ready.NON_DISPATCHABLE            # kind:epic
 # Bounded, rate-limit-safe sweep: an explicit per-run cap and a runaway ceiling on the paginated
 # snapshot. A partial page must never be mistaken for the whole board.
@@ -405,6 +424,98 @@ def apply_decision(current, decision, edit, view, read_state=None, warn=None):
     return static_triage.apply_triage(current, result, edit, view, warn, read_state=read_state)
 
 
+def validate_labels(decision, known_labels):
+    """Reduce a decision to the labels the target repo ACTUALLY has. Returns (decision, dropped).
+
+    registry #510. `triage.triage()` already refuses to DERIVE a `role:*` label the repo lacks
+    (#582), but that is one label family out of several: the derived `priority:P4` floor and the
+    `status:*` lane attestations reached `gh issue edit` unchecked. GitHub rejects the WHOLE edit
+    when any single `--add-label` names a label the repository does not have, so one unknown
+    suggestion lost the entire mutation — the add-first role verification included — exited the
+    applier 1, and re-tripped identically on every following tick because nothing about the issue
+    had changed. Validating here, against the label set the run already fetched once, converts that
+    permanent red run into a named, per-label log line.
+
+    WHAT IS VALIDATED, and what deliberately is not:
+      * `add` — every label, because each one is an API-level CREATE-OR-FAIL of the whole edit.
+      * the intended `role` — validated even though it is usually already in `add`, because
+        `apply_triage` writes the target INDEPENDENTLY of `add` (its add-before-strip phase 1 fires
+        whenever the target is not already on the issue). Dropping it here also withdraws every
+        `role:*` STRIP from the plan: that is #582's rule read from the other side — an incumbent
+        role is never stripped for a replacement this run has refused to write.
+      * `remove` is NOT validated. Removals are drawn from the issue's own live label set
+        (`triage()` intersects them with it), and a label ON an issue exists in the repository by
+        construction; filtering removals could only ever fail to strip something that must go.
+
+    `known_labels is None` means "label set unknown" and validates nothing — the same contract
+    `triage(known_labels=...)` uses. `_apply_cli` never passes None (it falls back to a live
+    `repo_label_set` read), so the tolerance exists for direct/plan-only callers, not for the sweep.
+    A non-writing decision is returned untouched: a skip has nothing to validate.
+    """
+    if known_labels is None or decision.get("action") not in WRITING_ACTIONS:
+        return decision, []
+    known = set(known_labels)
+    add = list(decision.get("add", ()))
+    remove = list(decision.get("remove", ()))
+    role = decision.get("role")
+    target = f"{static_triage.ROLE_PREFIX}{role}" if role else None
+    unknown_target = bool(target) and target not in known
+    dropped = sorted({label for label in add if label not in known}
+                     | ({target} if unknown_target else set()))
+    if not dropped:
+        return decision, []
+    reduced = dict(decision)
+    reduced["add"] = sorted(label for label in add if label in known)
+    if unknown_target:
+        reduced["role"] = None
+        reduced["remove"] = sorted(label for label in remove
+                                   if not label.startswith(static_triage.ROLE_PREFIX))
+    else:
+        reduced["remove"] = sorted(remove)
+    return reduced, dropped
+
+
+def drop_is_safe(decision, live_labels, issue_type, known_labels):
+    """Is a decision REDUCED by `validate_labels` still the transition it claims to be?
+
+    registry #510. "Drop the unknown label and apply the rest" is only safe while the rest still
+    stands on its own, and for this classifier it frequently does not — every label it suggests is
+    load-bearing for the verdict that produced it. The measured case: an unprioritised
+    `status:untriaged` issue is promoted only BECAUSE the derived `priority:P4` floor makes it
+    triage-complete. Write the promotion without that floor and the post-state is a `status:ready`
+    issue with no readable priority, which `derive_priority` declines to floor a second time
+    (`ready-attested-regression`, the #586 lane) — so the very next tick re-parks it, the tick after
+    that promotes it again, and the sweep oscillates with two writes forever. Refusing is strictly
+    better AND agrees with the classifier: without the label the issue is not triage-complete, and
+    the correct action for an incomplete `status:untriaged` issue is to leave it parked.
+
+    Two named invariants, checked against the post-state the REDUCED write would produce:
+
+      * LANE — exactly one of `status:ready` / `status:untriaged` survives. A half-applied status
+        transition (the attestation dropped, its opposite still stripped) puts the issue on NEITHER
+        lane, where the readiness engine cannot see it and this sweep's own board queries cannot
+        select it again: terminal, and precisely the stranding #586 exists to undo.
+      * PREMISE — a decision that ATTESTS `status:ready` (promote/repair) must still classify READY
+        without the dropped labels. A re-park attests nothing, so it needs only to land on the park
+        lane, from which the promotion lane re-admits it the moment the label set is fixed.
+
+    Fail-closed: a classifier that raises here means the premise is unproven, which is a refusal.
+    """
+    post = (set(live_labels) | set(decision.get("add", ()))) - set(decision.get("remove", ()))
+    lanes = post & LANE_LABELS
+    if len(lanes) != 1:
+        return False
+    if decision.get("action") == "repark":
+        return "status:untriaged" in lanes
+    if "status:ready" not in lanes:
+        return False
+    try:
+        return bool(static_triage.triage(post, issue_type, trusted=True,
+                                         known_labels=known_labels)["ready"])
+    except Exception:                                     # noqa: BLE001 — unproven means refused
+        return False
+
+
 def workflow_step_script(text, step_id):
     """The EXECUTABLE `run:` script of the ONE workflow step whose `id:` is `step_id`, dedented.
 
@@ -577,6 +688,27 @@ def _apply_cli(repo, number, issue, maintainer, app_bot, permission, known_label
     known = list(known_labels) if known_labels else static_triage.repo_label_set(repo)
     decision = plan(fresh, maintainer, app_bot, permission, known_labels=known,
                     allow_actions_bot_issues=allow_actions_bot_issues)
+    # registry #510: the LAST gate before the API. `known` is the label list this run fetched ONCE
+    # (retriage.yml's `gh_read label list`, or the live fallback above) — the same oracle #582 gave
+    # the classifier, now applied to EVERY label the decision would write rather than to the role
+    # alone. Validated BEFORE the decision is printed, so the audit line on the run log is the write
+    # that was actually attempted and not the one the classifier wished for.
+    decision, dropped = validate_labels(decision, known)
+    for label in dropped:
+        print(f"::warning title=retriage #{number}::classifier suggested unknown label {label} — "
+              f"dropped (it does not exist in {repo}'s label set, and GitHub fails the WHOLE label "
+              f"edit on one unknown name; registry #510)")
+    if dropped and decision["action"] in WRITING_ACTIONS and not drop_is_safe(
+            decision, live, fresh["type"], known):
+        # Applying what survives would strand or oscillate the issue (see drop_is_safe): write
+        # NOTHING this tick. Deliberately NOT an error exit — a repository missing one of its own
+        # taxonomy labels is a config defect to fix, not a reason to fail every sweep forever, and
+        # a red run is exactly the state registry #510 exists to end.
+        print(f"::warning title=retriage #{number}::{decision['action']} depended on "
+              f"{', '.join(dropped)}; applying only the labels that survive would leave the issue "
+              f"worse, so this tick writes NOTHING (registry #510 — a no-op with a log, not a red "
+              f"run). Create the missing label(s) to unblock it")
+        decision = {"action": "skip", "reason": UNSAFE_DROP_REASON, "dropped": dropped}
     print(json.dumps(decision, sort_keys=True))
     if decision["action"] not in WRITING_ACTIONS:
         return 0
@@ -1571,6 +1703,115 @@ def _self_test():
                    "area map widened the derivation rather than replacing it",
                    (code, roles_of(docs_typed.labels), "status:ready" in docs_typed.labels)
                    == (0, {"role:impl"}, True)))
+
+    # -------------------------------------------------------------------------------------------
+    # [registry #510] EVERY SUGGESTED LABEL IS VALIDATED AGAINST THE TARGET REPO'S LIVE LABEL SET.
+    # #582 pinned the ROLE family only; the derived `priority:P4` floor and the `status:*` lane
+    # attestations still went to the API unchecked, and GitHub fails the WHOLE `gh issue edit` on
+    # one unknown `--add-label`. So a single missing taxonomy label cost the entire mutation, exited
+    # the applier 1, and — nothing about the issue having changed — re-tripped on every following
+    # tick (run 29883925637: `'role:soundness' not found`, cleared only by a manual relabel).
+    #
+    # The unit rows below pin the validator's contract; the end-to-end rows after them drive the
+    # REAL entrypoint (main -> _apply_cli -> validate_labels -> drop_is_safe -> apply_decision)
+    # against a fake GitHub that raises on an unknown add exactly as the API does.
+    # -------------------------------------------------------------------------------------------
+    _known510 = {"role:impl", "role:docs", "status:ready", "status:untriaged", "priority:P2"}
+    _promote510 = {"action": "promote", "add": ["priority:P4", "role:impl", "status:ready"],
+                   "remove": ["role:docs", "status:untriaged"], "role": "impl"}
+    chk("[#510] an unknown suggested label is DROPPED and every valid one is KEPT",
+        validate_labels(_promote510, _known510),
+        ({"action": "promote", "add": ["role:impl", "status:ready"],
+          "remove": ["role:docs", "status:untriaged"], "role": "impl"}, ["priority:P4"]))
+    # NEGATIVE CONTROL, and the row that keeps the one above from being satisfied by a validator
+    # that simply drops things: a fully-known write must pass through byte-identical, with NO
+    # reported drop. Without it, `return {"add": [], ...}, sorted(add)` would pass the whole block.
+    chk("[#510] NEGATIVE CONTROL: a fully-known write passes through UNCHANGED, dropping nothing",
+        validate_labels({"action": "promote", "add": ["role:impl", "status:ready"],
+                         "remove": ["status:untriaged"], "role": "impl"}, _known510),
+        ({"action": "promote", "add": ["role:impl", "status:ready"],
+          "remove": ["status:untriaged"], "role": "impl"}, []))
+    # The role half is #582's rule read from the other side. `apply_triage` writes the target
+    # INDEPENDENTLY of `add` (its add-before-strip phase fires whenever the target is not already on
+    # the issue), so an unknown role must also clear `role` — and clearing it MUST withdraw every
+    # `role:*` strip, or the sweep would strip the incumbent for a replacement it refuses to write.
+    chk("[#510] an unknown ROLE clears the role AND withdraws every role:* strip (never strip an "
+        "incumbent for a replacement this run will not write)",
+        validate_labels({"action": "promote", "add": ["role:ci", "status:ready"],
+                         "remove": ["role:docs", "status:untriaged"], "role": "ci"}, _known510),
+        ({"action": "promote", "add": ["status:ready"], "remove": ["status:untriaged"],
+          "role": None}, ["role:ci"]))
+    chk("[#510] the role is validated even when it is NOT in `add` (apply_triage writes it anyway)",
+        validate_labels({"action": "repair", "add": [], "remove": [], "role": "ci"}, _known510),
+        ({"action": "repair", "add": [], "remove": [], "role": None}, ["role:ci"]))
+    chk("[#510] no label set means no validation (the documented `None` contract)",
+        validate_labels(_promote510, None), (_promote510, []))
+    chk("[#510] a non-writing decision is never touched",
+        validate_labels({"action": "skip", "reason": "epic"}, set()),
+        ({"action": "skip", "reason": "epic"}, []))
+
+    # drop_is_safe: the two named invariants that decide whether the REDUCED write may be applied.
+    chk("[#510] LANE INVARIANT: a reduction that leaves the issue on NEITHER lane is refused "
+        "(it would be invisible to the readiness engine AND to this sweep's own board queries)",
+        drop_is_safe({"action": "promote", "add": [], "remove": ["status:untriaged"]},
+                     {"status:untriaged", "role:impl", "area:dispatch", "priority:P2"}, "", known),
+        False)
+    chk("[#510] PREMISE INVARIANT: a promotion whose readiness DEPENDED on the dropped priority is "
+        "refused — applying it oscillates promote<->repark, two writes per two ticks, forever",
+        drop_is_safe({"action": "promote", "add": ["role:impl", "status:ready"],
+                      "remove": ["role:docs", "status:untriaged"]},
+                     {"status:untriaged", "role:docs", "area:dispatch"}, "", known),
+        False)
+    chk("[#510] ...and the SAME reduction IS applied when the post-state still classifies READY "
+        "without the dropped label (the invariant refuses a write, not every write)",
+        drop_is_safe({"action": "promote", "add": ["role:impl", "status:ready"],
+                      "remove": ["role:docs", "status:untriaged"]},
+                     {"status:untriaged", "role:docs", "area:dispatch", "priority:P2"}, "", known),
+        True)
+    chk("[#510] a re-park attests nothing, so it needs only to LAND on the park lane",
+        (drop_is_safe({"action": "repark", "add": ["status:untriaged"],
+                       "remove": ["status:ready"]},
+                      {"status:ready", "role:impl", "area:dispatch"}, "", known),
+         drop_is_safe({"action": "repark", "add": [], "remove": ["status:ready"]},
+                      {"status:ready", "role:impl", "area:dispatch"}, "", known)),
+        (True, False))
+
+    # THE LIVE FAILURE, END TO END. `known` (the fixture label set retriage.yml's own argv carries)
+    # has no `priority:P4`, so this unprioritised issue's promotion suggests a label the repo does
+    # not have — the #487-class shape. MUTATION TRIPWIRE: delete the `validate_labels` call from
+    # `_apply_cli` and FakeGh raises on that add exactly as the API does, so the applier reports
+    # ok=False and this row goes red on `code == 0` AND on `calls == []`.
+    unprioritised_start = {"area:dispatch", "role:docs", "status:untriaged"}
+    unprioritised = FakeGh(set(unprioritised_start), known)
+    code, seen = run_apply_argv(unprioritised)
+    checks.append(("[#510] an unknown suggested label is dropped with a loud per-issue log line, "
+                   "the tick writes NOTHING, and the run stays GREEN (it used to exit 1 forever)",
+                   (code, unprioritised.calls, unprioritised.labels == unprioritised_start,
+                    "classifier suggested unknown label priority:P4 — dropped"
+                    in seen.get("stdout", ""),
+                    UNSAFE_DROP_REASON in seen.get("stdout", ""))
+                   == (0, [], True, True, True)))
+    # ...and the acceptance criterion the live failure is about: RE-RUNNING is a no-op with the same
+    # log, not a second red run. The board is unchanged, so this is exactly what the next scheduled
+    # tick does to the same issue.
+    code, seen = run_apply_argv(unprioritised)
+    checks.append(("[#510] re-running on the SAME issue is a no-op-with-log — the #487-class "
+                   "failure cannot recur",
+                   (code, unprioritised.calls, unprioritised.labels == unprioritised_start,
+                    "classifier suggested unknown label priority:P4 — dropped"
+                    in seen.get("stdout", "")) == (0, [], True, True)))
+    # POSITIVE CONTROL: the same issue with a priority the repo DOES have still promotes in full,
+    # writing every valid label. Without it, `return skip` in `_apply_cli` would satisfy both rows
+    # above while disabling the entire sweep.
+    prioritised = FakeGh(unprioritised_start | {"priority:P2"}, known)
+    code, seen = run_apply_argv(prioritised)
+    checks.append(("[#510] POSITIVE CONTROL: a fully-known promotion still applies EVERY valid "
+                   "label, with no drop reported",
+                   (code, roles_of(prioritised.labels), "status:ready" in prioritised.labels,
+                    "status:untriaged" in prioritised.labels,
+                    "classifier suggested unknown label" in seen.get("stdout", ""))
+                   == (0, {"role:impl"}, True, False, False)))
+
     # [#605 review ROUND 4, MINOR] open/closed is no longer a stale input: it rides the same read.
     closed = FakeGh(start, known)
     code, seen = run_apply_argv(closed, live_state="CLOSED")
@@ -1758,15 +1999,24 @@ print(json.dumps([{"number": base + page * 1000 + index, "user": {"login": "owne
                    "body": "", "labels": [{"name": label}],
                    "updated_at": "2026-07-01T00:00:00Z"} for index in range(count)]))
 '''
+    # STUB_FAIL_APPLIES (registry #510) names the 1-based applier invocations that must FAIL, so the
+    # sweep loop's error isolation is asserted by OUTCOME: the log line is written BEFORE the exit,
+    # so a failing issue is still counted and "did the loop keep going" is answerable.
     RETRIAGE_STUB = '''import os, subprocess, sys
 if "--snapshot" in sys.argv:
     sys.exit(subprocess.run([sys.executable, os.environ["STUB_REAL_RETRIAGE"], *sys.argv[1:]],
                             check=False).returncode)
-with open(os.environ["STUB_APPLY_LOG"], "a", encoding="utf-8") as handle:
+log = os.environ["STUB_APPLY_LOG"]
+with open(log, "a", encoding="utf-8") as handle:
     handle.write("apply\\n")
+with open(log, encoding="utf-8") as handle:
+    nth = sum(1 for line in handle if line.strip())
+if str(nth) in {token for token in os.environ.get("STUB_FAIL_APPLIES", "").split(",") if token}:
+    print("simulated gh label write failure", file=sys.stderr)
+    sys.exit(1)
 '''
 
-    def run_sweep_step(full_pages=2, payload="array", run_number=3):
+    def run_sweep_step(full_pages=2, payload="array", run_number=3, fail_applies=""):
         """Execute the REAL sweep step body. Returns (exit code, log text, page-file names,
         window line count, applier invocation count, API targets the step actually requested)."""
         with tempfile.TemporaryDirectory() as directory:
@@ -1784,6 +2034,7 @@ with open(os.environ["STUB_APPLY_LOG"], "a", encoding="utf-8") as handle:
                                GITHUB_RUN_NUMBER=str(run_number),
                                STUB_FULL_PAGES=str(full_pages), STUB_PAYLOAD=payload,
                                STUB_APPLY_LOG=log, STUB_TARGET_LOG=targets_path,
+                               STUB_FAIL_APPLIES=fail_applies,
                                STUB_REAL_RETRIAGE=os.path.abspath(__file__))
             completed = subprocess.run(["bash", "-c", sweep_script], cwd=root, env=environment,
                                        capture_output=True, text=True, timeout=600, check=False)
@@ -1846,6 +2097,20 @@ with open(os.environ["STUB_APPLY_LOG"], "a", encoding="utf-8") as handle:
     code, log, _pages, _window, applies, _targets = run_sweep_step(payload="object")
     checks.append(("[#605 r2 f2] a non-array page payload fails the step CLOSED, never sweeps",
                    (code != 0, "not a JSON array" in log, applies) == (True, True, 0)))
+
+    # [registry #510] PER-ISSUE ERROR ISOLATION, EXECUTED. A GENUINE write failure — the class that
+    # is still an error, as opposed to a dropped unknown label — must be RECORDED per issue, must
+    # NOT abort the remaining issues, and must turn the step red exactly ONCE, after the loop. This
+    # was asserted only textually before (`\\bexit\\b` absent from the loop body), which cannot see
+    # `set -e` aborting the sweep at the first non-zero applier. Dies on: moving the `exit 1` inside
+    # the loop, dropping the `failed=1` bookkeeping (code would be 0), and on a sweep that stops at
+    # the first failure (applies would be 1, not 80). The green control is the very first
+    # `run_sweep_step` row above — same board, no injected failure, exit 0 with the same 80 applies.
+    code, log, _pages, _window, applies, _targets = run_sweep_step(fail_applies="1,2")
+    checks.append(("[#510] a genuine per-issue write failure is recorded, the OTHER 78 issues are "
+                   "still processed, and the step exits non-zero once AFTER the loop",
+                   (code != 0, applies, log.count("fail-closed retriage FAILED"),
+                    "one or more issues failed" in log) == (True, 80, 2, True)))
 
     ok = all(result for _, result in checks)
     for name, result in checks:
