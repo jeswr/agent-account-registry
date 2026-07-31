@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5343,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "52af8ac33416925197514de7a9e2c95f1af3082a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains correct and complete. It adds only documentation and a non-vacuous regression test that exercises the real d_value_key/d_value_eq and substrate numeric-comparison paths. The three assertions accurately pin behavior-changing mismatches: arbitrary-magnitude decimal loss in the i128-backed substrate representation, XPath/SPARQL numeric promotion across D-disjoint decimal and IEEE-754 value spaces, and missing integer-subtype facet validation. The claims align with the existing D-entailment value-key design, and there is no runtime behavior change, security defect, or hostile instruction in the diff.",
+  "verdict": "approve"
+ }
+}
