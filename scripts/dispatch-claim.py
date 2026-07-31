@@ -11777,36 +11777,45 @@ def _self_test():
     _RF_ROUTE_ANCHOR = r'(?m)^[ \t]*route_error = ""$'
     _RF_ROUTE_END = r'(?m)^[ \t]*models = routing\.get\("models", \{\}\)$'
 
-    def _workflow_route_constraint(mode, wanted, route_chain=(), raises=None, source=None):
-        """Run review-fix.yml's own route constraint. Returns (wanted, route_error)."""
+    def _workflow_route_constraint(mode, wanted, route_chain=(), raises=None, source=None,
+                                   route_agent="registry-impl"):
+        """Run review-fix.yml's own route constraint.
+
+        Returns (wanted, route_error, resolved_agent) — the chain constraint AND the [#285] fix
+        PERSONA, because the workflow derives both from the same live route re-derivation and the
+        one block of workflow source is what decides them."""
         src = _review_fix_step_python(_RF_ROUTE_ANCHOR, _RF_ROUTE_END,
                                       "fix-lane route constraint", job="resolve", source=source)
 
         def _resolve(repo, labels, policy_doc, routing_doc):
             if raises is not None:
                 raise raises
-            return {"model_chain": list(route_chain)}
+            return {"model_chain": list(route_chain), "agent": route_agent}
 
         ns = {"mode": mode, "wanted": list(wanted), "target_repo": PROBE_REPO,
               "issue_labels": ["role:impl", "area:sparq-zk"], "policy_doc": {}, "routing": {},
+              # The `--role review`/`--role impl` resolution the CLI already made. Deliberately
+              # NOT one of the route agents below, so "came from the route" and "came from the
+              # role" are distinguishable in every row.
+              "policy": {"agent": "role-resolved-agent"},
               "policy_resolve": types.SimpleNamespace(resolve=_resolve),
               # The REAL helper object the dispatcher constrains its own claim with, so the two
               # sides of the adopt comparison cannot disagree about what a route authorises.
               "dispatch_claim": types.SimpleNamespace(
                   _route_constrained_fix_chain=_route_constrained_fix_chain)}
         exec(src, ns)  # noqa: S102 — repository-owned workflow source
-        return ns["wanted"], ns["route_error"]
+        return ns["wanted"], ns["route_error"], ns["resolved_agent"]
 
     # 1. THE BUG, in the shape it actually takes. An openai-implemented PR whose source issue
     #    routes to a restricted soundness chain: the provider-wide fix walk offers sol+luna, the
     #    route authorises only luna. A ladder FLOOR over ESCALATION_LADDERS["openai"] would readmit
     #    sol; only the intersection refuses it.
-    assert _workflow_route_constraint("fix", FIX_CHAIN["openai"], route_chain=["luna"]) \
+    assert _workflow_route_constraint("fix", FIX_CHAIN["openai"], route_chain=["luna"])[:2] \
         == (["luna"], ""), _workflow_route_constraint("fix", FIX_CHAIN["openai"],
                                                       route_chain=["luna"])
     # 2. NO same-provider fixer at all -> EMPTY, never a fall-through to the provider default.
     #    An empty chain is what routes the run to the `unresolvable` job and a human.
-    assert _workflow_route_constraint("fix", FIX_CHAIN["anthropic"], route_chain=["sol"]) \
+    assert _workflow_route_constraint("fix", FIX_CHAIN["anthropic"], route_chain=["sol"])[:2] \
         == ([], ""), "a route sharing no model with the fix walk must empty the chain"
     # 3. A RESOLVER REFUSAL fails the fix lane closed — captured (so it can be reported), not
     #    swallowed into an unconstrained chain.
@@ -11818,7 +11827,7 @@ def _self_test():
     #    the INVERSE of the implementer's provider (REVIEW_CHAIN), never routing.toml's implementor
     #    chain, so review mode consumes no route and never calls the resolver.
     assert _workflow_route_constraint("review", REVIEW_CHAIN["anthropic"],
-                                      raises=ValueError("routing is unreadable")) \
+                                      raises=ValueError("routing is unreadable"))[:2] \
         == (list(REVIEW_CHAIN["anthropic"]), ""), (
         "review mode must not consume the source issue's route — a routing refusal there would "
         "strand every cross-provider review behind a fix-lane concern")
@@ -11854,6 +11863,77 @@ def _self_test():
           "of the workflow and INTERSECTED with the source issue's own route (not floored, not "
           "model_pin-dependent); an empty intersection and a resolver refusal both fail closed, "
           "review mode is untouched, and both deleting and floor-ifying the constraint are caught")
+
+    # L3b-agent. [#285] THE OTHER HALF OF THE SAME ROUTE. #103 made a trust-surface fix run on the
+    # right MODEL and left the PROMPT behind: the fix lane resolved its agent via `--role impl`
+    # regardless of the PR's trust tier, so an `area:review-loop` PR that worker.yml implemented as
+    # `registry-reviewer` (the security override wins over the role row) re-entered its fix leg as
+    # `registry-impl`. The persona is what carries the trust-plane obligations, and the fix leg is
+    # the one that EDITS the trust surface. The workflow now takes it from the SAME live route
+    # re-derivation the chain constraint above already runs — pinned here by EXECUTION, in the same
+    # block, because a persona and a chain derived from "the same route" by two separate reads is
+    # exactly the drift shape this file exists to catch.
+    _rf_agent = _workflow_route_constraint("fix", FIX_CHAIN["anthropic"], route_chain=["opus5"],
+                                           route_agent="registry-reviewer")
+    assert _rf_agent == (["opus5"], "", "registry-reviewer"), (
+        "the fix persona must be the SOURCE ISSUE's own route agent, not the role-resolved one",
+        _rf_agent)
+    # REVIEW MODE KEEPS ITS OWN PERSONA. Its agent comes from `--role review`; taking the
+    # implementor route's agent would hand the read-only, verdict-only reviewer the implementer's
+    # brief — the same reason review mode consumes no route CHAIN (row 4 above).
+    assert _workflow_route_constraint("review", REVIEW_CHAIN["anthropic"],
+                                      route_agent="registry-impl")[2] == "role-resolved-agent", (
+        "review mode must keep the --role review persona")
+    # FAIL CLOSED, not fall back. A route that names no usable agent empties the fix chain and
+    # says why, exactly as a resolver refusal does — the run is parked to a human by the
+    # `unresolvable` job rather than quietly running the plain implementer brief on a trust
+    # surface.
+    for _bad_agent in (None, "", "   ", 7):
+        _rf_agent_bad = _workflow_route_constraint("fix", FIX_CHAIN["anthropic"],
+                                                   route_chain=["opus5"], route_agent=_bad_agent)
+        assert _rf_agent_bad[0] == [] and "names no agent" in _rf_agent_bad[1], (
+            "a route with no usable agent must empty the fix chain and name why",
+            _bad_agent, _rf_agent_bad)
+    # ...and on a RESOLVER refusal there is no route persona to take. The value falls back to the
+    # role-resolved one only because the output must stay non-empty: that same refusal has already
+    # emptied the chain, so no model ever runs under it.
+    _rf_agent_err = _workflow_route_constraint("fix", FIX_CHAIN["openai"],
+                                               raises=ValueError("routing is unreadable"))
+    assert _rf_agent_err[0] == [] and _rf_agent_err[2] == "role-resolved-agent", (
+        "a resolver refusal must empty the fix chain (so the fallback persona is inert)",
+        _rf_agent_err)
+    # NON-VACUITY: neuter the persona derivation in the LIVE workflow text and require the first
+    # row to stop resolving the route's agent. Without these, every assertion above still passes
+    # against the workflow as it shipped.
+    _rf_agent_use = 'resolved_agent = route_agent or policy["agent"]'
+    _rf_agent_read = 'route_agent = route["agent"]'
+    for _line in (_rf_agent_use, _rf_agent_read):
+        assert _line in _rf_live, f"the fix-persona fixture is stale: {_line}"
+    _rf_agent_mutants = (
+        # (a) THE BUG AS IT SHIPPED: the route is re-derived for the chain, but the persona still
+        #     comes from `--role impl`.
+        _rf_live.replace(_rf_agent_use, 'resolved_agent = policy["agent"]'),
+        # (b) the route's agent is read and then overwritten with the role-resolved one — the same
+        #     end state reached one line earlier, which (a) alone would not catch.
+        _rf_live.replace(_rf_agent_read, 'route_agent = policy["agent"]'),
+    )
+    for _index, _mutant in enumerate(_rf_agent_mutants):
+        assert _mutant != _rf_live, f"fix-persona mutant {_index} is vacuous"
+        try:
+            _got = _workflow_route_constraint("fix", FIX_CHAIN["anthropic"],
+                                              route_chain=["opus5"],
+                                              route_agent="registry-reviewer",
+                                              source=_mutant)[2]
+        except AssertionError:            # the anchor is gone -> also a caught mutant
+            continue
+        assert _got != "registry-reviewer", (
+            "review-fix.yml's fix persona still came from the source issue's route after mutant "
+            f"{_index} — this pin is vacuous", _got)
+    print("  ok   adopt-loop L3b-agent: review-fix.yml's FIX persona is EXECUTED out of the "
+          "workflow and taken from the SOURCE ISSUE's own route (so a trust-surface fix keeps the "
+          "brief the worker implemented under); a route with no usable agent fails closed, review "
+          "mode keeps its --role review persona, and both ways of dropping the route agent are "
+          "caught")
 
     # L3c. [OPUS-5] THE SEVENTH SITE, and the one that is not in this repository at all: the
     # TARGET-side PLAN resolver. Every layer above pins two derivations that live in the registry.

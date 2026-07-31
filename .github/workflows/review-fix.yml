@@ -117,6 +117,9 @@ jobs:
       routing: ${{ steps.policy.outputs.routing }}
       model_chain: ${{ steps.policy.outputs.model_chain }}
       account_pool: ${{ steps.policy.outputs.account_pool }}
+      # [#285] The system-prompt persona for the model step. review = the `--role review` reviewer;
+      # fix = the SOURCE ISSUE's own live-re-derived route, so a trust-surface fix keeps the
+      # trust-aware brief the worker implemented under (see the resolution in the `policy` step).
       agent: ${{ steps.policy.outputs.agent }}
       gate_profile: ${{ steps.policy.outputs.gate_profile }}
       arm_auto_merge: ${{ steps.policy.outputs.arm_auto_merge }}
@@ -629,14 +632,40 @@ jobs:
           # PR. An empty result is never a fallback to the provider-wide chain: it empties `chain`,
           # which routes this run to the `unresolvable` job and a human.
           route_error = ""
+          route_agent = ""
           if mode == "fix":
               try:
-                  route_chain = list(policy_resolve.resolve(
-                      target_repo, list(issue_labels), policy_doc, routing)["model_chain"])
+                  route = policy_resolve.resolve(
+                      target_repo, list(issue_labels), policy_doc, routing)
+                  route_chain = list(route["model_chain"])
+                  route_agent = route["agent"]
+                  if not isinstance(route_agent, str) or not route_agent.strip():
+                      raise ValueError("the source issue's route names no agent")
               except (ValueError, TypeError, KeyError) as exc:
                   route_error = f"{exc.__class__.__name__}: {exc}"
                   route_chain = []
+                  route_agent = ""
               wanted = dispatch_claim._route_constrained_fix_chain(wanted, route_chain)
+          # ---- [#285] THE FIX PERSONA RIDES THE SAME ROUTE AS THE FIX CHAIN ----
+          # `policy["agent"]` above came from `--role impl`, i.e. routing.toml's `role = "impl"`
+          # row — the PLAIN implementer persona, resolved without reference to the PR's trust tier.
+          # #103 fixed the sibling half of this (the fix MODEL floor) and left the prompt behind, so
+          # a trust-surface fix ran the right model with the wrong brief: on THIS repo an
+          # `area:review-loop` issue is matched by the security override and worker.yml implemented
+          # it as `registry-reviewer`, but its fix leg re-entered as `registry-impl`. The fixer's
+          # system prompt is what carries the trust-plane obligations (fail-closed posture,
+          # non-vacuous self-tests, never-weaken-a-trust-check), so the leg that EDITS a
+          # trust-surface PR is exactly the one that must not lose them.
+          # The route is already re-derived LIVE, from the SOURCE ISSUE's own labels, one block up;
+          # take the persona from that same resolution so fix and implementation agree by
+          # construction. worker-live.sh resolves it to `.claude/agents/<agent>.md` in the target —
+          # the worker already ran under this agent to open the PR, so the prompt exists.
+          # NOT a fallback: `route_agent` is empty only when (a) mode is REVIEW, where the persona
+          # must stay the `--role review` reviewer (an implementor route would hand the read-only
+          # reviewer the implementer's brief), or (b) the fix-lane route refused, which has ALREADY
+          # emptied `chain` above — that run is parked to a human by the `unresolvable` job and no
+          # model ever consumes this value.
+          resolved_agent = route_agent or policy["agent"]
           models = routing.get("models", {})
           chain = []
           for alias in wanted:
@@ -689,7 +718,7 @@ jobs:
               "routing": policy["routing"],
               "model_chain": ",".join(chain),
               "account_pool": ",".join(policy["account_pool"]),
-              "agent": policy["agent"],
+              "agent": resolved_agent,
               "gate_profile": policy["gate_profile"],
               "arm_auto_merge": str(policy["arm_auto_merge"]).lower(),
               "max_review_rounds": str(policy["max_review_rounds"]),
@@ -709,6 +738,9 @@ jobs:
                     f"{','.join(route_chain) or 'NONE'}"
                     f"{f' (resolver refusal: {route_error})' if route_error else ''}")
           print(f"{mode} chain for {impl_provider}-implemented PR: {','.join(chain) or 'UNRESOLVABLE'}")
+          # [#285] Audit line: WHICH persona this lane resolved and WHERE it came from.
+          print(f"{mode} agent: {resolved_agent} "
+                f"({'source-issue route' if route_agent else 'role-resolved'})")
           PY
 
   claim:
