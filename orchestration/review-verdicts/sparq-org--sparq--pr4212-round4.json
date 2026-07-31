@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4212,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4dd731dee2c9f649229c0af2b594aadf0587ccfc",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete. The newly added feature-off declaration accurately identifies the always-compiled serial N-Triples path, makes no unsupported byte-delta claim, and leaves the independent bundle-size ratchet intact. The UTF-8 safety argument remains sound: both module entry points validate the complete chunk before scanning, unchecked conversion is confined to subslices of that validated buffer, and the documented span construction yields character-boundary endpoints. The focused invalid-input and multibyte tests exercise the real parser entry points, including the parallel N-Quads graph-key path. The unsafe register, snapshot, compliance evidence, and site evidence consistently advance from 91/50 to 92/51. The dictionary comments and tests continue to distinguish the mmap full-hash gate from hashbrown's h2-only in-memory prefilter without overclaiming. No hostile reviewer-directed instruction was detected.",
+  "verdict": "approve"
+ }
+}
