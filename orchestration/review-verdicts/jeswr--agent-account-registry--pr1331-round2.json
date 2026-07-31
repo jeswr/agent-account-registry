@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1331,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8a34ca9af75b30a3548d5fe0622a3e6006a147a7",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`migration_record` validates the PR number, an over-cap `from-gen`, an under-cap `to-gen`, and a same-comment park receipt whose generation equals `to-gen`. It never proves that this PR has a stale receipt at `from-gen` with the corrected receipt's cause/head, or that `to-gen == groom.age_park_generation(comments, bot_login)`. Once any such record exists, `verdict` takes the migration branch before the ordinary receipt, supported-generation, and cap-spent checks. The mutation-boundary `_decide` therefore does not actually re-derive the whole proof: a well-formed bot-authored record with invented from/to evidence, or one made stale by grant markers arriving before the DELETE, can select `converge` and remove `needs:user`. In the latter case the live grant count may already be over the cap while the inserted low-generation receipt makes `age_unpark_state` consider another automatic exit. The self-tests cover malformed records and a concurrent different migration record, but never mismatch the record against the PR's stale receipt or current grant count.",
+    "file": "scripts/reconcile-age-park-escalation.py",
+    "fix_hint": "Validate convergence against the complete fresh comment set: require an existing pre-migration age-park receipt matching the record's `from-gen`, cause, and head, and require the corrected receipt/record `to-gen` to equal the current `age_park_generation` and remain within the cap. Carry or derive enough fields to make those comparisons unambiguous. Add entry-point race tests where a grant marker arrives after POST, including enough grants to make the corrected generation cap-spent, plus tests for mismatched from-gen and cause/head; all must issue no DELETE.",
+    "severity": "major",
+    "title": "Convergence record is not bound to the stale receipt or live grant generation"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 fixes the stale-snapshot race: apply now re-reads labels, comments, and timeline after POST, rechecks ownership and park recency, and the entry-point tests demonstrate that a human or bot park event arriving in that window prevents DELETE. The bare-prefix authorization hole is narrowed substantially, but not fully closed. A parsed migration record is still accepted without proving that its from/to claim matches the PR's stale receipt and current grant-supported generation. Because the convergence branch bypasses those ordinary proof checks, a structurally valid bot comment can authorize removal on evidence that no longer (or never did) support the claimed correction.",
+  "verdict": "request_changes"
+ }
+}
