@@ -5,8 +5,8 @@ workers across my codebases. This repo is **public** so its GitHub Actions run o
 minutes. **Token VALUES never live in the repo** — each account's token is an encrypted GitHub
 **secret** (masked in logs, blocked from fork PRs); account **emails / PII are not published**
 (redacted from issues; the private handle→email map lives only in a maintainer secret + gist).
-Account handles, limits, live-usage probing, and the selection logic ARE public — they carry no
-secrets. Read-only to non-collaborators; only maintainer/bot-triggered workflows touch secrets.
+Account handles, limits, live-usage probing, and the selection logic ARE public — they carry no secrets — though **handles only as STATIC config** (`policy/repos.toml`,
+account-issue titles, `ACCTNN_TOKEN` secret names): every GENERATED surface names an account by its salted fingerprint instead (locked decision 22 — see § Security posture). Read-only to non-collaborators; only maintainer/bot-triggered workflows touch secrets.
 
 A worker (a GitHub Actions job in some codebase, e.g. `sparq-org/sparq`) asks this registry for an
 account to use; the registry applies per-account limits, a cross-codebase concurrency lock, model
@@ -791,9 +791,27 @@ the parsed document in memory and required to come back named.
     short-circuits and `if`/`while`/`case` constructs treated as unreachable — so a commented-out or
     short-circuited invocation is a refusal that names the fact. The text of a command is not its
     execution.
-- Account metadata + selection logic: only in this repo — which is **public**, so handles, limits and
-  the selection logic are published deliberately (they carry no secrets), token VALUES stay in GitHub
+- Account metadata + selection logic: only in this repo — which is **public**, so limits and the
+  selection logic are published deliberately (they carry no secrets), token VALUES stay in GitHub
   secrets, and account emails/PII are redacted from everything written here (locked decision 22).
+  Raw account **handles** are the deliberate exception in the *other* direction, and the split is
+  what matters: a handle is public only in the STATIC config a maintainer edits by hand —
+  `policy/repos.toml`'s `account_pool`, the account issue's TITLE, the `ACCTNN_TOKEN` secret NAMES —
+  and appears on **no generated surface at all**. Every record, log line, alert/issue body and
+  dashboard payload names an account by the salted fingerprint
+  `sha256(handle + ':' + PROVENANCE_SALT)[:16]` ONLY (locked decision 22a), and that is **enforced,
+  not merely documented**: `model-health.account_hash` refuses to derive without both handle and
+  salt and `make_record` fail-closed validates the assembled record so a raw `acctNN` can never be
+  written (#202); `dashboard-gen` validates the observability lease label against the fingerprint
+  shape and `_assert_private` backstops every known raw handle over the FINISHED public document;
+  `lease_schema.ACCOUNT` / `groom.SAFE_ACCOUNT_HASH` / `select-and-claim.ACCOUNT_FINGERPRINT_RE`
+  admit 16 hex characters in the ledger and nothing else; and `account-whoami.yml` /
+  `fingerprint-accounts.yml` salt every identity-bearing value before it can reach a public Actions
+  log, printing header COUNTS only when no salt is available (fail closed, never raw). This bullet
+  previously said *handles* were "published deliberately" without that split, which read as
+  licensing exactly what those paths fail closed on (#1091) — the #958 shape applied to the security
+  posture. **The code is the contract**: widening what a generated surface may carry is a locked
+  decision, reopened by a maintainer only, never by an agent making prose and code agree downward.
 - Script convention: retry via `scripts/gh_retry.py` for idempotent reads; **NEVER** wrap a CAS/ledger
   write or a mutation-confirmation in `gh_retry.run_gh` (their conflict/fail-loud semantics are
   caller-owned — a replayed mutation can double-dispatch a worker, #559/#558). A ledger CAS writer
