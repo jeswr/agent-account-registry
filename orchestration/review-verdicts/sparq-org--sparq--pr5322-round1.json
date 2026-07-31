@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5322,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a3654823a44db41b7dd17a0dc67a201672ceeb29",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly replaces calendar approximations with a fail-closed parser for the non-negative, whole-second day/time subset. Ordering, uniqueness, part placement, malformed input, and overflow are enforced with checked arithmetic, and the focused tests exercise accepted exact values plus nominal, malformed, negative, fractional, and overflowing rejection cases. The ontology, public API documentation, error text, and trust-graph skill consistently describe the narrowed policy semantics.",
+  "verdict": "approve"
+ }
+}
