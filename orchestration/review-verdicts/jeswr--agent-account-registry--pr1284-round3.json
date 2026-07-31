@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1284,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "25ee49b874da8e06e33d4f0ce2977e3c3e9fc64c",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 resolves the prior blocker. The fix lane now seals the model's exact commit before the hostile gate, uploads the bundle before target-controlled code runs, and moves the contents/workflows-capable push into a fresh publisher job. No token-bearing step follows the gate in the run job. The publisher binds the fetched object to the pre-gate SHA, dispatched parent (and recorded merge parent where applicable), bot identity, .beads policy, live head, and an atomic force-with-lease before pushing. Outcome recording and lease release wait for publication, while skipped or refused publication remains fail-closed as pushed=false. The tests exercise the real poisoning primitive, verify zero post-gate token steps non-vacuously, cover artifact substitution and malformed inputs, preserve the gate-visible worktree/index, and test the push lease end to end. No reviewer-directed instruction was detected in the diff.",
+  "verdict": "approve"
+ }
+}
