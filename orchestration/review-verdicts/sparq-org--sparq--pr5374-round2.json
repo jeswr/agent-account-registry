@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5374,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0b66951db45e765f5e3892cc03139755e6e139b3",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "resolve_pattern_scans still accepts a prover-chosen subset of constant-compatible scans and feeds that subset to FILTER and attribution binding. The new comments explicitly acknowledge that excluded compatible rows can violate the FILTER and that the declaration is only an interface contract, not a cryptographically established property. That is materially the same soundness gap as round 1: ordinary SPARQL evaluates each pattern over every compatible committed row, and the query text contains no source partition that authorizes the prover to redefine membership. The no-empty/no-dangling checks establish only total assignment of scans to labels, not that excluded scans cannot contribute to the claimed result. Consequently the verifier can accept a manifest while omitting real query-semantic FILTER/attribution obligations; shifting correct interpretation to the consumer does not prove the query result.",
+    "file": "crates/sparq-zk-compose/src/verifier.rs",
+    "fix_hint": "Do not use pattern_scans to narrow FILTER or attribution obligations until the mapping is bound to an independently verified query-result witness. Keep full constant-membership obligations for the flat verifier, or add cryptographic/structural binding of selected rows, all shared-variable joins, and claimed result bindings that proves excluded scans do not contribute. Add the round-1 cross-shaped negative witness `(17, age, 25)` / `(25, age, 17)` and require rejection when declarations hide the opposite failing slots.",
+    "severity": "blocker",
+    "title": "Prover declaration still suppresses query-semantic obligations"
+   },
+   {
+    "body": "The revised fixture fixes the earlier obvious mismatch by making both rows use `alice`, but the test itself states that join equality is not enforced and leaves join_edges empty. It calls only prefilter_manifest_structure and uses a witness-only filter input, so it does not exercise an end-to-end proof or bind a claimed solution row to the declared scan assignment. Agreement in fixture data is not a verified invariant: mutating one subject to disagree would still be accepted. Thus the test demonstrates that the relaxation works mechanically, but not that it is safe for a real BGP answer.",
+    "file": "crates/sparq-zk-compose/tests/e2e.rs",
+    "fix_hint": "Make the positive test exercise the real verification/result-binding path, including selected-row binding and enforced shared-variable join equality, and add a mutation that changes one join value or swaps an excluded scan and must be rejected. If the flat manifest cannot express and verify that result witness, retain membership-based fail-closed behavior rather than treating fixture agreement as evidence.",
+    "severity": "major",
+    "title": "Positive test still proves structural declaration acceptance, not query-result correctness"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 improves the test fixture: the selected rows now agree on the shared variable, and the documentation candidly states that the declaration is an unverified consumer-side reading contract. However, that candor does not repair the prior soundness defect. The verifier still lets a prover narrow ordinary SPARQL pattern membership through an unauthenticated declaration, and neither the declaration nor the selected result-row/join interpretation is cryptographically established. The same cross-shaped counterexample remains possible; describing the weakened acceptance statement does not make it proof of the query result. The prior major test-fixture defect is improved, but the blocker remains, so progress is improving rather than stagnant.",
+  "verdict": "request_changes"
+ }
+}
