@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5185,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e81a7260ae3fbc4f9de1a7e944d7edeec8cb679b",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`heading_grep_offences` applies `COUNT_GREP_RE.finditer(block)` to the raw job block. If the workflow's `OVERALL=$(grep -A2 ... inference-conformance-report.md | ...)` line is prefixed with `#`, the shell no longer executes it, but the regex still matches the unchanged substring exactly once and C1 passes. The same general weakness applies to any exact command shape preserved in non-executable YAML/shell text. Thus the claimed check that both load-bearing commands are present can still be vacuous, and the new deletion mutation does not exercise the comment-out case.",
+    "file": "scripts/check-inference-report-drift.py",
+    "fix_hint": "Restrict command matching to executable shell lines (at minimum reject matches whose command-containing line is shell-commented; ideally extract `run: |` script bodies and parse/normalize continuations sufficiently to identify active commands). Add mutations that comment out each load-bearing grep while preserving its full text, and require both mutations to make the self-test go red.",
+    "severity": "major",
+    "title": "C1 treats commented-out grep text as an executable command"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 adds independent regexes and mutations for deleting each grep, but the load-bearing C1 invariant is still not established. The regexes scan raw YAML block text and do not distinguish executable shell from comments. Commenting out the count-source assignment leaves the exact `grep -A2 ... inference-conformance-report.md` text present, so `COUNT_GREP_RE` still finds one match and the gate passes even though no count is extracted. The new mutation only deletes the text, so it misses this realistic disablement. This is materially the same false-negative class and severity as round 1.",
+  "verdict": "request_changes"
+ }
+}
