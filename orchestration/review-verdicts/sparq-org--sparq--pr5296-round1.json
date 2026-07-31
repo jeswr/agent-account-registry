@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5296,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c097c7b6956894b1e2b0cc214a3d4cd35a0d5845",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 8 says abs/neg \"can land without disturbing an audit snapshot,\" and the recommendation relies on that conclusion. But the document also says these APIs must be implemented in the external face repository and published through a tag bump. That changes the dependency source/tag and public trust-base surface, regardless of whether round_pack_normalized, unconstrained blocks, or currently instantiated compose circuits change. No cited audit-scope evidence establishes that such a source change remains inside the same snapshot. This is an honesty/soundness-sensitive scheduling claim while external sign-off sq-qhy4 is pending.",
+    "file": "research/noir-ieee754-dropped-api-evaluation.md",
+    "fix_hint": "Replace the categorical exception with a conditional audit-coordination requirement: abs/neg may be lower review risk because they do not modify round-and-pack, but they must land before or after the pinned audit snapshot unless the external auditor explicitly confirms that additive sign-lane APIs are within the accepted audit delta. Update the recommendation so it does not use snapshot safety as an established reason to greenlight now.",
+    "severity": "major",
+    "title": "Unsupported claim that adding abs/neg does not disturb an audit snapshot"
+   }
+  ],
+  "progress": null,
+  "summary": "The decision record is generally careful about its unverified premises and external-audit status, but it makes one audit-scheduling conclusion that is not supported by the stated evidence. Adding public operations to the externally audited dependency changes the audited source/tag even if existing arithmetic kernels and instantiated circuits are untouched. The record must not tell the maintainer that this can land without disturbing an audit snapshot unless the audit scope explicitly permits that change.",
+  "verdict": "request_changes"
+ }
+}
