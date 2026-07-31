@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1498,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "77cffefcdb92221fb84a08395ca65e326f353489",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4 says `lease_schema.packages_conflict` decides at all four enforcement sites, and section 9.3 requires an overrule to change that one predicate everywhere. That is false for the two open-PR admission legs: `filter_busy_area_items` and `revalidate_items_against_live_pulls` both call `partition_defer_attribution`, whose decision is an independent `busy`/`__global__`/membership predicate over an expanded union; neither calls `packages_conflict`. `package_conflicts_with_areas` exists in `lease_schema.py`, but these legs do not call that either. Consequently Reading A's stated code change affects ledger conflicts, not the two admission filters, while Reading B would require changing the independent busy-union logic. Since the record is intended to close the design question and bind a future implementation, this incorrect topology is a soundness gap, not a cosmetic citation error.",
+    "file": "research/1011-global-partition-bounded-concurrency.md",
+    "fix_hint": "Describe the actual decision topology and specify, for each reading, every predicate/call site that must move together. Either refactor the PLAN/CLAIM legs to consume a genuinely canonical conflict predicate before claiming one predicate governs all four sites, or explicitly require synchronized changes and end-to-end tests across `partition_defer_attribution`, `sibling_lease_conflict`, and `partition_available`. Update the new `packages_conflict` docstring's matching claim as well.",
+    "severity": "major",
+    "title": "The claimed single predicate does not govern PLAN and CLAIM"
+   }
+  ],
+  "progress": null,
+  "summary": "The recommendation may be defensible, but the design record's load-bearing implementation map is incorrect. It repeatedly says one conflict predicate governs all four enforcement sites and makes that premise binding on any overrule. In the current tree, the PLAN and CLAIM open-PR filters do not call `lease_schema.packages_conflict`; they defer through `partition_defer_attribution`, which independently tests the expanded busy union. This leaves the proposed readings and implementation obligations materially incomplete and could cause a future slot implementation to move only the ledger checks while the admission filters retain exclusive behavior.",
+  "verdict": "request_changes"
+ }
+}
