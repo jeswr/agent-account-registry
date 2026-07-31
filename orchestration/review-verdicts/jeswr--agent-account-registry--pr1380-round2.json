@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1380,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "365f2358e9f435427a923ade68ab5bab891210a1",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nApproved. The enabled repository row set is still derived from the fixed repository-owned policy path and policy failures refuse the build rather than silently narrowing the census. Seeded zero rows coexist with live evidence from unexpected repositories, and the renderer exposes explicit row totals while retaining the aggregate live-lease cross-check. The self-tests independently pin the policy path and expected live target, cover parser rejection and acceptance, exercise default production wiring and the activity guards directly, execute the real renderer for quiet, mixed, empty, and mismatched payloads, and assert the final render call site. No reviewer-directed instruction was found in the diff. Round 2 presents no material change from the already-approved round-1 evidence and no findings remain.",
+  "verdict": "approve"
+ }
+}
