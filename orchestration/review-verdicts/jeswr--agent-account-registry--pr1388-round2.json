@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1388,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5ea9b08972e4b98be27e1724ab114421aba6bd09",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 major finding is resolved. The revised text explicitly limits raw-handle publication to the catalog/enrollment path, names the generated enrollment surfaces that intentionally expose handles, and narrows the fingerprint invariant to the operational lease, health, dashboard, and identity-diagnostic surfaces. Those statements match the checked implementation: lease identities are full-matched as 16 lowercase hex; model-health requires handle plus salt and validates assembled/read records; dashboard observability rejects non-fingerprint labels and scans the finished document for catalog identities; and the diagnostic workflows hash identity-bearing values or withhold them when salt is absent. The prose also expressly disclaims the unsupported repo-wide no-generated-handle invariant identified in round 1. No correctness, soundness, test-validity, or security issue remains in this documentation-only diff.",
+  "verdict": "approve"
+ }
+}
