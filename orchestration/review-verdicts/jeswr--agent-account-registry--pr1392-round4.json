@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1392,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "400d3a8fcb245c4b6ec8783246610ce15d950f7b",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 closes the remaining round-3 fail-closed gap. The workflow now applies `agent_fix_refused` to the persona it actually publishes after route adoption or fallback: once a target has an `[agents]` table, only an explicit boolean `fix_capable = true` permits the final fix persona, while a target with no capability table retains the documented legacy fallback. The production predicate handles absent, malformed, false, blank, and non-string declarations conservatively. The workflow tests execute the live selection block, include red rows for every fallback shape requested in round 3 plus a declared-true fallback, preserve review mode, pin the output-to-worker seam exactly, and demonstrate non-vacuity with targeted mutants including the former permissive rule. The checked-in capability declarations also match every routed persona and the briefs the worker loads. No new correctness, security, or test-validity issue is supported by the diff.",
+  "verdict": "approve"
+ }
+}
