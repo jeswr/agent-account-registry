@@ -47,6 +47,11 @@
 #     from repo scope, at any ref)
 #   * a scan that derives NO secret-consuming job at all        -> refusal (it proves nothing:
 #     either the parser or the probe shape drifted)
+#   * a whole-context reader whose own NAME allowlist cannot be derived (absent, ambiguous, not a
+#     portable ERE) -> refusal. The environment these probes bind to is a TRUST BOUNDARY, not an
+#     account-token inventory: `dispatch-secrets` also holds REGISTRY_SECRETS_PAT and ALERT_TOKEN.
+#     A runbook that enumerated it unfiltered would be telling the maintainer to copy the
+#     registry's admin credentials into a second repository.
 #   * an output path that already exists                        -> refusal, the existing file is
 #     never overwritten, and the bundle is written ALL-OR-NOTHING
 #
@@ -105,6 +110,23 @@ DEFAULT_SINK_DEFAULT_BRANCH = "master"
 # guard: it stays FREE, the expression comes back reachable, and the bundle is refused.
 PRIVATE_GUARD_RE = re.compile(r"\Agithub\.event\.repository\.private==(?:true|['\"]true['\"])\Z")
 PRIVATE_GUARD_TEXT = "github.event.repository.private == true"
+
+# The whole-context probe's own account-token NAME allowlist, lifted out of its `jq ... test("...")`
+# filter. THREE separate properties, checked separately and on purpose: the scanner below finds
+# candidates and says nothing about their shape, and each rule that can refuse one has an input the
+# other two ACCEPT. Folding them together (an anchored-only scanner AND an anchored-only validator,
+# say) is the #945 shape — two copies of one rule leave each copy individually unkillable.
+_ALLOWLIST_PATTERN_RE = re.compile(r'test\(\s*"([^"\n]*)"\s*\)')
+# (1) ANCHORED. An unanchored filter is a substring test, and the runbook renders whatever it finds
+# straight into `grep -E`, where `ACCT[A-Z0-9]+_TOKEN` selects `XACCT01_TOKENX` too.
+_ALLOWLIST_ANCHORED_RE = re.compile(r"\A\^.*\$\Z", re.DOTALL)
+# (2) PORTABLE — it must mean the SAME THING in POSIX ERE as it does in the probe. jq's regex engine
+# is Oniguruma; `grep -E` is POSIX ERE, and the two diverge precisely at the BACKSLASH (`\d`, `\w`,
+# `\b` are Oniguruma shorthands ERE has no notion of). A pattern carrying one would silently select
+# a different set of names in the runbook than the probe fingerprints, so the accepted alphabet
+# excludes backslash outright and anything unrecognised is REFUSED, never translated.
+_ALLOWLIST_PORTABLE_RE = re.compile(r"\A[A-Za-z0-9_\[\]|()*+.?{},^$-]*\Z")
+# (3) A VALID REGEX AT ALL — `re.compile`, below.
 
 
 class SinkRefusal(Exception):
@@ -208,7 +230,79 @@ def bundle_verdict(parsed):
 # here), and the environments the bindings name. A namedtuple rather than a class: equality and
 # repr come from the stdlib, so there is no hand-written comparison for an assertion to be
 # tautologically compared against.
-Requirements = collections.namedtuple("Requirements", "secrets context_readers environments")
+Requirements = collections.namedtuple("Requirements",
+                                      "secrets context_readers environments allowlist")
+
+
+def context_allowlist(sources, context_readers):
+    """The account-token NAME allowlist the whole-context probe filters `toJSON(secrets)` with,
+    DERIVED from that probe's own text (#958 — one definition, never a restatement here).
+
+    This is a trust boundary, not a convenience. `toJSON(secrets)` covers the WHOLE environment,
+    and `dispatch-secrets` is not an account-token inventory — it also holds REGISTRY_SECRETS_PAT
+    and ALERT_TOKEN, which is exactly why the probe filters at all. The runbook has to name the
+    same set the probe fingerprints; an unfiltered enumeration would read as "copy each of these
+    into the sink", which is the registry's admin credentials landing in a second repository.
+
+    Fail-closed five ways, because every one of them ends in the runbook printing a name the
+    maintainer would then copy. Each has an input the other four accept, so none can hide behind
+    another (#945):
+      * NO name filter in the reader's text — either the probe stopped filtering (it now
+        fingerprints every secret in the environment) or the filter moved somewhere this cannot
+        see. Neither is a set this script may guess.
+      * MORE THAN ONE distinct filter across the readers — the readers disagree about their own
+        coverage, so there is no single set to print.
+      * an UNANCHORED filter — see `_ALLOWLIST_ANCHORED_RE`.
+      * a pattern outside the portable-ERE alphabet — see `_ALLOWLIST_PORTABLE_RE`.
+      * a pattern that is not a valid regex at all.
+    """
+    found = set()
+    for filename, _job, _read in context_readers:
+        found.update(_ALLOWLIST_PATTERN_RE.findall(sources.get(filename, "")))
+    readers = ", ".join(sorted({filename for filename, _job, _read in context_readers}))
+    if not found:
+        raise SinkRefusal(
+            f"{readers}: reads the WHOLE secrets context but no name allowlist (`test(\"...\")`) "
+            "can be derived from it — the runbook cannot say which secrets belong in the sink "
+            "without restating a filter that would then drift, and an unfiltered enumeration "
+            "would name every credential in the environment (fail closed)")
+    if len(found) > 1:
+        raise SinkRefusal(
+            f"{readers}: the whole-context readers carry DIFFERENT name allowlists ("
+            + ", ".join(sorted(found)) + ") — they disagree about their own coverage, so there is "
+            "no single set of names the runbook may print (fail closed)")
+    pattern = found.pop()
+    if not _ALLOWLIST_ANCHORED_RE.match(pattern):
+        raise SinkRefusal(
+            f"{readers}: the derived allowlist `{pattern}` is UNANCHORED — rendered into the "
+            "runbook's `grep -E` it would select every name that merely CONTAINS an account-token "
+            "name, so the enumeration would be wider than the probe's own coverage (fail closed)")
+    if not _ALLOWLIST_PORTABLE_RE.match(pattern):
+        raise SinkRefusal(
+            f"{readers}: the derived allowlist `{pattern}` is outside the POSIX-ERE alphabet this "
+            "runbook can hand to `grep -E` unchanged — in jq's Oniguruma it may select a set the "
+            "shell command would not. Refusing to translate it (fail closed)")
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        raise SinkRefusal(f"{readers}: the derived allowlist `{pattern}` is not a valid regular "
+                          f"expression ({exc}) — refusing to render it into a command")
+    return pattern
+
+
+def sink_expected_name_pattern(requirements):
+    """The POSIX ERE that EVERY secret name in the sink's environment must match: the probe's own
+    account-token allowlist, plus each separately derived NAMED requirement (PROVENANCE_SALT and
+    friends) the allowlist does not already cover.
+
+    It exists so the runbook's read-back can REJECT a name rather than merely print it. A read-back
+    a human eyeballs is not a check; this one is the difference between "the sink holds the fleet"
+    and "the sink holds the fleet plus whatever else got pasted in"."""
+    alternatives = [requirements.allowlist] if requirements.allowlist else []
+    alternatives += ["^" + re.escape(name) + "$" for name in requirements.secrets
+                     if not (requirements.allowlist
+                             and re.search(requirements.allowlist, name))]
+    return "|".join(alternatives)
 
 
 def sink_requirements(sources):
@@ -253,8 +347,12 @@ def sink_requirements(sources):
                 secrets.add(read.split(".", 1)[1])
             else:
                 context_readers.add((filename, job_name, read))
-    return Requirements(tuple(sorted(secrets)), tuple(sorted(context_readers)),
-                        tuple(sorted(environments)))
+    readers = tuple(sorted(context_readers))
+    # No whole-context reader means no unenumerable coverage, so there is nothing to filter and
+    # nothing to derive — `None`, not an empty pattern that would render as `grep -E ''` and match
+    # every line. Derived ONLY when a reader exists, and a refusal when one exists without it.
+    return Requirements(tuple(sorted(secrets)), readers, tuple(sorted(environments)),
+                        context_allowlist(sources, readers) if readers else None)
 
 
 # ---- the bundle ----------------------------------------------------------------------------------
@@ -266,10 +364,15 @@ def sink_readme(sources, requirements, sink_repo):
     probes = "\n".join(f"- `{WORKFLOW_DIR}/{name}`" for name in sorted(sources))
     secrets = "\n".join(f"- `{name}`" for name in requirements.secrets)
     # Stated separately because it CANNOT be enumerated: a job that reads the whole secrets context
-    # covers whatever the environment happens to hold, filtered by the probe's own allowlist.
+    # covers whatever the environment happens to hold, filtered by the probe's own allowlist. The
+    # allowlist is named because it is the boundary — "add each one" without it reads as an
+    # instruction to copy every credential the source environment happens to hold.
     contextual = "\n".join(
-        f"- `{filename}` job `{job}` reads `{read}`, so its coverage is exactly the account\n"
-        "  tokens this environment holds — add each one you want fingerprinted."
+        f"- `{filename}` job `{job}` reads `{read}` and filters it by NAME with\n"
+        f"  `{requirements.allowlist}`, so its coverage is exactly the secrets in this\n"
+        "  environment whose name matches that pattern. Add the account tokens you want\n"
+        "  fingerprinted and NOTHING else — this environment is a trust boundary, not an\n"
+        "  account-token inventory."
         for filename, job, read in requirements.context_readers)
     environments = "\n".join(f"- `{name}`" for name in requirements.environments)
     return f"""# account diagnostics (private sink)
@@ -369,13 +472,21 @@ def runbook(requirements, sink_repo, sink_default_branch, outdir="<dir>"):
     `research/271-coordinated-secret-migration-runbook.md` §S3 makes the same argument for the
     registry's own migration; this is the same ordering for the same reason."""
     steps = [
-        Step("0. The sink must be PRIVATE — read it back, do not assume it",
+        Step("0. The sink must exist and be PRIVATE — create only if absent, then PROVE it",
              "Every probe here is guarded on the repository being private, so a public sink is "
              "not a leak — it is a permanent no-op that looks like a working probe. Confirm "
              "before spending the rest of this runbook. If the repo does not exist yet, create "
-             "it private; never create it public and flip it afterwards.",
-             [f"gh repo view {sink_repo} --json visibility --jq .visibility",
-              f"gh repo create {sink_repo} --private"]),
+             "it private; never create it public and flip it afterwards.\n\n"
+             "Both lines are RUNNABLE AS WRITTEN in either state, which an unconditional "
+             "`view` then `create` pair is not: for a sink that already exists the create fails, "
+             "and for one that does not the view fails first. The first line therefore creates "
+             "ONLY when the view says the repo is absent. The second is an ASSERTION, not a "
+             "display: `gh api repos/<sink> --jq .private` prints `true` or `false`, and `test` "
+             "exits NONZERO on `false` — the same literal `\"private\": true` that "
+             "`model-health._repo_confirmed_private` requires before it will route detail to this "
+             "repo (#432). Do not go on to step 1 until it exits 0.",
+             [f"gh repo view {sink_repo} >/dev/null 2>&1 || gh repo create {sink_repo} --private",
+              f'test "$(gh api repos/{sink_repo} --jq .private)" = true']),
     ]
     for environment in requirements.environments:
         steps.append(Step(
@@ -398,11 +509,12 @@ def runbook(requirements, sink_repo, sink_default_branch, outdir="<dir>"):
             [f"gh secret set {name} -R {sink_repo} --env {environment}"
              for name in requirements.secrets]))
     if requirements.context_readers:
+        expected = sink_expected_name_pattern(requirements)
         steps.append(Step(
             "3. The account tokens the fleet fingerprint covers — enumerate them, then read back",
-            "One probe reads the WHOLE secrets context and filters it with its own allowlist, so "
-            "its coverage is exactly the account tokens present in the environment above — it "
-            "cannot be listed here without restating that allowlist.\n"
+            "One probe reads the WHOLE secrets context and filters it by NAME with its own "
+            f"allowlist `{requirements.allowlist}`, so its coverage is exactly the secrets in the "
+            "environment above whose name matches that pattern.\n"
             + "\n".join(f"  - {filename} job `{job}` reads `{read}`"
                         for filename, job, read in requirements.context_readers)
             + "\n\nNo `gh secret set` line is printed for these, deliberately. This repo's prose "
@@ -414,11 +526,24 @@ def runbook(requirements, sink_repo, sink_default_branch, outdir="<dir>"):
             "step-2 command under ITS OWN name, then read the sink environment back (second "
             "command). Every account you meant to cover must appear in that read-back — it is the "
             "only thing that distinguishes a provisioned fleet from an empty one, and step 5 "
-            "cannot tell them apart.",
+            "cannot tell them apart.\n\n"
+            "THE ENUMERATION IS FILTERED, AND THAT FILTER IS THE POINT. The registry environment "
+            "it reads is a TRUST BOUNDARY, not an account-token inventory — it also holds the "
+            "registry's admin PAT and alert token, which the probe never touches and the sink "
+            "must never hold. The first command therefore prints only the names the probe itself "
+            "would fingerprint; copy those, plus the named secrets of step 2, and nothing else. "
+            "The third command is the ENFORCEMENT of that: it exits NONZERO if the sink's "
+            "environment holds ANY name outside "
+            f"`{expected}`. A read-back that only prints names cannot catch a credential that was "
+            "pasted in by mistake; this one refuses.",
             [f"gh api repos/{REGISTRY_REPO}/environments/{environment}/secrets "
-             "--jq '.secrets[].name'" for environment in requirements.environments]
+             f"--jq '.secrets[].name' | grep -E '{requirements.allowlist}'"
+             for environment in requirements.environments]
             + [f"gh api repos/{sink_repo}/environments/{environment}/secrets "
-               "--jq '.secrets[].name'" for environment in requirements.environments]))
+               "--jq '.secrets[].name' | sort" for environment in requirements.environments]
+            + [f"! gh api repos/{sink_repo}/environments/{environment}/secrets "
+               f"--jq '.secrets[].name' | grep -vE '{expected}'"
+               for environment in requirements.environments]))
     steps.append(Step(
         "4. The workflows themselves",
         "Emitted byte-for-byte from the registry, guard included. Commit them to the sink's "
@@ -518,8 +643,11 @@ def _self_test():
     _test_guard_covers_every_job(chk)
     _test_bundle_set(chk)
     _test_requirements_are_derived(chk)
+    _test_allowlist_is_derived(chk)
     _test_bundle_is_verbatim(chk)
     _test_runbook_is_derived(chk)
+    _test_step0_runs_in_every_repo_state(chk)
+    _test_fleet_step_never_copies_unrelated_credentials(chk)
     _test_write_is_all_or_nothing(chk)
     _test_cli(chk)
     _test_live_tree(chk)
@@ -648,7 +776,8 @@ def _test_bundle_set(chk):
             bundle_verdict(dict(both, **{name: {"probe": _job(None)}}))[0], False)
 
 
-def _fixture_probe(condition_line, secret_line, environment_line="    environment: sink-env"):
+def _fixture_probe(condition_line, secret_line, environment_line="    environment: sink-env",
+                   filter_line=""):
     lines = ["name: probe", "on:", "  workflow_dispatch: {}", "permissions: {}", "jobs:",
              "  probe:", "    runs-on: ubuntu-latest"]
     if condition_line:
@@ -658,18 +787,39 @@ def _fixture_probe(condition_line, secret_line, environment_line="    environmen
     lines += ["    steps:", "      - name: probe", "        env:"]
     if secret_line:
         lines.append(secret_line)
-    lines += ["        run: echo probe", ""]
+    lines += ["        run: |", "          echo probe"]
+    if filter_line:
+        lines.append("          " + filter_line)
+    lines.append("")
     return "\n".join(lines)
 
 
 FIXTURE_GUARD_LINE = "    if: ${{ " + PRIVATE_GUARD_TEXT + " }}"
 FIXTURE_SECRET_LINE = "          TOK: ${{ secrets.SINK_FIXTURE_TOKEN }}"
+FIXTURE_CONTEXT_LINE = "          ALL: ${{ toJSON(secrets) }}"
+# The fixture's OWN allowlist, in the fixture's OWN namespace. Spelled here and embedded in the
+# fixture text below; the code under test never reads this constant, it reads the text — so this is
+# an independent input, not the tautology of question (c). `SINKACCT` collides with nothing in this
+# repo, so a hardcoded `^ACCT...` in the code cannot produce this answer.
+FIXTURE_ALLOWLIST = "^SINKACCT[0-9]+_TOKEN$"
+
+
+def _fixture_filter_line(allowlist=FIXTURE_ALLOWLIST):
+    return "jq -r 'keys[] | select(test(\"" + allowlist + "\"))' \"$SECRETS_FILE\""
 
 
 def _fixture_sources(condition_line=FIXTURE_GUARD_LINE, secret_line=FIXTURE_SECRET_LINE,
-                     environment_line="    environment: sink-env"):
-    return {name: _fixture_probe(condition_line, secret_line, environment_line)
+                     environment_line="    environment: sink-env", filter_line=""):
+    return {name: _fixture_probe(condition_line, secret_line, environment_line, filter_line)
             for name in PROBE_WORKFLOWS}
+
+
+def _fixture_contextual(filter_line=None):
+    """The fixture shape that exercises the whole-context path: a probe reading `toJSON(secrets)`
+    and (by default) carrying its own anchored allowlist."""
+    return _fixture_sources(
+        secret_line=FIXTURE_CONTEXT_LINE,
+        filter_line=_fixture_filter_line() if filter_line is None else filter_line)
 
 
 def _test_requirements_are_derived(chk):
@@ -678,9 +828,9 @@ def _test_requirements_are_derived(chk):
     chk("requirements: the whole requirement is DERIVED from the probe text — a secret name and "
         "an environment that appear nowhere else in this repo",
         sink_requirements(_fixture_sources()),
-        Requirements(("SINK_FIXTURE_TOKEN",), (), ("sink-env",)))
+        Requirements(("SINK_FIXTURE_TOKEN",), (), ("sink-env",), None))
 
-    contextual = _fixture_sources(secret_line="          ALL: ${{ toJSON(secrets) }}")
+    contextual = _fixture_contextual()
     chk("requirements: a toJSON(secrets) job is recorded as a context reader, not as a secret",
         (sink_requirements(contextual).secrets,
          [read for _f, _j, read in sink_requirements(contextual).context_readers]),
@@ -721,6 +871,76 @@ def _test_requirements_are_derived(chk):
         in (refusal({name: "name: broken\n" for name in PROBE_WORKFLOWS}) or ""), True)
 
 
+def _test_allowlist_is_derived(chk):
+    """The account-token allowlist is read OUT OF the probe, and a probe that cannot supply one is
+    a refusal — never an unfiltered enumeration of a trust boundary."""
+    def refusal(sources):
+        # Folded, per #945: a mutant that drops a branch and lets the next line raise must be a red
+        # ROW, not an aborted suite with a shortened check count.
+        try:
+            return None, sink_requirements(sources)
+        except Exception as exc:                                   # noqa: BLE001 - see comment
+            return f"{type(exc).__name__}: {exc}", None
+
+    # ACCEPT direction, and the control for question (d): the well-formed contextual fixture
+    # derives the fixture's OWN pattern and raises nothing.
+    reason, derived = refusal(_fixture_contextual())
+    chk("allowlist: DERIVED verbatim from the whole-context probe's own `test(\"^...$\")` filter",
+        (reason, derived.allowlist if derived else None), (None, FIXTURE_ALLOWLIST))
+    # And it is derived ONLY where there is something unenumerable to filter: a probe reading a
+    # NAMED secret needs no allowlist, and `None` here is what keeps `grep -E ''` (which matches
+    # every line) out of the runbook.
+    named_reason, named = refusal(_fixture_sources(filter_line=_fixture_filter_line()))
+    chk("allowlist: a probe with no whole-context read carries NO allowlist, and that is not a "
+        "refusal", (named_reason, named.allowlist if named else "no requirements"), (None, None))
+
+    # REJECT direction, one input per branch so no branch is masked by another (#945).
+    missing = refusal(_fixture_contextual(filter_line=""))[0]
+    chk("allowlist: a whole-context reader with NO name filter at all is REFUSED — an unfiltered "
+        "enumeration would name every credential in the environment",
+        (missing is not None, "no name allowlist" in (missing or ""),
+         PROBE_WORKFLOWS[0] in (missing or "")), (True, True, True))
+    # Anchoring, portability and validity are three DIFFERENT rules with three different fixes, and
+    # each input below is ACCEPTED by the other two rules — so removing any one rule alone shows up
+    # as a red row rather than being masked by its neighbour (#945's mutually-masking shape).
+    unanchored = refusal(_fixture_contextual(
+        filter_line=_fixture_filter_line("SINKACCT[0-9]+_TOKEN")))[0]
+    chk("allowlist: an UNANCHORED filter is REFUSED — in `grep -E` it would also select every "
+        "name that merely contains an account-token name",
+        (unanchored is not None, "UNANCHORED" in (unanchored or "")), (True, True))
+
+    # The two probes disagree: one filters on the fixture allowlist, the other on a different one.
+    split = _fixture_contextual()
+    split[PROBE_WORKFLOWS[1]] = _fixture_probe(
+        FIXTURE_GUARD_LINE, FIXTURE_CONTEXT_LINE,
+        filter_line=_fixture_filter_line("^SINKOTHER[0-9]+_TOKEN$"))
+    disagree = refusal(split)[0]
+    chk("allowlist: readers carrying DIFFERENT allowlists are REFUSED, not silently unioned or "
+        "first-wins", (disagree is not None, "DIFFERENT name allowlists" in (disagree or "")),
+        (True, True))
+
+    backslash = refusal(_fixture_contextual(
+        filter_line=_fixture_filter_line(r"^SINKACCT\d+_TOKEN$")))[0]
+    chk("allowlist: an Oniguruma-only escape (`\\d`) is REFUSED rather than handed to `grep -E`, "
+        "where it would select a different set of names",
+        (backslash is not None, "POSIX-ERE" in (backslash or "")), (True, True))
+    invalid = refusal(_fixture_contextual(
+        filter_line=_fixture_filter_line("^SINKACCT[0-9+_TOKEN$")))[0]
+    chk("allowlist: a pattern that is not a valid regex at all is REFUSED as INVALID, a different "
+        "diagnosis from the portability one",
+        (invalid is not None, "not a valid regular expression" in (invalid or "")), (True, True))
+
+    # The expected-name pattern the read-back enforces: the allowlist, PLUS every named secret the
+    # allowlist does not already cover, and NOTHING else. Built from a Requirements whose names
+    # appear nowhere else, so a hardcoded answer cannot produce it.
+    chk("allowlist: the sink's expected-name pattern is the allowlist plus each named requirement "
+        "the allowlist does not already cover — and the covered one is not restated",
+        sink_expected_name_pattern(Requirements(
+            ("SINKACCT07_TOKEN", "SINK_ODD_SALT"), (("f.yml", "j", "toJSON(secrets)"),),
+            ("sink-odd-env",), FIXTURE_ALLOWLIST)),
+        FIXTURE_ALLOWLIST + "|^SINK_ODD_SALT$")
+
+
 def _test_bundle_is_verbatim(chk):
     """Byte-for-byte. The guard was verified for the text that was verified."""
     sources = _fixture_sources()
@@ -739,12 +959,28 @@ def _test_bundle_is_verbatim(chk):
            "SINK_FIXTURE_TOKEN" in readme, "sink-env" in readme, "owner/sink" in readme],
         [True, True, True, True, True, True, True])
 
+    # The whole-context bullet is the one the sink's maintainer acts on, and it is the one that
+    # used to say "add each one you want fingerprinted" with no boundary stated at all.
+    ctx_sources = _fixture_contextual()
+    ctx_readme = bundle(ctx_sources, sink_requirements(ctx_sources),
+                        "owner/sink")[SINK_README_NAME]
+    chk("bundle: the sink README states the whole-context probe's NAME allowlist AND that the "
+        "environment is a boundary — without both, 'add each one' reads as an instruction to copy "
+        "every credential the source environment happens to hold",
+        (FIXTURE_ALLOWLIST in ctx_readme, "trust boundary" in ctx_readme), (True, True))
+
+
+# The requirements that exercise the whole-context (fleet) path. Every name in it appears nowhere
+# else in this repo, so no hardcoded answer in the code can reproduce the runbook it renders.
+CTX_REQUIREMENTS = Requirements(("SINK_ODD_SECRET",), (("f.yml", "j", "toJSON(secrets)"),),
+                                ("sink-odd-env",), FIXTURE_ALLOWLIST)
+
 
 def _test_runbook_is_derived(chk):
     """The runbook is a function of the requirements. Feeding it names that appear nowhere else
     proves it, and tokenised flag membership is what makes `--private` an assertion rather than a
     substring that `--privately` would also satisfy."""
-    requirements = Requirements(("SINK_ODD_SECRET",), (), ("sink-odd-env",))
+    requirements = Requirements(("SINK_ODD_SECRET",), (), ("sink-odd-env",), None)
     steps = runbook(requirements, "owner/sink", "trunk")
     commands = [command for step in steps for command in step.commands]
     tokens = [token for step in steps for command in step.tokens() for token in command]
@@ -771,8 +1007,7 @@ def _test_runbook_is_derived(chk):
     chk("runbook: the deployment-branch policy is set BEFORE the first secret value is written "
         "(between them the environment admits every branch)", policy < first_secret, True)
 
-    contextual = Requirements(("SINK_ODD_SECRET",), (("f.yml", "j", "toJSON(secrets)"),),
-                              ("sink-odd-env",))
+    contextual = CTX_REQUIREMENTS
     ctx_steps = runbook(contextual, "owner/sink", "trunk")
     titles = [step.title for step in ctx_steps]
     chk("runbook: a whole-context reader adds the account-token step; no reader, no step",
@@ -802,6 +1037,179 @@ def _test_runbook_is_derived(chk):
         all(step.tokens() is not None for step in steps), True)
     chk("runbook: the rendered text carries every command verbatim",
         all(command in render_runbook(steps) for command in commands), True)
+
+
+# ---- the runbook, EXECUTED ------------------------------------------------------------------
+# The rows above prove the commands are DERIVED. These prove they RUN — and that they run to the
+# right answer in each state the sink can be in. Nothing here reaches the network: `gh` is a stub
+# on PATH whose whole job is to be the seam. `--jq '.secrets[].name'` is what the real CLI applies
+# server-side, so the stub prints one name per line and the assertion under test is the part this
+# script actually authors: the FILTER and the read-back's exit code.
+#
+# The filter lives in `grep -E`, not inside `--jq`, precisely so it is this testable offline. A
+# filter buried in the jq program would be executed by a binary this container cannot stand in for,
+# and the reviewer's blocker would have been re-checkable only by eye.
+GH_STUB = r"""#!/bin/sh
+# `gh` stand-in. State lives in $STUB_DIR, so a create in one command is visible to the read-back
+# in the next: the runbook's step-0 lines are only correct TOGETHER.
+printf '%s\n' "$*" >> "$STUB_DIR/calls"
+case "$1 $2" in
+  "repo view")
+    [ -f "$STUB_DIR/private" ] || exit 1
+    ;;
+  "repo create")
+    if [ -f "$STUB_DIR/private" ]; then
+      echo "gh: repository already exists" >&2
+      exit 1
+    fi
+    case "$*" in
+      *--private*) echo true > "$STUB_DIR/private" ;;
+      *) echo false > "$STUB_DIR/private" ;;
+    esac
+    ;;
+  "api repos"*)
+    [ -f "$STUB_DIR/names" ] && { cat "$STUB_DIR/names"; exit 0; }
+    [ -f "$STUB_DIR/private" ] || exit 1
+    cat "$STUB_DIR/private"
+    ;;
+esac
+exit 0
+"""
+
+
+def _stubbed_shell(chk_dir, commands, state):
+    """Run `commands` under bash with the `gh` stub on PATH. Returns (returncode, stdout, calls).
+
+    The child environment is built from scratch — PATH and STUB_DIR only — so the result cannot
+    depend on anything this process inherited."""
+    import shutil
+    import subprocess
+    stub_bin = os.path.join(chk_dir, "bin")
+    stub_state = os.path.join(chk_dir, "state")
+    os.makedirs(stub_bin, exist_ok=True)
+    os.makedirs(stub_state, exist_ok=True)
+    gh_path = os.path.join(stub_bin, "gh")
+    with open(gh_path, "w", encoding="utf-8") as handle:
+        handle.write(GH_STUB)
+    os.chmod(gh_path, 0o755)
+    for name, content in state.items():
+        with open(os.path.join(stub_state, name), "w", encoding="utf-8") as handle:
+            handle.write(content)
+    bash = shutil.which("bash")
+    if bash is None or any(command is None for command in commands):   # pragma: no cover
+        # Never silently pass: an unrunnable harness must land as a red ROW.
+        return "no-harness", "", []
+    proc = subprocess.run(  # noqa: S603 - fixed argv, hermetic env, stub-only PATH
+        [bash, "-c", "\n".join(commands)], capture_output=True, text=True,
+        env={"PATH": stub_bin + os.pathsep + "/usr/bin" + os.pathsep + "/bin",
+             "STUB_DIR": stub_state})
+    calls_path = os.path.join(stub_state, "calls")
+    calls = []
+    if os.path.isfile(calls_path):
+        with open(calls_path, encoding="utf-8") as handle:
+            calls = handle.read().splitlines()
+    return proc.returncode, proc.stdout, calls
+
+
+def _only(commands, predicate):
+    """The single command matching `predicate`, or None when the step's shape has drifted. None
+    rather than an exception so a drifted shape reds a row instead of aborting the suite (#945)."""
+    matches = [command for command in commands if predicate(command)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _test_step0_runs_in_every_repo_state(chk):
+    """Step 0, EXECUTED, in each of the three states the sink can be in. The previous shape (an
+    unconditional `gh repo view` followed by an unconditional `gh repo create`) fails one command
+    in EVERY state, and its `--jq .visibility` only PRINTED — a PUBLIC sink read back clean.
+
+    Non-vacuity, by construction: deleting the read-back leaves state (c) green; making the create
+    unconditional leaves state (b) green; flipping the expected literal reds (a) and (b)."""
+    import tempfile
+    step0 = runbook(CTX_REQUIREMENTS, "owner/sink", "trunk")[0]
+    commands = list(step0.commands)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        code, _out, calls = _stubbed_shell(os.path.join(tmp, "absent"), commands, {})
+        chk("step 0: an ABSENT sink is CREATED (private) and then passes the read-back — the "
+            "runbook is runnable as written, not only for a repo that already exists",
+            (code, any(call.startswith("repo create") for call in calls)), (0, True))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        code, _out, calls = _stubbed_shell(os.path.join(tmp, "private"), commands,
+                                           {"private": "true\n"})
+        chk("step 0: an EXISTING private sink passes WITHOUT a create being attempted — the create "
+            "is conditional, so the documented already-exists state does not fail a command",
+            (code, [call for call in calls if call.startswith("repo create")]), (0, []))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        code, out, _calls = _stubbed_shell(os.path.join(tmp, "public"), commands,
+                                           {"private": "false\n"})
+        chk("step 0: an EXISTING PUBLIC sink FAILS — the visibility read-back is an assertion that "
+            "exits nonzero, not a value printed for a human to notice",
+            (code != 0, code != "no-harness", out.strip()), (True, True, ""))
+
+
+# The registry environment as it really is: account tokens the probe fingerprints, ALONGSIDE the
+# unrelated trust credentials `dispatch-secrets` also holds (the registry's admin PAT and its alert
+# token, here under fixture names that appear nowhere else). Plus the two near-misses an UNANCHORED
+# filter would wrongly select. If any of these reaches the sink, the runbook has told a maintainer
+# to copy a credential the probes never touch into a second repository.
+FLEET_FIXTURE_NAMES = "\n".join([
+    "SINKACCT01_TOKEN",
+    "SINKACCT02_TOKEN",
+    "SINK_ODD_ADMIN_PAT",
+    "SINK_ODD_ALERT_TOKEN",
+    "SINK_ODD_SECRET",
+    "XSINKACCT01_TOKEN",
+    "SINKACCT01_TOKENX",
+]) + "\n"
+
+
+def _test_fleet_step_never_copies_unrelated_credentials(chk):
+    """The blocker this step exists to close: the enumeration must name ONLY what the probe
+    fingerprints, and the sink read-back must REJECT anything else rather than print it."""
+    import tempfile
+    fleet = next(step for step in runbook(CTX_REQUIREMENTS, "owner/sink", "trunk")
+                 if "fleet fingerprint" in step.title)
+    enumerate_cmd = _only(fleet.commands, lambda c: REGISTRY_REPO in c)
+    assert_cmd = _only(fleet.commands, lambda c: "-vE" in shlex.split(c))
+    # Named as its own row, because `_stubbed_shell` reports a missing command as the sentinel
+    # "no-harness", which is != 0 — a step that rendered NO assertion at all would otherwise leave
+    # every REJECT row below green. The rejection rows re-check the sentinel for the same reason.
+    chk("fleet: the step renders exactly ONE filtered registry enumeration and exactly ONE "
+        "rejecting sink read-back", (enumerate_cmd is not None, assert_cmd is not None),
+        (True, True))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        code, out, _calls = _stubbed_shell(os.path.join(tmp, "enum"), [enumerate_cmd],
+                                           {"names": FLEET_FIXTURE_NAMES})
+        chk("fleet: the registry enumeration names ONLY the account tokens the probe's own "
+            "allowlist selects — the unrelated admin PAT and alert token in the same environment "
+            "are never requested, and neither near-miss is selected",
+            (code, out.split()), (0, ["SINKACCT01_TOKEN", "SINKACCT02_TOKEN"]))
+
+    # The read-back ACCEPTS a correctly provisioned sink: allowlisted account tokens plus the
+    # separately derived named requirement. Without this row an assertion that always failed would
+    # leave the rejection row below green (question (d)).
+    with tempfile.TemporaryDirectory() as tmp:
+        code, out, _calls = _stubbed_shell(
+            os.path.join(tmp, "clean"), [assert_cmd],
+            {"names": "SINKACCT01_TOKEN\nSINKACCT02_TOKEN\nSINK_ODD_SECRET\n"})
+        chk("fleet: the sink read-back ACCEPTS account tokens plus the derived named requirement "
+            "(PROVENANCE_SALT's fixture stand-in) — it is a decision, not a blanket refusal",
+            (code, out.strip()), (0, ""))
+
+    for label, extra in (("the registry's admin PAT", "SINK_ODD_ADMIN_PAT"),
+                         ("an unrelated token-shaped trust credential", "SINK_ODD_ALERT_TOKEN"),
+                         ("a name the anchors exclude", "XSINKACCT01_TOKEN")):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _out, _calls = _stubbed_shell(
+                os.path.join(tmp, "dirty"), [assert_cmd],
+                {"names": "SINKACCT01_TOKEN\nSINK_ODD_SECRET\n" + extra + "\n"})
+            chk(f"fleet: the sink read-back REJECTS {label} with a NONZERO exit — a read-back that "
+                "only printed names would pass this",
+                (code != 0, code != "no-harness"), (True, True))
 
 
 def _test_write_is_all_or_nothing(chk):
@@ -938,7 +1346,15 @@ def _test_live_tree(chk):
     ok, reason = bundle_verdict(parse_probes(sources))
     chk(f"live: every job of every probe is PROVABLY unreachable unless `{PRIVATE_GUARD_TEXT}` "
         f"({reason})", ok, True)
-    requirements = sink_requirements(sources)
+    # FOLDED, not raised (#945). A live probe that drifts into one of `sink_requirements`' fail-
+    # closed refusals — an unbound secret, a whole-context read whose name allowlist went away or
+    # went unanchored — must red the rows BELOW with the check count intact. Left to raise, it
+    # aborts the suite: the gate does go red, but every remaining assertion silently never runs and
+    # the log reads as a partial pass. The sentinel is deliberately not a plausible value.
+    try:
+        requirements = sink_requirements(sources)
+    except SinkRefusal as refusal:
+        requirements = Requirements((f"REFUSED: {refusal}",), (), (), None)
     chk("live: the sink requirement derived from the live probes is the dispatch-secrets "
         "environment", requirements.environments, ("dispatch-secrets",))
     chk("live: ... and it names the account token + salt the probes actually read",
@@ -946,6 +1362,15 @@ def _test_live_tree(chk):
     chk("live: ... and records the fleet-wide whole-context read",
         [(filename, read) for filename, _job, read in requirements.context_readers],
         [("fingerprint-accounts.yml", "toJSON(secrets)")])
+    # THE STANDING PIN ON THE FILTER. `dispatch-secrets` also holds REGISTRY_SECRETS_PAT and
+    # ALERT_TOKEN; this pattern is the only thing separating them from the names the runbook tells
+    # a maintainer to copy into the sink. If the probe's own filter is loosened, moved or dropped,
+    # this row goes red (or `sink_requirements` refuses) instead of the runbook quietly widening.
+    chk("live: the account-token allowlist is derived from the live probe and is still the "
+        "anchored ACCT family", requirements.allowlist, "^ACCT[A-Z0-9]+_TOKEN$")
+    chk("live: ... and the sink's expected-name pattern adds the salt WITHOUT widening the family",
+        sink_expected_name_pattern(requirements),
+        "^ACCT[A-Z0-9]+_TOKEN$|^PROVENANCE_SALT$")
     files = bundle(sources, requirements, DEFAULT_SINK_REPO)
     chk("live: the emitted bundle is byte-identical to the live probes",
         [files[os.path.join(WORKFLOW_DIR, name)] == sources[name] for name in PROBE_WORKFLOWS],
