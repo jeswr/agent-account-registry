@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5001,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "dfd6fef754fc5171d4e25217c72469cff85adbb5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new scheduled workflow is correctly restricted to schedule and manual dispatch, uses repository-scoped identity, grants only the permissions needed for checkout and issue-label updates, runs both classifier test suites before invoking the mutating --apply path, and serializes overlapping runs. The structural tests cover the load-bearing trigger, permission, ordering, unconditional-execution, reporting, and path-filter seams without bypassing the real workflow definition. The routing workflow is updated for both push and pull-request path filters, so changes to the new workflow exercise these assertions. No correctness, soundness, test-validity, or security defect is evident in the diff.",
+  "verdict": "approve"
+ }
+}
