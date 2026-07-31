@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5234,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4c3dc7d4098e30447281028fbd18bceeb578f236",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The README says adding, renaming, or removing a leg is a two-file change, but immediately broadens that to every issue or PR that \"touches a fragment\". Later, \"When the golden does NOT change\" says edits to features, test, tier, tier-reason, or comments are genuinely single-file changes. These rules cannot all be followed. Since this document is expressly meant to define permitted task scope, the broad wording can force unrelated edits to include a shared golden that must remain byte-identical, increasing contention without any required change.",
+    "file": ".github/feature-matrix.d/README.md",
+    "fix_hint": "State the rule consistently in terms of changes to the emitted leg-name set: require the fragment and golden only when adding/removing a leg or changing name; explicitly leave non-name field and comment edits as single-file changes. Apply the same qualification to the repeated fragment comments (for example, \"a leg-name-set change is a TWO-FILE change\") and adjust the documentation-presence test wording accordingly.",
+    "severity": "major",
+    "title": "Two-file scope rule contradicts its own name-only exception"
+   }
+  ],
+  "progress": null,
+  "summary": "The added exact-output regression test is non-vacuous and correctly restores sys.argv, and the change does not alter feature-matrix assembly behavior. However, the new scope contract is internally contradictory in the central README and is repeated too broadly across every fragment. It first correctly limits the two-file requirement to adding, renaming, or removing a leg, but then says any PR that merely touches a fragment must include the golden, while a later section correctly says features/test/tier/comment-only edits are single-file changes. Because this documentation is intended to control task decomposition, the contradiction makes the change incomplete and can cause needless shared-golden scope and conflicts.",
+  "verdict": "request_changes"
+ }
+}
