@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5308,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a191a872c09c59d5e60caa6364f518d5781c76c5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 4.1 and 5.3 claim WAC has no cross-document indirection and that ACP dependencies can be found by following object IRIs (with fragments stripped) to named graphs. The loader instead merges every control graph, and the WAC subject/mode rules do not require `solidx:inDoc`. Thus P's ACL can make `<https://x.ex/a#auth>` apply to a P resource while O's ACL supplies that same subject's `acl:agent` or `acl:mode`; changing O then changes P's grants despite the claimed empty WAC `rdeps`. The analogous problem exists for ACP: triples describing a referenced policy or matcher may be stored in any `.acr` graph, not necessarily the graph obtained from that term's IRI. A scoped splice based on the proposed dependencies can therefore retain stale allow/deny results, including fail-open stale allows. The seven mandated regressions do not cover this shared-named-subject case.",
+    "file": "research/solid-scoped-materializer-design.md",
+    "fix_hint": "Either enforce and validate a document-locality invariant at write admission (and state precisely which subjects must belong to which control document), or compute dependencies from actual subject occurrence/provenance across all control graphs rather than from IRI-to-graph naming. Revise the WAC confinement claim and `rdeps` algorithm accordingly, and add named WAC and ACP regressions where a policy/authorization/matcher subject is split across two differently named control graphs; mutation of either graph must rederive every affected origin.",
+    "severity": "major",
+    "title": "Document confinement assumes RDF subjects live in their IRI-named control document"
+   }
+  ],
+  "progress": null,
+  "summary": "The proposed confinement/dependency model is unsound for the current merged-graph reasoner. Named RDF subjects are not confined to the document implied by their IRI, so facts from an otherwise unrelated control graph can join onto an authorization, policy, or matcher used by another origin. The design explicitly declares WAC independent across origins and limits ACP dependency discovery to following object IRIs to graph names; both assumptions miss real dependencies and can retain stale grants after a scoped write.",
+  "verdict": "request_changes"
+ }
+}
