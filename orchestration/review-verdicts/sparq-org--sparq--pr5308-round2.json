@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5308,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "455e86e660611c8d67d0affcf0335c5d8d15f63b",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 4.1 and 5.2 acknowledge that policy bodies come from control-document triples, but dependency discovery still follows an object IRI, strips its fragment, and pulls the graph with that name. A referenced `<https://o.ex/.acr#pol>` may instead be described by triples in `<https://q.ex/other.acr>` because RDF subjects are not confined to their IRI-named document. The full materializer merges that Q graph, while the scoped closure need not include it; changing Q may therefore leave P's retained allow/deny or matcher result stale, including a stale allow. The mandated regressions cover a body stored in O's correspondingly named graph, not this split-subject case.",
+    "file": "research/solid-scoped-materializer-design.md",
+    "fix_hint": "Define dependencies from actual triple provenance: for every policy/control/matcher subject reachable from an origin's roots, include every control graph containing relevant triples with that subject, and iterate to closure; maintain reverse dependencies from those actual graph occurrences. Alternatively, enforce and validate a precise document-locality invariant at write admission. Add an ACP regression where P references `o#pol`, Q (a differently named `.acr`) supplies that subject's allow/matcher facts, and mutation/deletion of Q rederives P; require the mutation check to red when Q is omitted. Revise the claim that policy bodies can be located by fragment-stripped IRI accordingly.",
+    "severity": "major",
+    "title": "ACP dependencies still assume subject IRI determines the containing control graph"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-1 soundness defect remains. The revision correctly adds `solidx:inDoc` to its WAC proof, but the ACP dependency design still equates a referenced term's fragment-stripped IRI with the named graph containing facts about that term. RDF imposes no such document-locality rule, and the current merged input permits a third `.acr` graph to contribute `acp:allow`, matcher, or other body triples for a policy referenced by P. Because the proposed `deps` walk pulls the graph named by the object IRI rather than every graph where the subject actually occurs, a mutation can be omitted from `affected` and stale grants can survive. Progress is stagnant because this is materially the same major finding as round 1.",
+  "verdict": "request_changes"
+ }
+}
