@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5236,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "71eced6c620bd93f3315a3a51a3c9bf572ec06a7",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major finding is resolved. The caller audit now derives PR-triggered roots from every .yml/.yaml workflow, follows local reusable-workflow calls transitively, fails closed when an on block cannot be found, and includes a regression fixture proving reachability through an intermediate caller outside the prior hand-maintained Rust-CI list. The release-only entries are also checked for direct PR triggers and verified through the selector's real allowlist path. The focused 10-test release-only and selection suite passes.",
+  "verdict": "approve"
+ }
+}
