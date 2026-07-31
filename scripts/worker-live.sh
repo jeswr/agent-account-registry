@@ -1272,6 +1272,30 @@ _pr_gate_suite_loop() {
   ' "$file"
 }
 
+# [issue #1371] PURE (self-tested): pr-gate.yml's suite DERIVATION line together with the line that
+# immediately follows it -- the #824 dependency preflight -- normalised to stripped, comment-free
+# lines, so the preflight can be pinned by exact ADJACENT-PAIR match.
+#
+# ADJACENCY is the assertion, not mere presence: the suite is derived and then, with nothing in
+# between, preflighted. A DELETED call, an appended `|| true`, an `if false; then` wrapper and a
+# call moved BELOW the loop all change the second line and are caught; an absent file or a renamed
+# derivation yields a short extraction, which fails closed against any expected pair. This is the
+# #941/#956 YAML-seam shape -- a step-level mutant is invisible to every python assertion here, and
+# containment is not enough, because a call that is present and inert satisfies containment.
+#
+# Pinned SEPARATELY from _pr_gate_suite_loop and _pr_gate_escape_channel, and deliberately sharing
+# no line with either: three independent signals over one step, none able to mask another's mutant.
+_pr_gate_suite_preflight() {
+  local file=$1
+  [[ -f "$file" ]] || return 0
+  awk '
+    { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+    line ~ /^#/ || line == "" { next }
+    !on && line ~ /^suite=/ { on = 1; print line; next }
+    on { print line; exit }
+  ' "$file"
+}
+
 # [issue #824] Dependencies the enrolled suite EXECUTES but this repo does not ship. They are
 # preinstalled on the ubuntu-latest runner the gate actually runs on, but ABSENT from the
 # unprivileged model container (no root, no sudo, no pip) -- where roughly a THIRD of the suite then
@@ -6603,6 +6627,119 @@ CHANNEL
     "$([[ "$(_pr_gate_suite_loop "$loopfix/absent.yml" 2>/dev/null | paste -sd'|' -)" == "$expected_loop" ]] \
        && printf missed || printf caught)" "caught"
 
+  # ---- [issue #1371] THE #824 PREFLIGHT IN THE REQUIRED LANE. registry_selftest_gate refuses
+  # ENV-BLOCKED before a single row runs; the `gate` check drives the CLI arms directly and so ran
+  # the whole suite unpreflighted. MEASURED on a checkout with neither jq nor PyYAML: 29 of 56
+  # enrolled rows reported FAILING with output indistinguishable from real defects, and 56/56 green
+  # once both were installed. Two INDEPENDENT assertions, because they fail in different places:
+  # the WIRING (pr-gate.yml preflights the suite it just derived, adjacently) and the ARM ITSELF,
+  # EXECUTED in both directions. Neither subsumes the other -- a perfectly correct arm nobody calls
+  # is the bug this closes, and a called arm that refuses nothing is the same bug wearing a call. ----
+  local expected_preflight
+  expected_preflight=$(printf '%s\n' \
+    'suite=$(bash scripts/worker-live.sh print-selftest-suite "$base_manifest" "$base_retirements")' \
+    'bash scripts/worker-live.sh preflight-selftest-env "$suite"' | paste -sd'|' -)
+  chk "pr-gate.yml PREFLIGHTS the suite it derived, before the loop (exact adjacent pair)" \
+    "$(_pr_gate_suite_preflight "$SCRIPT_DIR/../.github/workflows/pr-gate.yml" | paste -sd'|' -)" \
+    "$expected_preflight"
+  # NON-VACUITY of the extractor: the four mutants that keep the call PRESENT-but-useless, plus the
+  # deletion. Each must change the extracted pair, or the row above is a constant comparing itself.
+  local pf_derive='          suite=$(bash scripts/worker-live.sh print-selftest-suite "$base_manifest" "$base_retirements")'
+  printf '%s\n' "$pf_derive" '          n=0' '          for s in $suite; do' \
+    > "$loopfix/pf-deleted.yml"
+  printf '%s\n' "$pf_derive" \
+    '          bash scripts/worker-live.sh preflight-selftest-env "$suite" || true' \
+    > "$loopfix/pf-or-true.yml"
+  printf '%s\n' "$pf_derive" '          if false; then' \
+    '            bash scripts/worker-live.sh preflight-selftest-env "$suite"' '          fi' \
+    > "$loopfix/pf-if-false.yml"
+  printf '%s\n' "$pf_derive" '          for s in $suite; do' '            :' '          done' \
+    '          bash scripts/worker-live.sh preflight-selftest-env "$suite"' > "$loopfix/pf-late.yml"
+  chk "preflight check is NON-VACUOUS: a DELETED preflight no longer matches" \
+    "$([[ "$(_pr_gate_suite_preflight "$loopfix/pf-deleted.yml" | paste -sd'|' -)" == "$expected_preflight" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "preflight check is NON-VACUOUS: an '|| true' suppressor no longer matches" \
+    "$([[ "$(_pr_gate_suite_preflight "$loopfix/pf-or-true.yml" | paste -sd'|' -)" == "$expected_preflight" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "preflight check is NON-VACUOUS: a conditionally-inert 'if false' no longer matches" \
+    "$([[ "$(_pr_gate_suite_preflight "$loopfix/pf-if-false.yml" | paste -sd'|' -)" == "$expected_preflight" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "preflight check is NON-VACUOUS: a preflight moved BELOW the loop no longer matches" \
+    "$([[ "$(_pr_gate_suite_preflight "$loopfix/pf-late.yml" | paste -sd'|' -)" == "$expected_preflight" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "preflight check fails CLOSED on an unreadable workflow" \
+    "$([[ "$(_pr_gate_suite_preflight "$loopfix/absent.yml" 2>/dev/null | paste -sd'|' -)" == "$expected_preflight" ]] \
+       && printf missed || printf caught)" "caught"
+
+  # THE ARM, EXECUTED. The REAL requirement table's verdict depends on what this runner happens to
+  # have installed -- that is the entire point of the table -- so neither direction could be driven
+  # deterministically against it. Two fixture copies of worker-live.sh have ONLY THE PROBES
+  # rewritten: to a binary and a module that must exist anywhere, and to two that cannot exist at
+  # all. The table's REAL rows are asserted against the REAL tree by the #824 block far above; what
+  # is under test here is the arm -- does it run the preflight, propagate the refusal, name the
+  # dependency, annotate the class, and stay quiet and rc 0 when nothing is missing.
+  local pffix="$tmp/sandbox/pffix" pf_dir
+  mkdir -p "$pffix/present" "$pffix/absent"
+  for pf_dir in "$pffix/present" "$pffix/absent"; do
+    printf '%s\n' 'worker-live.sh' > "$pf_dir/selftest-suite.txt"
+    : > "$pf_dir/selftest-retirements.txt"
+  done
+  # Both substitutions are ^-ANCHORED, which is what keeps them surgical: the only lines in this
+  # file that begin with the requirement table's own text are the table's two lines, so the sed
+  # cannot reach the (indented) source of this very block and rewrite its own patterns.
+  sed -e "s/^SELFTEST_ENV_REQUIREMENTS='jq|command|jq|/SELFTEST_ENV_REQUIREMENTS='jq|command|bash|/" \
+    -e 's/^PyYAML|pymodule|yaml|/PyYAML|pymodule|json|/' \
+    "$SCRIPT_DIR/worker-live.sh" > "$pffix/present/worker-live.sh"
+  sed -e "s/^SELFTEST_ENV_REQUIREMENTS='jq|command|jq|/SELFTEST_ENV_REQUIREMENTS='jq|command|no-such-binary-1371|/" \
+    -e 's/^PyYAML|pymodule|yaml|/PyYAML|pymodule|no_such_module_1371|/' \
+    "$SCRIPT_DIR/worker-live.sh" > "$pffix/absent/worker-live.sh"
+  # KNOWN-POSITIVE VALIDATION OF THE INSTRUMENT: a sed that matched nothing would leave both copies
+  # identical to the original, and every row below would then be silently reporting on whatever this
+  # runner has installed rather than on the fixture it names -- in which case the two directions
+  # could never BOTH be red, and one of them would be untested on every machine.
+  chk "#1371 fixture: the ABSENT copy's binary probe really was rewritten to an unresolvable one" \
+    "$(grep -c "^SELFTEST_ENV_REQUIREMENTS='jq|command|no-such-binary-1371|" \
+       "$pffix/absent/worker-live.sh")" "1"
+  chk "#1371 fixture: the ABSENT copy's module probe really was rewritten too" \
+    "$(grep -c '^PyYAML|pymodule|no_such_module_1371|' "$pffix/absent/worker-live.sh")" "1"
+  chk "#1371 fixture: the PRESENT copy's binary probe really was rewritten to an always-present one" \
+    "$(grep -c "^SELFTEST_ENV_REQUIREMENTS='jq|command|bash|" "$pffix/present/worker-live.sh")" "1"
+  chk "#1371 fixture: the PRESENT copy's module probe really was rewritten too" \
+    "$(grep -c '^PyYAML|pymodule|json|' "$pffix/present/worker-live.sh")" "1"
+
+  local pfarm_rc pfarm_out
+  pfarm_out=$(bash "$pffix/absent/worker-live.sh" preflight-selftest-env 'worker-live.sh' 2>&1) \
+    && pfarm_rc=0 || pfarm_rc=$?
+  chk "#1371 arm: an unavailable suite dependency REFUSES (the gate never enters the loop)" \
+    "$([[ "$pfarm_rc" -ne 0 ]] && printf refused || printf ran)" "refused"
+  chk "#1371 arm: the refusal NAMES the dependency it could not find (value, not just an exit code)" \
+    "$(printf '%s\n' "$pfarm_out" | grep -c '^ENV-BLOCKED .*no-such-binary-1371')" "1"
+  chk "#1371 arm: one ENV-BLOCKED line per absent dependency, not one for the first" \
+    "$(printf '%s\n' "$pfarm_out" | grep -c '^ENV-BLOCKED ')" "2"
+  chk "#1371 arm: it refuses under the ENV-BLOCKED CLASS, not as a self-test failure" \
+    "$(printf '%s\n' "$pfarm_out" | grep -c 'ENV-BLOCKED -- a dependency the suite EXECUTES')" "1"
+  chk "#1371 arm: and annotates it, because the whole cost of this class is diagnosis" \
+    "$(printf '%s\n' "$pfarm_out" | grep -c '^::error::the self-test suite is ENV-BLOCKED, not failing')" "1"
+
+  pfarm_out=$(bash "$pffix/present/worker-live.sh" preflight-selftest-env 'worker-live.sh' 2>&1) \
+    && pfarm_rc=0 || pfarm_rc=$?
+  chk "#1371 arm: every dependency present -> the suite is CLEARED to run (rc 0)" "$pfarm_rc" "0"
+  chk "#1371 arm: a cleared preflight SAYS so, so 'ran and cleared' differs from 'never reached'" \
+    "$pfarm_out" "self-test dependency preflight: every declared suite dependency is present"
+  chk "#1371 arm: a cleared preflight emits no ENV-BLOCKED line of its own" \
+    "$(printf '%s\n' "$pfarm_out" | grep -c '^ENV-BLOCKED ')" "0"
+  # The arity is the guard against the call site losing its quotes: `preflight-selftest-env $suite`
+  # would otherwise preflight the FIRST entry and report the other 55 clear. Driven against the
+  # PRESENT copy ON PURPOSE: against the absent one the arity refusal and the dependency refusal are
+  # value-identical, so the row would score a kill for a mutant it cannot see (measured -- deleting
+  # the arity check left that form GREEN). Here, dropping the guard yields the CLEARED path instead.
+  pfarm_out=$(bash "$pffix/present/worker-live.sh" preflight-selftest-env a.py b.py 2>&1) \
+    && pfarm_rc=0 || pfarm_rc=$?
+  chk "#1371 arm: an unquoted suite expansion REFUSES rather than preflighting one entry" \
+    "$([[ "$pfarm_rc" -ne 0 ]] && printf refused || printf ran)" "refused"
+  chk "#1371 arm: and the refusal names the ARITY, not an incidental dependency verdict" \
+    "$(printf '%s\n' "$pfarm_out" | grep -c 'usage: worker-live.sh preflight-selftest-env')" "1"
+
   # ---- [issue #849] the gate must verify the EXTRACTED actionlint binary, not only the tarball.
   # worker-live's _fetch_pinned_actionlint_unpack has checked both digests since #428 r2; pr-gate --
   # the REQUIRED `gate` check -- checked only the tarball, so a verified-tarball-but-wrong-binary
@@ -6672,6 +6809,29 @@ case "${1:-}" in
     [[ $# -eq 3 ]] || die 'usage: worker-live.sh print-selftest-suite <base-manifest> <base-retirements>'
     _derive_full_selftest_suite "$SCRIPT_DIR" "$SELFTEST_MANIFEST" "$2" "$3"
     ;;
+  # [issue #1371] The #824 dependency preflight, exposed to the lane that does not go through
+  # registry_selftest_gate. pr-gate.yml's suite step drives `print-selftest-suite` + `run-selftest`
+  # directly, so it entered the loop with no preflight at all: on a checkout missing jq and PyYAML
+  # the suite reported 29 of 56 rows FAILING, indistinguishable from real defects (measured while
+  # diagnosing #1346; the same tree is 56/56 green with both installed). An unrunnable row is not a
+  # failing row, and a mostly-unrunnable suite is emphatically not a pass -- refuse here, under the
+  # ENV-BLOCKED class, before a single row runs.
+  #
+  # The suite is ONE argument (print-selftest-suite emits a single space-separated line), and the
+  # arity is exact: an unquoted expansion at the call site would silently preflight only the first
+  # entry, so it refuses instead of narrowing the check.
+  preflight-selftest-env)
+    [[ $# -eq 2 ]] || die 'usage: worker-live.sh preflight-selftest-env "<suite>"'
+    if ! preflight_env_report=$(_selftest_env_blocked \
+      "$SELFTEST_ENV_REQUIREMENTS" "$SCRIPT_DIR" "$2"); then
+      printf '%s\n' "$preflight_env_report" >&2
+      # An ANNOTATION as well as a log line: the whole cost of this class is diagnosis, and the
+      # reader who needs it is looking at the check's annotations, not at line 400 of the log.
+      printf '::error::the self-test suite is ENV-BLOCKED, not failing — the per-script rows this run did NOT print would have been artifacts of the missing dependency named above\n' >&2
+      die 'pr-gate self-test suite: ENV-BLOCKED -- a dependency the suite EXECUTES is unavailable on this runner, so part of the suite cannot run at all (see the ENV-BLOCKED lines above). This is NOT a test failure and NOT a pass: jq and PyYAML are provisioned for this job, so an absence here is a runner/provisioning regression, and the rows it would have reddened are artifacts of it, not defects in the tree under test.'
+    fi
+    printf 'self-test dependency preflight: every declared suite dependency is present\n'
+    ;;
   # The sandboxed self-test runner pr-gate.yml's suite loop calls. It is the only entrypoint the
   # ENROLLED-SUITE LANE uses -- it is NOT the only way an enrolled self-test runs in this repo:
   # 21+ invocations across 10 production workflows call one directly as a preflight (issue #991),
@@ -6685,5 +6845,5 @@ case "${1:-}" in
     run_enrolled_selftest "$2"
     ;;
   self-test) self_test ;;
-  *) die 'usage: worker-live.sh <model|gate|bundle|verify-bundle|publish|review|fix|push-fix|write-back|purge-credentials|print-selftest-suite|run-selftest|self-test>' ;;
+  *) die 'usage: worker-live.sh <model|gate|bundle|verify-bundle|publish|review|fix|push-fix|write-back|purge-credentials|print-selftest-suite|preflight-selftest-env|run-selftest|self-test>' ;;
 esac
