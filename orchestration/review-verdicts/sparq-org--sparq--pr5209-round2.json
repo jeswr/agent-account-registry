@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5209,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6163a622cec87aeee1ff75aa6286828b0e159cc1",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The recursive IntAll/intAll rules remain sound for non-empty RDF intersection lists: the base case requires membership in the final conjunct, the recursive case requires both the current conjunct and the suffix, and IntTail restricts evaluation to cells reachable from an owl:intersectionOf list. The final rule derives class membership only after the full suffix proof succeeds, matching sparq-reason's whole-list members.iter().all check and its empty-list behavior. The real semi-naive evaluator test checks exact memberships for arities 1 through 4, demonstrates the former arity cap, pins equivalence at arities 1 and 2, and guards both shipped artifacts. The revised convergence prose distinguishes inspectable program structure from explicitly unmeasured external-engine behavior and labels work-box timing non-canonical. No correctness, soundness, security, or test-validity issue was found.",
+  "verdict": "approve"
+ }
+}
