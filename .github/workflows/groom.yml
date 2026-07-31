@@ -30,6 +30,8 @@ jobs:
       actions: read       # inspect registry worker run state
       contents: write     # CAS data/leases.json + read data/model-health.json (both on the `ledger` branch)
       issues: write       # upsert/close the model-access health alert issues (model-health decide)
+      pull-requests: read # #384: LIST the account-pool/acctNN grant PRs. READ, never write — the
+                          # abandoned-enrolment report only classifies open/merged/closed-unmerged.
     steps:
       - name: Checkout registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -137,6 +139,30 @@ jobs:
           set -euo pipefail
           printf '::add-mask::%s\n' "$REGISTRY_GH_TOKEN"
           python3 scripts/groom.py --report-orphan-claims \
+            --registry-repo "$GITHUB_REPOSITORY"
+
+      # Issue #384 — the OTHER half of the enrollment-hygiene picture. The burned-slot report above
+      # cannot see an abandoned #185 two-phase enrollment: that slot HAS an acctNN issue and HAS an
+      # ACCTNN_TOKEN secret, which is exactly what makes it not-orphaned there. It is nevertheless
+      # stuck forever — `set-up-account`'s `activate` job fires only on a MERGED account_pool PR, so
+      # a grant PR closed unmerged (or never merged) leaves the account `status:pending`,
+      # non-allocatable, with nothing counting it.
+      #
+      # REPORT-ONLY, with no gate or reclaim mode, for a reason stronger than the claim-ref one:
+      # deleting the orphaned credential secret would destroy the #211 idempotent RESUME (re-apply
+      # `set-up-account` on the request issue and the SAME enrollment completes), turning a
+      # recoverable abandonment into an unrecoverable one. The ambient token suffices — account
+      # issues and account_pool PRs are public on this repo — and every field this report names
+      # (handle, request issue, secret NAME) is on the documented handle-public enrollment surface.
+      - name: Report abandoned status:pending enrollments
+        continue-on-error: true
+        env:
+          REGISTRY_GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '::add-mask::%s\n' "$REGISTRY_GH_TOKEN"
+          # The age floor lives in groom.py (--stale-pending-days) as a single source of truth.
+          python3 scripts/groom.py --report-stale-pending \
             --registry-repo "$GITHUB_REPOSITORY"
 
       # Per-owner target token mint (issue #168): policy enables targets under TWO distinct owners

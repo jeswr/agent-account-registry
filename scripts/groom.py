@@ -1832,6 +1832,223 @@ def report_orphan_claims(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---- abandoned two-phase-enrollment report (issue #384) -----------------------------------------
+#
+# #185 made enrollment TWO-PHASE: set-up-account stores the credential, burns the claim ref and
+# creates the `acctNN` account issue `status:pending` (non-allocatable, and absent from
+# `account_pool` — doubly so), then opens a CHECKED `account-pool/acctNN` PR against
+# policy/repos.toml. The `activate` job flips status:pending -> status:available and closes the
+# request issue only when that PR MERGES.
+#
+# The gap this report closes: `activate` triggers on `pull_request: closed` with `merged == true`,
+# so a grant PR that is CLOSED UNMERGED — or simply never merged — has NO recovery path. The
+# account stays `status:pending` forever: a burned slot, a stored `ACCTNN_TOKEN` in
+# dispatch-secrets, and an open request issue, none of which anything else counts. The burned-slot
+# report above cannot see it either: the slot HAS an acctNN issue and HAS a secret, which is
+# precisely what makes it not-orphaned there.
+#
+# REPORT-ONLY, and not merely because reporting is easier:
+#   * the claim ref is never released (the #245 rule above — recycling a slot re-opens the
+#     credential-overwrite race), so there is no slot to hand back; and
+#   * the `ACCTNN_TOKEN` secret must NOT be deleted, because set-up-account's #211 idempotent
+#     resume DEPENDS on it: re-applying the `set-up-account` label finds the captured credential,
+#     skips the sign-in, and re-enters at validate -> account_pool PR -> activate, completing the
+#     SAME transaction. That path fails closed when the secret is absent ("resuming would activate
+#     an account with no usable credential"), so deleting the secret converts a RECOVERABLE
+#     abandoned enrollment into an unrecoverable one — the opposite of reclaiming it.
+# The recovery this report asks for is therefore a human one: re-apply `set-up-account` on the
+# named request issue to resume, or close the account issue to abandon it (slot stays burned).
+#
+# A pending account whose grant PR DID merge is counted but not named: that is the `activate` job
+# failing after a merge, which set-up-account's own `always()` alarm already hands to a human, and
+# it is a different fault from the closed-unmerged case this report exists for.
+#
+# PRIVACY: naming `acctNN`, its request issue and `ACCTNN_TOKEN` is inside the documented
+# handle-public scope — the account **catalog and enrollment** surface (README locked decision 22a
+# scoping): the account issue TITLE, its `secret_ref` body line, the secret NAMES and the
+# `account-pool/acctNN` PR are all public by design. No operational/ledger surface is touched here,
+# so no fingerprint applies and no token VALUE is ever read.
+PENDING_STATUS_LABEL = "status:pending"
+# The exact `request_issue: <n>` / `secret_ref: <name>` body lines set-up-account's register step
+# stamps into every account issue — the same anchored, whole-line match its own #211 reconcile
+# step uses, so a handle mentioned in prose can never be mistaken for the linkage.
+PENDING_REQUEST_ISSUE_RE = re.compile(r"(?m)^request_issue:[ \t]*([0-9]+)[ \t]*$")
+PENDING_SECRET_REF_RE = re.compile(r"(?m)^secret_ref:[ \t]*(ACCT[0-9]+_TOKEN)[ \t]*$")
+STALE_PENDING_DEFAULT_DAYS = 3
+STALE_PENDING_NOTE = (
+    "STALE-PENDING report-only — NEVER delete the ACCTNN_TOKEN secret or the claim ref: the "
+    "credential is what makes the enrollment RESUMABLE (#211), and the claim is what keeps the "
+    "slot from being recycled under a live credential (#245). Recover by re-applying the "
+    "`set-up-account` label on the named request issue (it completes the SAME enrollment), or "
+    "close the account issue to abandon it — its slot stays burned by design."
+)
+
+
+@dataclass(frozen=True)
+class PendingAccount:
+    """One OPEN `status:pending` account issue, with the fields a human needs to recover it."""
+
+    number: int
+    handle: str
+    age_days: int
+    request_issue: int | None
+    secret_ref: str | None
+
+
+def pending_account_issues(
+    issues: Any, now_epoch: int, min_age_days: int
+) -> list[PendingAccount]:
+    """Pure: OPEN `acctNN` account issues still `status:pending` and at least `min_age_days` old,
+    sorted by issue number — the enrollments that may have been abandoned mid-transaction.
+
+    FAIL CLOSED on a malformed listing instead of reporting whatever parsed: a silently short or
+    garbled page drops abandoned enrollments from the one report that counts them.
+
+    Three filters are load-bearing:
+      * PULL REQUESTS are skipped — /issues returns both, and the grant PR for this very account
+        can carry the handle in its title (the same exclusion the burned-slot report makes);
+      * CLOSED account issues are skipped — closing the account issue is the DOCUMENTED way to
+        abandon an enrollment (set-up-account's own refusal text says so, and the slot stays
+        burned), so a closed one has already been dealt with by a human and must not be re-raised
+        as an open alarm every sweep;
+      * the AGE floor keeps a legitimately in-flight enrollment out: the account issue exists for
+        the whole window in which the grant PR is being built, opened, gated and merged."""
+    if not isinstance(issues, list):
+        raise GroomError("account issue listing is malformed")
+    floor = _positive_int(min_age_days, "stale-pending age in days") * 86400
+    found: list[PendingAccount] = []
+    for item in issues:
+        if not isinstance(item, dict):
+            raise GroomError("account issue listing is malformed")
+        if "pull_request" in item:
+            continue
+        title = item.get("title")
+        if not isinstance(title, str):
+            raise GroomError("account issue listing is malformed")
+        if ACCT_ISSUE_TITLE_RE.match(title) is None:
+            continue
+        number = item.get("number")
+        if not isinstance(number, int) or isinstance(number, bool):
+            raise GroomError("an account issue carries no readable number")
+        if item.get("state") != "open":
+            continue
+        if PENDING_STATUS_LABEL not in _labels(item, f"account issue #{number}"):
+            continue
+        age = now_epoch - _epoch(
+            item.get("created_at"), f"account issue #{number} created_at"
+        )
+        if age < floor:
+            continue
+        body = item.get("body")
+        if body is not None and not isinstance(body, str):
+            raise GroomError(f"account issue #{number} body is malformed")
+        request = PENDING_REQUEST_ISSUE_RE.search(body or "")
+        secret = PENDING_SECRET_REF_RE.search(body or "")
+        found.append(
+            PendingAccount(
+                number=number,
+                handle=title,
+                age_days=age // 86400,
+                request_issue=int(request.group(1)) if request else None,
+                secret_ref=secret.group(1) if secret else None,
+            )
+        )
+    return sorted(found, key=lambda entry: entry.number)
+
+
+def grant_pr_disposition(pulls: Any, branch: str, base: str = "master") -> str:
+    """Pure: ``"merged"``, ``"open"`` or ``"none"`` for the account_pool grant PRs on `branch`.
+
+    Only a pull request whose head ref is EXACTLY `branch` and whose base is EXACTLY `base`
+    counts — the same exact-match assertion `grant-account.merged_grant_prs` makes, because a PR
+    on a look-alike branch, or into some other base, is not this enrollment's checked grant and
+    merging it would never have activated the account.
+
+    `merged` DOMINATES `open` (re-opening a branch cannot un-merge a grant that already landed),
+    and both dominate `none`. FAIL CLOSED on an unreadable listing: quietly reading it as `none`
+    would publish an enrollment whose grant PR is open and healthy as abandoned."""
+    if not isinstance(pulls, list):
+        raise GroomError(f"the pull-request listing for {branch} is malformed")
+    disposition = "none"
+    for pull in pulls:
+        if not isinstance(pull, dict):
+            raise GroomError(f"the pull-request listing for {branch} is malformed")
+        head, into = pull.get("head"), pull.get("base")
+        head_ref = head.get("ref") if isinstance(head, dict) else None
+        base_ref = into.get("ref") if isinstance(into, dict) else None
+        if head_ref != branch or base_ref != base:
+            continue
+        if pull.get("merged_at"):
+            return "merged"
+        if pull.get("state") == "open":
+            disposition = "open"
+    return disposition
+
+
+def format_stale_pending_report(
+    dispositions: list[tuple[PendingAccount, str]], min_age_days: int
+) -> list[str]:
+    """Pure: the report lines. One counted summary, one named line per abandoned enrollment."""
+    states = [state for _entry, state in dispositions]
+    abandoned = [entry for entry, state in dispositions if state == "none"]
+    lines = [
+        f"STALE-PENDING pending={len(dispositions)} min_age_days={min_age_days} "
+        f"grant_pr_open={states.count('open')} grant_pr_merged={states.count('merged')} "
+        f"abandoned={len(abandoned)}"
+    ]
+    for entry in abandoned:
+        request = f"#{entry.request_issue}" if entry.request_issue is not None else "UNLINKED"
+        lines.append(
+            f"STALE-PENDING {entry.handle}: account issue #{entry.number} has been "
+            f"status:pending for {entry.age_days}d and no `account-pool/{entry.handle}` PR is "
+            f"open or merged — the enrollment was abandoned before its account_pool grant landed "
+            f"(request issue {request}, credential secret {entry.secret_ref or 'UNRECORDED'})"
+        )
+    lines.append(
+        STALE_PENDING_NOTE
+        if abandoned
+        else "STALE-PENDING none — every pending enrollment has an open or merged account_pool PR"
+    )
+    return lines
+
+
+def report_stale_pending(args: argparse.Namespace) -> int:
+    """Report the abandoned two-phase enrollments. READ-ONLY: listings and a print, no mutation."""
+    registry_repo = args.registry_repo
+    if SAFE_REPO.fullmatch(registry_repo) is None:
+        raise GroomError("registry repo must be a safe owner/name")
+    min_age_days = _positive_int(args.stale_pending_days, "--stale-pending-days")
+    owner = registry_repo.split("/", 1)[0]
+    # The grant-branch namespace is IMPORTED from the module set-up-account.yml itself calls,
+    # never replicated: a groom that looked on a drifted branch name would find no PR and report
+    # every healthy in-flight enrollment as abandoned.
+    grant = _load_module(
+        Path(__file__).resolve().parent / "grant-account.py", "registry_grant_account"
+    )
+    api = GitHubAPI(os.environ.get("REGISTRY_GH_TOKEN", ""), "registry")
+    # FULLY PAGINATED for the reason the burned-slot report is: a capped page silently drops a
+    # pending account issue, and nothing else in the estate counts one.
+    pending = pending_account_issues(
+        api.paginate(f"/repos/{registry_repo}/issues?state=open"), int(time.time()), min_age_days
+    )
+    dispositions: list[tuple[PendingAccount, str]] = []
+    for entry in pending:
+        try:
+            branch = grant.grant_branch(entry.handle)
+        except Exception as exc:  # noqa: BLE001 - grant-account's own GrantError, imported lazily
+            raise GroomError(
+                f"account issue #{entry.number} carries a handle no grant branch can be derived "
+                "from, so its account_pool PR cannot be located — refusing (fail closed)"
+            ) from exc
+        # state=all: a CLOSED-UNMERGED grant PR must be read and classified, not missed. It is
+        # exactly the case `activate` (merged-only) can never recover.
+        pulls = api.paginate(f"/repos/{registry_repo}/pulls?head={owner}:{branch}&state=all")
+        dispositions.append((entry, grant_pr_disposition(pulls, branch)))
+    for line in format_stale_pending_report(dispositions, min_age_days):
+        print(line)
+    return 0
+
+
 def _labels(item: dict[str, Any], where: str) -> set[str]:
     raw = item.get("labels")
     if not isinstance(raw, list):
@@ -9236,6 +9453,332 @@ def _self_test() -> int:
     check("orphan-claims CLI: --report-orphan-claims without --registry-repo is a usage error, "
           "not a silent pass", orphan_usage_code, 2)
 
+    # ---- abandoned two-phase-enrollment report (issue #384) -------------------------------------
+    def _stale_raises(function, *call_args) -> Any:
+        try:
+            function(*call_args)
+        except GroomError:
+            return True
+        except Exception as exc:                   # noqa: BLE001 - a WRONG exception is not a pass
+            return f"{type(exc).__name__}: {exc}"
+        return False
+
+    stale_now = 10_000_000
+
+    def _stale_issue(**overrides: Any) -> dict[str, Any]:
+        """An OPEN, 10-day-old, status:pending account issue — the shape this report fires on.
+
+        Every check below mutates ONE field of this baseline, so a filter that stopped being
+        applied shows up as that row appearing (or vanishing) and nothing else."""
+        issue = {
+            "number": 501,
+            "title": "acct21",
+            "state": "open",
+            "labels": [{"name": "account"}, {"name": PENDING_STATUS_LABEL},
+                       {"name": "provider:anthropic"}],
+            "created_at": datetime.fromtimestamp(
+                stale_now - 10 * 86400, timezone.utc).isoformat(),
+            "body": "provider: anthropic\nsecret_ref: ACCT21_TOKEN\nrequest_issue: 900\n"
+                    "notes: registered via set-up-account broker; pending account_pool PR merge\n",
+        }
+        issue.update(overrides)
+        return issue
+
+    check("stale-pending: an OPEN, aged, status:pending acctNN issue is reported with the handle, "
+          "age, request issue and credential secret a human needs to recover it",
+          pending_account_issues([_stale_issue()], stale_now, 3),
+          [PendingAccount(number=501, handle="acct21", age_days=10,
+                          request_issue=900, secret_ref="ACCT21_TOKEN")])
+    check("stale-pending: EVERY conjunct is load-bearing — a PULL REQUEST, a CLOSED issue, a "
+          "non-pending status, a non-acctNN title and an issue younger than the floor are each "
+          "excluded, and dropping any one of those filters reds this",
+          [pending_account_issues([issue], stale_now, 3) for issue in (
+              _stale_issue(pull_request={"url": "x"}),
+              _stale_issue(state="closed"),
+              _stale_issue(labels=[{"name": "account"}, {"name": "status:available"}]),
+              _stale_issue(title="groom: report abandoned acct21 enrollment"),
+              _stale_issue(created_at=datetime.fromtimestamp(
+                  stale_now - 2 * 86400, timezone.utc).isoformat()),
+          )],
+          [[]] * 5)
+    check("stale-pending: the age floor is INCLUSIVE at exactly min_age_days and the reported age "
+          "is whole days (an off-by-one floor changes which enrollments are named)",
+          [[entry.age_days for entry in pending_account_issues(
+              [_stale_issue(created_at=datetime.fromtimestamp(
+                  stale_now - seconds, timezone.utc).isoformat())], stale_now, 3)]
+           for seconds in (3 * 86400, 3 * 86400 - 1, 7 * 86400 + 3600)],
+          [[3], [], [7]])
+    check("stale-pending: the same fleet under a LARGER floor reports nothing, so the "
+          "--stale-pending-days threshold is really consulted",
+          pending_account_issues([_stale_issue()], stale_now, 30), [])
+    check("stale-pending: the request_issue/secret_ref links are ANCHORED WHOLE body lines — a "
+          "handle or number mentioned in prose is not the linkage, and an unparseable body still "
+          "reports the account (it is no less abandoned) with the link marked absent",
+          [(entry.request_issue, entry.secret_ref) for entry in pending_account_issues(
+              [_stale_issue(body="see request_issue: 900 above\nACCT21_TOKEN\n"),
+               _stale_issue(number=502, body=None),
+               _stale_issue(number=503,
+                            body="request_issue:\t77\t\nsecret_ref:  ACCT21_TOKEN  \n")],
+              stale_now, 3)],
+          [(None, None), (None, None), (77, "ACCT21_TOKEN")])
+    check("stale-pending: a malformed issue listing REFUSES rather than parsing what it can — a "
+          "silently short page drops the abandoned enrollments this report exists to surface",
+          [_stale_raises(pending_account_issues, payload, stale_now, 3)
+           for payload in ("not-a-list", None, ["acct21"], [{"title": 21}],
+                           [_stale_issue(number="501")], [_stale_issue(labels="account")],
+                           [_stale_issue(created_at=None)], [_stale_issue(created_at="not-a-date")],
+                           [_stale_issue(body=7)])],
+          [True] * 9)
+    check("stale-pending: a non-positive age floor REFUSES — a zero/negative floor would report "
+          "every freshly created enrollment as abandoned",
+          [_stale_raises(pending_account_issues, [_stale_issue()], stale_now, bad)
+           for bad in (0, -1, None, 3.5, True)], [True] * 5)
+    check("stale-pending: the report is ordered by issue NUMBER, not listing order, so a sweep's "
+          "output is stable across pages",
+          [(entry.number, entry.handle) for entry in pending_account_issues(
+              [_stale_issue(number=77, title="acct30"), _stale_issue(number=12, title="acct29")],
+              stale_now, 3)],
+          [(12, "acct29"), (77, "acct30")])
+
+    stale_branch = "account-pool/acct21"
+    stale_open_pr = {"number": 7, "state": "open", "merged_at": None,
+                     "head": {"ref": stale_branch}, "base": {"ref": "master"}}
+    stale_merged_pr = {"number": 8, "state": "closed", "merged_at": "2026-01-02T03:04:05Z",
+                       "head": {"ref": stale_branch}, "base": {"ref": "master"}}
+    stale_closed_pr = {"number": 9, "state": "closed", "merged_at": None,
+                       "head": {"ref": stale_branch}, "base": {"ref": "master"}}
+    check("stale-pending: a CLOSED-UNMERGED grant PR is `none` — it is precisely the case the "
+          "merge-only `activate` job can never recover, so it must not read as covered",
+          grant_pr_disposition([stale_closed_pr], stale_branch), "none")
+    check("stale-pending: an OPEN grant PR is in flight, a MERGED one already landed, and merged "
+          "DOMINATES open (a re-opened branch cannot un-merge a grant)",
+          (grant_pr_disposition([stale_open_pr], stale_branch),
+           grant_pr_disposition([stale_merged_pr], stale_branch),
+           grant_pr_disposition([stale_open_pr, stale_merged_pr], stale_branch),
+           grant_pr_disposition([stale_merged_pr, stale_open_pr], stale_branch)),
+          ("open", "merged", "merged", "merged"))
+    check("stale-pending: the head/base match is EXACT — a look-alike branch, another handle's "
+          "grant branch, a missing head and a PR into another base are all `none`, so an "
+          "unrelated PR can never vouch for this enrollment's grant",
+          [grant_pr_disposition([pull], stale_branch) for pull in (
+              {**stale_merged_pr, "head": {"ref": "account-pool/acct21x"}},
+              {**stale_merged_pr, "head": {"ref": "account-pool/acct22"}},
+              {**stale_merged_pr, "head": {"ref": "acct21"}},
+              {**stale_merged_pr, "head": None},
+              {**stale_merged_pr, "base": {"ref": "develop"}},
+              {**stale_open_pr, "base": None},
+          )],
+          ["none"] * 6)
+    check("stale-pending: an unreadable pull listing REFUSES — reading it as `none` would publish "
+          "an enrollment whose grant PR is open and healthy as abandoned",
+          [_stale_raises(grant_pr_disposition, payload, stale_branch)
+           for payload in (None, "no-prs", {"number": 7}, [stale_open_pr, "oops"])],
+          [True] * 4)
+
+    stale_entry = PendingAccount(number=501, handle="acct21", age_days=10,
+                                 request_issue=900, secret_ref="ACCT21_TOKEN")
+    stale_report = format_stale_pending_report(
+        [(stale_entry, "none"),
+         (PendingAccount(502, "acct22", 11, None, None), "none"),
+         (PendingAccount(503, "acct23", 12, 901, "ACCT23_TOKEN"), "open"),
+         (PendingAccount(504, "acct24", 13, 902, "ACCT24_TOKEN"), "merged")], 3)
+    check("stale-pending: the summary counts every disposition, so a merged-but-still-pending "
+          "account (the `activate` job's own always() alarm owns it) is visible without being "
+          "named as abandoned",
+          stale_report[0],
+          "STALE-PENDING pending=4 min_age_days=3 grant_pr_open=1 grant_pr_merged=1 abandoned=2")
+    check("stale-pending: ONLY the abandoned enrollments are named, each with its handle, account "
+          "issue, age, grant branch and recovery links (an unlinked one says so rather than "
+          "inventing a number)",
+          [line for line in stale_report if line.startswith("STALE-PENDING acct")],
+          ["STALE-PENDING acct21: account issue #501 has been status:pending for 10d and no "
+           "`account-pool/acct21` PR is open or merged — the enrollment was abandoned before its "
+           "account_pool grant landed (request issue #900, credential secret ACCT21_TOKEN)",
+           "STALE-PENDING acct22: account issue #502 has been status:pending for 11d and no "
+           "`account-pool/acct22` PR is open or merged — the enrollment was abandoned before its "
+           "account_pool grant landed (request issue UNLINKED, credential secret UNRECORDED)"])
+    check("stale-pending: a report that names anything carries the NEVER-DELETE instruction — "
+          "deleting the credential secret destroys the #211 resume that recovers the enrollment",
+          stale_report[-1], STALE_PENDING_NOTE)
+    stale_clean_report = format_stale_pending_report([(stale_entry, "open")], 3)
+    check("stale-pending: a clean fleet reports `none` and names no account",
+          (len(stale_clean_report), "abandoned=0" in stale_clean_report[0],
+           [line for line in stale_clean_report if line.startswith("STALE-PENDING acct")]),
+          (2, True, []))
+
+    # The CLI contract, driven through main() exactly as groom.yml drives it: real argument
+    # parsing, the real grant-account.py import for the branch namespace, the real paginated
+    # request sequence. Only the HTTP boundary is stubbed.
+    stale_repo = "jeswr/agent-account-registry"
+
+    def _stale_live(days_ago: int) -> str:
+        return datetime.fromtimestamp(
+            int(time.time()) - days_ago * 86400, timezone.utc).isoformat()
+
+    def _stale_row(number: int, handle: str, days_ago: int, **overrides: Any) -> dict[str, Any]:
+        row = {
+            "number": number, "title": handle, "state": "open",
+            "labels": [{"name": "account"}, {"name": PENDING_STATUS_LABEL}],
+            "created_at": _stale_live(days_ago),
+            "body": f"secret_ref: {handle.upper()}_TOKEN\nrequest_issue: {number + 400}\n",
+        }
+        row.update(overrides)
+        return row
+
+    stale_pages = {
+        f"/repos/{stale_repo}/issues?state=open": [
+            _stale_row(501, "acct21", 10),                        # abandoned: no grant PR at all
+            _stale_row(502, "acct22", 10),                        # grant PR OPEN: in flight
+            _stale_row(503, "acct23", 10),                        # grant PR MERGED: activate's case
+            _stale_row(504, "acct24", 10),                        # grant PR CLOSED-UNMERGED
+            _stale_row(505, "acct25", 1),                         # below the age floor
+            _stale_row(506, "acct26", 10, state="closed"),        # deliberately abandoned already
+            _stale_row(507, "acct27", 10,
+                       labels=[{"name": "status:available"}]),    # live account
+            _stale_row(508, "acct28", 10,
+                       pull_request={"url": "x"}),                # the grant PR itself
+            _stale_row(509, "groom: acct29 is pending", 10),      # not an account record
+        ],
+        f"/repos/{stale_repo}/pulls?head=jeswr:account-pool/acct22&state=all": [
+            {"number": 61, "state": "open", "merged_at": None,
+             "head": {"ref": "account-pool/acct22"}, "base": {"ref": "master"}}],
+        f"/repos/{stale_repo}/pulls?head=jeswr:account-pool/acct23&state=all": [
+            {"number": 62, "state": "closed", "merged_at": "2026-01-02T03:04:05Z",
+             "head": {"ref": "account-pool/acct23"}, "base": {"ref": "master"}}],
+        f"/repos/{stale_repo}/pulls?head=jeswr:account-pool/acct24&state=all": [
+            {"number": 63, "state": "closed", "merged_at": None,
+             "head": {"ref": "account-pool/acct24"}, "base": {"ref": "master"}}],
+    }
+    stale_saved_api = globals()["GitHubAPI"]
+
+    def _stale_cli(
+        env: dict[str, str | None], pages: dict[str, list[Any]],
+        repo: str = stale_repo, extra: list[str] | None = None,
+    ) -> tuple[Any, ...]:
+        recorded: list[tuple[str, str, Any]] = []
+
+        class _RecordingAPI(stale_saved_api):                       # type: ignore[misc, valid-type]
+            def request(self, method, path, body=None, **_kw):
+                recorded.append((method, path, body))
+                base, page = path.split("&per_page=")[0], int(path.rsplit("page=", 1)[1])
+                # A FAITHFUL 100-per-page slice, not a page-1-only stub: a reader that stops
+                # after the first page must actually LOSE the rows on page 2 (see the multi-page
+                # check below), or "goes through the paginated reader" is asserted by path shape
+                # alone and a single-page read passes it.
+                return list(pages.get(base, []))[(page - 1) * 100:page * 100]
+
+        held = {"REGISTRY_GH_TOKEN": os.environ.get("REGISTRY_GH_TOKEN")}
+        saved_stale_argv, buffer = sys.argv, io.StringIO()
+        saved_out, saved_err = sys.stdout, sys.stderr
+        globals()["GitHubAPI"] = _RecordingAPI
+        try:
+            for key, value in env.items():
+                os.environ.pop(key, None) if value is None else os.environ.__setitem__(key, value)
+            sys.argv = ["groom.py", "--report-stale-pending", "--registry-repo", repo,
+                        *(extra or [])]
+            # BOTH streams: the groom step's stderr lands in the same log as its stdout.
+            sys.stdout = sys.stderr = buffer
+            code = main()
+        finally:
+            sys.stdout, sys.stderr = saved_out, saved_err
+            sys.argv = saved_stale_argv
+            globals()["GitHubAPI"] = stale_saved_api
+            for key, value in held.items():
+                os.environ.pop(key, None) if value is None else os.environ.__setitem__(key, value)
+        return code, buffer.getvalue(), recorded
+
+    stale_code, stale_text, stale_calls = _stale_cli(
+        {"REGISTRY_GH_TOKEN": "registry-token"}, stale_pages)
+    check("stale-pending CLI: names exactly the enrollments with NO open and NO merged grant PR "
+          "(no PR at all, and a CLOSED-UNMERGED one) and exits 0 — a hygiene report never takes "
+          "the sweep down",
+          (stale_code,
+           sorted(line.split()[1].rstrip(":") for line in stale_text.splitlines()
+                  if line.startswith("STALE-PENDING acct"))),
+          (0, ["acct21", "acct24"]))
+    check("stale-pending CLI: the summary line counts what the listings proved",
+          [line for line in stale_text.splitlines() if line.startswith("STALE-PENDING pending=")],
+          ["STALE-PENDING pending=4 min_age_days=3 grant_pr_open=1 grant_pr_merged=1 abandoned=2"])
+    check("stale-pending CLI: REPORT-ONLY — every request is a GET, so no secret and no claim ref "
+          "can be deleted (the credential is what makes the enrollment resumable, #211)",
+          sorted({method for method, _path, _body in stale_calls}), ["GET"])
+    check("stale-pending CLI: every listing goes through the PAGINATED reader, and the grant-PR "
+          "lookup is scoped to the IMPORTED `account-pool/<handle>` branch with state=all (a "
+          "merged-only lookup would miss the closed-unmerged case this report exists for)",
+          sorted(path for _method, path, _body in stale_calls),
+          [f"/repos/{stale_repo}/issues?state=open&per_page=100&page=1"]
+          + [f"/repos/{stale_repo}/pulls?head=jeswr:account-pool/acct2{n}&state=all"
+             f"&per_page=100&page=1" for n in (1, 2, 3, 4)])
+    check("stale-pending CLI: the recovery instruction reaches the log, and no token value does",
+          (STALE_PENDING_NOTE in stale_text, "registry-token" in stale_text), (True, False))
+
+    stale_paged_code, stale_paged_text, stale_paged_calls = _stale_cli(
+        {"REGISTRY_GH_TOKEN": "registry-token"},
+        {**stale_pages,
+         f"/repos/{stale_repo}/issues?state=open":
+             [{"number": 100 + n, "title": f"unrelated issue {n}", "state": "open",
+               "labels": [], "created_at": _stale_live(10), "body": ""} for n in range(100)]
+             + [_stale_row(501, "acct21", 10)]})
+    check("stale-pending CLI: an account issue on the SECOND page is still reported — the walk "
+          "really continues past a full page, so a capped read cannot silently declare a fleet "
+          "clean (this is the check a path-shape-only assertion cannot make)",
+          (stale_paged_code, "STALE-PENDING acct21:" in stale_paged_text,
+           sum(1 for _m, path, _b in stale_paged_calls if "/issues?state=open" in path)),
+          (0, True, 2))
+
+    stale_clean_code, stale_clean_text, _ = _stale_cli(
+        {"REGISTRY_GH_TOKEN": "registry-token"},
+        {**stale_pages, f"/repos/{stale_repo}/issues?state=open": [_stale_row(502, "acct22", 10)]})
+    check("stale-pending CLI: a fleet whose pending enrollments all have an open grant PR reports "
+          "`none` and names nobody",
+          (stale_clean_code, "abandoned=0" in stale_clean_text,
+           "STALE-PENDING acct" in stale_clean_text), (0, True, False))
+    stale_floor_code, stale_floor_text, _ = _stale_cli(
+        {"REGISTRY_GH_TOKEN": "registry-token"}, stale_pages, extra=["--stale-pending-days", "30"])
+    check("stale-pending CLI: --stale-pending-days really reaches the filter (a 30-day floor "
+          "clears this 10-day-old fleet)",
+          (stale_floor_code, "min_age_days=30 grant_pr_open=0 grant_pr_merged=0 abandoned=0"
+           in stale_floor_text, "STALE-PENDING acct" in stale_floor_text), (0, True, False))
+    stale_bad_floor_code, stale_bad_floor_text, stale_bad_floor_calls = _stale_cli(
+        {"REGISTRY_GH_TOKEN": "registry-token"}, stale_pages, extra=["--stale-pending-days", "0"])
+    check("stale-pending CLI: a non-positive floor REFUSES before any read — it would otherwise "
+          "report every enrollment created this minute as abandoned",
+          (stale_bad_floor_code, "STALE-PENDING" in stale_bad_floor_text, stale_bad_floor_calls),
+          (1, False, []))
+    stale_untoken_code, stale_untoken_text, _ = _stale_cli(
+        {"REGISTRY_GH_TOKEN": None}, stale_pages)
+    check("stale-pending CLI: a missing registry token is a REFUSAL, not an empty report — "
+          "`could not tell` must never read as `nothing is abandoned`",
+          (stale_untoken_code, "STALE-PENDING" in stale_untoken_text), (1, False))
+    stale_unsafe_code, stale_unsafe_text, stale_unsafe_calls = _stale_cli(
+        {"REGISTRY_GH_TOKEN": "registry-token"}, stale_pages,
+        repo="jeswr/agent-account-registry/../../evil")
+    check("stale-pending CLI: an unsafe --registry-repo REFUSES before any request is issued",
+          (stale_unsafe_code, "STALE-PENDING" in stale_unsafe_text, stale_unsafe_calls),
+          (1, False, []))
+    stale_short_code, stale_short_text, _ = _stale_cli(
+        {"REGISTRY_GH_TOKEN": "registry-token"},
+        {**stale_pages,
+         f"/repos/{stale_repo}/issues?state=open": [_stale_row(501, "acct2", 10)]})
+    check("stale-pending CLI: a handle no grant branch can be derived from REFUSES rather than "
+          "reporting an account whose grant PR was never looked for",
+          (stale_short_code, "STALE-PENDING" in stale_short_text), (1, False))
+    saved_stale_argv = sys.argv
+    try:
+        sys.argv = ["groom.py", "--report-stale-pending"]
+        saved_err = sys.stderr
+        sys.stderr = io.StringIO()
+        try:
+            stale_usage_code: Any = main()
+        except SystemExit as exc:
+            stale_usage_code = exc.code
+        finally:
+            sys.stderr = saved_err
+    finally:
+        sys.argv = saved_stale_argv
+    check("stale-pending CLI: --report-stale-pending without --registry-repo is a usage error, "
+          "not a silent pass", stale_usage_code, 2)
+
     # ---- THE YAML SEAM for the burned-slot report ------------------------------------------------
     # The measured lesson of this estate: the uncaught mutants live one level ABOVE the Python — a
     # renamed flag, an `if: false`, a dropped env line, a producer moved after its consumer. So the
@@ -9323,9 +9866,41 @@ def _self_test() -> int:
               "flag",
               [flag for flag in ("git/refs", "--delete", "--prune", "--fail-on", "DELETE")
                if flag in orphan_report_text], [])
+
+        # ---- the same seam for the abandoned-enrollment report (issue #384) ----------------------
+        check("YAML seam: groom.yml invokes --report-stale-pending exactly once, inside the "
+              "`groom` job", len(_orphan_steps_with("--report-stale-pending")), 1)
+        stale_report_step = _orphan_steps_with("--report-stale-pending")[0]
+        stale_report_text = _orphan_code(stale_report_step)
+        check("YAML seam: the abandoned-enrollment step runs THIS script against the registry "
+              "repo with a token (drop the env line and every tick refuses)",
+              ("python3 scripts/groom.py --report-stale-pending" in stale_report_text,
+               '--registry-repo "$GITHUB_REPOSITORY"' in stale_report_text,
+               "REGISTRY_GH_TOKEN: ${{ github.token }}" in stale_report_text),
+              (True, True, True))
+        check("YAML seam: the abandoned-enrollment step is neither if:-disabled nor sweep-fatal",
+              (_step_if_disabled(stale_report_step),
+               "continue-on-error: true" in stale_report_text), (False, True))
+        check("YAML seam: LEAST EXPOSURE holds for the new step too — the secrets context still "
+              "reaches exactly one step, and not this one",
+              (len(_orphan_steps_with("toJSON(secrets)")),
+               "toJSON(secrets)" in stale_report_text,
+               "ACCT_SECRET_NAMES" in stale_report_text), (1, False, False))
+        check("YAML seam: REPORT-ONLY at the seam — the abandoned-enrollment step carries no "
+              "secret-deletion, ref-deletion or gate flag (deleting the credential would destroy "
+              "the #211 resume that recovers the enrollment)",
+              [flag for flag in ("gh secret", "git/refs", "--delete", "--prune", "--fail-on",
+                                 "--reclaim", "DELETE")
+               if flag in stale_report_text], [])
+        check("YAML seam: the `groom` job can LIST pull requests (without it the grant-PR lookup "
+              "403s every tick) and can only READ them — a write scope is not least privilege for "
+              "a report",
+              ([line.split("#", 1)[0].strip() for line in orphan_job
+                if re.match(r"^ {6}pull-requests:", line)]),
+              ["pull-requests: read"])
     except Exception as exc:                       # noqa: BLE001 - fail CLOSED, never skip
-        check(f"YAML seam: groom.yml burned-slot wiring is inspectable "
-              f"({type(exc).__name__}: {exc})", False, True)
+        check(f"YAML seam: groom.yml enrollment-hygiene wiring (burned slots + abandoned "
+              f"enrollments) is inspectable ({type(exc).__name__}: {exc})", False, True)
 
     print("groom self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
@@ -9353,6 +9928,21 @@ def main() -> int:
         help="report `refs/acct-claims/` slots burned by a failed enrolment — claimed, but with "
              "no acctNN issue and no ACCTNN_TOKEN secret (issue #245), then exit. REPORT-ONLY: "
              "claim refs are never deleted",
+    )
+    parser.add_argument(
+        "--report-stale-pending",
+        action="store_true",
+        help="report `status:pending` acctNN accounts whose `account-pool/acctNN` PR is neither "
+             "open nor merged — enrollments abandoned mid-transaction, which the merge-only "
+             "`activate` job can never recover (issue #384), then exit. REPORT-ONLY: the "
+             "credential secret and the claim ref are never deleted",
+    )
+    parser.add_argument(
+        "--stale-pending-days",
+        type=int,
+        default=STALE_PENDING_DEFAULT_DAYS,
+        help="with --report-stale-pending: minimum age of a `status:pending` account issue before "
+             f"it can be reported as abandoned (default: {STALE_PENDING_DEFAULT_DAYS})",
     )
     parser.add_argument("--registry-repo")
     parser.add_argument("--policy-file", default="policy/repos.toml")
@@ -9404,6 +9994,18 @@ def main() -> int:
             # A refusal is the report. Exiting NON-ZERO on an unprovable inventory is what keeps
             # "could not tell" from reading as "nothing is burned"; groom.yml runs this step
             # continue-on-error so the refusal is loud without ever aborting the repair sweep.
+            print(f"groom: {exc}", file=sys.stderr)
+            return 1
+    if args.report_stale_pending:
+        if not args.registry_repo:
+            parser.error("--report-stale-pending requires --registry-repo")
+        try:
+            return report_stale_pending(args)
+        except GroomError as exc:
+            # Same contract as the burned-slot report: a refusal IS the report, and exiting
+            # NON-ZERO is what keeps "could not tell" from reading as "nothing is abandoned".
+            # groom.yml runs the step continue-on-error, so the refusal is loud but never aborts
+            # the repair sweep.
             print(f"groom: {exc}", file=sys.stderr)
             return 1
     if not args.registry_repo:
