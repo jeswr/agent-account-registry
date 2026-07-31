@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1434,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "256756d75a9abba6fc91239b5c569602c11071b7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nApproved. The change replaces substring-based audit suppression with an exact App-identity, reviewed-SHA, and dedicated-comment-shape predicate. Unprovable or malformed receipts fail toward reposting the audit, preserving the trust-plane trail. The writer and reader share centralized construction, and the self-test performs a production-path round trip while separately pinning stale SHA, human/foreign identity, laundering, header suffix, extra/trailing blocks, bare markers, CRLF normalization, and empty bot identity. No trust check is weakened, and no diff-scoped correctness, security, or non-vacuity defect was found.",
+  "verdict": "approve"
+ }
+}
