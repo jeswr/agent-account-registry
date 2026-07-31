@@ -684,11 +684,17 @@ jobs:
           # than the lane had before this change, and named in the audit line below. It grants
           # nothing: the alternative, parking every trust-surface fix to a human, would disable the
           # fix lane for the majority of this repo's PRs. But "retain a known fix-capable persona"
-          # has to be KNOWN, so a fallback the target EXPLICITLY declares `fix_capable = false`
-          # (a `role = "impl"` row repointed at a verdict-only brief) fails this job closed instead
-          # — same class as the docs-only-model refusal above: a routing-document defect a human
-          # must fix. Silence is not a refusal; a target with no [agents] table keeps exactly the
-          # behaviour it had before this change.
+          # has to be KNOWN, and [#285] review r3 measured what "known" was worth here: the
+          # fallback was refused only on an EXPLICIT `fix_capable = false`, so a target that had
+          # OPTED IN to the capability table and then omitted its `role = "impl"` persona — renamed
+          # it, or wrote a malformed row/value — published that undeclared persona to
+          # `worker-live.sh fix` as if it were known. Omission was the permissive case at the FINAL
+          # selection point, which is the one place the value actually reaches a model. So
+          # `agent_fix_refused` turns on whether the target declares capabilities AT ALL: no
+          # `[agents]` table -> exactly the pre-declaration behaviour, table present -> the
+          # fallback must be declared `fix_capable = true` like any other persona, and anything
+          # less fails this job closed — same class as the docs-only-model refusal above, a
+          # routing-document defect a human must fix.
           #
           # REVIEW MODE NEVER ENTERS THIS: `route_agent` is empty there (no route is consumed), so
           # the persona stays the `--role review` reviewer — which is DECLARED not fix-capable and
@@ -698,10 +704,6 @@ jobs:
           # job and no model consumes this value at all.
           persona_source = "role-resolved"
           resolved_agent = policy["agent"]
-          if mode == "fix" and policy_resolve.agent_fix_forbidden(routing, resolved_agent):
-              raise SystemExit(
-                  "the role-resolved fix persona is declared fix_capable = false in the target's "
-                  "routing: a mutating lane cannot run a verdict-only brief")
           if route_agent:
               if policy_resolve.agent_fix_capable(routing, route_agent):
                   resolved_agent = route_agent
@@ -709,6 +711,15 @@ jobs:
               else:
                   persona_source = ("role-resolved (route persona REFUSED: the target's routing "
                                     "does not declare it fix_capable)")
+          # The check is on the persona this job PUBLISHES, after the fallback is settled — the
+          # final selection point. An adopted route persona already satisfies it; a fallback the
+          # target never declared does not, so a capability-enabled target cannot reach
+          # `worker-live.sh fix` through silence.
+          if mode == "fix" and policy_resolve.agent_fix_refused(routing, resolved_agent):
+              raise SystemExit(
+                  "the fix persona this lane resolved is not declared fix_capable = true in the "
+                  "target's routing, which declares capabilities for other personas: a mutating "
+                  "lane runs a DECLARED fixer or nobody")
           models = routing.get("models", {})
           chain = []
           for alias in wanted:

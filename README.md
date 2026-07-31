@@ -308,11 +308,14 @@ a rolling `data/cache-affinity.json`), never in the public repos.
 
   `policy-resolve.agent_fix_capable` reads it **fail-closed**: undeclared, malformed, or anything
   that is not the boolean `true` is not adoptable, and the lane keeps its `--role impl`
-  implementer — so a target with no `[agents]` table behaves exactly as it did before this
-  existed. The complement is explicit too: a persona declared `fix_capable = false` sitting in the
-  fix lane's `role = "impl"` fallback fails the resolve job closed rather than fixing under a
-  brief that forbids fixing. Declare a row for every agent your routes name; `dispatch-claim.py`'s
-  self-test pins each declaration against the brief `worker-live.sh` actually loads.
+  implementer. The same rule then binds that fallback (`agent_fix_refused`): the persona the lane
+  finally **publishes** must be declared `fix_capable = true` too, so an explicit `false`, a
+  malformed row, or a `role = "impl"` persona this table simply never names fails the resolve job
+  closed rather than fixing under a brief that may forbid fixing. **Declare a row for every agent
+  your routes name** — the opt-in is the whole table, so a target with no `[agents]` table behaves
+  exactly as it did before this existed, while one that has it cannot reach the fixer through
+  silence. `dispatch-claim.py`'s self-test pins each declaration against the brief
+  `worker-live.sh` actually loads.
 
 ## Adding an account — step-by-step runbook (an agent can follow this verbatim)
 

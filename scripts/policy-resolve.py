@@ -544,24 +544,32 @@ def agent_fix_capable(routing_doc, agent):
     return declaration.get(FIX_CAPABLE_KEY) is True
 
 
-def agent_fix_forbidden(routing_doc, agent):
-    """Is ``agent`` EXPLICITLY declared NOT fix-capable?
+def agent_fix_refused(routing_doc, agent):
+    """Must a mutating (fix) lane REFUSE ``agent`` as its role-resolved FALLBACK persona?
 
-    The strict complement of :func:`agent_fix_capable`, and NOT its negation: an agent the target
-    has said nothing about is neither authorised nor forbidden. review-fix.yml uses this on the
-    persona it FALLS BACK to, so "retain a known fix-capable persona" cannot silently retain a
-    persona the target itself declares verdict-only (a `role = "impl"` row repointed at the
-    reviewer). Undeclared stays unchanged-behaviour; only an explicit `false` refuses.
+    review-fix.yml applies this to the persona it falls back to when the route's own persona is
+    not adoptable, so "retain a KNOWN fix-capable persona" has to mean known.
+
+    The only question is whether the target has OPTED IN to declaring capabilities at all:
+
+    * NO ``[agents]`` table -> nothing is refused. Every target that predates this declaration
+      keeps exactly the `--role impl` implementer it had before, which is why this is not simply
+      ``not agent_fix_capable``.
+    * The table EXISTS -> the fallback must be declared ``fix_capable = true`` like any other
+      persona. [#285 review r3] An explicit ``false`` is not the only way to be unusable: a
+      capability-enabled target that OMITS its `role = "impl"` persona, renames it without
+      declaring the new name, or writes a malformed row/value has produced capability data that
+      says nothing about the one persona a mutating lane is about to run. Reading that silence as
+      authorisation made omission the permissive case at the FINAL selection point — the one place
+      the value is published to `worker-live.sh fix`. Once a target declares capabilities, an
+      undeclared fallback is a routing-document defect a human must fix, not a default to grant.
+
+    A routing document that is not a table has no `[agents]` table to opt in with, and is refused
+    upstream by :func:`resolve` long before a persona is selected.
     """
-    if not isinstance(agent, str) or not agent.strip() or not isinstance(routing_doc, dict):
+    if not isinstance(routing_doc, dict) or AGENT_TABLE not in routing_doc:
         return False
-    table = routing_doc.get(AGENT_TABLE)
-    if not isinstance(table, dict):
-        return False
-    declaration = table.get(agent.strip())
-    if not isinstance(declaration, dict):
-        return False
-    return declaration.get(FIX_CAPABLE_KEY) is False
+    return not agent_fix_capable(routing_doc, agent)
 
 
 def _self_test():
@@ -1021,19 +1029,32 @@ notes = "declared, but says nothing about fixing"
     check("a non-table routing document is not an authorisation",
           [_cap(agent_fix_capable, doc, "impl-agent") for doc in (None, [], "agents")],
           [False, False, False])
-    # agent_fix_forbidden is the STRICT COMPLEMENT, not the negation: silence forbids nothing, so
-    # a target that has not declared capabilities keeps the behaviour it had.
-    check("only an EXPLICIT fix_capable = false forbids the fallback persona",
-          [agent_fix_forbidden(cap_routing, name) for name in
-           ("security-agent", "impl-agent", "silent-agent", "second-reviewer", "malformed-agent")],
-          [True, False, False, False, False])
-    check("no [agents] table forbids nobody", agent_fix_forbidden(routing, "impl-agent"), False)
-    check("a blank/non-string agent or a non-table routing document forbids nobody either, and "
-          "does not crash",
-          [_cap(agent_fix_forbidden, doc, name) for doc, name in
+    # agent_fix_refused is the FALLBACK side, and it turns on ONE thing: has the target opted in to
+    # declaring capabilities at all? [#285 review r3] It was the strict complement of
+    # `fix_capable = false` — which made OMISSION the permissive case at the final selection point:
+    # a capability-enabled target that never declared its `role = "impl"` persona (renamed, or a
+    # malformed row) handed that undeclared persona straight to `worker-live.sh fix` as a "known
+    # fix-capable" fallback. Once the table exists, only a DECLARATION authorises.
+    check("with an [agents] table, ONLY a declared-true fallback survives — false, silent, "
+          "malformed and UNDECLARED personas all refuse the fix lane",
+          [agent_fix_refused(cap_routing, name) for name in
+           ("impl-agent", "security-agent", "silent-agent", "second-reviewer", "malformed-agent",
+            "stringy-agent", "truthy-agent")],
+          [False, True, True, True, True, True, True])
+    # ...and the legacy carve-out, which is the ONLY reason this is not `not agent_fix_capable`.
+    check("no [agents] table refuses nobody (pre-declaration targets keep their implementer)",
+          [agent_fix_refused(routing, name) for name in ("impl-agent", "security-agent", "")],
+          [False, False, False])
+    check("an [agents] table that is PRESENT but declares nobody is an opt-in, not a bypass",
+          [agent_fix_refused(doc, "impl-agent")
+           for doc in ({"agents": {}}, {"agents": "impl-agent = true"}, {"agents": []})],
+          [True, True, True])
+    check("a blank/non-string agent is refused once the table exists, and does not crash; a "
+          "routing document that is not a table has no table to opt in with",
+          [_cap(agent_fix_refused, doc, name) for doc, name in
            ((cap_routing, None), (cap_routing, "   "), (cap_routing, 7),
             (None, "security-agent"), ("agents", "security-agent"))],
-          [False, False, False, False, False])
+          [True, True, True, False, False])
     # ---- [OPUS-5] CHAIN-ORDER PREFERENCES (sparq PR #4211 / the area:gui carve-out).
     # THIS resolver is the CLAIM side. PLAN runs the TARGET's route-resolve.py and
     # dispatch-claim._route_matches then demands EXACT equality of the chain, so a preference this

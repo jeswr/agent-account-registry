@@ -102,10 +102,14 @@ credential_format = "codex-auth-json"
 #
 # FAIL-CLOSED BY CONSTRUCTION: an undeclared agent, a malformed row, and any value that is not the
 # boolean `true` all read as NOT fix-capable, so the lane keeps its `--role impl` implementer. A
-# target with no [agents] table adopts no route persona at all. The reverse direction is explicit
-# too: `fix_capable = false` also REFUSES that persona as the fallback (policy-resolve
-# .agent_fix_forbidden), so a `role = "impl"` row repointed at a verdict-only brief fails the
-# resolve job closed instead of running a fixer that is told not to edit.
+# target with no [agents] table adopts no route persona at all.
+#
+# ONCE THIS TABLE EXISTS, IT BINDS THE FALLBACK TOO (policy-resolve.agent_fix_refused). The persona
+# the lane finally PUBLISHES — the route's if it was adopted, otherwise the `--role impl` one —
+# must be declared `fix_capable = true` here, so an omitted, renamed or malformed `role = "impl"`
+# declaration fails the resolve job closed instead of shipping an undeclared persona to
+# `worker-live.sh fix` as a "known fix-capable" fallback. DECLARE A ROW FOR EVERY AGENT YOUR ROUTES
+# NAME. Only a target with NO [agents] table at all keeps the pre-declaration behaviour.
 #
 # KEPT HONEST BY A TEST, not by this comment: dispatch-claim.py's L3b-agent rows read the REAL
 # briefs and require every `fix_capable = false` persona to declare itself verdict-only, every

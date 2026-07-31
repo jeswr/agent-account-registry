@@ -11779,7 +11779,7 @@ def _self_test():
 
     # The REGISTRY-OWNED resolver the workflow itself loads. It is bound HERE, above the harness,
     # because the harness injects its CAPABILITY functions unstubbed: the fix-persona rows below
-    # must drive `agent_fix_capable` / `agent_fix_forbidden` in production form, not a copy — the
+    # must drive `agent_fix_capable` / `agent_fix_refused` in production form, not a copy — the
     # #958 shape (one rule, two definitions) is exactly what a re-implemented capability check
     # would be, and a test that re-implements the predicate it is testing tests nothing.
     _pol285 = _load_module("registry_policy_resolve_285",
@@ -11821,7 +11821,7 @@ def _self_test():
               "policy": {"agent": policy_agent},
               "policy_resolve": resolver or types.SimpleNamespace(
                   resolve=_resolve, agent_fix_capable=_pol285.agent_fix_capable,
-                  agent_fix_forbidden=_pol285.agent_fix_forbidden),
+                  agent_fix_refused=_pol285.agent_fix_refused),
               # The REAL helper object the dispatcher constrains its own claim with, so the two
               # sides of the adopt comparison cannot disagree about what a route authorises.
               "dispatch_claim": types.SimpleNamespace(
@@ -11962,10 +11962,16 @@ def _self_test():
 
     # SYNTHETIC CAPABILITY TABLE — the adoption INVARIANT over the values a route may produce,
     # rather than over three checked-in names. `auditor-persona` is the row round 1 could not
-    # refuse: a verdict-only persona whose NAME differs from every review-role persona.
+    # refuse: a verdict-only persona whose NAME differs from every review-role persona. The
+    # remaining rows are the shapes [#285] review r3 found permissive in the FALLBACK slot, where
+    # only an explicit `false` used to refuse: silence, a malformed value, a malformed row, and a
+    # persona simply absent from a table that exists.
     _cap285 = {"agents": {"fixer-persona": {"fix_capable": True},
+                          "fallback-persona": {"fix_capable": True},
                           "auditor-persona": {"fix_capable": False},
-                          "silent-persona": {"note": "declared, says nothing about fixing"}}}
+                          "silent-persona": {"note": "declared, says nothing about fixing"},
+                          "stringy-persona": {"fix_capable": "true"}}}
+    _cap285["agents"]["broken-persona"] = "fix_capable = true"   # a row that is not a table at all
 
     def _persona285(source=None, **kwargs):
         """The persona review-fix.yml resolves, or "REFUSED" when the block fails the job closed."""
@@ -11974,14 +11980,30 @@ def _self_test():
         except SystemExit:
             return "REFUSED"
 
+    def _cap_row285(source, route_agent, policy_agent="fallback-persona", routing=_cap285):
+        """One synthetic row: which persona review-fix.yml publishes for this (route, fallback)."""
+        return _persona285(source=source, mode="fix", wanted=FIX_CHAIN["anthropic"],
+                           route_chain=["opus5"], route_agent=route_agent, routing=routing,
+                           policy_agent=policy_agent)
+
     def _persona_rows285(source=None):
         """The rows the capability gate must keep apart — LIVE tables first, then the invariant.
 
         Row 1 is the motivating `area:review-loop` case verbatim, driven end to end by the REAL
         resolver over the checked-in tables. Row 2 is an ordinary live route persona that must
-        still be ADOPTED. Rows 3-5 are the general invariant: declared-capable adopts,
+        still be ADOPTED. Rows 3-5 are the ROUTE side of the invariant: declared-capable adopts,
         declared-NOT-capable refuses under a name nothing else in the repo uses, and an UNDECLARED
-        persona refuses too. Row 6 is the fallback's own capability check."""
+        persona refuses too.
+
+        Rows 6-10 are the FALLBACK side, and rows 7-10 are [#285] review r3: once a target HAS an
+        `[agents]` table, an explicit `fix_capable = false` is not the only unusable fallback —
+        silence, a malformed value, a malformed row and a persona absent from the table are all
+        capability data that says nothing about the persona a mutating lane is about to run, and
+        every one of them used to be published to `worker-live.sh fix` as "known fix-capable".
+        Row 11 is the ordering that keeps that from over-firing: the check is on the persona
+        actually PUBLISHED, so an undeclared fallback the lane never uses does not take down a
+        target whose route persona is declared. Row 12 is the legacy carve-out — no `[agents]`
+        table at all is pre-declaration behaviour, not a refusal."""
         return (
             _persona285(source=source, mode="fix", wanted=FIX_CHAIN["anthropic"], resolver=_pol285,
                         target_repo=_reg285, issue_labels=_labels285, policy_agent=_impl285,
@@ -11989,15 +12011,17 @@ def _self_test():
             _persona285(source=source, mode="fix", wanted=FIX_CHAIN["anthropic"],
                         route_chain=["opus5"], route_agent="registry-ci", routing=_routing285,
                         policy_agent=_impl285),
-            _persona285(source=source, mode="fix", wanted=FIX_CHAIN["anthropic"],
-                        route_chain=["opus5"], route_agent="fixer-persona", routing=_cap285),
-            _persona285(source=source, mode="fix", wanted=FIX_CHAIN["anthropic"],
-                        route_chain=["opus5"], route_agent="auditor-persona", routing=_cap285),
-            _persona285(source=source, mode="fix", wanted=FIX_CHAIN["anthropic"],
-                        route_chain=["opus5"], route_agent="undeclared-persona", routing=_cap285),
-            _persona285(source=source, mode="fix", wanted=FIX_CHAIN["anthropic"],
-                        route_chain=["opus5"], route_agent="fixer-persona", routing=_cap285,
-                        policy_agent="auditor-persona"),
+            _cap_row285(source, "fixer-persona"),
+            _cap_row285(source, "auditor-persona"),
+            _cap_row285(source, "undeclared-persona"),
+            _cap_row285(source, "undeclared-persona", policy_agent="auditor-persona"),
+            _cap_row285(source, "undeclared-persona", policy_agent="silent-persona"),
+            _cap_row285(source, "undeclared-persona", policy_agent="stringy-persona"),
+            _cap_row285(source, "auditor-persona", policy_agent="broken-persona"),
+            _cap_row285(source, "undeclared-persona", policy_agent="absent-persona"),
+            _cap_row285(source, "fixer-persona", policy_agent="absent-persona"),
+            _cap_row285(source, "undeclared-persona", policy_agent="role-resolved-agent",
+                        routing={}),
         )
 
     # THE LIVE RED CASE: the trust-surface route's verdict-only persona is REFUSED for fix mode and
@@ -12014,10 +12038,13 @@ def _self_test():
         "fix` would run a brief that forbids editing the PR at all", _rf285[2], _route285)
     # ...and the full row set. Adoption tracks the DECLARATION and nothing else: a differently
     # named verdict-only persona is refused exactly like the reviewer, an undeclared one is
-    # refused, and a declared-NOT-capable persona in the `--role impl` fallback slot fails the
-    # resolve job CLOSED rather than fixing under a brief that forbids fixing.
-    assert _persona_rows285() == (_impl285, "registry-ci", "fixer-persona", "role-resolved-agent",
-                                  "role-resolved-agent", "REFUSED"), _persona_rows285()
+    # refused, and a fallback persona a capability-enabled target has not DECLARED fix-capable —
+    # by an explicit false, by silence, by a malformed value or row, or by never naming it — fails
+    # the resolve job CLOSED rather than fixing under a brief that may forbid fixing.
+    assert _persona_rows285() == (
+        _impl285, "registry-ci", "fixer-persona", "fallback-persona", "fallback-persona",
+        "REFUSED", "REFUSED", "REFUSED", "REFUSED", "REFUSED",
+        "fixer-persona", "role-resolved-agent"), _persona_rows285()
     # REVIEW MODE KEEPS ITS OWN PERSONA. Its agent comes from `--role review`; consuming an
     # implementor route there would hand the read-only reviewer the implementer's brief — the same
     # reason review mode consumes no route CHAIN (row 4 above). It is also the reason the fallback
@@ -12054,9 +12081,10 @@ def _self_test():
     _rf_init285 = 'resolved_agent = policy["agent"]'
     _rf_guard285 = "if policy_resolve.agent_fix_capable(routing, route_agent):"
     _rf_read285 = 'route_agent = route["agent"]'
-    _rf_forbid285 = ('if mode == "fix" and policy_resolve.agent_fix_forbidden('
+    _rf_refuse285 = ('if mode == "fix" and policy_resolve.agent_fix_refused('
                      "routing, resolved_agent):")
-    for _line in (_rf_init285, _rf_guard285, _rf_read285, _rf_forbid285):
+    _rf_refuse_call285 = "policy_resolve.agent_fix_refused(routing, resolved_agent)"
+    for _line in (_rf_init285, _rf_guard285, _rf_read285, _rf_refuse285, _rf_refuse_call285):
         assert _rf_live.count(_line) == 1, f"the fix-persona fixture is stale: {_line}"
     _rf_persona_mutants = (
         # (a) THE CHANGE AS FIRST PROPOSED (the review-round-1 blocker): adopt the route persona
@@ -12082,9 +12110,31 @@ def _self_test():
          _rf_live.replace(_rf_guard285, 'if route_agent.strip() != "registry-reviewer":')),
         # (f) the FALLBACK's own capability check made inert: a `role = "impl"` row repointed at a
         #     verdict-only brief would then fix under a brief that forbids fixing. Only the
-        #     fallback row can see this one.
+        #     fallback rows can see this one.
         ("the role-resolved fallback is never capability-checked",
-         _rf_live.replace(_rf_forbid285, "if False:")),
+         _rf_live.replace(_rf_refuse285, "if False:")),
+        # (g) [#285 review r3] THE REVIEW-ROUND-2 FALLBACK RULE ITSELF: refuse only the fallback the
+        #     target declares `fix_capable = false`, so on a target that HAS a capability table an
+        #     omitted / renamed / malformed `role = "impl"` persona is published to
+        #     `worker-live.sh fix` as if it were known fix-capable. Written out inline (rather than
+        #     as a predicate) so the mutant cannot crash on the malformed row and record a false
+        #     kill; rows 7-10 are the ones that move.
+        ("an UNDECLARED or malformed fallback persona is treated as authorised",
+         _rf_live.replace(_rf_refuse_call285,
+                          'isinstance(routing.get("agents", {}).get(resolved_agent), dict) '
+                          'and routing["agents"][resolved_agent].get("fix_capable") is False')),
+        # (h) ...and the opposite over-reach: the legacy carve-out dropped, so a target that never
+        #     declared capabilities at all has its fix lane refused outright. Only the no-[agents]
+        #     row (12) can see this one.
+        ("a target with NO capability table is refused instead of keeping its implementer",
+         _rf_live.replace(_rf_refuse_call285,
+                          "not policy_resolve.agent_fix_capable(routing, resolved_agent)")),
+        # (i) the check moved OFF the published persona and back onto the role-resolved fallback:
+        #     an undeclared fallback the lane never uses would take down a target whose route
+        #     persona IS declared. Only row 11 — adopted route, undeclared fallback — can see it.
+        ("the check reads the fallback instead of the persona actually published",
+         _rf_live.replace(_rf_refuse_call285,
+                          'policy_resolve.agent_fix_refused(routing, policy["agent"])')),
     )
     for _why285, _mutant in _rf_persona_mutants:
         assert _mutant != _rf_live, f"fix-persona mutant is vacuous: {_why285}"
@@ -12114,11 +12164,13 @@ def _self_test():
           "workflow and taken from the SOURCE ISSUE's own route ONLY when the target's routing "
           "DECLARES that persona fix_capable — driven over declared-capable / declared-NOT-capable "
           "/ undeclared route values, not over names, with the live declaration pinned against the "
-          "real briefs both ways; the fallback persona is capability-checked too (explicit false "
-          "fails the job closed), review mode keeps its verdict-only --role review persona, a "
-          "route with no usable agent fails closed, the publish/WORKER_AGENT seam is pinned "
-          "exact-match, and SIX ways to break the guard — including inferring capability from the "
-          "persona's NAME — are caught")
+          "real briefs both ways; the PUBLISHED persona is capability-checked too, so on a target "
+          "that declares capabilities a fallback that is explicitly false, silent, malformed or "
+          "simply undeclared fails the job closed while a target with NO [agents] table keeps its "
+          "implementer, review mode keeps its verdict-only --role review persona, a route with no "
+          "usable agent fails closed, the publish/WORKER_AGENT seam is pinned exact-match, and "
+          "NINE ways to break the guard — including inferring capability from the persona's NAME "
+          "and reading an undeclared fallback as authorised — are caught")
 
     # L3c. [OPUS-5] THE SEVENTH SITE, and the one that is not in this repository at all: the
     # TARGET-side PLAN resolver. Every layer above pins two derivations that live in the registry.
