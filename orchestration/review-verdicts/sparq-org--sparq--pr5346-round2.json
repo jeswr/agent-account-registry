@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5346,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0022517d490404b08625a38ba23505ddaad689f5",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 confirms the prior approval. The host-side codepoint-to-byte conversion reproduces the same contiguous window as fo_substring, including empty and start-before-one cases, and the generated Noir test invokes the real byte-positional primitive while asserting both byte length and every returned byte. The exhaustive property test is non-vacuous, and the CPython comparison independently checks every emitted ASCII and multibyte corpus window without unsafe interpolation. Coverage/fault accounting includes the new generated test. The documentation accurately limits the result to host-known strings, explicitly leaves private in-circuit codepoint positioning unresolved, and preserves the research-grade/external-audit posture. No correctness, soundness, test-validity, security, or prompt-injection issue was found.",
+  "verdict": "approve"
+ }
+}
