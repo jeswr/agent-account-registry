@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5232,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1d59962e29b3442d1cf17704309a190b28d2dfdb",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 finds no correctness, soundness, test-validity, or security defects. The coverage guard still machine-checks tracked npm lock roots and Dockerfile directories, validates Docker exclusions against parsed FROM directives, and includes non-vacuous negative tests for third-party pins, allowlist changes, and extra stages. The focused test suite passes all 9 tests. Findings are materially unchanged from round 2, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
