@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1340,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "eb8943ae1544cc718b751d4986c019a775836e29",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly distinguishes pending reset timestamps from elapsed ones at render time. The production payload defines `soonest_reset` as the earliest known reset and `oldest_reset` as the latest, and the renderer evaluates each independently, including the mixed case where one reset has elapsed while another remains pending. The meter remains conservative while its stale provenance is clearly disclosed. The executed Node harness exercises the actual page functions with future, elapsed, and split fixtures, asserts both required and forbidden wording, and also verifies that reset fields from a real `build_dashboard` document reach the renderer. I found no correctness, soundness, security, test-validity, or injection issue in the diff.",
+  "verdict": "approve"
+ }
+}
