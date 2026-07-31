@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5291,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4749247a1b28f9a0861c522ea608877b88b9ac61",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The manifest includes the literal `KNOWN_FAILING` in its introductory comments (including the claim that the marker is not written in this directory). `the_suite_declares_no_known_failing_case` recursively reads every file under `tests/trust-expression/` and flags any file whose text contains that exact substring, so it will always report `manifest.ttl` and fail whenever `framework-vocab` is enabled. This contradicts the feature-matrix claim that the companion guard runs successfully on the relevant legs.",
+    "file": "crates/sparq-trust/tests/trust-expression/manifest.ttl",
+    "fix_hint": "Remove the exact sentinel spelling from every file under `tests/trust-expression/` (rephrase the prose without assembling the token), or redesign the guard to parse an explicit machine-readable manifest property rather than substring-scanning comments. Keep a test proving an actual marked entry is rejected without making the checked-in suite self-trigger.",
+    "severity": "major",
+    "title": "Manifest contains the marker its fixture guard forbids"
+   }
+  ],
+  "progress": null,
+  "summary": "The new fixture guard is guaranteed to fail: the suite manifest contains the exact marker that the guard recursively rejects. This prevents the advertised framework-vocab/cert-graph test legs from passing, so the change is not merge-ready.",
+  "verdict": "request_changes"
+ }
+}
