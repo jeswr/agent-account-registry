@@ -1,0 +1,86 @@
+{
+ "host_envelope": {
+  "pr": 5130,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "58e5a03ea640cba65fc1737ac1fd2cfade1056b5",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The [data-plan-time-note] panel now reads \"Wall times are measured through the browser's performance.now() clock. Browser timer precision may be coarsened, so sub-resolution operators display '\u2014'\". No such measurement exists at this head. crates/sparq-engine/src/exec.rs:4840-4848 is the only place per-operator nanos are produced and on wasm32 it is `let nanos = 0u64;`. crates/sparq-wasm/src/explain_plan.rs returns the engine JSON verbatim; gui/app/src/lib/engine-context.tsx:1338 hands it to parsePlanJson (a bare JSON.parse). Grep finds performance.now() only in the GUI's own run-latency/ingest timers, never on the plan-nanos path, and nowhere in crates/. Consequence: EVERY wasm operator is 0, EVERY row shows '\u2014', and the note tells the user that means the work was too fast to time. The truth is no clock ran at all. A user comparing in-tab against native ANALYZE will conclude the query is sub-microsecond rather than untimed. The diff contains no implementation change, so it converts a correct disclosure into a false one \u2014 a direct honesty regression. Unchanged from round 5.",
+    "file": "gui/app/src/components/workbench/plan-tree.tsx",
+    "fix_hint": "Revert the note to the accurate wording (wall times are unmeasured in the in-tab engine; row counts and q-error are exact; use native/endpoint ANALYZE for real times). If the intent is to start measuring, land the measurement FIRST: add a wasm timing source (js_sys/web-time shim behind the existing cfg at crates/sparq-engine/src/exec.rs:4846) so nanos are non-zero, then update crates/sparq-wasm/tests/web.rs:947-956, crates/sparq-engine/src/explain_json.rs:32, and crates/sparq-wasm/src/explain_plan.rs:26,56 in the same change.",
+    "severity": "blocker",
+    "title": "User-visible note falsely claims wasm wall times are measured via performance.now(); engine hard-codes 0 nanos on wasm32"
+   },
+   {
+    "body": "The web-build error string at line 1323 now reads \"Structured in-tab EXPLAIN/ANALYZE still works (row counts and q-error are exact; wall times use performance.now() at browser timer resolution)\". This is user-facing text on the exact path where the user has just been denied real timings, so it is the most misleading possible placement: it tells someone who wanted wall times that the fallback provides them. It does not \u2014 the fallback yields 0 for every operator (crates/sparq-engine/src/exec.rs:4846). The comments at lines 130 and 1300-1308 make the same false assertion about the structured wasm source. All are prose-only edits with no backing code change in this diff. Note the file's OTHER performance.now() uses (lines 1221, 1270, 1415) are genuine per-run latency timers and are unrelated to per-operator plan nanos \u2014 their presence does not substantiate the claim.",
+    "file": "gui/app/src/lib/engine-context.tsx",
+    "fix_hint": "Restore the honest phrasing: row counts and q-error are exact, wall times are unmeasured in the in-tab engine. Keep pointing the user at the desktop-native or endpoint source, which remain the only sources that measure per-operator time.",
+    "severity": "blocker",
+    "title": "Native-EXPLAIN-unavailable error message repeats the false 'wall times use performance.now()' claim to users"
+   },
+   {
+    "body": "The spec previously asserted only that the honesty note is visible. It now asserts the note contains the literal \"performance.now() clock\". This passes for the wrong reason: it verifies a hard-coded string is rendered, and that string states a capability the system does not have. It provides zero evidence any timing is measured, yet it will block anyone who later restores the accurate wording, cementing the false claim as the expected contract. Under the non-vacuous-test rule this test cannot go red on the real defect \u2014 mutate the wasm nanos in exec.rs in any way and the assertion is unaffected.",
+    "file": "gui/e2e-playwright/specs/plan-explorer.web.spec.ts",
+    "fix_hint": "If the note is reverted, revert this assertion with it. If wasm timing is genuinely implemented later, assert on OBSERVED BEHAVIOUR rather than prose \u2014 e.g. that at least one operator row renders a non-'\u2014' duration under a mocked analyze payload with positive nanos, plus a separate case asserting 0/absent nanos still render '\u2014'.",
+    "severity": "major",
+    "title": "E2E assertion rewritten to pin the false claim \u2014 a wrong-oracle test that locks in the regression"
+   },
+   {
+    "body": "The header previously justified explain_native as scoped to \"the one job the webview cannot do itself \u2014 measure REAL per-operator wall time\". It now claims the wasm binding \"measures wall time through the browser's performance.now() clock at host-timer resolution\", reducing the native command's rationale to merely running the analyze \"with a native monotonic clock\". This matters beyond wording: this file documents WHY a SECOND native query surface was granted an exception past the removed pre-wired commands. Weakening a security/scope rationale with an untrue premise degrades the record a future reviewer relies on to judge whether the exception is still warranted. The test doc-comment at ~line 104 is likewise softened from \"the datum the wasm path fundamentally cannot provide\" to a neutral statement, removing the contrast that motivates the test.",
+    "file": "gui/src-tauri/src/explain.rs",
+    "fix_hint": "Restore the original justification. Being the only source that can measure per-operator wall time, because wasm32 has no usable monotonic clock, remains factually correct at this head and should not be diluted.",
+    "severity": "major",
+    "title": "Rewrites the documented justification for the reviewed native-query exception on a false premise"
+   },
+   {
+    "body": "The [data-plan-analyze] button title becomes \"...trace per-operator rows, q-error, and wall time at browser timer resolution\", and the module header changes the IN-TAB bullet from \"wall times unmeasured on wasm32\" to \"structured ANALYZE wall times use performance.now() at browser host-timer resolution\". Both advertise a measurement the code does not perform (crates/sparq-engine/src/exec.rs:4846). The tooltip is the primary affordance a user reads before choosing in-tab ANALYZE over the native path, so the overclaim actively steers users away from the only source that gives them what the tooltip promises. (Line 406's performance.now() in this file is the query-monitor elapsed readout, not plan nanos.)",
+    "file": "gui/app/src/components/workbench/plan-explorer.tsx",
+    "fix_hint": "Revert both strings to the unmeasured wording so the tooltip matches what an in-tab run actually produces.",
+    "severity": "major",
+    "title": "ANALYZE button tooltip and module header assert unbacked wall-time measurement"
+   },
+   {
+    "body": "The explain_native registration comment now states \"Structured in-tab wasm ANALYZE also measures wall time, through performance.now() at browser timer resolution.\" This directly contradicts crates/sparq-engine/src/exec.rs:4845-4847 (`Instant` is unusable on wasm32-unknown-unknown ... `let nanos = 0u64;`) and crates/sparq-wasm/src/explain_plan.rs:26,56, which remain unmodified by this PR and are still correct. The repo now carries two mutually exclusive statements about the same value, with the false one sitting next to the security note about the strict-empty egress allowlist.",
+    "file": "gui/src-tauri/src/lib.rs",
+    "fix_hint": "Revert to the accurate statement: the in-tab wasm engine reads 0 nanos and only the native engine measures real per-operator wall time.",
+    "severity": "major",
+    "title": "Command-registration comment contradicts the engine's own wasm32 timing code"
+   },
+   {
+    "body": "formatNanos and hotOperatorPath docs are rewritten so 0 means \"sub-resolution or unmeasured\" and hotOperatorPath returns null for \"work below the host timer's resolution\" instead of \"a wasm ANALYZE where every node reads 0\". The formatting behaviour is unchanged and still correct, but the documented SEMANTICS of '\u2014' now imply a measurement was attempted and rounded to zero. At this head every wasm value is a hard-coded constant, never a measurement. This is the library-level source of the false story the UI strings repeat, so leaving it would keep re-seeding the overclaim into future docs even if the visible strings were fixed.",
+    "file": "gui/app/src/lib/plan-view.ts",
+    "fix_hint": "Restore the 'wasm ANALYZE reads 0 = unmeasured (no monotonic clock on wasm32)' framing. If a real browser clock is added later, 'sub-resolution' becomes accurate and can be introduced together with that code.",
+    "severity": "major",
+    "title": "Reframes 0 nanos from 'unmeasured' to 'sub-resolution', silently changing what the UI's '\u2014' means"
+   },
+   {
+    "body": "The header and the two inline comments now justify `formatNanos(0) === '\u2014'` by \"0 is sub-resolution/unmeasured\" and the hotOperatorPath zeros case by \"a host timer can report 0 for work below its resolution\", replacing the accurate \"wasm32 reads 0 = unmeasured\". The assertions themselves are unchanged and still valid, so this is not a broken test \u2014 but the comments are the only place these cases record WHY they exist, and rewriting them onto a false premise removes the traceability a future maintainer would use to spot the drift. The rename ('no measured time (dry run / wasm zeros)' \u2192 'no positive time (dry run / sub-resolution zeros)') has the same effect.",
+    "file": "gui/app/src/lib/plan-view.test.ts",
+    "fix_hint": "Revert the comments and the test name; the assertions are correct as-is and need no change.",
+    "severity": "major",
+    "title": "Test comments rewritten to describe the zeros as measured sub-resolution values, removing the honesty rationale the assertions encode"
+   },
+   {
+    "body": "The doc-comment drops \"the datum the in-tab wasm engine fundamentally cannot provide (reads 0, no monotonic clock)\" and substitutes \"Structured in-tab wasm ANALYZE measures them through performance.now() at browser timer resolution.\" Same false premise as the other surfaces; lower severity only because this is an internal API doc rather than user-visible text.",
+    "file": "gui/app/src/lib/tauri-ipc.ts",
+    "fix_hint": "Revert alongside the other doc reverts so the IPC layer's description matches crates/sparq-engine/src/exec.rs:4846.",
+    "severity": "minor",
+    "title": "nativeServiceQuery/explain_native doc repeats the unbacked wasm-timing claim"
+   },
+   {
+    "body": "Taking the PR's intent charitably as a doc reconciliation, it is still incomplete: it rewrites only the GUI/tauri layer while the engine and wasm-binding layers retain the opposite (correct) statement \u2014 crates/sparq-engine/src/explain_json.rs:32 ('On wasm32 the wall nanos are always 0'), and crates/sparq-wasm/src/explain_plan.rs:26,56 \u2014 and the live wasm32 test crates/sparq-wasm/tests/web.rs:947-956 asserts `\"nanos\":0` in both its name and body. A reconciliation that leaves the source of truth stating the opposite of the presentation layer produces exactly the doc drift the repo's honesty rules exist to prevent.",
+    "file": "gui/src-tauri/src/explain.rs",
+    "fix_hint": "Whichever direction is chosen, make it complete and consistent across engine, wasm binding, its wasm32 test, and the GUI. Given the code as written, the consistent direction is to revert the GUI prose to match the engine.",
+    "severity": "minor",
+    "title": "Change is internally inconsistent with undiffed authoritative docs and the live wasm test \u2014 incomplete even on its own terms"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 6 diff is byte-for-byte the same string-only change reviewed in round 5, and the code it describes is unchanged. Re-verified at this head: crates/sparq-engine/src/exec.rs:4845-4847 still reads `#[cfg(target_arch = \"wasm32\")] let nanos = 0u64;` with the comment `Instant is unusable on wasm32-unknown-unknown (it panics): rows only there`. crates/sparq-wasm/src/explain_plan.rs calls sparq_engine::explain_plan_analyze and returns PlanNode::to_json() verbatim; gui/app/src/lib/engine-context.tsx:1338 feeds that string to parsePlanJson, which is a bare JSON.parse (packages/sparq-client/src/plan.ts:92-94). A repo-wide grep for performance.now() finds call sites only in the GUI's own run-latency/status-bar/ingest paths (engine-context.tsx:1221,1270,1415; status-bar.tsx; query-monitor.ts) \u2014 none of them touch per-operator plan nanos, and none appear in crates/. The live wasm32 test crates/sparq-wasm/tests/web.rs:947-956 (`explain_plan_analyze_json_fills_actuals_zero_nanos`) still asserts `\"nanos\":0`, and the authoritative docs at crates/sparq-engine/src/explain_json.rs:32 and crates/sparq-wasm/src/explain_plan.rs:26,56 still correctly say 0/no-monotonic-clock. So every in-tab ANALYZE operator reports exactly 0 and renders as an em dash, while the new user-facing note asserts the times WERE measured via performance.now() and merely fell below timer resolution. That inverts the meaning of the display for every wasm ANALYZE \u2014 an accurate honesty disclosure rewritten into a false measurement claim, with no implementation anywhere in the diff. The e2e spec is rewritten to assert the note contains the literal \"performance.now() clock\", pinning the false statement as the expected contract (a wrong-oracle test that passes because the string is hard-coded and can never go red on the real defect). Same findings, same severities as round 5: stagnant. Either revert the prose, or land a real wasm timing source (e.g. js_sys/web-time behind the cfg at exec.rs:484\u2026 [truncated 75 chars]",
+  "verdict": "request_changes"
+ }
+}
