@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1331,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "288386002f09c5353d1a4a6de397bfac2adb9c07",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`migration_record` accepts a comment solely when the bot login matches and `MIGRATION_MARKER` occurs anywhere in its body. It does not parse the marker fields, bind `pr=` to the current PR, or prove that the same comment carries a well-formed corrected `GROOM_AGE_PARK_MARKER` receipt. Nevertheless, `record is not None` selects the convergence path, whose only write is deletion of `needs:user`. The self-test makes this unsound behavior contractual by expecting a bare `<!-- registry-age-park-receipt-migrated:v1 -->` to count. Thus a truncated, quoted, or otherwise unrelated bot-authored marker prefix can become authorization to remove the human-owned hold even though no corrected receipt was ever minted.",
+    "file": "scripts/reconcile-age-park-escalation.py",
+    "fix_hint": "Parse a closed, anchored migration record and validate its PR number and from/to generations. For convergence, require the migration comment itself to carry exactly one well-formed corrected park receipt whose cause/head/generation agree with the migration record and the supported generation. Change the malformed-marker test to expect rejection, and add entry-point tests proving malformed, mismatched-PR, mismatched-generation, and marker-without-corrected-receipt comments issue no DELETE.",
+    "severity": "major",
+    "title": "Malformed marker prefixes authorize convergence deletion"
+   },
+   {
+    "body": "Ownership, live labels, and latest park application are read once before the write sequence. Apply mode then posts the audit comment and immediately deletes `needs:user` without refreshing any of those facts. A maintainer can re-apply `needs:user`, or another writer can create a newer park episode, after the initial timeline read but before the DELETE; this script will then erase that newer human decision. The post-delete label readback only proves the deletion landed, not that it was still authorized. This contradicts the stated sticky-human invariant and is especially important because posting the receipt creates a network-sized race window.",
+    "file": "scripts/reconcile-age-park-escalation.py",
+    "fix_hint": "Immediately before DELETE, re-fetch labels and timeline and re-run the exact-label ownership and latest-park recency checks against the refreshed state, binding them to the receipt just posted (or the validated convergence receipt). Refuse if the live hold is no longer provably the same machine-owned episode. Add an entry-point test whose fake API inserts a human `needs:user` application after POST and assert that no DELETE occurs.",
+    "severity": "major",
+    "title": "Apply deletes a human hold using a stale pre-comment snapshot"
+   }
+  ],
+  "progress": null,
+  "summary": "The migration is carefully structured and its tests exercise many fail-closed directions, but the destructive path has two major authorization gaps. Convergence treats any bot comment containing the marker prefix as a completed migration receipt, even if the marker is malformed or not paired with a corrected age-park receipt; the self-test explicitly blesses that case. In addition, apply mode deletes the human-owned hold from a stale snapshot, without rechecking ownership or park recency after the audit comment is posted. Either gap can remove `needs:user` without the proof the script claims is required.",
+  "verdict": "request_changes"
+ }
+}
