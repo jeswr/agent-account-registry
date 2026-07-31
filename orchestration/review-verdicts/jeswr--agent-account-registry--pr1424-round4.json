@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1424,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "695c77bcb7e56c15c2b08215a325a27dabcffd9c",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`route_token = os.environ.get(\"ALERT_TOKEN\") or registry_token` still treats `REGISTRY_ALERT_TOKEN` as the private destination credential. With `ALERT_REPO=private/alerts`, no `ALERT_TOKEN`, and a registry token that can read the destination, the live probe returns private and `_alert_route` returns `(\"private/alerts\", registry_token)`. This crosses the documented two-token boundary and can silently lose the best-effort alert when the registry-scoped token cannot write to the private repository. The default-route self-test now codifies the defect: after leaving `ALERT_TOKEN` unset, it expects `((\"private/alerts\", \"t0\"), ...)` rather than registry fallback with no probe.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Use only `ALERT_TOKEN` as the candidate private-route token. If it is absent, return `(registry_repo, registry_token)` without issuing a visibility probe. Add a distinct-token test with `ALERT_REPO` and `REGISTRY_ALERT_TOKEN` set but `ALERT_TOKEN` absent that asserts registry fallback and zero probe calls; make the uninjected live-probe test set an explicit `ALERT_TOKEN` and assert that token is used for both the probe and private return.",
+    "severity": "major",
+    "title": "Missing ALERT_TOKEN still selects the private route with the registry token"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 credential-boundary defect remains. Although the new routing matrix adds visibility checks and correctly returns the registry token on rejected routes, `_alert_route` still defines the candidate private-route token as `ALERT_TOKEN or REGISTRY_ALERT_TOKEN`. Consequently, a deployment with `ALERT_REPO` set, `ALERT_TOKEN` absent, and a registry-scoped token present still probes and selects the private repository using the registry credential. The new default-route self-test explicitly expects that unsafe selection. This is materially the same major finding as round 3, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
