@@ -162,6 +162,14 @@ FLEET_COMPOSITION_KEYS = frozenset({
 })
 
 
+# [#1353 BLOCKED] Thresholds that CANNOT be re-sized to satisfy the #680 bound: setting
+# groom.yml=1200 / retriage.yml=2400 in .github/workflows/dashboard.yml makes GitHub refuse
+# to ingest the workflow (action_required, jobs total_count=0 — measured on master
+# 2026-07-31T03:04Z, PR #1363, reverted by #1364). Mechanism unknown; tracked in #1353.
+# REMOVE THIS SET the moment #1353 is resolved — it is the weaker of the two states.
+_THRESHOLD_BOUND_EXEMPT = frozenset({"groom.yml", "retriage.yml"})
+
+
 class DashboardError(RuntimeError):
     pass
 
@@ -3422,7 +3430,6 @@ def _self_test():
     # and tracked in #1353. Until it is understood, the ideal thresholds are unreachable, so the
     # two sit at exactly 2x cadence and the fleet keeps its keepalive instead of its ideal sizing.
     # ⚠️ REMOVE THIS EXEMPTION the moment #1353 is resolved — it is the weaker of the two states.
-    _THRESHOLD_BOUND_EXEMPT = {"groom.yml", "retriage.yml"}
     check("[#680] every run-anchored threshold sits strictly between ONE and TWO nominal cadences "
           "of the workflow it watches (offenders listed as workflow -> (threshold, cadence)): at "
           "or under one cadence it kicks a punctual cron behind its own fire; at or over two, one "
@@ -3637,10 +3644,12 @@ esac
     missed = {name: [_ka_run(2 * cadence - 60)] for name, cadence in keepalive_cadences.items()}
     code, kicked, log = run_keepalive_step(artifacts=[_ka_marker(60)], runs=missed)
     keepalive_check(
-        "[#680] ...and EVERY run-anchored workflow that has missed exactly one fire is kicked "
-        "inside that same cycle — the 2x-cadence thresholds groom.yml and retriage.yml carried "
-        "before leave both of them unkicked here",
-        (code, kicked), (0, sorted(keepalive_cadences)), log)
+        "[#680] ...and EVERY non-exempt run-anchored workflow that has missed exactly one fire is "
+        "kicked inside that same cycle. groom.yml/retriage.yml are EXEMPT while #1353 blocks their "
+        "re-sizing: at exactly 2x cadence a single dropped fire still reads FRESH, so they are not "
+        "kicked — that is the cost of the exemption, asserted here so it stays visible",
+        (code, kicked),
+        (0, sorted(set(keepalive_cadences) - _THRESHOLD_BOUND_EXEMPT)), log)
 
     # --- #559: the CROSS-REPO leg. It kicks sparq-org/sparq, where a dup-dispatch storm shows up in
     # ANOTHER repo's telemetry entirely, and until now nothing executed it: the live-run guard, the
