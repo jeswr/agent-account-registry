@@ -784,7 +784,7 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
     pulls = flatten_pull_pages(pages)
     if pulls is None:
         raise BackfillError("pull listing is malformed")
-    written = skipped = needs_human = repaired = blocked = 0
+    written = skipped = needs_human = repaired = blocked = write_failed = 0
     # [registry #776] The POPULATION this run is accountable for: every open, same-repo,
     # bot-authored worker PR. Counted at the same branch that admits the PR into the loop, so
     # the seal below compares two numbers derived from ONE walk. Without it "skipped 76" was
@@ -965,9 +965,55 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
         repair = disposition == RECORD_INADMISSIBLE
         verb = "repair" if repair else "record"
         if apply_changes:
-            worker_pr.provenance_record(registry_repo, target_repo, number, opened_sha,
-                                        provider, alias, impl_account_h, issue, run_key,
-                                        supersede_legacy=repair)
+            try:
+                worker_pr.provenance_record(registry_repo, target_repo, number, opened_sha,
+                                            provider, alias, impl_account_h, issue, run_key,
+                                            supersede_legacy=repair)
+            # [registry #1317] ONE PR's failed write is not the whole population's failure.
+            # `WorkerPrError` is NOT a `BackfillError`, so it flew straight past main()'s handler:
+            # the FIRST bad write aborted the run with a traceback, every PR after it in the walk
+            # was silently dropped, and neither the completion line nor the seal ever ran.
+            # Survivable for a human-watched dispatch; disqualifying for the unattended trigger
+            # this class needs, where nobody reads the traceback.
+            #
+            # [registry #1317 r1] BUT NOT THE BASE CLASS. `provenance_record` raises WorkerPrError
+            # for THREE unrelated situations, and catching all of them here reported two of them
+            # as things they are not:
+            #   - a DIVERGENT existing record (the write-side CAS probe found a different record
+            #     already at this path) is a PERMANENT provenance conflict. "The next run retries"
+            #     is false — every future run re-reads the same record and refuses again — so it
+            #     is NEEDS-HUMAN, exactly like every other "a human must establish the truth
+            #     before anything is recorded" exit above.
+            #   - an ARGUMENT/INTEGRITY violation (impl_provider not in the pair, a non-16-hex
+            #     account hash, a non-40-hex head sha) means THIS SCRIPT derived a record it must
+            #     never write. That is a defect in the walk itself, not one PR's bad luck, and it
+            #     stays LOUD: it propagates, aborting the run, because continuing would repeat the
+            #     same malformed derivation for every remaining PR.
+            # Only the narrow write-exhausted class is soft, and only it claims a retry.
+            except worker_pr.RegistryRecordConflictError as exc:
+                needs_human += 1
+                print(f"NEEDS-HUMAN #{number}: a DIVERGENT provenance record already exists for "
+                      f"this PR ({exc}); refusing to overwrite it — this is a PERMANENT conflict "
+                      "that no retry can clear, so a human must reconcile the existing record "
+                      "with the identity this run derived")
+                continue
+            except worker_pr.RegistryWriteExhaustedError as exc:
+                # Its OWN bucket, not `blocked`. `blocked` means "this run refused to write a
+                # record it judged unsound" and the response is to fix the evidence; this means
+                # "the write itself did not land" and the response is to look at the registry
+                # write path — the #712 lesson that reasons are reported apart because the
+                # responses are different. It is also the one gauge that says an unattended sweep
+                # is failing to write at all, which a bucket shared with routine refusals could
+                # never show.
+                write_failed += 1
+                print(f"WRITE-FAILED #{number}: could not {verb} the provenance record "
+                      f"({exc}); leaving fail-closed invisible — records are create-only and no "
+                      "divergent record was found, so the next run re-derives this PR and retries "
+                      "the write")
+                # Nothing was recorded, so no draft conversion: drafting here would mutate the
+                # target for a PR that stays invisible to the review lane either way. #726's
+                # independence runs ONE way — a failed draft must never withhold a record.
+                continue
         else:
             # Privacy: never print the raw handle, only the (public-anyway) salted hash.
             print(f"DRY-RUN #{number}: would {verb} impl={provider}/{alias} "
@@ -986,13 +1032,14 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
     # be able to tell "this run adjudicated N worker PRs" from "and declined M PRs that were never
     # its job", which is exactly the distinction folding the #657 class into `skipped` destroyed.
     print(f"backfill complete: {mode} {written}, repaired {repaired}, skipped {skipped}, "
-          f"needs-human {needs_human}, blocked {blocked} "
+          f"needs-human {needs_human}, blocked {blocked}, write-failed {write_failed} "
           f"(population {population}) out-of-scope {out_of_scope}")
     # [registry #776] THE SEAL. Every worker PR left this loop through exactly one counted exit,
     # or this raises. Bare statement on purpose — see seal_population's docstring: a
     # `reason = ...` / `if reason: raise` shape has a deletable seam, and a mutant that deleted
     # exactly that seam survived the whole suite.
-    seal_population(written + repaired + skipped + needs_human + blocked, population)
+    seal_population(written + repaired + skipped + needs_human + blocked + write_failed,
+                    population)
 
 
 def identity_from_run_log(log_readable, log_text, target_repo, pr_number, issue, live_author,
@@ -1686,6 +1733,12 @@ def _self_test():
     routing_toml = Path(tempfile.mkdtemp()) / "routing.toml"
     routing_toml.write_text('[models.fable]\nprovider = "anthropic"\n', encoding="utf-8")
     patched = ("_gh_json", "_run_gh", "_load_worker_pr", "_load_dispatch_claim", "review_state")
+    # [registry #1317 r1] The stub below carries the REAL worker-pr exception classes, never a
+    # local alias. Aliasing `WorkerPrError=BackfillError` made every behavioural check blind to
+    # WHICH class the write handler catches — a stub that raises one flat class cannot tell a
+    # permanent divergent-record conflict from an exhausted write, which is precisely the
+    # distinction the handler now has to get right.
+    real_worker_pr = _load_worker_pr()
 
     def drive_backfill(pulls_pages, *, ledger=None, master=None, apply_changes=False,
                        admission=None, writer=None, commits=None, no_draft_convert=False):
@@ -1709,7 +1762,10 @@ def _self_test():
             return [{"sha": "ab" * 20}] if commits is None else commits
 
         stub = types.SimpleNamespace(
-            LEDGER_REF="ledger", WorkerPrError=BackfillError,
+            LEDGER_REF="ledger",
+            WorkerPrError=real_worker_pr.WorkerPrError,
+            RegistryRecordConflictError=real_worker_pr.RegistryRecordConflictError,
+            RegistryWriteExhaustedError=real_worker_pr.RegistryWriteExhaustedError,
             provenance_path=lambda repo, number: f"orchestration/provenance/{number}.json",
             _probe_registry_file=probe,
             account_hash=lambda account, salt: "deadbeefdeadbeef",
@@ -1748,8 +1804,8 @@ def _self_test():
           ("DRY-RUN #9002: would record" in e2e,
            "DRY-RUN #9002: would convert to draft" in e2e), (True, True))
     check("E2E: BOTH records are counted — draft policy never withholds a record",
-          "backfill complete: would record 2, repaired 0, skipped 0, needs-human 0, blocked 0 "
-          "(population 2)" in e2e, True)
+          "backfill complete: would record 2, repaired 0, skipped 0, needs-human 0, blocked 0, "
+          "write-failed 0 (population 2)" in e2e, True)
 
     # --- [registry #776] THE INADMISSIBLE-RECORD CLASS HAS A MACHINE EXIT ----------------------
     # Measured on the live estate 2026-07-27: 7 master records carry the attempt-less
@@ -1793,16 +1849,16 @@ def _self_test():
     check("a PR with NO ledger record but an ADMISSIBLE master one is already recorded — a "
           "ledger 404 alone never means recordless",
           ("skip #9002: provenance already recorded" in master_only,
-           "would record 0, repaired 0, skipped 1, needs-human 0, blocked 0 (population 1)"
-           in master_only), (True, True))
+           "would record 0, repaired 0, skipped 1, needs-human 0, blocked 0, write-failed 0 "
+           "(population 1)" in master_only), (True, True))
 
     repair_out = drive_backfill(e2e_pages, master={9001: STALE, 9002: HEALTHY},
                                 admission=real_admission)
     check("E2E: a PR whose record is present but INADMISSIBLE is REPAIRED, not left to a human",
           ("REPAIR #9001" in repair_out, "NEEDS-HUMAN #9001" in repair_out), (True, False))
     check("E2E: ...and the repair is COUNTED in its own bucket",
-          "would record 0, repaired 1, skipped 1, needs-human 0, blocked 0 (population 2)"
-          in repair_out, True)
+          "would record 0, repaired 1, skipped 1, needs-human 0, blocked 0, write-failed 0 "
+          "(population 2)" in repair_out, True)
     check("E2E: a PR whose record ALREADY ADMITS is skipped, never rewritten",
           ("skip #9002: provenance already recorded" in repair_out,
            "REPAIR #9002" in repair_out), (True, False))
@@ -1818,6 +1874,171 @@ def _self_test():
           "(e2e_run_gh raises on one), and still repairs",
           "repaired 1" in apply_out, True)
 
+    # --- [registry #1317] ONE FAILED WRITE MUST NOT ABORT THE POPULATION ----------------------
+    # The premise, re-derived from the REAL module rather than asserted in prose: `WorkerPrError`
+    # is not a `BackfillError`, so main()'s handler never saw it and the first failed write ended
+    # the run with a traceback mid-walk. If these two classes ever converge this whole block is
+    # measuring nothing, so the premise is checked before the behaviour is.
+    check("[#1317] worker_pr.WorkerPrError is NOT a BackfillError — main()'s handler cannot "
+          "catch it, which is why the write call site must",
+          issubclass(real_worker_pr.WorkerPrError, BackfillError), False)
+    # [registry #1317 r1] THE TAXONOMY THIS HANDLER RESTS ON, re-derived from the real module.
+    # Both narrow classes must remain WorkerPrError (every other caller catches the base and must
+    # keep catching them) and must remain DISTINCT from each other — if they ever collapse, the
+    # two handlers below stop discriminating and the behavioural checks silently measure nothing.
+    check("[#1317 r1] the two registry-write classes are WorkerPrError subclasses, and neither "
+          "is the other",
+          (issubclass(real_worker_pr.RegistryWriteExhaustedError, real_worker_pr.WorkerPrError),
+           issubclass(real_worker_pr.RegistryRecordConflictError, real_worker_pr.WorkerPrError),
+           issubclass(real_worker_pr.RegistryWriteExhaustedError,
+                      real_worker_pr.RegistryRecordConflictError),
+           issubclass(real_worker_pr.RegistryRecordConflictError,
+                      real_worker_pr.RegistryWriteExhaustedError)),
+          (True, True, False, False))
+    # A VALIDATION refusal from the REAL provenance_record — the class the write handler must NOT
+    # soften. Driven through the real function (it refuses on its first argument check, before any
+    # network call), so this stays true only while the taxonomy really does leave it uncaught.
+    validation_exc = None
+    try:
+        real_worker_pr.provenance_record("reg/repo", "o/r", 7, "ab" * 20, "not-a-provider",
+                                         "fable", "ab" * 8, 5, "backfill:1.1")
+    except real_worker_pr.WorkerPrError as exc:
+        validation_exc = exc
+    check("[#1317 r1] an ARGUMENT-VALIDATION refusal is a BARE WorkerPrError — neither narrow "
+          "class — so neither handler below can convert it into a soft, retryable outcome",
+          (validation_exc is not None,
+           isinstance(validation_exc, (real_worker_pr.RegistryWriteExhaustedError,
+                                       real_worker_pr.RegistryRecordConflictError))),
+          (True, False))
+    # ...and the catches must be spelled through the MODULE ATTRIBUTE, narrowly. A mutant that
+    # widens either handler back to `worker_pr.WorkerPrError` (or to a bare `Exception`) would
+    # pass every behavioural check that raises only a narrow class, while being the exact defect
+    # r1 found: a permanent conflict and a malformed-record derivation both reported as "the write
+    # did not land, the next run retries". Pinned here because no runtime test can see a handler
+    # that is merely WIDER than the exception it caught.
+    write_handlers = [h for node in ast.walk(backfill_tree) if isinstance(node, ast.Try)
+                      for h in node.handlers
+                      if any(isinstance(c, ast.Call)
+                             and getattr(c.func, "attr", "") == "provenance_record"
+                             for c in ast.walk(node))]
+
+    def handler_type_name(handler):
+        """A TOTALLY-ORDERED string for an except clause's type expression (`worker_pr.X`, `X`,
+        `<bare except>`, else the raw dump). A string ALWAYS, because the tuple-of-optionals form
+        this replaced raised `TypeError: '<' not supported between NoneType and str` the moment a
+        mutant installed a bare `except Name:` — an assertion that CRASHES on the very shape it
+        exists to reject is AGENTS.md's false kill, and it truncated the suite at 140 of 191."""
+        node = handler.type
+        if node is None:
+            return "<bare except>"
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            return f"{node.value.id}.{node.attr}"
+        if isinstance(node, ast.Name):
+            return node.id
+        return ast.dump(node)
+
+    check("[#1317 r1] the write catches EXACTLY the two narrow worker_pr classes — never the "
+          "WorkerPrError base, the local BackfillError, or a bare Exception",
+          # SORTED: the two handlers are siblings, so their ORDER is semantically irrelevant and
+          # asserting it would kill a harmless reordering instead of a real widening.
+          sorted(handler_type_name(h) for h in write_handlers),
+          ["worker_pr.RegistryRecordConflictError", "worker_pr.RegistryWriteExhaustedError"])
+
+    def failing_writer(fails_on, error=None):
+        def writer(*args, **kwargs):
+            if args[2] == fails_on:
+                raise error or real_worker_pr.RegistryWriteExhaustedError(
+                    "HTTP 409 writing the record")
+            writes.append((args[2], kwargs.get("supersede_legacy")))
+        return writer
+
+    def drive_or_escape(**kwargs):
+        """(stdout, the exception that ESCAPED backfill() or None).
+
+        Every drive below goes through this because the failures under test are exactly the ones
+        that escape: a widened/deleted handler lets the writer's exception out, and an uncounted
+        exit trips the seal. Caught here, each becomes a NAMED, line-anchored `FAIL` row; left
+        uncaught it aborts _self_test() mid-file, which scores as a kill while every check below
+        it never runs — AGENTS.md's crash-after-partial-run false outcome (measured on this very
+        block: four mutants took the suite from 191 checks to 140)."""
+        try:
+            return drive_backfill(e2e_pages, **kwargs), None
+        except Exception as exc:          # noqa: BLE001 — the escape IS the observation
+            return "", exc
+
+    # No records anywhere, so BOTH PRs are RECORD_ABSENT and both would be written. Failing the
+    # FIRST one in the walk is the case that used to lose #9002 entirely.
+    writes.clear()
+    first_fails, first_escaped = drive_or_escape(apply_changes=True,
+                                                 writer=failing_writer(9001),
+                                                 no_draft_convert=True)
+    check("[#1317] a failed write on the FIRST PR does not abort the walk — nothing escapes "
+          "backfill() and the SECOND PR is still recorded (this call raised outright before "
+          "the fix)",
+          (writes, first_escaped), ([(9002, False)], None))
+    check("[#1317] ...the failure is reported with its own reason and the create-only retry",
+          ("WRITE-FAILED #9001: could not record the provenance record "
+           "(HTTP 409 writing the record)" in first_fails,
+           "next run re-derives this PR and retries the write" in first_fails), (True, True))
+    check("[#1317] ...it lands in its OWN bucket, and the run still SEALS (drive_backfill "
+          "re-raises the unsealed BackfillError, so reaching this line is the seal passing)",
+          "recorded 1, repaired 0, skipped 0, needs-human 0, blocked 0, write-failed 1 "
+          "(population 2)" in first_fails, True)
+
+    # Now fail the DRAFTABLE PR with draft conversion ENABLED: a record that did not land must not
+    # be followed by a draft conversion. e2e_run_gh raises on any mutating gh call, so a lost
+    # `continue` blows this run up rather than passing quietly.
+    writes.clear()
+    second_fails, second_escaped = drive_or_escape(apply_changes=True,
+                                                   writer=failing_writer(9002))
+    check("[#1317] a PR whose write FAILED is not converted to draft — nothing was recorded, so "
+          "the target is left exactly as found",
+          ("converted #9002 to draft" in second_fails,
+           "WRITE-FAILED #9002" in second_fails, second_escaped), (False, True, None))
+    check("[#1317] ...and the PR whose write SUCCEEDED is unaffected by its neighbour's failure",
+          (writes, "recorded 1, repaired 0, skipped 0, needs-human 0, blocked 0, write-failed 1 "
+                   "(population 2)" in second_fails), ([(9001, False)], True))
+
+    # --- [registry #1317 r1] ...AND THE SOFT BUCKET MUST NOT SWALLOW A PERMANENT CONFLICT ------
+    # `provenance_record` raises for a DIVERGENT existing record (the write-side CAS probe found a
+    # different record already at this path — a concurrent writer, or a ledger record this walk's
+    # read did not see). Counting that as `write_failed` told the operator two false things: that
+    # nothing was written when in fact a CONFLICTING record is live, and that the next run would
+    # retry when in fact every future run re-reads the same record and refuses again. It is a
+    # permanent evidence conflict, so it exits through NEEDS-HUMAN like every other one.
+    writes.clear()
+    conflict_out, conflict_escaped = drive_or_escape(
+        apply_changes=True, no_draft_convert=True,
+        writer=failing_writer(9001, real_worker_pr.RegistryRecordConflictError(
+            "registry file orchestration/provenance/9001.json already exists with different "
+            "content on the 'ledger' branch")))
+    check("[#1317 r1] a DIVERGENT-RECORD conflict is NEEDS-HUMAN, never the retryable "
+          "write-failed bucket",
+          ("NEEDS-HUMAN #9001: a DIVERGENT provenance record already exists" in conflict_out,
+           "PERMANENT conflict that no retry can clear" in conflict_out,
+           "WRITE-FAILED #9001" in conflict_out), (True, True, False))
+    check("[#1317 r1] ...it is counted as needs-human, write-failed stays 0, and the walk still "
+          "continues to the next PR and SEALS (an uncounted conflict exit trips seal_population, "
+          "which surfaces here as an escaped exception)",
+          (writes, conflict_escaped,
+           "recorded 1, repaired 0, skipped 0, needs-human 1, blocked 0, write-failed 0 "
+           "(population 2)" in conflict_out), ([(9002, False)], None, True))
+
+    # The other direction: a BARE WorkerPrError (what the real function raises for a malformed
+    # provider/account-hash/head-sha, i.e. a record THIS script must never have derived) is not
+    # one PR's bad luck and must stay LOUD — it propagates out of backfill() exactly as it did
+    # before #1317, rather than being counted as a soft per-PR outcome. `type(...) is` on purpose:
+    # a handler that re-raised one of the narrow subclasses would satisfy `isinstance`.
+    writes.clear()
+    _loud_out, loud_escaped = drive_or_escape(
+        apply_changes=True, no_draft_convert=True,
+        writer=failing_writer(9001, real_worker_pr.WorkerPrError(
+            "impl_provider must be anthropic or openai")))
+    check("[#1317 r1] a bare WorkerPrError (validation/invariant) still ABORTS the run loudly — "
+          "it is neither bucketed nor silently continued past",
+          (type(loud_escaped) is real_worker_pr.WorkerPrError, str(loud_escaped), writes),
+          (True, "impl_provider must be anthropic or openai", []))
+
     # IDEMPOTENCE — the run must converge. Second invocation over the state the first one leaves
     # behind (the repaired record now on `ledger`) must write NOTHING and skip both.
     REPAIRED = json.dumps({"pr_number": 9001, "impl_provider": "anthropic", "impl_alias": "fable",
@@ -1831,8 +2052,8 @@ def _self_test():
                             writer=recording_writer, no_draft_convert=True)
     check("IDEMPOTENT: a second run over the first run's output writes nothing at all", writes, [])
     check("IDEMPOTENT: ...and reports both PRs as skipped",
-          "recorded 0, repaired 0, skipped 2, needs-human 0, blocked 0 (population 2)" in second,
-          True)
+          "recorded 0, repaired 0, skipped 2, needs-human 0, blocked 0, write-failed 0 "
+          "(population 2)" in second, True)
     check("IDEMPOTENT: ...ledger-first — the repaired ledger copy beats the stale master one",
           "REPAIR #9001" in second, False)
 
@@ -1840,12 +2061,12 @@ def _self_test():
     no_commits = drive_backfill(e2e_pages, commits=[])
     check("a PR with no commits is a COUNTED terminal state, not a silent `continue`",
           ("BLOCKED #9001: PR has no commits" in no_commits,
-           "would record 0, repaired 0, skipped 0, needs-human 0, blocked 2 (population 2)"
-           in no_commits), (True, True))
+           "would record 0, repaired 0, skipped 0, needs-human 0, blocked 2, write-failed 0 "
+           "(population 2)" in no_commits), (True, True))
     bad_sha = drive_backfill(e2e_pages, commits=[{"sha": "nothex"}])
     check("a malformed first-commit sha is a COUNTED terminal state too",
           ("BLOCKED #9001: first commit sha is malformed" in bad_sha,
-           "blocked 2 (population 2)" in bad_sha), (True, True))
+           "blocked 2, write-failed 0 (population 2)" in bad_sha), (True, True))
     check("a record this run would write that is ITSELF inadmissible is refused, and counted",
           "BLOCKED #9001: the record this run would write is itself NOT admissible"
           in drive_backfill(e2e_pages, admission=lambda record, pr: "synthetic refusal"), True)
@@ -1854,7 +2075,7 @@ def _self_test():
     # get past, so it is asserted as arithmetic that FAILS, on the same function backfill() calls.
     unsealed = None
     try:
-        drive_backfill(e2e_pages, master={9001: BackfillError("HTTP 403")},
+        drive_backfill(e2e_pages, master={9001: real_worker_pr.WorkerPrError("HTTP 403")},
                        admission=real_admission)
     except BackfillError as exc:
         unsealed = str(exc)
@@ -1962,7 +2183,7 @@ def _self_test():
                     "ab" * 20 if body is not None else None)
 
         orch_worker_pr = types.SimpleNamespace(
-            LEDGER_REF="ledger", WorkerPrError=BackfillError,
+            LEDGER_REF="ledger", WorkerPrError=real_worker_pr.WorkerPrError,
             provenance_path=lambda repo, number: f"orchestration/provenance/{number}.json",
             _probe_registry_file=orch_probe,
             account_hash=lambda account, salt: "deadbeefdeadbeef",
@@ -2055,7 +2276,7 @@ def _self_test():
     # population, every population counter is now byte-identical between the two runs and only the
     # out-of-scope bucket moves, which is what "enrolment must not move the worker lane" means.
     POPULATION_LINE = ("backfill complete: would record 1, repaired 0, skipped 0, "
-                       "needs-human 0, blocked 0 (population 1)")
+                       "needs-human 0, blocked 0, write-failed 0 (population 1)")
     check("[#657] FROZEN worker-class control: enrolment moves ONLY the out-of-scope bucket — "
           "every population counter is identical between the two runs",
           (f"{POPULATION_LINE} out-of-scope 1" in on_out,
