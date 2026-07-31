@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5421,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "786ca79bac12cbf10baae159a632e36efbb5a368",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The cache wiring is correctly ordered and main-scoped, the key tracks the script containing both corpus pins, and cache hits remain digest-gated before avoiding network access. The extracted fetch_pinned_file preserves fail-closed download and checksum behavior, including temporary-file cleanup. The new hermetic tests exercise the real shell helper, include cache-miss and digest-drift non-vacuity checks, pin workflow ordering and SHA-pinned actions, and confirm the conformance ratchet remains fatal. No correctness, soundness, test-validity, or security issue was found.",
+  "verdict": "approve"
+ }
+}
