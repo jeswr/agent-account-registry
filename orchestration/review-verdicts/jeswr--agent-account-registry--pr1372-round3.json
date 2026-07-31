@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1372,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "31cd9e5be69ba612d919c2a78cf5ea6fb60ee255",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-two recovery fix remains sound in the reviewed head. M4 distinguishes workflows outside the scheduled population from scheduled lanes whose runs were not sampled, treats unsampled and no-concluded-run lanes as recovery blockers, and carries those blockers through the production per-mode transport decision without suppressing measured rejections. The live and state-file paths preserve string run IDs, fetch job counts only for apparently rejected runs, distinguish unreadable counts from measured zero, and fail closed when no scheduled lane was sampled. The end-to-end assertions independently exercise holding an existing M4 alert for both indeterminate states, closing it after a fully observed recovery or deliberate population exit, and upserting a measured rejection despite another unread lane. I found no correctness, soundness, test-validity, or security defect in the diff.",
+  "verdict": "approve"
+ }
+}
