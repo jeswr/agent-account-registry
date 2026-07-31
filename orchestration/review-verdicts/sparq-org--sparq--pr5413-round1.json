@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5413,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "188c414f0d584e967667a9277d4da09e418e5762",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly redirects the identified prepare lifecycle progress message to stderr and makes the package guardrail tolerate stdout text preceding npm's final JSON manifest. The suffix parser preserves strict failure for malformed output and handles clean, pretty-printed, compact, and bracket-prefixed-noise cases. The tests are non-vacuous: they pin the currently derived lifecycle-script set, inspect those scripts for direct stdout writes, exercise both parser branches, and verify malformed streams still throw. No correctness, soundness, security, or completeness issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
