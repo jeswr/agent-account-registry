@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5273,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "66cde148b7e02bc128ce8c688818e8fd7187d459",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The CommonJS wasm target is integrated coherently: it uses a dedicated wasm-pack output directory, copies only the required artifacts, restores CommonJS semantics beneath the package's ESM root, exposes the subpath through conditional exports, includes it in packed files, and makes prepare's build-completeness check account for it. The runtime test exercises the load-bearing contract by requiring the generated nodejs glue before any initialization and immediately loading/querying a Store; the package and guardrail assertions cover export and tarball wiring. Documentation accurately distinguishes the raw synchronous Store surface from the ESM RDF/JS wrapper, and the public-surface skill was updated. No correctness, soundness, security, or vacuous-test issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
