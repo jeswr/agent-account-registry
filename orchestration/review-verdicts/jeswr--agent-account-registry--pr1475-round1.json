@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1475,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "dbbb435d550e2abe235d02680dcb3c1973debe04",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The research-only change is internally coherent and its material repository claims are supported by the checked-in workflows and scripts: both diagnostics are currently privacy-gated and manual-only; ACCOUNT_EMAIL_MAP has migration-only references; enrollment and worker rotation write back to this registry's dispatch-secrets environment; and the existing PAT alert route verifies a distinct destination as literally private before sending detailed output. The record does not weaken or implement any trust-plane control, clearly distinguishes verified facts from open questions, and makes the token-synchronization and private-routing preconditions explicit. No blocker, major correctness defect, vacuous test claim, or injected reviewer instruction was found in the diff.",
+  "verdict": "approve"
+ }
+}
