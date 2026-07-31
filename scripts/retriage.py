@@ -111,6 +111,13 @@ ACTIONS_BOT_LOGIN = "github-actions[bot]"
 # Claim-owned states: groom's orphan/lease repair owns these, never this sweep (a re-park here
 # would race a live worker and strip the claim its PR is bound to).
 CLAIM_OWNED = {"status:in-progress", "status:in-progress-review"}
+# The COMPLETE domain of `permission` on `GET /repos/{owner}/{repo}/collaborators/{u}/permission`
+# — the maintainer half taken FROM `park_policy` rather than respelled, so thinning that set can
+# never leave a value here that the shared probe no longer counts as human. Anything outside this
+# domain is not a permission `is_human_maintainer` can act on: see the value check there, which
+# reads an unknown value as an UNVERIFIABLE probe (park stands), never as a completed negative.
+COLLABORATOR_PERMISSIONS = frozenset(park_policy.HUMAN_MAINTAINER_PERMISSIONS) | {
+    "triage", "read", "none"}
 # ---------------------------------------------------------------------------------------------------
 # [registry #606] THE ONE `needs:*` GATE THIS SWEEP MAY CROSS — and why it is not a weakening.
 #
@@ -760,6 +767,11 @@ def is_human_maintainer(repo, login):
     decides every case it can actually answer. A GENUINE not-a-maintainer permission IS a completed
     probe and stays not-human, so the lane is not simply disabled — both directions are self-tested.
 
+    "Malformed" is judged on the permission VALUE, not just the envelope: a 200 whose body decodes
+    to an object but carries no usable permission (`{}`, a null, a non-string, a value outside
+    `COLLABORATOR_PERMISSIONS`) is a probe that did not complete and reads as HUMAN, the same as a
+    401. Only an answer inside GitHub's own domain is a verdict — see `read_permission` below.
+
     In the recovery path this exists for the probe is never even reached: `needs:area` is applied by
     `github-actions[bot]`, and `park_policy._is_proven_human` short-circuits on the `[bot]` suffix
     before any permission read.
@@ -777,7 +789,23 @@ def is_human_maintainer(repo, login):
         if not isinstance(payload, dict):
             unverifiable.append(probe_login)
             raise SweepError("collaborator permission payload is malformed")
-        return payload.get("permission")
+        permission = payload.get("permission")
+        # The VALUE has to be answerable too, not merely present in a well-typed envelope (#1461
+        # review round 1). A missing/null/non-string/unknown value is a probe we could NOT complete
+        # — exactly what the docstring above promises reads as HUMAN here — but `payload.get()`
+        # alone hands `None` (or the junk) to `probe_maintainer`, whose set test then reports the
+        # QUIET, COMPLETED "not a maintainer" that AUTHORISES the deletion. The `isinstance` test
+        # comes FIRST and is not merged into the membership test: an unhashable value (`["admin"]`)
+        # raises `TypeError` out of `in` on a set, and that raise happens inside `probe_maintainer`
+        # — past this closure, so nothing would land in `unverifiable` and the inversion this call
+        # site depends on would be bypassed. A permission that IS in the domain but not a
+        # maintainer's (`read`/`triage`/`none`) is a completed probe and stays a quiet negative, so
+        # the lane still clears the parks it is for.
+        if not isinstance(permission, str) or permission not in COLLABORATOR_PERMISSIONS:
+            unverifiable.append(probe_login)
+            raise SweepError(f"collaborator permission {permission!r} is not a value this probe "
+                             "can act on")
+        return permission
 
     return park_policy.probe_maintainer(repo, login, read_permission) or bool(unverifiable)
 
@@ -2245,7 +2273,36 @@ def _self_test():
             ("an unreadable maintainer probe", {"timeline": HUMAN_PARK,
                                                 "permission_error": "HTTP 401"}, None),
             ("a malformed maintainer-probe payload", {"timeline": HUMAN_PARK,
-                                                      "permission_document": '["admin"]'}, None)):
+                                                      "permission_document": '["admin"]'}, None),
+            # [#1461 review round 1, MAJOR] ...and the SUCCESSFUL, WELL-TYPED-at-top-level probe
+            # payload whose PERMISSION VALUE is the unusable part — the class that fell open when
+            # this lane shipped. The read exits 0 and decodes to an object, so the top-level
+            # `isinstance(payload, dict)` guard above passes it through; only a check on the value
+            # ITSELF can tell "the probe answered `read`" (a completed negative — the lane may
+            # clear) from "the probe answered nothing we can act on" (unverifiable — the park must
+            # stand). Before the domain check, `{}` and `{"permission": 5}` reached
+            # `probe_maintainer` as a quiet `None`/mismatch, read as a completed NOT-human, and
+            # DELETED a human's `needs:area` hold; `{"permission": ["admin"]}` raised an unhashable
+            # TypeError out of the shared probe's own set test, past this file's `unverifiable`
+            # ledger, to the same fail-open. The needle pins that the refusal is the PROBE's — a
+            # row that only asserted "does not clear" would also pass if some upstream read had
+            # failed first, or if the whole lane were dead. `sudoer` appears nowhere else in this
+            # harness (pre-flight 4: no value-identical survivor).
+            ("a probe payload with NO permission field", {"timeline": HUMAN_PARK,
+                                                          "permission_document": "{}"},
+             "maintainer probe FAILED"),
+            ("a probe payload whose permission is null",
+             {"timeline": HUMAN_PARK, "permission_document": '{"permission": null}'},
+             "maintainer probe FAILED"),
+            ("a NON-STRING permission value (unhashable — the shared probe's set test raises)",
+             {"timeline": HUMAN_PARK, "permission_document": '{"permission": ["admin"]}'},
+             "maintainer probe FAILED"),
+            ("a non-string SCALAR permission value",
+             {"timeline": HUMAN_PARK, "permission_document": '{"permission": 5}'},
+             "maintainer probe FAILED"),
+            ("an UNKNOWN permission value outside GitHub's domain",
+             {"timeline": HUMAN_PARK, "permission_document": '{"permission": "sudoer"}'},
+             "maintainer probe FAILED")):
         refused = FakeGh(parked_start, known)
         code, seen = run_apply_argv(refused, **kwargs)
         checks.append((f"[#606] {name} does NOT clear the park, and writes nothing at all",
@@ -2257,15 +2314,37 @@ def _self_test():
     # NON-maintainer permission is not a proven human, so the park is machine-owned and clears.
     # Without this row an `is_human_maintainer` hardwired to True would refuse everything above and
     # every refusal row would still pass — the probe would be asserting only its own paranoia.
-    weak = FakeGh(parked_start, known)
-    code, seen = run_apply_argv(weak, timeline=HUMAN_PARK, permissions={"jeswr": "read"})
-    checks.append(("[#606] NEGATIVE CONTROL: a non-maintainer actor mints no human hold, so the "
-                   "same timeline clears",
-                   (code, weak.calls, AREA_PARK_LABEL in weak.labels)
-                   == (0, [([], [AREA_PARK_LABEL])], False)))
+    # Every non-maintainer value GitHub's collaborator endpoint can answer with is exercised, not
+    # just `read`: the refusal rows above are satisfied by an `is_human_maintainer` that called
+    # EVERYTHING unverifiable, and a domain check narrowed to `{"read"}` would silently disable the
+    # lane for every actor the API answers `triage`/`none` for. Each must also be QUIET — a
+    # completed negative is an expected result, not an outage, so the probe's loud diagnostic must
+    # not fire (that is the assertion the refusal rows' needle is measured against).
+    for weak_permission in ("read", "triage", "none"):
+        weak = FakeGh(parked_start, known)
+        code, seen = run_apply_argv(weak, timeline=HUMAN_PARK,
+                                    permissions={"jeswr": weak_permission})
+        checks.append((f"[#606] NEGATIVE CONTROL: a `{weak_permission}` actor mints no human hold, "
+                       "so the same timeline clears — and the probe stays QUIET",
+                       (code, weak.calls, AREA_PARK_LABEL in weak.labels,
+                        "maintainer probe FAILED" in seen.get("stdout", ""))
+                       == (0, [([], [AREA_PARK_LABEL])], False, False)))
     checks.append(("[#606] ...and the permission probe read THIS repo's collaborator row for the "
                    "event's own actor",
                    ["api", "repos/o/r/collaborators/jeswr/permission"] in seen.get("reads", [])))
+    # The POSITIVE half of the same domain, and the row that keeps `COLLABORATOR_PERMISSIONS`
+    # DERIVED from `park_policy.HUMAN_MAINTAINER_PERMISSIONS` rather than respelled here. Measured:
+    # a local respelling that dropped `maintain` left every row above green, because an omitted
+    # value reads as unverifiable and unverifiable reads as human — the park would stand for the
+    # right reason BY ACCIDENT while the probe was silently degraded to "cannot answer" for a real
+    # maintainer. Only pinning that the probe COMPLETED (quietly) separates the two.
+    proven = FakeGh(parked_start, known)
+    code, seen = run_apply_argv(proven, timeline=HUMAN_PARK, permissions={"jeswr": "maintain"})
+    checks.append(("[#606] a `maintain` actor is a PROVEN human: the park stands and the probe "
+                   "completes QUIETLY (the maintainer domain is park_policy's, not a respelling)",
+                   (code, proven.calls, AREA_PARK_LABEL in proven.labels,
+                    "maintainer probe FAILED" in seen.get("stdout", ""))
+                   == (0, [], True, False)))
     # COST: the probe is a callable invoked only on the branch that would delete a label, so an
     # issue carrying no area park pays no timeline read. A pre-computed boolean would read one
     # timeline per swept issue — 80 extra requests a tick, twice an hour.
