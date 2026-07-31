@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1468,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d6174c111e8463ffe051dbfd9c4352686639277b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`current_pulls = {repo: _pulls(...) for repo in issues}` is a second paginated pull-list read performed after planning and before any planned mutations or `_release_claims`. Although the new initial snapshot read catches `GroomError`, a repo can succeed there and fail on this fresh read; that exception still escapes `run_sweep`, causing one repo to block every repo's repair and reclaim. It also runs even when `terminal_reap_candidates` is empty. This is exactly the head-of-line behavior the change claims to close. The end-to-end fixture does not test it: `paginate_refusals` is keyed only by path, so refusing `/pulls?state=open` always fails the first snapshot read and can never model first-call success followed by second-call failure.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Move the fresh pull reads inside the terminal-reap path and handle failures per repo. On a failed fresh pull read, withdraw that repo's terminal reap candidates from `dead_claims` (an unread pull listing cannot prove absence of a worker PR), record the deferral in the reap phase, and continue processing other repos. Add a call-sequenced fixture that lets the initial pull snapshot succeed and the fresh pull listing fail, asserting that affected leases are retained, other repos still reclaim, and all-refused reporting is non-zero only after work completes.",
+    "severity": "major",
+    "title": "Fresh pull-list revalidation can still abort the whole sweep"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new handling is fail-closed for the initial target snapshot, attempt-budget comments, and per-issue terminal revalidation, and the added tests exercise those paths. However, the fresh pull-list revalidation remains an unwrapped paginated read. A transient refusal there still aborts the entire sweep before actions and lease releases, so the stated elimination of the residual head-of-line failures is incomplete. The tests cannot expose this because their pull-list refusal is installed by path and therefore always fires on the earlier snapshot read first.",
+  "verdict": "request_changes"
+ }
+}
