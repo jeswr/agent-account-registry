@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5031,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a5e4d9edbd42143918f75c4488dbdedd9a736d2e",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 finds no correctness, soundness, test-validity, or security defect. The design record accurately describes the implemented double-lane path: the Noir member range-constrains the witnessed bits, applies canonical_f64_bits before constructing the value component, and binds that component plus the lexical witness to the committed leaf; the host encoder validates the lexical form and mirrors the same fold. The identity-guard test non-vacuously confirms that signed zero shares a value handle while remaining distinct through the lexical/identity lane, and the NaN test covers multiple payload classes. The VALUE_NONE and LANG_NONE exclusions are explicitly identified as unshipped, open external-audit obligations rather than claimed guarantees, and the text consistently disclaims soundness/privacy pending sq-qhy4. No instruction-like prompt injection appears in the diff. Because round 2 also had no findings at the same severity, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
