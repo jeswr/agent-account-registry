@@ -1,55 +1,6 @@
 {
  "snapshots": [
   {
-   "generated_at": "2026-07-30T23:18:15Z",
-   "_ts": 1785453495,
-   "schema_version": 1,
-   "targets": {
-    "sparq-org/sparq": {
-     "issues_open": 1831,
-     "issues_ready": 364,
-     "issues_closed_1h": 1,
-     "issues_closed_24h": 16,
-     "prs_open": 97,
-     "prs_draft": 80,
-     "prs_opened_1h": 6,
-     "prs_closed_1h": 0,
-     "prs_merged_1h": 1,
-     "prs_merged_24h": 8,
-     "review_changes_backlog": 11,
-     "needs_user_parked": 23,
-     "review_lane_health": "ok",
-     "review_lane_runs_1h": 9,
-     "worker_attempts_1h": 7,
-     "worker_success_rate_1h": 0.4286,
-     "pr_open_rate": 6.0,
-     "pr_close_rate": 1.0,
-     "net_pr_flow": 5.0
-    },
-    "jeswr/agent-account-registry": {
-     "issues_open": 611,
-     "issues_ready": 211,
-     "issues_closed_1h": 3,
-     "issues_closed_24h": 10,
-     "prs_open": 37,
-     "prs_draft": 27,
-     "prs_opened_1h": 0,
-     "prs_closed_1h": 0,
-     "prs_merged_1h": 2,
-     "prs_merged_24h": 7,
-     "review_changes_backlog": 6,
-     "needs_user_parked": 6,
-     "review_lane_health": "ok",
-     "review_lane_runs_1h": 10,
-     "worker_attempts_1h": 0,
-     "worker_success_rate_1h": null,
-     "pr_open_rate": 0.0,
-     "pr_close_rate": 2.0,
-     "net_pr_flow": -2.0
-    }
-   }
-  },
-  {
    "generated_at": "2026-07-30T23:45:05Z",
    "_ts": 1785455105,
    "schema_version": 1,
@@ -1173,6 +1124,55 @@
      "pr_open_rate": 2.0,
      "pr_close_rate": 0.0,
      "net_pr_flow": 2.0
+    }
+   }
+  },
+  {
+   "generated_at": "2026-07-31T11:32:23Z",
+   "_ts": 1785497543,
+   "schema_version": 1,
+   "targets": {
+    "sparq-org/sparq": {
+     "issues_open": 1883,
+     "issues_ready": 338,
+     "issues_closed_1h": 3,
+     "issues_closed_24h": 40,
+     "prs_open": 105,
+     "prs_draft": 87,
+     "prs_opened_1h": 4,
+     "prs_closed_1h": 0,
+     "prs_merged_1h": 2,
+     "prs_merged_24h": 33,
+     "review_changes_backlog": 10,
+     "needs_user_parked": 14,
+     "review_lane_health": "ok",
+     "review_lane_runs_1h": 18,
+     "worker_attempts_1h": 7,
+     "worker_success_rate_1h": 0.4286,
+     "pr_open_rate": 4.0,
+     "pr_close_rate": 2.0,
+     "net_pr_flow": 2.0
+    },
+    "jeswr/agent-account-registry": {
+     "issues_open": 671,
+     "issues_ready": 279,
+     "issues_closed_1h": 1,
+     "issues_closed_24h": 26,
+     "prs_open": 44,
+     "prs_draft": 34,
+     "prs_opened_1h": 0,
+     "prs_closed_1h": 0,
+     "prs_merged_1h": 1,
+     "prs_merged_24h": 23,
+     "review_changes_backlog": 5,
+     "needs_user_parked": 6,
+     "review_lane_health": "ok",
+     "review_lane_runs_1h": 9,
+     "worker_attempts_1h": 0,
+     "worker_success_rate_1h": null,
+     "pr_open_rate": 0.0,
+     "pr_close_rate": 1.0,
+     "net_pr_flow": -1.0
     }
    }
   }
