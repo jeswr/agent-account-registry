@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5266,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "38b98a65dacf17a470819eaa335f2d345ba4dd17",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "wrap_capability calls cap.validate(), but that method only enforces read/publish/admin secret separation. A caller can construct a Capability whose secret fields match its authorities but whose PublicGrant has an invalid suite, non-canonical/duplicate authority or branch scope, invalid validity, or another condition enforced only by PublicGrant::decode_from. wrap_capability then succeeds, while unwrap_capability with the matching recipient rejects the just-produced plaintext in Capability::decode_secret. This contradicts the new claim that malformed capabilities fail before wrapping and violates the natural invariant that a successful typed wrap can be opened by its intended recipient.",
+    "file": "crates/sparq-e2ee-ng/src/capability.rs",
+    "fix_hint": "Before encrypting, validate every structural invariant that Capability::decode_secret will enforce, ideally through one shared validation routine used by both constructed and decoded grants. Add a real-path regression test using a capability with separation-correct secrets but an invalid public grant (for example an unsupported suite), asserting wrap_capability rejects it; also retain a successful same-key wrap/unwrap round trip.",
+    "severity": "major",
+    "title": "Pre-wrap validation does not ensure the wrapped capability is decodable"
+   }
+  ],
+  "progress": null,
+  "summary": "The typed wrapping flow is sound for valid capabilities, and the AAD, wrong-recipient, low-order-key, and secret-field round trips exercise the real cryptographic path. However, the new pre-wrap validation guarantee is not implemented for all malformed capabilities: Capability::validate only checks authority/secret separation, while decode_secret additionally validates the public grant schema. Consequently wrap_capability can return Ok for an object that unwrap_capability with the same key must reject. This breaks the helper's documented and expected round-trip contract and leaves the new test coverage incomplete.",
+  "verdict": "request_changes"
+ }
+}
