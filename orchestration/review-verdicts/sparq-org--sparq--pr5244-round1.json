@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5244,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4f2a3a01d9ef6b6a4cc08318b4588ca81fe5e6d2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In delegate, d.branches == None assigns parent_scope directly, whereas only the Some path calls canon_scope. Because PublicGrant.branch, topic, and extra_branches are public, a caller can construct or mutate a parent with an out-of-order scope, duplicate branch, or shared topic and call delegate without first decoding it. The child then copies that malformed scope, signs it, and verify() succeeds because signing_bytes() performs no scope validation, but PublicGrant::decode(child.encode()) rejects it. This violates the documented claim that delegation yields a canonical child and means the API can mint authenticated yet structurally invalid grants. The existing decode rejection test demonstrates public-field bypass but does not cover this real delegate path.",
+    "file": "crates/sparq-e2ee-ng/src/capability.rs",
+    "fix_hint": "Validate the complete parent scope before either delegation branch (for example, require check_scope(&parent_scope) and reject malformed parents), then retain the existing canonicalization of explicit selections. Add a test that hand-mutates extra_branches into an invalid order/duplicate-topic shape and asserts delegate(..., branches: None) fails rather than returning a signed child; ideally cover both inherited and selected paths.",
+    "severity": "major",
+    "title": "Delegation can sign an inherited non-canonical branch set"
+   }
+  ],
+  "progress": null,
+  "summary": "The branch-set encoding and decode checks are coherent for grants that have passed decode or set_branch_scope, and the new tests exercise signing, round-trip, subset delegation, and canonical rejection. However, delegate accepts PublicGrant by reference while its branch fields remain publicly mutable. The branches: None path copies the parent's scope without validating or canonicalizing it, then signs a child that can be non-canonical and cannot be decoded. This contradicts the API's narrow-only/canonical-child contract and creates signed grants whose verify succeeds but whose wire representation is rejected. Fixing that fail-closed boundary and testing a hand-mutated parent is required.",
+  "verdict": "request_changes"
+ }
+}
