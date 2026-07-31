@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1484,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "322372cfac9de56f9898138d8c44ffcf21de843b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`stale_worker_pr_reason` now exempts every valid-provenance ready PR in `dirty`, `unstable`, or `blocked`, and `age_park_cause_recovered` clears an existing park on the same evidence. But `enumerate_review_items` does not dispatch from those merge-state strings: rebase requires a current, head-matched `pr_status.conflicting is True`, while CI repair requires a current concluded `repair_gate_conclusion == failure`; pending/unknown/degraded CI explicitly does nothing. It also has additional hold, source-label, lease, and shape exclusions. Thus a stale `blocked` PR whose checks never conclude, or an `unstable` PR without a current concluded failing repair gate, can now be neither repaired nor age-parked. For an existing park the code also spends the bounded re-admission grant and removes `review:parked` on provenance alone, although the enumerator may still have no repair item. The new tests call the groom helpers with synthetic state/provenance pairs and therefore never demonstrate the claimed delivery into dispatch.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Base the carve-out and re-admission proof on evidence that matches the actual repair admission predicate, not on `mergeable_state` plus provenance alone. At minimum, do not classify `blocked`/`unstable` as repair-owned without a current head-bound concluded repair trigger; account for other terminal exclusions as appropriate. Add an integration test through `enumerate_review_items` showing that every exempted/re-admitted posture produces the intended `needs-rebase` or `needs-ci-fix` item, plus negative cases for pending, unknown/degraded, stale-head, and held PRs. Preserve a visible escalation path whenever no item is emitted.",
+    "severity": "major",
+    "title": "Merge state plus provenance does not prove repair-lane ownership"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe proposed ownership predicate is too broad: an admissible provenance record plus a GitHub merge-state string does not prove that dispatch can emit a repair item. This can suppress the only age escalation for a permanently stalled ready PR and can consume an existing park's bounded re-admission even though no repair has a forward edge. The focused unit checks encode that unsupported equivalence instead of exercising the real enumerator.",
+  "verdict": "request_changes"
+ }
+}
