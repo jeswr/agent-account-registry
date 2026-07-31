@@ -133,7 +133,8 @@
 # A cap stated only as "N per tick" is an unbounded stall in disguise. The arithmetic, explicitly,
 # and asserted by _test_drain_arithmetic:
 #
-#     cap 5 moves/tick x 3 ticks/hour (cron :09,:29,:49) = 15 PRs/hour of drain capacity
+#     cap 5 moves/tick x 3 ticks/hour (TICKS_PER_HOUR, asserted against the workflow's own
+#         cron — the minutes themselves are NOT restated here, see #1046) = 15 PRs/hour of drain
 #     the measured class size was 7 -> fully drained in 2 ticks, i.e. <= 40 min worst case
 #     the outage it clears was measured at 58 min with zero merges
 #
@@ -195,15 +196,30 @@ REVIEW_PASS_LABEL = "review:pass"
 
 SELF_ID = "> \N{ROBOT FACE} **SPARQ agent** \N{EM DASH} regate-sweep"
 
-# Every file the self-test asserts against. The sweep job sparse-checks-out exactly this set and
-# _test_selftest_inputs_are_checked_out asserts that it does: a trimmed checkout would make the
+# The ONE definition of "which minute is taken by which registry cron" (#1046). It is DERIVED
+# from the tree by ci-latency-alert.py's `schedule_minute_map`, which is why this script has to
+# read that script and the whole workflows directory: the collision assertion below reads every
+# other lane's own schedule instead of a list somebody wrote down here and stopped updating.
+WORKFLOWS_DIR = ".github/workflows"
+CRON_MAP_SCRIPT = "scripts/ci-latency-alert.py"
+
+# Every file the self-test asserts against. The sweep job sparse-checks-out exactly this set plus
+# REQUIRED_DIRS, and _test_workflow_seam asserts that it does: a trimmed checkout would make the
 # YAML-seam assertions unreachable on the live path while still passing in pr-gate.
 REQUIRED_FILES = (
     "scripts/regate-sweep.py",
     REPAIRS_FILE,
     SUITE_MANIFEST,
     SWEEP_WORKFLOW,
+    CRON_MAP_SCRIPT,
 )
+
+# Directories the self-test asserts against, held separately because they are checked out and
+# verified as DIRECTORIES. `.github/workflows/regate-sweep.yml` is a substring of this entry, so
+# a containment check would pass with the directory dropped — and dropping it is precisely what
+# makes the derived cron map read one lane instead of thirteen (ci-latency-alert.py measured that
+# same mutant surviving a containment check). Exact, per-line membership only.
+REQUIRED_DIRS = (WORKFLOWS_DIR,)
 
 
 class RegateSweepError(Exception):
@@ -1021,6 +1037,66 @@ def _require(path):
         return handle.read()
 
 
+def _require_dir(path):
+    """`_require` for a DIRECTORY input. Same fail-closed contract: a self-test that quietly
+    stops asserting is worse than no self-test."""
+    full = os.path.join(_repo_root(), path)
+    if not os.path.isdir(full):
+        raise RegateSweepError(
+            f"input directory {path} is missing from the working copy at {_repo_root()} — the "
+            "assertions that read it cannot run. Add it to the job's sparse-checkout list.")
+    return full
+
+
+def _cron_map_module(root=None):
+    """Load the single derived definition of the registry cron-minute map (#1046).
+
+    Lazily, and only from the self-test: the live sweep never needs it, so a sweep tick carries
+    no new import. Same importlib idiom as mint-provenance.py / backfill-provenance.py."""
+    import importlib.util
+
+    base = _repo_root() if root is None else root
+    path = os.path.join(base, CRON_MAP_SCRIPT)
+    if not os.path.isfile(path):
+        raise RegateSweepError(
+            f"{CRON_MAP_SCRIPT} is missing from the working copy at {base} — it owns the derived "
+            "cron-minute map, and without it the collision assertion cannot run.")
+    spec = importlib.util.spec_from_file_location("registry_cron_map", path)
+    if spec is None or spec.loader is None:
+        raise RegateSweepError(f"cannot load {CRON_MAP_SCRIPT}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _derived_schedule_map(root=None):
+    """-> (module, {workflow: minutes}, error). The derived cron-minute map, REPORTING instead
+    of raising.
+
+    It is read at the TOP of the YAML seam, and a raise there would abort the ~40 assertions
+    below it — one mutant masking the rest, the shape this file's mutation run already flagged
+    on the cron. Reporting is NOT failing open: an unloadable module or an unreadable tree comes
+    back as ({}, error) and the caller's floor assertion reds on it."""
+    root = _repo_root() if root is None else root
+    try:
+        module = _cron_map_module(root)
+        return module, module.schedule_minute_map(root), None
+    except Exception as exc:  # noqa: BLE001 - ANY derivation failure must red, never abort
+        return None, {}, exc
+
+
+def cron_collisions(minutes, others):
+    """-> {workflow: [minutes shared]} for every OTHER lane this cron lands on top of.
+
+    Pure, so the seam test can feed it the real derived map and the fixture test can feed it a
+    map it wrote. NOTE it reports {} for an EMPTY `others` — a clean bill from this function is
+    only meaningful once the caller has established the map actually saw the tree, which is what
+    the lane-count floor in the seam test is for."""
+    mine = set(minutes)
+    return {name: sorted(mine & set(taken)) for name, taken in sorted(others.items())
+            if mine & set(taken)}
+
+
 def main(argv=None, runner=None, clock=None):
     """The CLI entry point. `runner` and `clock` exist so the self-test can exercise THIS function.
 
@@ -1123,6 +1199,7 @@ def _run_suite(chk):
     _test_published_census(chk)
     _test_abort_guards(chk)
     _test_census(chk)
+    _test_cron_collisions(chk)
     _test_workflow_seam(chk)
 
 
@@ -2448,6 +2525,27 @@ def _test_abort_guards(chk):
         _sparse_paths_or_empty({"steps": []}), set())
     chk("abort-guard: ...while _sparse_paths itself still RAISES",
         isinstance(_raises(lambda: _sparse_paths({"steps": []})), RegateSweepError), True)
+    # The derived cron map is read at the TOP of the seam, so a raise there would abort every
+    # assertion below it. It REPORTS — and reporting is not failing open: the map comes back
+    # EMPTY with the error attached, which is what the seam's lane-count floor reds on.
+    _no_tree = os.path.join(_repo_root(), "no-such-checkout")
+    chk("abort-guard: _require_dir accepts a directory that IS checked out",
+        os.path.isdir(_require_dir(WORKFLOWS_DIR)), True)
+    chk("abort-guard: ...and RAISES on one that is not, rather than letting the assertions that "
+        "read it quietly stop asserting",
+        isinstance(_raises(lambda: _require_dir("no-such-checkout")), RegateSweepError), True)
+    _owner = _cron_map_module()
+    chk("abort-guard: the cron-map owner still exposes the two names this script's seam binds to "
+        "— renaming either there must red HERE, by name, not as a confusing seam failure",
+        (callable(getattr(_owner, "schedule_minute_map", None)),
+         isinstance(getattr(_owner, "MIN_SCHEDULED_LANES", None), int)), (True, True))
+    _module, _map, _error = _derived_schedule_map(_no_tree)
+    chk("abort-guard: a cron map that cannot be derived REPORTS instead of raising, and reports "
+        "an EMPTY map rather than a clean one",
+        (_module, _map, isinstance(_error, RegateSweepError)), (None, {}, True))
+    chk("abort-guard: ...while _cron_map_module itself still RAISES, so the strict form stays "
+        "available", isinstance(_raises(lambda: _cron_map_module(_no_tree)), RegateSweepError),
+        True)
 
 
 def _test_census(chk):
@@ -2466,6 +2564,28 @@ def _test_census(chk):
     chk("census: BUCKETS partitions into attributable + refused with no overlap and no gap",
         sorted(BUCKETS),
         sorted(set(ATTRIBUTABLE_BUCKETS) | (set(BUCKETS) - set(ATTRIBUTABLE_BUCKETS))))
+
+
+def _test_cron_collisions(chk):
+    """The collision predicate on FIXTURES. The seam test feeds it the real derived map; this
+    feeds it maps written here, so the predicate is exercised in both directions without a
+    workflow tree — including the shape that was live on master when #1046 was filed."""
+    others = {".github/workflows/latch-watchdog.yml": {9, 19, 29, 39, 49, 59},
+              ".github/workflows/curate.yml": {17, 47}}
+    chk("cron-map: the collision that the hand-copied map hid is reported, named, per minute",
+        cron_collisions([9, 29, 49], others),
+        {".github/workflows/latch-watchdog.yml": [9, 29, 49]})
+    chk("cron-map: a triple that lands on nobody reports nothing",
+        cron_collisions([4, 24, 44], others), {})
+    chk("cron-map: ONE shared minute out of three is still a collision — a partial overlap must "
+        "not average away", cron_collisions([4, 24, 47], others),
+        {".github/workflows/curate.yml": [47]})
+    chk("cron-map: every colliding lane is reported, not just the first",
+        sorted(cron_collisions([9, 17, 44], others)),
+        [".github/workflows/curate.yml", ".github/workflows/latch-watchdog.yml"])
+    chk("cron-map: an EMPTY map returns a clean bill — which is why the seam test gates this "
+        "predicate behind a lane-count floor rather than trusting the {} on its own",
+        cron_collisions([9, 29, 49], {}), {})
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2556,10 +2676,31 @@ def _test_workflow_seam(chk):
     minutes = sorted(int(part) for part in str(crons[0]).split()[0].split(",")) if crons else []
     chk("seam: the cron fires TICKS_PER_HOUR times an hour — the number the drain arithmetic uses",
         len(minutes), TICKS_PER_HOUR)
-    chk("seam: the cron minutes do not collide with the other registry crons (dispatch 3/13/…, "
-        "conflict-resolver 1/21/41, groom 7/22/37/52, metrics 11/26/41/56, dashboard */15)",
-        sorted(set(minutes) & ({0, 15, 30, 45} | {1, 21, 41} | {7, 22, 37, 52}
-                               | {11, 26, 41, 56} | set(range(3, 60, 10)))), [])
+    # THE MAP IS DERIVED, NOT WRITTEN DOWN (#1046). This assertion used to carry a hand-copied
+    # list of every other lane's minutes — one of five copies, and it was already stale: it
+    # claimed :00/:15/:30/:45 for dashboard after dashboard had moved off it, so it would have
+    # walked the next schedule author straight into a collision while reading green. Now every
+    # other lane's OWN schedule is read, so a repoint anywhere in the tree reds HERE.
+    cron_map, schedule_map, map_error = _derived_schedule_map()
+    others = {name: mins for name, mins in schedule_map.items() if name != SWEEP_WORKFLOW}
+    # An unreachable floor when the module itself failed to load: a derivation that cannot report
+    # its own floor must not be treated as having cleared one.
+    lane_floor = getattr(cron_map, "MIN_SCHEDULED_LANES", 1 << 30)
+    chk("seam: this script and the cron-map owner agree on where the workflows live — the path "
+        "is written in both files, and two copies can be repointed together with neither redding",
+        WORKFLOWS_DIR, getattr(cron_map, "WORKFLOWS_DIR", None))
+    chk(f"seam: the cron map is DERIVED from the tree and saw both this lane and the rest of the "
+        f"estate ({len(schedule_map)} lanes, floor {lane_floor}) — a thin checkout, a failed "
+        "import or a failed parse yields one lane or none, and a collision check over an empty "
+        "map is vacuously green",
+        map_error or (len(schedule_map) >= lane_floor and SWEEP_WORKFLOW in schedule_map),
+        True)
+    chk("seam: the derived map agrees with this workflow's own parsed cron — two independent "
+        "readings of the same schedule, so a map keyed or expanded wrongly reds instead of "
+        "quietly comparing this lane against somebody else's minutes",
+        sorted(schedule_map.get(SWEEP_WORKFLOW, [])), minutes)
+    chk("seam: these minutes collide with NO other registry cron (derived; the collision is "
+        "reported by lane and by minute)", cron_collisions(minutes, others), {})
     chk("seam: manual dispatch is available", "workflow_dispatch" in triggers, True)
 
     # --- the call site ------------------------------------------------------------------------
@@ -2647,10 +2788,13 @@ def _test_workflow_seam(chk):
         (first_checkout.get("with") or {}).get("ref"), None)
     chk("seam: the checkout does not persist credentials",
         (first_checkout.get("with") or {}).get("persist-credentials"), False)
-    chk("seam: every file the self-test asserts against is in the job's sparse checkout",
-        sorted(_sparse_paths_or_empty(job)), sorted(REQUIRED_FILES))
+    chk("seam: every file AND directory the self-test asserts against is in the job's sparse "
+        "checkout, by exact per-line membership",
+        sorted(_sparse_paths_or_empty(job)), sorted(REQUIRED_FILES + REQUIRED_DIRS))
     for path in REQUIRED_FILES:
         _require(path)
+    for path in REQUIRED_DIRS:
+        _require_dir(path)
 
 
 if __name__ == "__main__":

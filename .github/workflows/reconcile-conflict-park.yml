@@ -14,9 +14,10 @@ on:
   workflow_dispatch:
   schedule:
     # Explicit off-peak minutes, the same throttling-resistant convention the other privileged
-    # crons use. :16/:36/:56 sit shortly BEFORE conflict-resolver's :01/:21/:41, so a park released
-    # here is picked up by the very next resolver sweep rather than waiting a full cycle, and clear
-    # of dispatch (:03/:13/...) and groom (:07/:22/...).
+    # crons use. :16/:36/:56 sit shortly BEFORE conflict-resolver, so a park released here is
+    # picked up by the very next resolver sweep rather than waiting a full cycle. Which minute
+    # belongs to which lane is DERIVED, not copied here (#1046): ci-latency-alert.py's
+    # `schedule_minute_map` reads every workflow in this directory.
     - cron: '16,36,56 * * * *'
 
 permissions: {}
