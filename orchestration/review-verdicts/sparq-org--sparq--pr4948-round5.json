@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4948,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "85f06fbb7561407ef96aae01ebf3a3374c090ce4",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The module says a corrupt dealer can only guess r and that rewriting the adopted mask preserves the verdict except with probability 1/p. But mask_authenticated_difference obtains r through session.draw_nonzero_fp(), and MacSession is created from backend.dealer(); the corrupt-dealer residual therefore gives that dealer the mask it generated. It can rewrite every value share by delta = -r, producing a consistent sharing of r' = 0. auth_mul(d, r') then produces a valid authenticated zero in the adopted-second-operand construction, mac_check_and_open accepts, and every unequal pair flips to equal. The test at lines 762-782 applies only a blind fixed +9 shift, so it remains vacuous for this actual attack.",
+    "file": "crates/sparq-mpc/src/auth_equal.rs",
+    "fix_hint": "Remove the claims that operand order hardens the corrupt-dealer residual, that the dealer must guess r, and that a mask rewrite preserves the verdict. Replace corrupt_dealer_rewrite_of_the_mask_preserves_the_verdict with a residual witness using delta = mask.neg(), asserting that an unequal verdict flips while mac_check_and_open accepts, or redesign mask generation so the rewriting dealer genuinely cannot know r. Keep the <=t-party malicious-with-abort claim explicitly separate and retain the research-grade/external-audit caveat; update the matching skill and research text consistently.",
+    "severity": "major",
+    "title": "Corrupt dealer still knows the adopted mask and can zero it"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant: the round-4 major soundness/honesty issue remains. The revised module still claims that a corrupt dealer must blindly guess the equality mask, but the mask is drawn by MacSession from that dealer's state. Such a dealer can consistently replace the adopted mask sharing with r' = 0 by applying delta = -r. Because auth_mul carries the MAC through the first operand and adopts a consistent rewrite of the second, the product and carried MAC both become valid sharings of zero; the MAC check accepts and an unequal pair is returned as equal. The test still uses a fixed +9 delta and therefore does not witness the adversary the documentation claims to analyze. The <=t-party argument may remain independently scoped, but the corrupt-dealer verdict-preservation claim is unsupported.",
+  "verdict": "request_changes"
+ }
+}
