@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1468,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f5d8c03c33a0556be9b8230b31a91a893bb5136a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 resolves the prior major finding. The fresh pull-list revalidation now runs only when terminal-reap candidates exist, only for repositories holding candidates, and each repository read is independently guarded. A refused listing withdraws that repository's candidates from both terminal confirmation and `dead_claims`, retaining their leases fail-closed while allowing other repositories and ordinary dead claims to proceed. The new call-sequenced fixture proves the initial snapshot succeeds before the later listing fails, checks cross-repository progress, retained versus released claims, systemic all-refused reporting after work, and the no-candidate request path. The associated fresh-issue, snapshot, and attempt-budget handling is consistently fail-closed and has non-vacuous behavioral coverage. I found no blocker, major, or lower-severity defect in the diff.",
+  "verdict": "approve"
+ }
+}
