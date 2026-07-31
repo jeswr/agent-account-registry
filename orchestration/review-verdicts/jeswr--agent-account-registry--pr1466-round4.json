@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1466,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0080d5600a186a08a5ce19c4352d692bc36657a0",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The record makes a stale differing-value tie sweep a correctness requirement, but its deletion invariant permits a maximum-generation deletion only for \"the deleter's own record\". The implementation requirements repeat that the primitive must refuse a max-generation delete unless it is the caller's own. A groom running after the originating writer died owns neither tied record, so it cannot collapse the tie by the stated tie-break. No alternative transition (such as writing the selected value at a higher generation) is defined. Consequently the documented indefinitely-UNKNOWN/fail-open-for-disarm state remains permanent under the protocol as specified.",
+    "file": "research/389-reviewed-sha-bind-store.md",
+    "fix_hint": "Define a concrete, fenced groom transition and its authorization/invariants. For example, specify how a groom may deterministically promote the selected value to a fresh generation without deleting a maximum-generation winner, including concurrent-groom behavior and non-vacuous tests; or define a narrowly safe delegated loser-delete rule and update the primitive guard and interleaving tests accordingly.",
+    "severity": "major",
+    "title": "The stale-tie groom is forbidden from deleting the dead writer's loser"
+   },
+   {
+    "body": "Step 0 returns success as soon as the listing contains `(N, op)`. It does not read or compare that record's body. That skips `_registry_put_file`'s create-or-keep divergence check, even though the record requires the body to be a pure function of the operation and says undeclared per-attempt variation must be a conflict. A pre-existing same-path record with divergent audit bytes (whether from corruption, a digest collision, or another contents writer) is therefore silently accepted on retry, weakening the claimed immutable audit trail.",
+    "file": "research/389-reviewed-sha-bind-store.md",
+    "fix_hint": "Require rediscovery to fetch and validate the existing record against the expected operation body using the declared volatile-field equivalence rule, and fail closed on divergence. Add a retry/restart test where `(N, op)` exists with non-equivalent bytes and assert conflict/UNKNOWN rather than success.",
+    "severity": "major",
+    "title": "Step 0 bypasses immutable-body equivalence validation"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 exposes two unresolved soundness gaps in the proposed protocol. First, the mandatory stale-tie groom cannot perform the operation assigned to it: the design permits deletion of a maximum-generation loser only by that record's originating operation, while the groom necessarily acts after that writer has died. Second, step 0 treats a filename match as successful rediscovery without validating the immutable audit body, bypassing the existing create-or-keep equivalence check and accepting a divergent record. Both defects affect invariants the record calls load-bearing, so the design is not yet complete enough to approve. Because round 3 recorded no issues, these are new major findings and progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
