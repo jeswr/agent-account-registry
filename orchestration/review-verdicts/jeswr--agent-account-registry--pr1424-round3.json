@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1424,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "695c77bcb7e56c15c2b08215a325a27dabcffd9c",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`route_token = os.environ.get(\"ALERT_TOKEN\") or registry_token` makes `REGISTRY_ALERT_TOKEN` stand in for the private destination token. Thus `ALERT_REPO=private/alerts`, no `ALERT_TOKEN`, and a registry token able to read that repository causes the live probe to return private and `_alert_route` to return `(\"private/alerts\", registry_token)`. This crosses the credential boundary the code says is mandatory and can silently lose an alert because `_ops_alert` is best-effort when the registry-scoped token lacks write access to the private repository. The self-test's default-route assertion after removing `ALERT_TOKEN` expects exactly this unsafe result, so it does not protect the required half-configured fallback.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Use only `ALERT_TOKEN` as the candidate private-route token. If it is absent, return `(registry_repo, registry_token)` without issuing a visibility probe. Add a distinct-token test with `ALERT_REPO` and `REGISTRY_ALERT_TOKEN` set but `ALERT_TOKEN` absent that asserts registry fallback and zero probe calls; update the default live-probe test to set an explicit `ALERT_TOKEN` and assert the probe and private return use it.",
+    "severity": "major",
+    "title": "Missing ALERT_TOKEN is treated as a valid private route"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new visibility checks are generally fail-closed, but the worker router reintroduces a credential-scope defect that round 2 had cleared. When `ALERT_REPO` is configured without `ALERT_TOKEN`, `_alert_route` substitutes `REGISTRY_ALERT_TOKEN` as the private-route credential. A successful visibility read can therefore select the private destination using the registry credential; if that credential cannot write there, the best-effort alert delivery silently disappears. This contradicts both the stated two-token separation and the sibling routers' requirement that the explicit private token be present. The new self-test currently codifies this unsafe path instead of rejecting it. Because the prior round had no findings and this is a new major finding, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
