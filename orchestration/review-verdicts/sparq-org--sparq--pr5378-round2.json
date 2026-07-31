@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5378,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "84df3fb4c3415259f658ad5dae3a068bb5f56f08",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains correct and complete. The shared remedy is appended only to the two draft-tier refusal paths, while the ordinary failing-leg path is explicitly tested not to receive it. Both positive tests inspect rendered output from the real gate/verdict functions, so they are non-vacuous. The documentation accurately distinguishes the causal draft fast-fail from the deliberately conservative non-draft/unreadable polling behavior. No correctness, soundness, security, or test-validity issue was found.",
+  "verdict": "approve"
+ }
+}
