@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 5403,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "91b16895efaf5f519b76a8d905750c40d4910242",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Both markers this PR adds stamp [SONNET-4.6] \u2014 gui/app/src/data/tools.ts:151 and gui/README.md:165 ('[SONNET-4.6] This is the honest live-wasm boundary') \u2014 while the commit carrying them (91b16895) is trailered 'Co-Authored-By: GPT-5.6 Sol <[redacted-email]>'. The marker and the trailer disagree inside one commit.\n\nAGENTS.md:152 (item 5) requires the inline [MODEL] marker and the Co-Authored-By trailer to be derived from the harness's actual runtime model, and to agree. AGENTS.md:167 names this precise string as the canonical failure case: attribution must be correct, 'not false markers (e.g. [SONNET-4.6]) left over from an earlier brief generation'.\n\nThis is metadata, not behaviour, so it does not block. It matters for the reason the rule exists: multi-model diffs are re-reviewed per model, and because these are durable source comments rather than commit metadata, a mislabelled span routes this work to the wrong re-review lane permanently. The correct marker for this author is well established \u2014 [GPT-5.6] appears 60 times under gui/ and packages/, including a neighbouring N3 comment at engine-context.tsx:917 inside the very block this README paragraph documents.",
+    "file": "gui/app/src/data/tools.ts",
+    "fix_hint": "Replace [SONNET-4.6] with [GPT-5.6] at gui/app/src/data/tools.ts:151 and gui/README.md:165, matching the commit trailer and the existing [GPT-5.6] stamps in gui/app/src/lib/engine-context.tsx. Do not touch the pre-existing [OPUS-4.8] / [FABLE-5] stamps elsewhere in these files \u2014 per AGENTS.md:449 those are accurate history and must never be rewritten.",
+    "severity": "minor",
+    "title": "Unchanged from round 2: [SONNET-4.6] marker contradicts the commit's own Co-Authored-By: GPT-5.6 Sol trailer"
+   },
+   {
+    "body": "gui/app/src/data/tools.ts:151 attributes the N3 work to 'sq-bfimm'. That id still occurs exactly once in the whole repository \u2014 this line. The README hunk in this same PR attributes the same feature to sq-glo5r (gui/README.md:141), and sq-glo5r is the id every existing N3 reference uses: engine-context.tsx:426 and :878, workspace-context.tsx, packages/sparq-client/src/workspace.ts, inference-tool.tsx, workbench.tsx, file-ingest.ts, gui/e2e-playwright/specs/n3-inference.web.spec.ts:1, and research/gui-consolidation-fix-plan.md.\n\nSo one feature carries two different bead ids in two files of one PR. I could not adjudicate whether sq-bfimm is a typo or a real-but-unreferenced bead: .beads/issues.jsonl contains neither id, and the bd CLI is not on PATH here. The finding is therefore the internal inconsistency, which is provable from the diff alone \u2014 not a claim that the bead is fabricated.\n\nImpact is traceability only: a reader grepping sq-bfimm for the design context gets one self-referential hit.",
+    "file": "gui/app/src/data/tools.ts",
+    "fix_hint": "Change sq-bfimm to sq-glo5r at gui/app/src/data/tools.ts:151 so the blurb comment agrees with this PR's own README hunk and the existing sq-glo5r N3 references. If sq-bfimm is a genuinely distinct bead, cite both ('sq-glo5r / sq-bfimm') so the link to the established id survives.",
+    "severity": "minor",
+    "title": "Unchanged from round 2: bead id sq-bfimm still resolves nowhere; this PR's own README hunk cites sq-glo5r for the same feature"
+   },
+   {
+    "body": "This PR updates the regime list in gui/README.md, inference-control.tsx (header comment and selector docstring), and the tools.ts blurb. Comments describing the same selector were left behind and now contradict the updated docstrings:\n\n- query-workbench.tsx:71 \u2014 'the per-workspace inference (RDFS / OWL 2 RL) selector, in the action row', on the import of the very component this PR re-documented as Off / RDFS / OWL 2 RL / N3.\n- query-workbench.tsx:843 \u2014 'the per-workspace inference regime (queries run with the chosen RDFS / OWL 2 RL entailment applied by the engine)', at the <InferenceControl /> render site.\n- workspace-context.tsx:104 \u2014 describes the persisted field as 'RDFS / OWL 2 RL entailment' (already noted in round 2), and engine-context.tsx:56 describes the lazy-loaded bundle as the 'RDFS / OWL 2 RL reasoner' although the N3 path at :892 loads the same bundle. These two are the same gap, listed for completeness rather than as an additional finding.\n\nDeliberately excluded: reason-wasm.ts:89 is correct as written \u2014 it is narrowed to \"rdfs\" | \"owl-rl\" on purpose and self-documents that N3 calls reasonN3 directly and never maps through modeToProfile. Filed against gui/README.md because the other paths are outside this diff; the gap is in this PR's sweep, not in those files' original authorship.",
+    "file": "gui/README.md",
+    "fix_hint": "Extend the same one-line edit to query-workbench.tsx:71 and :843, and optionally workspace-context.tsx:104 and engine-context.tsx:56, changing 'RDFS / OWL 2 RL' to 'RDFS / OWL 2 RL / N3'. Leave reason-wasm.ts:89 alone \u2014 its narrowing is intentional and already explained in place.",
+    "severity": "minor",
+    "title": "Unchanged from round 2: doc-sync sweep still misses sibling comments describing the same selector as RDFS / OWL 2 RL only"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3. The diff is unchanged from round 2 in every hunk, so all three prior findings stand, at the same severities, with no new ones \u2014 stagnant, not regressing. I re-verified the substance from the checkout rather than inheriting round 2's conclusion, because a doc-only diff that asserts behaviour is exactly where overclaim hides. Every claim holds. The selector really offers N3: WORKSPACE_INFERENCE_MODES is [\"off\",\"rdfs\",\"owl-rl\",\"n3\"] (packages/sparq-client/src/workspace.ts:81-86) and inference-control.tsx renders one button per entry, so the docstring edit describes the rendered control, not an aspiration. The README's N3 paragraph matches engine-context.tsx:892-925 line for line: enabled docs are filtered (d.enabled !== false), their texts joined, the base folded to N-Triples via storeToNTriples, concatenated, passed to reasoner.reasonN3, and base+derived loaded as the closure. The cache key is n3:<storeEpoch>:<fnv1a(rulesText)>, so toggling or editing a rule invalidates the prior closure even when the store epoch is unchanged \u2014 the correctness property that makes 'each document can be enabled, disabled, or removed independently' true at query time rather than only in the UI. The ground-triples-only caveat is not a hedge over a gap: it restates reasonN3's own documented contract at crates/sparq-reason-wasm/src/lib.rs:180-190 ('Only ground facts are returned (rules / formulae / variables are consumed by reasoning)'). No ZK/MPC or other honesty-gated surface is touched, and no performance number is introduced. The three findings are metadata hygiene with zero runtime or user-facing effect: a model marker contradicting the commit's own trailer, a bead id that resolves nowhere, and a doc-sync sweep that stopped short of three sibling comments describing the same selector. None is a blocker or major, so none holds the PR; all three are a single cheap follow-up commit on this branch, and they have now survived two rounds unaddressed.",
+  "verdict": "approve"
+ }
+}
