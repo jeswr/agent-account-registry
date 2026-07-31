@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1331,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "efa6153a42a8e2755eebee4fb393191314c0f461",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`migration_record` validates the record internally and `migration_is_current` only proves that its timestamp is newer than park applications. `_decide` never requires a pre-migration age-park receipt matching the record's `from_gen`, `cause`, and `head`, and never requires `record['to_gen']` to equal the fresh `groom.age_park_generation(comments, bot_login)`. In `verdict`, the `if migration:` branch still runs before the receipt, grant-support, and cap checks. Consequently a structurally valid bot-authored record whose claims are invented or have become inconsistent after new grant markers can select `converge` and authorize DELETE of `needs:user`; a low `to_gen` can also bypass the live cap-spent condition. The new race tests cover a later park event and a different migration record, but still do not cover a grant marker arriving after POST or a mismatch between the record and the actual stale receipt.",
+    "file": "scripts/reconcile-age-park-escalation.py",
+    "fix_hint": "At every `_decide`, including the post-POST mutation-boundary read, bind convergence to the complete live evidence: require an actual pre-migration park receipt matching the record's `from_gen`, `cause`, and `head`; require `to_gen` to equal the current grant-derived `age_park_generation`; and require that live corrected generation to remain within the cap. Add entry-point tests for mismatched from-gen/cause/head and for grant markers arriving after POST, including a cap-spent corrected generation, and assert that no DELETE occurs.",
+    "severity": "major",
+    "title": "Convergence still trusts a migration record unbound to live generation evidence"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 remains blocked by the same authorization gap as round 3. The new changes do not bind a migration record to the actual stale receipt or to the live grant-derived generation. Recency against park applications alone cannot prove that the record describes the episode being corrected. Because the migration branch still precedes the ordinary receipt, grant-support, and cap checks, inconsistent bot-authored evidence can authorize removal of the human-owned hold.",
+  "verdict": "request_changes"
+ }
+}
