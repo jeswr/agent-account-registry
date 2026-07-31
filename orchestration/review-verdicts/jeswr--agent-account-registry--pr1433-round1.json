@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1433,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a44ac5e87919f8d8d583f93cda076948c20a8a15",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The change adds `RemoteDisconnected` to `make_fetch`'s retry arm, but no plan-snapshot self-test makes `urlopen` raise that exception and proves three attempts, the 5/10-second sleeps, and the terminal `FetchError`. The existing shared-taxonomy self-test only proves that `http_transient.is_transient_network(RemoteDisconnected(...))` returns true; it does not prove `make_fetch` consults that classifier or catches this exception. Deleting the newly added tuple member therefore leaves the suite green while restoring the reported whole-tick failure. This also writes the network exception decision locally even though `http_transient.py` explicitly defines `is_transient_network` as the single shared taxonomy and describes a caller-private copy as half-consolidated.",
+    "file": "scripts/plan-snapshot.py",
+    "fix_hint": "Drive `make_fetch` through a patched `urlopen` that raises a real `RemoteDisconnected`, patch `time.sleep`, and assert the exact attempt count, delays, and final `FetchError`; include a success-on-later-attempt case if appropriate. Wire the call site to the already-loaded `http_transient.is_transient_network` predicate (with identity/delegation pinned) instead of adding another local exception list, while preserving and explicitly testing any intentionally broader legacy `URLError` behavior. Verify that deleting or conditionally bypassing the new guard makes the row fail without aborting the suite.",
+    "severity": "major",
+    "title": "RemoteDisconnected retry path has no non-vacuous call-site test"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new recovery path is plausible, but it is not independently exercised at the plan-snapshot call site and it reintroduces a private exception taxonomy despite this module already loading the shared transient-network classifier. The added tuple member can be deleted with the existing self-tests remaining green, so the marquee behavior is not protected.",
+  "verdict": "request_changes"
+ }
+}
