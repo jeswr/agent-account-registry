@@ -1665,7 +1665,7 @@ jobs:
           WORKER_PR_HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
           WORKER_FIX_ROUND: ${{ inputs.review_round }}
           WORKER_FIX_KIND: ${{ inputs.fix_kind }}
-        run: bash ../registry/scripts/worker-live.sh publish-fix
+        run: bash ../registry/scripts/worker-live.sh push-fix
 
   # Applies every durable mutation of a review/fix run: the registry verdict record, PR labels
   # and markers, the one-shot arm, and needs-user escalations. It is a SEPARATE job from `run`

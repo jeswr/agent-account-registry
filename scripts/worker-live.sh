@@ -1994,7 +1994,7 @@ coauthor_for() {
 }
 
 # Authenticated push, extracted so BOTH token-bearing callers share one askpass implementation
-# (`publish_fix` on the review-fix lane's isolated publisher, `publish_pr` on the worker lane's —
+# (`push_fix` on the review-fix lane's isolated publisher, `publish_pr` on the worker lane's —
 # issues #91 and #575). The askpass helper keeps the App token out of argv and out of the remote
 # URL. Both callers now run in a job where no target code has ever executed.
 _git_push_authenticated() {
@@ -2029,7 +2029,7 @@ ASKPASS
 #
 # This used to be `_git_commit_and_push`, and it ran AFTER the hostile gate with a
 # contents-write App token in scope. The push half now lives in the isolated `publish` job
-# (publish_fix below); what remains here runs PRE-GATE, refuses to run with a token at all, and
+# (push_fix below); what remains here runs PRE-GATE, refuses to run with a token at all, and
 # neutralises git hooks — the fixer edits the target worktree, and a planted `.git/hooks/pre-commit`
 # would otherwise execute target-authored code from inside this commit.
 #
@@ -2981,6 +2981,16 @@ run_fix() {
 # old in-runner push asserted from a position it can trust: the parents (the dispatched head, plus
 # the recorded merge parent for a conflict repair), the committer identity, and the per-kind .beads
 # policy.
+#
+# [issue #91 review r3] THE PUSHING PHASE KEEPS THE NAME `push-fix`. Only the pre-gate seal is new,
+# so only it takes a new name. The registry's identity-seam checks name this subcommand LITERALLY:
+# dispatch-claim.py probes `worker-live.sh push-fix` to prove the push-capable path still REFUSES
+# an ordinary head branch (the #657 waiver is `review`-only), and it scans review-fix.yml for a
+# `worker-live.sh push-fix` step carrying WORKER_SELF_ATTESTED. Renaming it does not fail those
+# loudly — the probe reads the usage line instead of the refusal, and the scan simply matches
+# nothing and goes VACUOUS. A gratuitous rename here therefore costs a live trust check, so the
+# split is stage-fix (new) + push-fix (unchanged name, unchanged gates), pinned by the CLI-seam
+# rows in the self-test below.
 STAGED_FIX_REF='refs/sparq-fix/staged'
 
 # PHASE 1 (run job, PRE-GATE, NO TOKEN): commit the fixer's work locally and seal it as a bundle.
@@ -3151,7 +3161,9 @@ _verify_staged_fix() {
 # PHASE 2 (publisher job, WITH the token): prove the bundle, then push the exact recorded object.
 # TARGET_DIR here is the PUBLISHER's OWN checkout of the PR head branch — no target code has ever
 # run on this runner, and nothing from the bundle is executed (`git fetch` and `git push` only).
-publish_fix() {
+# This is the `push-fix` subcommand, unchanged in name from the single-phase form it replaces —
+# see the naming note above STAGED_FIX_REF.
+push_fix() {
   require_target
   local worker_root=${WORKER_ROOT:-}
   local bundle=${WORKER_FIX_BUNDLE:-}
@@ -5270,7 +5282,7 @@ YAML
   # A zero reached by DELETING the push would read identically and be a total regression, so the
   # push is asserted to still EXIST — in the `publish` job, which contains no gate step at all.
   chk "(#91 r2) ...the fix push still exists, in a job that runs no gate (not merely deleted)" \
-    "$(grep -Fc 'run: bash ../registry/scripts/worker-live.sh publish-fix' "$rf_wf" || true):$(_workflow_job_body "$rf_wf" publish | grep -Fc 'worker-live.sh gate' || true)" \
+    "$(grep -Fc 'run: bash ../registry/scripts/worker-live.sh push-fix' "$rf_wf" || true):$(_workflow_job_body "$rf_wf" publish | grep -Fc 'worker-live.sh gate' || true)" \
     "1:0"
   # CAPABILITY, not just ordering: the job that executes the gate no longer mints a token that
   # could push at all, and the job that can push is the one that runs no target code.
@@ -5280,7 +5292,7 @@ YAML
   # ...over a job body the extractor really found, and one that stops at the job boundary — else
   # both counts above are properties of an empty (or of a whole-file) read.
   chk "(#91 r2) ...the job extractor is bounded and non-empty (run sees the gate, publisher does not)" \
-    "$(_workflow_job_body "$rf_wf" run | grep -Fc 'run: bash ../registry/scripts/worker-live.sh gate' || true):$(_workflow_job_body "$rf_wf" publish | grep -Fc 'run: bash ../registry/scripts/worker-live.sh publish-fix' || true)" \
+    "$(_workflow_job_body "$rf_wf" run | grep -Fc 'run: bash ../registry/scripts/worker-live.sh gate' || true):$(_workflow_job_body "$rf_wf" publish | grep -Fc 'run: bash ../registry/scripts/worker-live.sh push-fix' || true)" \
     "1:1"
   # The publisher's admission, exact-match at the YAML seam (#956/#941: a substring check accepts
   # `&& false` and a dropped conjunct alike). A staged sha ALONE must not admit it — the gate has to
@@ -6700,7 +6712,7 @@ print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcaplive/
     "$( ( cd "$sf_rb_pub" && _verify_staged_fix "$sf_rb_bundle" "$sf_rb_sha" "$sf_head" "$sf_rb_merge" rebase "$sf_bot" 20971520 ) 2>/dev/null | sed -n '1{s/:.*//;p;}'):$( ( cd "$sf_rb_pub" && _verify_staged_fix "$sf_rb_bundle" "$sf_rb_sha" "$sf_head" "$sf_seed" rebase "$sf_bot" 20971520 ) 2>/dev/null | sed -n '1{s/:.*//;p;}')" \
     "ok:defer"
 
-  # publish_fix end to end against a real remote. The guards that must stop it BEFORE any push run
+  # push_fix end to end against a real remote. The guards that must stop it BEFORE any push run
   # first, then the accepting run, then the SAME accepting run again — which must now fail on the
   # --force-with-lease, because the branch it leased has moved to the commit it just pushed.
   local sf_pf_root="$sf/pub-root" sf_pf_drift_rc=0 sf_pf_bad_rc=0 sf_pf_ok_rc=0 sf_pf_replay_rc=0
@@ -6712,12 +6724,12 @@ print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcaplive/
       GITHUB_OUTPUT="$out" WORKER_FIX_BUNDLE="$sf_bundle" WORKER_STAGED_SHA="$staged" \
       WORKER_STAGED_MERGE_HEAD='' WORKER_PR_HEAD_SHA="$expect_head" \
       WORKER_PR_HEAD_BRANCH="$sf_branch" WORKER_FIX_ROUND=2 WORKER_FIX_KIND=verdict \
-      TARGET_BOT_LOGIN="$sf_bot" publish_fix
+      TARGET_BOT_LOGIN="$sf_bot" push_fix
     ) > /dev/null 2>&1
   }
   _sf_publish "$sf_seed" "$sf_sha" "$tmp/pf-drift.out" || sf_pf_drift_rc=$?
   _sf_publish "$sf_head" "$sf_seed" "$tmp/pf-bad.out" || sf_pf_bad_rc=$?
-  chk "(#91 r2) publish_fix REFUSES before pushing on a drifted head, and on an unbound bundle" \
+  chk "(#91 r2) push_fix REFUSES before pushing on a drifted head, and on an unbound bundle" \
     "$sf_pf_drift_rc:$sf_pf_bad_rc:$(git -C "$sf_origin" rev-parse "refs/heads/$sf_branch")" \
     "1:1:$sf_head"
   _sf_publish "$sf_head" "$sf_sha" "$tmp/pf-ok.out" || sf_pf_ok_rc=$?
@@ -6732,6 +6744,50 @@ print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcaplive/
   _sf_publish "$sf_head" "$sf_sha" "$tmp/pf-replay.out" || sf_pf_replay_rc=$?
   chk "(#91 r2) ...and the CAS lease refuses the push once the branch moved off the leased head" \
     "$sf_pf_replay_rc:$(git -C "$sf_origin" rev-parse "refs/heads/$sf_branch")" "1:$sf_bd_sha"
+
+  # [issue #91 review r3] THE CLI SEAM. Every row above calls the shell FUNCTIONS directly, so none
+  # of them can see the `case` arm that names them — and the subcommand names are a cross-repo
+  # contract, not an internal detail. dispatch-claim.py's identity-seam checks name
+  # `worker-live.sh push-fix` LITERALLY, twice: a behavioural probe that the push-capable path
+  # still REFUSES an ordinary head branch (the #657 self-attested waiver is `review`-only), and a
+  # scan asserting no `push-fix` step in review-fix.yml carries WORKER_SELF_ATTESTED. Neither
+  # fails loudly on a rename — the probe reads the usage line instead of the refusal, and the scan
+  # matches nothing and goes VACUOUS — so the reachability is pinned HERE, in the lane that owns
+  # the name. Executed as a SUBPROCESS on purpose: nothing else in this suite proves the dispatch
+  # table routes these two names at all.
+  #
+  # The three outcomes are distinguished by MESSAGE, never by exit status alone (all three exit 1):
+  # `unreachable` is the usage line, `refused` is the worker-namespace head gate, `past-gate` is
+  # the next check along. WORKER_SELF_ATTESTED is set on EVERY arm below because design record §3
+  # forbids the waiver from reaching either of these phases: they seal and push commits, and a
+  # self-attested record must never buy write access to its own branch.
+  _sf_cli_gate() {
+    local sub=$1 branch=$2 out
+    out=$(
+      (
+        unset GH_TOKEN
+        # push_fix refuses a missing token BEFORE the head gate; stage_fix refuses a PRESENT one.
+        [[ "$sub" != push-fix ]] || export GH_TOKEN=not-a-real-token
+        TARGET_DIR="$sf_work" WORKER_ROOT="$sf_root" WORKER_PR_NUMBER=7 \
+        WORKER_PR_HEAD_BRANCH="$branch" WORKER_SELF_ATTESTED=true \
+        bash "$SCRIPT_DIR/worker-live.sh" "$sub"
+      ) 2>&1
+    )
+    case "$out" in
+      *'usage: worker-live.sh'*) printf 'unreachable' ;;
+      *'unsafe pull request head branch'*) printf 'refused' ;;
+      *) printf 'past-gate' ;;
+    esac
+  }
+  chk "(#91 r3) both fix phases are REACHABLE BY NAME and refuse an ordinary head branch, self-attested" \
+    "$(_sf_cli_gate stage-fix fix/ordinary-branch):$(_sf_cli_gate push-fix fix/ordinary-branch)" \
+    "refused:refused"
+  # NON-VACUITY, and it is the row that keeps the one above honest: a phase that refused
+  # EVERYTHING — or that died before reaching its head gate for an unrelated reason — would read
+  # `refused` above and deliver nothing. The worker-namespace branch must get PAST that same gate.
+  chk "(#91 r3) ...and the seam is NON-VACUOUS: a worker-namespace branch gets PAST that same gate" \
+    "$(_sf_cli_gate stage-fix "$sf_branch"):$(_sf_cli_gate push-fix "$sf_branch")" \
+    "past-gate:past-gate"
 
   # HONESTY of the classification: a prep failure that is NOT a refresh failure (here a malformed
   # stored credential) must classify NOTHING — downstream then records the truthful `unknown`
@@ -7316,7 +7372,7 @@ case "${1:-}" in
   review) run_review ;;
   fix) run_fix ;;
   stage-fix) stage_fix ;;
-  publish-fix) publish_fix ;;
+  push-fix) push_fix ;;
   write-back) write_back ;;
   # issue #232 review r2: removes the materialized credential tree from the runner BEFORE any
   # target-controlled step (rustup honouring the target's toolchain pin, then the gate's build
@@ -7339,5 +7395,5 @@ case "${1:-}" in
     run_enrolled_selftest "$2"
     ;;
   self-test) self_test ;;
-  *) die 'usage: worker-live.sh <model|gate|bundle|verify-bundle|publish|review|fix|stage-fix|publish-fix|write-back|purge-credentials|print-selftest-suite|run-selftest|self-test>' ;;
+  *) die 'usage: worker-live.sh <model|gate|bundle|verify-bundle|publish|review|fix|stage-fix|push-fix|write-back|purge-credentials|print-selftest-suite|run-selftest|self-test>' ;;
 esac
