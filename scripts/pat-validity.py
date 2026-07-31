@@ -43,7 +43,12 @@
 # PUBLIC-LOG REDACTION (sol review round 1 of #432): stdout lands in the PUBLIC registry repo's
 # workflow log whatever the alert route, so it carries ONLY a coarse
 # {"status": "ok"|"attention-required"|"unknown"} plus generic annotations — never the exact
-# verdict, the free-text detail, or the token's calendar expiry / days-left.
+# verdict, the free-text detail, or the token's calendar expiry / days-left. The `verdict=`
+# GITHUB_OUTPUT line is the deliberate EXCEPTION and the OTHER HALF of that contract (issue
+# #433): the outputs file is runner-internal, so it keeps the EXACT verdict — and only it. Both
+# halves are pinned on the SAME self-test run, because each is invisible to the other's test:
+# coarsening or dropping the outputs line silently breaks workflow-internal automation, while
+# widening it (detail, expiry) parks credential lifecycle one deliberate `echo` from the log.
 # FAIL-CLOSED AGAINST FALSE ALARMS: an unreachable/throttled/5xx-ing API proves nothing about the
 # PAT, so `network-unknown` is NOT `invalid` — it neither opens the CREDENTIAL rolling alert NOR
 # closes an existing one (unknown is not recovery either). But a PERMANENT unknown (a dead proxy,
@@ -2019,6 +2024,58 @@ def _self_test():
                     "(suppression is log-side, not alert-side)",
                     "DISTINCTIVE-DETAIL-NEVER-PUBLIC" in (captured[0] if captured
                                                           else {}).get("body", ""), True)
+            # --- issue #433: the MACHINE-READABLE half of the same contract. The public run log
+            # is coarse (the rows above), but GITHUB_OUTPUT — the runner-internal outputs file,
+            # rendered nowhere in the log — must still carry the EXACT verdict, and ONLY it. The
+            # two halves have to be pinned TOGETHER: the obvious over-application of the
+            # redaction (coarsen or drop the outputs write too) silently breaks the `verdict=`
+            # contract, and the obvious under-application (append the detail/expiry to the
+            # outputs file as well) parks credential lifecycle one `echo` away from the public
+            # log — and a test that reads only stdout is blind to both. Every OTHER main() row in
+            # this suite pops GITHUB_OUTPUT, so the write had NEVER executed (measured with
+            # `python3 -m trace --count --missing`: the two write lines unreached across 16
+            # main() invocations). Run on BOTH alert routes — the outputs contract is
+            # route-independent — and the file is pre-created so a DROPPED write reds this row
+            # instead of aborting the suite with FileNotFoundError.
+            import tempfile
+            for verdict, coarse in ((INVALID, "attention-required"), (VALID, "ok"),
+                                    (NETWORK_UNKNOWN, "unknown")):
+                module["probe"] = lambda token, repo, v=verdict: {
+                    "verdict": v, "detail": "DISTINCTIVE-DETAIL-NEVER-PUBLIC",
+                    "expires_at": "2099-01-02 03:04:05 UTC", "days_left": 3.5}
+                for route in ("verified-private", "redacted-public"):
+                    if route == "verified-private":
+                        os.environ["ALERT_REPO"] = "org/private"
+                        os.environ["ALERT_TOKEN"] = "priv"
+                    else:
+                        os.environ.pop("ALERT_REPO", None)
+                        os.environ.pop("ALERT_TOKEN", None)
+                    with tempfile.TemporaryDirectory() as outdir:
+                        outputs = os.path.join(outdir, "github_output")
+                        open(outputs, "w", encoding="utf-8").close()
+                        os.environ["GITHUB_OUTPUT"] = outputs
+                        out_text = io.StringIO()
+                        try:
+                            with contextlib.redirect_stdout(out_text):
+                                main([])
+                        finally:
+                            os.environ.pop("GITHUB_OUTPUT", None)
+                        with open(outputs, encoding="utf-8") as handle:
+                            raw = handle.read()
+                    text = out_text.getvalue()
+                    # Exact line + the trailing newline (GITHUB_OUTPUT is line-oriented: an
+                    # unterminated line would swallow whatever a later step appends), and NO
+                    # second line — the detail/expiry/days-left must not ride along.
+                    chk(f"main() {route}/{verdict}: GITHUB_OUTPUT carries the EXACT verdict "
+                        "line and nothing else (#433 machine contract)",
+                        (raw.splitlines(), raw.endswith("\n")),
+                        ([f"verdict={verdict}"], True))
+                    chk(f"main() {route}/{verdict}: the PUBLIC log stays coarse on the very run "
+                        "that writes that outputs line (#433)",
+                        (json.dumps({"status": coarse}) in text, verdict in text,
+                         "DISTINCTIVE-DETAIL-NEVER-PUBLIC" in text, "2099-01-02" in text,
+                         "3.5" in text),
+                        (True, False, False, False, False))
         finally:
             module["probe"] = real_probe3
             for key, val in saved_env.items():
