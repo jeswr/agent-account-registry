@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4948,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "85f06fbb7561407ef96aae01ebf3a3374c090ce4",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The docs claim a corrupt dealer rewriting the mask can reach r'=0 only by guessing the secret r, and the test models this by adding a fixed blind delta. But malicious_secure_equal_batch draws r through the same ShamirDealer/MacSession whose corruption is the stated residual. A corrupt dealer therefore knows mask_value and can consistently rewrite every value share by delta=-r. Because auth_mul adopts a consistent rewrite of its second operand, both the product and carried MAC track d*0=0; mac_check_and_open accepts, and any unequal pair is returned as equal. Thus the claimed corrupt-dealer hardening and verdict-preservation boundary are false, although this does not refute the separately scoped <=t-party argument.",
+    "file": "crates/sparq-mpc/src/auth_equal.rs",
+    "fix_hint": "Remove the claim that operand order protects against a corrupt dealer and state plainly that dealer corruption can zero the known mask and flip an unequal verdict. Replace corrupt_dealer_rewrite_of_the_mask_preserves_the_verdict with a witness using delta=mask.neg() that demonstrates the residual attack, or change the randomness/threat model so the rewriting adversary genuinely does not know r. Keep the AuthenticatedEqualityJoin guarantee explicitly limited to <=t corrupt parties with an honest trusted dealer.",
+    "severity": "major",
+    "title": "The corrupt dealer knows the mask and can zero the adopted operand"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 fixes the prior batch-cancellation finding: the module now states both lambda and chi weightings, separates the alpha-forgery and random-linear-combination cases, gives a qualified bound, and adds a real two-product production-check witness plus mutation. However, the newly explicit corrupt-dealer residual is unsound. The same dealer that draws the mask necessarily knows it, so it can rewrite every mask value share by -r, making the adopted second operand a valid sharing of zero. For unequal keys this makes the checked product zero with a matching MAC and silently flips the verdict to equal. The test deliberately chooses a blind fixed shift and therefore cannot support the claimed corrupt-dealer hardening. Because this is a new major honesty/soundness finding on an MPC surface, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
