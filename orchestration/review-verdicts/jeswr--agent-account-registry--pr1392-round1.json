@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1392,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "471b0aa67840c71323b45a1de45d3a31c50c72cd",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "For this repository, the security-label route used by the motivating `area:review-loop` case resolves `agent` to `registry-reviewer`. That checked-in agent brief explicitly permits only a review verdict, restricts tools to Read/Glob/Grep, says to mutate nothing except `.review-verdict.json`, and states that its job is never a fix. The changed `resolved_agent = route_agent or policy[\"agent\"]` sends that persona to `WORKER_AGENT` for the `worker-live.sh fix` step. Thus a trust-surface fix is now instructed not to edit the PR at all; a compliant model cannot perform the fix, while a model that does edit must violate its system persona. The comment's claim that retaining this brief carries fixer obligations conflicts with the actual brief's verdict-only contract.",
+    "file": ".github/workflows/review-fix.yml",
+    "fix_hint": "Introduce or select a trust-aware implementation/fixer persona whose instructions include the trust-plane obligations while still authorizing edits, and route fix mode to that persona. Do not reuse the read-only `registry-reviewer` brief for a mutation-capable leg. Extend the executable test beyond equality with `registry-reviewer`: pin that the resolved fix persona's actual checked-in brief authorizes fixing/mutation and is not verdict-only/read-only, while review mode continues to use `registry-reviewer`.",
+    "severity": "blocker",
+    "title": "Fix mode is assigned the verdict-only reviewer persona"
+   },
+   {
+    "body": "The new L3b-agent test asserts that fix mode returning `registry-reviewer` is correct, but it never checks what that agent means at the downstream prompt-loading boundary. Because the actual `registry-reviewer` brief forbids mutation and says `never a fix`, both persona-derivation mutants can be killed while the marquee behavior remains unusable. This is a one-layer-short test: it validates transport of the route string, not that the transition delivers into a fix-capable prompt.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "After choosing a dedicated trust-aware fixer persona, make the test resolve that persona and validate the consumer contract against the real `.claude/agents/<agent>.md` file (or a shared machine-readable capability declaration). Include a red case showing that a verdict-only/read-only persona such as `registry-reviewer` is refused for fix mode.",
+    "severity": "major",
+    "title": "Self-test treats an incompatible reviewer persona as the expected fix result"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly derives the fix persona from the same live route as the constrained model chain and fails closed on a missing agent, but the concrete persona selected by the repository's security route is not a fixer persona. `orchestration/routing.toml` maps trust-surface labels to `registry-reviewer`, and `.claude/agents/registry-reviewer.md` explicitly says verdict-only, read-only, mutate nothing, and never fix. Passing that persona into `worker-live.sh fix` therefore gives the editing leg instructions that prohibit its required work. The added execution tests prove the value is propagated, but assert the incompatible value as success, so they do not establish end-to-end correctness at the prompt consumer.",
+  "verdict": "request_changes"
+ }
+}
