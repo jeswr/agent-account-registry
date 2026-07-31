@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5189,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7e5c080c65194f86b0da596101e49f6140c6b1c0",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 finds no correctness, soundness, security, or test-validity defect. The manifest makes both planner features default-on and forwards them explicitly to sparq-engine; the README and matching agent-tools skill accurately document that public-surface behavior. The tests are meaningful for the integration contract: they pin the declared default set, compile against feature-gated engine APIs to witness forwarding, exercise the real MCP tools/call query path, verify IRI rewrite behavior and the literal-equality decline boundary, compare DP-enabled and scoped-disabled answers, and check planner scope restoration. The change adds no runtime dependency or uncaveated privacy claim. With no prior-round issues and no current issues, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
