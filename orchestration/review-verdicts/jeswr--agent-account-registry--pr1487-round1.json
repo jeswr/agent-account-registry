@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1487,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "addb612199d8d57bf08b0c2e861546a19edcf307",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly moves all removals ahead of the single add-label request, so a failed transition can lose a dispatch-enabling label but cannot create the ready/deferred overlap caused by the former add-first order. The new live-label reread fails closed on missing additions, residual removals, and malformed API data. The self-test exercises both write order and intermediate states across the transition table, independently pins the deferred transition's required removals, covers silent-success failures on both DELETE and POST, and confirms the healthy and unreadable reread paths. I found no diff-scoped correctness, security, or test-validity issue requiring changes.",
+  "verdict": "approve"
+ }
+}
