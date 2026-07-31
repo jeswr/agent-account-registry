@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5066,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ce79ec23e531d54f8e66e7a0525c50ebc9b2b9f9",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains clean. The change preserves the five load-bearing ODRL strata in A0/A/B/C/D order, carries each full closure into the next stratum in one dictionary, and consistently extracts final auth triples from that dictionary. Compilation failures are cached and returned as errors, while untrusted policy/request input still enters through the fact-only parser/interner, which rejects rules. The existing odrl_n3_differential test exercises the real materialize_odrl_n3 path, independently pins expected grant/deny sets, includes deny-overrides and adversarial fail-closed cases, and has generated non-vacuity coverage. This remains consistent with research/odrl-n3-compiled-rules.md's stratification and compiled-subset constraints.",
+  "verdict": "approve"
+ }
+}
