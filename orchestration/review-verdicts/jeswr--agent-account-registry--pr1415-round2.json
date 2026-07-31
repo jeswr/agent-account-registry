@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1415,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1af0dbce6017366a104516a7812fe68bd4210ba1",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 diff remains sound. The shared helper narrows only after a readable issue-label map proves the provenance-linked source absent, and only to a non-empty PR-declared area set that excludes `__global__`. Both occupancy and review-row packaging call that helper with the same validated provenance issue and normalized PR areas, preserving linkage parity; listed, malformed-present, unreadable-map, empty-area, and explicit-global cases retain the fail-closed global reservation. The new cause is correctly outside the global-only census while remaining in the complete reservation-cause enum. The added assertions exercise both producers, the lane-level effect, strict narrowing, cause attribution, and refusal edges with concrete outcomes. I found no correctness, non-vacuity, trust-check, or security issue. With no findings in either round, progress is materially unchanged.",
+  "verdict": "approve"
+ }
+}
