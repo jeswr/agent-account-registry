@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1415,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1af0dbce6017366a104516a7812fe68bd4210ba1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change soundly narrows the closed/unlisted-source reservation only when a readable issue-label map proves absence and the PR declares a non-global area set. Occupancy and review-row packaging share the same predicate, preserving linkage parity; empty, listed, unreadable-map, and explicit `area:__global__` cases retain the fail-closed global reservation. The new cause is correctly excluded from the global-only census while remaining in the complete reservation-cause enum. Diff-scoped self-tests exercise both producers, the lane-level consequence, strict narrowing, census attribution, and the important refusal cases with concrete non-vacuous assertions. I found no correctness, trust-check weakening, or security blocker in the diff.",
+  "verdict": "approve"
+ }
+}
