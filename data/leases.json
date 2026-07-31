@@ -91,16 +91,6 @@
    "expires_at": 1785480649
   },
   {
-   "account": "dc2d751954080e13",
-   "claim_id": "2c4d9597e8c3490393d98cf9d1a835f3",
-   "holder": "review:sparq-org/sparq#5066@dispatch-30605588315.1",
-   "package": "sparq-solid",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785474366,
-   "expires_at": 1785478566
-  },
-  {
    "account": "51bde6688e140866",
    "claim_id": "e9c65728c9194b3a905914488ee87afb",
    "holder": "review:sparq-org/sparq#5130@dispatch-30605588315.1",
