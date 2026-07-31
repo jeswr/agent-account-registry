@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5418,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "66019cad7a9819b47a4569b6e628be1b34c2a329",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 confirms the prior approval. The new flat-manifest gate derives repeated variable slots from the verifier-parsed query, checks every active row of each constant-compatible scan using canonical field equality, and remains disabled only on the extended-fragment path where variable-name-keyed solution/coherence binding already enforces the same invariant. The negative witness exercises the real prefilter entry point and pins the structured rejection, while the genuine self-loop and distinct-variable controls make the test non-vacuous and guard scope. The audit and skill text retain the research-grade, not-externally-audited caveat. No correctness, soundness, security, test-validity, or injection issue was found.",
+  "verdict": "approve"
+ }
+}
