@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1284,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "31718eb3c7fc98e82aaa0e47e13bb09b50a7b57a",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 5 remains correct, complete, and fail-closed. The fix lane seals the exact commit and uploads its inert bundle before target-controlled gate code runs; the isolated publisher accepts only a green gate and a non-empty pre-gate SHA, then revalidates the bundle tip, exact parent shape, bot identity, .beads policy, live remote state through a force-with-lease, and the recorded merge parent where applicable. The gate runner retains no target-write credential after executing target code, while outcome recording and lease release wait for publication without suppressing skipped or refused publishes. The workflow checks pin exact job boundaries and admission conditions and include non-vacuity mutants for post-gate token detection. Repository-level tests exercise stage restoration, missing and substituted artifacts, malformed bundles, identity and ancestry failures, .beads enforcement, CLI routing, successful publication, and lease rejection. Transcript artifacts are included in both purge discovery and deletion with selectivity and rename-drift coverage. No reviewer-directed instruction was detected in the diff.",
+  "verdict": "approve"
+ }
+}
