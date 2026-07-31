@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1446,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e40aec3ab83c2afb7265a544d877e5b445526a94",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 5 confirms the round-4 result. The failed-gate diagnostic remains an inert, SHA-pinned artifact upload conditioned exactly on a genuine gate failure and successful bundle verification; it neither executes shell nor receives a target credential. The contents/workflows/issues/pull-request write token is minted only on the verified gate-success lane, while failed-gate follow-up filing uses a separately minted issues-only token routed exclusively to that step. The live self-tests pin the complete security-sensitive conditions, evaluate failure/success/absent verdicts with positive controls, assert exact credential consumers and permission scopes, and cover the prior mint defect without relying on substring containment. I found no blocker, major, or lower-severity defect in the diff.",
+  "verdict": "approve"
+ }
+}
