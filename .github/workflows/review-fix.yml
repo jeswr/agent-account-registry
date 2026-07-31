@@ -118,8 +118,9 @@ jobs:
       model_chain: ${{ steps.policy.outputs.model_chain }}
       account_pool: ${{ steps.policy.outputs.account_pool }}
       # [#285] The system-prompt persona for the model step. review = the `--role review` reviewer;
-      # fix = the SOURCE ISSUE's own live-re-derived route, so a trust-surface fix keeps the
-      # trust-aware brief the worker implemented under (see the resolution in the `policy` step).
+      # fix = the SOURCE ISSUE's own live-re-derived route persona UNLESS that route names the
+      # verdict-only review persona, which a mutation lane cannot run under — then the `--role
+      # impl` implementer (see the resolution + its refusal in the `policy` step).
       agent: ${{ steps.policy.outputs.agent }}
       gate_profile: ${{ steps.policy.outputs.gate_profile }}
       arm_auto_merge: ${{ steps.policy.outputs.arm_auto_merge }}
@@ -646,26 +647,55 @@ jobs:
                   route_chain = []
                   route_agent = ""
               wanted = dispatch_claim._route_constrained_fix_chain(wanted, route_chain)
-          # ---- [#285] THE FIX PERSONA RIDES THE SAME ROUTE AS THE FIX CHAIN ----
+          # ---- [#285] THE FIX PERSONA RIDES THE ROUTE — BUT NEVER THE VERDICT-ONLY REVIEWER ----
           # `policy["agent"]` above came from `--role impl`, i.e. routing.toml's `role = "impl"`
-          # row — the PLAIN implementer persona, resolved without reference to the PR's trust tier.
-          # #103 fixed the sibling half of this (the fix MODEL floor) and left the prompt behind, so
-          # a trust-surface fix ran the right model with the wrong brief: on THIS repo an
-          # `area:review-loop` issue is matched by the security override and worker.yml implemented
-          # it as `registry-reviewer`, but its fix leg re-entered as `registry-impl`. The fixer's
-          # system prompt is what carries the trust-plane obligations (fail-closed posture,
-          # non-vacuous self-tests, never-weaken-a-trust-check), so the leg that EDITS a
-          # trust-surface PR is exactly the one that must not lose them.
-          # The route is already re-derived LIVE, from the SOURCE ISSUE's own labels, one block up;
-          # take the persona from that same resolution so fix and implementation agree by
-          # construction. worker-live.sh resolves it to `.claude/agents/<agent>.md` in the target —
-          # the worker already ran under this agent to open the PR, so the prompt exists.
-          # NOT a fallback: `route_agent` is empty only when (a) mode is REVIEW, where the persona
-          # must stay the `--role review` reviewer (an implementor route would hand the read-only
-          # reviewer the implementer's brief), or (b) the fix-lane route refused, which has ALREADY
-          # emptied `chain` above — that run is parked to a human by the `unresolvable` job and no
-          # model ever consumes this value.
-          resolved_agent = route_agent or policy["agent"]
+          # row — the target's IMPLEMENTER persona, resolved without reference to the PR's trust
+          # tier, so a docs-only or CI PR was fixed under the general implementer's brief. The
+          # route this lane already re-derives LIVE (one block up, from the SOURCE ISSUE's own
+          # labels) names the persona the worker actually implemented under, so taking the persona
+          # from that same resolution keeps the fix leg no more privileged than the leg it is
+          # fixing. worker-live.sh resolves it to `.claude/agents/<agent>.md` in the target.
+          #
+          # WITH ONE REFUSAL, and it is the case that motivated this change ([#285] review r1).
+          # A `[[route]]` may name a VERDICT-ONLY persona: on THIS repo the security override
+          # (`review-loop`/`dispatch`/`worker`/...) routes to `registry-reviewer`, whose checked-in
+          # brief is read-only (Read/Glob/Grep), mutates nothing but `.review-verdict.json` and
+          # says its job is "never a fix". Handing THAT brief to the `worker-live.sh fix` step
+          # instructs the fixer not to edit the PR at all: a compliant model produces no diff and a
+          # model that does edit is violating its own system prompt. So the route persona is
+          # adopted only when it is NOT the persona this target's routing assigns to the REVIEW
+          # role — that row IS the target's own machine-readable declaration of which brief is the
+          # verdict-only one (it is the persona this very workflow runs its review lane under).
+          # Refusal (and any resolver refusal that leaves the review persona underivable) falls
+          # back to `policy["agent"]`, the `--role impl` implementer: mutation-capable by
+          # construction of the role, no wider than the lane already had before this change, and
+          # named in the audit line below. It grants nothing — the alternative, parking every
+          # trust-surface fix to a human, would disable the fix lane for the majority of this
+          # repo's PRs, which is a bigger regression than the drift it removes.
+          #
+          # REVIEW MODE NEVER ENTERS THIS: `route_agent` is empty there (no route is consumed), so
+          # the persona stays the `--role review` reviewer. A fix-lane resolver refusal also leaves
+          # it empty — and that refusal has ALREADY emptied `chain` above, so that run is parked to
+          # a human by the `unresolvable` job and no model consumes this value at all.
+          persona_source = "role-resolved"
+          resolved_agent = policy["agent"]
+          if route_agent:
+              persona_error = ""
+              try:
+                  review_persona = policy_resolve.resolve(
+                      target_repo, ["role:review"], policy_doc, routing)["agent"]
+              except (ValueError, TypeError, KeyError) as exc:
+                  review_persona = None
+                  persona_error = f": {exc.__class__.__name__}: {exc}"
+              if not isinstance(review_persona, str) or not review_persona.strip():
+                  persona_source = ("role-resolved (route persona UNVERIFIABLE: this target "
+                                    f"resolves no review persona to check it against{persona_error})")
+              elif route_agent.strip() == review_persona.strip():
+                  persona_source = ("role-resolved (route persona REFUSED: it is this target's "
+                                    "verdict-only review persona)")
+              else:
+                  resolved_agent = route_agent
+                  persona_source = "source-issue route"
           models = routing.get("models", {})
           chain = []
           for alias in wanted:
@@ -738,9 +768,9 @@ jobs:
                     f"{','.join(route_chain) or 'NONE'}"
                     f"{f' (resolver refusal: {route_error})' if route_error else ''}")
           print(f"{mode} chain for {impl_provider}-implemented PR: {','.join(chain) or 'UNRESOLVABLE'}")
-          # [#285] Audit line: WHICH persona this lane resolved and WHERE it came from.
-          print(f"{mode} agent: {resolved_agent} "
-                f"({'source-issue route' if route_agent else 'role-resolved'})")
+          # [#285] Audit line: WHICH persona this lane resolved and WHERE it came from — including
+          # a route persona that was REFUSED for being this target's verdict-only reviewer.
+          print(f"{mode} agent: {resolved_agent} ({persona_source})")
           PY
 
   claim:
