@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5066,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ce79ec23e531d54f8e66e7a0525c50ebc9b2b9f9",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly replaces five text-level, dictionary-per-stratum evaluations with the compiled evaluator while preserving the load-bearing stratum order and carrying each full closure into the next evaluation in one dictionary. Fact ingestion remains fail-closed through intern_facts, rule compilation failures are cached and returned as errors, and extraction consistently uses the shared dictionary. The existing ODRL differential is non-vacuous: it exercises the real materialize_odrl_n3 path, compares against the independent Rust evaluator and explicit expected auth sets, includes deny-overrides and generated fail-closed coverage, and therefore directly gates this seam change. This is consistent with the compiled-rules audit's stratification and scoped-subset requirements.",
+  "verdict": "approve"
+ }
+}
