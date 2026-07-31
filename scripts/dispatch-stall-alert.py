@@ -27,7 +27,7 @@
 #     groom never RUNS                     -> dashboard.yml `cron-keepalive`
 #     dashboard never RUNS                 -> metrics.yml   `dashboard-publish` staleness fallback
 #
-# TWO HALVES, because one cannot express what the other sees:
+# THREE SIGNALS, because none of them can express what the others see:
 #
 #   (A) FAILURE STREAK — the last FAILURE_STREAK_THRESHOLD *executed* ticks all concluded
 #       `failure`. This is the brief's "N consecutive dispatch failures is a full pipeline stall".
@@ -42,10 +42,23 @@
 #       workflow cannot detect its own NON-EXECUTION, and (A) needs concluded runs to key on;
 #       a dispatcher that stopped being scheduled, or one whose runs all cancel, produces neither.
 #
+#   (C) RING EFFICIENCY — dispatch RUNS per EXECUTED tick (issue #1326). Neither (A) nor (B) can
+#       see this one, and that is the whole point: on the measured window every dispatch run
+#       concluded `success` and a PLAN was completing, so both halves above read healthy while
+#       54 dispatch runs produced ~4 executed ticks. The aggregate IS the defect, so it has to be
+#       asserted directly — no per-run signal can carry it. See _render_ring_body for what the
+#       number means and what to do about it.
+#
+# WHY (C) IS FREE. It is derived from the two payloads this watchdog already reads: the artifact
+# listing (which run ids uploaded a `dispatch-tick` marker — i.e. which runs EXECUTED) and the
+# dispatch runs listing (how many runs there were). It adds no API request, which matters here
+# more than usual: the condition it watches for is contention on the very budget an extra request
+# would spend. `_test_gh_flows` pins the request count at two.
+#
 # PAGING POLICY / AUTHORITY / CEILING: identical to scripts/metrics-alert.py. This script may
 # create/edit/comment/close ONE `ops-alert` issue per marker and nothing else — no arming path, no
 # merge path, no PR path, and no code path that can write a `needs:`/`status:`/`role:` label
-# (enforced by _test_no_hold_labels below, not by convention). Both alerts auto-close on an
+# (enforced by _test_no_hold_labels below, not by convention). Every alert auto-closes on an
 # explicit recovery. Its job carries `actions: read` + `contents: read` + `issues: write`.
 #
 # DEBT (issue #591, PR #590): `_alert_route` is another private copy of locked decision 22c.
@@ -85,7 +98,35 @@ STALE_ALERT_MARKER = "<!-- dispatch-stall-alert:v1 key=dispatch-plan-stale -->"
 # drift silently.
 STALE_THRESHOLD_SECONDS = 45 * 60
 
-# The artifacts the two halves key on. Both are written by dispatch.yml and by nothing else.
+# --- (C) the RING-EFFICIENCY metric (issue #1326) ----------------------------------------------
+RING_ALERT_TITLE = ("⚠️ The dispatcher is mostly administering itself — dispatch RUNS per EXECUTED "
+                    "tick is far above what the tick floor can ever admit")
+RING_ALERT_MARKER = "<!-- dispatch-stall-alert:v1 key=dispatch-ring-efficiency -->"
+# THE THRESHOLD, DERIVED — not chosen. The #819 floor admits at most
+# `3600 / MIN_TICK_INTERVAL_SECONDS` = 6 executed ticks/hour, and dispatch's cron fires exactly 6
+# times/hour (`3,13,23,33,43,53`). Those two numbers being EQUAL is the whole derivation: a
+# dispatcher rung only by its own schedule sits at a ratio of ~1.0, because every scheduled ring
+# lands on the floor boundary. `_test_ring_threshold_is_derived_from_the_floor` asserts that
+# equality against the LIVE floor constant and the LIVE cron, so a change to either side reds this
+# file instead of silently invalidating the number below.
+#
+# Every point above 1.0 is therefore doorbell rings the floor cannot admit — runs that were
+# structurally incapable of dispatching anything before they started. 3 means TWO OF EVERY THREE
+# dispatch runs were in that class.
+#
+# WHY 3 AND NOT THE MEASURED PATHOLOGY. The two reported windows read 8.2 (#1208: 41 runs, 5
+# dispatched) and 13.5 (#1326: 54 runs, ~4 executed). A threshold set at those only fires once the
+# fleet is already as bad as the worst case anyone has written up, which is a threshold that can
+# never catch the drift toward it. 3 keeps 3x headroom over the structural ideal and still sits
+# well under both measurements — asserted, in both directions, below.
+RING_RUNS_PER_EXECUTED_TICK_THRESHOLD = 3
+# Minimum concluded runs in the window before the ratio is allowed to mean anything. At the cron's
+# 6/hour this is two hours of evidence; below it a single slow tick swings the ratio by a whole
+# point and the alarm would be reporting noise. Under the sample the verdict is `unknown`, which
+# `decide` reads as "do nothing" — it never pages AND never closes a live alert.
+RING_MIN_RUNS = 12
+
+# The artifacts the halves key on. Both are written by dispatch.yml and by nothing else.
 TICK_MARKER_ARTIFACT = "dispatch-tick"          # an EXECUTED tick (uploaded before the snapshot)
 PLAN_ARTIFACT_PREFIX = "dispatch-plan-"         # a COMPLETED plan (uploaded at the end of PLAN)
 ARTIFACT_PAGE_SIZE = 100
@@ -227,8 +268,68 @@ def stale_verdict(epoch, now, threshold=STALE_THRESHOLD_SECONDS):
     return "fresh", "ok", age
 
 
+def artifact_horizon(payload, carried=None):
+    """Oldest `created_at` on an artifact page -> epoch|None, folded into `carried` across pages.
+    (`carried`, not `floor`: nothing here is related to the #819 tick floor.)
+
+    This is the LOWER BOUND of the window in which "did run N execute?" is answerable. The listing
+    is repo-wide and newest-first, so every `dispatch-tick` marker newer than this stamp is on the
+    pages that were actually read; anything older may simply have been crowded off by an unrelated
+    workflow's artifacts, and reading THAT as "the tick did not execute" would manufacture waste
+    out of a paging artefact. Same fact `page_covers_threshold` turns into a coverage proof, used
+    here as a horizon instead of a predicate.
+
+    Names are deliberately NOT filtered: the bound is about what the PAGE reached back to, which
+    every entry on it witnesses equally."""
+    stamps = [parse_rfc3339(entry.get("created_at")) for entry in _artifacts(payload)]
+    stamps = [s for s in stamps if s is not None]
+    if carried is not None:
+        stamps.append(carried)
+    return min(stamps) if stamps else None
+
+
+def ring_sample(runs_payload, executed_ids, horizon):
+    """-> (concluded dispatch runs, of which EXECUTED) inside the adjudicable window.
+
+    Runs OLDER than `horizon` are excluded because their marker artifact may be off the pages that
+    were read (see artifact_horizon). Runs still IN FLIGHT are excluded for the same reason
+    failure_streak excludes them: a tick that has not concluded has not necessarily uploaded its
+    marker yet, so counting it would report latency as waste. Both exclusions can only ever shrink
+    the numerator and the denominator together, never inflate the ratio."""
+    if horizon is None:
+        return 0, 0
+    runs = runs_payload.get("workflow_runs") if isinstance(runs_payload, dict) else None
+    if not isinstance(runs, list):
+        return 0, 0
+    counted = executed = 0
+    for run in runs:
+        if not isinstance(run, dict) or run.get("conclusion") is None:
+            continue
+        created = parse_rfc3339(run.get("created_at"))
+        if created is None or created < horizon:
+            continue
+        counted += 1
+        if run.get("id") in executed_ids:
+            executed += 1
+    return counted, executed
+
+
+def ring_verdict(counted, executed, threshold=RING_RUNS_PER_EXECUTED_TICK_THRESHOLD,
+                 min_runs=RING_MIN_RUNS):
+    """-> ('wasteful'|'ok'|'unknown', ratio|None). The standing metric, and the assertion on it.
+
+    `unknown` — never a page and never a close — for the two states that have no ratio in them:
+    too small a sample, and ZERO executed ticks. The zero case is deliberately not folded into
+    'infinitely wasteful': a window in which nothing executed at all is what half (B) exists to
+    page for, and reporting it twice under two markers is two alerts for one condition."""
+    if counted < min_runs or executed <= 0:
+        return "unknown", None
+    ratio = counted / executed
+    return ("wasteful" if ratio >= threshold else "ok"), ratio
+
+
 def decide(verdict, has_open_alert, bad="stalled"):
-    """'upsert' | 'close' | 'noop'. Shared by both halves."""
+    """'upsert' | 'close' | 'noop'. Shared by every half."""
     if verdict == bad:
         return "upsert"
     if verdict != bad and has_open_alert and verdict in ("ok", "fresh"):
@@ -284,6 +385,35 @@ def _render_stale_body(reason, age_seconds, run_url, workflow_url, maintainer):
     )
 
 
+def _render_ring_body(ratio, counted, executed, run_url, workflow_url, maintainer):
+    wasted = counted - executed
+    return (
+        f"{RING_ALERT_MARKER}\n"
+        "> 🤖 SPARQ agent — automated ops-alert (watch the dispatcher)\n\n"
+        f"@{maintainer} over the last **{counted}** concluded dispatch runs only **{executed}** "
+        f"were EXECUTED ticks — **{ratio:.1f} runs per executed tick** (threshold "
+        f"{RING_RUNS_PER_EXECUTED_TICK_THRESHOLD}). The other **{wasted}** started a job, issued "
+        "the floor's anchor read and dispatched nothing.\n\n"
+        f"- Dispatch runs: {workflow_url}\n"
+        f"- Detected by: {run_url}\n\n"
+        "**This is a throughput condition, not a failure.** Every one of those runs concluded "
+        "`success`, and a PLAN is still completing, so neither the failure-streak half nor the "
+        "PLAN-staleness half of this watchdog can see it — which is why the ratio is asserted "
+        "directly.\n\n"
+        "What it means, structurally: the `#819` tick floor admits at most one executed tick per "
+        "`MIN_TICK_INTERVAL_SECONDS`, and dispatch's own cron already rings at exactly that rate. "
+        "A ratio near 1 is therefore the healthy shape; everything above it is doorbell rings that "
+        "could not possibly have executed when they were made.\n\n"
+        "The two things that move this number:\n"
+        "1. **Bound the ring rate by the floor it will be judged against.** The doorbell jobs at "
+        "the end of `worker.yml` and `review-fix.yml` ring unconditionally; a ring made inside "
+        "the floor is a run that is guaranteed to no-op.\n"
+        "2. **Stop unfiltered triggers from starting dispatch-adjacent jobs at all** — the same "
+        "shape as the job-level-filter defects tracked against the other lanes.\n\n"
+        "Auto-closes as soon as the ratio comes back under the threshold.\n"
+    )
+
+
 # ---------------------------------------------------------------------------------------------
 # gh plumbing — mirrors scripts/metrics-alert.py exactly
 # ---------------------------------------------------------------------------------------------
@@ -336,25 +466,31 @@ ARTIFACT_MAX_PAGES = 3
 
 
 def read_signals(repo, now=None, runner=None):
-    """The API reads this watchdog costs. -> (executed_ids, plan_epoch, runs).
+    """The API reads this watchdog costs. -> (executed_ids, plan_epoch, horizon, runs).
 
-    Normally TWO requests. The artifact listing pages only while it has neither found a plan
-    artifact nor proven it reached back past the staleness threshold — at today's density page one
-    covers ~7 hours, so the loop exits after one request; the bound exists so an artifact storm
-    costs a couple more requests instead of producing a false page.
+    Normally TWO requests, and half (C) deliberately added none: `horizon` is folded out of the
+    SAME artifact pages `executed_ids` comes from, and the ratio out of the SAME runs listing half
+    (A) already keys on. A watchdog for budget contention that spends more budget to watch is one
+    more consumer of the thing it is complaining about.
+
+    The artifact listing pages only while it has neither found a plan artifact nor proven it
+    reached back past the staleness threshold — at today's density page one covers ~7 hours, so the
+    loop exits after one request; the bound exists so an artifact storm costs a couple more
+    requests instead of producing a false page.
 
     `runner` is resolved at CALL time, not bound as a default: a default argument captures the
     function object at definition, which makes the live path unpatchable and every stubbed-flow
     assertion below quietly exercise the real `gh`."""
     runner = runner or _gh_json
     now = _now() if now is None else now
-    executed, plan_epoch = set(), None
+    executed, plan_epoch, horizon = set(), None, None
     for page in range(1, ARTIFACT_MAX_PAGES + 1):
         payload = runner(["api", "-H", "Accept: application/vnd.github+json",
                           f"/repos/{repo}/actions/artifacts"
                           f"?per_page={ARTIFACT_PAGE_SIZE}&page={page}"])
         entries = _artifacts(payload)
         executed |= executed_tick_runs(payload)
+        horizon = artifact_horizon(payload, horizon)
         found = newest_plan_epoch(payload)
         if found is not None and (plan_epoch is None or found > plan_epoch):
             plan_epoch = found
@@ -363,7 +499,7 @@ def read_signals(repo, now=None, runner=None):
     runs = runner(["api", "-H", "Accept: application/vnd.github+json",
                    f"/repos/{repo}/actions/workflows/dispatch.yml/runs"
                    f"?per_page={RUN_PAGE_SIZE}"])
-    return executed, plan_epoch, runs
+    return executed, plan_epoch, horizon, runs
 
 
 def _find_open_alert(repo, token, marker, title, label):
@@ -427,10 +563,12 @@ def main():
     workflow_url = f"{server}/{registry_repo}/actions/workflows/dispatch.yml"
 
     now = _now()
-    executed_ids, plan_epoch, runs = read_signals(registry_repo, now=now)
+    executed_ids, plan_epoch, horizon, runs = read_signals(registry_repo, now=now)
     streak = failure_streak(runs, executed_ids)
     streak_state = streak_verdict(streak)
     stale_state, stale_reason, age = stale_verdict(plan_epoch, _now())
+    ring_runs, ring_executed = ring_sample(runs, executed_ids, horizon)
+    ring_state, ring_ratio = ring_verdict(ring_runs, ring_executed)
 
     code = 0
     for label, marker, title, verdict, bad, body, note in (
@@ -440,6 +578,11 @@ def main():
             ("dispatch-stale", STALE_ALERT_MARKER, STALE_ALERT_TITLE, stale_state, "stale",
              _render_stale_body(stale_reason, age, run_url, workflow_url, maintainer),
              "✅ Recovered — the dispatcher has completed a PLAN again. Auto-closing."),
+            ("dispatch-ring", RING_ALERT_MARKER, RING_ALERT_TITLE, ring_state, "wasteful",
+             _render_ring_body(ring_ratio or 0.0, ring_runs, ring_executed, run_url, workflow_url,
+                               maintainer),
+             "✅ Recovered — dispatch runs per executed tick is back under the threshold. "
+             "Auto-closing."),
     ):
         num, hard, soft = _find_open_alert(repo, token, marker, title, label)
         if hard:
@@ -456,9 +599,15 @@ def main():
         else:
             print(f"{label}: verdict={verdict} — nothing to do")
     age_note = "unknown" if age is None else f"{age // 60} min"
+    # The RATIO IS PUBLISHED EVERY RUN, not only when it pages (issue #1326 asks for a standing
+    # metric, and a number that only appears once it is already bad cannot show the drift toward
+    # bad). `unknown` is printed as such rather than as a 0 that would read like a healthy value.
+    ratio_note = "unknown" if ring_ratio is None else f"{ring_ratio:.1f}"
     print(f"dispatch-stall: executed-tick failure streak={streak} "
           f"(threshold {FAILURE_STREAK_THRESHOLD}), newest completed PLAN {age_note} old "
-          f"(threshold {STALE_THRESHOLD_SECONDS // 60} min)")
+          f"(threshold {STALE_THRESHOLD_SECONDS // 60} min), ring efficiency {ring_executed}/"
+          f"{ring_runs} runs executed = {ratio_note} runs per executed tick "
+          f"(threshold {RING_RUNS_PER_EXECUTED_TICK_THRESHOLD})")
     return code
 
 
@@ -572,8 +721,10 @@ def _self_test():
     _test_executed_tick_identification(chk)
     _test_failure_streak(chk)
     _test_plan_staleness(chk)
+    _test_ring_efficiency(chk)
     _test_decide(chk)
     _test_thresholds_agree_with_the_floor(chk)
+    _test_ring_threshold_is_derived_from_the_floor(chk)
     _test_threshold_vs_cadence(chk)
     _test_page_coverage(chk)
     _test_gh_flows(chk)
@@ -677,6 +828,90 @@ def _test_plan_staleness(chk):
             stale_verdict(newest_plan_epoch(payload), now)[0], "stale")
 
 
+def _test_ring_efficiency(chk):
+    """(C). Every assertion here has to be able to go RED on a plausible wrong answer — the whole
+    reason this half exists is that the aggregate is invisible to per-run signals, so a vacuous
+    test of it would restore exactly the blind spot it closes."""
+    now = 1_800_000_000
+
+    def stamp(ago):
+        return datetime.fromtimestamp(now - ago, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # --- the horizon, which is what makes the sample honest ---------------------------------
+    page = {"artifacts": [_artifact(TICK_MARKER_ARTIFACT, 1, created_at=stamp(600)),
+                          _artifact("publish-bundle-1-1", created_at=stamp(7 * 3600))]}
+    chk("ring: the horizon is the OLDEST stamp on the page, whatever the artifact is named "
+        "(the bound is about how far back the page reached, not about dispatch's own artifacts)",
+        artifact_horizon(page), now - 7 * 3600)
+    chk("ring: the horizon folds across pages, keeping the oldest",
+        artifact_horizon({"artifacts": [_artifact("x", created_at=stamp(60))]}, now - 7 * 3600),
+        now - 7 * 3600)
+    chk("ring: a page with nothing datable yields NO horizon (and therefore no ratio)",
+        artifact_horizon({"artifacts": [_artifact("x", created_at="yesterday")]}), None)
+
+    def runs(rows):
+        """rows: (id, conclusion, seconds_ago)."""
+        return {"workflow_runs": [{"id": rid, "run_number": rid, "conclusion": conc,
+                                   "created_at": stamp(ago)} for rid, conc, ago in rows]}
+
+    horizon = now - 3 * 3600
+    # THE MEASURED SHAPE (#1326): 13 runs inside the window, 1 of which executed.
+    measured = runs([(1, "success", 600)] + [(n, "success", 600) for n in range(2, 14)])
+    chk("ring: the #1326 shape — 13 concluded runs, 1 executed",
+        ring_sample(measured, {1}, horizon), (13, 1))
+    chk("ring: ... reads WASTEFUL", ring_verdict(*ring_sample(measured, {1}, horizon))[0],
+        "wasteful")
+    # A cron-only dispatcher: every run executed. This is the row that reds a mutant which always
+    # returns 'wasteful', and the row that proves the recovery/close path is reachable.
+    healthy = runs([(n, "success", 600) for n in range(1, 14)])
+    chk("ring: a dispatcher whose every run executed is OK at ratio 1.0",
+        ring_verdict(*ring_sample(healthy, set(range(1, 14)), horizon)), ("ok", 1.0))
+    # THE BOUNDARY, both sides. Off-by-one here is either a page or a blind spot.
+    chk("ring: exactly AT the threshold fires; one executed tick more does not "
+        f"({RING_RUNS_PER_EXECUTED_TICK_THRESHOLD} vs just under it)",
+        (ring_verdict(12, 4)[0], ring_verdict(12, 5)[0]), ("wasteful", "ok"))
+    # EXCLUSIONS. Both can only shrink numerator and denominator together.
+    older = runs([(1, "success", 600)] + [(n, "success", 4 * 3600) for n in range(2, 14)])
+    chk("ring: runs OLDER than the horizon are excluded — their marker artifact may simply be off "
+        "the pages that were read, and counting them would invent waste out of paging",
+        ring_sample(older, {1}, horizon), (1, 1))
+    inflight = runs([(1, "success", 600)] + [(n, None, 600) for n in range(2, 14)])
+    chk("ring: IN-FLIGHT runs are excluded — a tick that has not concluded has not necessarily "
+        "uploaded its marker yet, so counting it would report latency as waste",
+        ring_sample(inflight, {1}, horizon), (1, 1))
+    chk("ring: no horizon at all -> no sample", ring_sample(measured, {1}, None), (0, 0))
+    chk("ring: a malformed runs payload -> no sample", ring_sample({"nope": 1}, {1}, horizon),
+        (0, 0))
+
+    # --- the two states that have no ratio in them, and must neither page nor close ----------
+    # 3 runs, 1 executed — a ratio of exactly 3.0, i.e. OVER the threshold. Chosen so that
+    # dropping the minimum-sample guard makes this row page instead of staying quiet; a fixture
+    # that was under the threshold anyway would leave the guard untested.
+    small = runs([(n, "success", 600) for n in range(1, 4)])
+    chk("ring: under the minimum sample the verdict is UNKNOWN even though the ratio itself is "
+        "over the threshold — three runs is not evidence of a standing condition",
+        ring_verdict(*ring_sample(small, {1}, horizon)), ("unknown", None))
+    chk("ring: ZERO executed ticks over a full sample is UNKNOWN here — that is precisely the "
+        "condition half (B) pages for, and two markers for one condition is two alerts",
+        ring_verdict(*ring_sample(measured, set(), horizon)), ("unknown", None))
+    chk("ring: ... and an UNKNOWN verdict can neither page nor close a live ring alert",
+        (decide("unknown", False, bad="wasteful"), decide("unknown", True, bad="wasteful")),
+        ("noop", "noop"))
+    chk("ring: a wasteful verdict pages, and a recovered one closes",
+        (decide("wasteful", False, bad="wasteful"), decide("ok", True, bad="wasteful")),
+        ("upsert", "close"))
+    # main() renders every body eagerly and passes `ring_ratio or 0.0`. That fallback must be
+    # UNREACHABLE on the only path that posts one, or the alert could print a ratio of 0.0 while
+    # claiming the dispatcher is wasteful. It is unreachable exactly because a ratio accompanies
+    # every verdict that is not `unknown`, and `unknown` never upserts — asserted, not assumed.
+    chk("ring: every verdict that can reach the issue body carries its ratio (main()'s `or 0.0` "
+        "fallback is unreachable on the posting path)",
+        sorted({(state, ratio is None) for state, ratio in
+                (ring_verdict(13, 1), ring_verdict(12, 4), ring_verdict(12, 5),
+                 ring_verdict(13, 0), ring_verdict(3, 1))}),
+        [("ok", False), ("unknown", True), ("wasteful", False)])
+
+
 def _test_decide(chk):
     chk("decide: stalled -> upsert", decide("stalled", False), "upsert")
     chk("decide: stalled w/ open -> upsert", decide("stalled", True), "upsert")
@@ -700,6 +935,27 @@ def _test_thresholds_agree_with_the_floor(chk):
     streak_seconds = FAILURE_STREAK_THRESHOLD * floor.MIN_TICK_INTERVAL_SECONDS
     chk("thresholds: the failure streak is reachable strictly sooner than the staleness threshold",
         (streak_seconds, streak_seconds < STALE_THRESHOLD_SECONDS), (1800, True))
+
+
+def _test_ring_threshold_is_derived_from_the_floor(chk):
+    """CROSS-FILE, and this one carries the whole derivation of (C)'s threshold. The claim "a
+    healthy ratio is ~1.0" is true only while the cron rings at exactly the rate the #819 floor can
+    admit. Both numbers live in other files, so assert them there: raise the floor to 20 minutes
+    without touching this file and the ratio silently acquires a floor of 2, making the threshold
+    mean something nobody chose."""
+    floor = _load_floor()
+    ceiling_per_hour = 3600 // floor.MIN_TICK_INTERVAL_SECONDS
+    cron_per_hour = 60 // _cron_period_minutes(_load_workflow(DISPATCH_WORKFLOW))
+    chk("ring/floor: the schedule alone rings at EXACTLY the rate the floor can admit, which is "
+        "what makes 1.0 the healthy ratio the threshold is a multiple of",
+        (ceiling_per_hour, cron_per_hour, ceiling_per_hour == cron_per_hour), (6, 6, True))
+    chk("ring/floor: the threshold keeps real headroom over that structural ideal, and still fires "
+        "well below both measured pathologies (8.2 in #1208, 13.5 in #1326) — a threshold set AT "
+        "the measured pathology can never catch the drift toward it",
+        (RING_RUNS_PER_EXECUTED_TICK_THRESHOLD > 1,
+         RING_RUNS_PER_EXECUTED_TICK_THRESHOLD < 8), (True, True))
+    chk("ring/floor: the minimum sample spans at least two hours of the schedule, so one slow "
+        "tick cannot swing the published ratio", RING_MIN_RUNS >= 2 * cron_per_hour, True)
 
 
 def _test_threshold_vs_cadence(chk):
@@ -742,7 +998,7 @@ def _test_page_coverage(chk):
             return pages.get(page, {"artifacts": []})
         return {"workflow_runs": []}
 
-    _executed, plan_epoch, _runs = read_signals("o/r", now=now, runner=crowded)
+    _executed, plan_epoch, _horizon, _runs = read_signals("o/r", now=now, runner=crowded)
     chk("coverage: an artifact STORM makes the watchdog page on rather than fire a false alarm",
         (seen, plan_epoch == now - 600), ([1, 2, 3], True))
 
@@ -760,26 +1016,34 @@ def _test_page_coverage(chk):
 
 
 def _test_gh_flows(chk):
-    """The live path over a stubbed `gh`: the signal reads, and the alert flow for both halves."""
+    """The live path over a stubbed `gh`: the signal reads, and the alert flow for every half."""
     calls = []
+    # 101 executed; 102-113 are floor-held rings that concluded `success` and dispatched nothing —
+    # the #1326 shape, and the shape in which (A) and (B) are the only signals that read healthy.
+    _run_rows = ([{"id": 101, "run_number": 1, "conclusion": "failure",
+                   "created_at": "2026-07-27T19:00:00Z"}]
+                 + [{"id": rid, "run_number": rid, "conclusion": "success",
+                     "created_at": "2026-07-27T19:00:00Z"} for rid in range(102, 114)])
 
     def fake(args, label="dispatch-stall"):
         calls.append(args[-1])
         if "/artifacts" in args[-1]:
             return {"artifacts": [_artifact(TICK_MARKER_ARTIFACT, 101),
                                   _artifact(f"{PLAN_ARTIFACT_PREFIX}101-1")]}
-        return {"workflow_runs": [{"id": 101, "run_number": 1, "conclusion": "failure"}]}
+        return {"workflow_runs": _run_rows}
 
-    executed_ids, plan_epoch, runs = read_signals("o/r", now=1_800_000_000, runner=fake)
-    chk("live: the watchdog costs exactly TWO API requests in the normal case", len(calls), 2)
+    executed_ids, plan_epoch, horizon, runs = read_signals("o/r", now=1_800_000_000, runner=fake)
+    chk("live: the watchdog costs exactly TWO API requests in the normal case — and half (C) "
+        "added NONE, which is the point of a watchdog for budget contention", len(calls), 2)
     chk("live: ... the artifacts listing and the dispatch runs listing",
         [("/artifacts" in calls[0]), ("workflows/dispatch.yml/runs" in calls[1])], [True, True])
-    chk("live: it derives both signals from them",
-        (executed_ids, plan_epoch is not None, failure_streak(runs, executed_ids)),
-        ({101}, True, 1))
+    chk("live: it derives all three signals from them",
+        (executed_ids, plan_epoch is not None, failure_streak(runs, executed_ids),
+         ring_sample(runs, executed_ids, horizon)),
+        ({101}, True, 1, (13, 1)))
     chk("live: a REFUSED listing degrades to no signal rather than raising",
         read_signals("o/r", now=1_800_000_000, runner=lambda *a, **k: None),
-        (set(), None, None))
+        (set(), None, None, None))
 
     # The alert flow, end to end, with `gh` stubbed at the subprocess boundary.
     class _Result:
@@ -812,8 +1076,10 @@ def _test_gh_flows(chk):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
-    chk("live: a 3-hour-old PLAN with no open alert files exactly one issue and exits 0",
-        (code, issued.count(["issue", "create"])), (0, 1))
+    chk("live: a 3-hour-old PLAN over 13 runs that produced ONE executed tick, with no open "
+        "alert, files exactly TWO issues (staleness + ring efficiency — the failure streak is 1 "
+        "and stays quiet) and exits 0",
+        (code, issued.count(["issue", "create"])), (0, 2))
 
 
 def _test_no_hold_labels(chk):
