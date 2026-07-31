@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1455,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8651c707cbaa3ba0bc55fa6f444ba02a7cbbe6e5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`fb_distinct` means the `(repo, token)` pairs differ, not that the repositories differ. A supported configuration can therefore have `ALERT_REPO == REGISTRY_REPO` but `ALERT_TOKEN != REGISTRY_ALERT_TOKEN`. `_cmd_decide` then enumerates that same repository into `fallback_open`; after `_upsert_alert` successfully refreshes the firing issue on the primary route, the new branch calls `_close_superseded_alert` against the same repository and marker and closes that very issue. This erases the only live firing alert. The test fixes `priv_repo` and `reg_repo` to different values and therefore cannot catch the failure.",
+    "file": "scripts/model-health.py",
+    "fix_hint": "Only perform superseded-copy closure when the normalized primary and fallback repository names are genuinely different; preserve the existing credential-fallback behavior separately. Add a test with the same repository and distinct tokens that starts with an open firing marker and proves the tick leaves it open and does not issue a close/comment.",
+    "severity": "blocker",
+    "title": "Same-repository fallback closes the only firing alert"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe supersede path is unsafe when the primary and fallback use the same repository with different credentials: it closes the live alert that the primary just refreshed. The new tests cover only distinct repositories, so they do not expose this supported route configuration.",
+  "verdict": "request_changes"
+ }
+}
