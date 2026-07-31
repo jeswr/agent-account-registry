@@ -1,5 +1,4 @@
 account-usage.py
-alert_route.py
 auto-mint-provenance.py
 backfill-provenance.py
 broker-refresh.py

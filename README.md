@@ -388,22 +388,6 @@ REPORT-ONLY and deliberately has no cleanup mode: deleting a claim ref re-opens 
 above. A slot that carries a secret but no issue is NOT reported — that is a stored credential
 whose enrolment died before registration, and it needs the account issue written, not a cleanup.
 
-**Abandoned two-phase enrolments are reported, never auto-reclaimed (#384).** The burned-slot line
-above cannot see these: the slot *has* an `acctNN` issue and *has* an `ACCTNN_TOKEN` secret, which is
-exactly what makes it not-orphaned there. But `set-up-account`'s `activate` job fires only when the
-`account-pool/acctNN` PR **merges**, so a grant PR closed unmerged (or simply never merged) strands
-the account at `status:pending` forever — non-allocatable, holding a burned slot and a live secret,
-counted by nothing. Every `groom` sweep now prints a `STALE-PENDING` line: a summary
-(`pending=… grant_pr_open=… grant_pr_merged=… abandoned=…`) plus one named row per pending account
-older than `--stale-pending-days` (default 3) whose grant PR is neither open nor merged, carrying its
-request issue and credential secret name. It is REPORT-ONLY and has no reclaim mode, for a reason
-stronger than the claim-ref one: **the orphaned secret must not be deleted.** It is what makes the
-enrolment *resumable* — re-applying the `set-up-account` label on the named request issue re-enters
-the same transaction (#211), and that path fails closed if the credential is gone. So recovery is
-either resume, or close the account issue to abandon it (its slot stays burned by design). A pending
-account whose grant PR *did* merge is counted but not named — that is `activate` failing after a
-merge, which `set-up-account`'s own `always()` alarm already hands to a human.
-
 ### Step 0 — obtain a DURABLE, NON-ROTATING token (do NOT use a subscription blob)
 
 - **Anthropic** (Claude models): run `claude setup-token` while logged into the target account. It

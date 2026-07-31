@@ -61,13 +61,9 @@
 # (enforced by _test_no_hold_labels below, not by convention). Every alert auto-closes on an
 # explicit recovery. Its job carries `actions: read` + `contents: read` + `issues: write`.
 #
-# DEBT (issue #591): `_alert_route` is another private copy of locked decision 22c. The shared home
-# scripts/alert_route.py now EXISTS on master with the IDENTICAL signature — #591 migrated the four
-# emitters it named and stopped there, because this file's self-test cannot run where PyYAML is
-# absent and an unverifiable migration of a live alerting path is not worth the swap. Discharging
-# this is `_alert_route = <module>.alert_route` plus adding scripts/alert_route.py to the
-# dispatch-stall job's sparse-checkout list in groom.yml (which alert_route.py's own census then
-# enforces once this file is added to its CONSUMERS tuple).
+# DEBT (issue #591, PR #590): `_alert_route` is another private copy of locked decision 22c.
+# scripts/alert_route.py is not on master, so this file carries a byte-compatible copy with the
+# IDENTICAL signature; migration is a one-line import swap.
 import ast
 import importlib.util
 import json
