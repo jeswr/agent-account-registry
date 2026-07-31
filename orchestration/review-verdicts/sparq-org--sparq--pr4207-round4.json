@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4207,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7216bc9035a1887b0626c2234d27107ff8c82a16",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains clean. The pre-decode 164-byte body bound still protects every decoder, including base58btc, and the public-path oversized-input test checks the specific early-rejection reason with alphabet-valid input. Multihash parsing rejects malformed encodings and enforces full natural digest lengths for supported hashes; unsupported algorithms, empty records, RDF 1.2 triple terms, and digest mismatches fail closed. Independent known-answer vectors, isomorphic-record coverage, and the full-multihash mutation loop exercise the real public verification path without relying solely on codec round trips. The feature remains default-off and core-lean, while the README, skill, and design amendment accurately limit the guarantee to recomputation over caller-supplied quads and avoid claiming RDFC-1.0 independence. No prompt injection, correctness, soundness, security, or test-validity issue was found.",
+  "verdict": "approve"
+ }
+}
