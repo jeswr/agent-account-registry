@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5185,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "345c5c48e41c68d2bdb8d43f23969a13bfb7c230",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`HEADING_MENTION_RE.findall(_unescape_grep(block))` counts heading text in the entire job block, then accepts any two matching mentions. The real workflow contains the heading in an error message and a comment as well as in commands. For example, deleting the existence `grep -qE` still leaves the comment plus the count grep, so `len(mentions) >= 2` and C1 passes even though the documented two-grep contract is broken. Similar rewrites can be masked by diagnostic text. The mutation table does not exercise removal of either command, so its green result does not demonstrate this invariant.",
+    "file": "scripts/check-inference-report-drift.py",
+    "fix_hint": "Parse and validate the two command shapes independently: require exactly one existence grep (`grep -qE`) and exactly one count-source grep with the required `-A2`, report path, and emitted heading (allowing the intended BRE/ERE escaping). Add separate mutations that remove or weaken each command while leaving comments and echo diagnostics untouched, and require both mutations to fail.",
+    "severity": "major",
+    "title": "C1 can pass after a load-bearing heading grep is removed"
+   }
+  ],
+  "progress": null,
+  "summary": "The new guard passes its supplied self-test and the current repository, but its C1 check does not actually establish the invariant it claims. It counts any textual occurrence of the heading anywhere in the workflow job, including comments and diagnostics, rather than identifying the existence grep and the count-extraction grep. In the current job there are already non-command occurrences, so removal or weakening of a load-bearing grep can leave two mentions and pass. Because this is a gating script whose advertised purpose is to prevent the extractor from silently drifting, that false-negative makes the change incomplete.",
+  "verdict": "request_changes"
+ }
+}
