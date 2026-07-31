@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5232,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "29adf0a671497dcdddef945398a59bad31ec2da7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`test_exclusions_are_not_stale` only asserts that an excluded Dockerfile exists and that the static reason string is nonempty. The reason says these files use this repository's own floating images, but the test never inspects their `FROM` directives. A future change to a third-party or digest-pinned base would therefore remain excluded from Dependabot while this gating test stayed green, contradicting the claimed structural guarantee that every relevant Dockerfile is covered or has a non-stale exclusion.",
+    "file": "scripts/tests/test_dependabot_coverage.py",
+    "fix_hint": "For each excluded Dockerfile, parse its effective `FROM` image references and assert the concrete exclusion invariant (for example, only the expected `ghcr.io/sparq-org/...:latest` first-party image, with no digest pin or third-party base). Alternatively, remove the exclusions and add Docker Dependabot entries for those directories. Add a focused negative test showing that replacing an excluded first-party floating base with a third-party pinned base makes the guard fail.",
+    "severity": "major",
+    "title": "Docker exclusions do not validate the premise that makes them safe"
+   }
+  ],
+  "progress": null,
+  "summary": "The new coverage test passes on the current tree and correctly catches the npm workspace-root regression. However, its Docker exclusion validation does not enforce the stated security invariant: it checks only that each excluded Dockerfile still exists and that its hard-coded reason is nonempty. If either excluded deployment Dockerfile later changes from the asserted first-party floating image to a third-party or digest-pinned base, the gating check will continue to pass and Dependabot coverage will remain silently absent. Because this is a supply-chain gate intended to prevent exactly that class of silent coverage hole, the exclusion premise must be machine-checked.",
+  "verdict": "request_changes"
+ }
+}
