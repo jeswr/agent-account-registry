@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5409,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6700ef77713b8dc6681c60b16a8e289f743f253c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "read_varint uses payload.checked_shl(7 * i), but checked_shl only rejects an out-of-range shift; it does not reject significant bits shifted past u64. On byte 10 (i == 9), only payload values 0 or 1 fit. For example a terminal tenth byte with payload 2 is shifted by 63 and loses the overflowing bit, allowing a malformed >64-bit varint to decode as a smaller value instead of returning Err. This violates the function's explicit over-long/>64-bit and fail-closed guarantees. Existing tests cover truncation and non-minimal encoding but not this load-bearing overflow case.",
+    "file": "crates/sparq-vectors/src/external_key.rs",
+    "fix_hint": "Before incorporating byte 10, reject i == 9 when payload > 1 (or use checked multiplication/addition that detects lost high bits), then add tests for a valid maximal u64 varint and invalid 10-byte terminal payloads such as 0x02 and 0x7f. Exercise parse_multihash as well as the helper path so malformed external identifiers are proven to fail closed.",
+    "severity": "major",
+    "title": "Ten-byte varints can overflow u64 and be accepted as another value"
+   }
+  ],
+  "progress": null,
+  "summary": "The external-key table codec is generally carefully bounded and its corpus tests exercise real parse/round-trip paths. However, the unsigned-varint decoder does not actually enforce its documented u64 overflow invariant: checked_shl validates only the shift count, not whether the payload bits fit. As a result, malformed 10-byte varints can be accepted and normalized to the wrong value. This contradicts the public fail-closed contract and can make lookup_multihash interpret an invalid external identifier as a valid one. A targeted overflow test and decoder fix are required before approval.",
+  "verdict": "request_changes"
+ }
+}
