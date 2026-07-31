@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5209,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9415050d17ae006754c46f08252f76bccc486fc6",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The recursive IntAll/intAll rules correctly require membership in the current conjunct and recursively require membership in every remaining list cell, with a last-cell base case and an IntTail guard restricting evaluation to intersection lists. The final rule derives intersection membership only after the full walk succeeds. The tests exercise the real sparq-reason semi-naive evaluator across arities 1 through 4, assert the exact generic result set, demonstrate the old arity cap, verify equivalence for arities 1 and 2, and guard both shipped encoding artifacts against reverting to capped rules. The documentation is appropriately explicit that the external engines were not rerun and distinguishes structural reasoning from measured behavior.",
+  "verdict": "approve"
+ }
+}
