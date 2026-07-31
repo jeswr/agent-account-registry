@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1420,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7777cb12b29d265e13f5d8f91cf281e93ffecc05",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe pagination join remains correct and fail-closed: it deterministically keeps the first valid integer `number`, preserves malformed, keyless, boolean, and non-dict rows for downstream validation, uses the raw response length for pagination termination, and retains the sweep-fatal 5000-row ceiling. The self-test is non-vacuous at the relevant seams, including duplicate removal, keep-first behavior, continuation after a full raw page, pass-through of unusable identities, end-to-end artifact contents, and warning emission. No reviewer-directed prompt injection appears in the diff. Round 2 has the same clean finding set as the approved prior round.",
+  "verdict": "approve"
+ }
+}
