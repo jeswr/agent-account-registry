@@ -11919,12 +11919,21 @@ def _self_test():
         _policy_doc285 = tomllib.load(_handle)
     with open(_root285 / "orchestration" / "routing.toml", "rb") as _handle:
         _routing285 = tomllib.load(_handle)
-    _labels285 = ["role:impl", "area:review-loop"]      # the motivating trust-surface issue
+    # [#1397] The trust-surface issue whose route names a VERDICT-ONLY persona is now a `role:review`
+    # one, not the `role:impl` one this fixture used to name: the security override yields the
+    # persona back to the ROLE row (`persona_from_role = true`), so `{role:impl, area:review-loop}`
+    # resolves to the implementer and no longer covers the refusal direction at all. The row this
+    # block needs is any LIVE, DISPATCHABLE label set the real tables route to a persona declared
+    # NOT fix-capable — `{role:review, area:review-loop}` is that set (roleless issues are not a
+    # candidate: ready-issues.py excludes them before a plan row exists). The fixture asserts the
+    # property rather than the name, so it fails LOUDLY again if a future routing edit removes the
+    # last verdict-only route instead of silently covering one direction.
+    _labels285 = ["role:review", "area:review-loop"]    # a trust-surface issue on the review lane
     _route285 = _pol285.resolve(_reg285, _labels285, _policy_doc285, _routing285)["agent"]
     _impl285 = _pol285.resolve(_reg285, ["role:impl"], _policy_doc285, _routing285)["agent"]
     assert _pol285.agent_fix_capable(_routing285, _impl285) and not _pol285.agent_fix_capable(
             _routing285, _route285), (
-        "fixture: this repo's security override must still route a trust-surface issue to a "
+        "fixture: this repo's routing must still resolve some live trust-surface issue to a "
         "persona its routing declares NOT fix-capable, while the role:impl fallback IS declared "
         "fix-capable — otherwise the live rows below cover neither direction",
         _route285, _impl285)
@@ -11994,7 +12003,8 @@ def _self_test():
     def _persona_rows285(source=None):
         """The rows the capability gate must keep apart — LIVE tables first, then the invariant.
 
-        Row 1 is the motivating `area:review-loop` case verbatim, driven end to end by the REAL
+        Row 1 is a live `area:review-loop` trust-surface issue whose route names the verdict-only
+        persona (`role:review` since #1397 — see the fixture above), driven end to end by the REAL
         resolver over the checked-in tables. Row 2 is an ordinary live route persona that must
         still be ADOPTED. Rows 3-5 are the ROUTE side of the invariant: declared-capable adopts,
         declared-NOT-capable refuses under a name nothing else in the repo uses, and an UNDECLARED
