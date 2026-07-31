@@ -2011,6 +2011,14 @@
    "model_alias": "opus5",
    "exit_class": "success",
    "run_id": "30622675627.1"
+  },
+  {
+   "ts": 1785493755,
+   "provider": "anthropic",
+   "account": "9e13ea21abf27e68",
+   "model_alias": "opus5",
+   "exit_class": "success",
+   "run_id": "30622765706.1"
   }
  ]
 }
