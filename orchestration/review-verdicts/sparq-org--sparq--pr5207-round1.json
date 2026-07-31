@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5207,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bccd8b8358ed11cf6860342d7e29cad18fd59311",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new text says the enumerated byte metrics are \"the only hard-failing metrics.\" scripts/perf-gate.py instead classifies only mode=noise as advisory and puts every other regression in det_regs, which exits 2. bench/perf-baseline.json includes hard-failing non-byte mode=auto metrics, notably vectors_diskann_recall_at10, vectors_pq_recall_at10, and geo_compliance_deficit. Even the byte list is incomplete (for example comp_store_bytes_per_triple and fts_bytes_per_doc are mode=auto). The same inaccurate \"only deterministic byte-count metrics hard-fail\" formulation also appears in research/engine-performance-review.md and research/shacl-compact-and-shuttle-parsers-2026-07.md.",
+    "file": "research/optimization-audit-2026-07.md",
+    "fix_hint": "Keep the accurate narrow statement that parse_ns_per_byte is advisory/non-blocking, but replace the exclusivity claim everywhere with wording such as: \"mode=noise timing metrics are advisory; all mode=auto deterministic metrics hard-fail.\" Where metrics are listed, either make the list complete from bench/perf-baseline.json or clearly label it as examples/the metrics relevant to that proposal.",
+    "severity": "major",
+    "title": "The documents incorrectly say only byte-count metrics hard-fail"
+   }
+  ],
+  "progress": null,
+  "summary": "The clarification that parse_ns_per_byte is advisory and non-blocking matches scripts/perf-gate.py. However, the new broader claim that only deterministic byte-count metrics hard-fail is false: the gate hard-fails every non-noise (deterministic) regression, including non-byte metrics such as vectors_diskann_recall_at10, vectors_pq_recall_at10, and geo_compliance_deficit. The documents also present an incomplete list of hard-gated byte metrics. Because this wording misstates the repository's merge gates in several audit/design records, it should be corrected before approval.",
+  "verdict": "request_changes"
+ }
+}
