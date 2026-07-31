@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1402,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "768383fb856fe40b5e94655c52157132ed661534",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`resolve` now publishes the branch-ref SHA and the worker returns that value as `reviewed_sha`, but `review_outcome()` performs a fresh pulls API read and passes `live['head']['sha']` to `revalidate_outcome_head()`. If the pulls object is lagging as described for #4212, this compares the old pulls-API SHA with the branch-ref SHA, returns `head-moved`, voids the round, applies no findings/state, leaves the reviewed-SHA unbound, and causes the sweep to dispatch the same review again. Thus the loop has merely moved from worker pre-flight to outcome, contradicting the stated termination property. None of the added tests constructs this end-to-end disagreement path.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Make outcome freshness resolve the same validated branch ref used by dispatch (while retaining the state, author, draft, hold, and exact-SHA checks), or carry and verify authoritative ref evidence in a way that remains fresh and fail-closed. Add a call-site/integration self-test where the pulls API SHA is stale but the branch ref and reviewed SHA agree, and assert the outcome is accepted; separately assert a genuinely advanced branch ref is stale.",
+    "severity": "blocker",
+    "title": "Outcome freshness still reads the stale pulls-API head"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe resolve-side ref reconciliation is locally fail-closed, but the change does not establish the claimed single source of truth end-to-end. A review dispatched against the branch-ref SHA is still revalidated at outcome against the pulls API SHA. During the exact cache-disagreement condition this PR targets, the valid result is therefore classified as stale, discarded, and re-enumerated. The new tests cover the reducer and workflow text but not this production consumer, so they cannot detect the incomplete transition.",
+  "verdict": "request_changes"
+ }
+}
