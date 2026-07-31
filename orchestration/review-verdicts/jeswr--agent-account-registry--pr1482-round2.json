@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1482,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "cfd10fd0e7967449e1f90653a1172ad1b4b1058c",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The loop covers INVALID, VALID, and NETWORK_UNKNOWN, but the module's declared output domain also includes INSUFFICIENT and EXPIRING. Consequently, a non-crashing mutant that rewrites only `insufficient-scope` or `expiring-soon` to another verdict in the GITHUB_OUTPUT write survives this test, even though the added comments and assertion claim that the exact verdict is pinned. The coarse stdout branches are represented, but that does not establish the machine-readable per-verdict identity contract.",
+    "file": "scripts/pat-validity.py",
+    "fix_hint": "Exercise all five verdict constants in this same end-to-end output/stdout loop (with the corresponding coarse status), so each supported probe verdict is independently asserted as the exact `verdict=` value. Verify a verdict-specific substitution for each newly added case makes the pristine check row fail without changing the total check count.",
+    "severity": "major",
+    "title": "Exact GITHUB_OUTPUT contract omits two supported verdicts"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new test materially exercises the output write and couples it to the redacted stdout, but it does not pin the advertised exact-verdict contract for all five supported verdicts. Two production verdicts remain untested, so verdict-specific coarsening or substitution can still ship while every new row passes. Because round 1 recorded no findings and this round identifies a new major gap, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
