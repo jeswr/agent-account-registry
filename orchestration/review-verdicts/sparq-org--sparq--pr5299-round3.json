@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5299,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9ea583f6d120ff0dea38107133d32f15154e3331",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`Num::of_literal` trims numeric lexical forms before parsing, reflecting the XSD numeric datatypes' whitespace-collapse behavior, but `integer_facets_ok` and `exact_decimal_lexical` pass the original untrimmed `lex` to `cmp_plain_decimal`. Thus a valid pair such as `\" 1 \"^^xsd:positiveInteger = \"1\"^^xsd:integer` fails the facet check and returns `DistinctGroundEqual`. Likewise, an out-of-i128 `xsd:integer` or `xsd:decimal` surrounded by whitespace is rejected by the exact fallback. This contradicts the module and skill claims that both well-formed numeric operands are decided and reintroduces the documented whitespace-padded numeric acceptance-set mismatch class.",
+    "file": "crates/sparq-reason/src/rif.rs",
+    "fix_hint": "Apply the datatype's whitespace normalization consistently before facet validation and exact-decimal comparison (at minimum use the same trimmed lexical that `Num::of_literal` parses), while preserving rejection of internal whitespace and invalid integer fraction/exponent forms. Add real `validate` and `closure` tests for whitespace-padded derived-integer boundaries and whitespace-padded >i128 integer/decimal equality and inequality controls.",
+    "severity": "major",
+    "title": "Raw lexical comparisons reject valid whitespace-collapsed numeric literals"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 fixes the prior derived-integer facet bug with explicit arbitrary-precision bounds checks and adds meaningful validation/closure tests for invalid and boundary values. However, the new paths compare raw lexical strings while the shared numeric classifier applies the XSD whitespace-collapse behavior via trim(). Consequently valid whitespace-padded derived integers and out-of-i128 integer/decimal values are rejected as undecidable, despite the new public documentation claiming all well-formed numeric pairs are decided. This is a new major correctness/completeness finding, so progress is regressing under the required rubric.",
+  "verdict": "request_changes"
+ }
+}
