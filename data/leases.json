@@ -32,16 +32,6 @@
   },
   {
    "account": "9e13ea21abf27e68",
-   "claim_id": "5efc4d2c05f94abe8daddec7059ff178",
-   "holder": "sparq-org/sparq#3455@30626718680.1",
-   "package": "sparq-canon",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785496887,
-   "expires_at": 1785503187
-  },
-  {
-   "account": "9e13ea21abf27e68",
    "claim_id": "5550bc4b0e144f6bab0eb149a578ce8e",
    "holder": "review:sparq-org/sparq#5318@dispatch-30626476669.1",
    "package": "gui",
