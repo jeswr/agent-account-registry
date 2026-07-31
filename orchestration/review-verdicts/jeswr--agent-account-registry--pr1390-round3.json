@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1390,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f31f12420e0c3ec6a099f6f5e925c616d1fa10b4",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 approval remains supported. The health evaluator's pre-continue-on-error step outcome is exported from the correct identified step, carried through the downstream job, and consumed as a separate fail/recovery condition with distinct marker/title dedupe. Job-level and evaluator-level failures remain independent, mutation return codes are aggregated, missing/skipped outcomes cannot falsely close an alert, and the sparse-checkout plus exact workflow seam assertions cover the live inputs and fail-stop invocation order. I found no blocker, major, or lower-severity diff-scoped issue. Because the prior round was already clean and this round remains clean, progress is stagnant under the prescribed comparison scale.",
+  "verdict": "approve"
+ }
+}
