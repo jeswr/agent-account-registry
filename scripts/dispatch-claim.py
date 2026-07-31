@@ -587,7 +587,15 @@ def packages_conflict(left, right):
     reason `plan_package` is: PLAN's assemble filter, CLAIM's live re-check, the cross-lane ledger
     view and the allocator's own `partition_available` must all decide with ONE function. A key
     names a SET of areas, so two rows exclude iff their sets INTERSECT; `__global__` is the
-    universal set and still serializes in both directions."""
+    universal set and still serializes in both directions.
+
+    WHETHER `__global__` SHOULD SERIALIZE AT ALL — bounded N-slot concurrency instead of exclusion
+    — is a DECIDED question, not an open one: see registry #677 point 1 / #1011, recorded in
+    `research/1011-global-partition-bounded-concurrency.md`. N slots either schedule a population
+    that is not runnable (the measured holders are inert OPEN PRs, not queued rows) or delete the
+    disjointness invariant for the admitted pairs, and the class that admits — same crate,
+    textually disjoint, jointly wrong — is one no gate grades and no reviewer reads. The lever is
+    NARROWING a cause on evidence that proves the footprint, which keeps this predicate intact."""
     return _lease_schema.packages_conflict(left, right)
 
 
