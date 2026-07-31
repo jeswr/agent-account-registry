@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5308,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c0ac360a03e956e74dd9f157afe5476f5307b8b4",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 5.2 says `subjects` updates only the written document's entries and `deps` is recomputed for the written document only, while section 5.3 computes `affected` from the pre-existing `rdeps(D)`. Suppose P already applies `<o#pol>`, but Q does not yet mention that subject, so Q is absent from `deps*(P)` and `rdeps(Q)`. A PUT to Q that adds `<o#pol> acp:allow acl:Read` changes `subjects[<o#pol>]`, and the full materializer grants P, but recomputing only Q's deps cannot discover that P now reads Q; `affected` omits P. The same issue applies to newly added WAC facts for an authorization subject declared elsewhere. Thus the proposed incremental index can diverge immediately on insertion, even though the documented narrow/delete regression starts from an already-known dependency.",
+    "file": "research/solid-scoped-materializer-design.md",
+    "fix_hint": "Maintain reverse reachability from frontier subjects to dependent documents/origins, and when a write adds or removes occurrences for any subject, recompute every dependency closure that can reach each changed subject before computing `affected`; a conservative full fallback on such occurrence-set changes is also sound. Add named ACP and WAC regressions that begin with P referencing/declaring the subject while Q does not mention it, then PUT Q with allow/agent facts and require P's scoped result to equal full materialization. Include a mutation demonstrating that recomputing only the written document leaves the regression red. Clarify index-update ordering so old dependencies also safely invalidate deletions.",
+    "severity": "major",
+    "title": "Adding a subject occurrence does not invalidate existing dependency closures"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 fixes the prior naming-based provenance defect by defining closure through actual subject occurrences and adding split-subject regressions. However, the incremental maintenance rule for that occurrence index is still unsound: a write can add a new occurrence of a subject already reachable from another origin without the written graph previously appearing in that origin's deps/rdeps. Recomputing deps only for the written document then fails to invalidate that origin, so the scoped view can miss a newly introduced grant. This is a new major finding, so progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
