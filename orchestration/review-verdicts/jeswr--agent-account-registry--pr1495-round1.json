@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1495,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2cb2772efea503db73d12a92575a71f191cf3b35",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change is reviewable and complete. The new checks use a hand-written expected live-lease surface, include both live and expired ledger rows, hold the ledger/time/serviced set fixed while varying non-ledger inputs, and separately demonstrate that the varied inputs affect the remainder of the document. This non-vacuously pins the stated justification that the published agent counts remain a projection of already-public live lease data. No trust check is weakened, no production control flow changes, and no hostile reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
