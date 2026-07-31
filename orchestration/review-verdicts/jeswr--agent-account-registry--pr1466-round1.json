@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1466,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4b2d11dfb371441e1b215bf64fdf78b7ae056005",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Encoding each SHA in a distinct path removes contention on the very object that must be serialized. Two writers rebinding the same PR to H1 and H2 can both successfully create their separate files. They can then each observe and delete the other's file, leaving no record, or one writer can delete the other's newer binding after its own create. A failed delete can also leave multiple records indefinitely. Per-file SHA preconditions only protect each individual delete; they do not condition the transaction on the prior PR-level binding. Thus the statements that no step modifies shared state, that UNKNOWN is bounded by one tick, and that it resolves without intervention are false. Worse, a zero-record race is resolved as the meaningful `none` state rather than UNKNOWN, so it is indistinguishable from an intentional retraction and can drive trust-plane behavior from a lost update.",
+    "file": "research/389-reviewed-sha-bind-store.md",
+    "fix_hint": "Specify a PR-level serialization/linearization mechanism and its recovery invariant before recommending this layout. For example, use a single mutable per-PR pointer with a real expected-version CAS, or an append-only event protocol with unique ordering/fencing and a resolver that cannot confuse incomplete concurrent writes with retraction. Add explicit interleaving analysis for bind/bind, bind/retract, and delete failure; every reachable state must either select the intended latest binding under a defined order or remain fail-closed and be recoverable. Do not classify absence as `none` when it can also result from an interrupted or racing transition.",
+    "severity": "blocker",
+    "title": "The create-then-delete protocol is not a CAS on the PR binding"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe record correctly identifies the PR-body TOCTOU and the hot-path read constraint, but the recommended filename-encoded protocol is not a compare-and-swap binding. Concurrent rebinders can permanently erase or ambiguously retain one another's records, so the claimed bounded UNKNOWN window and eventual resolution do not follow. Because this document is intended to constrain the later trust-plane implementation, that protocol flaw must be resolved in the design before approval.",
+  "verdict": "request_changes"
+ }
+}
