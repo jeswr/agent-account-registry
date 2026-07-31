@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5154,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "40d0fbc64276c1672d8d17f2247ef714288619e6",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3's clean result remains valid. The verifier consistently treats only uniquely mapped, bd-migration-labelled issues as authenticated; marker-only decoys and duplicate authenticated mappings fail closed. Planned dependency and parent markers are checked against resolved issue numbers, live omissions fail verification, closed-endpoint omissions are explicitly recorded as moot, and unresolvable edges necessarily coincide with unmigrated authenticated endpoints. The self-tests exercise the real pure verification path across complete, forged, duplicate, incomplete, misdirected, cross-kind, closed, and native-summary cases, including the trust-boundary regression requested in earlier rounds. The CLI keeps verification read-only and rejects simultaneous --apply. No new correctness, soundness, test-validity, security, or instruction-injection issue is present.",
+  "verdict": "approve"
+ }
+}
