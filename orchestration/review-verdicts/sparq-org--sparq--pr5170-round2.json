@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5170,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "47d3108f7a7431ee3611d20d98f31f39540e1695",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The enforced coverage-cone wiring is fail-safe and internally consistent. Narrowing occurs only for an explicit selected mode with a non-empty, well-formed affected closure; all other selector states and write failures leave an empty filter, which coverage.sh treats as a full-shard run. The shell intersection preserves explicit COVERAGE_CRATES remeasurement, handles whitespace-only filters, records inherited crates in the summary, and keeps measured below-floor crates failing. The added tests exercise the actual CLI and coverage.sh selection path, including full/error fallbacks, disjoint shards, reporting, and gate labeling. No correctness, soundness, security, or vacuous-test defect is evident in the diff.",
+  "verdict": "approve"
+ }
+}
