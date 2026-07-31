@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4948,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "85f06fbb7561407ef96aae01ebf3a3374c090ce4",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The module says rewriting the adopted mask preserves the verdict unless the adversary guesses secret r, and the test adds a blind fixed delta. But malicious_secure_equal_batch obtains r from session.draw_nonzero_fp() under the same ShamirDealer/MacSession whose corruption defines this residual. That dealer knows mask_value and can rewrite every mask value share by delta = -r. The adopted operand is then a valid sharing of zero; auth_mul produces product d*0 and a consistent carried MAC, so mac_check_and_open accepts and any unequal pair becomes equal. Thus the corrupt-dealer hardening/verdict-preservation claim remains false, and the current test is vacuous for the actual adversary described.",
+    "file": "crates/sparq-mpc/src/auth_equal.rs",
+    "fix_hint": "Remove the claims that operand order hardens against a corrupt dealer and that a dealer must guess r. Replace corrupt_dealer_rewrite_of_the_mask_preserves_the_verdict with a residual-attack witness using delta = mask.neg() and assert that an unequal verdict flips while the MAC check accepts, or redesign randomness so the rewriting adversary genuinely cannot know r. Keep the Malicious descriptor explicitly limited to <=t corrupt parties with an honest trusted dealer and retain the research-grade/external-audit caveat. Update the matching skill and research text consistently.",
+    "severity": "major",
+    "title": "Corrupt dealer still knows the mask and can zero the adopted operand"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is stagnant: the round-3 major soundness/honesty issue remains materially unchanged. The implementation draws the equality mask through the same in-process ShamirDealer/MacSession, while the documentation and test assume a corrupt dealer must choose its rewrite blindly because it does not know r. A corrupt dealer knows the mask it generated and can consistently rewrite the adopted second operand by delta = -r, producing r' = 0. auth_mul then carries a matching product/MAC for d*0, mac_check_and_open accepts, and an unequal pair is returned as equal. The fixed +9 test does not exercise this load-bearing residual. The <=t-party claim may remain separately scoped, but the corrupt-dealer hardening and verdict-preservation claims must be removed or corrected.",
+  "verdict": "request_changes"
+ }
+}
