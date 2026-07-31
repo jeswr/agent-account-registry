@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5334,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b370f5e865afdc025a25fcea9b67f7747df8274a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly centralizes runtime SIMD dispatch in active_kernel(), preserves the existing architecture-specific feature checks before unsafe intrinsic calls, and adds a non-vacuity test that fails closed in CI when AVX2+FMA coverage is required but unavailable. The test exercises the real dispatcher and rechecks representative body/drain/tail dimensions against the independent f64 reference. Documentation and the unsafe register are consistent with the implementation; no correctness, soundness, security, or test-validity defect was found.",
+  "verdict": "approve"
+ }
+}
