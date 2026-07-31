@@ -1577,6 +1577,83 @@ _workflow_step_run() {
     }'
 }
 
+# PURE (self-tested): EVALUATE a workflow step's `if:` expression against a supplied context and
+# print `fires`, `skipped`, or `unparseable`. The context is a JSON object mapping the full context
+# path (`needs.worker.outputs.gate_outcome`, `steps.verify.outcome`, …) to the string value the
+# runner would expand it to.
+#
+# The grammar is DELIBERATELY TINY: `${{ … }}` wrapping a flat `&&` conjunction of
+# `<name> == <operand>` / `<name> != <operand>`, where `<operand>` is a single-quoted literal or
+# another context name. Anything else — `||`, `!`, parentheses, a function call (`always()`,
+# `success()`), a bare `true`/`false`, or a name the caller supplied no value for — prints
+# `unparseable`, so the caller's assertion goes RED rather than silently passing. That refusal IS
+# the mutation detector: `… && false` and `… || true` both stop parsing.
+#
+# [#1446 review r1] WHY THIS EXISTS. Substring assertions on an `if:` are exactly the vacuity
+# AGENTS.md item 6 names: `grep -Fc "gate_outcome != 'success'"` is equally satisfied by
+# `… != 'success' || true`, and — worse — a containment check cannot distinguish a gate that RAN
+# and FAILED from one that never ran at all (a skipped step expands to `skipped`; an absent job
+# output to the empty string). A step that writes to the target repo must be testable for the
+# values it has to REFUSE, which means evaluating the whole condition, not grepping a clause.
+#
+# NOTE the asymmetry that keeps this fail-closed: GitHub additionally wraps a status-function-free
+# `if:` in an implicit `success()`, which this evaluator does NOT model. So `fires` here is a
+# NECESSARY condition for the real step to run, never a sufficient one — a `skipped` verdict is
+# therefore a sound proof that the real step does not run, which is the direction the trust
+# assertions need.
+_workflow_if_fires() {
+  local expr="$1" ctx="$2"
+  python3 - "$expr" "$ctx" <<'PY'
+import json, re, sys
+
+expr = sys.argv[1].strip()
+
+
+def refuse():
+    print("unparseable")
+    raise SystemExit(0)
+
+
+try:
+    ctx = json.loads(sys.argv[2])
+except Exception:
+    refuse()
+if not isinstance(ctx, dict):
+    refuse()
+
+m = re.fullmatch(r"\$\{\{(.+)\}\}", expr, re.S)
+if not m:
+    refuse()
+body = " ".join(m.group(1).split())
+
+NAME = r"[A-Za-z0-9_.\-]+"
+fires = True
+# ONE refusal guard, deliberately. The `fullmatch` (not `match`) below is the whole grammar: a term
+# with anything before or after the comparison — `|| true`, `&& false`, `always()`, a parenthesis, a
+# leading `!` — fails it and is refused. An earlier revision ALSO pre-scanned the body for `[|()!]`;
+# that was a second copy of this same guard, and AGENTS.md item 4 is explicit that duplicated guards
+# make each copy individually unkillable (neutering the pre-scan alone left the suite green, because
+# `fullmatch` still refused every input it was meant to catch). One killable guard beats two.
+for term in body.split("&&"):
+    t = re.fullmatch(rf"\s*({NAME})\s*(==|!=)\s*('[^']*'|{NAME})\s*", term)
+    if not t:
+        refuse()
+    lhs, op, rhs = t.groups()
+    if lhs not in ctx:
+        refuse()
+    if rhs.startswith("'"):
+        rhs_value = rhs[1:-1]
+    elif rhs in ctx:
+        rhs_value = ctx[rhs]
+    else:
+        refuse()
+    equal = ctx[lhs] == rhs_value
+    fires = fires and (equal if op == "==" else not equal)
+
+print("fires" if fires else "skipped")
+PY
+}
+
 # PURE (self-tested): print the JOB a workflow step belongs to, selected by its exact `id:` — the
 # job key (a two-space-indented mapping key) most recently seen above it. [#568 + #575] Which JOB a
 # trust-sensitive step lives in is now itself a security property: the pre-publish re-check is sound
@@ -4722,6 +4799,38 @@ WFFIX
   chk "#575: ...and still reads a step's OWN if: (the boundary fix is not a blanket empty)" \
     "$(_workflow_step_if "$wf_fixture" other)" '${{ never() }}'
 
+  # --- [#1446 review r1] THE `if:` EVALUATOR, tested on synthetic expressions before any live
+  # condition is measured through it. Its three verdicts must each be REACHABLE and must each be
+  # driven by the input — an instrument that always says `skipped` would pass every negative row
+  # below it, and one that always says `unparseable` would pass every mutation row. ---
+  local ev_ctx='{"a.b":"failure","c.d":"success","e.f":"x","g.h":"x"}'
+  chk "if-eval: a satisfied conjunction FIRES" \
+    "$(_workflow_if_fires "\${{ a.b == 'failure' && c.d == 'success' }}" "$ev_ctx")" "fires"
+  chk "if-eval: ...and flipping ONE operand's value alone makes it skip (the verdict tracks input)" \
+    "$(_workflow_if_fires "\${{ a.b == 'skipped' && c.d == 'success' }}" "$ev_ctx")" "skipped"
+  chk "if-eval: != is evaluated as inequality, not as a second equality" \
+    "$(_workflow_if_fires "\${{ a.b != 'success' }}" "$ev_ctx"):$(_workflow_if_fires "\${{ a.b != 'failure' }}" "$ev_ctx")" \
+    "fires:skipped"
+  chk "if-eval: a name-vs-NAME comparison reads both sides from the context" \
+    "$(_workflow_if_fires "\${{ e.f == g.h }}" "$ev_ctx"):$(_workflow_if_fires "\${{ e.f == a.b }}" "$ev_ctx")" \
+    "fires:skipped"
+  chk "if-eval: the empty-string literal is a real value (a skipped step's empty output)" \
+    "$(_workflow_if_fires "\${{ e.f != '' }}" "$ev_ctx"):$(_workflow_if_fires "\${{ e.f == '' }}" "$ev_ctx")" \
+    "fires:skipped"
+  # FAIL-CLOSED REFUSALS. Every one of these would otherwise be evaluated as something it is not;
+  # printing `unparseable` makes the caller's row red instead of quietly agreeing with it.
+  local ev_bad
+  for ev_bad in "\${{ a.b == 'failure' || true }}" "\${{ a.b == 'failure' && false }}" \
+                "\${{ !(a.b == 'failure') }}" "\${{ always() && a.b == 'failure' }}" \
+                "\${{ (a.b == 'failure') }}" "\${{ a.b == failure }}" \
+                "\${{ z.z == 'failure' }}" "a.b == 'failure'" ""; do
+    chk "if-eval: refuses what it cannot faithfully evaluate (${ev_bad:-<empty>})" \
+      "$(_workflow_if_fires "$ev_bad" "$ev_ctx")" "unparseable"
+  done
+  chk "if-eval: a non-object / malformed context is refused too (never read as an empty context)" \
+    "$(_workflow_if_fires "\${{ a.b == 'failure' }}" 'not json'):$(_workflow_if_fires "\${{ a.b == 'failure' }}" '[]')" \
+    "unparseable:unparseable"
+
   # --- [issue #575] THE WIRING INVARIANT, asserted on the LIVE workflow. The finding was that the
   # target's own gate ran on the same runner, in the same job, as a token-bearing publisher. These
   # lines are what make a regression to that shape a red tick rather than a silent reopening. ---
@@ -4879,13 +4988,187 @@ WFFIX
   # above. ---
   chk "the publish/PR step is ALSO gated on the pre-publish trust re-check (issue #568)" \
     "$(_workflow_step_if "$wf" pr | grep -Fc "steps.republish-trust.outcome == 'success'" || true)" "1"
-  chk "the pre-publish trust re-check runs on the gate-success publish path (issue #568)" \
-    "$(_workflow_step_if "$wf" republish-trust \
-       | grep -Fc "needs.worker.outputs.gate_outcome == 'success'" || true)" "1"
-  # ...and only on a bundle that VERIFIED, so a refused artifact aborts before the re-check spends
-  # an API round trip on an issue whose work can never be published anyway.
-  chk "the pre-publish trust re-check requires the bundle verification to have passed" \
-    "$(_workflow_step_if "$wf" republish-trust | grep -Fc "steps.verify.outcome == 'success'" || true)" "1"
+  # [#1446 review r1] Pinned as the COMPLETE expression rather than as a clause count. The old pair
+  # of rows (a containment check per conjunct) could not see an ADDED disjunct —
+  # `… == 'success' || true` satisfies every containment row while running the re-check on an
+  # unverified bundle, or on a gate that never returned. Exact match is one row and admits no such
+  # mutant (AGENTS.md item 6).
+  chk "the pre-publish trust re-check's COMPLETE if: is pinned exactly (gate green + verified bundle)" \
+    "$(_workflow_step_if "$wf" republish-trust)" \
+    "\${{ needs.worker.outputs.gate_outcome == 'success' && steps.verify.outcome == 'success' }}"
+
+  # --- [issue #33] The gate-FAILED RETENTION lane, asserted on the LIVE workflow. A failed gate
+  # discarded the completed model diff outright (the `pr` step skipped, nothing else looking at the
+  # 1-day pre-gate artifact), so a systematic gate failure lost its evidence. It is retained as an
+  # ARTIFACT of this run in THIS repository.
+  #
+  # ⚠️ [#1446 review r2] THE SHAPE OF THIS LANE IS THE SECURITY PROPERTY, so the rows below are
+  # mostly about what it is NOT. An earlier revision pushed the reconstructed commit to a
+  # `sparq-agent/gate-failed/` branch in the TARGET repo, arguing the namespace is invisible to this
+  # registry's provenance/review/arm enumerators. Invisible to our enumerators is not INERT: the push
+  # carries a contents+workflows-write App token, so it raises a `push` event in the target and any
+  # `on: push` workflow there runs — including one the candidate bundle itself adds under
+  # `.github/workflows/`. Gate-FAILED, unreviewed content would have reached target-side EXECUTION.
+  # A branch name cannot fix that, so the diagnostic moved to a plane that executes nothing. What
+  # must therefore stay true, and is asserted here: the lane makes NO target write of any kind, it
+  # holds NO credential, and a failed gate still reaches NONE of the target-touching steps. ---
+  local gf_if pub_if
+  gf_if=$(_workflow_step_if "$wf" preserve)
+  pub_if=$(_workflow_step_if "$wf" pr)
+  # EXACT MATCH on the whole condition — not containment. Any appended disjunct, any dropped or
+  # reordered conjunct, any relaxed comparison is a different string and flips this row. The
+  # expected value is written out here literally, so it comes from this test rather than from the
+  # file under test (AGENTS.md item 2b).
+  chk "#33 (LIVE): the retention lane's COMPLETE if: is pinned exactly (no appended disjunct)" \
+    "$gf_if" \
+    "\${{ needs.worker.outputs.gate_outcome == 'failure' && steps.verify.outcome == 'success' }}"
+  chk "#33 (LIVE): ...and the publish lane's COMPLETE if: is pinned exactly too" \
+    "$pub_if" \
+    "\${{ needs.worker.outputs.gate_outcome == 'success' && steps.republish-trust.outcome == 'success' && steps.republish-trust.outputs.verified != '' && steps.republish-trust.outputs.verified == needs.worker.outputs.verifier_sha256 }}"
+  # Now EVALUATE, against a context in which every non-gate clause is satisfied, so the only thing
+  # moving between rows is the gate verdict itself. `_gf_ctx <gate_outcome> [verify] [recheck]
+  # [attested] [pinned]` — every parameter defaults to the value that SATISFIES its clause, so each
+  # falsification row below moves exactly one input.
+  local gf_outcome
+  _gf_ctx() {
+    printf '{"needs.worker.outputs.gate_outcome":"%s","steps.verify.outcome":"%s","steps.republish-trust.outcome":"%s","steps.republish-trust.outputs.verified":"%s","needs.worker.outputs.verifier_sha256":"%s"}' \
+      "$1" "${2-success}" "${3-success}" "${4-attested-digest}" "${5-attested-digest}"
+  }
+  chk "#33 (LIVE): a gate that RAN and FAILED is the one verdict that reaches the retention lane" \
+    "$(_workflow_if_fires "$gf_if" "$(_gf_ctx failure)")" "fires"
+  # A gate verdict that is NOT a failure: the gate step was SKIPPED (an earlier step — e.g. the
+  # toolchain setup that sits between the pre-gate bundle seal and the gate — failed, so the gate's
+  # implicit success() skipped it), cancelled, or the job output never materialised at all. A valid
+  # bundle exists in every one of them, and a missing verdict is not a verdict: retain nothing.
+  for gf_outcome in '' skipped cancelled success; do
+    chk "#33 (LIVE): gate_outcome='${gf_outcome:-<empty>}' retains NOTHING (a missing verdict is not a failure)" \
+      "$(_workflow_if_fires "$gf_if" "$(_gf_ctx "$gf_outcome")")" "skipped"
+  done
+  # MUTUAL EXCLUSION, evaluated rather than grepped: on a genuine gate failure exactly the retention
+  # lane is eligible, on a green gate exactly the publish lane, and on a MISSING verdict neither.
+  chk "#33 (LIVE): the two lanes are mutually exclusive (failure -> retain only, success -> publish only)" \
+    "$(_workflow_if_fires "$gf_if" "$(_gf_ctx failure)")/$(_workflow_if_fires "$pub_if" "$(_gf_ctx failure)"):$(_workflow_if_fires "$gf_if" "$(_gf_ctx success)")/$(_workflow_if_fires "$pub_if" "$(_gf_ctx success)")" \
+    "fires/skipped:skipped/fires"
+  chk "#33 (LIVE): ...and a SKIPPED gate makes NEITHER lane eligible (no lane is the default)" \
+    "$(_workflow_if_fires "$gf_if" "$(_gf_ctx skipped)")/$(_workflow_if_fires "$pub_if" "$(_gf_ctx skipped)")" \
+    "skipped/skipped"
+  # A bundle refused as tampered must not be re-published under a LONGER retention either.
+  chk "#33 (LIVE): an unverified bundle blocks the retention lane" \
+    "$(_workflow_if_fires "$gf_if" "$(_gf_ctx failure failure)")" "skipped"
+  # INERTING MUTANTS on the live condition (AGENTS.md item 3: delete a guard, and separately make it
+  # conditionally inert, in a non-crashing form). Both mutants leave every substring a `grep -Fc`
+  # row looks for intact — `|| true` re-opens the lane for a gate that never ran, `&& false` kills
+  # it entirely — and the evaluator refuses both, so the rows above go red rather than staying green
+  # over a widened or dead lane.
+  local gf_body=${gf_if#\$\{\{}
+  gf_body=${gf_body%\}\}}
+  chk "#33 (LIVE): an appended '|| true' is DETECTED, not waved through as it would be by a grep" \
+    "$(_workflow_if_fires "\${{$gf_body || true }}" "$(_gf_ctx skipped)")" "unparseable"
+  chk "#33 (LIVE): an appended '&& false' is DETECTED too (the lane made inert)" \
+    "$(_workflow_if_fires "\${{$gf_body && false }}" "$(_gf_ctx failure)")" "unparseable"
+
+  # THE #1446 r2 FINDING, asserted four independent ways. (1) NO GIT REF: no EXECUTABLE line of this
+  # workflow names a `gate-failed/` ref, so the whole class of "a preserved branch raises a push
+  # event in the target and runs its workflows" is absent rather than namespaced away. Comments are
+  # stripped first — the rationale above deliberately names the rejected design, and a scan that the
+  # prose alone could satisfy would be measuring the wrong thing. Non-vacuous on both sides: the
+  # artifact NAME the lane really uses (`gate-failed-issue-…`, no slash) is outside the pattern, and
+  # the control row proves the same comment-stripped scan still SEES a target ref expression.
+  local wf_code
+  wf_code=$(grep -v '^[[:space:]]*#' "$wf")
+  chk "#1446 r2 (LIVE): no gate-failed GIT REF is named by any executable line of this workflow" \
+    "$(printf '%s\n' "$wf_code" | grep -c 'gate-failed/' || true)" "0"
+  chk "#1446 r2 (LIVE): ...and that same scan DOES see the publishable head ref (positive control)" \
+    "$([[ "$(printf '%s\n' "$wf_code" | grep -c 'sparq-agent/issue-' || true)" -gt 0 ]] \
+        && printf visible || printf blind)" "visible"
+  # (2) NO EXECUTION AND NO CREDENTIAL: the lane is a pure `uses:` artifact upload. It has no shell
+  # at all (so it cannot push, call `gh`, or run anything), and the publisher's App token appears
+  # nowhere in it. `publish`'s `pr` step is the positive control for both extractors.
+  chk "#1446 r2 (LIVE): the retention lane runs NO shell whatsoever (it cannot push or call gh)" \
+    "$(_workflow_step_run "$wf" preserve | grep -c . || true)" "0"
+  chk "#1446 r2 (LIVE): ...and the run-block extractor DOES find the publish lane's shell (control)" \
+    "$(_workflow_step_run "$wf" pr | grep -Fc 'worker-live.sh publish' || true)" "1"
+  chk "#1446 r2 (LIVE): the publisher App token is not in the retention lane's scope" \
+    "$(_workflow_step_body "$wf" preserve | grep -Fc 'steps.app-token-pub.outputs.token' || true)" "0"
+  chk "#1446 r2 (LIVE): ...and the token expression IS found on the step that legitimately holds it" \
+    "$(_workflow_step_body "$wf" pr | grep -Fc 'steps.app-token-pub.outputs.token' || true)" "1"
+  # ...and it cannot acquire one later either: it is ORDERED BEFORE the mint, so at the moment a
+  # gate-failed run retains its diff no write credential exists in the job at all.
+  local preserve_ln
+  preserve_ln=$(_first_match_line '^        id: preserve$' < "$wf")
+  chk "#1446 r2 (LIVE): the retention lane runs BEFORE the App-token mint (no credential in scope)" \
+    "$([[ -n "$preserve_ln" && -n "$mint_ln" && "$preserve_ln" -lt "$mint_ln" ]] \
+        && printf before || printf after-or-missing)" "before"
+  # (3) A GATE-FAILED RUN REACHES NEITHER THE WRITE CREDENTIAL NOR ANY TARGET-TOUCHING STEP.
+  # Evaluated per step rather than argued: the mint of the contents/workflows/issues/PR-write publish
+  # token, and every step in the publisher that reads or writes the target repository, are keyed on
+  # gate SUCCESS, so under a failure verdict each one skips. The success column is the non-vacuity
+  # control — the same evaluator must be able to say `fires` for all four.
+  #
+  # ⚠️ [#1446 review r3] THE MINT IS IN THIS MATRIX BECAUSE IT WAS THE DEFECT. It carried no `if:`
+  # at all, so it inherited the implicit `success()` — which a gate-FAILED run satisfies, since
+  # checkout/download/verify/retain all succeed on that lane. The r2 ordering row above (retention
+  # BEFORE the mint) proves no credential exists DURING the upload and says nothing about what the
+  # failure lane mints AFTERWARDS, so it could not see this. A row that evaluates the mint's own
+  # condition can, and an `if:` deleted from it again reads as `unparseable` here rather than as a
+  # pass.
+  local gf_step gf_fail_col='' gf_ok_col=''
+  for gf_step in app-token-pub checkout-target republish-trust pr; do
+    gf_fail_col+="$(_workflow_if_fires "$(_workflow_step_if "$wf" "$gf_step")" "$(_gf_ctx failure)")/"
+    gf_ok_col+="$(_workflow_if_fires "$(_workflow_step_if "$wf" "$gf_step")" "$(_gf_ctx success)")/"
+  done
+  chk "#1446 r3 (LIVE): a gate-FAILED run mints NO write token and reaches NO target-touching step" \
+    "$gf_fail_col" "skipped/skipped/skipped/skipped/"
+  chk "#1446 r3 (LIVE): ...and a gate-GREEN run reaches all four (the four rows above are not vacuous)" \
+    "$gf_ok_col" "fires/fires/fires/fires/"
+  # ...and the mint's COMPLETE condition, pinned exactly (AGENTS.md item 6): a `|| true` disjunct
+  # re-opens the mint for a gate that never ran while satisfying every containment grep, and the
+  # evaluator rows above would report it as `unparseable`, but only this row names what the
+  # condition must BE. It is the same pair of clauses the pre-publish re-check carries.
+  chk "#1446 r3 (LIVE): the publish mint's COMPLETE if: is pinned exactly (gate green + verified bundle)" \
+    "$(_workflow_step_if "$wf" app-token-pub)" \
+    "\${{ needs.worker.outputs.gate_outcome == 'success' && steps.verify.outcome == 'success' }}"
+  # WHICH STEPS HOLD WHICH CREDENTIAL — the routing, asserted as an exact set rather than per step,
+  # so a NEW step handed the write token (the regression this finding is about) fails the row by
+  # appearing in it. The write token reaches exactly the three gate-gated target-touching steps.
+  chk "#1446 r3 (LIVE): the publish WRITE token reaches exactly the three gate-gated steps" \
+    "$(_workflow_steps_referencing "$wf" 'steps.app-token-pub.outputs.token' | tr '\n' '|')" \
+    "Checkout target at the pre-gate base (pinned, no persisted token)|Re-verify live trust immediately before publish (drift → abort, no state change)|Reconstruct, push, and open the DRAFT target pull request (review pending)|"
+  # THE ONE LANE THAT MUST SURVIVE A FAILED GATE (issue #40) AND WHAT IT MAY DO. Gating the mint
+  # above on gate success would have silently emptied the follow-up filer's GH_TOKEN — the #40
+  # property (a refused patch still files its declared out-of-scope work) would have died at
+  # runtime with every `if:` row still green. It has its own mint instead, requesting issues:write
+  # ONLY, reaching only that step, and carrying the byte-identical condition of the step it serves.
+  local fu_if='${{ always() && steps.verify.outcome == '"'"'success'"'"' }}'
+  chk "#40/#1446 r3 (LIVE): the follow-up filer still runs on a failed gate (always()-guarded, verified bundle)" \
+    "$(_workflow_step_if "$wf" followups)" "$fu_if"
+  chk "#1446 r3 (LIVE): ...and its issues-only mint carries the byte-identical condition, so the token exists there" \
+    "$(_workflow_step_if "$wf" app-token-followups)" "$fu_if"
+  chk "#1446 r3 (LIVE): the follow-up token requests issues:write and NO code/ref/workflow/PR write" \
+    "$(_workflow_step_body "$wf" app-token-followups | grep -cE '^ +permission-issues: write$' || true):$(_workflow_step_body "$wf" app-token-followups | grep -cE '^ +permission-(contents|workflows|pull-requests):' || true)" \
+    "1:0"
+  chk "#1446 r3 (LIVE): ...and the SAME permission scan sees all three write scopes on the publish mint (control)" \
+    "$(_workflow_step_body "$wf" app-token-pub | grep -cE '^ +permission-(contents|workflows|pull-requests): write$' || true)" "3"
+  chk "#1446 r3 (LIVE): the issues-only token is a SHA-pinned mint of the same App" \
+    "$(_workflow_step_body "$wf" app-token-followups | grep -cE '^ +uses: actions/create-github-app-token@[0-9a-f]{40} ' || true)" "1"
+  chk "#1446 r3 (LIVE): the issues-only token reaches exactly the follow-up filing step" \
+    "$(_workflow_steps_referencing "$wf" 'steps.app-token-followups.outputs.token' | tr '\n' '|')" \
+    "Create declared follow-up issues (discovered out-of-scope work)|"
+  # (4) WHAT IT DOES DO. A SHA-pinned upload of the verified bundle, retained materially longer than
+  # the 1-day pre-gate copy whose expiry is the whole reason issue #33 exists, and failing closed on
+  # an empty upload rather than silently retaining nothing.
+  chk "#33 (LIVE): the retention lane is a SHA-pinned upload-artifact of the verified bundle" \
+    "$(_workflow_step_body "$wf" preserve | grep -cE '^ +uses: actions/upload-artifact@[0-9a-f]{40} ' || true):$(_workflow_step_body "$wf" preserve | grep -Fc 'path: ${{ runner.temp }}/publish-bundle' || true)" \
+    "1:1"
+  chk "#33 (LIVE): ...and an empty upload fails the step rather than silently retaining nothing" \
+    "$(_workflow_step_body "$wf" preserve | grep -Fc 'if-no-files-found: error' || true)" "1"
+  local gf_days
+  gf_days=$(_workflow_step_body "$wf" preserve | sed -n 's/^ *retention-days: \([0-9][0-9]*\) *$/\1/p')
+  chk "#33 (LIVE): the diagnostic outlives the 1-day pre-gate artifact it exists to replace" \
+    "$([[ "${gf_days:-0}" -gt 1 ]] && printf "outlives:$gf_days" || printf "expires-with-it:${gf_days:-none}")" \
+    "outlives:30"
+  chk "#33 (LIVE): it lives in the isolated publisher, never beside the hostile gate" \
+    "$(_workflow_step_job "$wf" preserve)" "publish"
 
   # --- [issue #568 + #575] WHICH JOB the re-check runs in is itself the security property. On the
   # worker runner it had to defend itself against the very host it executed on: the gate's

@@ -1552,10 +1552,86 @@ jobs:
           }
           bash registry/scripts/worker-live.sh verify-bundle
 
+      # [issue #33] THE GATE-FAILED LANE — DIAGNOSTIC RETENTION, AND IT NEVER TOUCHES THE TARGET.
+      # A failed gate used to discard the model's completed work outright: the `pr` step is skipped,
+      # the run ends, and the only surviving copy of the diff was the pre-gate bundle artifact whose
+      # 1-day retention expired unread, so a systematic gate failure lost the evidence needed to
+      # diagnose it. The work is RETAINED instead — as the same digest-verified bundle, re-uploaded
+      # from THIS run to THIS repository's artifact storage under a long retention.
+      #
+      # ⚠️ IT IS AN ARTIFACT, NOT A GIT REF, AND THAT IS THE SECURITY PROPERTY (review round 2 of
+      # #1446). An earlier revision pushed the reconstructed commit to a `sparq-agent/gate-failed/`
+      # branch in the TARGET repository, reasoning that the namespace is invisible to this registry's
+      # provenance/review/arm enumerators. That reasoning was wrong at the boundary that matters: a
+      # branch name only hides a ref from THIS repo's consumers, it does not make the ref inert. The
+      # push is performed with a contents+workflows-write App token, so it raises a `push` event in
+      # the target and any `on: push` workflow there runs as a consequence — INCLUDING a workflow the
+      # candidate bundle itself adds or rewrites under `.github/workflows/`. That turns gate-FAILED,
+      # unreviewed content into target-side EXECUTION with the target's own Actions capabilities and
+      # secrets, which is exactly what a failed gate exists to prevent. There is no branch-name
+      # convention that fixes it. So the diagnostic lives on a plane that executes nothing: an
+      # artifact is inert data, it is scoped to this run in this repository, and no token of any kind
+      # is in scope here — this step is deliberately placed BEFORE every App-token mint in the job.
+      #
+      # [#1446 review r3] AND THE MINTS THEMSELVES ARE NOW LANE-CORRECT. Ordering alone only proved
+      # no credential exists DURING the upload; it said nothing about what the failure lane reaches
+      # afterwards, and until r3 the write-capable publish mint below carried no `if:` at all, so a
+      # gate-FAILED run minted a contents+workflows+issues+PR-write token it then used for nothing.
+      # That mint is gated on gate success now. The only credential a failed gate reaches is the
+      # issues-only follow-up mint (the #40 lane, which must survive a failed gate) — it can file an
+      # issue and nothing else: no ref, no code, no workflow, no pull request.
+      #
+      # ⚠️ SCOPE: NOTHING CONSUMES THIS ARTIFACT AUTOMATICALLY (review round 1 of #1446). The next
+      # attempt still checks out the default branch and re-runs the model from scratch; the fix loop
+      # only ever operates on an existing pull request's head. This lane buys a HUMAN a durable copy
+      # of the failing tree — it does not resume anything and it does not avoid re-paying model cost.
+      #
+      # THE GATE MUST HAVE ACTUALLY RUN AND ACTUALLY FAILED. `== 'failure'` is exact on purpose:
+      # `gate_outcome` is `steps.gate.outcome` from the worker job, and the gate step carries an
+      # implicit `success()`, so a failed toolchain setup — or any earlier step failing between the
+      # PRE-gate bundle seal and the gate — leaves a perfectly valid bundle with the gate SKIPPED.
+      # Under a `!= 'success'` test (and likewise for an empty/cancelled outcome) that absent verdict
+      # would read as a gate failure. A missing verdict is not a verdict, so it retains nothing.
+      # `steps.verify.outcome` keeps this bound to the bundle that MATCHED the pre-gate record: an
+      # artifact refused as tampered must not be re-published under a longer retention either.
+      #
+      # DELIBERATELY NO `continue-on-error`. It cannot mask the gate: on this lane the worker job is
+      # already red with the gate's own nonzero exit and verbatim output, and on the gate-green lane
+      # this step is skipped and so cannot fail at all. Every downstream job (`final-state`,
+      # `provenance`, `release`) is `always()`-gated and reads the worker's outputs, so a red
+      # publisher here still converges the issue to `status:deferred` and still frees the lease.
+      # Swallowing the error would only hide the one thing this step exists to guarantee.
+      - name: Retain the gate-FAILED diff for diagnosis (inert artifact, no target write)
+        id: preserve
+        if: ${{ needs.worker.outputs.gate_outcome == 'failure' && steps.verify.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gate-failed-issue-${{ inputs.issue_number }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/publish-bundle
+          # Long enough that a systematic gate failure is still diagnosable after the wave that
+          # produced it has been triaged, and bounded on purpose: this repository is public, so the
+          # artifact is readable by anyone: the same content class as the 1-day pre-gate bundle
+          # beside it, kept no longer than a diagnosis needs.
+          retention-days: 30
+          if-no-files-found: error
+
       # Minted only AFTER the bundle verified. Same scopes the old in-worker publish used, but now
       # they exist on a runner that has never executed target code.
+      #
+      # [#1446 review r3] AND ONLY ON THE PUBLISH LANE. This step used to carry no `if:` at all, so
+      # it inherited the implicit `success()` — and on a gate-FAILED run the steps before it
+      # (checkout, download, verify, the retention upload) all succeed, so the implicit condition
+      # was satisfied and a contents+workflows+issues+PR-write token was minted for a run that may
+      # never legitimately write a line to the target. Nothing consumed it (every target-touching
+      # step below is keyed on gate success), but an unused write credential on a runner is still a
+      # credential, and it made "a failed gate reaches no write credential" false as written. The
+      # condition is now the SAME one the pre-publish re-check carries — gate green AND a bundle
+      # that matched the pre-gate record — so on every other verdict the mint SKIPS and its
+      # `outputs.token` is empty. The follow-up filing lane, which must still run on a failed gate
+      # (issue #40), no longer borrows this token: it has its own issues-only mint far below.
       - name: Mint target-scoped App token for the verified publish
         id: app-token-pub
+        if: ${{ needs.worker.outputs.gate_outcome == 'success' && steps.verify.outcome == 'success' }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
@@ -1572,7 +1648,18 @@ jobs:
       # The publisher checks out the target at the PRE-GATE BASE — never at the worker's post-gate
       # worktree, which is exactly the artefact this whole job exists to distrust. fetch-depth: 0
       # because a push from a shallow clone can be refused by the remote.
+      #
+      # [issue #33] Still keyed on the GATE VERDICT. The gate-failed retention lane above is an
+      # artifact upload — it needs no checkout, no token and no live-trust re-check, because it
+      # writes nothing to the target — so a failed gate continues to reach no target-write
+      # machinery whatsoever, exactly as before this lane existed. [#1446 review r3] The token that
+      # feeds this step is keyed on the same verdict, so on a failed gate the write credential is
+      # not merely unused here: it is never minted.
       - name: Checkout target at the pre-gate base (pinned, no persisted token)
+        # `id:` carries no runtime meaning here — it exists so the self-test can extract and
+        # EVALUATE this step's condition by name, which is how "a gate-FAILED run reaches no
+        # target-touching step at all" became an asserted property rather than a claim.
+        id: checkout-target
         if: ${{ needs.worker.outputs.gate_outcome == 'success' }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -1724,6 +1811,28 @@ jobs:
           mkdir -p "$WORKER_ROOT"
           bash registry/scripts/worker-live.sh publish
 
+      # [#1446 review r3] THE ONE CREDENTIAL A GATE-FAILED RUN REACHES, AND IT CANNOT WRITE CODE.
+      # Follow-up filing is the single publisher activity that legitimately survives a failed gate
+      # (issue #40: the model's declared out-of-scope work must still be captured when its patch is
+      # refused), so gating the write-capable mint above on gate success would have silently emptied
+      # that step's GH_TOKEN. It gets its own token instead, requesting `issues: write` ONLY — no
+      # contents, no workflows, no pull-requests — so the credential that exists beside the
+      # bundle-derived follow-up spec on the failure lane cannot push a ref, add a workflow, or open
+      # a pull request in the target even if the spec were hostile. Its condition is byte-identical
+      # to the step it serves, so it exists exactly when that step runs and never otherwise.
+      - name: Mint issues-only App token for follow-up filing (no code/ref/workflow write)
+        id: app-token-followups
+        if: ${{ always() && steps.verify.outcome == 'success' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve.outputs.target_owner }}
+          repositories: ${{ needs.resolve.outputs.target_name }}
+          # `gh label create`, `gh label list`, `gh issue list` and `gh issue create` — the whole of
+          # worker-issue.py's followup path — are covered by this one permission.
+          permission-issues: write
+
       - name: Create declared follow-up issues (discovered out-of-scope work)
         id: followups
         # The procedure for the orchestrator to capture work it discovers but must NOT do in this
@@ -1736,7 +1845,9 @@ jobs:
         if: ${{ always() && steps.verify.outcome == 'success' }}
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ steps.app-token-pub.outputs.token }}
+          # The ISSUES-ONLY token minted directly above — never the publish token, which does not
+          # exist on this lane and whose contents/workflows/PR write this step has never needed.
+          GH_TOKEN: ${{ steps.app-token-followups.outputs.token }}
           SPEC_FILE: ${{ runner.temp }}/publish-bundle/followups.jsonl
         run: |
           set -uo pipefail
