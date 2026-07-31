@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5154,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "40d0fbc64276c1672d8d17f2247ef714288619e6",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2's major trust-boundary finding is resolved. Verification now splits labelled, authenticated migration mappings from unlabelled marker-only issues; only unique authenticated mappings count, marker-only decoys remain unmigrated, and the verdict fails closed. The added self-tests exercise both a fully labelled board that passes and unique correctly-edged unlabelled decoys that fail, as requested. Duplicate authenticated mappings, shadow copies, missing and unresolvable edges, closed endpoints, and unavailable native dependency summaries are handled consistently with the documented scope. No new correctness, soundness, test-validity, or security issue was found in the diff.",
+  "verdict": "approve"
+ }
+}
