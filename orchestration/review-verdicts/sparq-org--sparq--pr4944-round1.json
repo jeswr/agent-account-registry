@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4944,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8539a7335b768f968d0d51899273d604f9b8dad8",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The stream-write hardening is coherent and complete as scoped. Pending output streams prevent premature completion; import/remove batch synchronously with explicit error termination and preserve the documented incremental semantics; invalid graph terms are rejected before matching, closing the Variable-as-wildcard destructive case. The tests exercise the real adapter/store path, observe state inside completion handlers, count actual delta calls, cover constructor and per-call chunk sizes, source errors, named/default graph addressing, and invalid destructive inputs. The exported option type and public skill documentation are updated consistently. No correctness, soundness, security, or vacuous-test issue was found.",
+  "verdict": "approve"
+ }
+}
