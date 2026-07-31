@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5417,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "49915ca0b67722f4ee1198fc46f39ecbff979d2e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major wrong-answer finding. ListExpander now chooses a prefix fresh against every blank label reachable through rows, including nested lists, formulae, and quoted triples; both the query-answer path and the closure/proof path seed the expander with all rows it will process. The new end-to-end regression projects the formerly colliding _l1 blank alongside a two-cell list and verifies that the projected node receives no rdf:first/rest structure. The query API tests exercise the real matcher for comparison and functional builtins, lists, formulae, backward rules, projection-over-closure behavior, deduplication, and the no-forward-rule error. The public API and wasm/package documentation are updated consistently. No remaining correctness, soundness, test-validity, or security issue is evident in the diff-scoped evidence.",
+  "verdict": "approve"
+ }
+}
