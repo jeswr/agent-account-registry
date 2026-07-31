@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5273,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "563183a2762460d51e5922086d6bdcd6cbb8b67f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and complete. The dedicated wasm-pack nodejs output is copied into an independently CommonJS-scoped directory, exported through a require condition, included in the package allowlist, and incorporated into prepare's completeness check. The runtime test exercises the load-bearing behavior directly by requiring the generated nodejs glue before initialization and immediately loading and querying a Store; the package and guardrail checks cover the export, marker, glue, and wasm artifacts. The documentation accurately distinguishes the synchronous raw Store surface from the ESM RDF/JS wrapper. No correctness, soundness, security, or test-validity issue is evident.",
+  "verdict": "approve"
+ }
+}
