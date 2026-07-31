@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5217,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bef9bf4f2601d974abfe5c2793f58e1acd12714c",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "decompose_run() includes any job whose conclusion is not null, cancelled, or skipped. That still admits failure, timed_out, action_required, and similar non-success outcomes. A failed CI job commonly stops at its first failing step, so its observed total and step inventory are truncated; medianing it with successful jobs can understate leg time, distort family imbalance and fold candidates, and omit later slow steps. The round-2 defect is therefore unresolved, and the test suite still has no short failed job beside successful observations to prove exclusion.",
+    "file": "scripts/ci_leg_inventory.py",
+    "fix_hint": "Restrict topology-steering observations to conclusion == \"success\" (and preferably restrict fetched runs to successful conclusions too), or keep non-success observations in a separate diagnostic population that cannot affect medians or derived findings. Add a fixture test with successful observations plus a short failed job and assert the failed job is excluded from aggregation.",
+    "severity": "major",
+    "title": "Failed jobs are still sampled as representative completed work"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2's major measurement-validity defect remains unchanged. decompose_run() still admits every conclusion except null, cancelled, and skipped, so failed/timed-out/action-required jobs can enter duration medians despite commonly being truncated before later steps execute. The fixture test still verifies only exclusion of cancelled, skipped, and running jobs and provides no failed-job counterexample. Because the same major finding remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
