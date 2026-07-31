@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5244,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "381c15b977ebe10fa7f7a01568b4ab6c4673a2df",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. delegate now constructs the complete parent scope and validates it with check_scope before either the inherited or selected branch path, so publicly mutated parents with out-of-order or duplicate branches, a primary-order violation, or shared topics cannot be used to mint a signed child. The new delegation_rejects_a_non_canonical_parent test exercises the real delegate path for both branches: None and branches: Some(...), first confirms the malformed parent is rejected by decode, and confirms canonical delegation still succeeds. The implementation preserves subset-only selection and canonicalizes selected children. No new correctness, soundness, test-validity, security, or instruction-injection issue is evident in the supplied diff.",
+  "verdict": "approve"
+ }
+}
