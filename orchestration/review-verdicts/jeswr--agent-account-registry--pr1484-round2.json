@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1484,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c2f8c81c19cc631eddd1195e3dbc2e2e6319fac6",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`stale_worker_pr_reason` checks the worker branch, bot author, marker, provenance, and `mergeable_state`, but never checks `pull.head.repo.full_name`. `age_park_cause_recovered` checks even less before spending the bounded re-admission grant. By contrast, `enumerate_review_items` unconditionally rejects a PR whose head repository is not the target repository before it reaches the `needs-rebase` branch. Thus a valid-provenance, bot-authored, worker-shaped `dirty` PR with a foreign, deleted, or otherwise mismatched head repository is now never age-parked; if already parked, it is unparked on provenance alone. Dispatch emits no item, and subsequent sweeps continue exempting `dirty`, leaving a silent terminal stall. The integration fixture fixes `head.repo.full_name` to the target, so it cannot detect this mismatch.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Make both the new-park carve-out and existing-park re-admission require the terminal shape evidence dispatch requires, at minimum a present same-repository head. Thread the target repository into the predicate or otherwise share an admission proof, failing closed when the head repository is missing/mismatched. Add enumerator-backed negative tests for foreign and unavailable head repositories and show those postures retain a visible escalation rather than being exempted or unparked.",
+    "severity": "major",
+    "title": "Repair carve-out still bypasses dispatch's terminal head-repository gate"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 materially improves the state predicate: only `dirty` is carved out, and the new test reaches the real enumerator for a normal same-repository worker PR. However, the claimed delivery equivalence is still incomplete. `stale_worker_pr_reason` admits the carve-out from branch/author/body shape plus provenance and `dirty`, while dispatch has an earlier unconditional `head.repo.full_name == repo` gate. A bot-authored worker-shaped PR whose head repository is foreign or unavailable can therefore be exempted from a new park, or have an existing machine park consumed and cleared, yet can never emit `needs-rebase`; because `dirty` remains carved out, later age sweeps do not restore the escalation. This is the same major delivery-proof defect in a narrower posture, so progress is stagnant under the required scale.",
+  "verdict": "request_changes"
+ }
+}
