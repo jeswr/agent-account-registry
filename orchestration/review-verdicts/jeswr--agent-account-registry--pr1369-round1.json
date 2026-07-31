@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1369,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7a7fd095aaad2ba98fd8857df453d7a5e70b8195",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4 says a point-in-time GraphQL queue/arm read is the right guard because it licenses an action taken \u201cnow,\u201d and presents `not-queued and not-armed -> draft it` as fail-closed. But `review_state()` and the later draft-conversion API call are separate requests with no head binding or compare-and-swap. A PR can become queued, armed, or review-passed after the probe and before conversion; the conversion can then evict or un-arm exactly the live merge the guard is meant to protect. Reusing `backfill-provenance.review_state` preserves that TOCTOU window rather than resolving it. This also undercuts the claim that all listed failure directions are closed.",
+    "file": "research/1012-parked-non-draft-queue-membership.md",
+    "fix_hint": "Revise the recommendation to specify and justify a race-safe mutation protocol. For example, establish a GitHub-supported conditional/atomic operation, or add a post-mutation detection-and-recovery protocol whose safety is demonstrated; if neither is possible, explicitly reject automatic draft conversion or require human execution. Add the queue/arm transition between probe and mutation as a mandatory adversarial test/design case.",
+    "severity": "major",
+    "title": "Draft-conversion recommendation has an unaddressed probe-to-mutation race"
+   }
+  ],
+  "progress": null,
+  "summary": "The record correctly rejects a point-in-time queue absence as durable evidence for freeing a crate, but then relies on the same point-in-time evidence to authorize a separate draft mutation without addressing the race between the GraphQL read and that mutation. That leaves the recommended remedy capable of evicting a PR that becomes queued or armed after the probe. Because this is the load-bearing safety claim of the proposed follow-up, the design is not yet sound enough to approve.",
+  "verdict": "request_changes"
+ }
+}
