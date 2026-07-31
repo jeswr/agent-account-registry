@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5223,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a83f0c9a8f548c134b7600c95280e65a0e0b8ee9",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. open_object now requires the supplied root ID to exist in the indexed block set, requires the indexed envelope to equal the separately supplied root, and traverses that indexed envelope. The new regression test exercises both the absent-root replacement attack while preserving chunk_count and the same-ID/different-envelope case. This restores the documented exact-set invariant, and no new correctness, soundness, test-validity, or security issue is evident in the diff. The research-grade and external-audit caveats remain explicit.",
+  "verdict": "approve"
+ }
+}
