@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5212,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0021aaeeaabf22f9137660ab351c79037db056f9",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The `coverage-engine-run` rust-cache `with:` mapping contains `save-if` twice, and the `coverage-engine-merge` mapping does as well. YAML mappings require unique keys; parsers may reject duplicates or silently retain one occurrence, so this can make the GitHub Actions workflow invalid or behave parser-dependently. The new comments say these keys were left alone, but the patch added a second copy instead of only adding/updating commentary.",
+    "file": ".github/workflows/ci.yml",
+    "fix_hint": "Keep exactly one `save-if: ${{ github.ref == 'refs/heads/main' }}` in each affected rust-cache `with:` mapping and place the new rationale beside that existing key.",
+    "severity": "major",
+    "title": "Duplicate save-if keys make two workflow mappings ambiguous"
+   },
+   {
+    "body": "The diff repeatedly claims the posture is pinned by `scripts/tests/test_mergequeue_cache_posture.py`, but its `with_value` helper returns the first matching key and never asserts uniqueness. Consequently, both newly duplicated `save-if` keys pass the test, making the relevant structural coverage incomplete.",
+    "file": ".github/workflows/ci.yml",
+    "fix_hint": "Extend the existing structural test to assert exactly one non-comment `save-if:` entry per rust-cache step, then verify the test fails against the duplicated form and passes after deduplication.",
+    "severity": "minor",
+    "title": "The cited posture test does not detect duplicate mapping keys"
+   }
+  ],
+  "progress": null,
+  "summary": "The cache-key consolidation itself is plausible, but the workflow change introduces duplicate `save-if` mapping keys in two rust-cache steps. Duplicate YAML keys are invalid/ambiguous across parsers and the existing posture test is vacuous for this failure because it returns only the first matching key. Remove the duplicate entries and strengthen the structural test so this regression cannot recur.",
+  "verdict": "request_changes"
+ }
+}
