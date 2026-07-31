@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1413,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "971d2b6b3bfeffe6ab25b79a759f048ed718e89d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe credential-bearing Authorization headers are moved from curl argv to curl's stdin header reader in all five changed call sites. The repository-wide guard fails closed on workflow parse failure and zero observed header arguments, reports only header names, and covers separated, joined-short, long-equals, case-insensitive, Proxy-Authorization, operator-boundary, synthetic leak/clean, and live-workflow directions. The live indirect-header anchor also prevents the three remediated workflow files from disappearing silently from observation. I found no correctness, soundness, test-validity, or security defect supported by the diff.",
+  "verdict": "approve"
+ }
+}
