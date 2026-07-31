@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1418,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "337d4229ac7c695c95419b77c19cec73ff9328da",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 resolves the prior major finding. `grant_pr_disposition` now validates that a matching PR with a non-null, parseable `merged_at` is also `closed`, refuses the contradictory open-and-merged shape, and includes a non-vacuous regression check covering both record orders plus a contradiction after a closed-unmerged record. The valid closed+merged and closed+unmerged cases remain separately asserted. I found no remaining diff-scoped correctness, soundness, test-validity, or security issue that warrants blocking this report-only change.",
+  "verdict": "approve"
+ }
+}
