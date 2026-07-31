@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1388,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6ad00c3769d427323281c8420ff0d2c08bc96e56",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new text says account issue titles are static configuration edited by a maintainer and that a raw handle appears on \u201cno generated surface at all,\u201d including no generated log line, issue body, or alert. At the current PR head, `.github/workflows/set-up-account.yml` computes `HANDLE=[redacted-account]`, creates the account issue with `gh issue create --title \"$HANDLE\"`, emits multiple `echo`/error lines containing `$HANDLE`, creates policy PR text containing the handle, and posts request/account comments containing `$HANDLE`. Those are machine-generated public surfaces, not hand-edited static configuration. The narrower fingerprint guarantees in model-health, dashboard-gen, and lease parsing do not establish the universal invariant asserted here.",
+    "file": "README.md",
+    "fix_hint": "Describe the actual scoped invariant precisely: identify which generated identity-bearing ledger/health/dashboard/diagnostic surfaces require fingerprints, while explicitly retaining the enrollment/account-catalog surfaces that intentionally expose handles. Alternatively, implementing a repo-wide no-generated-handle invariant would require code changes across set-up-account and its consumers, with non-vacuous seam tests; prose alone cannot establish it.",
+    "severity": "major",
+    "title": "Universal no-generated-handle claim contradicts the enrollment workflow"
+   }
+  ],
+  "progress": null,
+  "summary": "The documentation change overstates the implemented privacy boundary. The repository does enforce salted fingerprints on several named ledger/dashboard paths, but it does not enforce the new universal claim that raw handles occur only in hand-edited static configuration and on no generated surface. A current enrollment workflow generates public issues, comments, PR text, and Actions log lines containing the raw handle. Because this paragraph declares the code-backed security contract and says widening it requires a locked decision, documenting a materially stronger invariant than the code provides is not sound.",
+  "verdict": "request_changes"
+ }
+}
