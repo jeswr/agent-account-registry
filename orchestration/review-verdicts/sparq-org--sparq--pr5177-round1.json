@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5177,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "da59417903e1317098572801999afa16098d7567",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "publish() refuses every pending decision when the current status is success or failure. A workflow can register after an earlier evaluation has published success (notably a workflow_run-chained workflow after the 180-second floor). Its predecessor's completion triggers an evaluation that can observe the new workflow in progress and correctly decide PENDING, but publish() discards that decision because the current status is terminal. Since workflow_run fires on completion rather than start, the required context remains green for the entire new run and branch protection could merge before that gating work finishes. The registration floor does not prevent workflows from appearing after the floor, and the test suite explicitly asserts this unsafe suppression rather than exercising late registration. This contradicts the documented invariant that the status must never be green while a gating sibling is pending or unresolved.",
+    "file": "scripts/ci_summary_status.py",
+    "fix_hint": "Do not apply terminal-to-pending monotonicity globally. Introduce an observation/version ordering that distinguishes stale concurrent evaluations from genuinely newer sibling sets (for example, serialize publication per SHA without canceling the predecessor, or compare a durable sibling-set generation/freshness marker before suppressing a pending write). Add a real late-registration test: publish success, introduce a new in-progress workflow run after the floor, evaluate to pending, and require the published context to become pending until that workflow completes.",
+    "severity": "major",
+    "title": "Terminal-to-pending suppression permits a stale green during newly registered work"
+   }
+  ],
+  "progress": null,
+  "summary": "The shadow workflow is staged safely because the resident gate remains authoritative, but the new status evaluator can publish or retain success while a newly registered gating workflow is still running. That violates the stated parity invariant and makes the status unsafe for its intended promotion to the required check.",
+  "verdict": "request_changes"
+ }
+}
