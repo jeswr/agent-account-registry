@@ -1,0 +1,51 @@
+{
+ "host_envelope": {
+  "pr": 5271,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "414cb811b3d741dd1e84b049227f7b61e6decae5",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Two independent reasons this assertion can pass even if the 404 path wrongly re-armed the 2s timer.\n\n1. `page.clock.install()` (line 246) runs inside the test body, i.e. after the webPersona auto-fixture has already done `page.goto(\"/\")` (gui/e2e-playwright/support/web-fixtures.ts). Playwright's documented usage installs the clock before navigation; installing afterwards depends on the injection reaching the already-loaded main world. If it does not take effect, `fastForward(5_000)` is a no-op on the app's real setTimeout and the check degrades to exactly the round-2 form the prior review flagged.\n\n2. Even when the clock does apply, `calls` is incremented in the Node-side route handler. `fastForward` resolves once the in-page timers have fired; a retry's fetch then has to cross to the driver before the handler runs. Reading `calls` synchronously on the next line can observe the pre-retry value.\n\nThe message text and muted-class assertions in this test are real; only the \"polling stops\" half is soft. Note that `expect(listCalls).toBe(0)` in the preceding test has the same class of race, though it is a much less likely false pass since nothing should be issuing a request at all there.",
+    "file": "gui/e2e-playwright/specs/plan-explorer.web.spec.ts",
+    "fix_hint": "Replace the immediate read with a polling assertion that spans the window: `await expect.poll(() => calls, { timeout: 5000 }).toBe(1)` after the fastForward (this also removes the need for the fast clock to be perfectly synchronous). For the clock itself, either move `page.clock.install()` into a fixture/`test.beforeEach` that runs before `page.goto(\"/\")`, or drop the clock entirely and rely on expect.poll over a real 5s window since the spec's no-waitForTimeout rule permits web-first polling.",
+    "severity": "minor",
+    "title": "\"polling stops\" still may not observe a retry: clock.install() runs after the fixture's goto, and expect(calls).toBe(1) is not synchronized with the route handler"
+   },
+   {
+    "body": "`endpointRegistryMessage` is applied only in the poll path; the kill catch falls through to `error.message`, so killError renders the raw `QueryRegistryHttpError` string.\n\nThis is reachable in a normal configuration. `GET /queries` is READ-gated and `DELETE /queries/{id}` is WRITE-gated (crates/sparq-server/src/http.rs, list_queries_handler / cancel_query_handler), and auth_gate leaves reads OPEN when only `--auth-token` is set without `--auth-token-read` (pinned by auth_gate_write_only_gates_writes_not_reads). So an operator on a write-only-gated server can open the monitor with an empty token field, see rows fine, click Kill, and get \"Kill failed (HTTP 401).\" with nothing saying a bearer token is required for the cancel route. Every other gate in this panel is explained; this one is not.",
+    "file": "gui/app/src/components/workbench/plan-explorer.tsx",
+    "fix_hint": "Route the kill catch through the same helper, with a kill-specific 401/403 branch, e.g. \"Cancel is write-gated \u2014 enter the server's bearer token to kill a running query.\" Keep the existing 404 success-by-race branch ahead of it. A small unit or component case per branch would pin the mapping.",
+    "severity": "minor",
+    "title": "A Kill rejected by the WRITE gate surfaces a bare \"Kill failed (HTTP 401).\" while the equivalent list failure gets an explanatory line"
+   },
+   {
+    "body": "`registryHeaders` sends `token?.trim()` and the callers pass `endpointToken.trim() || undefined`, so \"secret\" and \"secret \" are the same request. But the reset effect (lines 406-410) compares `current.token !== endpointToken` on the raw value, so appending a trailing space to the token field silently unmounts EndpointQueryMonitor and the user has to click \"Monitor endpoint\" again for an identical request. The url side is already normalized (the parent passes `endpointUrl.trim()`); the token side is not.\n\nRelated and equally small: the teardown is silent. The panel just reverts to \"Server-side monitoring is opt-in and starts only when requested\", which reads as if it was never started.",
+    "file": "gui/app/src/components/workbench/plan-explorer.tsx",
+    "fix_hint": "Normalize both sides once \u2014 pass `endpointToken.trim()` down from PlanExplorer (or compare `current.token.trim() !== endpointToken.trim()`). Optionally render a one-line muted note when a running monitor is auto-stopped by an endpoint edit, so the disappearance is explained rather than inferred.",
+    "severity": "nit",
+    "title": "The auto-stop effect compares the token untrimmed while the fetch helpers trim it, so whitespace-only edits tear down monitoring"
+   },
+   {
+    "body": "`endpointRegistryMessage` returns `retry: true` for anything that is not a recognized QueryRegistryHttpError status. A server that goes away, a DNS failure, or a CORS rejection therefore leaves a red `[data-plan-endpoint-monitor-error]` line while the component re-fetches on a fixed 2s cadence for as long as the tab stays open. The 404/405 and 401/403 cases are correctly terminal; only the open-ended one is unbounded.\n\nLow impact \u2014 it is opt-in, same-origin-as-configured, and stops on unmount \u2014 but it is a quiet background loop with no ceiling.",
+    "file": "gui/app/src/components/workbench/plan-explorer.tsx",
+    "fix_hint": "Add a modest backoff (2s doubling to ~30s) or a consecutive-failure cap after which the chain stops and the message offers a re-arm, resetting the counter on the next success alongside the existing setKillError(null).",
+    "severity": "nit",
+    "title": "A generic (non-HTTP) poll failure retries every 2s indefinitely with no backoff or attempt cap"
+   },
+   {
+    "body": "`parseRegistryRow` requires `start` to be a finite number and the interface documents it as Unix epoch ms, but no consumer uses it \u2014 EndpointMonitorRow renders only kind, fingerprint and elapsed_ms. The validation is harmless (and correctly matches the server's `started_at_unix_ms`), but a stricter check on an unused field will reject a future server that legitimately omits it.",
+    "file": "gui/app/src/lib/query-monitor.ts",
+    "fix_hint": "Either use it (an absolute start time in the row's title attribute complements the relative elapsed readout) or drop it from the interface and the required-field check, leaving elapsed_ms as the single time source.",
+    "severity": "nit",
+    "title": "EndpointRunningQuery.start is validated but never read"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2's major is genuinely fixed. tokenTransitRisk now tests `code === \"token-over-plaintext\" && level === \"warning\"` (plan-explorer.tsx:232-235), so the benign level:\"info\" loopback-http-plus-token case emitted by connectionSafetyWarnings (packages/sparq-client/src/endpoint.ts) no longer disables the toggle or renders a false claim. It has a real regression guard: one new e2e fills MOCK_URL (loopback http) AND a token and asserts the toggle ENABLED; another fills http://example.test/sparql with a token and asserts DISABLED plus the plaintext message. That is the exact discriminator the prior round asked for, and the message assertion pins tokenTransitRisk=true independently of endpointBlocked.\n\nThe four round-2 minors are addressed. Opt-in is now pinned by request absence (`expect(listCalls).toBe(0)` after filling URL and a sentinel token), not UI absence. killError clears on the next successful poll, and the killing latch is keyed to the id, so overlapping kills no longer clobber each other. The stale-snapshot divergence is closed by an effect that nulls monitoredEndpoint on url/token change, unmounting EndpointQueryMonitor before any request carries the new value. registryUrl's heuristic now states its assumption.\n\nI walked the async paths and found no material hole: the poll chain stays serial (one timeout slot), the sequence guard drops stale kill/poll results without killing the chain, aborts short-circuit every setState, and the effect deps are immutable snapshot fields so it runs once per mount. Client parsing matches QueryRegistry::list exactly (id/kind/start/fingerprint/elapsed_ms); the 404/405 and 401/403 branches match list_queries_handler's real gates; the unit tests assert URL derivation, headers, signal forwarding, status exposure and both malformed shapes non-vacuously.\n\nNo blocker or major; the rest is test-strength and message polish. Tests were assessed by reading only \u2014 no gui/app/node_modules here, so `node --test` could not run.",
+  "verdict": "approve"
+ }
+}
