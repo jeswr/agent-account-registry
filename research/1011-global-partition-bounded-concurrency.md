@@ -63,30 +63,33 @@ everything**. So:
 — is reading (B). The rest of this record answers both, because a maintainer who reads "N-slot
 concurrency buys nothing" (true of B) must not then reach for (A) as the fix.
 
-## 2. `__global__` never means "genuinely repo-wide" — it means "footprint unknown"
+## 2. `__global__` never means "genuinely repo-wide" — but it does not always mean "footprint unknown"
 
-This is the load-bearing premise for (b) and (c), and it is stated by the code itself rather than
-inferred. `plan_package` (`lease_schema.py:48-55`):
+This is the load-bearing premise for (b) and (c). Its first half is stated by the code itself
+rather than inferred; its second half has an exception that an earlier draft of this record
+flattened, and §2.1 states it. `plan_package` (`lease_schema.py:48-55`):
 
 > **ZERO AREAS STAYS `__global__`, and that asymmetry is the whole safety argument.** An unlabelled
 > row's true footprint is **UNKNOWN**, so it must keep reserving everything; narrowing it to
 > "nothing" would make an item whose blast radius nobody can name concurrent with all work at once.
 
-Both sides of the partition reach `__global__` only through unknown-ness:
+Neither side of the partition reaches `__global__` because the work is *genuinely* repo-wide:
 
 **ROW side** (a dispatch candidate). `plan_package` returns `__global__` for **zero** areas and for
 an unreadable key; two or more areas reduce to the composite `{A,B}` since #112. So a global ROW is
 exactly an issue nobody has labelled. `ready-issues.py:550-552` pins both halves — a lone global row
 is ready, and a global row serializes a labelled sibling out of the same tick.
 
-**OCCUPANCY side** (an open worker PR). The four declared causes (`dispatch-claim.py:520-528`):
+**OCCUPANCY side** (an open worker PR). The four declared causes (`dispatch-claim.py:520-528`).
+The fourth column is the one an earlier draft of this record did not ask, and §2.1 is what the
+answer costs:
 
-| cause | what it means | unknown crate, or genuinely repo-wide? |
-|---|---|---|
-| `missing-provenance` | no admissible record — areas **UNKNOWABLE** | unknown |
-| `source-unlisted` | valid record, source issue closed/unlisted | unknown |
-| `source-no-areas` | valid record, source issue carries no `area:` | unknown |
-| `declared-areas` | the reservation came from real `area:*` labels | **see below** |
+| cause | what it means | genuinely repo-wide? | footprint evidence at decision time? |
+|---|---|---|---|
+| `missing-provenance` | no admissible record **and** the PR declares nothing | no | **none, by construction** (`:1925-1942` peels every PR that *does* declare areas off into `missing-provenance-narrowed` before this branch is reached) |
+| `source-unlisted` | valid record, source issue closed/unlisted | no | **possibly PR-side.** `areas` is already seeded from the PR's own `area:*` (`:1900-1901`) and `:1922` unions `__global__` on top **regardless**. Source side unavailable (issue closed) |
+| `source-no-areas` | valid record, source issue open, carries no `area:` | no | **possibly PR-side**, same seed; source side absent by *observation*, not unknowable (`:1918`) |
+| `declared-areas` | the reservation came from real `area:*` labels | **see below** | n/a — structurally near-empty |
 
 #1011 already found that this is 3-to-1 against the throughput reading of #677's proposed
 "unknown crate vs genuinely repo-wide" distinction. **It is stronger than 3-to-1: the fourth bucket
@@ -98,11 +101,49 @@ label is literally `area:__global__`** — a spelling `plan_package` absorbs by 
 (`lease_schema.py:71-84`), that `SAFE_AREA`/`SAFE_PACKAGE`/the resolve gates reject, that no
 deriver mints, and that `dispatch-claim.py:1933-1941` records as absent from sparq's 99 labels.
 
-**So on today's boards, 100% of `__global__` holders are unknown-crate holders.** There is no
-"genuinely repo-wide" population to trade against — a repo-wide change arrives wearing several
-`area:` labels and reduces to a *composite*, which is narrow and already concurrent with disjoint
-work. The distinction #677 hoped to spend does not merely fall the wrong way; **one side of it is
-empty.**
+**So on today's boards there is no genuinely-repo-wide `__global__` holder to trade against** — a
+repo-wide change arrives wearing several `area:` labels and reduces to a *composite*, which is
+narrow and already concurrent with disjoint work. The distinction #677 hoped to spend does not
+merely fall the wrong way; **one side of it is empty.**
+
+### 2.1 The two globals: safety-driven and linkage-parity-driven
+
+What does **not** follow — and what an earlier draft of this record wrongly asserted as "100% of
+`__global__` holders are unknown-crate holders" — is that every global holder's footprint is
+*unmeasurable*. Reservation **shape** and footprint **evidence** are different things, and
+`busy_packages_of_pulls` decides them at different places:
+
+```
+areas = {PR's own area:* labels}          # :1900-1901  — evidence, may be non-empty
+...
+areas |= issue_areas or {GLOBAL_PACKAGE}  # :1918  source-no-areas  — union, never a replacement
+areas |= {GLOBAL_PACKAGE}                 # :1922  source-unlisted — unconditional
+```
+
+So an occupancy row may be `{__global__, crate_a, …}`: it holds the universal key **and** carries
+machine path-derived atoms that name part of its footprint. Two populations, not one:
+
+- **Safety-driven global** — nothing names the footprint, so the universal key is the only honest
+  answer. This is `missing-provenance`'s residual *by construction*: the `elif areas and
+  GLOBAL_PACKAGE not in areas` guard at `:1925` has already taken every PR with usable PR-side
+  areas, so a row reaching the `else` at `:1944` declares **no footprint-naming area at all**. (The
+  guard's second clause admits one other entrant — a PR wearing the literal `area:__global__` — but
+  that is the spelling §2 shows no producer mints, and it names nothing either way.)
+- **Linkage-parity global** — the footprint may be partly named, and the row is global anyway
+  because **the other leg has not moved**. `source-unlisted` says so in the code comment at
+  `:1922-1923` (*"the enumerator still emits this PR as `__global__` — mirror it"*) and this record
+  says so itself in §5 and §9: it can be narrowed once both legs move together. `source-no-areas`
+  is global because the *source* side is unlabelled, while the PR side may still declare.
+
+**How large each population is has not been measured** (§8.1), and it is target-dependent: a target
+with no PR-area deriver produces no PR-side evidence at all, so *every* holder there is
+safety-driven. This repository is such a board — 40 of 41 open PRs declare no `area:` label
+(`:1815-1819`, measured 2026-07-29; the one exception is hand-applied, not derived). sparq runs
+`scripts/pr-area-labels.py`, so its linkage-parity population may be non-zero — **that is a may,
+not a measurement** (§8.1). The rest of this record is written so that **it does not depend on
+which**: §4.1 shows `N` is the wrong lever for the safety-driven population because overlap is
+unmeasurable, and §5 shows `N` is the wrong lever for the linkage-parity population because
+*narrowing* dominates it.
 
 ## 3. (a) What N buys against the measured board
 
@@ -167,8 +208,9 @@ words: "`global-reservation` … **THE ROW'S CRATE IS NOT CONTENDED**" (`:2004-2
 stall therefore means admitting rows the occupant's reservation covers, and on any ordinary frontier
 almost all of them are narrow.
 
-Releasing those rows means letting narrow work run **concurrently with a holder of unknown
-footprint**. That is not "bounded N-slot concurrency". It is the direction `plan_package`,
+Releasing those rows means letting narrow work run **concurrently with a holder whose footprint is
+unknown, or at best partly named while it still reserves the universal key** (§2.1). That is not
+"bounded N-slot concurrency". It is the direction `plan_package`,
 `_pr_reserving_packages`, `_legacy_global_minting` (`:580-600`) and `non_reserving_partitions`
 (`:1736-1776`) each independently refuse, in the same words — *an item whose blast radius nobody
 can name becomes concurrent with all work at once* — and it is the direction #1011 itself names as
@@ -200,13 +242,28 @@ is.
 
 **The soundness argument, stated as plainly as it can be:**
 
-> `N` bounds the **cardinality** of the set of unknown-footprint holders in flight. The hazard is
-> the **overlap** between their footprints. A bound on cardinality is not a bound on overlap unless
-> the footprints are known to be disjoint — and `__global__` is, by construction (§2), exactly the
-> key that means *this footprint is not known*. **There is no value of `N > 1` for which the
-> overlap is bounded**, because the quantity being bounded is unmeasured at the moment the
-> scheduling decision is made. `N = 1` is not a tuning choice; it is the only value at which the
-> unknown quantity cannot be multiplied.
+> `N` bounds the **cardinality** of the set of global holders in flight. The hazard is the
+> **overlap** between their footprints. A bound on cardinality is not a bound on overlap unless the
+> footprints are known to be disjoint. For a **safety-driven** holder (§2.1) they are not known at
+> all, so **there is no value of `N > 1` for which the overlap is bounded** — the quantity being
+> bounded is unmeasured at the moment the scheduling decision is made. `N = 1` is not a tuning
+> choice; it is the only value at which the unknown quantity cannot be multiplied.
+
+**And `N` does not get better on the population that does have evidence — because `N` never reads
+it.** A slot counter admits a pair by *count*; it does not consult either holder's atoms. Two facts
+make that decisive:
+
+1. **The predicate erases the distinction the counter would need.** `packages_conflict` returns
+   True whenever either side is universal (`lease_schema.py:105-118`), so `{__global__, crate_a}`
+   and `{__global__}` are the *same row* to every enforcement site. A cardinality rule sitting on
+   top of that predicate cannot tell a linkage-parity holder from a safety-driven one, so it admits
+   both on the same counter — buying whatever the evidence-bearing pairs are worth **and** the
+   evidence-free pairs at the same time.
+2. **Where the evidence exists, narrowing strictly dominates `N`.** Narrowing turns the row into a
+   *composite*, which is concurrent with disjoint work already (#112) and still excluded from
+   overlapping work by the unchanged predicate. `N` buys the same concurrency by switching the
+   exclusion off instead of by resolving the unknown — same throughput, guarantee deleted. There is
+   no board on which `N` beats narrowing on the linkage-parity population; §5 ranks that work.
 
 This is why the answer cannot be recovered by picking a small N. Going from `N = 1` to `N = 2`
 takes the number of unbounded-overlap pairs from **0** to **1**. Every increment after that is
@@ -225,14 +282,21 @@ The best in-tree estimate of how often two in-flight branches share a file is th
 | `area:deps` (7 holders, 21 pairs) | **100%** — every pair collides on `Cargo.lock` |
 | crate areas | **57.1%** (sparq `research/crate-region-parallelism.md` §4) |
 
-**Honesty about this number.** 57.1% is measured over PRs that carry crate `area:` labels — a
-*different* population from unknown-footprint holders, which by definition carry none. It is
-therefore an **estimate, not a bound and not a measurement of the admitted class**. It is the best
-available because unknown-footprint holders are drawn from the same work distribution; it could be
-wrong in either direction. Used only as an order of magnitude, it says: at `N = 2` roughly **one in
-two** concurrent global pairs would touch a shared crate area, and on the #75 board (`N = 4`,
-6 pairs) the expectation is ~3.4 colliding pairs per tick. The `deps`/`Cargo.lock` row says the
-floor is worse than that: some shared files are touched by *everything*, at 100%.
+**Honesty about this number, and it lands differently on the two populations of §2.1.** 57.1% is
+measured over PRs that carry crate `area:` labels.
+
+- Against **linkage-parity** holders that carry PR-derived `area:*`, that is the *same* kind of
+  population, so the figure applies about as directly as any in-tree figure can. It is evidence
+  **for** the hazard on the population #677 would most want to release, not against it.
+- Against **safety-driven** holders it is a **different** population — they carry no labels by
+  construction — so there it is an **estimate, not a bound and not a measurement of the admitted
+  class**. It is the best available because those holders are drawn from the same work
+  distribution; it could be wrong in either direction.
+
+Used only as an order of magnitude, it says: at `N = 2` roughly **one in two** concurrent global
+pairs would touch a shared crate area, and on the #75 board (`N = 4`, 6 pairs) the expectation is
+~3.4 colliding pairs per tick. The `deps`/`Cargo.lock` row says the floor is worse than that: some
+shared files are touched by *everything*, at 100%.
 
 ### 4.3 The detectors that exist, and what each one misses
 
@@ -263,15 +327,32 @@ failure mode is the expensive kind.
 
 ## 5. (c) Does the answer differ per cause?
 
-**No — and §2 is why: there is nothing to differentiate.** Taking the causes one at a time, in the
-order #1011 asks:
+**No — but not because the causes are alike.** The *answer* is NO for all four; the *reason* is
+not the same one four times, and an earlier draft of this record collapsed them by asserting every
+holder's footprint was unmeasurable. Taking the causes one at a time, in the order #1011 asks, with
+the §2.1 split made explicit:
 
-| cause | population | would N differ here? |
-|---|---|---|
-| `declared-areas` | structurally near-empty (§2 — requires a literal `area:__global__`) | **no population to concede to.** A genuinely repo-wide change wears several `area:` labels and is a *composite*, already concurrent with disjoint work since #112. |
-| `missing-provenance` | already narrowed wherever the PR's own path-derived labels bound it (#4821, `:1926-1946`); the residual is the PR whose footprint is genuinely unknown | **no.** The residual is unknown-ness in its purest form. |
-| `source-unlisted` | **the single largest residual** — 7 of the 14 `__global__`-reserving ticks over 101 executed ticks (2026-07-27 12:54Z – 2026-07-28 14:52Z, `:1838-1848`) | **no** — and it is the one with a real repair that is *not* concurrency: narrow it. Blocked only on doing both legs together (`enumerate_review_items` still emits the same PR as `__global__`; splitting them is the LINKAGE PARITY failure). |
-| `source-no-areas` | source issue open, unlabelled | **no.** It already reserves `__global__` on the PLAN side under the unchanged candidate-side `packages_of` rule. What it needs is an `area:` label, not a second slot. |
+| cause | population | global is… | why N is still no |
+|---|---|---|---|
+| `declared-areas` | structurally near-empty (§2 — requires a literal `area:__global__`) | n/a | **no population to concede to.** A genuinely repo-wide change wears several `area:` labels and is a *composite*, already concurrent with disjoint work since #112. |
+| `missing-provenance` | already narrowed wherever the PR's own path-derived labels bound it (#4821, `:1926-1946`); the residual declares nothing at all | **safety-driven** | §4.1 in its unqualified form. The residual is unknown-ness in its purest form: overlap is unmeasurable at decision time, so cardinality cannot bound it at any `N > 1`. |
+| `source-unlisted` | **the single largest residual** — 7 of the 14 `__global__`-reserving ticks over 101 executed ticks (2026-07-27 12:54Z – 2026-07-28 14:52Z, `:1838-1848`) | **linkage-parity** (`:1922`) — PR-side `area:*` may already be in the row | §4.1's dominance leg: where evidence exists the repair is *narrowing*, which buys the same concurrency with the exclusion predicate intact. Blocked only on doing both legs together (`enumerate_review_items` still emits the same PR as `__global__`; splitting them is the LINKAGE PARITY failure). Where the evidence does *not* exist it falls back to the safety-driven case. |
+| `source-no-areas` | source issue open, unlabelled | **linkage-parity** on the source side (`:1918`); PR side may declare | narrowing the occupancy leg alone buys nothing — the in-progress source issue reserves `__global__` on the PLAN side anyway under the unchanged candidate-side `packages_of` (`ready-issues.py:154-161`). What it needs is an `area:` label on the issue, not a second slot. |
+
+**Why the answer nonetheless does not differ.** `N` sits on top of `packages_conflict`, which sees
+only "is either side universal" (§4.1, point 1). It therefore cannot admit the linkage-parity
+population without admitting the safety-driven one on the same counter, so it must be priced
+against the worse of the two.
+
+**How far that carries, stated honestly.** The only board whose PR-label population this record can
+cite is *this* repository, where the safety-driven share is everything (40 of 41 declaring no
+`area:`, `:1815-1819`, 2026-07-29). **Whether sparq's global holders are safety-driven, linkage-parity,
+or a mix has not been measured here** — the 7-of-14 `source-unlisted` figure counts ticks by cause,
+not by whether those PRs carried their own derived labels. So the pricing argument above is
+load-bearing on this board and *conditional* on sparq. It does not need to be unconditional: if a
+target's safety-driven count turned out to be zero, `N` would still lose there on §4.1's dominance
+leg alone, because narrowing buys the same concurrency with the predicate intact. §8.1 names the
+read that would settle it.
 
 What **does** differ per cause is the **narrowing** work — the direction that removes unknown-ness
 rather than un-serialising it — and the table above ranks it by measured residual:
@@ -284,9 +365,11 @@ last successful un-serialisation here — `NON_RESERVING_PARTITIONS = {"ci", "do
 bought throughput by **measuring that the population does not collide** (0 of 15 `ci` pairs, 0 of 10
 `docs` pairs on the busy board; 9.2% / 4.8% on the wider one) and exempting only where the evidence
 was there; `deps` at 100% and crate areas at 57.1% were refused on the same evidence, in the same
-change. That is the template any future concurrency change must follow — and it is the template
-`__global__` **cannot** be run through, because the evidence is a measurement of a footprint that,
-by definition, has no name. The impossibility of gathering the evidence *is* the argument.
+change. That is the template any future concurrency change must follow. `__global__` **cannot** be
+run through it as a single class: for the safety-driven half the evidence is a measurement of a
+footprint that has no name, and for the linkage-parity half the evidence that *does* exist points
+the other way — 57.1% on crate areas (§4.2), which is the same refusal `deps` and crate areas
+already took. Either half fails the template; neither is an argument for `N`.
 
 ## 6. What an overrule inherits: cardinality is not expressible in this model
 
@@ -326,12 +409,17 @@ Stated as the three answers #1011 asked for:
   any narrow atom (§3.1 — structural, with its one unmeasured leg named there and in §8.1). The
   measured `kept=0` stall is a rule-1 stall caused by a *global occupant*, which reading (B) does
   not touch (§3.2) and which the #677/#822 sweep already drains in one tick (§3.3).
-- **(b) The class it admits is concurrent same-crate edits by a holder of unnamed footprint, and it
-  has no detector** (§4.3). The bound does not bind: `N` caps cardinality, the hazard is overlap,
-  and overlap is unmeasured at decision time by construction (§4.1).
-- **(c) The answer does not differ per cause** (§5), because after #4821 and #112 the *only*
-  reachable `__global__` holders are unknown-crate holders — the "genuinely repo-wide" bucket is
-  structurally near-empty. What differs per cause is the narrowing work, ranked in §5.
+- **(b) The class it admits is concurrent same-crate edits by a global holder, and it has no
+  detector** (§4.3). The bound does not bind: `N` caps cardinality, the hazard is overlap. For a
+  **safety-driven** holder overlap is unmeasured at decision time by construction; for a
+  **linkage-parity** holder it may be partly named, but `N` never reads it — `packages_conflict`
+  shows the enforcement sites only "is either side universal", so one counter admits both
+  populations, and where the evidence *does* exist narrowing dominates `N` outright (§2.1, §4.1).
+- **(c) The answer does not differ per cause, though the reason does** (§5). After #4821 and #112
+  the "genuinely repo-wide" bucket is structurally near-empty, so there is no repo-wide population
+  to concede to; but `missing-provenance` is refused as unmeasurable while `source-unlisted` /
+  `source-no-areas` are refused because narrowing is the better lever and `N` cannot be aimed at
+  them alone. What differs per cause is that narrowing work, ranked in §5.
 
 Until a maintainer overrules, **#1011 keeps its `needs:design` gate** — a hard `needs:*` gate in
 `ready-issues.GATE_LABELS` (`:40`), so the issue cannot be dispatched to an implementer while it is
@@ -349,6 +437,15 @@ atom. Both are already computed and printed every tick —
 (`:2130`) splits by reason, and `dispatch.yml:1355` emits `assemble-census`. **No new code is
 needed to answer this; only a read of runs already in the log.** If the first count is 0, or the
 second is > 0, reading (B) is inert and the change is a no-op with a soundness cost — stop there.
+
+**And split the holder population while reading the same log, because §2.1 leaves it unmeasured.**
+Each `busy` occupancy row already carries both its `cause` and its reserved set
+(`busy_packages_of_pulls:1991-1992`), so one pass answers: of the rows holding `__global__`, how
+many reserve **only** `__global__` (safety-driven) versus `__global__` *plus* at least one narrow
+atom (linkage-parity, footprint partly named). That ratio is what decides whether the narrowing
+work of §5 is worth more than the residual — and if the safety-driven count is 0 on a target, §4.1's
+unqualified leg does not apply *there* and the case against `N` rests only on its dominance leg,
+which an overrule must then argue against directly.
 
 **8.2 Build the detector before the concurrency, not after.** The minimum honest bar: for any two
 PRs the scheduler *allowed to run concurrently*, assert post-hoc that their changed-file sets are
