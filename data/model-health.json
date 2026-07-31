@@ -2011,6 +2011,14 @@
    "model_alias": "sol",
    "exit_class": "success",
    "run_id": "30624051454.1"
+  },
+  {
+   "ts": 1785494232,
+   "provider": "openai",
+   "account": "dc2d751954080e13",
+   "model_alias": "sol",
+   "exit_class": "success",
+   "run_id": "30624040408.1"
   }
  ]
 }
