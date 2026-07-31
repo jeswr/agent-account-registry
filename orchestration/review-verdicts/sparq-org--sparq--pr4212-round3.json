@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4212,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4dd731dee2c9f649229c0af2b594aadf0587ccfc",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding. The dictionary documentation now explicitly scopes the full 64-bit hash-before-equality guarantee to mapped_find, states that the in-memory hashbrown table has only an h2 tag prefilter, and describes shard routing as selection rather than hash equality. The two focused tests substantiate those distinct claims: the mmap test counts equality calls for present and absent full hashes, while the in-memory test constructs an h2 collision with differing full hashes and verifies both equality invocation and correct non-deduplication. The UTF-8 change is also sound as scoped: both parser entry points validate the complete chunk before scanning, all unchecked conversions consume subslices of that validated buffer, and the span endpoints are structurally character boundaries. Invalid-input and multibyte-boundary tests exercise the real parser paths. No hostile reviewer-directed instruction was detected.",
+  "verdict": "approve"
+ }
+}
