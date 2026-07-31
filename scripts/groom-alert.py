@@ -607,6 +607,18 @@ def _test_workflow_seam(chk):
             (1, ["python3 registry/scripts/groom-alert.py --self-test",
                  "python3 registry/scripts/groom-alert.py"]))
         call = alert_steps[0] if alert_steps else []
+        # ORDER ALONE IS NOT ENOUGH. `--self-test` before the live call only PROVES anything if the
+        # shell stops on its nonzero exit: under `set -uo pipefail` (no -e) the live invocation runs
+        # anyway and, exiting 0, becomes the step's status — so an unreadable groom.yml or a broken
+        # assertion above is masked while unproved code mutates issues. Whole-line exact match, so
+        # dropping the `e`, reordering the `set` after a call, or deleting the line all go red.
+        chk("seam: ...under a FAIL-STOP shell, `set` FIRST — without -e a red --self-test falls "
+            "through to the live alert, which then mutates issues on code that never proved itself",
+            [line.strip() for line in code(call)
+             if line.strip().startswith(("set ", "python3 "))],
+            ["set -euo pipefail",
+             "python3 registry/scripts/groom-alert.py --self-test",
+             "python3 registry/scripts/groom-alert.py"])
         chk("seam: BOTH signals reach the script — the job result AND the health step's outcome. "
             "A missing GROOM_HEALTH_OUTCOME line reads as an empty outcome, which decide_health "
             "treats as a permanent no-op: the exact silent failure of issue #331",

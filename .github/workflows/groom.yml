@@ -776,7 +776,12 @@ jobs:
           # only the groom job RESULT + run link), so that fallback is safe.
           ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+        # FAIL-STOP is load-bearing: a detector never mutates issues before it has proved itself on
+        # this tick's code, so `-e` must abort the step the moment `--self-test` exits nonzero.
+        # Under plain `set -uo pipefail` a red self-test (an unreadable groom.yml, a broken seam
+        # assertion) would fall through and the live run's exit code would mask it. groom-alert.py's
+        # --self-test pins this exact `set` line and its position ahead of both invocations.
         run: |
-          set -uo pipefail
+          set -euo pipefail
           python3 registry/scripts/groom-alert.py --self-test
           python3 registry/scripts/groom-alert.py
