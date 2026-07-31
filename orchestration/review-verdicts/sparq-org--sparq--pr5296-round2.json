@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5296,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "197487c084c22828882ef6d9569af81682a943f0",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. Sections 3.2, 8, and 9 now distinguish low implementation/re-review delta from audit-snapshot neutrality, explicitly recognize that the face-repo tag bump changes the pinned trust-base source, and require landing before or after the audit snapshot unless the external auditor confirms the additive API is within the accepted delta. This is consistent with the pinned-tag and external-sign-off limitations recorded in the audit dossier. The record remains appropriately conditional about unread face-repo details, does not claim external audit or circuit soundness, and specifies non-vacuous acceptance tests for signed zero, NaN behavior, mutation sensitivity, canonicality, and forge rejection. No hostile embedded instruction was detected.",
+  "verdict": "approve"
+ }
+}
