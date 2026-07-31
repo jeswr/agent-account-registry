@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5417,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "66b1cc691f264547056972c2d8207285ebc2390e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "reason_n3_query passes projected answers directly to a default ListExpander. ListExpander generates list cells named `_l1`, `_l2`, etc. without first collecting blank labels already present in those answers. A query can bind a conclusion variable to a data blank with one of those labels while also returning a list value; expansion then reuses the same blank for a list cell, merging two distinct RDF nodes and emitting a semantically wrong graph. The existing test only uses IRI/literal data and a constant list, so it cannot detect the collision.",
+    "file": "crates/sparq-reason/src/n3/mod.rs",
+    "fix_hint": "Before expanding query answers, reserve every blank label reachable in the rows (including nested list and quoted-triple members), and allocate list-cell labels from a fresh prefix/counter that cannot collide. Add an end-to-end reason_n3_query regression where the projected answer contains an existing `_l1`-style blank and a list, then assert the existing blank and generated list head remain distinct. Prefer making ListExpander collision-safe centrally so all callers inherit the fix.",
+    "severity": "major",
+    "title": "List expansion can merge generated cells with projected blank nodes"
+   }
+  ],
+  "progress": null,
+  "summary": "The query path correctly reuses the native matcher and the focused builtin/list/formula tests exercise real evaluation. However, the new dictionary-returning API can silently corrupt list-valued answers because ListExpander allocates fixed `_lN` blank labels without reserving blank labels already present in projected answer terms. This is a wrong-answer bug on a newly public path and needs a collision regression test and namespace-safe allocation before approval.",
+  "verdict": "request_changes"
+ }
+}
