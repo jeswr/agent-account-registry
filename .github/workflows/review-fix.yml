@@ -983,12 +983,32 @@ jobs:
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
         run: |
           set -euo pipefail
-          prefix="review:"
-          [[ "$MODE" == fix ]] && prefix="fix:"
+          # Adoption is a CAS OWNERSHIP TRANSFER, not a read-only look (issue #363 — the review-lane
+          # sibling of the impl lane's #132, ported from worker.yml's adopt step): --adopt swaps the
+          # lease holder from the dispatcher to THIS run and re-bases its expiry to now + the lane's
+          # full budget, so (a) two runs can never both own one claim — a re-run attempt is handed
+          # the SAME claim_id input, and the old read-only --inspect let it validate and then
+          # release a lease its live sibling was working under, (b) a queued lane whose dispatcher
+          # lease already expired is refused (exit 3, `set -e` fails the step) instead of
+          # resurrecting a possibly-reallocated slot, and (c) the lease cannot expire mid-run.
+          # The run-named holder this writes is ALSO what lets groom-leases renew the lease on run
+          # liveness (select-and-claim.HOLDER_RUN / LEASE_HOLDING_WORKFLOWS, issue #1128) rather
+          # than only on its TTL — a dispatcher-shaped `@dispatch-<id>.<n>` holder names no run.
+          # The refreshed ttl is this job's self-claim ttl for the same lane; both literals are
+          # pinned to dispatch-claim.py REVIEW_TTL / FIX_TTL by `_review_fix_workflow_values`, so
+          # editing one side alone turns that self-test RED — change both, or don't change either.
+          if [[ "$MODE" == fix ]]; then
+            prefix="fix:"; adopt_ttl=6300
+          else
+            prefix="review:"; adopt_ttl=4200
+          fi
+          holder="$prefix$TARGET_REPO#$PR_NUMBER@$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
           python3 registry/scripts/select-and-claim.py \
-            --inspect "$CLAIM_ID" \
+            --adopt "$CLAIM_ID" \
             --repo "$GITHUB_REPOSITORY" \
-            --expected-holder-prefix "$prefix$TARGET_REPO#$PR_NUMBER@" > "$RUNNER_TEMP/adopt.json"
+            --expected-holder-prefix "$prefix$TARGET_REPO#$PR_NUMBER@" \
+            --holder "$holder" \
+            --ttl "$adopt_ttl" > "$RUNNER_TEMP/adopt.json"
           if ! python3 - "$RUNNER_TEMP/adopt.json" <<'PY'
           import hashlib
           import json
@@ -1051,6 +1071,11 @@ jobs:
           print(f"dispatcher lease adopted: model={model}, claim={claim_id[:8]}")
           PY
           then
+            # Safe to release now: --adopt already CAS-transferred this lease to OUR run holder, so
+            # this release frees only our own lease — never a concurrent attempt's live one (issue
+            # #363: the old --inspect path released a claim it did not own). A not-adoptable /
+            # already-adopted claim never reaches here — --adopt exits 3 and `set -e` fails the
+            # step first.
             python3 registry/scripts/select-and-claim.py \
               --release "$CLAIM_ID" \
               --repo "$GITHUB_REPOSITORY" || true
