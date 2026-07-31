@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5064,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "54c01d0a644c6363961bdde38ff68592a1ba0c11",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new workflow correctly closes the stated aarch64 execution gap. It uses a real GitHub-hosted arm64 runner, fails closed on both the architecture and ASIMD capability, enables the feature that compiles the SIMD module, mechanically confirms the relevant unit tests are present, and then runs the complete sparq-vectors suite under those features. On aarch64 Linux, the ASIMD HWCAP checked through /proc/cpuinfo is the capability used by Rust's runtime NEON detection, so the dispatcher exercised by the tests will select the NEON kernel rather than the scalar fallback. The path filters, permissions, concurrency, pinned actions, timeout, and feature choices are coherent with the scoped purpose. The unsafe-register updates accurately describe the added execution evidence without overstating it as a memory-safety proof.",
+  "verdict": "approve"
+ }
+}
