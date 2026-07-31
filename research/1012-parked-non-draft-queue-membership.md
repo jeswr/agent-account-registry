@@ -8,9 +8,10 @@
 > **Recommendation: do NOT add a queue-membership read to `_pull_inactivity_decision`. Spend the
 > same GraphQL probe on the other side of the problem — as the safety guard on converting a
 > machine-parked `__global__` holder to DRAFT, which moves the PR into the state the existing test
-> already proves. The probe does NOT license the machine to issue that conversion itself — §4.1 —
-> so the conversion is human-executed.** §6 is the maintainer's confirm-or-overrule; §7 is what an
-> overrule obliges before any code is written.
+> already proves. The probe does NOT license the machine to issue that conversion itself — nor
+> pre-authorise a human's — §4.1: it is a DIAGNOSIS, and the converting human re-establishes queue,
+> arm and `review:pass` state immediately before pressing.** §6 is the maintainer's
+> confirm-or-overrule; §7 is what an overrule obliges before any code is written.
 
 ## 1. The question
 
@@ -144,7 +145,8 @@ Failure directions the probe closes **at the instant it is read**:
 
 That table is **not** a claim that the remedy is race-free, and an earlier revision of this section
 wrongly captioned it as one ("all closed"). The probe and the conversion are two separate requests;
-§4.1 is the correction, and it is what decides *who executes* the last row.
+§4.1 is the correction: it decides *who executes* the last row, and what that executor —
+machine or human — must re-establish immediately before executing it.
 
 Three further properties this shape has and the §2 proposal does not:
 
@@ -206,12 +208,41 @@ was that a point-in-time read must not license an outcome that has to hold *late
 milliseconds rather than minutes, but the loss it risks — a reviewed, queued merge destroyed — is
 **not machine-recoverable**, while the thing bought is a throughput optimisation the estate
 demonstrably survives without (§5). An optional gain must not carry an irreversible-by-machine
-downside. **So the machine probes and does not mutate**: on a measured starved lane it surfaces a
-pre-validated, human-executable request naming the exact command, and the human's press is atomic
-with that human's own observation. That is §6 **(A1)**.
+downside. **So the machine probes and does not mutate**: on a measured starved lane it surfaces the
+holder to a human. That is §6 **(A1)**.
 
-If the maintainer prefers the loop to execute the conversion (§6 **(A2)**), these bind before any
-code is written:
+**But human execution alone does not make the sweep's read current.** The sweep's probe is taken at
+sweep time; the human presses later — possibly much later. Every transition of the paragraph above
+(enqueue, arm, `review:pass`) can happen in *that* gap too, and `gh pr ready N --undo` does the same
+damage whoever types it. Human authorisation makes the conversion *permissible*; it does not make a
+stale read a safety guard. A surface that presented the sweep's answer as validation would launder
+an expired probe into a clearance — (A2)'s window with none of (A2)'s re-probe. So **(A1) binds
+too**, and these are as non-negotiable as (A2)'s:
+
+1. **The surfaced item is a DIAGNOSIS, never a clearance.** It reports the probe's answer stamped
+   with the time it was taken and explicitly marked **possibly stale**. It must not state or imply
+   — in wording, in naming, or by presenting the command as the item's "action" — that conversion
+   has been pre-validated. The word the earlier revision of this section used, *pre-validated*, is
+   the defect: there is no such state.
+2. **The human re-establishes queue, arm and `review:pass` state immediately before converting**,
+   from current GitHub state rather than from the surfaced item. The item carries the strict-read
+   command (`backfill-provenance.review_state` over the holder, the same parser, no laxer one) and
+   the conversion command as one contiguous sequence, so the human's own read-to-mutation window is
+   the smallest the API allows — the #139 boundary of (A2).1, moved to the human.
+3. **The residual window is NAMED on the surface itself**, in the shape #294 is named: even a
+   contiguous human read-then-convert is two requests, and inside scope the human is the *only*
+   actor that can transition the holder (the paragraph above) — so what the surface asks is that
+   the human not race themselves. Worst case written out: an evicted queue entry or an un-armed
+   reviewed merge, whose repair is a human re-arm.
+4. **Mandatory adversarial cases, non-vacuous, both directions**, on whatever renders the surface:
+   a holder whose probe answered not-queued/not-armed renders as a diagnosis carrying both the
+   staleness stamp and the re-probe obligation — **never** as a cleared or one-click action; a probe
+   that answered queued, armed, `review:pass`, or unreadable renders **no** conversion request at
+   all. Each must go **RED** if the staleness stamp, the re-probe instruction, or the refusal branch
+   is removed.
+
+If the maintainer prefers the loop to execute the conversion (§6 **(A2)**), the four above are
+replaced by these, which bind before any code is written:
 
 1. **A fresh re-probe immediately before the mutation, with nothing between.** The #139 pattern
    (`scripts/worker-pr.py:5468-5490`) — the tightest boundary GitHub's API allows. A probe taken
@@ -238,9 +269,10 @@ code is written:
   recovery is the backfill workflow.
 - The measured holder is still **counted and named** every tick after #677, and still does not
   self-heal until the remedy in §4 (or an overrule per §7) is built.
-- Under **(A1)** it does not self-heal even then: its exit is still a human press. What the remedy
-  buys is that the press becomes one pre-validated click on a measured starved lane instead of a
-  diagnosis. Self-healing is what **(A2)** buys, and §4.1 is its price.
+- Under **(A1)** it does not self-heal even then: its exit is still a human press, and that human
+  still re-reads state themselves before pressing (§4.1 (A1).2). What the remedy buys is that the
+  holder is *named on a measured starved lane* with the strict-read-then-convert sequence to hand —
+  not that the press is pre-cleared. Self-healing is what **(A2)** buys, and §4.1 is its price.
 
 ## 6. Maintainer decision
 
@@ -249,11 +281,13 @@ Confirm **one**:
 - [ ] **(A1) Confirm the recommendation.** `_pull_inactivity_decision` keeps `non-draft` as an
       unconditional BUSY. A follow-up implements the §4 remedy with the conversion
       **human-executed**: the starvation sweep probes with `backfill-provenance.review_state`,
-      MACHINE parks only, and *surfaces* the conversion rather than issuing it (§4.1).
+      MACHINE parks only, and *surfaces a stale-stamped diagnosis* rather than issuing or
+      pre-validating the conversion — bound by §4.1's four **(A1)** obligations, of which the
+      human's own immediate re-probe is the load-bearing one.
       #1012 closes on this record; the follow-up is a separate issue.
 - [ ] **(A2) As (A1), but the loop executes the conversion** — accepting the named probe-to-
-      mutation window of §4.1 and bound by its four obligations, which are as non-negotiable as
-      §7's.
+      mutation window of §4.1 and bound by its four **(A2)** obligations in place of (A1)'s, which
+      are as non-negotiable as §7's.
 - [ ] **(B) Overrule — build the positive queue proof anyway.** Then §7 binds it.
 - [ ] **(C) Neither — leave the hold in place, unremedied.** #1012 closes as `wontfix` and the
       counted/named holder is accepted as the standing cost.
