@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 5419,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5b281ca972165824cd585f178554f2f5041e0581",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The module repeatedly says m/u are MAC-checked before they are opened and uses that ordering to claim the coZK confidentiality interaction is closed. However MacSession::mac_check_and_open reconstructs every value first, then constructs and opens sigma, and only then returns an error on a failed check. With a real distributed transport, reconstruction is the opening/broadcast; withholding the Rust return value does not make the check precede the open. The code may still provide standard detect-and-abort integrity for authenticated masked values, but the stronger ordering/confidentiality claim does not trace to the implementation.",
+    "file": "crates/sparq-mpc/src/auth_equal.rs",
+    "fix_hint": "Rewrite the module/API/design/skill claims to state the actual open-then-verify-with-no-result-release behavior and justify precisely why opening an inconsistent masked value is safe, or implement a protocol that genuinely validates before exposing the opened values. Remove the claim that this alone closes the coZK confidentiality interaction unless the audit argument supports that exact transcript ordering.",
+    "severity": "major",
+    "title": "Claims that the MAC check happens before opening contradict the implementation"
+   },
+   {
+    "body": "The PR claims forged product shares and wrong degree_reduce re-sharings abort, but the equality tests inject only pre-multiplication input value/MAC inconsistencies and mask substitutions. forged_input_key_share_aborts_at_minimal_n is not the Hole-1 forged product-share attack described in the docs, and no test injects a deviation inside either of equality_gadget's value/MAC degree reductions. Thus the load-bearing claims are not pinned on the real operator path and the suite could remain green if this composition ceased to catch either advertised deviation.",
+    "file": "crates/sparq-mpc/src/auth_equal.rs",
+    "fix_hint": "Add narrowly scoped test hooks that drive (1) a forged share at the relevant equality open boundary and (2) a wrong internal degree_reduce resharing in each authenticated multiplication through equality_gadget/auth_equal_verdicts, with honest controls and mutation checks showing the corresponding unsafe construction returns a wrong verdict. Align the prose and test names with the deviation actually exercised.",
+    "severity": "major",
+    "title": "The advertised headline deviations are not tested through the equality path"
+   },
+   {
+    "body": "the_masked_difference_is_re_randomised_and_never_reveals_the_difference asserts m != d on every run and at least RUNS-1 distinct outputs. For an honest uniform nonzero mask, m equals d exactly when r=1, and collisions are also valid. Fixed seeds make the current run repeatable but do not make these protocol-valid events impossible; a harmless RNG change can fail the test.",
+    "file": "crates/sparq-mpc/src/auth_equal.rs",
+    "fix_hint": "Test deterministic algebraic invariants and distribution using an appropriate statistical test with an explicit negligible-failure design, or expose/inject chosen masks in test code so rerandomization and non-disclosure properties can be checked without asserting that valid random outcomes never occur.",
+    "severity": "minor",
+    "title": "Confidentiality regression test treats nonzero-probability outcomes as impossible"
+   }
+  ],
+  "progress": null,
+  "summary": "The authenticated equality composition is plausible, but the PR overstates the ordering and confidentiality property of the actual open path, and its tests do not exercise the headline forged-product/wrong-resharing deviations through this operator. The confidentiality test also encodes probabilistic events as impossible, making it an unsound regression test. These are material for a security-tier promotion and should be corrected before approval.",
+  "verdict": "request_changes"
+ }
+}
