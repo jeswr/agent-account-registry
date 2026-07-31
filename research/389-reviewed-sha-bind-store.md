@@ -7,8 +7,11 @@
 > the migration must satisfy (most of which are *read-path* constraints, not write-path ones),
 > refutes the two options #389 proposes in the form it proposes them, and recommends a third.
 >
-> **Recommendation: option (b′) — a write-once, filename-encoded per-PR record on the `ledger`
-> data-plane branch, resolved by ONE directory listing per target repo per tick.** §6 is the
+> **Recommendation: option (b′) — write-once, generation-fenced, filename-encoded per-PR records
+> on the `ledger` data-plane branch, resolved by ONE directory listing per target repo per tick.**
+> §5 states the linearization rule and its recovery invariant, because per-path CAS alone does
+> *not* serialize a PR-level binding and an earlier draft of this record wrongly claimed it did.
+> §6 is the
 > maintainer's confirm-or-overrule. §7 states what must be true before any code is written, and §8
 > is the honest list of what this record does *not* settle.
 
@@ -146,21 +149,60 @@ Two repairs are possible, and choosing between them is this record's actual deci
   Cost: the record is one mutable file per PR, so R5 needs one content read per open PR — the same
   per-PR budget problem as option (a), and a new mutating primitive next to a deliberately
   write-once one, which is a footgun for the next author.
-- **(b′)** keep the store write-once and make *absence/presence* carry the value. Recommended below.
+- **(b′)** keep the store write-once and let the *set of filenames*, ordered by an explicit
+  generation fence, carry the value. Recommended below.
 
-## 5. Recommendation — (b′): write-once, filename-encoded, one listing per repo
+## 5. Recommendation — (b′): write-once, generation-fenced, one listing per repo
 
-**Layout.** `orchestration/reviewed-sha/{owner}/{repo}/{pr}-{sha}.json` on `ledger`, where `{sha}`
-is the 40-hex reviewed head. The JSON body carries the audit detail (round, run id, verdict record
-back-link); **the binding itself is entirely in the filename.**
+**Layout.** `orchestration/reviewed-sha/{owner}/{repo}/{pr}-{gen}-{value}.json` on `ledger`, where
+`{value}` is either the 40-hex reviewed head or the literal `none`, and `{gen}` is a zero-padded
+monotonic generation counter. The JSON body carries the audit detail (round, run id, verdict record
+back-link); **the binding itself is entirely in the filename.** Records for a PR are selected by
+the exact `{pr}-` prefix — `1-` never matches `12-`, since `{pr}` is unpadded and `-` is the
+separator.
 
-**Write.** Binding head H for PR N = `_registry_put_file` at `{N}-{H}.json`, unchanged and
-unmodified — each record is genuinely write-once, so create-or-keep is exactly the right contract
-and re-running a bind is idempotent for free. Then DELETE any other `{N}-*.json`, each with its own
-read-sha precondition. Retraction to `none` = delete the record; there is no tombstone and no
-mutable pointer anywhere. **The TOCTOU is closed** because no step is a read-modify-write of a
-shared document: the create is a precondition-free create of a path only this binding owns, and
-every delete carries a sha precondition.
+Two properties do the work, and the second is the one an earlier draft of this record was missing:
+
+- every record is genuinely write-once, so `_registry_put_file`'s create-or-keep contract is
+  exactly right and a replayed bind is idempotent for free;
+- **retraction is a `none` record, never a deletion**, and **no delete may ever remove the winning
+  record at the maximum generation**. Absence therefore means *never bound*, and cannot be produced
+  by an interrupted or racing transition.
+
+**Per-path CAS is not a CAS on the PR binding — the generation fence is.** A plain
+`{pr}-{sha}.json` create-then-delete-the-others protocol removes contention from the very object
+that has to be serialized: two writers rebinding PR N to H1 and H2 write *different* paths, so both
+creates succeed, and each per-file sha precondition guards only its own delete — never the PR-level
+transition. The reachable interleavings include both writers deleting each other's record (zero
+records left, read as an intentional retraction: a lost update driving the disarm latch) and the
+older intent deleting the newer binding. A per-object CAS composes into a transaction only when the
+writers contend on ONE object; these do not. What linearizes the binding is the generation ordering
+plus the never-delete-the-winner invariant below, not the contents-API precondition on its own.
+
+**Write** — bind PR N to value V (a 40-hex head, or `none` to retract):
+
+1. Re-list the directory — never write from the tick's cached map — and let
+   `g = max(gen over records of N) + 1`, or `0` if there are none.
+2. `_registry_put_file` at `{N}-{g}-{V}.json`, unchanged and unmodified. The path is unique to the
+   triple, so a rerun of the same intent is a byte-identical keep.
+3. Re-list. Exactly one record at gen `g` ⇒ landed. Two or more ⇒ a concurrent bind at the same
+   generation: **the lexicographically smallest filename at the maximum generation wins**, a rule
+   every observer computes identically from the listing alone. A loser deletes ONLY ITS OWN record,
+   and only while it can see the winner in that same listing.
+4. If we lost and our intent is still live, re-derive it from live state and retry from (1) at a
+   fresh generation — the "re-read and re-derive the expected SHA every time" discipline
+   `select-and-claim.py` already uses, under `scripts/ledger_retry.py`'s classifier and wait
+   schedule. Never a hand-rolled sleep loop; never `run_gh` around any of these writes.
+5. GC, which is never load-bearing: a writer that can see a record for N at a higher generation in
+   the same listing may delete records for N at strictly lower generations, each with its own
+   read-sha precondition. A GC delete that fails leaks an inert record — it can never change a
+   resolution, because resolution reads only the maximum generation.
+
+**A delete is legal in exactly two cases**: (i) a record at a strictly lower generation than one
+observed in the *same* listing; (ii) the deleter's own record at the maximum generation while a
+lexicographically smaller sibling is present in that same listing. Every other delete is refused.
+That guard belongs in the delete primitive, not in its callers (§7) — it is the invariant, so it
+must not be re-implemented per site.
 
 **Read.** ONE `GET /contents/orchestration/reviewed-sha/{owner}/{repo}?ref=ledger` per target repo
 per tick returns every filename. R5, R6 and R10 all resolve from that one map, and the per-PR sites
@@ -170,37 +212,69 @@ per-open-PR that options (a) and (b-mut) both require. It is not a saving; the P
 arrives with the listing whether or not it carries a marker. The claim is only that this is the
 one layout that does not make an already-overdrawn budget worse.
 
-**Resolution rule, and it must be tri-state.**
+**Resolution rule, and it must be four-valued.**
 
-| filenames matching `{N}-*` | resolves to | why |
+| records with the exact `{N}-` prefix | resolves to | why |
 |---|---|---|
-| exactly one, `{N}-H` | bound to `H` | the only binding |
-| none | `none` (unbound) | matches today's absent-marker semantics exactly |
-| two or more | **UNKNOWN — never acts** | mid-rebind; the value is genuinely not yet decided |
+| none | `unbound` | never bound; NOT reachable as a race artifact, by the invariant above |
+| one at max gen, 40-hex value | bound to that sha | the current binding |
+| one at max gen, value `none` | retracted | the explicit tombstone |
+| two or more tied at max gen | **UNKNOWN — never acts** | a same-generation bind race, not yet collapsed |
+
+Readers may collapse `unbound` and retracted into today's single "no reviewed sha" decision — it is
+the same outcome at all of R1-R10. The distinction exists for the *resolver*, not the readers: a
+tombstone is what stops an interrupted or racing transition from being indistinguishable from an
+intentional retraction. Absence must never be classified as `none` in a store where absence is also
+reachable by losing a write; here it is not reachable that way, and that is the whole reason
+retraction cannot be a delete.
 
 UNKNOWN is not a new concept here: `armed_sha_mismatch:1441-1442` already returns `None` for a
 stale/unknown snapshot with the comment "unknown never acts", and `plan-snapshot.py:954-957`
-already carries the same ABSENCE≠NULL discipline for the arm bit. The multi-record window exists
-only between the create and its delete, is bounded by one tick, and resolves without intervention.
+already carries the same ABSENCE≠NULL discipline for the arm bit.
+
+**Interleaving analysis.** Every reachable state must select the intended latest binding under the
+defined order, or be UNKNOWN and recoverable. The cases:
+
+| interleaving | reachable state | resolves |
+|---|---|---|
+| bind/bind, W2 lists after W1's create | records at `g` and `g+1` | max gen = W2, the later intent. W1's record is inert and GC-able |
+| bind/bind, both list before either creates | two records tied at `g` | UNKNOWN for the tick; each writer sees the tie on re-list, the lexicographic loser deletes its OWN record, resolution collapses to the winner |
+| bind/retract | identical to bind/bind — a retraction is a `none` record, so neither writer ever deletes the peer's record | max gen, or a tie resolved as above |
+| GC delete fails, or writer dies after step 5 | leaked lower-gen records | no effect: resolution reads only the max generation |
+| writer dies between step 2 and its losing delete | a tie at max gen that no live writer will collapse | **UNKNOWN indefinitely** — see below |
+
+The same-generation tie-break may award the binding to the *earlier* intent. That is acceptable
+precisely because the loser does not simply resend: it re-derives from live state and rebinds at
+`g+1`, so the terminal state is still the intent that was live last.
+
+**The one unrecoverable-without-help state, stated plainly.** An earlier draft claimed the
+multi-record window "is bounded by one tick and resolves without intervention". That is false: it
+holds only while a writer survives to run step 3. A writer that dies between its create and its
+losing delete leaves a tie at the maximum generation that nothing collapses. So **UNKNOWN must be a
+swept state**: a groom lane resolves ties whose record set is unchanged across N ticks by applying
+the same deterministic tie-break, and alerts. That sweep is a correctness requirement of this
+migration, not an optimisation — without it a single dead writer parks one PR's binding in
+fail-open-for-disarm forever.
 
 **Be honest about the direction UNKNOWN fails.** For every *admission* reader (R6, R8) it is
-fail-closed — no dispatch. For the *disarm* latch (R5, R10) declining to act is **fail-open** for
-one tick, and `plan-snapshot.py:18-21` says so in as many words: an armed PR whose head advanced
-past its marker keeps a stale arm latched. That is a real cost, it is the same trade the existing
-stale-snapshot carve-out already makes, and it is bounded by a tick — but it is the one place this
-migration is not strictly better than the status quo, and the maintainer should price it
-explicitly rather than discover it. Ordering the delete *before* the create would trade this for a
-window that resolves to `none` and thus *spuriously disarms* a validly-armed PR, which is worse:
-disarm redrafts and relabels, so a false positive there is destructive and a false negative is
-merely late.
+fail-closed — no dispatch. For the *disarm* latch (R5, R10) declining to act is **fail-open**, and
+`plan-snapshot.py:18-21` says so in as many words: an armed PR whose head advanced past its marker
+keeps a stale arm latched. Bounded by a tick when the racing writers are alive; bounded only by the
+sweep interval when one is not. That is a real cost, it is the same trade the existing
+stale-snapshot carve-out already makes — but it is the one place this migration is not strictly
+better than the status quo, and the maintainer should price it explicitly rather than discover it.
+The alternative of resolving a tie optimistically (pick the newest-looking record and act) is
+worse: disarm redrafts and relabels, so a false positive there is destructive while a false
+negative is merely late.
 
 **Directory-listing ceiling.** The contents API returns at most 1,000 entries for a directory. With
-one live record per open PR and deletes on rebind, steady state is O(open PRs) — two orders of
-magnitude clear. But a delete that never lands leaks a record permanently, so the ceiling is a real
-liability and the migration owes it a bound: fail closed (treat the whole listing as UNKNOWN and
-alert) at a low-water mark well under 1,000, rather than silently truncating. The Git Trees API is
-the documented escape hatch if the layout ever needs it; this record does not propose reaching for
-it now.
+one live record per open PR and best-effort GC of superseded generations, steady state is
+O(open PRs) — two orders of magnitude clear. But GC is deliberately not load-bearing, so leaked
+lower-generation records accumulate at whatever rate deletes fail; the ceiling is a real liability
+and the migration owes it a bound: fail closed (treat the whole listing as UNKNOWN and alert) at a
+low-water mark well under 1,000, rather than silently truncating. The same groom lane that sweeps
+ties is the natural place to re-attempt leaked GC deletes. The Git Trees API is the documented
+escape hatch if the layout ever needs it; this record does not propose reaching for it now.
 
 **Permissions.** Writes are `contents: write` on the *registry* repo — the review-fix outcome job
 already holds it, and no new scope on any target is needed, which is the decisive advantage over
@@ -233,9 +307,21 @@ A single PR that does all four is not reviewable and should be refused.
 - **A test that injects a concurrent write between probe and PUT** and asserts the sha precondition
   rejects it — i.e. that the CAS is real, not decorative. A test that passes against a stubbed
   store with no precondition check is vacuous.
-- **A tri-state resolution test per reader**: bound / unbound / UNKNOWN, asserting UNKNOWN never
-  produces a disarm row and never produces a dispatch. Missing/unreadable record ⇒ DEFER, never
-  grant.
+- **A four-valued resolution test per reader**: bound / unbound / retracted / UNKNOWN, asserting
+  UNKNOWN never produces a disarm row and never produces a dispatch. Missing/unreadable record ⇒
+  DEFER, never grant.
+- **The delete primitive does not exist yet, and it carries the invariant.** `worker-pr.py` has
+  `_probe_registry_file`/`_registry_put_file` but no registry-contents DELETE — the only `-X DELETE`
+  in the file is a label removal (`:1882`). Stage 1 must add one that takes a read-sha precondition
+  AND refuses any delete the §5 rule does not permit: never a record at the maximum generation
+  unless it is the caller's own and a lexicographically smaller sibling is present in the same
+  listing. The guard lives in the primitive so no caller can re-derive it wrongly.
+- **Interleaving self-tests, driven against an in-memory store, not a stub that always succeeds**:
+  (i) two same-generation binds ⇒ UNKNOWN, and the record set is NEVER empty for a PR that was
+  bound — the assertion that would have caught the create-then-delete design; (ii) bind racing a
+  retraction ⇒ the tombstone or the bind wins by the stated order, never zero records; (iii) a
+  delete that would remove the max-generation winner is REFUSED — this case must go red if the
+  guard is deleted; (iv) a failed GC delete leaves resolution unchanged.
 - **R5 stays PURE and TOTAL.** The resolution map is passed *in* (like `pr_status` is today); the
   predicate must not acquire I/O. If the map is absent, every PR resolves UNKNOWN.
 - **The mirrored regex** at `dispatch-claim.py:349` (kept in sync with `worker-pr.py:352` by
@@ -246,9 +332,12 @@ A single PR that does all four is not reviewable and should be refused.
 ## 8. What this record does not decide
 
 It does not decide the JSON schema of the record body, the alert thresholds for step 1's divergence
-counter, or whether the stranded-recovery retraction should become a delete or an explicit
-tombstone if a later requirement needs retraction to be *auditable* (deletes are recoverable from
-the `ledger` branch history, which this record treats as sufficient but does not prove). It does
+counter, the generation field's width and its overflow behaviour, the sweep interval for stale
+UNKNOWN ties, or whether the same-generation tie-break should stay lexicographic-lowest (chosen
+here only because every observer computes it identically from the listing alone) rather than
+something intent-aware. It does settle that retraction is a tombstone record and not a delete —
+that is a correctness requirement of §5's invariant, not the auditability preference §5 previously
+treated it as. It does
 not re-open #379 — that PR's narrowing is correct and should stay until stage 4 removes the writer
 entirely. It does not claim the PR body is unsafe as a *human-readable* mirror; only that it cannot
 be the authority. And it does not propose a schedule: the residual it closes is a rare prose-edit
