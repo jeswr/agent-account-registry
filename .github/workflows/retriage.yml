@@ -79,6 +79,11 @@ jobs:
           # registry #582: give the planner the repo's ACTUAL label set so it can never plan an add
           # of a label that does not exist (nor a strip of the last role:* label for one). Without
           # it, `role:soundness` — absent from this repo — stranded promoted issues role-less.
+          # registry #510: ONE fetch per run, and `retriage.py --apply` now validates EVERY label a
+          # decision would write against it, not only the role. GitHub fails the WHOLE label edit on
+          # a single unknown `--add-label`, so one missing taxonomy label used to cost the entire
+          # mutation and re-trip on every following tick; an unknown label is now dropped with a
+          # per-issue log line and the tick is a no-op, never a red run.
           known=$(gh_read label list -R "$REPO" --limit 500 --json name --jq '[.[].name]|join(",")')
           # #605 review finding 2: `--paginate --slurp` pulled EVERY page into a file BEFORE any
           # ceiling could look at it, so the "runaway ceiling" bounded neither requests nor memory
