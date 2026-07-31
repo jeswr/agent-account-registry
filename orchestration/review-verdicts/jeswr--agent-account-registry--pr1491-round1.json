@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1491,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "17ebd6bbf03353bd505e1039e0b3479c4341bc59",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new record-marker call runs in the launch-invariant block before allocator.claim. Consequently a no-slot tick writes a strandedrecover marker even though no recovery review is dispatched; the modified self-test at the no-slot case explicitly expects record-marker plus stranded-recover while asserting launched == 0. The budget later describes these markers as recovery dispatches that recorded no review round and can use them to apply a human-owned needs-user terminal. That evidence is false: allocator capacity failure is not a failed recovery execution. This also conflates machine capacity with the question-class stop that the surrounding taxonomy says must not represent capacity.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Acquire and validate the reviewer lease before charging a stranded recovery attempt, while retaining the required ordering of the durable charge before the marker retraction and workflow dispatch. Add a no-slot assertion that no strandedrecover marker is written, plus a red test showing only lease-backed recovery launches consume the limit. If the architecture requires mutation before allocation, use a separate reservation/rollback protocol so an unlaunched no-slot tick cannot remain charged as a recovery dispatch.",
+    "severity": "major",
+    "title": "Recovery attempts are charged before a reviewer lease exists"
+   }
+  ],
+  "progress": null,
+  "summary": "The new counter is written before lease allocation, so it does not count the dispatched recovery attempts its terminal decision claims to bound. In particular, the updated no-slot test explicitly proves that an attempt is charged even though no reviewer lease is obtained and launched remains zero. This can consume recovery budget because of allocator unavailability rather than repeated failed recovery executions, making the human terminal unsound. Round 1 has no prior findings to compare.",
+  "verdict": "request_changes"
+ }
+}
