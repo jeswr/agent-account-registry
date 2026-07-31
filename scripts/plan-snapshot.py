@@ -51,6 +51,12 @@ degrades the record loudly instead of impersonating an absent aggregator.
 Repo-level listings (issues / pulls) keep their sweep-fatal 5000-entry ceiling: the
 target planner step requires a complete issue snapshot for every manifest repo, so a
 per-repo degradation there needs a cross-step design (follow-up; see the PR record).
+They are also KEEP-FIRST de-duplicated by `number` as the pages are joined (issue #905):
+GitHub paginates a live ordering, so a row created or reordered mid-walk can land on two
+pages, and every downstream repeat check — `validate_plan`'s repeated review/disarm item
+and repeated issue row — reads that as corruption and kills the whole fleet-wide tick.
+The join is the one place the race exists, so it is the one place it is absorbed; the
+drop is annotated, never silent. See `_paginated`.
 
 COST (issue #721). This step is the dispatch tick: measured 2026-07-27 it was 759 s and
 812 s of a 771 s / 829 s PLAN job — ~98% — against a 600 s cron period. An instrumented
@@ -839,17 +845,62 @@ def _ordered_map(worker, jobs, concurrency=SNAPSHOT_CONCURRENCY):
 
 
 def _paginated(fetch, path):
-    """Repo-level page walk to a short page. The explicit ceiling only guards a runaway
-    snapshot (5000 covers the migrated backlog with organic-growth margin) and stays
-    SWEEP-fatal: the target planner step needs a complete listing for every repo."""
+    """Repo-level page walk to a short page, KEEP-FIRST by `number`. The explicit ceiling
+    only guards a runaway snapshot (5000 covers the migrated backlog with organic-growth
+    margin) and stays SWEEP-fatal: the target planner step needs a complete listing for
+    every repo.
+
+    [registry #905] THE PAGINATION RACE IS ABSORBED HERE, at the one place the pages are
+    joined. GitHub paginates a live, mutating ordering: a row created — or merely reordered
+    by an update — between two page fetches can legitimately land on both pages, and a
+    listing is not a set. Every downstream repeat check treats that as corruption and
+    HARD-FAILS the whole fleet-wide tick: `validate_plan` raises DispatchError on a repeated
+    (repo, pr_number) in `review_items` / `disarm_items` (and on a repeated `<repo>#<number>`
+    issue row), and the enumerators that feed them walk this listing straight through with no
+    de-duplication of their own. One routine race, zero dispatch fleet-wide.
+
+    THIS layer owns it rather than the enumerators (the two options #905 put up) because it
+    is where the defect actually is: the race is a property of joining pages, not of any one
+    consumer, and this walk is the single choke point upstream of ALL of them — the issues
+    leg and the pulls leg, plan rows and review/disarm rows alike. Fixing it in the
+    enumerators would be the same fix written once per lane, each able to drift, and would
+    still leave the issue rows repeating.
+
+    Narrow on purpose:
+    - KEEP-FIRST, so the answer is deterministic and the earlier read wins; a row's authority
+      comes from the per-PR detail read (`_pr_status_record`), which re-derives head_sha and
+      degrades on a mismatch, not from which page it arrived on.
+    - Only rows that carry a usable `number` are de-duplicated. Anything else passes through
+      UNCHANGED — this is a de-duplicator, never a filter, and dropping malformed rows here
+      would silently take over a judgement the row-shape validators downstream already make.
+    - The page-length ceiling still counts PAGES fetched, not surviving rows, so a runaway
+      listing stays sweep-fatal even if every row on it is a repeat.
+    - LOUD. A silent shrink is how a genuinely truncated listing would hide as a healthy one,
+      so the drop is annotated with the exact numbers involved."""
     items = []
+    seen = set()
+    duplicates = []
     for page in range(1, LIST_PAGE_LIMIT + 1):
         separator = "&" if "?" in path else "?"
         result = fetch(f"https://api.github.com{path}{separator}per_page=100&page={page}")
         if not isinstance(result, list):
             raise FetchError("GitHub API returned a non-list page")
-        items.extend(result)
+        for row in result:
+            number = row.get("number") if isinstance(row, dict) else None
+            if isinstance(number, int) and not isinstance(number, bool):
+                if number in seen:
+                    duplicates.append(number)
+                    continue
+                seen.add(number)
+            items.append(row)
         if len(result) < 100:
+            if duplicates:
+                print(f"::warning::plan-snapshot: {path} returned "
+                      f"{len(duplicates)} repeated row(s) across {page} page(s) "
+                      f"(#{', #'.join(str(number) for number in sorted(set(duplicates)))}) "
+                      "— keeping the first of each. A row created or reordered between two "
+                      "page fetches lands on both pages; without this the plan's repeat "
+                      "checks would fail the whole tick (registry #905).")
             return items
     raise FetchError("refusing a target snapshot at or above 5000 entries")
 
@@ -1789,6 +1840,79 @@ def _self_test():
                 raise AssertionError("a failed repo listing must stay sweep-fatal")
             assert list(Path(out_dir).iterdir()) == [], "a dead sweep wrote a partial snapshot"
 
+    def a_pagination_race_duplicate_is_dropped_keep_first_and_announced():
+        """[#905] A row that lands on TWO pages must not kill the tick. Downstream,
+        `validate_plan` raises DispatchError on a repeated (repo, pr_number) in review_items /
+        disarm_items and on a repeated issue row, and the enumerators walk this listing
+        straight through — so one routine pagination race is zero dispatch fleet-wide. Each
+        assertion names the mutation that reds it:
+          * drop the `seen` guard entirely      -> the repeat survives into the listing (1);
+          * keep-LAST instead of keep-first     -> the later body wins (2);
+          * de-duplicate on some key other than
+            `number` (e.g. the whole row/state) -> distinct rows collapse (3);
+          * test SURVIVING rows for the short
+            page instead of the raw page length -> page 1 is 100 raw rows but only 99
+                                                   survivors, so the walk would stop one page
+                                                   early and sell a truncated listing as
+                                                   complete — page 2's row 6 vanishes (3);
+          * de-duplicate keyless/non-dict rows  -> the walk becomes a silent FILTER (4);
+          * drop the repeat SILENTLY            -> no annotation, and a shrinking listing
+                                                   becomes indistinguishable from a healthy
+                                                   one (5, via the end-to-end run).
+        """
+        first = {"number": 5, "state": "open", "mark": "page-1"}
+        later = {"number": 5, "state": "open", "mark": "page-2"}
+        pages = {
+            # A FULL first page is what makes the walk fetch a second one at all — full by
+            # RAW row count, with one repeat inside the page itself, so "is this the short
+            # page?" can only be answered from the page GitHub returned.
+            1: ([first] + [{"number": n, "state": "open"} for n in range(100, 198)]
+                + [{"number": 100, "state": "open"}]),
+            # The two keyless rows are IDENTICAL on purpose: a de-duplicator keyed on the
+            # whole row — or on a `number` that is None for both — collapses them, and (4)
+            # is what notices. Distinct keyless rows would let that mutant live.
+            2: [later, {"number": 6, "state": "open"},
+                {"no_number": "x"}, {"no_number": "x"}, {"number": "7"}],
+        }
+
+        def raced(url):
+            return pages.get(int(url.rsplit("page=", 1)[1]), [])
+
+        walked = _paginated(raced, f"/repos/{repo}/pulls?state=open")
+        numbers = [row["number"] for row in walked if isinstance(row.get("number"), int)]
+        assert len(numbers) == len(set(numbers)), numbers                              # (1)
+        assert walked[0] is first and later not in walked, walked[:2]                  # (2)
+        assert 6 in numbers, numbers                                                   # (3)
+        assert [row for row in walked if not isinstance(row.get("number"), int)] == [
+            {"no_number": "x"}, {"no_number": "x"}, {"number": "7"}], walked            # (4)
+
+        # END TO END, through the artifact the PLAN assembler actually reads. Non-worker
+        # heads, so the walk under test is the ONLY thing this run exercises (no detail
+        # reads). The issues leg shares this same walk, hence the same protection.
+        def raced_listing(url):
+            base, _, query = url.partition("?")
+            page_number = int(query.rsplit("page=", 1)[1])
+            if base.endswith(f"/repos/{repo}/issues"):
+                return [{"number": 4, "title": "t"}] if page_number == 1 else []
+            if base.endswith(f"/repos/{repo}/pulls"):
+                return [dict(row, head={"ref": "topic", "sha": "a" * 40,
+                                        "repo": {"full_name": repo}})
+                        for row in pages.get(page_number, [])
+                        if isinstance(row.get("number"), int)]
+            raise AssertionError(f"unexpected fetch {url}")
+
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log), tempfile.TemporaryDirectory() as out_dir:
+            snapshot_targets(raced_listing, claim, [repo], out_dir)
+            listing = json.loads(
+                Path(out_dir, "raw-pulls-0.json").read_text(encoding="utf-8"))
+        planned = [row["number"] for row in listing["items"]]
+        assert listing["complete"] is True
+        assert planned.count(5) == 1 and len(planned) == len(set(planned)) == 100, planned
+        assert "::warning::" in log.getvalue() and "#5" in log.getvalue(), (      # (5)
+            "a de-duplicated listing must SAY so — a silent shrink is indistinguishable "
+            f"from a truncated listing sold as complete: {log.getvalue()!r}")
+
     def retry_after_is_honoured_and_capped():
         """Overlapping reads is how a SECONDARY rate limit gets provoked, so the back-off
         has to honour what GitHub asks for. Tests the helper AND its call site in
@@ -2670,6 +2794,7 @@ def _self_test():
         in_flight_reads_never_exceed_the_requested_bound,
         concurrency_stays_inside_the_secondary_rate_limit_budget,
         sweep_fatal_listing_failure_is_still_fatal,
+        a_pagination_race_duplicate_is_dropped_keep_first_and_announced,
         retry_after_is_honoured_and_capped,
         the_three_403s_are_told_apart,
         the_classifier_is_the_SHARED_one_not_a_local_copy,
