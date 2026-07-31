@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5378,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "84df3fb4c3415259f658ad5dae3a068bb5f56f08",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The shared remedy is appended to both draft-tier refusal paths without changing gate decisions, and the focused tests exercise both rendered failure messages plus the negative ordinary-failure case. The existing non-draft polling behavior is documentation-only and remains explicitly pinned by its focused test. Targeted unittest execution passed all four relevant tests. No correctness, soundness, security, or vacuity issue was found.",
+  "verdict": "approve"
+ }
+}
