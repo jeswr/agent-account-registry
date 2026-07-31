@@ -31,16 +31,6 @@
    "expires_at": 1785528653
   },
   {
-   "account": "58b7c92faa5b5ca5",
-   "claim_id": "fcb1cb2c42d840cf9a43baa51e320adf",
-   "holder": "fix:jeswr/agent-account-registry#1468@30655198512.1",
-   "package": "groom",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785522451,
-   "expires_at": 1785528751
-  },
-  {
    "account": "9e13ea21abf27e68",
    "claim_id": "3c083dc6fbba4c0584c350f86f5df75f",
    "holder": "sparq-org/sparq#2789@30655804107.1",
