@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5238,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1a7edbe2d74dd3f2f10fe0f413c193626ce66958",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 confirms the prior approval. The verifier now collects every distinct slot occupied by the filtered variable across all query patterns matched by a scan and requires a matching true filter edge for every active row and slot. The BTreeSet deduplicates same-slot matches without weakening the obligation. The negative regression test reaches the real structural verifier and specifically witnesses the pre-fix find_map acceptance gap; the positive test validates same-slot deduplication. The audit update accurately limits the demonstrated impact to structural-gate reachability and retains the external-audit caveat. No correctness, soundness, security, or test-validity issue was found.",
+  "verdict": "approve"
+ }
+}
