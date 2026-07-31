@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1388,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5ea9b08972e4b98be27e1724ab114421aba6bd09",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The documentation-only change remains correct and complete. Its scoped distinction between catalog/enrollment surfaces and operational surfaces matches the checked implementation: raw handles are intentionally present in policy and enrollment artifacts; lease and health records require 16-character lowercase-hex account fingerprints; model-health requires handle plus salt and validates the assembled record; dashboard observability validates the canonical fingerprint shape and scans the finished public document for known raw identities; and the two diagnostic workflows either hash identity-bearing values or emit only non-identifying counts/placeholders when salt is unavailable. The text also accurately limits the guarantee instead of claiming a repo-wide ban on generated handles. No correctness, soundness, test-validity, security, or injection issue is present.",
+  "verdict": "approve"
+ }
+}
