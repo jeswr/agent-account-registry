@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5293,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "56e5c7cdaeeb9eac552f8a6993db688ef96944e9",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new deterministic drift gate correctly ties the committed inference report's pass-plus-documented-divergence total to both the generated scoreboard floor and the inference CI job's enforced and advertised ratchets. Its parsers are scoped to the intended scoreboard row, final Overall report section, and CI job block; malformed or ambiguous anchors fail closed. The hermetic self-test covers both drift directions, each independent CI copy, neighboring-job isolation, subtotal exclusion, reclassification semantics, and representative parse failures. Both the self-test and the check against the PR-head repository state pass.",
+  "verdict": "approve"
+ }
+}
