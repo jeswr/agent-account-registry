@@ -113,12 +113,12 @@
   {
    "account": "51bde6688e140866",
    "claim_id": "34328f4c07ed4a8399567693e33154f1",
-   "holder": "sparq-org/sparq#3153@dispatch-30611961420.1",
+   "holder": "sparq-org/sparq#3153@30612206126.1",
    "package": "zk-xpath",
    "role": "ci",
    "model": "opus5",
-   "issued_at": 1785482109,
-   "expires_at": 1785488409
+   "issued_at": 1785482143,
+   "expires_at": 1785488443
   },
   {
    "account": "58b7c92faa5b5ca5",
