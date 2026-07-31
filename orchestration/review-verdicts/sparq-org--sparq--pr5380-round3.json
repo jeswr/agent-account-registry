@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5380,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b2278dd2ba8f2667afaccbc8dfef298d64c74719",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior authorization-boundary defect. The backend now collects every distinct credentialSubject object, accepts only exactly one named-node subject, and rejects ambiguous graphs before recording any holding. The signed end-to-end regression test presents the same two-subject graph in both triple orders, confirms proof verification reaches the ambiguity rejection, asserts the holdings map remains empty, and verifies neither candidate gains access. The implementation is deterministic and fail-closed for the previously reported case; the feature remains opt-in, the unconditional matcher behavior is covered separately, and the documentation accurately limits the backend to plaintext trust-the-issuer verification with no privacy, selective-disclosure, revocation, or expiry claim.",
+  "verdict": "approve"
+ }
+}
