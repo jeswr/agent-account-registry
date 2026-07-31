@@ -5803,6 +5803,82 @@ def _apply_trust_surface_audit(repo, pr_number, hits, reviewed_sha, bot_login=""
         _run_gh(["pr", "comment", str(pr_number), "-R", repo, "--body", body])
 
 
+# ---- [registry #1345] ONE SOURCE OF TRUTH FOR "THE HEAD" -----------------------------------------
+# GitHub answers "what is this pull request's head?" out of TWO stores that can disagree: the pulls
+# API's `head.sha`, and the ref `refs/heads/<head.ref>`. review-fix.yml's `resolve` read the FIRST
+# and published it as `head_sha`; worker-live.sh's `run_review`/`run_fix` fetch the SECOND and
+# assert equality against the value they were handed. Neither read is wrong on its own — which is
+# exactly why this never surfaced as a bug in either component. On sparq PR #4212 the two stores
+# disagreed for over an hour (pulls API `c145686f…`, branch ref `e2323e9a…`, `updatedAt` frozen)
+# and FIVE consecutive fix runs, one per dispatch tick, died at `PR head advanced since dispatch`.
+#
+# WHY IT NEVER TERMINATED. That abort runs BEFORE any state is written: no fix-model receipt, so
+# the round budget is not charged; no park, no label, no marker. The next tick re-derived a
+# byte-identical world and re-dispatched. A fixed point, not a retry — the same no-exit shape as
+# the age-park cap (#1301), `head-unmoved` (#1295), the approved+stale gate (#1327) and the
+# empty-diff deferral (PR #1076).
+#
+# WHICH STORE WINS, and why it is not a coin toss. Ask which one the lane actually OPERATES on:
+# `worker-live.sh` fetches `refs/heads/<branch>`, checks it out, edits it and PUSHES BACK TO IT,
+# and the `reviewed_sha` the outcome binds is `git rev-parse HEAD` of that same ref. The pulls API
+# copy is a cache of that ref which lags a force-push. So `resolve` resolves and publishes the
+# BRANCH REF, and every downstream consumer of `head_sha` (the worker pre-flight guard, the round
+# marker's `--head-sha` binding, `stage-verdict --expected-sha`, the reviewed-sha idempotence
+# marker) is handed the same store the worker will fetch.
+#
+# WHY THAT TERMINATES — structurally, not by adding another counter. Once both sides read one ref,
+# a pre-flight abort means the branch ref answered differently a moment after it answered at
+# dispatch, i.e. SOMETHING PUSHED. Two identical aborts in a row therefore cannot happen without a
+# state change between them, which is precisely the property #1345 asks to be asserted. The guard
+# is NOT relaxed to buy this: worker-live.sh's `[[ "$base_sha" == "$expected_head" ]]` is untouched
+# and a genuinely advanced head still aborts.
+def safe_head_ref(ref):
+    """PURE. True iff `ref` is a head branch name safe to interpolate into a URL path or refspec.
+
+    `resolve` puts this value into a `gh api repos/{repo}/git/ref/heads/{ref}` PATH, so it is
+    validated at the point of use. This is the Python twin of the relaxed safe-ref `case` in
+    worker-live.sh's `run_review`, which guards the SAME value into `git fetch origin
+    refs/heads/$head_branch`; worker-live.sh's --self-test holds the two equal by a DIFFERENTIAL
+    over a shared fixture rather than by the two comments agreeing (#958)."""
+    text = str(ref or "")
+    if not text or text.startswith("-") or text.endswith("/") or text.endswith(".lock"):
+        return False
+    if ".." in text or "@{" in text or "//" in text:
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9._/-]+", text))
+
+
+def reconcile_dispatch_head(head_branch, pull_api_sha, branch_ref, log=print):
+    """PURE. The sha `resolve` must publish as `head_sha`: the head BRANCH REF's commit.
+
+    ``branch_ref`` is the parsed `GET /repos/{repo}/git/ref/heads/{head_branch}` payload.
+
+    FAIL CLOSED, and the direction is the whole point: a payload without a well-formed 40-hex
+    `object.sha` RAISES rather than degrading to ``pull_api_sha``. Degrading would silently restore
+    the two-store mismatch this function exists to remove — and it would do so on exactly the reads
+    that are already going wrong. A resolve-time failure costs ONE tick (and burns no account
+    lease: `resolve` runs before `claim`); the mismatch cost five claims an hour, forever.
+
+    The disagreement is LOGGED with BOTH shas every time it is seen. On #4212 it was invisible
+    until the two values were compared by hand."""
+    # `GET …/git/ref/heads/{branch}` answers with an OBJECT for an exact ref and a LIST when the
+    # path is read as a prefix (the shape the older `…/git/refs/…` endpoint returns) — so the
+    # payload type is checked rather than assumed, and a list lands on the same refusal as a
+    # missing sha instead of an AttributeError nobody wrote a message for.
+    node = branch_ref.get("object") if isinstance(branch_ref, dict) else None
+    ref_sha = str(node.get("sha", "")) if isinstance(node, dict) else ""
+    if not re.fullmatch(r"[0-9a-f]{40}", ref_sha):
+        raise WorkerPrError(
+            f"refs/heads/{head_branch} did not resolve to a commit sha; refusing to fall back to "
+            "the pulls API copy of the head (that two-store mismatch is registry #1345)")
+    if ref_sha != pull_api_sha:
+        log(f"::warning::head store disagreement on refs/heads/{head_branch}: the pulls API "
+            f"reports head.sha={pull_api_sha}, the branch ref is {ref_sha}. Dispatching against "
+            "the BRANCH REF — the ref the worker fetches, edits and pushes back to (registry "
+            "#1345).")
+    return ref_sha
+
+
 # ---- composite outcomes (thin workflow steps, testable decisions) --------------------------------
 def revalidate_outcome_head(state, login, draft, live_head, reviewed_sha, bot_login,
                             self_attested=False):
@@ -7814,6 +7890,75 @@ def _self_test():
            len(_gh_error_detail(subprocess.CompletedProcess(
                ["gh"], 1, stdout="", stderr="x " * 500))["excerpt"]) <= _GH_STDERR_EXCERPT_MAX),
           (True, True))
+
+    # ---- [registry #1345] ONE SOURCE OF TRUTH FOR "THE HEAD" -------------------------------------
+    # The two shas below are the MEASURED pair from sparq PR #4212 — the pulls API's `head.sha` and
+    # the branch ref that disagreed with it for over an hour. They are used verbatim, and appear
+    # nowhere else in this harness, so a mutant that returns the wrong one cannot collide with a
+    # value some other fixture already carries (AGENTS.md item 4, "value-identical survivor").
+    _h1345_api = "c145686ff41f8b9ac816c350dc77b6686e638063"
+    _h1345_branch = "e2323e9a621ac29d4f886d3278637a30948a8279"
+    _h1345_log = []
+    check("[#1345] the two stores AGREE: the branch ref's sha is published unchanged",
+          reconcile_dispatch_head("sparq-agent/issue-1345-x", _h1345_branch,
+                                  {"object": {"sha": _h1345_branch, "type": "commit"}},
+                                  log=_h1345_log.append),
+          _h1345_branch)
+    check("[#1345] ...and agreement is SILENT (the warning marks a real disagreement, so an "
+          "unconditional one would make the instrumentation useless)", _h1345_log, [])
+    # THE DEFECT ITSELF: dispatch read the pulls API, the worker fetches the branch ref. The
+    # reducer must publish the BRANCH REF. A mutant returning `pull_api_sha` reproduces #4212
+    # exactly and turns this red.
+    check("[#1345] the two stores DISAGREE: the BRANCH REF wins, never the pulls API copy",
+          reconcile_dispatch_head("sparq-agent/issue-1345-x", _h1345_api,
+                                  {"object": {"sha": _h1345_branch, "type": "commit"}},
+                                  log=_h1345_log.append),
+          _h1345_branch)
+    # Read the log DEFENSIVELY: a mutant that makes the warning conditionally inert (AGENTS.md
+    # item 3's second experiment) leaves it empty, and an `[-1]` on an empty list would raise —
+    # recording as a crash that ABORTS every check below rather than as one red row (item 4's
+    # "crash-after-partial-run" false outcome). Measured: it does exactly that.
+    _h1345_last = _h1345_log[-1] if _h1345_log else ""
+    check("[#1345] ...and the disagreement is INSTRUMENTED with BOTH shas (it was invisible on "
+          "#4212 until the two values were compared by hand)",
+          (len(_h1345_log), _h1345_last.startswith("::warning::"),
+           _h1345_api in _h1345_last, _h1345_branch in _h1345_last,
+           "sparq-agent/issue-1345-x" in _h1345_last),
+          (1, True, True, True, True))
+    # FAIL CLOSED, and in the ONE direction that matters: an unresolvable branch ref must RAISE,
+    # never degrade to `pull_api_sha`. The degrade is the tempting edit (it "keeps the lane
+    # running") and it silently restores the two-store mismatch on exactly the reads already going
+    # wrong. Every shape below returns the pulls API sha under that mutant, so each one kills it.
+    for _h1345_name, _h1345_payload in (
+            ("an empty payload", {}),
+            ("a null payload", None),
+            ("an object with no sha", {"object": {"type": "commit"}}),
+            ("a non-hex sha", {"object": {"sha": "not-a-sha"}}),
+            ("a short sha", {"object": {"sha": _h1345_branch[:12]}}),
+            ("an UPPERCASE sha", {"object": {"sha": _h1345_branch.upper()}}),
+            ("a tag object with a list sha", {"object": {"sha": [_h1345_branch]}}),
+            ("a non-dict object node", {"object": _h1345_branch}),
+            # The REAL alternate shape: a prefix read answers with a LIST of refs, not one object.
+            ("a prefix-match LIST payload", [{"object": {"sha": _h1345_branch}}]),
+    ):
+        try:
+            _h1345_got = reconcile_dispatch_head(
+                "sparq-agent/issue-1345-x", _h1345_api, _h1345_payload, log=_h1345_log.append)
+        except WorkerPrError as exc:
+            _h1345_got = "raised" if "#1345" in str(exc) else f"raised-unnamed:{exc}"
+        check(f"[#1345] {_h1345_name} RAISES rather than falling back to the pulls API copy",
+              _h1345_got, "raised")
+    # `head_branch` reaches a `gh api …/git/ref/heads/{ref}` URL PATH in `resolve`, so the
+    # predicate that guards it is asserted here on both directions. worker-live.sh's --self-test
+    # runs the SAME table against its own `case` statement (the differential that keeps the two
+    # copies from drifting apart — #958).
+    for _h1345_ref, _h1345_want in (
+            ("sparq-agent/issue-1345-fix", True), ("main", True), ("a_b.c-d/e", True),
+            ("", False), ("-delete-everything", False), ("../../etc/passwd", False),
+            ("a..b", False), ("a@{0}", False), ("a//b", False), ("trailing/", False),
+            ("x.lock", False), ("has space", False), ("semi;colon", False), ("dollar$sign", False),
+    ):
+        check(f"[#1345] safe_head_ref({_h1345_ref!r})", safe_head_ref(_h1345_ref), _h1345_want)
 
     # GUARD 9 — the YAML SEAM, structurally on parsed nodes. A substring or `count(...) == N`
     # assertion over workflow text does not catch `if: false`, `continue-on-error: true`, a deleted

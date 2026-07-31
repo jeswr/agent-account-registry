@@ -1142,6 +1142,25 @@ _shell_function_body() {
   ' "$file"
 }
 
+# [registry #1345] Evaluate `run_review`'s SHIPPED safe-ref `case` against one candidate head
+# branch, printing nothing and returning 0 (accepted) / 1 (refused by `die`).
+#
+# The block is EXTRACTED FROM THIS FILE and eval'd rather than re-typed, because the point of the
+# caller is a DIFFERENTIAL against worker-pr.safe_head_ref — the Python twin that guards the same
+# value into `resolve`'s `gh api …/git/ref/heads/{ref}` URL path. A re-typed copy here would make
+# the differential compare two copies of the author's understanding instead of the two predicates
+# that actually run, which is the #958 shape this repo keeps paying for. `die` exits, so the eval
+# is confined to a subshell; a drifted anchor yields an EMPTY block, which would silently "accept"
+# everything — so the extraction is asserted non-empty by the caller before any verdict is read.
+_head_ref_case_predicate() {
+  local head_branch=$1 block
+  block=$(awk '/^  case "\$head_branch" in$/ { on = 1 }
+               on { print }
+               on && /^  esac$/ { exit }' "$SCRIPT_DIR/worker-live.sh")
+  [[ -n "$block" ]] || return 2
+  ( eval "$block" ) >/dev/null 2>&1
+}
+
 # PURE (self-tested): the body of the `run-selftest)` CLI arm, normalised to stripped, comment-free
 # lines. Pinned by EXACT BLOCK because this arm is the one place whose exit code pr-gate.yml trusts
 # for every row -- and a mutant that SUPPRESSES that exit code (`run_enrolled_selftest "$2" || true`)
@@ -4525,6 +4544,97 @@ WFFIX
   # ...and it is needle-specific rather than matching every step it walks past.
   chk "#232: an expression no step references matches nothing (the scan is not a blanket hit)" \
     "$(_workflow_steps_referencing "$wf" 'steps.prepare.outputs.no_such_output' | wc -l | tr -d ' ')" "0"
+
+  # --- [registry #1345] ONE SOURCE OF TRUTH FOR "THE HEAD" ---------------------------------------
+  # `resolve` published the pulls API's `head.sha`; `run_review`/`run_fix` below fetch
+  # `refs/heads/<branch>` and assert equality against what they were handed. TWO stores, one name.
+  # On sparq #4212 they disagreed for over an hour and five consecutive fix runs — one per dispatch
+  # tick, 5 leases + 5 containers per hour — died at `PR head advanced since dispatch` before
+  # writing any state, so the next tick re-derived an identical world. `resolve` now resolves the
+  # BRANCH REF (the ref this script fetches, edits and pushes back to) and publishes THAT, so the
+  # guard compares one store against itself and an abort implies a push happened in between.
+  #
+  # THE GUARD IS NOT RELAXED, and that is asserted first: `run_fix`'s equality check must still be
+  # the exact-match it always was, or "the head moved" stops meaning anything.
+  local head_guard_re='^ +\[\[ "\$(base|head)_sha" == "\$expected_head" \]\] \|\|$'
+  chk "#1345: the pre-flight head guard is still EXACT equality on both live lanes (not relaxed)" \
+    "$(grep -Ec "$head_guard_re" "$SCRIPT_DIR/worker-live.sh" || true)" "2"
+  chk "#1345: resolve reads the head BRANCH REF as well as the pulls API copy" \
+    "$(grep -Fc 'git/ref/heads/' "$rf_wf" || true)" "1"
+  # PRESENCE of the call is not the property — the REBIND is. A resolve step that computed the
+  # branch ref and then published `head.sha` anyway is #4212 unchanged, and it satisfies any
+  # containment check over this file. Pin the assignment itself, exact-match.
+  chk "#1345: ...and head_sha is REBOUND to the reducer's result, not merely computed beside it" \
+    "$(grep -Ec '^ +head_sha = worker_pr_head_ref\.reconcile_dispatch_head\(head_branch, head_sha, branch_ref\)$' \
+        "$rf_wf" || true)" "1"
+  # ORDER, not mere presence (AGENTS.md item 6): the rebind must precede BOTH consumers that were
+  # measurably wrong without it — the `head_sha` job output every downstream sha binding reads, and
+  # the reviewed-sha idempotence marker, which compared a branch-derived marker against the pulls
+  # API copy and so could never match during a disagreement.
+  local rf_src rebind_at output_at marker_at guard_at fetch_at
+  rf_src="$(cat "$rf_wf")"
+  rebind_at=$(_first_match_line 'head_sha = worker_pr_head_ref\.reconcile_dispatch_head(' <<< "$rf_src")
+  output_at=$(_first_match_line '"head_sha": head_sha,' <<< "$rf_src")
+  marker_at=$(_first_match_line 'already_done = bool(marker) and marker\.group(1) == head_sha' <<< "$rf_src")
+  chk "#1345: the rebind precedes the head_sha job output (order, not presence)" \
+    "$([[ -n "$rebind_at" && -n "$output_at" && "$rebind_at" -lt "$output_at" ]] \
+        && echo before || echo not-before)" "before"
+  chk "#1345: ...and precedes the reviewed-sha idempotence compare" \
+    "$([[ -n "$rebind_at" && -n "$marker_at" && "$rebind_at" -lt "$marker_at" ]] \
+        && echo before || echo not-before)" "before"
+  # The head branch reaches a URL PATH there, so its safe-ref guard must run BEFORE the
+  # interpolation, not after it.
+  guard_at=$(_first_match_line 'if not worker_pr_head_ref\.safe_head_ref(head_branch):' <<< "$rf_src")
+  fetch_at=$(_first_match_line 'git/ref/heads/{head_branch}' <<< "$rf_src")
+  chk "#1345: the safe-ref guard precedes the URL interpolation of head_branch" \
+    "$([[ -n "$guard_at" && -n "$fetch_at" && "$guard_at" -lt "$fetch_at" ]] \
+        && echo before || echo not-before)" "before"
+  # NON-VACUITY for the three order checks above: the same probes run against a MUTANT workflow in
+  # which the rebind line is deleted. All three must report `not-before`, otherwise they are
+  # measuring nothing (a `_first_match_line` that silently returns empty would pass every one of
+  # them if the comparison direction were written the other way round).
+  local rf_mutant="$tmp/review-fix-no-rebind.yml"
+  grep -v 'head_sha = worker_pr_head_ref\.reconcile_dispatch_head(' "$rf_wf" > "$rf_mutant"
+  chk "#1345: the mutant really lost exactly the rebind line (mutation actually applied)" \
+    "$(( $(wc -l < "$rf_wf") - $(wc -l < "$rf_mutant") ))" "1"
+  local mut_rebind
+  mut_rebind=$(_first_match_line 'head_sha = worker_pr_head_ref\.reconcile_dispatch_head(' < "$rf_mutant")
+  chk "#1345: ...and the order probe reports NOT-before on it (the checks are non-vacuous)" \
+    "$([[ -n "$mut_rebind" ]] && echo before || echo not-before)" "not-before"
+  # --- THE DIFFERENTIAL. `head_branch` is guarded by TWO predicates that must agree: this script's
+  # `case` (into `git fetch origin refs/heads/$head_branch`) and worker-pr.safe_head_ref (into
+  # `resolve`'s URL path). Two copies of one guard make each copy individually unkillable (#945),
+  # so they are compared ref-for-ref over one shared table rather than trusted to match.
+  local h1345_refs=(
+    'sparq-agent/issue-1345-fix' 'main' 'a_b.c-d/e'
+    '' '-delete-everything' '../../etc/passwd' 'a..b' 'a@{0}' 'a//b' 'trailing/' 'x.lock'
+    'has space' 'semi;colon' 'dollar$sign'
+  )
+  local h1345_py h1345_sh='' h1345_ref
+  h1345_py="$(python3 -B - "$SCRIPT_DIR/worker-pr.py" "${h1345_refs[@]}" <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("registry_worker_pr_1345", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print("|".join("ok" if module.safe_head_ref(ref) else "no" for ref in sys.argv[2:]))
+PY
+)"
+  for h1345_ref in "${h1345_refs[@]}"; do
+    if _head_ref_case_predicate "$h1345_ref"; then h1345_sh+='ok|'; else h1345_sh+='no|'; fi
+  done
+  h1345_sh="${h1345_sh%|}"
+  # Read the extraction BEFORE the verdicts: an empty block would eval to nothing, accept every
+  # ref, and make the differential agree only because both sides were asked nothing.
+  local case_rc=0
+  _head_ref_case_predicate 'a..b' || case_rc=$?
+  chk "#1345: the shipped safe-ref \`case\` was really extracted (rc=2 means a drifted anchor \
+handed the differential an EMPTY predicate that accepts everything)" "$case_rc" "1"
+  chk "#1345 DIFFERENTIAL: the shell and Python safe-ref predicates agree ref-for-ref" \
+    "$h1345_sh" "$h1345_py"
+  chk "#1345: ...over a table that exercises BOTH verdicts (an all-reject table agrees vacuously)" \
+    "$([[ "$h1345_py" == *ok* && "$h1345_py" == *no* ]] && echo both || echo one-sided)" "both"
 
   # --- [issue #232 review r2] ...and the half of the containment the ROUTING scan above cannot
   # measure. Which steps are HANDED `steps.prepare.outputs.credential_path` is a routing fact; which

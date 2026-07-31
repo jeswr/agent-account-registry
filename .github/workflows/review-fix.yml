@@ -302,6 +302,40 @@ jobs:
           # triggers (concluded-red gate / conflicting base) from live data at admission.
           if mode == "fix" and fix_kind == "verdict" and "review:changes" not in labels:
               raise SystemExit("fix mode requires the review:changes state")
+
+          # [registry #1345] ONE SOURCE OF TRUTH FOR "THE HEAD". `head.sha` read above is the pulls
+          # API's COPY of this PR's head. The ref the lane actually OPERATES on is
+          # `refs/heads/<head.ref>`: worker-live.sh fetches it, checks it out, edits it and pushes
+          # BACK to it, and the `reviewed_sha` the outcome binds is that ref's commit. The two
+          # disagree while the PR object lags a force-push — on sparq #4212 for over an hour — and
+          # this job published one while worker-live.sh's pre-flight guard asserted against the
+          # other. Five consecutive fix runs, one per dispatch tick, then died at `PR head advanced
+          # since dispatch` BEFORE writing any state, so each tick re-derived a byte-identical world
+          # and re-dispatched: 5 leases + 5 containers an hour on one PR, with no exit.
+          #
+          # Resolving the BRANCH REF here, once, puts both sides on ONE store — so a pre-flight
+          # abort now implies that ref answered differently than it had a moment earlier, i.e. a
+          # PUSH, and two identical aborts in a row can no longer happen without a state change
+          # between them. The guard itself is NOT relaxed to buy that. It is resolved BEFORE the
+          # `already_done` compare below (which reads a branch-derived marker and so could never
+          # match the pulls API copy during a disagreement) and before every consumer of the
+          # `head_sha` output. Fail-closed direction, both stores logged on disagreement, and the
+          # executable assertions: worker-pr.py `reconcile_dispatch_head`.
+          #
+          # `head_branch` reaches a URL PATH here, so it is validated by that module's own
+          # predicate — never by a regex re-typed into this `run:` script.
+          import importlib.util
+          spec_head_ref = importlib.util.spec_from_file_location(
+              "registry_worker_pr_head_ref", Path("registry", "scripts", "worker-pr.py"))
+          worker_pr_head_ref = importlib.util.module_from_spec(spec_head_ref)
+          spec_head_ref.loader.exec_module(worker_pr_head_ref)
+          if not worker_pr_head_ref.safe_head_ref(head_branch):
+              raise SystemExit("pull request head branch is not a safe ref name")
+          branch_ref = json.loads(subprocess.run(
+              ["gh", "api", f"repos/{repo}/git/ref/heads/{head_branch}"],
+              capture_output=True, text=True, check=True).stdout)
+          head_sha = worker_pr_head_ref.reconcile_dispatch_head(head_branch, head_sha, branch_ref)
+
           # Idempotence guard: the reviewed-sha marker is bound LAST in the outcome job, so a
           # marker equal to the live head proves this head's review completed end-to-end — a
           # duplicate dispatch (raced against the bind) exits gracefully via `already_done`
