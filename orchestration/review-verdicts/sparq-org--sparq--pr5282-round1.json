@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5282,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "40eab803bc40ba7bbd4b5dbc99c922c5fd269e24",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The comment says the fuzz lane's randomized/replay legs are push- and schedule-driven, but `.github/workflows/fuzz.yml` explicitly runs deterministic corpus replay for pull requests as well. This overstates the trigger-based reason for duplicating the invariant in the stable workspace test, although the stable-toolchain coverage and compile-time seed linkage still justify the test.",
+    "file": "crates/sparq-canon/tests/fuzz_seed_dedup.rs",
+    "fix_hint": "State that randomized fuzzing is push/schedule driven while deterministic corpus replay also runs on pull requests; retain the accurate point that the fuzz lane requires nightly whereas this regression runs under the stable workspace test gate.",
+    "severity": "minor",
+    "title": "Module comment incorrectly says corpus replay is only push/schedule driven"
+   }
+  ],
+  "progress": null,
+  "summary": "The regression test is non-vacuous and correctly pins the committed five-line reproducer: parsing retains five quads, set semantics yield four distinct input quads, and canonicalization produces four distinct parseable quads. The include path resolves to the tracked seed, so deleting or moving the seed fails at compile time. Static inspection found no correctness, soundness, or security blocker. I could not execute the test because Cargo is unavailable in this checkout environment. One comment inaccurately describes CI trigger coverage, but this does not undermine the test.",
+  "verdict": "approve"
+ }
+}
