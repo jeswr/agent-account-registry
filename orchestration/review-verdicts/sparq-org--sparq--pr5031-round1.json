@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5031,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1a91be43ad6af9011cee10ffde486b1a7206a03b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 14.1 states that `LANG_NONE = 1` is safe because a real `LANG_CONST` is a blake3 output and therefore a small tag cannot alias it. A hash reduced/encoded into the circuit field can equal 1; choosing a small constant makes collision negligible, not impossible. The same section correctly rejects an analogous probabilistic argument for `VALUE_NONE` and requires an asserted band exclusion, so treating the language slot as collision-free is inconsistent. Since the text uses this to claim encoding separation and this record is an audit input, the absolute safety claim is unsound even though broader soundness remains caveated.",
+    "file": "research/zk-field-native-encoding.md",
+    "fix_hint": "Either define and enforce a language-constant domain/range that excludes the sentinel (with matching host and circuit checks/tests), or describe LANG_NONE separation as collision-resistant/domain-separated rather than impossible and explicitly retain the resulting assumption as an audit obligation. Avoid saying a small field tag cannot be a hash output.",
+    "severity": "major",
+    "title": "LANG_NONE is not provably disjoint from hashed language constants"
+   }
+  ],
+  "progress": null,
+  "summary": "The f64 resolution is consistent with the referenced host and Noir canonicalisation paths, and the document appropriately preserves the external-audit caveat. However, the new reserved-tag argument makes an absolute collision-separation claim for LANG_NONE that does not follow from choosing a small field value. This is a load-bearing encoding/audit record, so the claim must be corrected or backed by an enforced exclusion invariant before approval.",
+  "verdict": "request_changes"
+ }
+}
