@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1424,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "695c77bcb7e56c15c2b08215a325a27dabcffd9c",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-1 credential-routing defect is fixed. `scripts/worker-pr.py` now keeps the private `ALERT_TOKEN` separate from `REGISTRY_ALERT_TOKEN`, returns the registry-scoped token on every rejected private route, and retains the private token only for a positively verified private destination. The self-test uses distinct token sentinels, checks the visibility probe's repository and credential, covers same-repo/public/failed/indeterminate routes, and exercises the fallback through production wiring. The analogous plan and groom routers fail closed to the public registry under their ambient workflow credential. I found no diff-supported correctness, soundness, test-validity, or security issue requiring changes.",
+  "verdict": "approve"
+ }
+}
