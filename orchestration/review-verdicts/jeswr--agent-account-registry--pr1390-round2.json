@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1390,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f31f12420e0c3ec6a099f6f5e925c616d1fa10b4",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe prior round's major fail-open finding is resolved. The live alert step now uses `set -euo pipefail`, so a nonzero self-test aborts before any issue mutation, and the workflow seam test pins the exact fail-stop line in position before the self-test and live invocation. The new health-outcome producer, job output, downstream environment carrier, independent decision path, dedupe/recovery behavior, sparse-checkout inputs, and mutation return-code aggregation are coherently wired and exercised by non-vacuous flow and seam assertions. I found no remaining blocker, major, or lower-severity diff-scoped issue.",
+  "verdict": "approve"
+ }
+}
