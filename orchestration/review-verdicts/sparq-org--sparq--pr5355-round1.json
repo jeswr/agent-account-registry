@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5355,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5132910f94f3d2115daa90e5d9f3f5d3e035558e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 2.3 says the existing whole-step two-attempt wrapper is present on the inference legs. In the current workflow, the D-entailment, RIF, EL, QL, and DL ratchet steps invoke cargo test once and only capture PIPESTATUS; unlike the SHACL/geo/etc. steps, they have no MAX_ATTEMPTS loop. The broader point that nextest cannot retry a pre-test fetch failure remains correct, but this statement inaccurately describes the current protection and could mislead future CI work.",
+    "file": "research/ci-nextest-leg-conversion-evaluation.md",
+    "fix_hint": "Remove \"and inference legs\" from the parenthetical list, or distinguish the wrapped conformance lanes from the single-attempt inference lanes and state explicitly that the latter currently have no whole-step fetch retry.",
+    "severity": "minor",
+    "title": "Inference ratchet legs do not have the claimed whole-step retry wrappers"
+   }
+  ],
+  "progress": null,
+  "summary": "The documentation-only change reaches a well-supported conclusion: nextest cannot replace doctest execution, the default CI profile hides successful-test stdout needed by the ratchet parsers, and per-test retries do not address failures that occur before tests start. The workflow references and parser shapes match the checkout. One factual overstatement should be cleaned up, but it does not undermine the conversion decision.",
+  "verdict": "approve"
+ }
+}
