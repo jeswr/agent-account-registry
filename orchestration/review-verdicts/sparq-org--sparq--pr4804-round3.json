@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4804,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "97e9a145933aab784cb9e42e3b2af72dbeade16f",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete as scoped. StatusDelta enumerates MSB-first changes, bounds attacker-influenced allocation, and fails closed for non-newer snapshots, coverage changes, and limit overflow. The freshness precondition exactly matches the real gate, including future-dated and aged snapshots. The exhaustive single-byte differential test establishes the safety implication across the relevant freshness states, while the real-gate test confirms that a selected revoked slot is denied. Public exports and access-control documentation match the implementation and retain the per-list, staleness-window, re-materialisation, and no in-reasoner retraction limitations.",
+  "verdict": "approve"
+ }
+}
