@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5177,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0b3f603a5e9dc6e163d9b4ae16ebaf333075fa09",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "publish() still discards every PENDING decision whenever the current status is success or failure. After a prior evaluation publishes success, a newly registered workflow can be observed in progress by another evaluation (for example one triggered by a different sibling completion), but that correct PENDING decision is suppressed. The new workflow's own workflow_run event occurs only on completion, so the context can remain green throughout its execution and permit a merge before the gating work finishes. The registration floor does not bound workflows that register after it. The comments' claim that genuinely new pending work is repaired by its completion event addresses eventual terminal state, not safety while the work is running.",
+    "file": "scripts/ci_summary_status.py",
+    "fix_hint": "Replace global terminal-to-pending monotonicity with ordering that distinguishes stale writers from genuinely newer sibling observations, such as serialized per-SHA publication or a durable observation generation/freshness token. Add a real late-registration test that first publishes success, then introduces a new in-progress gating workflow after the floor, evaluates it, and requires the published context to become pending until that workflow completes.",
+    "severity": "major",
+    "title": "Terminal-to-pending suppression still leaves late-registered gating work green"
+   },
+   {
+    "body": "TestPublish verifies that pending can never replace success or failure, but does not distinguish a stale concurrent evaluation from a newer observation containing newly registered gating work. Consequently the suite locks in the major defect instead of exercising the late-registration safety invariant documented in branch-protection.md.",
+    "file": "scripts/tests/test_ci_summary_status.py",
+    "fix_hint": "Add observation ordering metadata to the publication API and tests. Keep a stale-writer regression test, but add the late-registration sequence and assert that a newer pending observation supersedes an older terminal status.",
+    "severity": "minor",
+    "title": "Publication tests still encode the unsafe invariant"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 does not address the prior major finding. The evaluator still globally suppresses terminal-to-pending publication, and the test suite still asserts that behavior without a late-registration scenario. A workflow that registers after an earlier success can remain in progress while the required status stays green; workflow_run supplies an event only when that workflow completes, which is too late to prevent a merge during the run. The shadow staging limits current impact, but this is unsound for the documented intended promotion to a required check.",
+  "verdict": "request_changes"
+ }
+}
