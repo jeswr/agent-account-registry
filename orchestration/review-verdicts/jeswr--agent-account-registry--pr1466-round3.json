@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1466,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0080d5600a186a08a5ce19c4352d692bc36657a0",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 resolves both prior major findings. The path now includes a stable per-operation identity, distinct same-value writers therefore create distinct immutable objects, and same-value maximum-generation ties resolve deterministically without a permanent provenance conflict. Step 0 re-lists and rediscovers an already-landed `(PR, op)` record before allocating a generation, so an ambiguous PUT result or workflow-attempt restart does not fabricate another transition. The body-equivalence contract, loser-delete deferral, four-valued resolver, stale-tie sweep, directory ceiling, and required non-vacuous interleaving tests are stated explicitly and consistently with those invariants. This design record changes no behavior, and I found no remaining diff-scoped correctness, soundness, test-validity, or security issue.",
+  "verdict": "approve"
+ }
+}
