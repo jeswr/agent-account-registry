@@ -1875,7 +1875,12 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
     queue/arm state is not provable from an explicit-null REST latch alone because merge-queue
     membership is GraphQL-only per worker-pr.py's own doctrine — a directly-queued PR shows no
     REST latch — so an unprovable park could merge
-    mid-air into a crate this partition just freed for a sibling. The measured collapse
+    mid-air into a crate this partition just freed for a sibling. WHETHER TO BUY THAT PROOF
+    OVER GRAPHQL INSTEAD is a decided question, not an open one: see
+    `research/1012-parked-non-draft-queue-membership.md` (registry #1012) — a queue read is
+    point-in-time evidence licensing a permission that must hold until a sibling pushes, which is
+    strictly weaker than the standing `draft` proof, so the remedy is to DRAFT a machine-parked
+    holder (guarded by that same read) rather than to admit the read here. The measured collapse
     (26 of 27 open sparq worker PRs source-parked, ~1 plan item/tick against a 13-row
     frontier, dispatch runs 29664401328/29665207000) is still fixed: the collapse
     population is parked DRAFTS, and those free. The parked SOURCE issue itself stays
