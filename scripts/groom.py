@@ -1974,8 +1974,12 @@ def grant_pr_disposition(pulls: Any, branch: str, base: str = "master") -> str:
     counting as a non-match. On a record that DOES match exactly, the two fields the verdict is
     read from are validated before they are believed: an absent or wrong-typed `state` would fall
     through to `none` and publish a healthy open grant as abandoned, and a truthy non-timestamp
-    `merged_at` would vouch for a grant that never landed. Fields on a NON-matching record are
-    deliberately not policed — an unrelated PR's shape is none of this report's business."""
+    `merged_at` would vouch for a grant that never landed. They are also validated AGAINST EACH
+    OTHER: GitHub never stamps `merged_at` on a PR it still reports as `open`, so a record that
+    claims both is not a merged grant read two ways — it is evidence this report cannot trust, and
+    believing its `merged_at` would suppress an abandoned enrollment on a contradiction. Fields on
+    a NON-matching record are deliberately not policed — an unrelated PR's shape is none of this
+    report's business."""
     if not isinstance(pulls, list):
         raise GroomError(f"the pull-request listing for {branch} is malformed")
     disposition = "none"
@@ -1997,6 +2001,10 @@ def grant_pr_disposition(pulls: Any, branch: str, base: str = "master") -> str:
         merged_at = pull.get("merged_at")
         if merged_at is not None:
             _epoch(merged_at, f"the grant PR for {branch} merged_at")
+            if state != "closed":
+                raise GroomError(
+                    f"the grant PR for {branch} is {state} yet carries a merged_at timestamp"
+                )
             return "merged"
         if state == "open":
             disposition = "open"
@@ -9622,6 +9630,20 @@ def _self_test() -> int:
               {**stale_merged_pr, "merged_at": ""},
           )],
           [True] * 10)
+    check("stale-pending: a matching grant PR that is BOTH open and merged_at-stamped REFUSES — "
+          "each field is well-formed alone, but GitHub never stamps merged_at on a PR it still "
+          "reports as open, and believing the timestamp would silently suppress an abandoned "
+          "enrollment on a contradiction; a genuinely closed+stamped record still reads `merged` "
+          "and a closed+unstamped one still reads `none`, so the guard is the inconsistency, not "
+          "the timestamp",
+          ([_stale_raises(grant_pr_disposition, payload, stale_branch) for payload in (
+              [{**stale_merged_pr, "state": "open"}],
+              [{**stale_open_pr, "merged_at": "2026-01-02T03:04:05Z"}],
+              [stale_closed_pr, {**stale_merged_pr, "state": "open"}],
+           )],
+           grant_pr_disposition([{**stale_merged_pr, "state": "closed"}], stale_branch),
+           grant_pr_disposition([stale_closed_pr], stale_branch)),
+          ([True, True, True], "merged", "none"))
 
     stale_entry = PendingAccount(number=501, handle="acct21", age_days=10,
                                  request_issue=900, secret_ref="ACCT21_TOKEN")
