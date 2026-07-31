@@ -3502,15 +3502,6 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         if lease["claim_id"] not in dead_claims
         and not is_repair_holder(lease["holder"])
     }
-    # This listing is the reap guard's fresh view ONLY. The ready-repair "is this issue already
-    # being worked?" question is NOT answered from it (issue #279): it is a pre-LOOP snapshot,
-    # already stale by the time a later action reaches its write, so that question is re-asked
-    # per action at the write boundary below — exactly as the defer branch does.
-    # [#649] Over the repos that HAVE a snapshot, not over `groomable`: only those repos can hold
-    # a terminal reap candidate (`_terminal_non_pr_claims` never infers orphaned without a target
-    # view), so re-reading a repo whose listing was already unreadable would spend a request that
-    # can only re-raise — reinstating the very abort-before-reclaim this closes.
-    current_pulls = {repo: _pulls(groomable[repo], repo) for repo in issues}
     # #509 mutation-boundary guard for label/orphan reaping.  A claim selected from the earlier
     # target snapshots is released only if a fresh issue read still says terminal/absent and the
     # fresh pull listing still has no worker PR for it.  An unpark or newly opened PR wins the
@@ -3533,6 +3524,46 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             repo: {} for repo in issues
         }
         unproven_claims: set[str] = set()
+        # [#649, review round 1] The fresh PR listing is the OTHER HALF of #509's boundary
+        # predicate, and it used to be read — unwrapped, for every snapshotted repo, whether or not
+        # anything was up for reaping — between planning and this block. A repo whose listing
+        # SUCCEEDED in the snapshot phase and is refused here therefore raised past
+        # `_release_claims`, which is exactly the head-of-line abort the rest of this issue closes;
+        # the snapshot phase's own try cannot see it, because this is a second, later read.
+        #
+        # It now runs ONLY when there is a reap to revalidate, ONLY for the repos that actually
+        # hold a candidate, and PER REPO. The fail direction is the reap loop's, not
+        # record-and-continue: `_terminal_non_pr_claims` reads a missing `pulls` entry as
+        # `{}` — "no worker PR" — so an unread listing would CONFIRM a release it never proved.
+        # The repo's candidates are withdrawn and their leases RETAINED instead, and every other
+        # repo's reap, and every run-proven dead claim, still reclaims this tick.
+        current_pulls: dict[str, dict[int, dict[str, Any]]] = {}
+        for repo in sorted({parse_holder(lease["holder"]).repo for lease in candidate_leases}):
+            try:
+                current_pulls[repo] = _pulls(groomable[repo], repo)
+            except GroomError as exc:
+                withdrawn = [
+                    lease for lease in candidate_leases
+                    if parse_holder(lease["holder"]).repo == repo
+                ]
+                print(
+                    f"ALERT repo {repo}: {exc} — fresh PR listing unreadable, so terminal reap "
+                    f"revalidation defers for {len(withdrawn)} claim(s); the leases are RETAINED "
+                    "(an unread pull listing cannot prove the ABSENCE of a worker PR)"
+                )
+                for lease in withdrawn:
+                    reap_attempted += 1
+                    reap_deferrals.append(
+                        f"{repo}#{parse_holder(lease['holder']).issue}: {exc}"
+                    )
+                    unproven_claims.add(lease["claim_id"])
+        if unproven_claims:
+            # Withdrawn before the per-claim re-read below, so a claim this listing failure already
+            # disqualified does not spend a fresh-issue request it can no longer act on.
+            candidate_leases = [
+                lease for lease in candidate_leases
+                if lease["claim_id"] not in unproven_claims
+            ]
         for lease in candidate_leases:
             holder = parse_holder(lease["holder"])
             reap_attempted += 1
@@ -7084,6 +7115,15 @@ def _self_test() -> int:
             refusal = terminal_sweep_env.get("paginate_failures", {}).get(path)
             if refusal is not None:
                 raise refusal
+            # [#649, review round 1] CALL-SEQUENCED refusal, keyed by (path, 1-based Nth call to
+            # that path). The defect under test is a listing that SUCCEEDS in the snapshot phase and
+            # is refused on the LATER fresh read; a path-keyed map cannot express it — refusing
+            # `/pulls?state=open` there always fails the FIRST read, so the scenario is
+            # unrepresentable and the whole revalidation read goes untested.
+            nth = sum(1 for seen in terminal_sweep_env["paginated"] if seen == path)
+            sequenced = terminal_sweep_env.get("paginate_seq_failures", {}).get((path, nth))
+            if sequenced is not None:
+                raise sequenced
             if path == "/repos/owner/repo/issues?state=open":
                 return terminal_sweep_env["planned_issues"]
             if path == "/repos/owner/repo/pulls?state=open":
@@ -7449,6 +7489,7 @@ def _self_test() -> int:
             details: tuple[dict[str, Any], ...] | None = None,
             extra_gets: dict[str, Any] | None = None,
             paginate_refusals: dict[str, GroomError] | None = None,
+            paginate_seq_refusals: dict[tuple[str, int], GroomError] | None = None,
             leases: tuple[dict[str, Any], ...] | None = None,
             repos: tuple[str, ...] = ("owner/repo",),
         ) -> tuple[str, str, list[set[str]]]:
@@ -7456,8 +7497,10 @@ def _self_test() -> int:
 
             `details` overrides what the per-PR detail GET returns, so a candidate can be
             revalidated AWAY inside the hand-off loop (the deliberate-skip case). `paginate_refusals`
-            refuses a LISTING (issue #649's snapshot and comments reads), `repos`/`leases` widen the
-            fixture to a second target so a head-of-line claim about ONE repo can be witnessed.
+            refuses a LISTING (issue #649's snapshot and comments reads), `paginate_seq_refusals`
+            refuses the Nth call to one listing path (the terminal-reap re-read, which is the SECOND
+            read of `/pulls?state=open`), `repos`/`leases` widen the fixture to a second target so a
+            head-of-line claim about ONE repo can be witnessed.
             """
             terminal_sweep_leases[:] = list(leases) if leases is not None else [{
                 **base,
@@ -7479,8 +7522,10 @@ def _self_test() -> int:
                     **(extra_gets or {}),
                 },
                 writes=[],
+                paginated=[],
                 http_failures=dict(refusals),
                 paginate_failures=dict(paginate_refusals or {}),
+                paginate_seq_failures=dict(paginate_seq_refusals or {}),
             )
             terminal_sweep_releases.clear()
             saved_limits = globals()["load_limits"]
@@ -7498,7 +7543,7 @@ def _self_test() -> int:
                 globals()["load_limits"] = saved_limits
                 terminal_sweep_env.update(
                     pulls=[], gets={}, http_failures={}, planned_issues=[], fresh_issues={},
-                    paginate_failures={},
+                    paginate_failures={}, paginate_seq_failures={},
                 )
             return log.getvalue(), error, [set(claims) for claims in terminal_sweep_releases]
 
@@ -9147,18 +9192,105 @@ def _self_test() -> int:
             ),
             ([set()], True, True, True),
         )
+
+        # (3b) [review round 1] The reap block's OTHER fresh read: the pull listing that supplies
+        # the "no open worker PR" half of #509's boundary. It is a SECOND read of a path the
+        # snapshot phase already read, so the snapshot phase's own try CANNOT cover it — the
+        # listing succeeds there and is refused here — and it used to sit outside the block,
+        # unwrapped, aborting the whole sweep before `_release_claims`. Expressing that needs a
+        # CALL-SEQUENCED refusal; a path-keyed one can only fail the first (snapshot) read.
+        pull_reval_log, pull_reval_error, pull_reval_releases = _sweep_with_refusals(
+            {},
+            repos=("owner/repo", "owner/other"),
+            leases=(repo_lease, other_lease),
+            paginate_seq_refusals={
+                ("/repos/owner/repo/pulls?state=open", 2):
+                    _refused_listing("/repos/owner/repo/pulls?state=open")},
+        )
+        reval_pull_reads = sum(
+            1 for path in terminal_sweep_env["paginated"]
+            if path == "/repos/owner/repo/pulls?state=open"
+        )
+        check(
+            "MUTATION #649 (3b — fresh PR listing): a listing that SUCCEEDED in the snapshot and "
+            "is refused on the reap re-read defers ONLY its own repo's claims — owner/repo#7 keeps "
+            "its lease while owner/other#8 reclaims in the SAME tick. Hoisting the read back out "
+            "of the reap block raises before _release_claims (releasing NOTHING); leaving the "
+            "failed repo merely ABSENT from current_pulls reads as 'no worker PR' and releases "
+            "BOTH. Both mutations red this.",
+            (
+                pull_reval_releases,
+                "ALERT repo owner/repo:" in pull_reval_log,
+                "fresh PR listing unreadable" in pull_reval_log,
+                "cannot prove the ABSENCE of a worker PR" in pull_reval_log,
+                "Resource not accessible by integration" in pull_reval_log,
+                pull_reval_error,
+                "reap_deferred=1" in pull_reval_log,
+                # INSTRUMENT VALIDATION: the FIRST read of that same path — the snapshot phase's —
+                # must have SUCCEEDED. Without this the scenario silently degenerates into the
+                # already-covered snapshot case (2) and proves nothing about the LATER read.
+                "snapshot_deferred=0" in pull_reval_log,
+            ),
+            ([{"f" * 32}], True, True, True, True, "", True, True),
+        )
+        pull_all_log, pull_all_error, pull_all_releases = _sweep_with_refusals(
+            {},
+            repos=("owner/repo", "owner/other"),
+            leases=(repo_lease, other_lease),
+            paginate_seq_refusals={
+                (f"/repos/{repo}/pulls?state=open", 2):
+                    _refused_listing(f"/repos/{repo}/pulls?state=open")
+                for repo in ("owner/repo", "owner/other")},
+        )
+        check(
+            "#649 (3b) precedence rule 2: EVERY fresh PR listing refused is systemic — non-zero "
+            "naming both claims BY ISSUE — and the raise happens only AFTER the sweep's work, so "
+            "reclaim still ran and released nothing it could not prove",
+            (
+                pull_all_releases,
+                "every terminal reap revalidation failed (2 attempted, 0 completed)"
+                in pull_all_error,
+                "owner/repo#7" in pull_all_error and "owner/other#8" in pull_all_error,
+                "reap_deferred=2" in pull_all_log,
+                # Same instrument validation: BOTH snapshots read fine, so the only phase that
+                # failed is the revalidation one this scenario is about.
+                "snapshot_deferred=0" in pull_all_log,
+            ),
+            ([set()], True, True, True, True),
+        )
+        # A tick with NOTHING to revalidate must not spend the second listing at all — the read is
+        # inside the reap block, not unconditional. The pair is what makes this non-vacuous: the
+        # reaping tick above really did issue a SECOND read of the same path (or the refusal at
+        # ordinal 2 could never have fired), and this quiet tick issues only the snapshot's first.
+        _sweep_with_refusals({}, leases=())
+        quiet_pull_reads = sum(
+            1 for path in terminal_sweep_env["paginated"]
+            if path == "/repos/owner/repo/pulls?state=open"
+        )
+        check(
+            "#649 (3b) CALL SITE: the reap-revalidation pull listing is read ONCE PER REAPING "
+            "TICK and NOT AT ALL when there is no terminal reap candidate (hoisting it back to an "
+            "unconditional comprehension makes the quiet tick 2)",
+            (reval_pull_reads, quiet_pull_reads),
+            (2, 1),
+        )
     finally:
         globals().update(terminal_sweep_saved)
 
     # ---- run_sweep mutation-boundary guard (issue #170, review round 1, finding 3) ----
     # Drive the REAL run_sweep with a stubbed API in which the open-PR listing is SCHEDULED per
-    # read: the plan read (#1) and pre-loop snapshot read (#2) see NO pulls, and only the defer
-    # branch's mutation-boundary re-read (#3) sees the freshly opened admitted worker PR. The
+    # read: the planning snapshot read (#1) sees NO pulls, and only the defer branch's
+    # mutation-boundary re-read (#2) sees the freshly opened admitted worker PR. The
     # discriminating pair: (A) the PR appears at the boundary → NO label mutation may occur
-    # (deleting or inverting the run_sweep defer-branch guard, or reverting it to the pre-loop
+    # (deleting or inverting the run_sweep defer-branch guard, or keying it on the planning
     # snapshot, reds this — the snapshot never saw the PR); (B) no PR ever appears → the defer
     # mutation MUST occur (an inverted guard, or one keyed on anything but the fresh read, reds
     # this instead).
+    #
+    # [#649, review round 1] The boundary read is the SECOND, not the third: the reap
+    # revalidation's own pull listing now runs only when there is a terminal reap candidate, and
+    # this fixture's ledger is empty. Leaving these ordinals at 3 would make every
+    # PR-appears-at-the-boundary scenario below assert about a PR that never appears at all.
     sweep_env: dict[str, Any] = {}
 
     class _SweepAPI:
@@ -9262,9 +9394,9 @@ def _self_test() -> int:
                 encoding="utf-8",
             )
             os.chdir(tmp)
-            # (A) The admitted worker PR opens AFTER the pre-loop snapshot (listing read #2) and
-            # is first visible to the mutation-boundary re-read (#3): NO label write may land.
-            summary_a = _sweep_scenario(pr_visible_from=3)
+            # (A) The admitted worker PR opens AFTER the planning snapshot (listing read #1) and
+            # is first visible to the mutation-boundary re-read (#2): NO label write may land.
+            summary_a = _sweep_scenario(pr_visible_from=2)
             check(
                 "MUTATION boundary: a post-snapshot admitted worker PR suppresses the defer WRITE",
                 (summary_a, sweep_env["writes"]),
@@ -9272,7 +9404,7 @@ def _self_test() -> int:
             )
             check(
                 "MUTATION boundary: the guard actually RE-READ open PRs at the boundary",
-                sweep_env["pull_reads"] >= 3,
+                sweep_env["pull_reads"] >= 2,
                 True,
             )
             # (B) No PR ever appears: the exhausted defer mutation MUST land (discriminates an
@@ -9345,7 +9477,7 @@ def _self_test() -> int:
             # the LIVE ref admits it → the terminal defer park is CANCELLED (no write). Reverting
             # the live gate reds this: the on-disk admission alone would park the already-valid
             # issue (the exact stale-checkout bug).
-            summary_c = _sweep_scenario(pr_visible_from=3)
+            summary_c = _sweep_scenario(pr_visible_from=2)
             check(
                 "issue #174: a record on the LIVE ref (missing on the checkout) cancels the park",
                 (summary_c, sweep_env["writes"]),
@@ -9359,7 +9491,7 @@ def _self_test() -> int:
             saved_stdout = sys.stdout
             sys.stdout = alert_buf
             try:
-                summary_d = _sweep_scenario(pr_visible_from=3)
+                summary_d = _sweep_scenario(pr_visible_from=2)
             finally:
                 sys.stdout = saved_stdout
             check(
@@ -9377,7 +9509,7 @@ def _self_test() -> int:
             alert_buf = io.StringIO()
             sys.stdout = alert_buf
             try:
-                summary_e = _sweep_scenario(pr_visible_from=3)
+                summary_e = _sweep_scenario(pr_visible_from=2)
             finally:
                 sys.stdout = saved_stdout
             check(
@@ -9412,19 +9544,19 @@ def _self_test() -> int:
                 _ready_landed(_sweep_scenario(pr_visible_from=10**6)),
                 (1, True),
             )
-            # (G) The worker PR is first visible to the boundary re-read (#3): NO write may land.
-            # Reverting the ready branch to the pre-loop snapshot reds this — the snapshot (#2)
+            # (G) The worker PR is first visible to the boundary re-read (#2): NO write may land.
+            # Reverting the ready branch to the planning snapshot reds this — the snapshot (#1)
             # never saw the PR — and so does deleting the guard.
-            summary_g = _sweep_scenario(pr_visible_from=3)
+            summary_g = _sweep_scenario(pr_visible_from=2)
             check(
-                "MUTATION #279: a worker PR opening after the pre-loop snapshot suppresses the "
+                "MUTATION #279: a worker PR opening after the planning snapshot suppresses the "
                 "status:ready WRITE",
                 (summary_g[1], sweep_env["writes"]),
                 (0, []),
             )
             check(
                 "#279: the ready branch actually RE-READ open PRs at the write boundary",
-                sweep_env["pull_reads"] >= 3,
+                sweep_env["pull_reads"] >= 2,
                 True,
             )
             # (H) The availability direction #279 asked about: an arbitrary open PR whose body
@@ -9443,7 +9575,7 @@ def _self_test() -> int:
                 "#279: an arbitrary open PR whose body says `Fixes #8` cannot hold the issue out "
                 "of ready repair",
                 _ready_landed(
-                    _sweep_scenario(pr_visible_from=3, appearing_pull=loose_pull)),
+                    _sweep_scenario(pr_visible_from=2, appearing_pull=loose_pull)),
                 (1, True),
             )
             # (I) The CLASS-AWARE half of the boundary predicate is live too ([registry #835]):
@@ -9464,7 +9596,7 @@ def _self_test() -> int:
                 "#279 control: with the default EMPTY allowlist an orchestrator PR suppresses "
                 "nothing and the repair lands",
                 _ready_landed(
-                    _sweep_scenario(pr_visible_from=3, appearing_pull=sweep_orch_pull)),
+                    _sweep_scenario(pr_visible_from=2, appearing_pull=sweep_orch_pull)),
                 (1, True),
             )
             globals()["load_limits"] = lambda *_a, **_k: {"owner/repo": Limits(
@@ -9472,7 +9604,7 @@ def _self_test() -> int:
                 enrolled_authors=orch_enrolled)}
             try:
                 summary_i = _sweep_scenario(
-                    pr_visible_from=3, appearing_pull=sweep_orch_pull)
+                    pr_visible_from=2, appearing_pull=sweep_orch_pull)
             finally:
                 globals()["load_limits"] = sweep_patched["load_limits"]
             check(
