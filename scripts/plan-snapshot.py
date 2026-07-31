@@ -84,6 +84,7 @@ import time
 import traceback
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
+from http.client import RemoteDisconnected
 from urllib.request import (Request, HTTPHandler, HTTPRedirectHandler, HTTPSHandler,
                             build_opener, urlopen)
 import zipfile
@@ -779,7 +780,17 @@ def make_fetch(token, store=None):
                 raise FetchError(
                     f"authenticated GitHub read failed (HTTP {exc.code}) for "
                     + url.split("?")[0]) from exc
-            except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+            except (URLError, TimeoutError, json.JSONDecodeError,
+                    RemoteDisconnected) as exc:
+                # [#552] RemoteDisconnected subclasses ConnectionResetError -> OSError and is
+                # NOT a URLError, so it escaped this arm and killed the whole tick — measured
+                # twice on 2026-07-31 (PLAN 05:10:15Z, and again 09:44:22Z alongside the GUARD
+                # half of #1025). A tick lost here costs a full floor interval, not one request,
+                # because the executed-tick anchor is written when the tick decides to proceed.
+                # gh_retry.py already classifies this as transient (self-test at :627); this arm
+                # keeps plan-snapshot's own bounded 3-attempt schedule rather than introducing a
+                # second policy. The 403 arm above is deliberately NOT widened: a budget 403
+                # carries no Retry-After and every retry deepens the outage (#819).
                 if attempt < 2:
                     time.sleep(5 * (attempt + 1))
                     continue
