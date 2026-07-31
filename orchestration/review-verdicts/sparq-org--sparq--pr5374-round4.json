@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5374,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "aba3562547bf5b1eed51e73e33e5bb79ed6e18a5",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct on the diff-scoped evidence. The new pattern_scans field is explicitly and consistently non-load-bearing: check_pattern_scans adds only well-formedness rejections, while FILTER, attribution, Q6, and join obligations continue to derive scan membership independently through scan_matches_pattern. The e2e tests exercise the real structural verifier entry point and pin both same-layout and cross-slot non-narrowing counterexamples, plus each malformed-declaration rejection and legacy serde behavior. The audit record and public skill preserve the research-grade, not-externally-audited sq-qhy4 posture. No correctness, soundness, test-validity, security, or hostile-instruction issue is present. Because round 3 also had no findings, progress is stagnant rather than improving.",
+  "verdict": "approve"
+ }
+}
