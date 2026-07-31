@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1446,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4e084cda47e22fb2404669e269d314032db66f74",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The `app-token-pub` step has no `if:` condition. The `publish` job is admitted with `always()` whenever a bundle exists; on a genuine gate failure its checkout/download/verify/preserve steps can all succeed. The next step therefore satisfies the implicit `success()` and mints a target-scoped token with contents, workflows, issues, and pull-request write permissions. Only the later checkout/recheck/PR steps are gated on `gate_outcome == 'success'`. This directly contradicts the new claim that a failed gate reaches no write credential or target-write machinery. The self-test misses the defect: it checks only that `preserve` is ordered before the mint and evaluates checkout/recheck/PR, never whether the mint itself skips for failure. Ordering the upload before mint proves no credential exists during upload, not that the failure path cannot mint one afterward.",
+    "file": ".github/workflows/worker.yml",
+    "fix_hint": "Gate `app-token-pub` itself on the exact successful gate and verified-bundle condition (and pin that complete expression), so the token is never minted on failure, skipped, cancelled, empty, or failed verification outcomes. Extend the evaluated target-touching/credential step matrix to include `app-token-pub`, with failure/skipped negative rows and a success positive control.",
+    "severity": "major",
+    "title": "Gate-failed runs still mint the target write token"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 3 removes the round-2 blocker: the failed candidate is retained as a SHA-pinned artifact in the registry run and no longer becomes a target Git ref capable of triggering target workflows. The gate/verifier condition is exact and the added tests exercise both positive and negative outcomes. However, the advertised credential boundary is not actually enforced. On a gate failure, the publish job can verify and retain the bundle successfully, after which the ungated App-token step runs under the current job's successful step state and mints a target-scoped contents/workflows-write token. The target checkout and PR steps are gated off, so this is narrower than the prior execution blocker, but it contradicts the explicit no-credential security property and grants unnecessary target write authority on a rejected path. Progress is improving because the blocker is fixed and only a major issue remains.",
+  "verdict": "request_changes"
+ }
+}
