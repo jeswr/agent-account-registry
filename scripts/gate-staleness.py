@@ -19,11 +19,21 @@
 # one, and until now nothing in CI could answer the second.
 #
 # ⚠️ THE DISCRIMINATOR IS THE MERGE-REF BASE TIP, NOT `base.sha`. `github.event.pull_request.base.sha`
-# is NOT the tested tree: #920 measured it mispredicting 5 of the 7 failures, and pr-gate.yml uses
-# it for one unrelated purpose (fetching the baseline self-test manifest). The tree that was
+# is NOT the tested tree: #920 measured it mispredicting 5 of the 7 failures. The tree that was
 # actually graded is `HEAD^1` of the checked-out merge commit — the base tip GitHub composed the
 # merge ref from. That is read here from git, from inside the run, which is the ONLY place it is
 # observable; no API field reports it.
+#
+# pr-gate.yml used to read `base.sha` for one other purpose — fetching the PROTECTED BASELINE copy
+# of `scripts/selftest-suite.txt`, the manifest a pull request may not silently retire an entry
+# from — and this file recorded that as an unrelated use. It was not unrelated: the two operands
+# are different commits, so an entry ENROLLED on the base branch after the merge ref was composed
+# is missing from the graded tree through no act of the pull request and reads as a removal. The
+# derivation then refuses, `suite` is never assigned, and the REQUIRED gate reds with ZERO
+# self-tests run — for every pull request composed before that enrolment, none of which can fix it
+# from its own diff. Both operands are now the graded base, so the baseline is compared against the
+# tree it was actually composed into. `assert_baseline_operand_seam` pins that at the YAML seam,
+# because the regression is one token wide and leaves the step present and passing.
 #
 # HOW THE READING IS DERIVED, and the two operands it needs from pr-gate.yml's checkout:
 #   * `fetch-depth: 0` — without it only the merge ref is fetched and `refs/remotes/origin/<base>`
@@ -77,6 +87,25 @@ HEAD_SHA_ENV = "PR_HEAD_SHA"
 BASE_REF_ENV = "PR_BASE_REF"
 HEAD_SHA_EXPR = "${{ github.event.pull_request.head.sha }}"
 BASE_REF_EXPR = "${{ github.event.pull_request.base.ref }}"
+
+# The OTHER consumer of a base commit in the same job: the step that derives the protected baseline
+# self-test manifest. It is pinned here, beside the report, because the operand is the same one —
+# and reading it from the event payload instead of from the merge commit is what this module's
+# whole measurement says is wrong.
+SUITE_STEP_MARKER = "print-selftest-suite"
+BASE_SHA_EXPR = "github.event.pull_request.base.sha"
+# The derivation, normalised (stripped, comment-free, blank-free) in order, as an EXACT ADJACENT
+# BLOCK. `assert_baseline_operand_seam` explains why containment is not enough here.
+BASELINE_BLOCK = (
+    'base=$(git rev-parse --verify --quiet "HEAD^1^{commit}" || true)',
+    'head_parent=$(git rev-parse --verify --quiet "HEAD^2^{commit}" || true)',
+    'third_parent=$(git rev-parse --verify --quiet "HEAD^3^{commit}" || true)',
+    'if [ -z "$base" ] || [ -z "$head_parent" ] || [ -n "$third_parent" ]; then',
+    'echo "::error::HEAD is not the two-parent refs/pull/N/merge commit this gate grades; '
+    'refusing to derive the self-test suite"',
+    "exit 1",
+    "fi",
+)
 
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 # Deliberately narrower than git's own ref grammar. The base ref reaches this script from the event
@@ -235,6 +264,12 @@ def _assert_unconditional(scope, mapping):
         raise AssertionError(f"{scope} carries a truthy `continue-on-error:`")
 
 
+def _normalised_run_lines(run):
+    """PURE: a `run:` body as stripped, comment-free, blank-free lines."""
+    return [line.strip() for line in str(run or "").splitlines()
+            if line.strip() and not line.strip().startswith("#")]
+
+
 def assert_report_seam(job):
     """RAISES unless pr-gate's `gate` job invokes this script unconditionally, with exactly the
     documented flags, fed from exactly the documented event fields."""
@@ -309,6 +344,67 @@ def assert_merge_ref_inputs(job):
     return True
 
 
+def assert_baseline_operand_seam(job):
+    """RAISES unless pr-gate.yml's self-test-suite step derives its PROTECTED BASELINE — the
+    base-branch copy of `scripts/selftest-suite.txt` a pull request may not silently retire an entry
+    from — from the SAME commit this module reports on: `HEAD^1` of the checked-out merge commit.
+
+    This is the seam, not a restatement of the header. The step read
+    `github.event.pull_request.base.sha`, which is a DIFFERENT commit from the graded base, so an
+    entry enrolled on the base branch after the merge ref was composed read as a removal the pull
+    request never made — refusing the derivation, leaving `suite` unassigned, and redding this
+    REQUIRED gate with zero self-tests run, for every pull request composed before that enrolment.
+
+    Three independent facts, because they fail in different places and one restored alone still
+    reopens the hole:
+      1. the derivation is EXACTLY `BASELINE_BLOCK` — an adjacent, whole-block match. A guard that
+         has lost its `exit 1`, gained a `|| true`, or been made conditionally inert keeps every
+         token a containment check looks for while deriving a baseline from the wrong tree.
+      2. `base` is assigned ONCE. A second assignment after the block silently wins, and the block
+         match alone cannot see it.
+      3. no `${{ }}` reaches the body and no `base.sha` reaches the step at all, through `run:` or
+         through `env:` — the two spellings the reverted operand would arrive by."""
+    if not isinstance(job, dict):
+        raise AssertionError(f"the `{GATE_JOB}` job is missing from the workflow")
+    steps = job.get("steps")
+    if not isinstance(steps, list):
+        raise AssertionError(f"the `{GATE_JOB}` job declares no steps")
+    found = [s for s in steps
+             if isinstance(s, dict) and SUITE_STEP_MARKER in str(s.get("run") or "")]
+    if len(found) != 1:
+        raise AssertionError(f"expected exactly one `{GATE_JOB}` step deriving the suite with "
+                             f"`{SUITE_STEP_MARKER}`, found {len(found)}")
+    step = found[0]
+    _assert_unconditional(f"the step deriving the suite with `{SUITE_STEP_MARKER}`", step)
+    run = str(step.get("run") or "")
+    # On the RAW body, comments included: GitHub expands `${{ }}` before the shell ever sees the
+    # script, so a `#`-prefixed line is not inert here (pr-gate.yml says so at its advisory step).
+    if "${{" in run:
+        raise AssertionError("the suite step interpolates `${{ }}` into its `run:` body — the "
+                             "baseline operand must come from git, not from the event payload")
+    lines = _normalised_run_lines(run)
+    # ...but on the CODE only: a comment must stay free to name the operand this exists to reject,
+    # which is how the #920 lesson is recorded at the seam it applies to.
+    for where, text in (("run:", "\n".join(lines)), ("env:", repr(step.get("env")))):
+        if BASE_SHA_EXPR in text:
+            raise AssertionError(
+                f"the suite step reads `{BASE_SHA_EXPR}` through its {where} — that is NOT the "
+                "graded base (issue #920), and comparing the protected baseline against a commit "
+                "this tree was never composed with reds the gate on entries the PR never removed")
+    assignments = [line for line in lines if line.startswith("base=")]
+    if len(assignments) != 1:
+        raise AssertionError(f"the suite step assigns `base=` {len(assignments)} time(s), want "
+                             "exactly 1 — a later assignment silently overrides the derivation")
+    start = lines.index(assignments[0])
+    block = tuple(lines[start:start + len(BASELINE_BLOCK)])
+    if block != BASELINE_BLOCK:
+        raise AssertionError(
+            f"the suite step's baseline derivation is {block}, want exactly {BASELINE_BLOCK} — "
+            "pinned as an adjacent whole block because a dropped `exit 1`, an appended `|| true` "
+            "or an `if false` leaves every token in place while the fail-closed guard never fires")
+    return True
+
+
 # ---- SELF-TEST ---------------------------------------------------------------------------------
 def _fixture_repo(root, git):
     """Build a real git repository shaped exactly like a pr-gate checkout: HEAD detached at a
@@ -346,6 +442,42 @@ def _seam_fixture():
          "env": {HEAD_SHA_ENV: HEAD_SHA_EXPR, BASE_REF_ENV: BASE_REF_EXPR},
          "run": ("set -euo pipefail\n"
                  f'python3 {INVOCATION} --head-sha "${HEAD_SHA_ENV}" --base-ref "${BASE_REF_ENV}"\n')},
+    ]}
+
+
+# The suite step as pr-gate.yml spells it, written out INDEPENDENTLY of `BASELINE_BLOCK` rather
+# than joined from it: an accept row whose input is built from the constant the assertion compares
+# against is a tautology that cannot fail (AGENTS.md pre-flight item 2b). A typo in either one now
+# reds this fixture, and the LIVE row below is what speaks for what actually runs.
+_BASELINE_STEP_RUN = """set -euo pipefail
+base_manifest="$RUNNER_TEMP/base-selftest-suite.txt"
+base_retirements="$RUNNER_TEMP/base-selftest-retirements.txt"
+# [issue #920] the protected baseline is read from the GRADED BASE, not from base.sha.
+base=$(git rev-parse --verify --quiet "HEAD^1^{commit}" || true)
+head_parent=$(git rev-parse --verify --quiet "HEAD^2^{commit}" || true)
+third_parent=$(git rev-parse --verify --quiet "HEAD^3^{commit}" || true)
+if [ -z "$base" ] || [ -z "$head_parent" ] || [ -n "$third_parent" ]; then
+  echo "::error::HEAD is not the two-parent refs/pull/N/merge commit this gate grades; \
+refusing to derive the self-test suite"
+  exit 1
+fi
+if git cat-file -e "$base:scripts/selftest-suite.txt" 2>/dev/null; then
+  git show "$base:scripts/selftest-suite.txt" > "$base_manifest"
+else
+  cp scripts/selftest-suite.txt "$base_manifest"
+fi
+suite=$(bash scripts/worker-live.sh print-selftest-suite "$base_manifest" "$base_retirements")
+echo "$suite"
+"""
+
+
+def _baseline_seam_fixture():
+    """A `gate` job carrying the suite step exactly as pr-gate.yml spells it."""
+    return {"steps": [
+        {"name": "Checkout PR head",
+         "uses": CHECKOUT_ACTION + "0" * 40,
+         "with": {"persist-credentials": False, "fetch-depth": 0}},
+        {"name": "Run the full registry self-test suite", "run": _BASELINE_STEP_RUN},
     ]}
 
 
@@ -638,6 +770,83 @@ def _self_test():
         chk(f"the checkout check REFUSES when {name}",
             bool(_refused(assert_merge_ref_inputs, mutate(mutation))), True)
 
+    # ---- THE PROTECTED-BASELINE OPERAND (#920 follow-up). The suite step reads a base commit too,
+    # and it read the WRONG one: `base.sha` is not the commit `refs/pull/N/merge` was composed from,
+    # so an entry enrolled on the base branch after composition read as a retirement the pull
+    # request never made — and that refusal runs BEFORE the first self-test, so the required gate
+    # reds having measured nothing. Every mutant below leaves the step present, unconditional and
+    # exiting 0 on a healthy PR; each is a live regression to that false red.
+    baseline_good = _baseline_seam_fixture()
+    chk("the documented baseline derivation is accepted",
+        _refused(assert_baseline_operand_seam, baseline_good), "")
+
+    def baseline_mutate(fn):
+        job = copy.deepcopy(baseline_good)
+        fn(job)
+        return job
+
+    def _brun(job, old, new):
+        job["steps"][1].update({"run": job["steps"][1]["run"].replace(old, new)})
+
+    GRADED = 'base=$(git rev-parse --verify --quiet "HEAD^1^{commit}" || true)'
+    GUARD = 'if [ -z "$base" ] || [ -z "$head_parent" ] || [ -n "$third_parent" ]; then'
+
+    # ⚠️ EACH OF THE FOUR CONTROLS NEEDS A MUTANT ONLY IT CAN KILL, or the pair masks and each copy
+    # is individually unkillable (AGENTS.md pre-flight item 4). MEASURED here: with the block
+    # compare made inert, 7 rows red; with the `${{ }}` check, the single-assignment check or the
+    # `env:` check made inert, ZERO rows red until the three mutants below were re-shaped to leave
+    # the pinned block VERBATIM. The headline reversion row is kept, and is redundantly killed.
+    def baseline_mutants():
+        # THE REGRESSION ITSELF (killed by more than one control — stated, not banked as evidence
+        # that any single control works).
+        yield ("the operand is reverted to base.sha in the body",
+               lambda j: _brun(j, GRADED, "base='${{ github.event.pull_request.base.sha }}'"))
+        # ...and the same reversion spelled so the pinned block survives WORD FOR WORD: `base` is
+        # still derived from HEAD^1, and the consumer simply reads the event field instead. Only
+        # the `env:` check can see this one.
+        yield ("base.sha arrives through env: and the CONSUMER reads it",
+               lambda j: (j["steps"][1].update({"env": {"PR_BASE_SHA": f"${{{{ {BASE_SHA_EXPR} }}}}"}}),
+                          _brun(j, 'git show "$base:', 'git show "$PR_BASE_SHA:')))
+        # A LATER assignment wins at runtime with the pinned block still present, verbatim, and
+        # adjacent. Only the single-assignment count can see this one.
+        yield ("a second assignment AFTER the block overrides the derivation",
+               lambda j: _brun(j, "if git cat-file -e",
+                               "base=$(git rev-parse HEAD)\nif git cat-file -e"))
+        # An event field interpolated anywhere in the body: `run:` is expanded before the shell
+        # sees it, so this is both the reversion's delivery route and an injection surface. Only
+        # the raw-body `${{` check can see this one.
+        yield ("an event expression is interpolated elsewhere in the body",
+               lambda j: j["steps"][1].update(
+                   {"run": j["steps"][1]["run"]
+                    + 'echo "${{ github.event.pull_request.title }}"\n'}))
+        # The fail-closed guard, deleted and — separately — made inert without crashing.
+        yield ("the two-parent guard is deleted",
+               lambda j: _brun(j, GUARD, "if false; then"))
+        yield ("the guard stops refusing (`exit 1` -> `exit 0`)",
+               lambda j: _brun(j, "  exit 1\n", "  exit 0\n"))
+        yield ("the guard's refusal is swallowed by `|| true`",
+               lambda j: _brun(j, "  exit 1\n", "  exit 1 || true\n"))
+        yield ("the third-parent probe is dropped, so a three-parent HEAD passes",
+               lambda j: _brun(j, ' || [ -n "$third_parent" ]', ""))
+        yield ("the head-parent probe is dropped, so a NON-merge HEAD passes",
+               lambda j: _brun(j, ' || [ -z "$head_parent" ]', ""))
+        # The operand replaced by another commit that is not the graded base.
+        yield ("the operand becomes HEAD itself",
+               lambda j: _brun(j, GRADED, 'base=$(git rev-parse --verify --quiet "HEAD" || true)'))
+        yield ("the operand becomes the PR HEAD parent",
+               lambda j: _brun(j, '"HEAD^1^{commit}"', '"HEAD^2^{commit}"'))
+        # And the step-level shapes that make any of it not run.
+        yield ("the step is made conditional", lambda j: j["steps"][1].update({"if": "false"}))
+        yield ("the step may fail silently",
+               lambda j: j["steps"][1].update({"continue-on-error": True}))
+        yield ("the step is dropped", lambda j: j["steps"].pop(1))
+        yield ("the step is duplicated",
+               lambda j: j["steps"].append(copy.deepcopy(j["steps"][1])))
+
+    for name, mutation in baseline_mutants():
+        chk(f"the baseline check REFUSES when {name}",
+            bool(_refused(assert_baseline_operand_seam, baseline_mutate(mutation))), True)
+
     # A job that is absent or step-less must REFUSE, not read as satisfied: this is the shape a
     # renamed job or a trimmed workflow presents, and it is exactly where a checker fails open.
     for shape, job in (("an absent job", None), ("a step-less job", {}),
@@ -645,6 +854,8 @@ def _self_test():
         chk(f"the seam check REFUSES {shape}", bool(_refused(assert_report_seam, job)), True)
         chk(f"the checkout check REFUSES {shape}",
             bool(_refused(assert_merge_ref_inputs, job)), True)
+        chk(f"the baseline check REFUSES {shape}",
+            bool(_refused(assert_baseline_operand_seam, job)), True)
 
     # ---- and the LIVE workflow, which is the only row that speaks for what actually runs.
     # An absent PyYAML is REPORTED AS A FAILING ROW, not raised: an exception here would abort the
@@ -665,6 +876,8 @@ def _self_test():
         _refused(assert_report_seam, live_job), "")
     chk("LIVE pr-gate.yml still checks out the merge ref with full history",
         _refused(assert_merge_ref_inputs, live_job), "")
+    chk("LIVE pr-gate.yml derives the protected baseline from the GRADED BASE, not base.sha",
+        _refused(assert_baseline_operand_seam, live_job), "")
 
     print("gate-staleness self-test", "PASSED" if ok else "FAILED", f"({checks} checks)")
     return 0 if ok else 1

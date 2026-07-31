@@ -186,13 +186,41 @@ jobs:
           set -euo pipefail
           base_manifest="$RUNNER_TEMP/base-selftest-suite.txt"
           base_retirements="$RUNNER_TEMP/base-selftest-retirements.txt"
-          base='${{ github.event.pull_request.base.sha }}'
+          # [issue #920] THE PROTECTED BASELINE IS READ FROM THE GRADED BASE — `HEAD^1` of the
+          # checked-out merge commit — NOT `github.event.pull_request.base.sha`. They are DIFFERENT
+          # COMMITS: GitHub does not recompute `refs/pull/N/merge` when the base branch moves
+          # (#920 measured a graded base 24 commits and 12 hours behind master on #756), while the
+          # event field is re-read per `pull_request` event, so the two drift apart by exactly the
+          # staleness gate-staleness.py reports one step above.
+          #
+          # THAT DRIFT IS A FALSE RED, AND IT IS THE WHOLE POPULATION. This baseline exists to
+          # refuse a pull request that DROPS an enrolled entry. An entry ENROLLED on the base
+          # branch after this merge ref was composed is absent from the graded tree through no act
+          # of the pull request — and against an event-field baseline it reads as "removed without
+          # prior base-branch retirement approval". `print-selftest-suite` then exits non-zero,
+          # `suite` is never assigned, and this required gate reds for EVERY open pull request
+          # composed before that enrolment, none of which can fix it from its own diff. Comparing
+          # the graded tree against the base it was actually composed with is the same refusal for
+          # a real removal — the merge result still lacks the entry the graded base has — and no
+          # refusal at all for an addition the pull request never saw.
+          #
+          # FAIL CLOSED on anything that is not the two-parent merge commit: a `ref:` override or a
+          # non-`pull_request` checkout makes `HEAD^1` some unrelated commit, and a baseline
+          # derived from the wrong tree is precisely what this step must not do. (The same operand,
+          # read the same way, is what gate-staleness.py and compose-gate.py already grade from.)
+          base=$(git rev-parse --verify --quiet "HEAD^1^{commit}" || true)
+          head_parent=$(git rev-parse --verify --quiet "HEAD^2^{commit}" || true)
+          third_parent=$(git rev-parse --verify --quiet "HEAD^3^{commit}" || true)
+          if [ -z "$base" ] || [ -z "$head_parent" ] || [ -n "$third_parent" ]; then
+            echo "::error::HEAD is not the two-parent refs/pull/N/merge commit this gate grades; refusing to derive the self-test suite"
+            exit 1
+          fi
           if ! git cat-file -e "$base^{commit}" 2>/dev/null; then
-            echo "::error::base commit $base is unresolvable; refusing to derive the self-test suite"
+            echo "::error::graded base commit $base is unresolvable; refusing to derive the self-test suite"
             exit 1
           fi
           # Bootstrap only: the introducing PR's base has no shared manifest yet, so its current
-          # complete manifest is the protected baseline. Every later PR reads the base-branch copy.
+          # complete manifest is the protected baseline. Every later PR reads the graded base's copy.
           if git cat-file -e "$base:scripts/selftest-suite.txt" 2>/dev/null; then
             git show "$base:scripts/selftest-suite.txt" > "$base_manifest"
           else
