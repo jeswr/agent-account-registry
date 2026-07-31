@@ -87,6 +87,48 @@ provider_model = "gpt-5.6-luna"        # Second codex tier (opus<luna<fable<opus
                                        # fallback.
 credential_format = "codex-auth-json"
 
+# ---------------------------------------------------------------------------------------------------
+# [#285] [agents] — AGENT CAPABILITIES. The MACHINE-READABLE declaration of what each persona's
+# checked-in brief (`.claude/agents/<name>.md`, loaded by worker-live.sh as the system prompt)
+# authorises. `fix_capable` answers exactly ONE question: may this persona be handed a lane that
+# MUTATES the checkout?
+#
+# WHO READS IT: review-fix.yml's resolve step, via policy-resolve.agent_fix_capable. The fix lane
+# adopts the SOURCE ISSUE's own route persona ONLY when it is declared `fix_capable = true` here.
+# It is a DECLARATION and not an inference: the form this replaced (review round 1) compared the
+# route's agent NAME against the persona the `role = "review"` row selects, which adopts any OTHER
+# verdict-only persona under a different name AND makes the reviewer adoptable the moment that row
+# is repointed — neither has anything to do with what the brief actually permits.
+#
+# FAIL-CLOSED BY CONSTRUCTION: an undeclared agent, a malformed row, and any value that is not the
+# boolean `true` all read as NOT fix-capable, so the lane keeps its `--role impl` implementer. A
+# target with no [agents] table adopts no route persona at all.
+#
+# ONCE THIS TABLE EXISTS, IT BINDS THE FALLBACK TOO (policy-resolve.agent_fix_refused). The persona
+# the lane finally PUBLISHES — the route's if it was adopted, otherwise the `--role impl` one —
+# must be declared `fix_capable = true` here, so an omitted, renamed or malformed `role = "impl"`
+# declaration fails the resolve job closed instead of shipping an undeclared persona to
+# `worker-live.sh fix` as a "known fix-capable" fallback. DECLARE A ROW FOR EVERY AGENT YOUR ROUTES
+# NAME. Only a target with NO [agents] table at all keeps the pre-declaration behaviour.
+#
+# KEPT HONEST BY A TEST, not by this comment: dispatch-claim.py's L3b-agent rows read the REAL
+# briefs and require every `fix_capable = false` persona to declare itself verdict-only, every
+# `fix_capable = true` persona's brief to say it edits the checkout, and every agent named by any
+# route below (and by [defaults]) to be declared here at all.
+[agents.registry-impl]
+fix_capable = true
+[agents.registry-ci]
+fix_capable = true
+[agents.registry-docs]
+fix_capable = true
+[agents.registry-researcher]
+fix_capable = true
+# The ONE verdict-only persona. Read-only tools (Read/Glob/Grep), writes nothing but
+# `.review-verdict.json`, brief states its job is "never a fix" — handing it to `worker-live.sh
+# fix` instructs the fixer not to edit the PR at all, so a compliant model produces no diff.
+[agents.registry-reviewer]
+fix_capable = false
+
 [defaults]
 model_chain = ["opus5", "sol"]
 agent = "registry-impl"

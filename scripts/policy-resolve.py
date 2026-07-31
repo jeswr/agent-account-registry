@@ -642,6 +642,70 @@ def assert_agent_capability(agent, required, target_root="."):
     return declared
 
 
+# [#285 review r2] AGENT CAPABILITY — the target's OWN machine-readable declaration of which
+# personas may be handed a lane that MUTATES a checkout. Declared as `[agents.<name>] fix_capable`
+# in the target's protected routing table, next to the `[[route]]` rows that name those personas.
+AGENT_TABLE = "agents"
+FIX_CAPABLE_KEY = "fix_capable"
+
+
+def agent_fix_capable(routing_doc, agent):
+    """Does TARGET's routing DECLARE ``agent`` able to run a mutating (fix) lane?
+
+    [#285 review r2] review-fix.yml's fix lane adopts the SOURCE ISSUE's route persona only when
+    this returns True. It replaced an INFERENCE — "the route agent is fix-capable because its NAME
+    differs from the one the `role = "review"` row selects" — which is unsound in both directions:
+    a SECOND verdict-only persona under any other name was adopted and handed to `worker-live.sh
+    fix` (whose brief forbids the edit the lane exists to make), and repointing the review row made
+    the old reviewer adoptable without one word of its brief changing.
+
+    FAIL-CLOSED, and every clause below is a way to be non-adoptable: a non-string/blank agent, a
+    routing document that is not a table, NO `[agents]` table at all (every target that has not
+    declared capabilities yet — those keep the `--role impl` implementer they had before this
+    existed), an undeclared agent, a malformed row, and any `fix_capable` that is not the boolean
+    `true` (a truthy string or 1 is a malformed declaration, never an authorisation).
+    """
+    if not isinstance(agent, str) or not agent.strip():
+        return False
+    if not isinstance(routing_doc, dict):
+        return False
+    table = routing_doc.get(AGENT_TABLE)
+    if not isinstance(table, dict):
+        return False
+    declaration = table.get(agent.strip())
+    if not isinstance(declaration, dict):
+        return False
+    return declaration.get(FIX_CAPABLE_KEY) is True
+
+
+def agent_fix_refused(routing_doc, agent):
+    """Must a mutating (fix) lane REFUSE ``agent`` as its role-resolved FALLBACK persona?
+
+    review-fix.yml applies this to the persona it falls back to when the route's own persona is
+    not adoptable, so "retain a KNOWN fix-capable persona" has to mean known.
+
+    The only question is whether the target has OPTED IN to declaring capabilities at all:
+
+    * NO ``[agents]`` table -> nothing is refused. Every target that predates this declaration
+      keeps exactly the `--role impl` implementer it had before, which is why this is not simply
+      ``not agent_fix_capable``.
+    * The table EXISTS -> the fallback must be declared ``fix_capable = true`` like any other
+      persona. [#285 review r3] An explicit ``false`` is not the only way to be unusable: a
+      capability-enabled target that OMITS its `role = "impl"` persona, renames it without
+      declaring the new name, or writes a malformed row/value has produced capability data that
+      says nothing about the one persona a mutating lane is about to run. Reading that silence as
+      authorisation made omission the permissive case at the FINAL selection point — the one place
+      the value is published to `worker-live.sh fix`. Once a target declares capabilities, an
+      undeclared fallback is a routing-document defect a human must fix, not a default to grant.
+
+    A routing document that is not a table has no `[agents]` table to opt in with, and is refused
+    upstream by :func:`resolve` long before a persona is selected.
+    """
+    if not isinstance(routing_doc, dict) or AGENT_TABLE not in routing_doc:
+        return False
+    return not agent_fix_capable(routing_doc, agent)
+
+
 def _self_test():
     policy = tomllib.loads('''
 [repos."sparq-org/sparq"]
@@ -1086,6 +1150,93 @@ agent = "docs-agent"
         rejects("structurally invalid routing yields NO keyword set (fail closed)",
                 "routing defaults table is required",
                 lambda: routing_security_keywords("o/r", tmp_policy, tmp_target))
+    # ---- [#285 review r2] AGENT CAPABILITY, the declaration review-fix.yml's fix lane adopts a
+    # route persona on. Every row is a way to be NON-adoptable, because the one thing that must
+    # never happen is a verdict-only brief reaching `worker-live.sh fix`.
+    cap_routing = tomllib.loads('''
+[agents.impl-agent]
+fix_capable = true
+[agents.security-agent]
+fix_capable = false
+[agents.stringy-agent]
+fix_capable = "true"
+[agents.truthy-agent]
+fix_capable = 1
+[agents.silent-agent]
+notes = "declared, but says nothing about fixing"
+[agents.malformed-agent]
+''')
+    cap_routing["agents"]["malformed-agent"] = "fix_capable = true"   # a row that is not a table
+    # An EMPTY-NAMED declaration; `[agents.""]` is legal TOML. Without it the blank-agent guard is
+    # an EQUIVALENT mutant (`table.get("")` misses anyway) and nothing here could kill it. With it,
+    # dropping that guard turns a route agent of `"   "` into an authorisation.
+    cap_routing["agents"][""] = {"fix_capable": True}
+
+    def _cap(predicate, doc, name):
+        """Call a capability predicate, reporting a CRASH as a value.
+
+        An AttributeError/TypeError raised by a dropped input guard would otherwise abort this
+        whole suite — which records as a kill while every check below it never runs (pre-flight 4,
+        crash-after-partial-run). Reported as a value it reds exactly one row and the total check
+        count is unchanged, which is what makes the mutation measurement readable."""
+        try:
+            return predicate(doc, name)
+        except Exception as exc:               # noqa: BLE001 — a crash is not an answer
+            return exc.__class__.__name__
+
+    check("a DECLARED fix-capable persona is adoptable",
+          agent_fix_capable(cap_routing, "impl-agent"), True)
+    check("a persona declared fix_capable = false is REFUSED (the verdict-only reviewer)",
+          agent_fix_capable(cap_routing, "security-agent"), False)
+    # The unsound round-1 inference in one line: capability is NOT "the name differs from the
+    # review row's". A second verdict-only persona under any other name must still be refused —
+    # and it is, because nothing declares it.
+    check("an UNDECLARED persona is not adoptable however it is named",
+          [agent_fix_capable(cap_routing, name)
+           for name in ("second-reviewer", "docs-agent", "default-agent")],
+          [False, False, False])
+    check("a NON-BOOLEAN fix_capable is a malformed declaration, never an authorisation",
+          [agent_fix_capable(cap_routing, name)
+           for name in ("stringy-agent", "truthy-agent", "silent-agent", "malformed-agent")],
+          [False, False, False, False])
+    check("a target with NO [agents] table adopts nothing (pre-declaration behaviour)",
+          agent_fix_capable(routing, "impl-agent"), False)
+    check("a blank/absent/non-string agent is not adoptable, and does not CRASH the resolve step "
+          "either (the table above declares an empty-named agent, so this is a real refusal)",
+          [_cap(agent_fix_capable, cap_routing, value)
+           for value in (None, "", "   ", 7, ["impl-agent"])],
+          [False, False, False, False, False])
+    check("surrounding whitespace does not defeat the declaration lookup",
+          agent_fix_capable(cap_routing, "  impl-agent  "), True)
+    check("a non-table routing document is not an authorisation",
+          [_cap(agent_fix_capable, doc, "impl-agent") for doc in (None, [], "agents")],
+          [False, False, False])
+    # agent_fix_refused is the FALLBACK side, and it turns on ONE thing: has the target opted in to
+    # declaring capabilities at all? [#285 review r3] It was the strict complement of
+    # `fix_capable = false` — which made OMISSION the permissive case at the final selection point:
+    # a capability-enabled target that never declared its `role = "impl"` persona (renamed, or a
+    # malformed row) handed that undeclared persona straight to `worker-live.sh fix` as a "known
+    # fix-capable" fallback. Once the table exists, only a DECLARATION authorises.
+    check("with an [agents] table, ONLY a declared-true fallback survives — false, silent, "
+          "malformed and UNDECLARED personas all refuse the fix lane",
+          [agent_fix_refused(cap_routing, name) for name in
+           ("impl-agent", "security-agent", "silent-agent", "second-reviewer", "malformed-agent",
+            "stringy-agent", "truthy-agent")],
+          [False, True, True, True, True, True, True])
+    # ...and the legacy carve-out, which is the ONLY reason this is not `not agent_fix_capable`.
+    check("no [agents] table refuses nobody (pre-declaration targets keep their implementer)",
+          [agent_fix_refused(routing, name) for name in ("impl-agent", "security-agent", "")],
+          [False, False, False])
+    check("an [agents] table that is PRESENT but declares nobody is an opt-in, not a bypass",
+          [agent_fix_refused(doc, "impl-agent")
+           for doc in ({"agents": {}}, {"agents": "impl-agent = true"}, {"agents": []})],
+          [True, True, True])
+    check("a blank/non-string agent is refused once the table exists, and does not crash; a "
+          "routing document that is not a table has no table to opt in with",
+          [_cap(agent_fix_refused, doc, name) for doc, name in
+           ((cap_routing, None), (cap_routing, "   "), (cap_routing, 7),
+            (None, "security-agent"), ("agents", "security-agent"))],
+          [True, True, True, False, False])
     # ---- [OPUS-5] CHAIN-ORDER PREFERENCES (sparq PR #4211 / the area:gui carve-out).
     # THIS resolver is the CLAIM side. PLAN runs the TARGET's route-resolve.py and
     # dispatch-claim._route_matches then demands EXACT equality of the chain, so a preference this
