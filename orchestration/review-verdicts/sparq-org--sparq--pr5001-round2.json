@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5001,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "dfd6fef754fc5171d4e25217c72469cff85adbb5",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains clean. The scheduled workflow is restricted to schedule and manual dispatch, checks out the repository without persisted credentials, uses repository-scoped identity, and grants only the label-write and checkout permissions it needs. Both classifier suites run before the mutating --apply invocation, overlapping runs are serialized, and the reporting step consumes the completed sweep log. The structural tests exercise the real workflow definition and pin the load-bearing trigger, permission, unconditional-execution, ordering, apply, reporting, and path-filter seams. The routing workflow includes the new workflow in both pull-request and push path filters, preventing the seam tests from becoming vacuous. No hostile reviewer-directed instruction appears in the diff, and no correctness, soundness, test-validity, or security defect is evident.",
+  "verdict": "approve"
+ }
+}
