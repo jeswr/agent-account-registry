@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5374,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3c3628827d7d8bb8e04b5993ee39301b0c30e090",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "resolve_pattern_scans accepts any prover-chosen subset of scans that match a pattern's constants, then bind_query_correctness and bind_attributions use that narrower relation. Constant matching is not merely ambiguity: for a SPARQL BGP over the committed union, every matching scan's triples are candidates for every same-layout pattern. A declaration is not proof that the excluded scan cannot contribute. For `{ ?s <age> ?v . ?v <age> ?o FILTER(?v >= 18) }`, scans with rows `(17, age, 25)` and `(25, age, 17)` can be declared respectively only for pattern 0 and pattern 1, so each declared `?v` slot is 25 while the matching-but-undeclared slots containing 17 escape FILTER gating. No-empty and no-dangling checks do not close this: every scan and pattern is named, yet real membership obligations were removed. The claim that a relying party reads rows according to the declaration changes the query semantics into source-partitioned patterns, which the query text does not express and which is not cryptographically established.",
+    "file": "crates/sparq-zk-compose/src/verifier.rs",
+    "fix_hint": "Do not use a prover-declared subset to relax query-semantic obligations. Keep FILTER and attribution checks over full membership unless an independently verified, query-semantic witness proves that excluded scans cannot contribute (including join/result-row binding). Add a negative counterexample with cross-shaped values such as `(17, age, 25)` and `(25, age, 17)` and require rejection when the declaration attempts to hide the failing opposite slots. The positive test must exercise an actual query solution/result-binding path rather than structural acceptance alone.",
+    "severity": "blocker",
+    "title": "Unbound declaration can suppress real FILTER and attribution obligations"
+   },
+   {
+    "body": "pattern_scans_declaration_removes_the_same_layout_over_demand only calls prefilter_manifest_structure and uses scans `(alice, age, 25)` and `(bob, age, 25)`. Those rows do not satisfy the shared `?v` join between the two patterns (`25` versus `bob`), and the manifest has no join edge tying them into a solution. Therefore acceptance proves only that the new declaration bypasses the old structural over-demand; it does not prove that the declaration corresponds to a real BGP answer or safely preserves FILTER semantics.",
+    "file": "crates/sparq-zk-compose/tests/e2e.rs",
+    "fix_hint": "Replace or supplement this with a real end-to-end manifest whose selected rows form a valid joined query solution, and include adversarial matching scans that are excluded by the declaration. The test should demonstrate that every row which can contribute under actual SPARQL evaluation remains subject to the correct FILTER and attribution gates.",
+    "severity": "major",
+    "title": "Happy-path test is not a valid witness of query correctness"
+   }
+  ],
+  "progress": null,
+  "summary": "The declaration is validated only as a subset of constant-layout membership, but that is not enough to justify narrowing FILTER and attribution obligations. Under ordinary SPARQL dataset semantics, every scan whose constants match a triple pattern can contribute solutions to that pattern; a prover cannot redefine that semantic relation by declaring that a matching scan answers only another same-layout pattern. The new positive test demonstrates structural acceptance of a source-partitioned interpretation, not correctness of the query's real evaluation path. This creates a soundness escape and the PR should not be approved.",
+  "verdict": "request_changes"
+ }
+}
