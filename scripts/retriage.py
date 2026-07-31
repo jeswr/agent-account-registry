@@ -17,6 +17,9 @@ directions:
               own drift makes enumerable (the lost-`role:*` case: `triage()` re-derives the role)
               is repaired in place. Strictly better than a re-park — it needs no human — and it is
               the SAME classifier verdict, not a second notion of completeness.
+  * UNPARK-AREA — the ONE `needs:*` gate this sweep may ever cross, and only because the MACHINE
+              minted it and the single fact it asserts is provably false (issue #606). See
+              AREA_PARK_LABEL below for the whole argument and its four preconditions.
 
 WHO MAY BE RETRIAGED (registry #487). The author trust gate is the FIRST thing `plan()` checks,
 and until now it recognised exactly two automation identities: the maintainer and the orchestrator
@@ -41,7 +44,9 @@ enumerability predicate; if the drift does not PROVE one of the three transition
 no-op skip. Park policy is load-bearing and checked BEFORE any classification: an untrusted author,
 any `needs:*` / `trust:untrusted` gate, an `<!-- orchestration:hold -->` marker, the
 dispatcher-owned `status:deferred`, the machine-owned `status:parked`, a claim-owned
-`status:in-progress[-review]`, and `kind:epic` are all skipped, never re-parked.
+`status:in-progress[-review]`, and `kind:epic` are all skipped, never re-parked. The single,
+narrowly-bounded exception is the UNPARK-AREA lane (AREA_PARK_LABEL) — which crosses NO other park:
+it is evaluated LAST, after every one of the checks above has already declined to fire.
 
 ONE APPLIER FOR ALL THREE ACTIONS (PR #595 finding 3). `--apply` owns the whole
 read -> plan -> mutate -> verify sequence for every accepted action above, through the SAME
@@ -93,9 +98,47 @@ ACTIONS_BOT_LOGIN = "github-actions[bot]"
 # Claim-owned states: groom's orphan/lease repair owns these, never this sweep (a re-park here
 # would race a live worker and strip the claim its PR is bound to).
 CLAIM_OWNED = {"status:in-progress", "status:in-progress-review"}
+# ---------------------------------------------------------------------------------------------------
+# [registry #606] THE ONE `needs:*` GATE THIS SWEEP MAY CROSS — and why it is not a weakening.
+#
+# `triage.triage()` parks a triage-complete-but-area-less issue with `needs:area`. That label is
+# MACHINE vocabulary with exactly ONE meaning — "this issue carries no `area:*` label" — and the
+# classifier is its only minter. It is also a `needs:*` gate, so before #606 NOTHING could clear it:
+# `plan()` skips every gated issue before it classifies, and `triage()` itself counts `needs:area`
+# in its own `gated` test, so `ready` (the branch that carries the label's only strip) is
+# unreachable while it is live. Restoring the `area:*` label therefore left the issue parked
+# FOREVER, behind a door every lane refuses to open — the same recovery-matrix hole as #586, one
+# gate over. #586 deliberately declined to MINT this label for that exact reason; #606 is the other
+# half, the EXIT.
+#
+# The exit is bounded by FOUR preconditions, every one of which must hold, and each of which kills a
+# different way this could become a fail-open:
+#   1. THE PARK'S OWN FACT IS FALSE — an `area:*` label is present. Nothing else is inferred: the
+#      label asserts one thing and only that thing is falsified. A park whose fact still HOLDS is
+#      never crossed, whatever the timeline says.
+#   2. IT IS THE ONLY GATE. `gates == [AREA_PARK_LABEL]` exactly. `needs:design` (the B2 hard gate),
+#      `needs:user` (the terminal human hold), `trust:untrusted` and every unknown `needs:*` still
+#      skip the issue untouched — a second gate is never crossed and never even inspected.
+#   3. EVERY OTHER PARK HAS ALREADY DECLINED. The unpark is evaluated LAST in `plan()`, after the
+#      hold marker, `status:deferred`, `status:parked`, the claim-owned states, `kind:epic` and the
+#      lane-membership refusal. Ordering IS the control here (self-test pinned per park).
+#   4. A PROVEN MACHINE APPLIED IT — `park_policy.label_application_machine_owned` for THIS EXACT
+#      label. A human who deliberately applies `needs:area` to an area-labelled issue is saying
+#      something the machine cannot read, so their hold stands. That predicate returns False for
+#      EVERY ambiguity (human-latest, unreadable timeline, malformed event, and — the case its own
+#      docstring names `needs:area` as the live prevalence example for — NO `labeled` event at all),
+#      and `plan()`'s default is no probe at all, which is likewise a refusal. Absence of evidence
+#      is never permission.
+#
+# WHAT IT DELIVERS INTO (AGENTS.md pre-flight 11). The unpark REMOVES the label and writes nothing
+# else — it makes no readiness claim of its own. The now-ungated issue is re-classified by the
+# EXISTING promotion lane on the next tick, through the same `triage()` verdict every other lane
+# uses, so this is not a second notion of completeness. Convergence is two writes and cannot
+# oscillate: with an `area:*` label present `triage()` never re-mints the park.
+AREA_PARK_LABEL = "needs:area"
 # The actions that WRITE. `--apply` mutates for each of them through the one shared applier; every
 # other verdict is a no-op skip (fail-closed: an unknown action never becomes a write).
-WRITING_ACTIONS = ("promote", "repark", "repair")
+WRITING_ACTIONS = ("promote", "repark", "repair", "unpark-area")
 NON_DISPATCHABLE = _ready.NON_DISPATCHABLE            # kind:epic
 # Bounded, rate-limit-safe sweep: an explicit per-run cap and a runaway ceiling on the paginated
 # snapshot. A partial page must never be mistaken for the whole board.
@@ -160,8 +203,15 @@ def actions_bot_trust(policy_file, repo):
 
 
 def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage,
-         known_labels=None, allow_actions_bot_issues=False):
-    """`known_labels` (optional): the target repo's ACTUAL label set. Supplying it makes the role
+         known_labels=None, allow_actions_bot_issues=False, park_clearable=None):
+    """`park_clearable(label) -> bool` (optional, registry #606): may an automated path DELETE this
+    exact park label from this exact issue right now? `_apply_cli` binds it to
+    `park_policy.label_application_machine_owned` over the live timeline. `None` — every direct and
+    self-test caller that does not opt in — is a REFUSAL, not a default grant: with no probe the
+    UNPARK-AREA lane below never fires and this function's verdicts are byte-for-byte the pre-#606
+    ones, so the `needs:*` gate skip stays load-bearing for every caller that cannot prove ownership.
+
+    `known_labels` (optional): the target repo's ACTUAL label set. Supplying it makes the role
     transition fail-closed (registry #582) — the classifier never plans an add of a label the repo
     does not have, and never plans a strip of the last role label for one. Without a role the
     classifier reports not-ready, so this path skips the issue as `classifier-incomplete` rather
@@ -184,7 +234,13 @@ def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage,
     # actions-bot author exactly as for the maintainer.
     gates = sorted(label for label in labels
                    if label.startswith("needs:") or label == "trust:untrusted")
-    if gates:
+    # [#606] preconditions 1 + 2 of the UNPARK-AREA lane, evaluated here only to decide whether the
+    # gate skip fires; the lane ITSELF is precondition 3 and lives at the very bottom of the park
+    # sequence. `gates == [AREA_PARK_LABEL]` is an EXACT single-element match, never a membership
+    # test: `needs:area` alongside `needs:design`/`needs:user`/`trust:untrusted` is still gated.
+    area_unpark = (gates == [AREA_PARK_LABEL]
+                   and any(label.startswith("area:") for label in labels))
+    if gates and not area_unpark:
         return {"action": "skip", "reason": "gated:" + ",".join(gates)}
     if HOLD_MARKER in (issue.get("body") or ""):
         return {"action": "skip", "reason": "explicit-hold"}
@@ -204,6 +260,18 @@ def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage,
     untriaged = "status:untriaged" in labels
     if not untriaged and "status:ready" not in labels:
         return {"action": "skip", "reason": "not-retriageable"}
+    # ---- [#606] UNPARK-AREA: precondition 3 (every other park has already declined, because this
+    # is the LAST thing evaluated) and precondition 4 (a proven machine applied the label). ----
+    if area_unpark:
+        if park_clearable is None or not park_clearable(AREA_PARK_LABEL):
+            # A distinct reason, not the generic `gated:` one, so the two populations are
+            # countable apart: "gated" means the sweep never even asked, this means it asked and
+            # the answer was no (human-applied, unreadable timeline, or no evidence at all).
+            return {"action": "skip", "reason": "area-park-not-machine-owned"}
+        # REMOVE ONLY. No `status:ready`, no role, no priority — the unpark makes no readiness
+        # claim; it deletes a park whose one fact is false and hands the issue to the promotion
+        # lane above, which re-classifies it from the SAME `triage()` verdict on the next tick.
+        return {"action": "unpark-area", "add": [], "remove": [AREA_PARK_LABEL], "role": None}
     try:
         # #598: the issue's REAL type, not the literal `"task"` this used to pass. With the literal,
         # `ROLE_BY_TYPE["task"]` always resolved, so this sweep could never reach the area-derived
@@ -270,7 +338,11 @@ def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage,
         # with it: this sweep SKIPS every gated issue, so writing that gate would strand the issue
         # behind a door the sweep itself refuses to open — re-creating the exact hole #586 closes.
         # `status:untriaged` alone is sufficient; the promotion lane re-admits on label restore.
-        add -= {"needs:area"}
+        # STILL TRUE AFTER #606, which is why this line stays. The UNPARK-AREA lane only crosses the
+        # gate once the park's fact is FALSE (an `area:*` label is present) AND a proven machine
+        # applied it; a re-park mints it on an issue that by construction has NO area, so the
+        # minted gate would be uncrossable and the issue stranded exactly as before.
+        add -= {AREA_PARK_LABEL}
         if "status:untriaged" not in add or "status:ready" not in remove:
             # triage() always parks a not-ready issue this way; a drifted classifier that does not
             # is unproven input, so do nothing.
@@ -391,10 +463,13 @@ def snapshot(pages, cap=SWEEP_CAP, ceiling=SWEEP_CEILING, rotation=0):
 def apply_decision(current, decision, edit, view, read_state=None, warn=None):
     """Apply an ACCEPTED decision through the SHARED fail-closed applier (triage.apply_triage).
 
-    Every writing action goes through here — `promote`, and the #586 `repark`/`repair` lanes — so
-    the two directions of the sweep cannot drift into two mutation paths. `ready` is the projected
-    attestation (a re-park is on its way OUT of `status:ready`); `role` is the intended single role,
-    which the applier adds and VERIFIES before it strips any incumbent.
+    Every writing action goes through here — `promote`, the #586 `repark`/`repair` lanes and the
+    #606 `unpark-area` lane — so the directions of the sweep cannot drift into separate mutation
+    paths, and the add-before-strip/single-role post-condition covers all of them equally (the
+    unpark carries no `role`, so it plans no role transition and its post-read simply confirms the
+    incumbent one survived). `ready` is the projected attestation (a re-park is on its way OUT of
+    `status:ready`); `role` is the intended single role, which the applier adds and VERIFIES before
+    it strips any incumbent.
 
     Returns {"ok": bool, "warnings": [...]}. ok=False must turn the workflow step RED — never
     swallow it, and never let the shell short-circuit past the post-condition (PR #595 finding 3).
@@ -531,6 +606,91 @@ def read_live_body(repo, number):
     return {"body": body, "state": state.strip().upper(), "type": name}
 
 
+def issue_timeline_events(repo, number):
+    """The FULL, paginated label timeline of `repo#number`, through the shared bounded-retry READ
+    layer. RAISES on anything that is not positively a complete list of well-formed pages.
+
+    The newest events — the ones ownership hinges on — are on the LAST page, so a truncated or
+    malformed read must raise rather than return a prefix: `park_policy` turns the raise into
+    LABEL_OWNER_UNKNOWN, i.e. NOT clearable, which is the only safe direction for a predicate whose
+    True authorises deleting a park label."""
+    raw = static_triage._gh_read(                           # noqa: SLF001 — the one shared read layer
+        ["api", "--paginate", "--slurp",
+         f"repos/{repo}/issues/{number}/timeline?per_page=100"])
+    try:
+        pages = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise SweepError(f"issue #{number}: the timeline read is not JSON ({exc})") from exc
+    if not isinstance(pages, list):
+        raise SweepError(f"issue #{number}: the timeline read is not a list of pages")
+    for page in pages:
+        if not isinstance(page, list):
+            raise SweepError(f"issue #{number}: a timeline page is not a list — refusing to "
+                             "decide label ownership from a partial view")
+    return [event for page in pages for event in page]
+
+
+def is_human_maintainer(repo, login):
+    """park_policy's STRICT maintainer probe (`HUMAN_MAINTAINER_PERMISSIONS`) over the shared
+    bounded-retry read layer — with the UNVERIFIABLE direction INVERTED for this call site.
+
+    `probe_maintainer`'s documented direction is "unverifiable = not human", and it is right for the
+    question its other callers ask: *may I APPLY a park?* There, not-human means no veto is minted,
+    i.e. the park lands — the conservative answer. This call site asks the OPPOSITE question — *may
+    I DELETE a park label a human may have applied?* — and there "not human" is the answer that
+    GRANTS. An expired token, a transport blip or a malformed payload would silently degrade every
+    human gesture to "a machine applied it" and authorise deleting a human's hold, with no operator
+    signal beyond one warning line.
+
+    So a probe we could not COMPLETE reads as HUMAN here: the park stands, which is visible, cheap,
+    and one manual label removal away from recovery — instead of a silent override. This is strictly
+    MORE conservative than the shared default and does not fork it: `is_human` is park_policy's
+    documented injection point, and the shared probe (with its distinct loud diagnostic) still
+    decides every case it can actually answer. A GENUINE not-a-maintainer permission IS a completed
+    probe and stays not-human, so the lane is not simply disabled — both directions are self-tested.
+
+    In the recovery path this exists for the probe is never even reached: `needs:area` is applied by
+    `github-actions[bot]`, and `park_policy._is_proven_human` short-circuits on the `[bot]` suffix
+    before any permission read.
+    """
+    unverifiable = []
+
+    def read_permission(probe_login):
+        try:
+            raw = static_triage._gh_read(                   # noqa: SLF001 — one shared read layer
+                ["api", f"repos/{repo}/collaborators/{probe_login}/permission"])
+            payload = json.loads(raw or "null")
+        except Exception:                                  # noqa: BLE001 — re-raised for the probe
+            unverifiable.append(probe_login)
+            raise
+        if not isinstance(payload, dict):
+            unverifiable.append(probe_login)
+            raise SweepError("collaborator permission payload is malformed")
+        return payload.get("permission")
+
+    return park_policy.probe_maintainer(repo, login, read_permission) or bool(unverifiable)
+
+
+def live_park_clearable(repo, number, log=print):
+    """`plan()`'s `park_clearable` bound to the LIVE issue — precondition 4 of the #606 unpark lane.
+
+    `park_policy.label_application_machine_owned` for THIS EXACT label, never `park_applications`:
+    that helper answers a question about READMISSION_LABELS *collectively* and its own docstring
+    names `needs:area` (200 live instances on sparq-org/sparq) as the case where "no park event at
+    all" would be read as permission. The predicate used here returns False for every ambiguity —
+    human-latest application, no `labeled` event, unreadable timeline, malformed shape — and it is
+    the SAME function groom / dispatch-claim / the conflict reconcilers authorise their own label
+    deletions with, so "may not clear there" and "may not clear here" cannot drift. The one
+    deliberate local strengthening is the maintainer probe's fail direction — see
+    `is_human_maintainer`."""
+    def clearable(label):
+        return park_policy.label_application_machine_owned(
+            repo, number, label, issue_timeline_events,
+            is_human=lambda login: is_human_maintainer(repo, login), log=log)
+
+    return clearable
+
+
 def _apply_cli(repo, number, issue, maintainer, app_bot, permission, known_labels,
                allow_actions_bot_issues=False):
     """`--apply`: re-read the LIVE labels AND the LIVE body, plan against them, mutate fail-closed.
@@ -576,7 +736,11 @@ def _apply_cli(repo, number, issue, maintainer, app_bot, permission, known_label
         return 0
     known = list(known_labels) if known_labels else static_triage.repo_label_set(repo)
     decision = plan(fresh, maintainer, app_bot, permission, known_labels=known,
-                    allow_actions_bot_issues=allow_actions_bot_issues)
+                    allow_actions_bot_issues=allow_actions_bot_issues,
+                    # [#606] The ownership probe is a CALLABLE, not a pre-computed boolean: it is
+                    # only ever invoked on the one branch that would delete a park label, so an
+                    # issue that is not `needs:area`-parked costs no timeline read at all.
+                    park_clearable=live_park_clearable(repo, number))
     print(json.dumps(decision, sort_keys=True))
     if decision["action"] not in WRITING_ACTIONS:
         return 0
@@ -930,6 +1094,103 @@ def _self_test():
         plan(repaired, "owner", "app[bot]", "none"),
         {"action": "skip", "reason": "ready-consistent"})
 
+    # -------------------------------------------------------------------------------------------
+    # [registry #606] THE UNPARK-AREA LANE — the ONE `needs:*` gate this sweep may cross.
+    # Before this, a `needs:area`-parked issue whose `area:*` label a human restored was stranded
+    # FOREVER: `plan()` skips every gated issue before it classifies, and `triage()` counts
+    # `needs:area` in its OWN `gated` test, so the branch carrying the label's only strip is
+    # unreachable while it is live. Four preconditions bound the exit (see AREA_PARK_LABEL); each
+    # one gets its own rows here, in BOTH directions, and the ordering precondition is asserted
+    # against every other park individually because ordering is the only thing enforcing it.
+    # -------------------------------------------------------------------------------------------
+    def probe(answer, calls=None):
+        """A `park_clearable` that RECORDS what it was asked. `calls` makes the question itself
+        assertable — a lane that probed for the wrong label, or probed for a park it must never
+        cross, is a different defect from one that got the wrong answer."""
+        def clearable(label):
+            if calls is not None:
+                calls.append(label)
+            return answer
+
+        return clearable
+
+    # PRODUCER PIN, BY EXECUTION. This lane's whole authority rests on `needs:area` being the label
+    # `triage()` mints for a no-area issue and on that being its ONLY meaning. Asserted by running
+    # the producer, not by comparing two spellings of a constant: rename the park in triage.py and
+    # this row goes red instead of the unpark lane silently becoming unreachable.
+    _minted = static_triage.triage({"priority:P2", "role:impl", "status:untriaged"}, "task")
+    chk("[#606] PRODUCER PIN: triage() parks a no-area issue with EXACTLY this label, not ready",
+        (sorted(lb for lb in _minted["add"] if lb.startswith("needs:")), _minted["ready"]),
+        ([AREA_PARK_LABEL], False))
+
+    _parked = labelled("status:untriaged", "priority:P2", ROLE_LABEL, "area:groom", AREA_PARK_LABEL)
+    _asked = []
+    chk("[#606] HEADLINE: a restored area:* label makes the machine park clearable, and the "
+        "unpark REMOVES ONLY that label (it makes no readiness claim of its own)",
+        plan(_parked, "owner", "app[bot]", "none", park_clearable=probe(True, _asked)),
+        {"action": "unpark-area", "add": [], "remove": [AREA_PARK_LABEL], "role": None})
+    chk("[#606] ...and the ownership question was asked about EXACTLY that label, exactly once",
+        _asked, [AREA_PARK_LABEL])
+    chk("[#606] PRECONDITION 4: a probe that says no (human-applied / unreadable / no evidence) "
+        "leaves the park standing",
+        plan(_parked, "owner", "app[bot]", "none", park_clearable=probe(False)),
+        {"action": "skip", "reason": "area-park-not-machine-owned"})
+    chk("[#606] PRECONDITION 4: NO probe at all is a refusal, never a default grant",
+        plan(_parked, "owner", "app[bot]", "none"),
+        {"action": "skip", "reason": "area-park-not-machine-owned"})
+    _unasked = []
+    chk("[#606] PRECONDITION 1: a park whose one FACT still holds (no area:*) stays gated — "
+        "ownership can never authorise crossing a park that is still TRUE",
+        plan(labelled("status:untriaged", "priority:P2", ROLE_LABEL, AREA_PARK_LABEL),
+             "owner", "app[bot]", "none", park_clearable=probe(True, _unasked)),
+        {"action": "skip", "reason": "gated:" + AREA_PARK_LABEL})
+    chk("[#606] ...and that issue's timeline is never even consulted", _unasked, [])
+    for extra in ("needs:design", "needs:user", "needs:external-audit", "trust:untrusted"):
+        chk(f"[#606] PRECONDITION 2: {extra} alongside the park keeps the WHOLE issue gated",
+            plan(labelled("status:untriaged", "priority:P2", ROLE_LABEL, "area:groom",
+                          AREA_PARK_LABEL, extra), "owner", "app[bot]", "none",
+                 park_clearable=probe(True)),
+            {"action": "skip", "reason": "gated:" + ",".join(sorted([AREA_PARK_LABEL, extra]))})
+    # PRECONDITION 3 is ORDERING, and ordering is enforced by nothing but the position of the lane
+    # in plan(). Every park is asserted individually WITH a granting probe, so hoisting the unpark
+    # above any one of them turns exactly that row red.
+    for park, reason in ((park_policy.MACHINE_PARK_LABEL, "machine-parked"),
+                         ("status:in-progress", "claim-owned"),
+                         ("status:in-progress-review", "claim-owned"),
+                         ("kind:epic", "epic"),
+                         ("status:deferred", "not-retriageable")):
+        chk(f"[#606] PRECONDITION 3: {park} refuses the unpark even with a GRANTING probe",
+            plan(labelled("status:untriaged", "priority:P2", ROLE_LABEL, "area:groom",
+                          AREA_PARK_LABEL, park), "owner", "app[bot]", "none",
+                 park_clearable=probe(True)),
+            {"action": "skip", "reason": reason})
+    chk("[#606] PRECONDITION 3: an orchestration hold outranks a granting probe",
+        plan(labelled("status:untriaged", "priority:P2", ROLE_LABEL, "area:groom", AREA_PARK_LABEL,
+                      body=HOLD_MARKER), "owner", "app[bot]", "none", park_clearable=probe(True)),
+        {"action": "skip", "reason": "explicit-hold"})
+    chk("[#606] PRECONDITION 3: an untrusted author outranks a granting probe",
+        plan(labelled("status:untriaged", "priority:P2", ROLE_LABEL, "area:groom", AREA_PARK_LABEL,
+                      author="outsider"), "owner", "app[bot]", "read", park_clearable=probe(True)),
+        {"action": "skip", "reason": "untrusted-author"})
+    chk("[#606] PRECONDITION 3: an issue on NEITHER sweep lane is not unparked either",
+        plan(labelled("priority:P2", ROLE_LABEL, "area:groom", AREA_PARK_LABEL),
+             "owner", "app[bot]", "none", park_clearable=probe(True)),
+        {"action": "skip", "reason": "not-retriageable"})
+    # WHAT THE TRANSITION DELIVERS INTO (AGENTS.md pre-flight 11). An unpark that re-admits into an
+    # unchanged tree has produced nothing: the point is the issue reaching DISPATCH, not the label
+    # going away. Two writes, then a fixed point — and `triage()` never re-mints the park, because
+    # the `area:*` label it parks for is present, so the pair cannot oscillate.
+    _unparked = applied(_parked, plan(_parked, "owner", "app[bot]", "none",
+                                      park_clearable=probe(True)))
+    _promotion = plan(_unparked, "owner", "app[bot]", "none")
+    chk("[#606] DELIVERS INTO: the un-parked issue is PROMOTED by the EXISTING lane next tick",
+        (_promotion["action"], sorted(_promotion["add"]), _promotion["remove"]),
+        ("promote", ["status:ready"], ["status:untriaged"]))
+    chk("[#606] ...and the third tick is a FIXED POINT — two writes, no oscillation, no re-mint",
+        plan(applied(_unparked, _promotion), "owner", "app[bot]", "none",
+             park_clearable=probe(True)),
+        {"action": "skip", "reason": "ready-consistent"})
+
     # ---- the bounded, fail-closed snapshot ----
     def api(number, *names, login="owner", updated="2026-07-01T00:00:00Z"):
         return {"number": number, "user": {"login": login}, "body": "",
@@ -1160,7 +1421,9 @@ def _self_test():
     stale = {"author": {"login": "owner"}, "body": "", "labels": [{"name": "stale:snapshot"}]}
 
     def run_apply_argv(gh, stdin_doc=None, live_body="", body_error=None, live_document=None,
-                       live_state="OPEN", argv=None, live_type=None):
+                       live_state="OPEN", argv=None, live_type=None, timeline=None,
+                       timeline_error=None, permissions=None, timeline_document=None,
+                       permission_document=None, permission_error=None):
         """Drive main(apply_argv) end-to-end against a fake GitHub. Returns (exit code, spied).
 
         THE STUB BOUNDARY IS `triage._gh_read`, NOT `read_live_body` (#605 review round 4, MAJOR).
@@ -1173,7 +1436,17 @@ def _self_test():
         body, which is how the #605 round-2 fail-open hold race is exercised. `live_document`
         overrides the whole RAW response text (a malformed success). `body_error` makes the read
         fail like the real `_gh_read` does, which must stop the write. `live_type` is the LIVE
-        issue-type name (#598); `None` renders GitHub's untyped answer, a JSON `null` `issueType`."""
+        issue-type name (#598); `None` renders GitHub's untyped answer, a JSON `null` `issueType`.
+
+        [#606] `timeline` is the LIST OF PAGES the paginated timeline read returns (so
+        `issue_timeline_events`' own argv, JSON parse and page-shape validation are under test, not
+        replaced); `timeline_document` overrides that response's RAW text (a malformed SUCCESS);
+        `timeline_error` makes the read fail like a transport blip; `permissions` maps a login to
+        the collaborator permission the probe reads, with `permission_document` /
+        `permission_error` the same two malformed-success / failed-read overrides for it. All are
+        None by default, and then the timeline read is never issued at all — which is itself
+        asserted below, because a sweep that read one timeline per swept issue would be a per-issue
+        API cost regression."""
         seen = {}
         saved_plan = globals()["plan"]
         saved_read = static_triage._gh_read                # noqa: SLF001 — the seam under test
@@ -1182,17 +1455,37 @@ def _self_test():
 
         def spy_plan(issue_doc, maintainer, app_bot, permission,
                      classify=static_triage.triage, known_labels=None,
-                     allow_actions_bot_issues=False):
+                     allow_actions_bot_issues=False, park_clearable=None):
             seen.update(known_labels=known_labels, maintainer=maintainer, permission=permission,
                         labels=list(issue_doc.get("labels", ())), body=issue_doc.get("body"),
                         type=issue_doc.get("type"),
-                        allow_actions_bot_issues=allow_actions_bot_issues)
+                        allow_actions_bot_issues=allow_actions_bot_issues,
+                        # [#606] whether `_apply_cli` supplied a probe AT ALL: dropping the
+                        # `park_clearable=` argument reverts the lane to a permanent refusal with
+                        # every direct-call row below still green.
+                        park_clearable=park_clearable)
             return saved_plan(issue_doc, maintainer, app_bot, permission, classify, known_labels,
-                              allow_actions_bot_issues)
+                              allow_actions_bot_issues, park_clearable)
 
         def fake_read(args):
             """The one shared read layer, faked at the boundary the production code really calls."""
             seen.setdefault("reads", []).append(list(args))
+            # [#606] The ownership probe's two reads, dispatched on the argv the PRODUCTION helpers
+            # build — so a helper that asked for the wrong path, or skipped the read entirely, gets
+            # a different (asserted) `reads` log rather than a stubbed-away pass.
+            if args[:1] == ["api"] and args[-1].endswith("/permission"):
+                if permission_error is not None:
+                    raise RuntimeError(f"gh {' '.join(args)} failed: {permission_error}")
+                if permission_document is not None:
+                    return permission_document
+                login = args[-1].split("/collaborators/")[1].split("/")[0]
+                return json.dumps({"permission": (permissions or {}).get(login, "none")})
+            if any("/timeline" in token for token in args):
+                if timeline_error is not None:
+                    raise RuntimeError(f"gh {' '.join(args)} failed: {timeline_error}")
+                if timeline_document is not None:
+                    return timeline_document
+                return json.dumps(timeline if timeline is not None else [[]])
             if body_error is not None:
                 # Exactly how the real _gh_read reports a failed read.
                 raise RuntimeError(f"gh {' '.join(args)} failed: {body_error}")
@@ -1606,6 +1899,119 @@ def _self_test():
                                   ("status:ready", "priority:P2", "area:dispatch"),
                                   ("status:untriaged", "priority:P2", "area:dispatch"))]
                    == ["skip", "repair", "promote"]))
+
+    # -------------------------------------------------------------------------------------------
+    # [registry #606] THE UNPARK LANE THROUGH THE REAL ENTRYPOINT AND THE PRODUCTION PROBE.
+    # The direct rows above hand `plan()` a boolean-shaped stub; these drive
+    # main -> _apply_cli -> live_park_clearable -> issue_timeline_events / is_human_maintainer ->
+    # park_policy.label_application_machine_owned against canned TIMELINES, so the helper's own
+    # argv, JSON parse and page-shape validation are what is under test. Mutants these kill:
+    # dropping `park_clearable=` from _apply_cli's plan() call (a permanently dead lane with every
+    # direct row green), dropping "unpark-area" from WRITING_ACTIONS (`return 0` before the write —
+    # the #605 r2 f1 shape), and swapping the ownership predicate for one that reads absence,
+    # malformedness or a human application as permission.
+    # -------------------------------------------------------------------------------------------
+    parked_start = {"status:untriaged", "priority:P2", "area:dispatch", "role:impl",
+                    AREA_PARK_LABEL}
+
+    def park_event(login, at="2026-07-01T00:00:00Z", label=AREA_PARK_LABEL):
+        return [[{"event": "labeled", "label": {"name": label}, "created_at": at,
+                  "actor": {"login": login}}]]
+
+    BOT_PARK = park_event("github-actions[bot]")
+    HUMAN_PARK = park_event("jeswr", at="2026-07-02T00:00:00Z")
+
+    cleared = FakeGh(parked_start, known)
+    code, seen = run_apply_argv(cleared, timeline=BOT_PARK)
+    checks.append(("[#606] the workflow-shaped ARGV CLEARS a machine-applied needs:area park, in "
+                   "ONE mutation, and attests NOTHING else",
+                   (code, cleared.calls, AREA_PARK_LABEL in cleared.labels,
+                    "status:ready" in cleared.labels, roles_of(cleared.labels))
+                   == (0, [([], [AREA_PARK_LABEL])], False, False, {"role:impl"})))
+    checks.append(("[#606] the timeline really goes through the shared read layer, PAGINATED, for "
+                   "THIS issue — not a stub standing in for the helper",
+                   [args for args in seen.get("reads", []) if "timeline" in " ".join(args)]
+                   == [["api", "--paginate", "--slurp",
+                        "repos/o/r/issues/7/timeline?per_page=100"]]))
+    checks.append(("[#606] _apply_cli actually SUPPLIES a probe to plan()",
+                   callable(seen.get("park_clearable"))))
+    # DELIVERS INTO, end to end: the next tick of the SAME sweep promotes the un-parked issue into
+    # the dispatchable frontier. Without this the lane would only prove a label went away.
+    code, _seen = run_apply_argv(cleared, timeline=BOT_PARK)
+    checks.append(("[#606] DELIVERS INTO, end to end: the NEXT tick promotes it into dispatch",
+                   (code, "status:ready" in cleared.labels, "status:untriaged" in cleared.labels,
+                    roles_of(cleared.labels)) == (0, True, False, {"role:impl"})))
+
+    # `needle` (where one exists) pins the DIAGNOSTIC as well as the outcome. Three of
+    # `issue_timeline_events`' shape guards are otherwise UNKILLABLE-by-outcome, because
+    # `park_policy._event_rows` independently raises on most malformed shapes downstream and every
+    # refusal path lands on the same verdict — the mutually-masking-duplicate shape of AGENTS.md
+    # pre-flight 4. Measured: deleting each of the three left this suite green until these needles
+    # existed. The needle is not decoration: an operator staring at a park that will not clear needs
+    # to know WHICH read failed, and `label_application_ownership` logs the raise verbatim.
+    for name, kwargs, needle in (
+            ("a PROVEN-HUMAN application", {"timeline": HUMAN_PARK,
+                                            "permissions": {"jeswr": "admin"}}, None),
+            ("NO `labeled` event at all (absence is not permission)", {"timeline": [[]]}, None),
+            ("a labeled event for a DIFFERENT label only",
+             {"timeline": park_event("github-actions[bot]", label="needs:design")}, None),
+            ("an UNREADABLE timeline", {"timeline_error": "HTTP 503"}, "HTTP 503"),
+            ("a malformed timeline EVENT", {"timeline": [["not-an-object"]]}, None),
+            ("an unparseable created_at",
+             {"timeline": park_event("github-actions[bot]", at="zzz")}, None),
+            # THE DROPPED PAGE, and the reason the per-page guard is not cosmetic. Page 1 carries a
+            # BOT application; page 2 is malformed and — in the real API — could be the page holding
+            # a LATER human one. Without the guard the flatten silently swallows page 2 and the
+            # surviving bot event reads as "a machine applied it", so the park CLEARS on a partial
+            # view. This fixture is the one that makes deleting the guard change the OUTCOME, not
+            # merely the message.
+            ("a DROPPED timeline page (a partial view that could hide a human application)",
+             {"timeline": [park_event("github-actions[bot]")[0], {}]},
+             "a timeline page is not a list"),
+            # A malformed SUCCESSFUL read is a distinct class from a failed one, and it is the class
+            # #605 round 4 caught falling open elsewhere in this file: the read exits 0, so only a
+            # shape check can refuse it.
+            ("a non-JSON timeline body", {"timeline_document": "Not Found"},
+             "the timeline read is not JSON"),
+            ("a timeline body that is not a list of pages",
+             {"timeline_document": '{"message": "Moved Permanently"}'},
+             "the timeline read is not a list of pages"),
+            # ...and the same two classes on the MAINTAINER PROBE, where the fail direction is
+            # INVERTED on purpose (is_human_maintainer): an unverifiable actor reads as HUMAN here,
+            # so the park stands. Under park_policy's shared direction these two CLEAR — a broken
+            # probe token silently authorising the deletion of a human's hold.
+            ("an unreadable maintainer probe", {"timeline": HUMAN_PARK,
+                                                "permission_error": "HTTP 401"}, None),
+            ("a malformed maintainer-probe payload", {"timeline": HUMAN_PARK,
+                                                      "permission_document": '["admin"]'}, None)):
+        refused = FakeGh(parked_start, known)
+        code, seen = run_apply_argv(refused, **kwargs)
+        checks.append((f"[#606] {name} does NOT clear the park, and writes nothing at all",
+                       (code, refused.calls, refused.labels == set(parked_start),
+                        "area-park-not-machine-owned" in seen.get("stdout", ""),
+                        needle is None or needle in seen.get("stdout", ""))
+                       == (0, [], True, True, True)))
+    # NEGATIVE CONTROL for the maintainer probe itself. The SAME human-login timeline with a
+    # NON-maintainer permission is not a proven human, so the park is machine-owned and clears.
+    # Without this row an `is_human_maintainer` hardwired to True would refuse everything above and
+    # every refusal row would still pass — the probe would be asserting only its own paranoia.
+    weak = FakeGh(parked_start, known)
+    code, seen = run_apply_argv(weak, timeline=HUMAN_PARK, permissions={"jeswr": "read"})
+    checks.append(("[#606] NEGATIVE CONTROL: a non-maintainer actor mints no human hold, so the "
+                   "same timeline clears",
+                   (code, weak.calls, AREA_PARK_LABEL in weak.labels)
+                   == (0, [([], [AREA_PARK_LABEL])], False)))
+    checks.append(("[#606] ...and the permission probe read THIS repo's collaborator row for the "
+                   "event's own actor",
+                   ["api", "repos/o/r/collaborators/jeswr/permission"] in seen.get("reads", [])))
+    # COST: the probe is a callable invoked only on the branch that would delete a label, so an
+    # issue carrying no area park pays no timeline read. A pre-computed boolean would read one
+    # timeline per swept issue — 80 extra requests a tick, twice an hour.
+    plain = FakeGh(start, known)
+    code, seen = run_apply_argv(plain)
+    checks.append(("[#606] an issue with no area park costs NO timeline read (the probe is lazy)",
+                   (code, [args for args in seen.get("reads", []) if "timeline" in " ".join(args)])
+                   == (0, [])))
 
     # -------------------------------------------------------------------------------------------
     # [PR #595 findings 3 + 6] STATIC WORKFLOW CONTRACT. The sweep must mutate ONLY through the
