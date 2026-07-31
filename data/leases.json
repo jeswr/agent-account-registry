@@ -41,16 +41,6 @@
    "expires_at": 1785475044
   },
   {
-   "account": "51bde6688e140866",
-   "claim_id": "247d081c07424683958f978d8b153d86",
-   "holder": "fix:jeswr/agent-account-registry#1331@dispatch-30601523249.1",
-   "package": "groom",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785468752,
-   "expires_at": 1785475052
-  },
-  {
    "account": "58b7c92faa5b5ca5",
    "claim_id": "130301d74742403b943a28ce30f13abe",
    "holder": "fix:jeswr/agent-account-registry#1346@dispatch-30601523249.1",
