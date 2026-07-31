@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5320,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "dc33d866574dc6e4495a0e3865380fbd5b9867a3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The documentation-only change is internally consistent and appropriately caveated. It correctly distinguishes XPath fn:avg(()) (empty sequence) from SPARQL Avg({}) (integer zero), explicitly admits that the out-of-tree Noir rejection behavior is not verified here, and preserves the research-grade/not-externally-audited posture. The reachability claim is supported by the in-tree verifier's fail-closed handling of GraphPattern::Group and Extend-over-Group, while the differential README accurately limits its evidence to scalar functions. No vacuous test or security claim is introduced because the change claims no new implementation or verification coverage.",
+  "verdict": "approve"
+ }
+}
