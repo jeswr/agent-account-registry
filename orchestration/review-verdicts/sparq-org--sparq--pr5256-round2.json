@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5256,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1fe4d5b12c29928c3e0e106d0a959f0d94fa7f08",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly adds a feature-matrix leg that executes the default-OFF vc-bridge tests and supplies non-self-referential W3C interoperability coverage for both supported cryptosuites. The fixture byte hashes match the published constants. The tests exercise the public hashing, verification, token-dispatch, and ingest paths, and include meaningful negative mutations for signatures, credential content, proof configurations, and suite confusion, so the positive verification is not vacuous. Scope and audit-status claims are appropriately limited to off-circuit ingest-time verification and explicitly disclaim in-circuit/query soundness and external audit. I found no correctness, soundness, security, or test-validity defect in the diff. The Rust test suite could not be executed in this review environment because cargo is unavailable.",
+  "verdict": "approve"
+ }
+}
