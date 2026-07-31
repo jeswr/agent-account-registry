@@ -51,16 +51,6 @@
    "expires_at": 1785491398
   },
   {
-   "account": "dc2d751954080e13",
-   "claim_id": "1ca15adbaba640bba8348c072e488d98",
-   "holder": "review:sparq-org/sparq#5282@dispatch-30614578877.1",
-   "package": "sparq-canon",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785485109,
-   "expires_at": 1785489309
-  },
-  {
    "account": "9e13ea21abf27e68",
    "claim_id": "966ac6b5bd78458883f601ddd2127238",
    "holder": "fix:sparq-org/sparq#5289@dispatch-30614578877.1",
