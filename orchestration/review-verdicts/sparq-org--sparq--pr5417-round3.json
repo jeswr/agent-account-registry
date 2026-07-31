@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5417,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "49915ca0b67722f4ee1198fc46f39ecbff979d2e",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 finds no correctness, soundness, test-validity, or security defect in the changed query path. The wasm shim delegates directly to the reasoner's matcher-backed query API; the query implementation materializes only data facts, combines data/query backward rules for premise resolution, projects and deduplicates grounded conclusions, and preserves fresh existential/list-cell identities. The focused n3_query integration tests exercise the real public entry points for closure projection, comparison and functional builtins, first-class lists, quoted formulae, backward rules, deduplication, fail-loud handling, and the prior blank/list collision regression. Public exports and usage documentation remain aligned. The targeted test could not be rerun in this checkout because cargo is unavailable, so this verdict rests on the diff-scoped code and tests. With zero prior and current findings, progress is stagnant by the mandated scale.",
+  "verdict": "approve"
+ }
+}
