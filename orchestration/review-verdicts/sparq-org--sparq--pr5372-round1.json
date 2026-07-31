@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5372,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d6a48c7aa7664a4447df4504ada94535b1109301",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`rule_term` intentionally returns `Term::Formula` unchanged, so a rule containing a quoted formula with `?x` still emits `?x` under `RuleVars::VarIris`. This contradicts the enum/API/skill claims that no syntactic variable survives and that the result is suitable for consumers that cannot handle variables. The unit test even pins this contradictory behavior, while the integration test only checks a rule without nested formulae. N3 builtins commonly carry formula terms, so this is not merely theoretical.",
+    "file": "crates/sparq-reason/src/n3/serialize.rs",
+    "fix_hint": "Define the intended grounding semantics for variables scoped inside quoted formulae and implement recursive conversion consistent with that scope, or narrow the public contract and fail closed when VarIris encounters such a formula. Add an integration test using a rule with a variable inside a quoted formula and assert the documented no-`?` invariant (or the explicit error).",
+    "severity": "major",
+    "title": "VarIris mode does not ground variables inside nested formula terms"
+   },
+   {
+    "body": "`premise_blank_label` infers parser-generated provenance solely from the variable spelling. Therefore an ordinary source variable such as `?__bn0_x` is serialized as `_:x`, even when no premise blank node existed. The emitted RuleVars::N3 rule is not equivalent to the parsed rule, invalidating the advertised round-trip/fixpoint guarantee and potentially changing variable sharing. The current recognition test validates only the name pattern and misses the provenance ambiguity.",
+    "file": "crates/sparq-reason/src/n3/serialize.rs",
+    "fix_hint": "Preserve premise-blank provenance explicitly in the parsed rule representation, or use a collision-free internal naming scheme recorded per rule rather than decoding arbitrary variable text. Add a public-path regression test with an ordinary `?__bn0_x` variable and verify pass-all output reparses with identical behavior and does not turn it into a blank node.",
+    "severity": "major",
+    "title": "Legal user variables matching __bn<digits>_<label> are corrupted"
+   }
+  ],
+  "progress": null,
+  "summary": "The new pass-all path is well targeted and its basic closure/rule round-trip tests exercise the real parser and reasoner, but two advertised serialization invariants fail for valid rule terms. Ground mode deliberately leaves variables inside nested formula terms even though the public API promises that no syntactic variable survives. In addition, the serializer guesses premise-blank provenance from a variable-name prefix, so an ordinary user variable with that legal shape is silently changed into a blank node. Both can change or invalidate emitted documents and need correction plus regression tests before approval.",
+  "verdict": "request_changes"
+ }
+}
