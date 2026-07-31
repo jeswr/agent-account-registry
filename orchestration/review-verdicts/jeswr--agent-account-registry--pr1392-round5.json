@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1392,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "400d3a8fcb245c4b6ec8783246610ce15d950f7b",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 5 remains clean. The fix lane re-derives the source issue route once, constrains the model chain from that result, and adopts its persona only through the target-owned boolean capability declaration. The final published persona is checked after fallback selection: on a capability-enabled target, false, absent, malformed, blank, and non-string declarations refuse the mutating lane, while targets that have not introduced an agents table retain the documented legacy implementer. Review mode does not enter the fix-only refusal. The workflow tests execute the production selection block, distinguish route adoption from role fallback, cover both live routing and malformed synthetic shapes, kill targeted non-crashing mutants for each decision, and pin the exact resolve-output-to-worker seam. The checked-in capability table is also tested against every routed persona and the actual brief loaded by the worker. The worker independently validates the agent as a safe atom and requires a regular, non-symlink brief. No injected reviewer-directed instruction appears in the diff, and no blocker, major, or lesser issue is supported by the diff-scoped evidence.",
+  "verdict": "approve"
+ }
+}
