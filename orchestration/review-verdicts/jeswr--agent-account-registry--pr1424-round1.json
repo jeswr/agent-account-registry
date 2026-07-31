@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1424,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "93828ba86a67f891011f9239e1cca5721a797bc0",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "_alert_route computes one token as ALERT_TOKEN or REGISTRY_ALERT_TOKEN and returns that same token even when a same-repo/public/unverifiable ALERT_REPO is rejected. Thus ALERT_REPO=private/alerts, ALERT_TOKEN scoped only to that private repo, and a failed visibility probe yields (REGISTRY_REPO, ALERT_TOKEN), not (REGISTRY_REPO, REGISTRY_ALERT_TOKEN). The registry write then lacks permission. This is especially serious here because _ops_alert is deliberately best-effort and catches delivery errors, so the operational failure proceeds with no alert despite the new docstring's claim that fallback loses no alert. The new assertions expecting (reg/repo, t1) make the credential-routing bug pass the self-test.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Keep the private-route token and registry fallback token separate. Probe and write a confirmed private ALERT_REPO with ALERT_TOKEN; for every rejected/unconfigured route return REGISTRY_REPO with REGISTRY_ALERT_TOKEN (or the intended ambient registry credential). Update the rejection and same-repo tests to use distinct sentinel tokens and assert that fallback uses the registry sentinel, while the visibility probe alone uses the alert sentinel.",
+    "severity": "major",
+    "title": "Rejected private routes fall back to the registry with the wrong token"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe plan/groom visibility routing is fail-closed and has end-to-end coverage, but worker-pr's newly added rejection fallback binds the registry destination to the private-route credential. In the common case where ALERT_TOKEN is scoped only to ALERT_REPO, the fallback cannot write and _ops_alert swallows the failure, contradicting the change's no-alert-lost guarantee. The self-test currently codifies this wrong credential choice. One major issue requires changes.",
+  "verdict": "request_changes"
+ }
+}
