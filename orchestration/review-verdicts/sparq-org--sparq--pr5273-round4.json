@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5273,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b36627259a6f6a1e0ce6db183893d4885e0d7d48",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete. The dedicated wasm-pack nodejs target is built with the same feature set as the web target, copied from an isolated output directory, CommonJS-scoped under the ESM package root, exported for require consumers, included in the package allowlist, and required by prepare/package guardrails. The runtime test exercises the load-bearing behavior on the real generated nodejs glue: synchronous require followed immediately by Store load, ASK, SELECT, and cleanup without initialization. The accompanying package and scope tests cover the export wiring and CommonJS marker, while the packaging guardrail covers shipped glue and wasm bytes. Documentation accurately distinguishes the raw synchronous Store API from the ESM RDF/JS wrapper. No correctness, soundness, security, or test-validity defect is evident, and the diff contains no instruction-like prompt injection. Findings remain empty as in round 3.",
+  "verdict": "approve"
+ }
+}
