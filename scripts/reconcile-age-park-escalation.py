@@ -58,6 +58,16 @@ A CORRECTED `GROOM_AGE_PARK_MARKER` RECEIPT at the generation the record support
 removal of `needs:user`. RECEIPT-FIRST like every other park write here, and the removal is
 VERIFIED by reading the labels back — a 2xx is not the same fact as the label being gone.
 
+THE REMOVAL IS AUTHORISED AT THE MUTATION BOUNDARY, NOT BY THE ENUMERATION. Posting the receipt
+opens a network-sized window between the proof and the delete, and `needs:user` is the one label a
+human re-applies BY HAND when they want the PR held. So immediately before the DELETE — and after
+the POST — labels, comments and the timeline are RE-READ and the whole proof is re-derived from
+that fresh state (`_decide`, the ONE evaluation, called twice). The delete runs only if the live
+hold is still the same machine-owned episode AND our corrected receipt is now on record proving
+the same corrected generation; anything else refuses [raced] with the receipt already public, and
+the next run converges on it. A pre-comment snapshot cannot see the hold a human applied while the
+comment was in flight, and that hold is exactly the one this script must never overwrite.
+
 WHAT IT DOES NOT DO. It re-admits nothing. `review:parked` stands, and grooming clears it if and
 only if that park's own cause is proven recovered, from the CORRECTED generation, under the same
 `AGE_UNPARK_MAX` bound. So the migration terminates rather than returning these PRs to the thing
@@ -75,6 +85,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.parse
@@ -106,12 +117,22 @@ CODE_GRANTS_SUPPORT = "grants-support-gen"   # a GENUINE flap: the cap is doing 
 CODE_CAP_SPENT = "cap-spent"            # the corrected generation is over the cap too
 CODE_RESIDUAL_HOLD = "residual-hold"    # another needs:* would survive the removal
 CODE_SUPERSEDED = "superseded"          # a park application is newer than our own receipt
+CODE_RACED = "raced"                    # the live hold changed between the proof and the write
 CODE_READ_FAILED = "read-failed"        # this PR's own GitHub state was unreadable
 CODE_UNVERIFIED = "unverified"          # the removal could not be PROVEN to have landed
 REFUSAL_CODES = (
     CODE_DONE, CODE_NO_HUMAN_HOLD, CODE_NO_MACHINE_PARK, CODE_HUMAN_APPLIED, CODE_DENY_PROSE,
     CODE_NO_RECEIPT, CODE_WITHIN_CAP, CODE_GRANTS_SUPPORT, CODE_CAP_SPENT, CODE_RESIDUAL_HOLD,
-    CODE_SUPERSEDED, CODE_READ_FAILED, CODE_UNVERIFIED,
+    CODE_SUPERSEDED, CODE_RACED, CODE_READ_FAILED, CODE_UNVERIFIED,
+)
+
+# The migration record's CLOSED grammar, parsed and anchored exactly as groom parses its own
+# receipts. A marker PREFIX occurring somewhere in a bot comment is not a record of anything: it
+# names no PR, no generations and no receipt — and `migration_record` is what selects the
+# convergence path, whose only write DELETES the human-owned hold.
+_MIGRATION_RECORD = re.compile(
+    r"pr=(?P<pr>[1-9][0-9]{0,9}) from-gen=(?P<from_gen>[1-9][0-9]{0,3}) "
+    r"to-gen=(?P<to_gen>[1-9][0-9]{0,3}) -->"
 )
 
 
@@ -129,12 +150,34 @@ def _load(modname, filename):
 groom = _load("registry_groom", "groom.py")
 
 
-def migration_record(comments, bot_login):
-    """The NEWEST bot-authored comment carrying this script's marker, or None.
+def migration_record(comments, bot_login, pr_number):
+    """The NEWEST bot-authored comment carrying a COMPLETE, SELF-PROVING migration record for THIS
+    PR — ``{"pr", "from_gen", "to_gen", "cause", "head", "created_at"}`` — or None.
 
     Bot-authored only, like every other receipt reader here: a marker a third party could write is
     not a record of what this migration did, and trusting one would let a drive-by comment either
-    suppress the correction or authorise the convergence delete below."""
+    suppress the correction or authorise the convergence delete below.
+
+    AND BOT-AUTHORED IS NOT ENOUGH (review round 1). A truthy record selects the convergence path,
+    whose ONLY write is the removal of the human-owned hold, so this predicate IS the authorisation
+    for that delete and it has to prove the delete's whole premise from the comment itself:
+      - a CLOSED, ANCHORED record — a bare or truncated marker prefix, at any position in any bot
+        comment (a quote, a summary, this script's own log pasted back), parses as nothing;
+      - BOUND TO THIS PR — `pr=` must be this PR's number, so a record minted for a DIFFERENT PR
+        and quoted here proves nothing here;
+      - a real MIGRATION — `from-gen` over the cap and `to-gen` strictly below it and below
+        `from-gen`, i.e. the one move this script exists to make and not some other write that
+        borrowed the marker;
+      - CARRYING THE CORRECTED RECEIPT — exactly one park marker in the SAME comment, read by
+        groom's OWN parser, at exactly the generation the record claims to have moved to.
+        Convergence means "the receipt landed, the removal did not"; with no receipt in hand there
+        is nothing to converge ON, and the delete would leave the PR holding neither the human
+        terminal nor a receipt the re-admission phase can consider.
+    Anything short of all of it is None, which routes the PR back through the ordinary proof."""
+    try:
+        want_pr = int(pr_number)
+    except (TypeError, ValueError):     # an unidentified PR can bind no record
+        return None
     found = None
     for comment in (comments if isinstance(comments, list) else []):
         if not isinstance(comment, dict):
@@ -142,13 +185,36 @@ def migration_record(comments, bot_login):
         login = str((comment.get("user") or {}).get("login", ""))
         if login.casefold() != str(bot_login or "\0").casefold():
             continue
-        if MIGRATION_MARKER in str(comment.get("body", "")):
-            found = comment
+        body = str(comment.get("body", ""))
+        # EXACTLY ONE of each marker. A comment that quotes a record and carries its own is two
+        # different claims, and `find` would read only whichever came first.
+        if body.count(MIGRATION_MARKER) != 1 or body.count(groom.AGE_PARK_MARKER) != 1:
+            continue
+        match = _MIGRATION_RECORD.match(
+            body[body.find(MIGRATION_MARKER) + len(MIGRATION_MARKER):].lstrip(), 0)
+        if match is None:
+            continue
+        if int(match.group("pr")) != want_pr:
+            continue
+        from_gen, to_gen = int(match.group("from_gen")), int(match.group("to_gen"))
+        if not (to_gen < from_gen and to_gen <= groom.AGE_UNPARK_MAX
+                and from_gen > groom.AGE_UNPARK_MAX):
+            continue
+        # groom's OWN parser, on a normalised copy of this ONE comment: the corrected receipt has
+        # to be the thing groom will read back, not a string that merely looks like it here.
+        receipts = groom.age_receipts(
+            [{"user": {"login": login}, "body": body, "created_at": comment.get("created_at")}],
+            groom.AGE_PARK_MARKER, bot_login)
+        if len(receipts) != 1 or receipts[0]["gen"] != to_gen:
+            continue
+        found = {"pr": want_pr, "from_gen": from_gen, "to_gen": to_gen,
+                 "cause": receipts[0]["cause"], "head": receipts[0]["head"],
+                 "created_at": comment.get("created_at")}
     return found
 
 
 def verdict(pr_labels, park_receipts, supported_generation, bot_bodies, hold_applied_by_human,
-            reconciled, migration_is_current=False):
+            migration, migration_is_current=False):
     """PURE. ``(disposition, corrected_generation, code, detail)``.
 
     `disposition` is one of:
@@ -164,14 +230,17 @@ def verdict(pr_labels, park_receipts, supported_generation, bot_bodies, hold_app
     record supports, counting MARKERS so a corrupt grant receipt can never make the supported
     generation look SMALLER (which is the direction that would manufacture a migration).
     `hold_applied_by_human` MUST be True whenever that could not be determined (fail closed at
-    the call site). `migration_is_current` is likewise a fail-closed caller computation: our
-    receipt must be strictly newer than every park application, or a LATER, unrelated park is
-    what the live label is and converging would delete it."""
+    the call site). `migration` is `migration_record`'s validated record or None — NOT "a marker
+    was seen": the convergence generation is read from the record's own `to-gen`, so the delete is
+    bound to the receipt that was actually minted rather than to whichever receipt sorts last.
+    `migration_is_current` is likewise a fail-closed caller computation: our receipt must be
+    strictly newer than every park application, or a LATER, unrelated park is what the live label
+    is and converging would delete it."""
     live = {label for label in (pr_labels or []) if isinstance(label, str)}
     if park_policy.HUMAN_PARK_LABEL not in live:
-        return (None, None, CODE_DONE if reconciled else CODE_NO_HUMAN_HOLD,
+        return (None, None, CODE_DONE if migration else CODE_NO_HUMAN_HOLD,
                 f"no live `{park_policy.HUMAN_PARK_LABEL}`"
-                + (" — this migration is complete" if reconciled else " — nothing to migrate"))
+                + (" — this migration is complete" if migration else " — nothing to migrate"))
     if park_policy.MACHINE_PARK_PR_LABEL not in live:
         return (None, None, CODE_NO_MACHINE_PARK,
                 f"no live `{park_policy.MACHINE_PARK_PR_LABEL}` — removing the human hold would "
@@ -194,15 +263,15 @@ def verdict(pr_labels, park_receipts, supported_generation, bot_bodies, hold_app
         return (None, None, CODE_RESIDUAL_HOLD,
                 f"{'/'.join(sorted(residual))} would still hold this PR out after the removal — "
                 "refusing to move a park into a state it could not leave")
-    if reconciled:
+    if migration:
         if not migration_is_current:
             return (None, None, CODE_SUPERSEDED,
                     "a park application is at least as new as this migration's own receipt, so "
                     "the live hold is a DIFFERENT, later decision — not the one we minted for")
-        corrected = receipts[-1]["gen"] if receipts else None
-        return ("converge", corrected, CODE_CONVERGE,
-                "the corrected receipt is on record but the human-owned hold is still live — "
-                "completing the interrupted removal, consuming no new evidence")
+        return ("converge", migration["to_gen"], CODE_CONVERGE,
+                f"the corrected receipt is on record at `gen={migration['to_gen']}` but the "
+                "human-owned hold is still live — completing the interrupted removal, consuming "
+                "no new evidence")
     if not receipts:
         return (None, None, CODE_NO_RECEIPT,
                 "no age-park receipt — this is not a park grooming's age hand-off wrote, so "
@@ -334,6 +403,50 @@ def _maintainer_probe(repo, maintainer, token):
     return probe
 
 
+def _decide(repo, number, pr_labels, comments, timeline, bot_login, maintainer, token):
+    """The verdict for ONE PR from ONE consistent read of its state.
+
+    THE ONE EVALUATION, CALLED TWICE — once on the enumerated state and again at the MUTATION
+    BOUNDARY, immediately before the DELETE. Two spellings of this walk would be two things that
+    could come to disagree about whether the live hold is still the episode this run proved, which
+    is the drift park_applications' own docstring exists to prevent."""
+    bot_bodies = [str(comment.get("body", ""))
+                  for comment in comments if isinstance(comment, dict)
+                  and str((comment.get("user") or {}).get("login", "")).casefold()
+                  == str(bot_login).casefold()]
+    is_human = _maintainer_probe(repo, maintainer, token)
+    # FAIL CLOSED on the ownership probe: anything unreadable counts as "a human applied it", so an
+    # unreadable timeline never authorises removing the human terminal. The refusal lives in the
+    # `except` rather than in a pre-set default — a default here would be dead (every path either
+    # assigns or returns) and a dead guard reads as protection that is not there.
+    try:
+        applied_by_human = not park_policy.label_application_machine_owned(
+            repo, number, park_policy.HUMAN_PARK_LABEL, lambda _repo, num: timeline,
+            is_human=is_human, log=lambda *_a, **_k: None)
+    except Exception as exc:  # noqa: BLE001
+        return (None, None, CODE_HUMAN_APPLIED, f"ownership probe failed ({exc})")
+    record = migration_record(comments, bot_login, number)
+    # THE RECENCY CONJUNCT, and it is only consulted on the convergence path. Our own receipt
+    # matching is a HISTORICAL fact; it does not prove that the label live RIGHT NOW is the one we
+    # minted for. park_applications is the documented API for "when was the newest park applied",
+    # and a park on ANY park label refuses — the conservative direction, and the same call groom's
+    # convergence branch makes for the same reason.
+    current = False
+    if record is not None:
+        stamp = record.get("created_at")
+        if park_policy.valid_timestamp(stamp):
+            latest_park, _human, readable = park_policy.park_applications(
+                repo, number, None, lambda _repo, num: timeline,
+                is_human=is_human, log=lambda *_a, **_k: None)
+            current = bool(readable) and (
+                latest_park is None or park_policy.parse_ts(stamp) > latest_park)
+    return verdict(
+        pr_labels,
+        groom.age_receipts(comments, groom.AGE_PARK_MARKER, bot_login),
+        groom.age_park_generation(comments, bot_login),
+        bot_bodies, applied_by_human, record, current)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true")
@@ -366,47 +479,9 @@ def main(argv=None):
                 f"label on {args.repo}#{number}")
             comments = _paginated(args.repo, number, "comments", token=args.token)
             timeline = _paginated(args.repo, number, "timeline", token=args.token)
-            bot_bodies = [str(comment.get("body", ""))
-                          for comment in comments if isinstance(comment, dict)
-                          and str((comment.get("user") or {}).get("login", "")).casefold()
-                          == args.bot_login.casefold()]
-            is_human = _maintainer_probe(args.repo, args.maintainer, args.token)
-            # FAIL CLOSED on the ownership probe: anything unreadable counts as "a human applied
-            # it", so an unreadable timeline never authorises removing the human terminal. The
-            # refusal lives in the `except` rather than in a pre-set default — a default here
-            # would be dead (every path either assigns or `continue`s) and a dead guard reads as
-            # protection that is not there.
-            try:
-                applied_by_human = not park_policy.label_application_machine_owned(
-                    args.repo, number, park_policy.HUMAN_PARK_LABEL,
-                    lambda _repo, num: timeline, is_human=is_human,
-                    log=lambda *_a, **_k: None)
-            except Exception as exc:  # noqa: BLE001
-                print(f"  #{number}: REFUSED [{CODE_HUMAN_APPLIED}] — ownership probe failed "
-                      f"({exc})")
-                census[CODE_HUMAN_APPLIED] += 1
-                refused.append((number, CODE_HUMAN_APPLIED))
-                continue
-            record = migration_record(comments, args.bot_login)
-            # THE RECENCY CONJUNCT, and it is only consulted on the convergence path. Our own
-            # receipt matching is a HISTORICAL fact; it does not prove that the label live RIGHT
-            # NOW is the one we minted for. park_applications is the documented API for "when was
-            # the newest park applied", and a park on ANY park label refuses — the conservative
-            # direction, and the same call groom's convergence branch makes for the same reason.
-            current = False
-            if record is not None:
-                stamp = record.get("created_at")
-                if park_policy.valid_timestamp(stamp):
-                    latest_park, _human, readable = park_policy.park_applications(
-                        args.repo, number, None, lambda _repo, num: timeline,
-                        is_human=is_human, log=lambda *_a, **_k: None)
-                    current = bool(readable) and (
-                        latest_park is None or park_policy.parse_ts(stamp) > latest_park)
-            disposition, corrected, code, detail = verdict(
-                pr_labels,
-                groom.age_receipts(comments, groom.AGE_PARK_MARKER, args.bot_login),
-                groom.age_park_generation(comments, args.bot_login),
-                bot_bodies, applied_by_human, record is not None, current)
+            disposition, corrected, code, detail = _decide(
+                args.repo, number, pr_labels, comments, timeline,
+                args.bot_login, args.maintainer, args.token)
             if not disposition:
                 print(f"  #{number}: REFUSED [{code}] — {detail}")
                 census[code] += 1
@@ -431,6 +506,28 @@ def main(argv=None):
                      "-f", f"body={body}"], token=args.token)
                 print(f"    WRITE corrected age-park receipt pr={number} "
                       f"cause={stale['cause']} gen={stale['gen']} -> gen={corrected}")
+            # THE MUTATION BOUNDARY (review round 1). Everything above was read BEFORE the POST,
+            # and `needs:user` is the one label a human re-applies by hand precisely while a run
+            # like this is in flight. Re-read labels, comments and the timeline and re-derive the
+            # WHOLE proof from that fresh state: the only disposition that authorises the delete is
+            # `converge`, which is now the exact statement "our corrected receipt is on record for
+            # this PR at this generation, and the live hold is still the same machine-owned episode
+            # with no newer park over it". A snapshot taken before the comment cannot say that.
+            live_labels = _label_names(
+                _paginated(args.repo, number, "labels", token=args.token),
+                f"label re-read for {args.repo}#{number}")
+            live_disposition, live_corrected, live_code, live_detail = _decide(
+                args.repo, number, live_labels,
+                _paginated(args.repo, number, "comments", token=args.token),
+                _paginated(args.repo, number, "timeline", token=args.token),
+                args.bot_login, args.maintainer, args.token)
+            if live_disposition != "converge" or live_corrected != corrected:
+                print(f"  #{number}: REFUSED [{CODE_RACED}] — the live hold is no longer the "
+                      f"machine-owned episode this run proved, so the removal is not this "
+                      f"migration's to make: [{live_code or live_disposition}] {live_detail}")
+                census[CODE_RACED] += 1
+                refused.append((number, CODE_RACED))
+                continue
             _gh(["api", "-X", "DELETE",
                  f"repos/{args.repo}/issues/{number}/labels/"
                  + urllib.parse.quote(park_policy.HUMAN_PARK_LABEL, safe="")],
@@ -489,13 +586,18 @@ def _self_test():
     def receipt(gen, cause="orphan-draft", sha=head):
         return {"cause": cause, "head": sha, "gen": gen, "at": "2026-07-29T07:18:01Z"}
 
+    def migration_rec(to_gen=1, from_gen=3, pr=5001):
+        # migration_record's VALIDATED output shape — the only thing that reaches `verdict`.
+        return {"pr": pr, "from_gen": from_gen, "to_gen": to_gen, "cause": "orphan-draft",
+                "head": head, "created_at": "2026-07-30T00:00:00Z"}
+
     def v(**over):
         # sparq#5001's LIVE shape: park receipts gen 1/2/3, ZERO grants, both labels live, the
         # hold machine-applied. Literal generations throughout — deriving them from
         # AGE_UNPARK_MAX would leave every row green when the cap is moved.
         base = dict(pr_labels=live, park_receipts=[receipt(1), receipt(2), receipt(3)],
                     supported_generation=1, bot_bodies=["untouched beyond the threshold"],
-                    hold_applied_by_human=False, reconciled=False, migration_is_current=False)
+                    hold_applied_by_human=False, migration=None, migration_is_current=False)
         base.update(over)
         return verdict(**base)
 
@@ -537,14 +639,19 @@ def _self_test():
     # marker would otherwise refuse it forever.
     check("a migration whose receipt landed and whose removal did not CONVERGES (mints nothing) "
           "— and is DONE, not converging, once the hold is actually gone",
-          (v(reconciled=True, migration_is_current=True,
+          (v(migration=migration_rec(), migration_is_current=True,
              park_receipts=[receipt(3), receipt(1)])[:3],
-           v(reconciled=True, migration_is_current=True,
+           v(migration=migration_rec(), migration_is_current=True,
              pr_labels=[park_policy.MACHINE_PARK_PR_LABEL])[:3]),
           (("converge", 1, CODE_CONVERGE), (None, None, CODE_DONE)))
+    check("the convergence generation is read from the RECORD's own `to-gen` — the delete is "
+          "bound to the receipt that was actually minted, not to whichever receipt sorts last",
+          v(migration=migration_rec(to_gen=2), migration_is_current=True,
+            park_receipts=[receipt(3)])[:3], ("converge", 2, CODE_CONVERGE))
     check("convergence refuses when a park application is not OLDER than our own receipt — the "
           "live hold is then a different, later decision",
-          v(reconciled=True, migration_is_current=False)[:3], (None, None, CODE_SUPERSEDED))
+          v(migration=migration_rec(), migration_is_current=False)[:3],
+          (None, None, CODE_SUPERSEDED))
 
     # ---- the AUDIT BODY, read back through groom's OWN parser --------------------------------
     body = audit_body(5001, "orphan-draft", head, 3, 1, "detail")
@@ -569,16 +676,41 @@ def _self_test():
           "the PR from every later re-classification would be a hold in itself",
           [denied for pattern, denied in park_policy.LEGACY_PARK_DENY_PROSE
            if pattern.search(body)], [])
-    check("the one-shot marker is trusted ONLY from the bot's own comments, and a malformed "
-          "comment entry is skipped rather than crashing the read",
-          (migration_record([{"user": {"login": bot}, "body": f"x {MIGRATION_MARKER} pr=1 -->"}],
-                            bot) is not None,
-           migration_record([{"user": {"login": "drive-by"},
-                              "body": f"x {MIGRATION_MARKER} pr=1 -->"}], bot) is not None,
+    # ---- the MIGRATION RECORD, which is the AUTHORISATION for the convergence delete -----------
+    # It is not "a bot comment mentioned the marker". Each row below is a way a marker can appear
+    # on a PR without a corrected receipt for THIS PR ever having been minted, and each one of
+    # them would otherwise select the convergence path, whose only write removes the human hold.
+    def rec(body_text, number=5001, login=bot):
+        return migration_record([{"user": {"login": login}, "body": body_text,
+                                  "created_at": "2026-07-30T00:00:00Z"}], bot, number)
+
+    # TRUNCATED but otherwise intact: one marker, one corrected receipt, and a record whose fields
+    # stop early. It is the case the substring test could not tell from a complete record, and the
+    # only fixture that reaches the anchored parse in its FAILING direction.
+    truncated = body.replace("pr=5001 from-gen=3 to-gen=1 -->", "pr=5001 -->")
+    check("the record is COMPLETE, CLOSED, PR-BOUND and carries its own corrected receipt — a "
+          "bare prefix, a TRUNCATED record, a foreign PR's record, a duplicated (quoted) marker, "
+          "a record with no corrected receipt, one whose to-gen disagrees with the receipt it "
+          "carries, one whose receipt groom's parser cannot read, one that never crossed the cap, "
+          "one on an unidentified PR, and a third party's are all NOT records",
+          ((rec(body) or {}).get("to_gen"),
+           rec(body, number=5002),
+           rec(body, login="drive-by"),
+           rec(f"noise {MIGRATION_MARKER} -->"),
+           rec(truncated),
+           rec(f"{MIGRATION_MARKER} pr=5001 from-gen=3 to-gen=1 -->"),
+           rec(body.replace("to-gen=1", "to-gen=2")),
+           rec(body.replace(f"head={head}", "head=not-a-sha")),
+           rec(body.replace("from-gen=3", "from-gen=2")),
+           rec(body + f"\n> quoted: {MIGRATION_MARKER} pr=5001 from-gen=3 to-gen=1 -->"),
+           rec(body, number=None),
+           (rec(body) or {}).get("from_gen"), (rec(body) or {}).get("cause"),
+           (rec(body) or {}).get("head"),
            migration_record(["not a comment", None,
-                             {"user": {"login": bot}, "body": f"{MIGRATION_MARKER} -->"}],
-                            bot) is not None),
-          (True, False, True))
+                             {"user": {"login": bot}, "body": body,
+                              "created_at": "2026-07-30T00:00:00Z"}], bot, 5001) is not None),
+          (1, None, None, None, None, None, None, None, None, None, None, 3, "orphan-draft",
+           head, True))
 
     # The entry point refuses to run at all without the two arguments that bound it to a repo:
     # a default here would point the migration at whatever `gh` happened to resolve.
@@ -610,12 +742,29 @@ def _self_test():
     # ---- THE ENTRY POINT, driven over a fake gh ----------------------------------------------
     # main() is where a fabricating bug survives: the pure verdict above cannot see a dry run
     # that writes, a removal that is never verified, or an ownership probe that is never wired.
+    def _issue_number(joined):
+        """The issue the call addresses, as the string key the POSTED-comment ledger uses."""
+        tail = joined.split("/issues/", 1)[1] if "/issues/" in joined else ""
+        return tail.split("/")[0].split("?")[0]
+
     def _fake_gh(state):
         def gh(argv, token=None, check=True):
             state["calls"].append(list(argv))
             joined = " ".join(argv)
             if argv[:3] == ["api", "-X", "POST"] or argv[:3] == ["api", "-X", "DELETE"]:
                 state["writes"].append(list(argv))
+                if argv[:3] == ["api", "-X", "POST"]:
+                    # A posted comment BECOMES VISIBLE, as it does on GitHub — without this the
+                    # mutation-boundary re-read could never see the receipt it must converge on,
+                    # and the whole apply path would be tested against a fiction.
+                    state["posted"].setdefault(_issue_number(joined), []).append(
+                        {"user": {"login": bot}, "created_at": state["posted_at"],
+                         "body": argv[-1].split("=", 1)[1] if "=" in argv[-1] else ""})
+                    # ...and the world moves while the comment is in flight.
+                    if state.get("race_event"):
+                        state["timeline"] = list(state["timeline"]) + [state["race_event"]]
+                    if state.get("race_comment"):
+                        state["posted"][_issue_number(joined)].append(state["race_comment"])
                 if argv[:3] == ["api", "-X", "DELETE"] and not state.get("delete_fails"):
                     # .get, not [] — a malformed fixture entry must reach the code under test,
                     # not raise inside this harness. It did, and the malformed-payload row below
@@ -628,8 +777,12 @@ def _self_test():
                              "pull_request": {"url": f"https://api.github.com/x/pulls/{number}"}}
                             for number in state["numbers"]]]
             elif "/comments" in joined:
-                payload = (state["comments"] if state.get("raw_comments")
-                           else [state["comments"]])
+                base = state["comments"]
+                # isinstance, not a bare `+`: the malformed-payload fixture is not a list and must
+                # reach the code under test rather than raising inside this harness.
+                rows = (base + state["posted"].get(_issue_number(joined), [])
+                        if isinstance(base, list) else base)
+                payload = rows if state.get("raw_comments") else [rows]
             elif "/timeline" in joined:
                 payload = [state["timeline"]]
             elif "/labels" in joined:
@@ -647,10 +800,13 @@ def _self_test():
         return gh
 
     def run(argv, actor_login=bot, delete_fails=False, comments=None, permission="admin",
-            labels=None, numbers=(5001,), raw_comments=False, ownership_raises=False):
+            labels=None, numbers=(5001,), raw_comments=False, ownership_raises=False,
+            race_event=None, race_comment=None):
         state = {
             "calls": [], "writes": [], "delete_fails": delete_fails, "permission": permission,
-            "numbers": list(numbers), "raw_comments": raw_comments,
+            "numbers": list(numbers), "raw_comments": raw_comments, "posted": {},
+            "posted_at": "2026-07-30T00:00:00Z", "race_event": race_event,
+            "race_comment": race_comment,
             "labels": labels if labels is not None else [
                 {"name": park_policy.HUMAN_PARK_LABEL},
                 {"name": park_policy.MACHINE_PARK_PR_LABEL}],
@@ -766,6 +922,60 @@ def _self_test():
           "gone' — the migration is only ever credited with a removal it can prove",
           (f"REFUSED [{CODE_READ_FAILED}]" in malformed_log, "0 migrated" in malformed_log),
           (True, True))
+
+    # THE MARKER IS NOT THE AUTHORISATION — driven through the ENTRY POINT, because the delete it
+    # would authorise is issued there. Each fixture is a PR whose ONLY age-park evidence is a bot
+    # comment carrying some form of the marker; none of them is a corrected receipt minted for
+    # THIS PR, so none of them may produce a DELETE of the human-owned hold.
+    forged = {
+        "a bare, unclosed marker prefix": f"noise {MIGRATION_MARKER} -->",
+        "a record minted for a DIFFERENT PR": audit_body(4242, "orphan-draft", head, 3, 1, "d"),
+        "a TRUNCATED record carrying a real receipt": audit_body(
+            5001, "orphan-draft", head, 3, 1, "d").replace(
+                "pr=5001 from-gen=3 to-gen=1 -->", "pr=5001 -->"),
+        "a record carrying NO corrected receipt":
+            f"{MIGRATION_MARKER} pr=5001 from-gen=3 to-gen=1 -->",
+        "a record whose to-gen disagrees with the receipt it carries":
+            audit_body(5001, "orphan-draft", head, 3, 1, "d").replace("to-gen=1", "to-gen=2"),
+    }
+    forged_out = {}
+    for name, forged_body in forged.items():
+        _rc, forged_log, forged_state = run(
+            ["--apply"], comments=[{"user": {"login": bot}, "created_at": "2026-07-29T09:00:00Z",
+                                    "body": forged_body}])
+        forged_out[name] = (forged_state["writes"], "REFUSED [" in forged_log)
+    check("NO bot comment short of a complete, PR-bound record carrying its own corrected receipt "
+          "authorises the convergence delete: every forged marker REFUSES and the human-owned "
+          "hold survives with no write of any kind",
+          forged_out, {name: ([], True) for name in forged})
+
+    # THE MUTATION BOUNDARY. Ownership and recency were read BEFORE the receipt was posted, and
+    # posting it is a network round trip — long enough for the maintainer to re-apply the hold, or
+    # for another writer to open a NEWER park episode. Both must stop the DELETE dead.
+    def _race_run(event=None, comment=None):
+        _rc, log, state = run(["--apply"], race_event=event, race_comment=comment)
+        return (len([c for c in state["writes"] if c[:3] == ["api", "-X", "POST"]]),
+                [c for c in state["writes"] if c[:3] == ["api", "-X", "DELETE"]],
+                f"REFUSED [{CODE_RACED}]" in log, f"{CODE_RACED}=1" in log)
+
+    check("a human who re-applies the hold, or a NEWER park episode, landing AFTER the receipt is "
+          "posted and BEFORE the removal is never overwritten — the boundary re-reads labels, "
+          "comments and timeline and the DELETE does not run (the receipt stands; the next run "
+          "sees the newer decision for what it is)",
+          (_race_run(event={"event": "labeled", "label": {"name": park_policy.HUMAN_PARK_LABEL},
+                            "created_at": "2026-07-31T00:00:00Z", "actor": {"login": "jeswr"}}),
+           _race_run(event={"event": "labeled", "label": {"name": park_policy.HUMAN_PARK_LABEL},
+                            "created_at": "2026-07-31T00:00:00Z", "actor": {"login": bot}})),
+          ((1, [], True, True), (1, [], True, True)))
+    # And the delete is bound to the generation THIS run proved, not merely to "some record is
+    # now on record": a concurrent writer whose record lands after ours claims a different
+    # corrected generation, and the removal it would authorise is not the one we justified.
+    check("a NEWER record claiming a DIFFERENT corrected generation refuses too — the removal is "
+          "bound to the generation this run proved and published, not to whatever record is "
+          "newest at the moment of the write",
+          _race_run(comment={"user": {"login": bot}, "created_at": "2026-07-30T01:00:00Z",
+                             "body": audit_body(5001, "orphan-draft", head, 4, 2, "concurrent")}),
+          (1, [], True, True))
 
     # And the one-shot: a second --apply run over a PR already carrying the marker (hold gone)
     # must be a no-op.
