@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1489,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9144553becbddda94a5c1ed4a7cdb14e94569d61",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change adds a fail-closed scheduled certification of the triage planner's derived label vocabulary against the repository label set. The vocabulary is derived from the actual role tables plus the non-role producers, the CLI rejects empty input and names drift, and the independent job has read-only permissions. The tests pin the expected vocabulary independently, exercise table repointing, empty/clean/missing CLI outcomes, producer closure, and execute the exact workflow step against complete and deficient label sets. I found no diff-supported correctness, soundness, test-validity, or security issue requiring changes.",
+  "verdict": "approve"
+ }
+}
