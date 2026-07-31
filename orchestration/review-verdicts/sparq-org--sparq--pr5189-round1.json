@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5189,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7e5c080c65194f86b0da596101e49f6140c6b1c0",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly makes the two existing sparq-engine planner features default-on for the native sparq-mcp surface, forwards each feature explicitly, and updates the matching public-surface documentation. The new tests are non-vacuous for the intended integration contract: they pin the manifest default set, make broken feature forwarding fail compilation by referencing feature-gated engine APIs, exercise algebra rewriting through the real MCP tools/call query path, compare DP-planned and explicitly disabled planner results on that path, and check scoped planner state restoration. The literal-equality decline witness covers the stated sq-lr2ii boundary. No security issue, soundness regression, hostile instruction, heavy dependency addition, or uncaveated privacy claim appears in the diff.",
+  "verdict": "approve"
+ }
+}
