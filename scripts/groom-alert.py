@@ -9,11 +9,12 @@
 # upserts/auto-closes a rolling `ops-alert` issue.
 #
 # Mirrors plan-alert.py (issue #38) / usage-alert.py (issue #39) hardening exactly:
-#  - _alert_route: the private ALERT_REPO is the destination ONLY when ALERT_TOKEN can write there;
-#    a half-configured deployment (repo set, token missing) falls back to the registry repo under
-#    the ambient token instead of silently failing the private write. The groom-alert body carries
-#    NO account handles (it reports only the job RESULT + run link), so the fallback needs no
-#    redaction variant.
+#  - _alert_route: the private ALERT_REPO is the destination ONLY when it is POSITIVELY VERIFIED
+#    private (issue #436, mirroring #432 round 1) — ALERT_TOKEN present so the write cannot fail
+#    silently, ALERT_REPO distinct from the public registry, and the destination confirmed by a
+#    live GET /repos/{ALERT_REPO}. Every other shape falls back to the registry repo under the
+#    ambient token. The groom-alert body carries NO account handles (it reports only the job
+#    RESULT + run link), so the fallback needs no redaction variant.
 #  - decide(): close ONLY on an explicit `success` — needs.<job>.result also permits `skipped`,
 #    which proves nothing about recovery, so an open alert must survive a skipped GROOM.
 #  - _gh(check=True): a non-zero gh returncode is surfaced as a sanitized ::warning:: (op +
@@ -38,12 +39,43 @@ ALERT_TITLE = "⚠️ Scheduled GROOM job is failing — crash-recovery and heal
 ALERT_MARKER = "<!-- groom-alert:v1 key=groom-job-failure -->"
 
 
-def _alert_route(alert_repo, alert_token, registry_repo):
+def _repo_confirmed_private(repo, token):
+    """True ONLY on a definitive `"private": true` from GET /repos/{repo} read under the route
+    token — same helper, same fail-closed posture as usage-alert.py's (issue #436, mirroring #432
+    round 1). A failed lookup, an unparseable payload, or anything but a literal boolean true
+    reads as NOT private. The response body is parsed, never echoed, so a lookup against a
+    wrong/hostile repo name can put nothing in the public log."""
+    proc = _gh(["api", f"repos/{repo}"], capture=True, token=token)
+    if proc.returncode != 0:
+        return False
+    try:
+        payload = json.loads(proc.stdout or "")
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("private") is True
+
+
+def _alert_route(alert_repo, alert_token, registry_repo, confirmed_private=None):
     """(repo, token) for the alert issue — same semantics as usage-alert.py's router (privacy
-    d22c + issue #39): private ALERT_REPO only when ALERT_TOKEN is present; otherwise the registry
-    repo under the ambient token (token=None means "use the ambient GH_TOKEN")."""
+    d22c + issue #39; hardened for issue #436 exactly as #432 round 1 hardened usage-alert.py).
+    The private ALERT_REPO is the destination ONLY over a POSITIVELY VERIFIED private route:
+    ALERT_TOKEN present (so the write cannot fail silently under the ambient token), ALERT_REPO
+    distinct from the public registry repo (case-insensitive — a "private route" naming the
+    registry itself IS the public repo), AND the destination CONFIRMED private by a live
+    GET /repos/{ALERT_REPO} under ALERT_TOKEN. Configuration alone — two non-empty strings — is
+    NOT verification: it fails OPEN on a same-repo or public ALERT_REPO, silently degrading the
+    channel the maintainer believes is private. EVERY other shape (unconfigured, half-configured,
+    same-repo, public, or a failed/indeterminate visibility lookup) falls back to the registry
+    repo under the ambient token (token=None means "use the ambient GH_TOKEN"), so no alert is
+    lost — this body carries only the job RESULT + run link, which is publishable, so the fallback
+    needs no redaction variant. `confirmed_private` is injectable for the self-test; the default
+    performs the live lookup, and it is consulted only once both halves of the route are set (a
+    half-configured route needs no API call to be rejected)."""
     if alert_repo and alert_token:
-        return alert_repo, alert_token
+        same_repo = alert_repo.strip().lower() == (registry_repo or "").strip().lower()
+        check = confirmed_private if confirmed_private is not None else _repo_confirmed_private
+        if not same_repo and check(alert_repo, alert_token):
+            return alert_repo, alert_token
     return registry_repo, None
 
 
@@ -166,15 +198,77 @@ def _self_test():
         ok = ok and good
         print(f"  {'ok  ' if good else 'FAIL'} {n}: {got} (want {want})")
 
-    # Routing (mirrors usage-alert.py's audited matrix)
-    chk("route: repo+token -> private + token",
-        _alert_route("org/private", "tok", "org/registry"), ("org/private", "tok"))
-    chk("route: repo but NO token -> registry fallback",
-        _alert_route("org/private", "", "org/registry"), ("org/registry", None))
+    # Routing (mirrors usage-alert.py's audited matrix, including #432 round 1 / issue #436:
+    # configuration alone is NOT verification — the destination must be CONFIRMED private).
+    vis_calls = []
+    chk("route: repo+token+CONFIRMED private -> private + token",
+        _alert_route("org/private", "tok", "org/registry",
+                     confirmed_private=lambda r, t: vis_calls.append((r, t)) or True),
+        ("org/private", "tok"))
+    chk("route: the visibility check runs against the ALERT repo under the ALERT token",
+        vis_calls, [("org/private", "tok")])
+    chk("route: ALERT_REPO == REGISTRY_REPO -> registry fallback (#436: not a private channel)",
+        _alert_route("org/registry", "tok", "org/registry",
+                     confirmed_private=lambda r, t: True), ("org/registry", None))
+    chk("route: same-repo rejection is case-insensitive (GitHub repo names are)",
+        _alert_route("Org/Registry", "tok", "org/registry",
+                     confirmed_private=lambda r, t: True), ("org/registry", None))
+    chk("route: UNCONFIRMED visibility (public repo or failed lookup) -> registry fallback (#436)",
+        _alert_route("org/other-public", "tok", "org/registry",
+                     confirmed_private=lambda r, t: False), ("org/registry", None))
+    half_calls = []
+    chk("route: repo but NO token -> registry fallback, and NO visibility call",
+        (_alert_route("org/private", "", "org/registry",
+                      confirmed_private=lambda r, t: half_calls.append(r) or True), half_calls),
+        (("org/registry", None), []))
     chk("route: repo but None token -> registry fallback",
-        _alert_route("org/private", None, "org/registry"), ("org/registry", None))
+        _alert_route("org/private", None, "org/registry",
+                     confirmed_private=lambda r, t: True), ("org/registry", None))
     chk("route: no repo -> registry",
-        _alert_route("", "tok", "org/registry"), ("org/registry", None))
+        _alert_route("", "tok", "org/registry",
+                     confirmed_private=lambda r, t: True), ("org/registry", None))
+    chk("route: neither repo nor token -> registry",
+        _alert_route(None, None, "org/registry",
+                     confirmed_private=lambda r, t: True), ("org/registry", None))
+    # _repo_confirmed_private (#436, mirroring #432 r1): True ONLY on a definitive
+    # `"private": true`; every failure shape is False (fail closed) and the lookup runs under the
+    # ROUTE token, never the ambient one.
+    vis_seen = []
+
+    def _vis_run(rc, stdout):
+        def run(args, **kw):
+            vis_seen.append((list(args), (kw.get("env") or {}).get("GH_TOKEN")))
+
+            class _R:
+                returncode, stderr = rc, ""
+            _R.stdout = stdout
+            return _R()
+        return run
+
+    _real_run = subprocess.run
+    try:
+        subprocess.run = _vis_run(0, json.dumps({"private": True, "full_name": "org/private"}))
+        chk("_repo_confirmed_private: definitive private=true -> True, GET /repos under the "
+            "route token",
+            (_repo_confirmed_private("org/private", "route-tok"), vis_seen[0]),
+            (True, (["gh", "api", "repos/org/private"], "route-tok")))
+        subprocess.run = _vis_run(0, json.dumps({"private": False}))
+        chk("_repo_confirmed_private: a PUBLIC destination -> False (fail closed)",
+            _repo_confirmed_private("org/pub", "t"), False)
+        # The failed-lookup fixture answers a WELL-FORMED `private: true` body on a NON-ZERO
+        # returncode on purpose: with an empty stdout the parse would fail anyway, so deleting
+        # the returncode guard would be a value-identical survivor here.
+        subprocess.run = _vis_run(1, json.dumps({"private": True}))
+        chk("_repo_confirmed_private: failed lookup -> False (never assumed private)",
+            _repo_confirmed_private("org/private", "t"), False)
+        subprocess.run = _vis_run(0, "gh: not json")
+        chk("_repo_confirmed_private: unparseable payload -> False (fail closed)",
+            _repo_confirmed_private("org/private", "t"), False)
+        subprocess.run = _vis_run(0, json.dumps({"visibility": "private"}))
+        chk("_repo_confirmed_private: anything but a literal private=true bool -> False",
+            _repo_confirmed_private("org/private", "t"), False)
+    finally:
+        subprocess.run = _real_run
     # decide(): success-only closure (`skipped` must not close), upsert on hard fail
     chk("decide: failure -> upsert", decide("failure", False), "upsert")
     chk("decide: failure w/ open -> upsert", decide("failure", True), "upsert")
@@ -218,10 +312,16 @@ def _self_test():
     base_env = {"REGISTRY_REPO": "org/registry", "GROOM_RESULT": "", "RUN_URL": "u",
                 "MAINTAINER_HANDLE": "m", "ALERT_REPO": "", "ALERT_TOKEN": ""}
 
-    def run_main(groom_result, list_json="[]", fail=(), alert_repo="", alert_token=""):
+    def run_main(groom_result, list_json="[]", fail=(), alert_repo="", alert_token="",
+                 dest_private=True):
         calls.clear()
         responses.clear()
         responses[("issue", "list")] = _Result(1 if ("issue", "list") in fail else 0, list_json)
+        # #436: the route's live visibility probe. Answering `private: true` by default keeps
+        # every pre-#436 assertion below semantically identical; `dest_private=False` drives the
+        # rejection path end-to-end.
+        responses[("api", f"repos/{alert_repo}")] = _Result(
+            0, json.dumps({"private": bool(dest_private)}))
         for key in fail:
             if key != ("issue", "list"):
                 responses[key] = _Result(1)
@@ -290,6 +390,31 @@ def _self_test():
              (create_env2 or {}).get("GH_TOKEN") == ambient,
              (create_env2 or {}).get("GH_TOKEN") == "sentinel-alert-tok"),
             ("org/registry", True, False))
+        # #436 END-TO-END: main() must actually CONSULT the route's visibility verdict. A fully
+        # configured ALERT_REPO+ALERT_TOKEN whose destination is NOT private lands on the registry
+        # under the ambient token — and the probe itself must have been issued against the ALERT
+        # repo under the ALERT token (a route that never asks would pass the destination check
+        # vacuously).
+        run_main("failure", alert_repo="org/notprivate", alert_token="sentinel-alert-tok",
+                 dest_private=False)
+        create_cmd3, create_env3 = find(("issue", "create"))
+        probe_cmd, probe_env = find(("api", "repos/org/notprivate"))
+        chk("wiring[#436]: configured but UNCONFIRMED-private destination -> registry fallback",
+            (create_cmd3 is not None and create_cmd3[create_cmd3.index("-R") + 1],
+             (create_env3 or {}).get("GH_TOKEN") == ambient,
+             (create_env3 or {}).get("GH_TOKEN") == "sentinel-alert-tok",
+             probe_cmd, (probe_env or {}).get("GH_TOKEN")),
+            ("org/registry", True, False,
+             ["gh", "api", "repos/org/notprivate"], "sentinel-alert-tok"))
+        # ...and the same-repo misconfiguration (ALERT_REPO set to the PUBLIC registry itself)
+        # must be refused WITHOUT even asking — it cannot be a private channel by construction.
+        run_main("failure", alert_repo="org/registry", alert_token="sentinel-alert-tok")
+        create_cmd4, create_env4 = find(("issue", "create"))
+        chk("wiring[#436]: ALERT_REPO == the public registry -> ambient token, no visibility probe",
+            (create_cmd4 is not None and create_cmd4[create_cmd4.index("-R") + 1],
+             (create_env4 or {}).get("GH_TOKEN") == ambient,
+             [s for s in subs() if s[0] == "api"]),
+            ("org/registry", True, []))
         # the dedupe scan uses --limit 100 and matches a title past position 20.
         crowd = [{"number": i, "title": f"unrelated ops alert {i}"} for i in range(25)]
         rc_h, _ = run_main("failure", json.dumps(crowd + [{"number": 99, "title": ALERT_TITLE}]))

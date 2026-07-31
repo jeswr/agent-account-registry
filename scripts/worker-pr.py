@@ -454,13 +454,53 @@ def account_hash(handle, salt):
     return hashlib.sha256(f"{handle}:{salt}".encode()).hexdigest()[:16]
 
 
-def _alert_route():
-    """Ops-alert destination (locked decision 22c): a maintainer-set ALERT_REPO (+ optional
-    ALERT_TOKEN) routes the account-enumerating alert issue to a PRIVATE repo; unset falls back
-    to the registry repo + workflow token (current behaviour)."""
-    repo = os.environ.get("ALERT_REPO") or os.environ.get("REGISTRY_REPO")
+def _repo_confirmed_private(repo, token):
+    """True ONLY on a definitive `"private": true` from GET /repos/{repo} read under the route
+    token — same helper, same fail-closed posture as usage-alert.py's (issue #436, mirroring #432
+    round 1). A failed lookup, an unparseable payload, or anything but a literal boolean true
+    reads as NOT private. The response body is parsed, never echoed, so a lookup against a
+    wrong/hostile repo name can put nothing in the public log.
+
+    CANNOT RAISE, by construction: `_alert_route` is called OUTSIDE `_ops_alert`'s best-effort
+    wrapper (the park/escalation sites resolve the route first), so an exception here would abort
+    a park instead of degrading an alert. Every failure shape — including a `gh` that will not
+    even start — reads as NOT private."""
+    try:
+        proc = _run_gh(["api", f"repos/{repo}"], check=False, env={"GH_TOKEN": token})
+    except Exception:  # noqa: BLE001 — a visibility probe must never abort the caller
+        return False
+    if proc.returncode != 0:
+        return False
+    try:
+        payload = json.loads(proc.stdout or "")
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("private") is True
+
+
+def _alert_route(confirmed_private=None):
+    """Ops-alert destination (locked decision 22c; hardened for issue #436 exactly as #432 round 1
+    hardened usage-alert.py/pat-validity.py). A maintainer-set ALERT_REPO routes the alert issue to
+    a PRIVATE repo ONLY over a POSITIVELY VERIFIED private route: a route token present (so the
+    write can land at all), ALERT_REPO distinct from the public registry repo (case-insensitive —
+    a "private route" naming the registry itself IS the public repo), AND the destination CONFIRMED
+    private by a live GET /repos/{ALERT_REPO} under that token. Configuration alone — a non-empty
+    ALERT_REPO — is NOT verification: it fails OPEN on a same-repo or public ALERT_REPO, silently
+    degrading the channel the maintainer believes is private. EVERY other shape (unconfigured,
+    tokenless, same-repo, public, or a failed/indeterminate visibility lookup) falls back to the
+    registry repo + workflow token, which is the pre-#436 unconfigured behaviour, so no alert is
+    lost. `confirmed_private` is injectable for the self-test; the default performs the live
+    lookup, consulted only once BOTH halves of the route are set (a tokenless route needs no API
+    call to be rejected — `_ops_alert` refuses to deliver without a token anyway)."""
+    registry_repo = os.environ.get("REGISTRY_REPO")
+    alert_repo = os.environ.get("ALERT_REPO")
     token = os.environ.get("ALERT_TOKEN") or os.environ.get("REGISTRY_ALERT_TOKEN")
-    return repo, token
+    if alert_repo and token:
+        same_repo = alert_repo.strip().lower() == (registry_repo or "").strip().lower()
+        check = confirmed_private if confirmed_private is not None else _repo_confirmed_private
+        if not same_repo and check(alert_repo, token):
+            return alert_repo, token
+    return registry_repo, token
 
 
 def _ops_alert(alert_repo, alert_token, title, body):
@@ -6276,6 +6316,15 @@ def _self_test():
         ok = ok and good
         print(f"  {'ok  ' if good else 'FAIL'} {name}: {got} (want {want})")
 
+    # HERMETIC ROUTE RESOLUTION (#436). `_alert_route` now issues a live GET /repos/{ALERT_REPO}
+    # visibility probe, and several wiring blocks below resolve the route FOR REAL (the terminal
+    # `_registry_put_file` paths evaluate `_ops_alert(*_alert_route(), …)` even while `_ops_alert`
+    # itself is stubbed). An ambient ALERT_REPO + token in the job env would turn that into a real
+    # `gh` call, which the enrolled-suite sandbox reds as a self-test touching the live estate.
+    # The route matrix below sets both vars explicitly; nothing else in this suite reads them.
+    for _ambient_key in ("ALERT_REPO", "ALERT_TOKEN"):
+        os.environ.pop(_ambient_key, None)
+
     bot = "sparq[bot]"
     comments = [
         {"user": {"login": bot}, "body": f"x {ROUND_MARKER} n=1 run=10.1 -->"},
@@ -11004,14 +11053,96 @@ def _self_test():
           "acct09" in _scrubbed["issues"][0]["title"], False)
     check("verdict scrub strips an issue email",
           "@" in _scrubbed["issues"][0]["body"], False)
+    # ---- ops-alert routing (locked decision 22c; hardened for issue #436) ----------------------
+    # The private ALERT_REPO is selected ONLY over a POSITIVELY VERIFIED private route. Every
+    # rejection direction is asserted, and the same-repo direction is asserted on the PROBE (not
+    # on the returned tuple): when ALERT_REPO names the registry, both branches return the SAME
+    # (repo, token) pair, so dropping the same-repo guard is value-identical and invisible to a
+    # return-value check — only "the visibility probe was never issued" can kill it.
     os.environ["REGISTRY_REPO"] = "reg/repo"
     os.environ["REGISTRY_ALERT_TOKEN"] = "t0"
     os.environ.pop("ALERT_REPO", None)
     os.environ.pop("ALERT_TOKEN", None)
-    check("alert route defaults to registry", _alert_route(), ("reg/repo", "t0"))
+    unconfigured_probes = []
+    check("alert route defaults to registry",
+          _alert_route(confirmed_private=lambda r, t: unconfigured_probes.append(r) or True),
+          ("reg/repo", "t0"))
+    check("alert route: no ALERT_REPO -> NO visibility probe", unconfigured_probes, [])
     os.environ["ALERT_REPO"] = "private/alerts"
     os.environ["ALERT_TOKEN"] = "t1"
-    check("alert route honours ALERT_REPO", _alert_route(), ("private/alerts", "t1"))
+    route_probes = []
+    check("alert route honours a CONFIRMED-private ALERT_REPO",
+          _alert_route(confirmed_private=lambda r, t: route_probes.append((r, t)) or True),
+          ("private/alerts", "t1"))
+    check("alert route probes the ALERT repo under the ALERT token",
+          route_probes, [("private/alerts", "t1")])
+    check("[#436] an UNCONFIRMED-private ALERT_REPO falls back to the registry",
+          _alert_route(confirmed_private=lambda r, t: False), ("reg/repo", "t1"))
+    same_repo_probes = []
+    os.environ["ALERT_REPO"] = "reg/repo"
+    check("[#436] ALERT_REPO == the PUBLIC registry -> registry route, and the probe is NEVER "
+          "issued (the same-repo guard, killable only here)",
+          (_alert_route(confirmed_private=lambda r, t: same_repo_probes.append(r) or True),
+           same_repo_probes),
+          (("reg/repo", "t1"), []))
+    os.environ["ALERT_REPO"] = "Reg/Repo"
+    same_case_probes = []
+    check("[#436] same-repo rejection is case-insensitive (GitHub repo names are)",
+          (_alert_route(confirmed_private=lambda r, t: same_case_probes.append(r) or True),
+           same_case_probes),
+          (("reg/repo", "t1"), []))
+    os.environ["ALERT_REPO"] = "private/alerts"
+    os.environ.pop("ALERT_TOKEN", None)
+    os.environ.pop("REGISTRY_ALERT_TOKEN", None)
+    tokenless_probes = []
+    check("[#436] ALERT_REPO with NO token at all -> registry route, no probe",
+          (_alert_route(confirmed_private=lambda r, t: tokenless_probes.append(r) or True),
+           tokenless_probes),
+          (("reg/repo", None), []))
+    # The DEFAULT (uninjected) route must perform the live lookup — a default that answers True
+    # without asking would make every check above vacuous in production.
+    os.environ["REGISTRY_ALERT_TOKEN"] = "t0"
+    probe_calls = []
+
+    class _ProbeResult:
+        def __init__(self, rc=0, stdout=""):
+            self.returncode, self.stdout, self.stderr = rc, stdout, "SENTINEL-PROBE-STDERR"
+
+    def _probe_gh(rc, stdout):
+        def run(args, *, input_text=None, check=True, env=None):
+            probe_calls.append((list(args), (env or {}).get("GH_TOKEN")))
+            return _ProbeResult(rc, stdout)
+        return run
+
+    real_probe_gh = globals()["_run_gh"]
+    try:
+        globals()["_run_gh"] = _probe_gh(0, json.dumps({"private": True}))
+        check("[#436] the DEFAULT route issues GET /repos/{ALERT_REPO} under the route token",
+              (_alert_route(), probe_calls),
+              (("private/alerts", "t0"), [(["api", "repos/private/alerts"], "t0")]))
+        globals()["_run_gh"] = _probe_gh(0, json.dumps({"private": False}))
+        check("[#436] probe says PUBLIC -> registry fallback", _alert_route(), ("reg/repo", "t0"))
+        # A NON-ZERO returncode carrying a WELL-FORMED `private: true` body on purpose: with an
+        # empty stdout the parse would fail anyway, so deleting the returncode guard would be a
+        # value-identical survivor here.
+        globals()["_run_gh"] = _probe_gh(1, json.dumps({"private": True}))
+        check("[#436] probe FAILED -> registry fallback (never assumed private)",
+              _alert_route(), ("reg/repo", "t0"))
+        globals()["_run_gh"] = _probe_gh(0, "gh: not json")
+        check("[#436] probe returned unparseable JSON -> registry fallback",
+              _alert_route(), ("reg/repo", "t0"))
+        globals()["_run_gh"] = _probe_gh(0, json.dumps({"visibility": "private"}))
+        check("[#436] anything but a literal private=true bool -> registry fallback",
+              _alert_route(), ("reg/repo", "t0"))
+
+        def _raising_gh(*_a, **_kw):
+            raise WorkerPrError("SENTINEL-PROBE-RAISE")
+        globals()["_run_gh"] = _raising_gh
+        check("[#436] a RAISING probe degrades to the registry route — it must never abort the "
+              "park/escalation site that resolved the route",
+              _alert_route(), ("reg/repo", "t0"))
+    finally:
+        globals()["_run_gh"] = real_probe_gh
     for key in ("REGISTRY_REPO", "REGISTRY_ALERT_TOKEN", "ALERT_REPO", "ALERT_TOKEN"):
         os.environ.pop(key, None)
     # ---- ready_and_arm wiring (Decision 7 revision, sol r1 on #257): approved trust-surface
