@@ -172,6 +172,23 @@ MARKER_KINDS = {
     "nochange": "<!-- sparq-fix-nochange:v1",
     "gatefail": "<!-- sparq-fix-gatefail:v1",
     "missed": "<!-- sparq-fix-missed:v1",
+    # [registry #406] THE STRANDED RECOVERY-ATTEMPT MARKER — the review lane's only marker kind,
+    # and the one counter here that a DISPATCH writes rather than an outcome.
+    #
+    # Issue #161 made the `stranded` CLAIM state re-review the current head under the ROUND
+    # budget instead of a terminal needs-user, reserving the human hand-off for repeated failed
+    # recovery. That bound is only as durable as the ROUND marker, and review-outcome records
+    # the round marker LAST: a recovery review that dies before it leaves `count_rounds` flat,
+    # so the next tick re-derives the same posture and the same untouched budget. The recovery
+    # can then re-emit across lease expiries forever without ever converging on the human — the
+    # pre-#161 behaviour (escalate on the first observation) at least terminated.
+    #
+    # dispatch-claim charges ONE of these per recovery dispatch, BEFORE it retracts the
+    # disproved reviewed-sha assertion, so it climbs on exactly the runs whose round marker never
+    # landed. Same `round=<n> run=<key>` grammar, reserved namespace and bot-login trust filter
+    # as every other kind, so `marker_runs` / `marker_runs_since` (and the readmission window
+    # they carry) count it with no new parsing.
+    "strandedrecover": "<!-- sparq-review-strandedrecover:v1",
 }
 # Model-escalation accounting (maintainer directive 2026-07-17). Durable, bot-authored markers:
 # the fix outcome records WHICH model executed each fix round (the commit [alias] tag is not
@@ -957,9 +974,10 @@ def marker_runs_since(comments, bot_login, kind, round_n, since, log=print):
     CHARGED. Ordering is over PARSED aware datetimes (park_policy.parse_ts), never raw
     strings.
 
-    Consumed today by dispatch-claim's MISSED_FIX_LIMIT budget (`missed`). fix_outcome's
-    nochange/gatefail limits still charge the LIFETIME count deliberately: each of those
-    markers records a fix that actually RAN, so its park is work genuinely consumed (and the
+    Consumed today by dispatch-claim's MISSED_FIX_LIMIT budget (`missed`) and, on the same
+    window, by its STRANDED_RECOVERY_LIMIT budget (`strandedrecover`, registry #406).
+    fix_outcome's nochange/gatefail limits still charge the LIFETIME count deliberately: each of
+    those markers records a fix that actually RAN, so its park is work genuinely consumed (and the
     attempt fingerprint keeps it from re-emitting on a no-work tick) — windowing them is a
     separate policy change, kept out of this diff because the auth-class round-charging work
     lands on that same path."""
@@ -6434,6 +6452,23 @@ def _self_test():
     check("nochange runs per round", len(marker_runs(comments, bot, "nochange", 2)), 2)
     check("nochange other round empty", len(marker_runs(comments, bot, "nochange", 1)), 0)
     check("missed runs", len(marker_runs(comments, bot, "missed", 2)), 1)
+    # [registry #406] KIND-GENERIC, driven from MARKER_KINDS itself so a newly declared kind (this
+    # issue adds `strandedrecover`, the counter the stranded recovery is bounded by) is covered the
+    # moment it exists rather than whenever someone remembers to add a row. Every kind must parse
+    # under the shared grammar, count only its OWN prefix at only its OWN round, and count only
+    # BOT-authored comments — a kind that shares a budget with another, or that a forged comment
+    # can inflate, reds here.
+    for _kind in sorted(MARKER_KINDS):
+        _row = [{"user": {"login": bot},
+                 "body": f"x {MARKER_KINDS[_kind]} round=4 run=k.1 -->"}]
+        check(f"the {_kind} marker parses, and counts only its own kind/round/author",
+              (sorted(marker_runs(_row, bot, _kind, 4)),
+               len(marker_runs(_row, bot, _kind, 5)),
+               len(marker_runs([{"user": {"login": "mallory"}, "body": _row[0]["body"]}],
+                               bot, _kind, 4)),
+               sorted(other for other in MARKER_KINDS
+                      if other != _kind and marker_runs(_row, bot, other, 4))),
+              (["k.1"], 0, 0, []))
     check("duplicate run key detected", round_recorded(comments, bot, 1, "10.1"), True)
     check("new run key not recorded", round_recorded(comments, bot, 3, "99.1"), False)
 

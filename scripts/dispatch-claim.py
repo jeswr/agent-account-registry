@@ -340,6 +340,18 @@ FIX_TTL = _lease_ttl("fix")         # 10+10+60+10+15 = 105m (was 60m — exactly
 SELF_CLAIM_REVIEW_CAP = 10
 SELF_CLAIM_FIX_CAP = 3
 MISSED_FIX_LIMIT = 6  # consecutive missed fix dispatches per round before needs-user (decision 13)
+# [registry #406] The `stranded` RECOVERY's own durable bound, counted INDEPENDENTLY of the round
+# marker. Issue #161's recovery is bounded by `count_rounds` alone, and review-outcome writes the
+# round marker LAST — so a recovery review that crashes before it leaves the round count flat and
+# the recovery re-emits on every tick that re-derives the posture, never converging on the human
+# hand-off #161 reserved for repeated failure. `strandedrecover` markers are written by the
+# DISPATCH (below, before the retraction), so they climb on exactly the runs the round marker
+# misses; this many of them for one recovery round is the terminal.
+STRANDED_RECOVERY_LIMIT = 3
+# The worker-pr MARKER_KINDS key those markers are recorded under. The self-test asserts it is a
+# real member of that table, so renaming the kind in worker-pr.py reds here instead of silently
+# turning both the charge and the budget into no-ops against a kind nothing writes.
+STRANDED_RECOVERY_MARKER_KIND = "strandedrecover"
 # "not probed yet" sentinel for the per-PR readmission-cutoff memo (#555 recurrence gap): the
 # cutoff's own falsy value (None = no proven human gesture) is a MEANINGFUL result, so it cannot
 # double as the not-yet-read marker.
@@ -6527,19 +6539,39 @@ def _missed_fix_budget(worker_pr, comments, bot_login, round_number, cutoff_fn, 
     count has reached the limit — below it the decision is the same either way, exactly like the
     round budget's `rounds >= max_rounds` gate — so no extra timeline read is spent on the
     common case."""
-    lifetime = len(worker_pr.marker_runs(comments, bot_login, "missed", round_number))
-    if lifetime < MISSED_FIX_LIMIT:
+    return _dispatch_marker_budget(worker_pr, comments, bot_login, "missed", MISSED_FIX_LIMIT,
+                                   round_number, cutoff_fn, repo, number,
+                                   label="missed-fix", noun="miss(es)")
+
+
+def _dispatch_marker_budget(worker_pr, comments, bot_login, kind, limit, round_number,
+                            cutoff_fn, repo, number, *, label, noun):
+    """The generic form of the above, as (charged, lifetime): a per-round durable DISPATCH
+    counter, charged over the human-readmission window and reported over its lifetime.
+
+    Every counter with this shape needs the same two properties, so they are stated once here
+    rather than re-derived per call site: (1) the LIMIT decision charges only markers recorded at
+    or after `cutoff`, so a readmission grants real dispatch capacity instead of re-deriving the
+    same exhaustion off markers burned before the human said "keep trying" (#555 recurrence gap);
+    and (2) the LIFETIME count is returned alongside it as the monotone axis a park's attempt
+    fingerprint needs, because a window-relative count resets and would read as "unchanged"
+    across two genuinely distinct windows.
+
+    Consumed by the missed-fix budget (`missed`) and by the stranded recovery's own bound
+    (`strandedrecover`, registry #406)."""
+    lifetime = len(worker_pr.marker_runs(comments, bot_login, kind, round_number))
+    if lifetime < limit:
         return lifetime, lifetime
     cutoff = cutoff_fn()
     if not cutoff:
         return lifetime, lifetime
     charged = len(worker_pr.marker_runs_since(
-        comments, bot_login, "missed", round_number, cutoff))
+        comments, bot_login, kind, round_number, cutoff))
     if charged != lifetime:
         print(f"readmission window open for {repo}#{number}: a park label was cleared at "
-              f"{cutoff} (a human unlabel or a proven automatic re-admission); the missed-fix "
+              f"{cutoff} (a human unlabel or a proven automatic re-admission); the {label} "
               f"budget for round {round_number} charges {charged} of {lifetime} recorded "
-              f"miss(es)")
+              f"{noun}")
     return charged, lifetime
 
 
@@ -6873,8 +6905,13 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     print(f"defer review {repo}#{number}: the stranded posture did not "
                           f"re-derive on live data (tier-reachable gate={live_gate})")
                     continue
+                # [registry #406] States what was DECIDED HERE — the posture re-derived — and no
+                # more: the round budget and the recovery-attempt budget below both still get to
+                # stand this item down, so promising a re-review on this line would make every
+                # escalation read as a contradiction in the tick log.
                 print(f"recover review {repo}#{number}: stranded residue of an interrupted "
-                      "defuse/disarm — re-reviewing the current head under the round budget")
+                      "defuse/disarm re-derived on live data — admitted to the round and "
+                      "recovery-attempt budgets below")
                 # The marker retraction this recovery needs to be executable at all (issue #708)
                 # happens at the LAUNCH INVARIANT below, not here: every escalation, hold and defer
                 # between this point and the dispatch must be able to stand the item down without
@@ -6957,6 +6994,48 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                               f"was cleared at {cutoff} (a human unlabel or a proven "
                               f"automatic re-admission); the round budget charges "
                               f"{budget_rounds} of {rounds} recorded round(s)")
+            # ---- [registry #406] THE STRANDED RECOVERY'S SECOND, ROUND-INDEPENDENT BOUND ------
+            # The round budget above cannot bound the #161 recovery on its own: every recovery
+            # re-review records its ROUND marker through review-outcome, which runs LAST, so a
+            # recovery that dies anywhere before that leaves `rounds` exactly where it was. The
+            # posture then re-derives on the next tick that sees {drafted, unarmed, reviewed head,
+            # green gate}, the budget re-reads the same untouched count, and the recovery re-emits
+            # across lease expiries forever — never reaching the human hand-off #161 reserved for
+            # repeated failure. (The pre-#161 behaviour escalated on the first observation, so the
+            # loop terminated; #161 traded that for a bound it cannot always increment.)
+            #
+            # `strandedrecover` is written by the DISPATCH itself (at the launch invariant below,
+            # BEFORE the retraction), so it counts exactly the attempts whose round marker never
+            # landed. It is keyed to the round the recovery WOULD consume (`rounds + 1`): a
+            # recovery that DID record its round moves the key forward and the counter starts
+            # over, so a reset always means a round was genuinely recorded — never merely that
+            # another attempt was made. Both bounds therefore hold at once, and neither can be
+            # satisfied by the other's silence.
+            #
+            # Charged over the SAME readmission window as every other durable counter (#555
+            # recurrence gap): the stop below is the HUMAN-owned terminal, and a human who clears
+            # it must get real recovery attempts back rather than an immediate re-escalation off
+            # the markers burned before they said "keep trying".
+            #
+            # Ordered AFTER the base admission (a retargeted PR still leaves the loop with no
+            # mutation) and BEFORE decide_budget, so the specific fact — this PR's recovery is
+            # crash-looping without recording work — wins over the generic round-budget park when
+            # both are exhausted.
+            if item["state"] == "stranded":
+                recovery_round = rounds + 1
+                recoveries, recoveries_total = _dispatch_marker_budget(
+                    worker_pr, comments, bot_login, STRANDED_RECOVERY_MARKER_KIND,
+                    STRANDED_RECOVERY_LIMIT, recovery_round, _readmission_cutoff, repo, number,
+                    label="stranded-recovery", noun="recovery dispatch(es)")
+                if recoveries >= STRANDED_RECOVERY_LIMIT:
+                    _pr_needs_user(script_dir, repo, number, issue_number,
+                                   f"{recoveries} stranded recovery dispatches for round "
+                                   f"{recovery_round} recorded no review round "
+                                   f"({recoveries_total} lifetime, limit "
+                                   f"{STRANDED_RECOVERY_LIMIT}) — the residue of the interrupted "
+                                   "defuse/disarm is not converging on its own, so a human must "
+                                   "inspect this PR")
+                    continue
             impl_provider = record["impl_provider"]
             run_key = (f"{os.environ.get('GITHUB_RUN_ID', 'local')}."
                        f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}")
@@ -7282,6 +7361,37 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # capacity park, review:pass) plus a tri-state arm/draft guard of its own, and this
                 # runs only AFTER every escalation/hold/defer above has declined to stand the item
                 # down — so the recovery never writes to a PR it was about to park.
+                #
+                # [registry #406] CHARGE THE DURABLE RECOVERY ATTEMPT FIRST — before the
+                # retraction, and so before anything else this recovery does. The bound above can
+                # only converge if every dispatched recovery is counted somewhere the next tick
+                # can read, and the ROUND marker (written LAST, by review-outcome) is precisely
+                # what a crashed recovery never writes. The ordering is asymmetric on purpose: a
+                # marker recorded for a retraction that then fails over-counts by one, which
+                # spends one attempt toward a human; a retraction that succeeded with no marker
+                # under-counts FOREVER, which is the unbounded re-emission this closes.
+                #
+                # A write failure DEFERS with a counted lane error and dispatches nothing. Unlike
+                # the missed-fix marker further down it needs no direct human escalation of its
+                # own: this write is the FIRST mutation of the recovery, so failing here leaves
+                # the PR in exactly the posture it arrived in — nothing retracted, no lease spent,
+                # no review run — and a recovery that cannot be counted therefore never happens
+                # at all, rather than happening uncountably. The loud counted error is the signal;
+                # the item stays enumerable for the next tick.
+                try:
+                    _run_target_helper(script_dir, repo, "worker-pr.py", [
+                        "record-marker", "--repo", repo, "--pr", str(number),
+                        "--kind", STRANDED_RECOVERY_MARKER_KIND,
+                        "--round", str(rounds + 1), "--run-key", run_key,
+                        "--bot-login", bot_login])
+                except DispatchError as exc:
+                    lanes[lane]["error"] += 1
+                    defer_reasons["stranded-attempt-marker-write-failed"] += 1
+                    print(f"::error::defer review {repo}#{number}: the durable stranded "
+                          f"recovery-attempt marker could not be recorded ({exc}); NOT "
+                          "dispatching, because a recovery this tick cannot count is a recovery "
+                          "the round-independent budget can never bound")
+                    continue
                 try:
                     _run_target_helper(script_dir, repo, "worker-pr.py", [
                         "stranded-recover", "--repo", repo, "--pr", str(number),
@@ -16052,6 +16162,10 @@ def _self_test():
                     fake["pull"].get("body") or "", wiring_worker_pr.UNBOUND_REVIEWED_SHA))
         if args and args[0] == "stranded-recover" and fake.get("stranded_retract_raises"):
             raise DispatchError("simulated retraction failure")
+        # [registry #406] The durable recovery-attempt marker write can fail like any other
+        # target write; `marker_write_raises` drives the fail-closed leg (charge, then nothing).
+        if args and args[0] == "record-marker" and fake.get("marker_write_raises"):
+            raise DispatchError("simulated marker write failure")
 
     def live_pull(*, draft, labels=(), body="", auto_merge=None, mergeable=True,
                   base_ref="main"):
@@ -16251,6 +16365,11 @@ def _self_test():
             strand_routing = {"models": {
                 "sol": {"provider_model": "TBD", "harness": "codex"},
                 "luna": {"provider_model": "TBD", "harness": "codex"}}}
+            # [registry #406] The run key the dispatcher stamps into its durable markers — derived
+            # here the SAME way production derives it, so the assertion holds both locally and
+            # under a real GITHUB_RUN_ID/RUN_ATTEMPT.
+            strand_run_key = (f"{os.environ.get('GITHUB_RUN_ID', 'local')}."
+                              f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}")
             # ==== THE ROLE SPLIT, AT THE STRANDED LEG (issue #762) ====
             # #761 asserted HERE that a draft-tier green DEFERS, and said in code that #765 would
             # replace that assertion. This is that replacement: the CLAIM leg now re-derives the
@@ -16280,9 +16399,16 @@ def _self_test():
             # ISSUE #708: the recovery RETRACTS the disproved reviewed-sha assertion BEFORE it
             # claims the lease. Without this call review-fix.yml's resolve step exits already_done,
             # skips the model job and reports success — the recovery never once executed on master.
+            # [registry #406] ...and it CHARGES its durable recovery-attempt marker BEFORE the
+            # retraction, so an attempt that dies anywhere after this point is still counted.
             assert [(script, args[0]) for script, args in helper_calls] == [
-                ("worker-pr.py", "stranded-recover")], helper_calls
+                ("worker-pr.py", "record-marker"), ("worker-pr.py", "stranded-recover")], \
+                helper_calls
             assert helper_calls[0][1] == [
+                "record-marker", "--repo", repo, "--pr", "41",
+                "--kind", STRANDED_RECOVERY_MARKER_KIND, "--round", "1",
+                "--run-key", strand_run_key, "--bot-login", bot], helper_calls
+            assert helper_calls[1][1] == [
                 "stranded-recover", "--repo", repo, "--pr", "41",
                 "--head-sha", sha_a, "--issue", "7"], helper_calls
             assert alloc.calls == [("review", ["sol", "luna"])], alloc.calls
@@ -16304,13 +16430,14 @@ def _self_test():
             launched, reasons = run_items(
                 [stranded_item], allocator=alloc, routing=strand_routing)
             assert [(script, args[0]) for script, args in helper_calls] == [
-                ("worker-pr.py", "stranded-recover")], helper_calls
+                ("worker-pr.py", "record-marker"), ("worker-pr.py", "stranded-recover")], \
+                helper_calls
             assert alloc.calls == [("review", ["sol", "luna"])], alloc.calls
             assert launched == 0 and reasons["review:no-slot"] == 1, reasons
-            # ...and the recovery is a REVIEW dispatch: the only helper it invoked retracts a
-            # marker, and the only account it asked for is a REVIEWER. Nothing armed, nothing
-            # merged, no auto-merge helper was called — subset-green bought a re-review and
-            # nothing else. Adding an arm to this path reds the helper-call equality above.
+            # ...and the recovery is a REVIEW dispatch: the only helpers it invoked count and
+            # retract a marker, and the only account it asked for is a REVIEWER. Nothing armed,
+            # nothing merged, no auto-merge helper was called — subset-green bought a re-review
+            # and nothing else. Adding an arm to this path reds the helper-call equality above.
             assert not any("arm" in str(args) or "merge" in str(args)
                            for _script, args in helper_calls), helper_calls
             # A DRAFT-TIER head that is still IN PROGRESS does not recover (pending is not green).
@@ -16340,6 +16467,121 @@ def _self_test():
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "needs-user")], helper_calls
             assert alloc.calls == [], alloc.calls
+
+            # ---- [registry #406] THE RECOVERY BOUND THE ROUND MARKER CANNOT PROVIDE -----------
+            # THE LATENT DEFECT #161 left: `count_rounds` is the recovery's ONLY bound, and
+            # review-outcome records the round marker LAST. Every fixture below has ZERO round
+            # markers — the round budget is wide open and can stop NOTHING — which is exactly the
+            # state a recovery that crashes before review-outcome leaves behind, on every attempt,
+            # forever. What terminates the loop here can only be the recovery-attempt counter.
+            def strand_marker(count, created, round_n, start=1):
+                return [{"user": {"login": bot}, "created_at": created,
+                         "body": f"x {wiring_worker_pr.MARKER_KINDS['strandedrecover']} "
+                                 f"round={round_n} run={i}.1 -->"}
+                        for i in range(start, start + count)]
+
+            def strand_reason():
+                return [args[args.index("--reason") + 1] for script, args in helper_calls
+                        if script == "worker-pr.py" and args[0] == "needs-user"]
+
+            # The kind CLAIM charges is a real member of worker-pr's marker table: a rename there
+            # would otherwise leave the charge and the budget both counting a kind nobody writes.
+            assert STRANDED_RECOVERY_MARKER_KIND in wiring_worker_pr.MARKER_KINDS, \
+                sorted(wiring_worker_pr.MARKER_KINDS)
+            fake["pull"] = live_pull(draft=True, labels=["review:needs"],
+                                     body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+            # (a) ONE SHORT OF THE LIMIT, no rounds recorded: the recovery still RUNS — the bound
+            # is a real budget, not a disguised revival of the pre-#161 immediate escalation.
+            fake["comments"] = strand_marker(
+                STRANDED_RECOVERY_LIMIT - 1, "2026-07-30T00:00:00Z", 1)
+            alloc = StrandAllocator()
+            run_items([stranded_item], allocator=alloc, routing=strand_routing)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "record-marker"), ("worker-pr.py", "stranded-recover")], \
+                helper_calls
+            assert alloc.calls == [("review", ["sol", "luna"])], alloc.calls
+            # (b) AT the limit, still with no round ever recorded: the recovery STOPS at the
+            # human terminal, retracts nothing and claims nothing. Deleting the budget check (or
+            # charging the marker after the retraction, so the counter never reaches the limit)
+            # reds this: the recovery would dispatch a third, fourth, Nth time forever.
+            fake["pull"] = live_pull(draft=True, labels=["review:needs"],
+                                     body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+            fake["comments"] = strand_marker(
+                STRANDED_RECOVERY_LIMIT, "2026-07-30T00:00:00Z", 1)
+            alloc = StrandAllocator()
+            run_items([stranded_item], allocator=alloc, routing=strand_routing)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "needs-user")], helper_calls
+            assert alloc.calls == [], alloc.calls
+            assert [f"{STRANDED_RECOVERY_LIMIT} stranded recovery dispatches for round 1 "
+                    "recorded no review round" in reason
+                    for reason in strand_reason()] == [True], helper_calls
+            # (c) THE COUNTER RESETS ONLY ON RECORDED WORK. The same burned attempts, plus ONE
+            # round marker: the recovery would now consume round 2, the attempts keyed to round 1
+            # are spent history, and it RUNS again (charging round 2). A reset therefore always
+            # means a round was genuinely recorded — never merely that another attempt was made.
+            fake["pull"] = live_pull(draft=True, labels=["review:needs"],
+                                     body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+            fake["comments"] = strand_marker(
+                STRANDED_RECOVERY_LIMIT, "2026-07-30T00:00:00Z", 1) + [
+                {"user": {"login": bot}, "created_at": "2026-07-30T02:00:00Z",
+                 "body": f"x {wiring_worker_pr.ROUND_MARKER} n=1 run=1.1 -->"}]
+            alloc = StrandAllocator()
+            run_items([stranded_item], allocator=alloc, routing=strand_routing)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "record-marker"), ("worker-pr.py", "stranded-recover")], \
+                helper_calls
+            assert helper_calls[0][1][helper_calls[0][1].index("--round") + 1] == "2", helper_calls
+            assert alloc.calls == [("review", ["sol", "luna"])], alloc.calls
+            # (d) THE READMISSION WINDOW (#555 recurrence gap): a human who clears the terminal
+            # this park applied gets REAL recovery attempts back, instead of an immediate
+            # re-escalation off the very markers that were burned before they said "keep trying".
+            fake["pull"] = live_pull(draft=True, labels=["review:needs"],
+                                     body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+            fake["comments"] = strand_marker(
+                STRANDED_RECOVERY_LIMIT, "2026-07-30T00:00:00Z", 1)
+            fake["timeline"] = {41: [{"event": "unlabeled", "label": {"name": "needs:user"},
+                                      "created_at": "2026-07-30T01:00:00Z",
+                                      "actor": {"login": "jeswr"}}], 7: []}
+            alloc = StrandAllocator()
+            window_log = io.StringIO()
+            with contextlib.redirect_stdout(window_log):
+                run_items([stranded_item], allocator=alloc, routing=strand_routing)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "record-marker"), ("worker-pr.py", "stranded-recover")], \
+                helper_calls
+            assert "the stranded-recovery budget for round 1 charges 0 of " \
+                f"{STRANDED_RECOVERY_LIMIT}" in window_log.getvalue(), window_log.getvalue()
+            # ...and a BOT unlabel opens NO window: the same burned markers still park (the
+            # conservative direction every other budget on this path fails in).
+            fake["pull"] = live_pull(draft=True, labels=["review:needs"],
+                                     body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+            fake["timeline"] = {41: [{"event": "unlabeled", "label": {"name": "needs:user"},
+                                      "created_at": "2026-07-30T01:00:00Z",
+                                      "actor": {"login": "sparq-orchestrator[bot]"}}], 7: []}
+            alloc = StrandAllocator()
+            run_items([stranded_item], allocator=alloc, routing=strand_routing)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "needs-user")], helper_calls
+            assert alloc.calls == [], alloc.calls
+            fake.pop("timeline", None)
+            # (e) THE CHARGE IS FAIL-CLOSED: if the attempt marker cannot be recorded, NOTHING is
+            # retracted and NO lease is spent — an uncountable recovery never happens at all,
+            # rather than happening uncountably. Counted as a lane error, never a green defer.
+            fake["pull"] = live_pull(draft=True, labels=["review:needs"],
+                                     body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+            fake["comments"] = []
+            fake["marker_write_raises"] = True
+            alloc = StrandAllocator()
+            reasons = run_items([stranded_item], allocator=alloc,
+                                routing=strand_routing)[1]
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "record-marker")], helper_calls
+            assert alloc.calls == [], alloc.calls
+            assert reasons["stranded-attempt-marker-write-failed"] == 1, reasons
+            assert run_items.lanes["review"]["error"] == 1, run_items.lanes
+            fake.pop("marker_write_raises", None)
+
             # stranded DO-NOTHING: the posture failed to re-derive (gate red again) -> defer,
             # neither a review dispatch nor a hand-off
             fake.update(check_runs=gate_red, comments=[])
@@ -16383,6 +16625,7 @@ def _self_test():
                 launched, reasons = run_items([stranded_item], allocator=alloc,
                                               routing=strand_routing)
                 assert [(script, args[0]) for script, args in helper_calls] == [
+                    ("worker-pr.py", "record-marker"),
                     ("worker-pr.py", "stranded-recover")], helper_calls
                 assert launched == 1, (launched, reasons)
                 assert [arg for args in launch_runs for arg in args
@@ -24085,6 +24328,16 @@ PARK_CAUSE_SITES_869 = (
     # stays prose-only. Its prose matches no LEGACY_PARK_PROSE pattern either, so
     # reclassify_legacy_park already returns None for it and the park stands.
     ("the durable missed-fix marker could not be recorded", "question", None, 1),
+    # [registry #406] THE SECOND DOCUMENTED EXCLUSION, for the same reason as the first. This park
+    # fires when the `stranded` recovery has spent STRANDED_RECOVERY_LIMIT dispatches on one round
+    # without any of them recording a review round — a crash loop in the recovery itself. No cause
+    # in the CLOSED taxonomy names that: `budget` means the review ROUND budget (and is CAPACITY —
+    # machine-owned, auto-readmittable, which is the wrong class for a stop whose whole content is
+    # "N identical attempts produced nothing"), `marker-corrupt` means durable markers failed
+    # VALIDATION, and #869 may not extend the taxonomy to satisfy a coverage count. It stays
+    # QUESTION-class prose-only, matching no LEGACY_PARK_PROSE pattern, so reclassify_legacy_park
+    # returns None for it and the park stands.
+    ("stranded recovery dispatches for round", "question", None, 1),
 )
 
 
