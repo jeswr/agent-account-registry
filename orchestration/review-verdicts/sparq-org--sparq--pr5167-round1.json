@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5167,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7a47d4550d696e6cd0882b3aa288412584084cad",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly adds a suite-level wall-clock budget to both Kani workflows, clamps individual harness runs to the remaining budget, records CUT/NOT RUN outcomes, and fails closed when any proof lacks a verdict. The manifest checker consistently validates both workflows' configured budgets against their job backstops and per-harness ceilings, with focused self-tests covering overrun, undersized, missing, and safe-backstop cases. No correctness, soundness, test-validity, or security defect is evident in the diff.",
+  "verdict": "approve"
+ }
+}
