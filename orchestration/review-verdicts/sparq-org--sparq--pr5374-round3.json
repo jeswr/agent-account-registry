@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5374,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "aba3562547bf5b1eed51e73e33e5bb79ed6e18a5",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves both prior findings. The new pattern_scans declaration is now explicitly non-load-bearing: check_pattern_scans only adds well-formedness rejections, while FILTER, attribution, Q6, and join obligations continue to derive scan membership independently through scan_matches_pattern. The relevant e2e tests exercise the real structural verifier path and pin the prior same-layout and cross-slot counterexamples, including mutation-sensitive rejection when declarations attempt to hide failing slots. The audit record and public skill accurately preserve the research-grade, not-externally-audited posture and document that the over-demand remains. No correctness, soundness, test-validity, or security issue remains in the diff-scoped evidence.",
+  "verdict": "approve"
+ }
+}
