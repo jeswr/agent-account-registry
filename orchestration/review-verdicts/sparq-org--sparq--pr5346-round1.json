@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5346,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0022517d490404b08625a38ba23505ddaad689f5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is correctly and honestly scoped. The host-side codepoint-to-byte window conversion preserves the existing F&O window semantics, including empty, negative-length, start-before-one, past-end, multibyte, combining-mark, astral, and padded-buffer cases. The generated Noir tests exercise the real byte-positional substring primitive with converted windows and assert both returned byte length and content. The exhaustive conversion property test is non-vacuous, the CPython cross-check safely encodes fixed corpus strings as Unicode escapes, and fault-injection/coverage accounting is extended for the new generated test. Documentation clearly states that this does not make private in-circuit strings codepoint-positional and retains the external-audit caveat posture. No correctness, soundness, test-validity, or security issue was found in the diff.",
+  "verdict": "approve"
+ }
+}
