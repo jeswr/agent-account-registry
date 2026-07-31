@@ -903,8 +903,17 @@ the parsed document in memory and required to come back named.
   workflow there runs as a consequence, including one the candidate bundle itself adds under
   `.github/workflows/`. That would let gate-FAILED, unreviewed content reach target-side execution
   with the target's own Actions capabilities and secrets. An artifact executes nothing, is scoped to
-  this run in this repository, and the retention step is ordered BEFORE the App-token mint, so a
-  failed gate never holds a write credential at all.
+  this run in this repository, and the retention step is ordered BEFORE every App-token mint in the
+  job.
+
+  **What a failed gate may hold, exactly.** Ordering alone only says no credential exists *during*
+  the upload, so the publisher's contents+workflows+issues+PR-write mint is itself keyed on gate
+  success and a verified bundle: on a failed gate it SKIPS and its token is empty, and every
+  target-touching step below it (checkout, pre-publish trust re-check, push/PR) stays skipped as
+  before. The one credential the failure lane does reach is a separate `issues: write`-ONLY token
+  for follow-up filing — the lane that must survive a refused patch (issue #40), so that declared
+  out-of-scope work is still captured. It can open an issue and nothing else: no ref, no code, no
+  workflow, no pull request.
 
   **Scope: nothing consumes that artifact automatically.** The next attempt still starts the model
   from a fresh default-branch checkout and the fix loop only ever operates on an existing pull

@@ -5099,19 +5099,61 @@ WFFIX
   chk "#1446 r2 (LIVE): the retention lane runs BEFORE the App-token mint (no credential in scope)" \
     "$([[ -n "$preserve_ln" && -n "$mint_ln" && "$preserve_ln" -lt "$mint_ln" ]] \
         && printf before || printf after-or-missing)" "before"
-  # (3) A GATE-FAILED RUN REACHES NO TARGET-TOUCHING STEP. Evaluated per step rather than argued:
-  # every step in the publisher that reads or writes the target repository is keyed on gate SUCCESS,
-  # so under a failure verdict each one skips. The success column is the non-vacuity control — the
-  # same evaluator must be able to say `fires` for all three.
+  # (3) A GATE-FAILED RUN REACHES NEITHER THE WRITE CREDENTIAL NOR ANY TARGET-TOUCHING STEP.
+  # Evaluated per step rather than argued: the mint of the contents/workflows/issues/PR-write publish
+  # token, and every step in the publisher that reads or writes the target repository, are keyed on
+  # gate SUCCESS, so under a failure verdict each one skips. The success column is the non-vacuity
+  # control — the same evaluator must be able to say `fires` for all four.
+  #
+  # ⚠️ [#1446 review r3] THE MINT IS IN THIS MATRIX BECAUSE IT WAS THE DEFECT. It carried no `if:`
+  # at all, so it inherited the implicit `success()` — which a gate-FAILED run satisfies, since
+  # checkout/download/verify/retain all succeed on that lane. The r2 ordering row above (retention
+  # BEFORE the mint) proves no credential exists DURING the upload and says nothing about what the
+  # failure lane mints AFTERWARDS, so it could not see this. A row that evaluates the mint's own
+  # condition can, and an `if:` deleted from it again reads as `unparseable` here rather than as a
+  # pass.
   local gf_step gf_fail_col='' gf_ok_col=''
-  for gf_step in checkout-target republish-trust pr; do
+  for gf_step in app-token-pub checkout-target republish-trust pr; do
     gf_fail_col+="$(_workflow_if_fires "$(_workflow_step_if "$wf" "$gf_step")" "$(_gf_ctx failure)")/"
     gf_ok_col+="$(_workflow_if_fires "$(_workflow_step_if "$wf" "$gf_step")" "$(_gf_ctx success)")/"
   done
-  chk "#1446 r2 (LIVE): a gate-FAILED run reaches NO target-touching publisher step (checkout/recheck/PR)" \
-    "$gf_fail_col" "skipped/skipped/skipped/"
-  chk "#1446 r2 (LIVE): ...and a gate-GREEN run reaches all three (the three rows above are not vacuous)" \
-    "$gf_ok_col" "fires/fires/fires/"
+  chk "#1446 r3 (LIVE): a gate-FAILED run mints NO write token and reaches NO target-touching step" \
+    "$gf_fail_col" "skipped/skipped/skipped/skipped/"
+  chk "#1446 r3 (LIVE): ...and a gate-GREEN run reaches all four (the four rows above are not vacuous)" \
+    "$gf_ok_col" "fires/fires/fires/fires/"
+  # ...and the mint's COMPLETE condition, pinned exactly (AGENTS.md item 6): a `|| true` disjunct
+  # re-opens the mint for a gate that never ran while satisfying every containment grep, and the
+  # evaluator rows above would report it as `unparseable`, but only this row names what the
+  # condition must BE. It is the same pair of clauses the pre-publish re-check carries.
+  chk "#1446 r3 (LIVE): the publish mint's COMPLETE if: is pinned exactly (gate green + verified bundle)" \
+    "$(_workflow_step_if "$wf" app-token-pub)" \
+    "\${{ needs.worker.outputs.gate_outcome == 'success' && steps.verify.outcome == 'success' }}"
+  # WHICH STEPS HOLD WHICH CREDENTIAL — the routing, asserted as an exact set rather than per step,
+  # so a NEW step handed the write token (the regression this finding is about) fails the row by
+  # appearing in it. The write token reaches exactly the three gate-gated target-touching steps.
+  chk "#1446 r3 (LIVE): the publish WRITE token reaches exactly the three gate-gated steps" \
+    "$(_workflow_steps_referencing "$wf" 'steps.app-token-pub.outputs.token' | tr '\n' '|')" \
+    "Checkout target at the pre-gate base (pinned, no persisted token)|Re-verify live trust immediately before publish (drift → abort, no state change)|Reconstruct, push, and open the DRAFT target pull request (review pending)|"
+  # THE ONE LANE THAT MUST SURVIVE A FAILED GATE (issue #40) AND WHAT IT MAY DO. Gating the mint
+  # above on gate success would have silently emptied the follow-up filer's GH_TOKEN — the #40
+  # property (a refused patch still files its declared out-of-scope work) would have died at
+  # runtime with every `if:` row still green. It has its own mint instead, requesting issues:write
+  # ONLY, reaching only that step, and carrying the byte-identical condition of the step it serves.
+  local fu_if='${{ always() && steps.verify.outcome == '"'"'success'"'"' }}'
+  chk "#40/#1446 r3 (LIVE): the follow-up filer still runs on a failed gate (always()-guarded, verified bundle)" \
+    "$(_workflow_step_if "$wf" followups)" "$fu_if"
+  chk "#1446 r3 (LIVE): ...and its issues-only mint carries the byte-identical condition, so the token exists there" \
+    "$(_workflow_step_if "$wf" app-token-followups)" "$fu_if"
+  chk "#1446 r3 (LIVE): the follow-up token requests issues:write and NO code/ref/workflow/PR write" \
+    "$(_workflow_step_body "$wf" app-token-followups | grep -cE '^ +permission-issues: write$' || true):$(_workflow_step_body "$wf" app-token-followups | grep -cE '^ +permission-(contents|workflows|pull-requests):' || true)" \
+    "1:0"
+  chk "#1446 r3 (LIVE): ...and the SAME permission scan sees all three write scopes on the publish mint (control)" \
+    "$(_workflow_step_body "$wf" app-token-pub | grep -cE '^ +permission-(contents|workflows|pull-requests): write$' || true)" "3"
+  chk "#1446 r3 (LIVE): the issues-only token is a SHA-pinned mint of the same App" \
+    "$(_workflow_step_body "$wf" app-token-followups | grep -cE '^ +uses: actions/create-github-app-token@[0-9a-f]{40} ' || true)" "1"
+  chk "#1446 r3 (LIVE): the issues-only token reaches exactly the follow-up filing step" \
+    "$(_workflow_steps_referencing "$wf" 'steps.app-token-followups.outputs.token' | tr '\n' '|')" \
+    "Create declared follow-up issues (discovered out-of-scope work)|"
   # (4) WHAT IT DOES DO. A SHA-pinned upload of the verified bundle, retained materially longer than
   # the 1-day pre-gate copy whose expiry is the whole reason issue #33 exists, and failing closed on
   # an empty upload rather than silently retaining nothing.
