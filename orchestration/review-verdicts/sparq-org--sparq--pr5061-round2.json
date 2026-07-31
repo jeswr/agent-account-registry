@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5061,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ebdfd0620ce51e498b3a003b3e7f3f9c9baa82f2",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior major findings. The new record now explicitly explains that the force-vs-Brillig differential exercises honest execution only and cannot establish constraint-level enforcement; it requires a witness-mutation or witness-bypass verifier test and keeps the upstream draft blocked until such a test exists. The companion program record uses the same distinction. The measurement discussion now limits corpus matching to label/count consistency, expressly states that execution and provenance remain unverified, and requires confirmation or a reproducible rerun before relying on the gate row. The remaining statements are appropriately caveated: the array-write domination argument is described as plausible rather than certified, no acceptance criteria or measurements are claimed for this session, and the sq-qhy4 external-audit limitation is retained. The documentation-only tracking correction is internally consistent and does not introduce a soundness or security defect.",
+  "verdict": "approve"
+ }
+}
