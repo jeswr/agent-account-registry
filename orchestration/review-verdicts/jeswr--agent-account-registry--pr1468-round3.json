@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1468,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f5d8c03c33a0556be9b8230b31a91a893bb5136a",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 remains sound and complete. The fresh pull-list revalidation is candidate-scoped and per-repository; a refused listing marks each affected claim attempted and deferred, removes those claims from both terminal confirmation and `dead_claims`, and therefore retains their leases without blocking readable repositories or ordinary run-proven dead claims. The snapshot and attempt-budget failures likewise choose conservative, explicitly scoped skip sets rather than fabricating empty views or zero budgets. All eight constructed phase outcomes are pinned into systemic exit reporting, and the end-to-end fixtures non-vacuously cover partial progress, all-refused failure, cross-repository isolation, call sequencing, and the no-candidate request path. I found no blocker, major, or lower-severity defect in the diff.",
+  "verdict": "approve"
+ }
+}
