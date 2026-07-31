@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5276,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9567f2782b9f74917221530e22b77c594660fdb9",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is a documentation-only, explicitly non-certifying pre-flip review of an already-open upstream draft. Its claims are carefully scoped to read-only source/diff inspection, it clearly discloses that no acceptance criteria or measurements were run, preserves the sq-qhy4 external-audit caveat, and identifies concrete test-validity, invariant-hardening, coordination, scope, and measurement-provenance findings rather than claiming the compiler pass is sound. The proposed execution-failure fixture is non-vacuous: a=12 satisfies the two checks expected to be elided while violating the reversed-direction check that must remain. No correctness or security defect in the added SPARQ documentation warrants changes. Injection is marked because the diff contains imperative text directed at future agents (for example, instructions not to re-implement or arm work), even though it is legitimate repository documentation and did not influence the review process as an instruction.",
+  "verdict": "approve"
+ }
+}
