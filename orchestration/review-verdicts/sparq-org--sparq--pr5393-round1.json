@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5393,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "78331a83dcd487b131d480b0e441ba232cd1f73c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is documentation-only and accurately aligns the module overview with the implementation: apply_migration performs issue creation, body-marker stamping, and default-on label reconciliation; dependency writes are marker-only; fetch_native_blockers is read-only and verify_migration does not treat its count summary as proof of a specific edge. The readiness claim also matches open_blocker_count, which holds on either native or marker blockers. No correctness, soundness, test-validity, or security issue is introduced.",
+  "verdict": "approve"
+ }
+}
