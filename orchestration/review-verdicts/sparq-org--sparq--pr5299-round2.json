@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5299,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "168c143d3353010256b3d568cdcac89682586b4d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`numeric_value` delegates to `as_numeric`, while `exact_decimal_lexical` accepts every datatype recognized by `is_integer_datatype`; neither path checks the value-space facets of derived XSD integer types. For example, `\"-1\"^^xsd:positiveInteger = \"-1\"^^xsd:integer` is decided true and can fire a rule, and out-of-range `xsd:byte`/negative `xsd:unsignedLong` values are likewise decided rather than rejected. These literals are not well-formed typed numeric operands for their declared datatypes, contradicting the module and skill claims that ill-formed numeric lexicals fail closed. The added tests cover lexical grammar and magnitude but not derived-type facets.",
+    "file": "crates/sparq-reason/src/rif.rs",
+    "fix_hint": "Before either `as_numeric` comparison or the arbitrary-precision fallback, validate the declared integer subtype's bounds/sign facet (including positive/non-positive/non-negative and fixed-width signed/unsigned ranges). Return `None` for violations. Add real `validate` and `closure` tests using at least `-1^^xsd:positiveInteger`, `128^^xsd:byte`, and a negative or overflowing unsigned type, alongside valid boundary controls.",
+    "severity": "major",
+    "title": "Derived-integer facet violations are treated as valid numeric values"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 fixes the prior >i128 gap with an exact decimal fallback and adds real closure-path tests for equal and unequal huge values. However, the new equality path still does not establish that literals in XSD derived integer datatypes are valid members of those datatypes: both the shared tower and the new fallback classify by integer-family datatype plus decimal lexical shape, without enforcing subtype facets. Consequently an ill-typed literal can participate in equality and make a RIF rule fire or become vacuous, contrary to the documented fail-closed behavior for ill-formed numerics. Because this is a newly identified major correctness issue, progress is regressing under the required rubric.",
+  "verdict": "request_changes"
+ }
+}
