@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5291,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4749247a1b28f9a0861c522ea608877b88b9ac61",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's blocking fixture-guard defect is fixed: the checked suite directory now contains only the lowercase prose \"known-failing\", while the guard searches for the exact uppercase sentinel, so the checked-in manifest no longer self-triggers. The conformance runner exercises the public parse/evaluate/verify path, checks expected answers and disclosure counts, independently replays the rewritten query over each response, includes a provenance-stripping non-vacuity test, and verifies nonce mismatch rejection. The manifest and fixture guards cover all declared cases and validate referenced data. No new correctness, soundness, test-validity, or security issue is evident in the diff. Targeted tests could not be executed in this environment because cargo is unavailable.",
+  "verdict": "approve"
+ }
+}
