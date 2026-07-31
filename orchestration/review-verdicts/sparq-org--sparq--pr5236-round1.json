@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5236,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1c5a60df44f66bdfc407b5a9971e8dc85f99e18a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "ReleaseOnlyWorkflowInertnessTests.test_no_rust_ci_workflow_invokes_a_release_only_workflow scans only OrchestrationSafeInertnessTests._RUST_CI_WORKFLOWS. The invariant documented by the change is stronger: no allowlisted workflow may be uses:-invoked by any workflow that runs on pull_request, pull_request_target, or merge_group. The repository has many PR-triggered workflows outside that hand-maintained list, and a new caller there would not fail this test. In that state an allowlisted workflow can change a PR result, yet ci_select will continue suppressing the full selection for edits to it, contradicting the stated inertness proof.",
+    "file": "scripts/tests/test_ci_select.py",
+    "fix_hint": "Derive the caller corpus from every workflow under .github/workflows whose parsed top-level on block contains a PR/merge-group trigger, instead of using _RUST_CI_WORKFLOWS. Also account for transitive reusable-workflow calls (or explicitly compute reachability from PR-triggered roots), so a PR workflow calling an intermediate reusable workflow that calls a release-only workflow is detected. Add a regression fixture/test for a caller outside _RUST_CI_WORKFLOWS.",
+    "severity": "major",
+    "title": "Caller audit is not fail-closed over PR-triggered workflows"
+   }
+  ],
+  "progress": null,
+  "summary": "The release-only carve-out is reasonable in principle, but its claimed fail-closed inertness proof is incomplete. The regression test checks callers only in a manually maintained subset of workflows, so a future PR-triggered workflow can call an allowlisted reusable release workflow without turning this test red. That would make edits to the called workflow affect a PR check while ci_select still classifies them as orchestration-only.",
+  "verdict": "request_changes"
+ }
+}
