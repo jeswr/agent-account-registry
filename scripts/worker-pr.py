@@ -422,6 +422,27 @@ class WorkerPrError(RuntimeError):
     """A concise, credential-free operational error."""
 
 
+# --- registry-write failure taxonomy (registry #1317 r1) --------------------------------------
+# Both are WorkerPrError SUBCLASSES, so every existing `except WorkerPrError` keeps catching them
+# unchanged; they exist so a caller that wants to survive ONE record's failure can tell the two
+# apart, because the operator response differs and only one of them can ever clear by retrying.
+# A caller that catches the BASE class at a write site necessarily also swallows argument
+# validation ("impl_provider must be anthropic or openai") and the live-PR integrity refusals —
+# invariant violations that must stay loud — which is exactly how a permanent conflict came to be
+# reported as "the write did not land, the next run will retry".
+class RegistryRecordConflictError(WorkerPrError):
+    """A record ALREADY EXISTS for this path with different content, so the create-only write was
+    refused. PERMANENT: retrying re-reads the same divergent record and refuses again. A human
+    must reconcile the two records (or the ledger copy must be superseded by a caller that has
+    proved the existing one is dead to every consumer)."""
+
+
+class RegistryWriteExhaustedError(WorkerPrError):
+    """The PUT itself never landed — permanent API rejection, or the CAS/transient retry budget
+    ran out. OPERATIONAL: nothing was recorded and no divergent record was found, so the record
+    is still writable and a later run re-derives it and retries."""
+
+
 # ---- pure helpers (unit-tested by --self-test) ---------------------------------------------------
 def account_hash(handle, salt):
     """Privacy-preserving account fingerprint (locked decision 22a): the registry is PUBLIC, so
@@ -2675,6 +2696,11 @@ def _registry_put_file(registry_repo, path, document, message, volatile_fields=f
     error fails loud immediately. On final failure the REAL last API error is raised, never a
     generic conflict message.
 
+    THE RAISED CLASS SPLITS THE TWO OUTCOMES (registry #1317 r1): a divergent existing record
+    raises `RegistryRecordConflictError` (PERMANENT — no retry can clear it), an unlanded PUT
+    raises `RegistryWriteExhaustedError` (OPERATIONAL — the record is still writable). Both are
+    WorkerPrError, so existing catchers are unaffected.
+
     ``supersede_legacy`` (registry #776) lifts the LEGACY-MASTER veto ONLY — never the ledger
     one. Master permanently rejects protected-path writes, so a legacy master record that every
     consumer REFUSES can never be corrected in place; without this the divergence check below
@@ -2699,7 +2725,7 @@ def _registry_put_file(registry_repo, path, document, message, volatile_fields=f
     legacy, _legacy_sha = _probe_registry_file(registry_repo, path)
     if legacy is not None and not _registry_record_equivalent(legacy, document, volatile_fields):
         if not supersede_legacy:
-            raise WorkerPrError(
+            raise RegistryRecordConflictError(
                 f"registry file {path} already exists with different content on the default "
                 f"branch")
         # SUPERSEDE (registry #776): the caller has proved the existing record is refused by the
@@ -2723,8 +2749,9 @@ def _registry_put_file(registry_repo, path, document, message, volatile_fields=f
         if existing is not None:
             if _registry_record_equivalent(existing, document, volatile_fields):
                 return False  # already recorded — idempotent success
-            raise WorkerPrError(f"registry file {path} already exists with different content "
-                                f"on the '{LEDGER_REF}' branch")
+            raise RegistryRecordConflictError(
+                f"registry file {path} already exists with different content "
+                f"on the '{LEDGER_REF}' branch")
         if legacy is not None:
             return False  # identical pre-migration record, no ledger copy — idempotent success
         args = ["api", "-X", "PUT", f"repos/{registry_repo}/contents/{path}",
@@ -2773,7 +2800,7 @@ def _registry_put_file(registry_repo, path, document, message, volatile_fields=f
                f"data-plane branch: {reason} after {attempts} attempt(s). Last API error: "
                f"{last_error or 'unknown'}. Records are not landing (protection/ref/availability) "
                f"— a maintainer should check branch protection and the `{LEDGER_REF}` ref.")
-    raise WorkerPrError(
+    raise RegistryWriteExhaustedError(
         f"registry write for {path} on branch '{LEDGER_REF}' failed after {attempts} attempt(s) "
         f"({reason}); last API error: {last_error or 'unknown'}")
 
@@ -7356,7 +7383,10 @@ def _self_test():
             if existing is not None:
                 if _registry_record_equivalent(existing, document, volatile_fields):
                     return False  # already recorded — idempotent success, no rewrite
-                raise WorkerPrError(f"registry file {path} already exists with different content")
+                # Same CLASS the real writer raises for a divergence (registry #1317 r1), so a
+                # caller that discriminates on it is exercised here exactly as in production.
+                raise RegistryRecordConflictError(
+                    f"registry file {path} already exists with different content")
             prov_state["store"][path] = body
             return True
 
@@ -9248,6 +9278,16 @@ def _self_test():
         except WorkerPrError as exc:
             check("divergent existing ledger record fails closed",
                   "different content" in str(exc), True)
+            # [registry #1317 r1] WHICH class, asserted both ways. A divergent record is a
+            # PERMANENT conflict — a caller that survives one record's failure (backfill's walk)
+            # keys on this to refuse the "nothing landed, the next run retries" report, which no
+            # retry could ever make true. Still a WorkerPrError, so every existing catcher is
+            # unaffected; collapsing the two classes reds this line.
+            check("  ...as a PERMANENT RegistryRecordConflictError, never the operational "
+                  "write-exhausted class",
+                  (isinstance(exc, RegistryRecordConflictError),
+                   isinstance(exc, RegistryWriteExhaustedError),
+                   isinstance(exc, WorkerPrError)), (True, False, True))
         put_state["files"] = {legacy_loc: record_meta({"pr_number": 8})}
         try:
             _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json", doc, "m")
@@ -9255,6 +9295,9 @@ def _self_test():
         except WorkerPrError as exc:
             check("divergent legacy master record fails closed",
                   "different content" in str(exc) and "default branch" in str(exc), True)
+            check("  ...and it too is the PERMANENT conflict class",
+                  (isinstance(exc, RegistryRecordConflictError),
+                   isinstance(exc, RegistryWriteExhaustedError)), (True, False))
         # sol review r1: an identical LEGACY copy must never mask a divergent LEDGER copy —
         # readers consume the ledger first, so this exact combination silently served the
         # divergent record while the writer reported "already recorded".
@@ -9459,6 +9502,13 @@ def _self_test():
                   "kept conflicting" in str(exc), False)
             check("conflict-exhausted write names the deadline as the terminal reason",
                   "deadline" in str(exc) and "contention" in str(exc), True)
+            # [registry #1317 r1] The OTHER direction of the split: nothing landed and nothing
+            # divergent was found, so the record is still writable and a later run may retry.
+            check("  ...and it is the OPERATIONAL RegistryWriteExhaustedError, never the "
+                  "permanent conflict class",
+                  (isinstance(exc, RegistryWriteExhaustedError),
+                   isinstance(exc, RegistryRecordConflictError),
+                   isinstance(exc, WorkerPrError)), (True, False, True))
         # The fixed six-attempt budget is GONE: a conflict burst keeps retrying PAST the old cap
         # (nine PUTs here) until the deadline elapses, so a late writer cannot be starved out.
         conflict_puts = sum(1 for call in put_calls if "-X" in call)
@@ -9489,6 +9539,10 @@ def _self_test():
                   "Resource not accessible by integration" in str(exc), True)
             check("permanent PUT error is labelled non-retryable (not contention)",
                   "non-retryable" in str(exc), True)
+            check("  ...and a rejected PUT is still the write-exhausted class, not a conflict "
+                  "(no divergent record exists — the path is unwritten)",
+                  (isinstance(exc, RegistryWriteExhaustedError),
+                   isinstance(exc, RegistryRecordConflictError)), (True, False))
         check("a permanent error fails loud on the FIRST attempt (no wasted retries)",
               sum(1 for call in put_calls if "-X" in call), 1)
         check("a permanent error never backs off (nothing to wait out)", backoff_attempts, [])
