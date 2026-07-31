@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1372,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "31cd9e5be69ba612d919c2a78cf5ea6fb60ee255",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-one fail-open recovery path is corrected. M4 now distinguishes out-of-population workflows from scheduled lanes whose ingestion state was not read, derives explicit recovery blockers from the per-mode census, and carries those blockers through the production transport decision so an open alert is held rather than closed on `not-sampled` or `no-concluded-run`. The new end-to-end tests exercise the exact prior finding: a healthy sampled sibling plus an indeterminate formerly rejected lane and an existing M4 issue, while also proving that fully read and deliberately retired populations can close and that blockers do not suppress measured rejections. Expected values are independently pinned, the live fetch/job-count wiring is exercised, and I found no remaining correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
