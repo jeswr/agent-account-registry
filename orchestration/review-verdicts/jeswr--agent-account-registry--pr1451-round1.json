@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1451,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "471b967cba081b2e96e4ab8a528241f98ab10daa",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "scripts/dispatch-claim.py loads the live policy during --self-test, resolves sparq-org/sparq as _DEFERRED_REPO, and asserts that its review_enrolment_authors is empty. This change makes that value frozenset({\"jeswr\"}), so the explicit assertion `sparq is NOT enrolled by this change` fails. The same test's control expects an orchestrator-class sparq PR to remain skipped. Thus this one-line policy change cannot pass the repository gate and widens the rollout without updating the executable evidence for the new target.",
+    "file": "policy/repos.toml",
+    "fix_hint": "Update the enrolment rollout tests and documentation in the same change so sparq is treated as an intentionally enabled target, with a positive enumerator leg driven from the shipped sparq policy and controls proving unlisted authors/classes remain refused. Run the full dispatch-claim --self-test and preserve the downstream-wiring interlock.",
+    "severity": "blocker",
+    "title": "Enabling sparq violates the shipped enrolment interlock/self-test"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe policy-only expansion is not complete: it directly contradicts the shipped self-test that deliberately keeps sparq unenrolled. The repository's own gate will fail, and the diff provides no replacement evidence that the wider rollout is intentional and correctly exercised.",
+  "verdict": "request_changes"
+ }
+}
