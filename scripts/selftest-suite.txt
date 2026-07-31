@@ -22,6 +22,7 @@ grant-scope-audit.py
 groom-alert.py
 groom-mint-alert.py
 groom.py
+http_transient.py
 latch-watchdog.py
 lease_schema.py
 ledger-invariant.py

@@ -1631,6 +1631,21 @@ _tokens_after_gate() {
   ' "$1"
 }
 
+# PURE (self-tested): print the body of ONE top-level job — every line after `  <job>:` up to the
+# next two-space-indented key. [issue #91 review r2] Per-JOB is the granularity the post-gate
+# property is now stated at: the fix push moved out of the job that runs target code and into a
+# sibling one, so "the run job mints no contents-write token" and "the publisher runs no gate" are
+# both claims about a single job that must not be able to read a neighbour's lines and pass.
+_workflow_job_body() {
+  local file="$1" job="$2"
+  [[ -f "$file" ]] || { printf 'worker-live: workflow file missing: %s\n' "$file" >&2; return 1; }
+  awk -v job="$job" '
+    $0 == "  " job ":" { inside=1; next }
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { inside=0 }
+    inside { print }
+  ' "$file"
+}
+
 # PURE (self-tested): print the `- name:` of every workflow step whose text references NEEDLE, in
 # file order. [issue #232] worker-prep no longer persists the account handle, the isolated HOME or
 # the credential paths into the JOB-WIDE $GITHUB_ENV — it emits them as step OUTPUTS, which are
@@ -2003,14 +2018,19 @@ coauthor_for() {
 }
 
 # Authenticated push, extracted so BOTH token-bearing callers share one askpass implementation
-# (`_git_commit_and_push` on the review-fix lane, `publish_pr` on the isolated publisher job of
-# issue #575). The askpass helper keeps the App token out of argv and out of the remote URL.
+# (`push_fix` on the review-fix lane's isolated publisher, `publish_pr` on the worker lane's —
+# issues #91 and #575). The askpass helper keeps the App token out of argv and out of the remote
+# URL. Both callers now run in a job where no target code has ever executed.
 _git_push_authenticated() {
-  local worker_root=$1 branch=$2 push_lease=${3:-}
+  local worker_root=$1 branch=$2 push_lease=${3:-} src_ref=${4:-HEAD}
   [[ -n ${GH_TOKEN:-} ]] || die 'target-scoped App token is missing'
   [[ -n "$worker_root" && "$worker_root" != / && -d "$worker_root" ]] || die 'WORKER_ROOT is unsafe'
   [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die 'unsafe push branch'
   [[ -z "$push_lease" || "$push_lease" =~ ^[0-9a-f]{40}$ ]] || die 'unsafe push lease sha'
+  # [issue #91 r2] The SOURCE is explicit so the isolated fix publisher can push the exact,
+  # pre-gate-recorded commit OBJECT rather than whatever its own HEAD happens to be. Constrained to
+  # HEAD or a 40-hex sha: never a branch name, never a ref the publisher's own checkout resolves.
+  [[ "$src_ref" == HEAD || "$src_ref" =~ ^[0-9a-f]{40}$ ]] || die 'unsafe push source ref'
   local askpass="$worker_root/git-askpass.sh"
   cat > "$askpass" <<'ASKPASS'
 #!/usr/bin/env bash
@@ -2020,33 +2040,37 @@ case "$1" in
 esac
 ASKPASS
   chmod 700 "$askpass"
-  local push_args=(push origin "HEAD:refs/heads/$branch")
+  local push_args=(push origin "$src_ref:refs/heads/$branch")
   [[ -z "$push_lease" ]] ||
-    push_args=(push "--force-with-lease=refs/heads/$branch:$push_lease" origin "HEAD:refs/heads/$branch")
+    push_args=(push "--force-with-lease=refs/heads/$branch:$push_lease" origin "$src_ref:refs/heads/$branch")
   GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 git "${push_args[@]}"
 }
 
-# Shared host-side commit + authenticated push (used by push_fix). The optional 4th/5th args
-# (conflict-repair path, fix kind=rebase): a .beads BASELINE ref — the merged default branch
-# legitimately carries .beads churn, so the tree must MATCH that ref there instead of being
-# untouched — and a 40-hex --force-with-lease guard (CAS push against the dispatched head; the
-# merge commit itself is a fast-forward, the lease only defends the race where someone pushed
-# after dispatch).
+# Host-side commit of the fixer's work, WITH NO TOKEN AND NO PUSH (issue #91 review r2). The
+# optional 4th arg (conflict-repair path, fix kind=rebase) is a .beads BASELINE ref — the merged
+# default branch legitimately carries .beads churn, so the tree must MATCH that ref there instead
+# of being untouched.
 #
-# NOTE (issue #575): the worker PUBLISH lane no longer routes through this helper. Its commit is
-# reconstructed on a separate, target-code-free publisher runner from a digest-bound patch, with
-# git hooks neutralised — see bundle_work()/publish_pr() below.
-_git_commit_and_push() {
-  local branch=$1 message=$2 trailer=$3 beads_baseline_ref=${4:-} push_lease=${5:-}
+# This used to be `_git_commit_and_push`, and it ran AFTER the hostile gate with a
+# contents-write App token in scope. The push half now lives in the isolated `publish` job
+# (push_fix below); what remains here runs PRE-GATE, refuses to run with a token at all, and
+# neutralises git hooks — the fixer edits the target worktree, and a planted `.git/hooks/pre-commit`
+# would otherwise execute target-authored code from inside this commit.
+#
+# NOTE (issue #575): the worker PUBLISH lane does not route through this helper either. Its commit
+# is reconstructed on a separate, target-code-free publisher runner from a digest-bound patch —
+# see bundle_work()/publish_pr() below.
+_git_commit_fix() {
+  local message=$1 trailer=$2 beads_baseline_ref=${3:-}
   local worker_root=${WORKER_ROOT:-}
   local bot_login=${TARGET_BOT_LOGIN:-}
   local bot_id=${TARGET_BOT_ID:-}
-  [[ -n ${GH_TOKEN:-} ]] || die 'target-scoped App token is missing'
+  # TOKEN-FREE BY CONSTRUCTION. This runs on the runner that executes the hostile gate moments
+  # later, so a token in scope here means the workflow regressed — refuse rather than proceed.
+  [[ -z ${GH_TOKEN:-} ]] || die 'fix commit phase must run with NO GitHub token'
   [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
-  [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die 'unsafe push branch'
   [[ "$bot_id" =~ ^[0-9]+$ ]] || die 'unsafe target bot id'
   [[ "$bot_login" =~ ^[A-Za-z0-9_.-]+\[bot\]$ ]] || die 'unsafe target bot login'
-  [[ -z "$push_lease" || "$push_lease" =~ ^[0-9a-f]{40}$ ]] || die 'unsafe push lease sha'
   if [[ -n "$beads_baseline_ref" ]]; then
     [[ "$beads_baseline_ref" =~ ^[A-Za-z0-9._/-]+$ ]] || die 'unsafe .beads baseline ref'
     git diff --quiet "$beads_baseline_ref" -- .beads ||
@@ -2059,9 +2083,7 @@ _git_commit_and_push() {
   git add -A -- .
   git diff --cached --check
   [[ -n "$(git diff --cached --name-only)" ]] || die 'no staged changes to publish'
-  git commit -m "$message" -m "$trailer"
-
-  _git_push_authenticated "$worker_root" "$branch" "$push_lease"
+  git -c core.hooksPath=/dev/null commit --no-verify -m "$message" -m "$trailer"
 }
 
 # ---- issue #575: the model's work crosses the hostile/token boundary as INERT DATA --------------
@@ -2981,42 +3003,264 @@ run_fix() {
   printf 'worker-live: fix run completed (changes=%s, injection=%s)\n' "$fix_made_changes" "$injection"
 }
 
-push_fix() {
+# ---- issue #91 review r2: the FIX lane's work crosses the hostile/token boundary as an INERT,
+# SHA-BOUND git bundle ---------------------------------------------------------------------------
+# The `run` job executes the TARGET's own gate — arbitrary target-controlled build scripts and
+# tests — as the runner user. It then used to commit and push to the PR head branch ON THAT SAME
+# RUNNER, holding a contents/workflows-capable App token. Quarantining the gate step's
+# $GITHUB_ENV/$GITHUB_PATH/$GITHUB_OUTPUT/$GITHUB_STEP_SUMMARY removed the channel that reaches a
+# command file the DOCUMENTED way, but it was never a boundary and must not be read as one: the
+# gate runs as the SAME uid, the runner's real command files sit under
+# $RUNNER_TEMP/_runner_file_commands/ (set_env_*, add_path_*, step_summary_*), and code that
+# enumerates that directory appends to them directly — consumed at step end whatever this step's
+# environment said. No workflow-level mechanism prevents a same-uid write.
+#
+# So the token-bearing half moved OFF that runner, extending issue #575's worker-lane split to this
+# lane: NOTHING TOKEN-BEARING FOLLOWS THE GATE in either one now, which is the property
+# `_tokens_after_gate` asserts on both live files. What crosses is a git BUNDLE holding the single
+# fix commit, sealed PRE-GATE by `stage_fix` (which refuses to run with a token at all) with its
+# commit SHA emitted as a PRE-GATE STEP OUTPUT — captured by the runner before the hostile step
+# starts, so no later step can alter it. Nothing in the bundle is ever executed: the publisher
+# `git fetch`es it and pushes the object.
+#
+# THE SHA IS THE VERIFICATION, and it is why this lane needs no manifest digest. A git commit id
+# binds its message, author, tree AND full parent chain, and git re-derives it on fetch, so "the
+# object I fetched hashes to the id recorded before the gate ran" already refuses every
+# substitution a digest comparison would. The publisher then re-asserts, offline, each property the
+# old in-runner push asserted from a position it can trust: the parents (the dispatched head, plus
+# the recorded merge parent for a conflict repair), the committer identity, and the per-kind .beads
+# policy.
+#
+# [issue #91 review r3] THE PUSHING PHASE KEEPS THE NAME `push-fix`. Only the pre-gate seal is new,
+# so only it takes a new name. The registry's identity-seam checks name this subcommand LITERALLY:
+# dispatch-claim.py probes `worker-live.sh push-fix` to prove the push-capable path still REFUSES
+# an ordinary head branch (the #657 waiver is `review`-only), and it scans review-fix.yml for a
+# `worker-live.sh push-fix` step carrying WORKER_SELF_ATTESTED. Renaming it does not fail those
+# loudly — the probe reads the usage line instead of the refusal, and the scan simply matches
+# nothing and goes VACUOUS. A gratuitous rename here therefore costs a live trust check, so the
+# split is stage-fix (new) + push-fix (unchanged name, unchanged gates), pinned by the CLI-seam
+# rows in the self-test below.
+STAGED_FIX_REF='refs/sparq-fix/staged'
+
+# PHASE 1 (run job, PRE-GATE, NO TOKEN): commit the fixer's work locally and seal it as a bundle.
+stage_fix() {
   require_target
+  local worker_root=${WORKER_ROOT:-}
   local pr_number=${WORKER_PR_NUMBER:-}
   local head_branch=${WORKER_PR_HEAD_BRANCH:-}
+  local expected_head=${WORKER_PR_HEAD_SHA:-}
   local fix_round=${WORKER_FIX_ROUND:-}
   local model_alias=${WORKER_MODEL_ALIAS:-}
   local fix_kind=${WORKER_FIX_KIND:-verdict}
-  local expected_head=${WORKER_PR_HEAD_SHA:-}
   local default_branch=${TARGET_DEFAULT_BRANCH:-}
-  [[ -n ${GH_TOKEN:-} ]] || die 'target-scoped App token is missing'
+  local max_bytes=${WORKER_BUNDLE_MAX_BYTES:-20971520}
+
+  # TOKEN-FREE BY CONSTRUCTION: this phase shares a runner with the hostile gate that follows it.
+  [[ -z ${GH_TOKEN:-} ]] || die 'fix stage phase must run with NO GitHub token'
+  [[ -n "$worker_root" && "$worker_root" != / && -d "$worker_root" ]] || die 'WORKER_ROOT is unsafe'
   [[ "$pr_number" =~ ^[1-9][0-9]*$ ]] || die 'unsafe pull request number'
+  [[ "$head_branch" =~ ^sparq-agent/issue-[1-9][0-9]*-[A-Za-z0-9._-]+$ ]] ||
+    die 'unsafe pull request head branch'
+  [[ "$expected_head" =~ ^[0-9a-f]{40}$ ]] || die 'unsafe expected head sha'
+  [[ "$fix_round" =~ ^[1-9][0-9]*$ ]] || die 'unsafe fix round'
+  case "$fix_kind" in verdict|ci|rebase) ;; *) die 'unsafe fix kind' ;; esac
+  safe_atom "$model_alias" || die 'unsafe fixer model alias'
+  [[ "$max_bytes" =~ ^[1-9][0-9]*$ ]] || die 'unsafe bundle size limit'
+
+  local base_sha
+  base_sha=$(git rev-parse HEAD)
+  [[ "$base_sha" == "$expected_head" ]] ||
+    die 'PR head drifted before the fix was sealed; the sweep re-plans next tick'
+
+  local message="fix: address review round $fix_round for #$pr_number [$model_alias]"
+  local beads_ref='' merge_head=''
+  if [[ "$fix_kind" == rebase ]]; then
+    safe_atom "$default_branch" || die 'unsafe target default branch'
+    # Committing while MERGE_HEAD is set records the two-parent merge commit — ancestry from the
+    # worker-opened commit is preserved (the loop's rewritten-history check stays satisfied). The
+    # second parent is RECORDED here, pre-gate, so the publisher binds to the revision that was
+    # actually merged rather than to whatever the default branch has become by publish time.
+    message="fix: merge $default_branch into #$pr_number to resolve conflicts [$model_alias]"
+    beads_ref="origin/$default_branch"
+    merge_head=$(git rev-parse --verify --quiet MERGE_HEAD) ||
+      die 'conflict-repair fix has no MERGE_HEAD to record'
+    [[ "$merge_head" =~ ^[0-9a-f]{40}$ ]] || die 'unsafe recorded merge parent'
+  elif [[ "$fix_kind" == ci ]]; then
+    message="fix: repair failing CI legs for #$pr_number (round $fix_round) [$model_alias]"
+  fi
+
+  # THE GATE MUST STILL SEE THE TREE THE MODEL LEFT. run_gate's `git diff --check` and BOTH
+  # registry-selftest selectors derive their targets from `git diff` / `git status`, so leaving the
+  # work COMMITTED here would empty them and turn the gate VACUOUS — the same trap bundle_work
+  # documents for the worker lane. The index state is therefore captured and restored around the
+  # commit: `--soft` for the conflict-repair kind (run_fix stages the resolution host-side),
+  # `--mixed` otherwise (the model's edits are unstaged, its new files untracked).
+  local reset_mode=--mixed
+  [[ -z "$(git diff --cached --name-only)" ]] || reset_mode=--soft
+
+  _git_commit_fix "$message" "Co-Authored-By: $(coauthor_for "$model_alias")" "$beads_ref"
+  local staged_sha
+  staged_sha=$(git rev-parse HEAD)
+  [[ "$staged_sha" =~ ^[0-9a-f]{40}$ ]] || die 'staged fix commit sha is unsafe'
+
+  local bundle_dir="$worker_root/fix-bundle"
+  rm -rf -- "$bundle_dir"
+  mkdir -p "$bundle_dir"
+  chmod 700 "$bundle_dir"
+  git update-ref "$STAGED_FIX_REF" "$staged_sha" || die 'could not record the staged fix ref'
+  # Thin bundle: the new commit ALONE. Both parents are excluded, so the publisher — which already
+  # has the PR head and fetches the default branch — supplies them as prerequisites and `git bundle
+  # verify` refuses an artifact whose history does not attach to them.
+  #
+  # Every git call in this pair of functions carries its OWN `|| die`. `set -e` is SUPPRESSED for
+  # any command that is not the last of an `&&`/`||` list, and that suppression reaches into the
+  # functions and subshells it invokes — so errexit alone is not a fail-closed guarantee for a
+  # caller we do not control.
+  local -a bundle_args=("$bundle_dir/fix.bundle" "$STAGED_FIX_REF" "^$base_sha")
+  [[ -z "$merge_head" ]] || bundle_args+=("^$merge_head")
+  git bundle create "${bundle_args[@]}" || die 'could not seal the staged fix bundle'
+  [[ -s "$bundle_dir/fix.bundle" ]] || die 'staged fix bundle is empty'
+
+  git reset "$reset_mode" "$base_sha" > /dev/null || die 'could not restore the pre-gate index'
+  [[ "$(git rev-parse HEAD)" == "$base_sha" ]] ||
+    die 'stage phase failed to restore the pre-gate head'
+
+  local total
+  total=$(_bundle_total_bytes "$bundle_dir")
+  [[ "$total" -le "$max_bytes" ]] || die "staged fix bundle is oversized ($total > $max_bytes bytes)"
+
+  write_output staged_sha "$staged_sha"
+  write_output staged_base_sha "$base_sha"
+  write_output staged_merge_head "$merge_head"
+  write_output staged_bytes "$total"
+  printf 'worker-live: sealed the %s fix commit %s as a %s-byte inert bundle BEFORE the hostile gate\n' \
+    "$fix_kind" "$staged_sha" "$total"
+}
+
+# PURE (self-tested): prove a downloaded fix bundle carries EXACTLY the commit the PRE-GATE step
+# recorded, and that the commit is one this lane is allowed to push. Prints `ok` and exits 0, or
+# prints `defer: <reason>` and exits 1. Runs in the publisher's own target checkout and needs no
+# token — every arm is a REFUSAL, including a MISSING EXPECTATION: an empty recorded SHA means the
+# pre-gate stage step never ran, which is the missing-artifact case, not a free pass.
+_verify_staged_fix() {
+  local bundle=$1 staged_sha=$2 expected_head=$3 merge_head=$4 fix_kind=$5 bot_login=$6 \
+    max_bytes=$7
+  [[ "$staged_sha" =~ ^[0-9a-f]{40}$ ]] ||
+    { printf 'defer: no pre-gate staged commit sha was recorded (fail closed)\n'; return 1; }
+  [[ "$expected_head" =~ ^[0-9a-f]{40}$ ]] ||
+    { printf 'defer: dispatched head sha is missing or unsafe\n'; return 1; }
+  case "$fix_kind" in verdict|ci|rebase) ;;
+    *) printf 'defer: fix kind is missing or unsafe\n'; return 1 ;;
+  esac
+  [[ "$bot_login" =~ ^[A-Za-z0-9_.-]+\[bot\]$ ]] ||
+    { printf 'defer: target bot login is missing or unsafe\n'; return 1; }
+  [[ "$max_bytes" =~ ^[1-9][0-9]*$ ]] ||
+    { printf 'defer: bundle size limit is not configured (fail closed)\n'; return 1; }
+  # The merge parent is required for exactly one kind and forbidden for the others, so neither a
+  # dropped nor a smuggled second parent can ride through on the shape of the other kinds.
+  if [[ "$fix_kind" == rebase ]]; then
+    [[ "$merge_head" =~ ^[0-9a-f]{40}$ ]] ||
+      { printf 'defer: conflict repair recorded no merge parent (fail closed)\n'; return 1; }
+  else
+    [[ -z "$merge_head" ]] ||
+      { printf 'defer: a non-rebase fix recorded a merge parent\n'; return 1; }
+  fi
+  [[ -f "$bundle" && ! -L "$bundle" ]] ||
+    { printf 'defer: fix bundle artifact is missing or is not a regular file\n'; return 1; }
+  local size
+  size=$(wc -c < "$bundle" | tr -d ' ')
+  [[ "$size" -le "$max_bytes" ]] ||
+    { printf 'defer: fix bundle artifact is oversized (%s > %s bytes)\n' "$size" "$max_bytes"; return 1; }
+  git bundle verify "$bundle" > /dev/null 2>&1 ||
+    { printf 'defer: fix bundle failed git integrity/prerequisite verification\n'; return 1; }
+  git fetch --no-tags --quiet "$bundle" "+$STAGED_FIX_REF:$STAGED_FIX_REF" > /dev/null 2>&1 ||
+    { printf 'defer: fix bundle carries no %s ref\n' "$STAGED_FIX_REF"; return 1; }
+  local fetched
+  fetched=$(git rev-parse --verify --quiet "$STAGED_FIX_REF^{commit}") ||
+    { printf 'defer: fix bundle ref does not resolve to a commit\n'; return 1; }
+  # THE BINDING. Anything the gate could have done to the artifact — a rewritten patch, a different
+  # tree, an extra parent, a forged author — changes the object id, and git recomputed that id
+  # while unpacking.
+  [[ "$fetched" == "$staged_sha" ]] ||
+    { printf 'defer: bundle tip %s is NOT the pre-gate recorded commit %s\n' \
+        "${fetched:0:12}" "${staged_sha:0:12}"; return 1; }
+  local parents expected_parents
+  parents=$(git rev-list --parents -n 1 "$staged_sha" | cut -d' ' -f2-)
+  expected_parents="$expected_head"
+  [[ "$fix_kind" != rebase ]] || expected_parents="$expected_head $merge_head"
+  [[ "$parents" == "$expected_parents" ]] ||
+    { printf 'defer: staged commit does not extend the dispatched head (parents %s)\n' "$parents"
+      return 1; }
+  local author committer
+  author=$(git show -s --format=%an "$staged_sha")
+  committer=$(git show -s --format=%cn "$staged_sha")
+  [[ "$author" == "$bot_login" && "$committer" == "$bot_login" ]] ||
+    { printf 'defer: staged commit identity is not the target bot (%s/%s)\n' "$author" "$committer"
+      return 1; }
+  # The SAME per-kind .beads policy the pre-gate commit enforced, restated against the object: a
+  # conflict repair may carry the default branch's own .beads churn (its baseline is the merged
+  # revision), every other kind may carry none at all.
+  local beads_base="$expected_head"
+  [[ "$fix_kind" != rebase ]] || beads_base="$merge_head"
+  git diff --quiet "$beads_base" "$staged_sha" -- .beads ||
+    { printf 'defer: staged commit diverges from its .beads baseline\n'; return 1; }
+  printf 'ok\n'
+}
+
+# PHASE 2 (publisher job, WITH the token): prove the bundle, then push the exact recorded object.
+# TARGET_DIR here is the PUBLISHER's OWN checkout of the PR head branch — no target code has ever
+# run on this runner, and nothing from the bundle is executed (`git fetch` and `git push` only).
+# This is the `push-fix` subcommand, unchanged in name from the single-phase form it replaces —
+# see the naming note above STAGED_FIX_REF.
+push_fix() {
+  require_target
+  local worker_root=${WORKER_ROOT:-}
+  local bundle=${WORKER_FIX_BUNDLE:-}
+  local staged_sha=${WORKER_STAGED_SHA:-}
+  local expected_head=${WORKER_PR_HEAD_SHA:-}
+  local merge_head=${WORKER_STAGED_MERGE_HEAD:-}
+  local head_branch=${WORKER_PR_HEAD_BRANCH:-}
+  local fix_kind=${WORKER_FIX_KIND:-verdict}
+  local fix_round=${WORKER_FIX_ROUND:-}
+  local default_branch=${TARGET_DEFAULT_BRANCH:-}
+  local bot_login=${TARGET_BOT_LOGIN:-}
+  local max_bytes=${WORKER_BUNDLE_MAX_BYTES:-20971520}
+
+  [[ -n ${GH_TOKEN:-} ]] || die 'target-scoped App token is missing'
+  printf '::add-mask::%s\n' "$GH_TOKEN"
+  [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
+  mkdir -p "$worker_root"
   [[ "$head_branch" =~ ^sparq-agent/issue-[1-9][0-9]*-[A-Za-z0-9._-]+$ ]] ||
     die 'unsafe pull request head branch'
   [[ "$fix_round" =~ ^[1-9][0-9]*$ ]] || die 'unsafe fix round'
   case "$fix_kind" in verdict|ci|rebase) ;; *) die 'unsafe fix kind' ;; esac
-  safe_atom "$model_alias" || die 'unsafe fixer model alias'
-  printf '::add-mask::%s\n' "$GH_TOKEN"
-  local message="fix: address review round $fix_round for #$pr_number [$model_alias]"
-  local beads_ref='' lease=''
+  [[ "$expected_head" =~ ^[0-9a-f]{40}$ ]] || die 'unsafe expected head sha'
+  # The publisher checks out the LIVE head branch, so its own HEAD is the live head: a head that
+  # moved since dispatch means another push landed and this fix is no longer bound to reviewed
+  # state. Refuse here, and again atomically through the --force-with-lease below.
+  [[ "$(git rev-parse HEAD)" == "$expected_head" ]] ||
+    die 'PR head advanced since dispatch; the sweep re-plans next tick'
   if [[ "$fix_kind" == rebase ]]; then
     safe_atom "$default_branch" || die 'unsafe target default branch'
-    [[ "$expected_head" =~ ^[0-9a-f]{40}$ ]] || die 'unsafe expected head sha'
-    # Committing while MERGE_HEAD is set records the two-parent merge commit — ancestry from the
-    # worker-opened commit is preserved (the loop's rewritten-history check stays satisfied).
-    message="fix: merge $default_branch into #$pr_number to resolve conflicts [$model_alias]"
-    beads_ref="origin/$default_branch"
-    lease="$expected_head"
-  elif [[ "$fix_kind" == ci ]]; then
-    message="fix: repair failing CI legs for #$pr_number (round $fix_round) [$model_alias]"
+    [[ "$merge_head" =~ ^[0-9a-f]{40}$ ]] || die 'conflict repair recorded no merge parent'
+    git fetch --no-tags --quiet origin \
+      "+refs/heads/$default_branch:refs/remotes/origin/$default_branch" ||
+      die 'could not fetch the target default branch to bind the recorded merge parent'
+    git merge-base --is-ancestor "$merge_head" "refs/remotes/origin/$default_branch" ||
+      die 'recorded merge parent is not history of the target default branch'
   fi
-  _git_commit_and_push "$head_branch" "$message" \
-    "Co-Authored-By: $(coauthor_for "$model_alias")" "$beads_ref" "$lease"
-  local head_sha
-  head_sha=$(git rev-parse HEAD)
-  write_output pushed_sha "$head_sha"
-  printf 'worker-live: pushed %s fix for round %s to %s\n' "$fix_kind" "$fix_round" "$head_branch"
+  local verdict
+  verdict=$(_verify_staged_fix "$bundle" "$staged_sha" "$expected_head" "$merge_head" \
+    "$fix_kind" "$bot_login" "$max_bytes") || die "staged fix REFUSED — $verdict"
+  # Push the OBJECT, never this checkout's HEAD, under a CAS lease on the dispatched head. The
+  # lease is now applied to every fix kind (it used to guard the conflict repair alone): the
+  # staged commit's first parent IS the dispatched head, so the push is a fast-forward whenever
+  # the lease holds and must not land at all when it does not.
+  _git_push_authenticated "$worker_root" "$head_branch" "$expected_head" "$staged_sha" ||
+    die 'the remote REFUSED the push (lease violated, or branch protection); nothing was published'
+  write_output pushed_sha "$staged_sha"
+  printf 'worker-live: pushed the pre-gate %s fix commit %s for round %s to %s\n' \
+    "$fix_kind" "$staged_sha" "$fix_round" "$head_branch"
 }
 
 # Persist a HOST-SIDE-ROTATED account credential back to its ACCTNN_TOKEN secret.
@@ -3157,9 +3401,25 @@ PY
   printf 'worker-live: wrote the full refreshed credential back to the account secret (env dispatch-secrets)\n'
 }
 
+# [issue #91] The WITHHELD MODEL TRANSCRIPT artifacts, all sitting DIRECTLY under WORKER_ROOT (not
+# under `home`, so the subtree removal below does not reach them). They carry no account credential,
+# but the gate makes them the same class of target: it executes the TARGET's own build scripts and
+# tests as the runner user at a $RUNNER_TEMP path every step knows, and a hostile one that
+# base64-encodes `model-output.log` into the retained job log has published exactly what this script
+# promises to withhold ("raw model output withheld to protect credentials"; the run's diagnostics
+# artifact was DROPPED for the same reason — worker.yml names `error-signals.log` as raw CLI stderr).
+# Encoded output also defeats GitHub's exact-secret masking, so "the credential itself is already
+# purged" is not an answer here.
+#
+# Every one of these is consumed ONLY inside run_model / run_fix — the exit classification and the
+# usage-telemetry lift both run there — which is strictly before the purge step in both live lanes.
+# Nothing after the purge reads them, so removing them costs no signal.
+WORKER_TRANSCRIPT_ARTIFACTS=(model-output.log cli-stderr.log error-signals.log)
+
 # PURE (self-tested): print every path under WORKER_ROOT that can still hold account credential
-# material — the isolated HOME subtree in full, plus the host-side pre-flight artifacts that sit
-# directly under the root — in sorted order. Expected output after `purge-credentials` is EMPTY.
+# material or the withheld model transcript — the isolated HOME subtree in full, plus the host-side
+# pre-flight artifacts and the transcript artifacts that sit directly under the root — in sorted
+# order. Expected output after `purge-credentials` is EMPTY.
 #
 # It is a DISCOVERY scan and takes ONLY the root, deliberately: that is exactly what
 # target-controlled code in the gate has to work with. GitHub hands $RUNNER_TEMP to every step
@@ -3171,9 +3431,15 @@ _credential_residue() {
   local root=$1
   [[ -n "$root" && "$root" != / ]] || die 'unsafe credential-residue root'
   [[ -d "$root" ]] || return 0
+  local -a transcript_pred=()
+  local artifact
+  for artifact in "${WORKER_TRANSCRIPT_ARTIFACTS[@]}"; do
+    transcript_pred+=(-o -name "$artifact")
+  done
   {
     find "$root/home" -print 2>/dev/null || true
-    find "$root" -maxdepth 1 \( -name '.credential-*' -o -name '.selected-credential' \) -print \
+    find "$root" -maxdepth 1 \
+      \( -name '.credential-*' -o -name '.selected-credential' "${transcript_pred[@]}" \) -print \
       2>/dev/null || true
   } | sort
 }
@@ -3192,10 +3458,17 @@ _credential_residue() {
 # implicit `success()` admit the gate. Idempotent (a re-run, or a prepare that never materialized
 # anything, is a clean no-op) because both live lanes call it under `always()`.
 #
+# [issue #91] IT TAKES THE WITHHELD MODEL TRANSCRIPT WITH IT. The credential files were only the
+# most valuable thing the gate could read off this tree, never the only one: `model-output.log` and
+# its siblings sit directly under the root, survive the HOME removal, and are reachable by the same
+# $RUNNER_TEMP walk. Removing them here — rather than trying to redact the gate's own stdout — is
+# what actually closes the channel, because a hostile build script chooses its own encoding and no
+# output filter downstream of it can be relied on to recognise base64 of an arbitrary file.
+#
 # What is deliberately NOT removed: `$WORKER_ROOT/cli` (the pinned harness install, on $GITHUB_PATH)
 # and the plain data files the post-gate steps still read — the fix lane's `followups.jsonl` among
-# them. Those carry no account credential; widening this into the job's whole scratch tree would
-# break the lanes without closing anything.
+# them. Those carry no account credential and no transcript; widening this into the job's whole
+# scratch tree would break the lanes without closing anything.
 purge_credentials() {
   local worker_root=${WORKER_ROOT:-}
   [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
@@ -3205,11 +3478,15 @@ purge_credentials() {
   fi
   rm -rf -- "$worker_root/home" || true
   rm -f -- "$worker_root"/.credential-* "$worker_root"/.selected-credential || true
+  local artifact
+  for artifact in "${WORKER_TRANSCRIPT_ARTIFACTS[@]}"; do
+    rm -f -- "$worker_root/$artifact" || true
+  done
   local residue
   residue=$(_credential_residue "$worker_root")
   [[ -z "$residue" ]] ||
-    die "credential purge left readable account material under WORKER_ROOT: $(printf '%s' "$residue" | tr '\n' ' ')"
-  printf 'worker-live: purged the isolated account credential tree before any target-controlled code\n'
+    die "purge left readable account material or withheld model transcript under WORKER_ROOT: $(printf '%s' "$residue" | tr '\n' ' ')"
+  printf 'worker-live: purged the isolated account credential tree and the withheld model transcript before any target-controlled code\n'
 }
 
 # PURE (self-tested): verdict on whether a live worker lane purges the account credential tree
@@ -4947,9 +5224,137 @@ YAML
     "$(_workflow_step_body "$wf" republish-trust | grep -Ec "^ +(BASH_ENV|ENV): ''$" || true)" "2"
   chk "the pre-publish block runs the pinned driver in python isolated mode" \
     "$(_workflow_step_run "$wf" republish-trust | grep -Fc 'python3 -I "$driver" reverify' || true)" "1"
-  chk "the target-controlled gate step cannot persist environment into later steps (quarantine)" \
+  # [#91 review r1] Named for what it MEASURES. The redirection is env-level: it removes the
+  # channel from every actor that reaches a command file the documented way, and does not stop a
+  # same-uid write to the runner's real files under $RUNNER_TEMP/_runner_file_commands/ (see the
+  # step's own comment, and the blast-radius rows below).
+  chk "the gate step redirects \$GITHUB_ENV/\$GITHUB_PATH away from the runner's own (env-level)" \
     "$(_workflow_step_body "$wf" gate \
        | grep -Ec '^ +GITHUB_(ENV|PATH): \$\{\{ runner.temp \}\}/gate-quarantine/(env|path)$' || true)" "2"
+  # --- [issue #91] ...and the same for the PUBLISHING pair, in EITHER lane. Persisting environment
+  # is only half of what a runner command file gives target-controlled cargo. $GITHUB_STEP_SUMMARY is
+  # RETAINED and rendered on the run page and takes arbitrary markdown; $GITHUB_OUTPUT is the same
+  # primitive one indirection out (a target-authored `steps.gate.outputs.*` a later step expands).
+  # An exfiltrator wants those, not $GITHUB_ENV — and GitHub's secret masking does not stop it,
+  # because masking matches the LITERAL secret string and base64 of it is a different string.
+  #
+  # Per lane, because the fix lane had NO quarantine at all while running the same
+  # `worker-live.sh gate` on the same target checkout — and from the weaker position, since a
+  # write-capable GH_TOKEN `push` step still follows its gate. Asserted on the EXACT
+  # variable-to-path pairing (8 = 4 files x 2 lanes): an ERE alternation over both halves would
+  # count `GITHUB_ENV: .../step-summary` as a hit. ---
+  local q_line q_have=0
+  for q_line in 'GITHUB_ENV: ${{ runner.temp }}/gate-quarantine/env' \
+                'GITHUB_PATH: ${{ runner.temp }}/gate-quarantine/path' \
+                'GITHUB_OUTPUT: ${{ runner.temp }}/gate-quarantine/output' \
+                'GITHUB_STEP_SUMMARY: ${{ runner.temp }}/gate-quarantine/step-summary'; do
+    # `grep -Fc` and never `grep -Fq` (#879): -q exits on the first match, SIGPIPEs the producer,
+    # and under `pipefail` the pipeline reports 141 — read here as "quarantine present" only by
+    # accident of which branch the shell takes. -c drains its input.
+    q_have=$(( q_have + $(_workflow_step_body "$wf" gate | grep -Fc -- "$q_line" || true) ))
+    q_have=$(( q_have + $(_workflow_step_body "$rf_wf" gate | grep -Fc -- "$q_line" || true) ))
+  done
+  chk "(#91) BOTH lanes REDIRECT all four runner command-file variables on the gate step (exact paths)" \
+    "$q_have" "8"
+  # ...over a body the extractor really found: a count read off an empty body proves nothing (#941).
+  # Matched on the exact `run:` LINE, not the bare command: both step bodies discuss
+  # `worker-live.sh gate` in their own quarantine rationale, and a containment match would be
+  # satisfied by the comment alone.
+  local gate_run='run: bash ../registry/scripts/worker-live.sh gate'
+  chk "(#91) ...and that count is read off the REAL gate step body in each lane (non-vacuous)" \
+    "$(_workflow_step_body "$wf" gate | grep -Fc -- "$gate_run" || true):$(_workflow_step_body "$rf_wf" gate | grep -Fc -- "$gate_run" || true)" \
+    "1:1"
+  # Quarantining $GITHUB_OUTPUT is only safe while nothing CONSUMES `steps.gate.outputs`: a future
+  # consumer would read an empty value from a path the runner never reads back, and silently. So the
+  # absence of a consumer is asserted, not assumed. Comment lines are excluded — worker.yml's own
+  # quarantine rationale says the words `steps.gate.outputs`, and matching that would make this row
+  # fail for the wrong reason. Both lanes read `steps.gate.outcome` instead, which is host-derived.
+  chk "(#91) ...safe to quarantine \$GITHUB_OUTPUT: neither lane consumes steps.gate.outputs" \
+    "$(grep -F 'steps.gate.outputs' "$wf" | grep -Evc '^[[:space:]]*#' || true):$(grep -F 'steps.gate.outputs' "$rf_wf" | grep -Evc '^[[:space:]]*#' || true)" \
+    "0:0"
+  # --- [issue #91 review r2] WHAT THE REDIRECTION ABOVE DOES NOT BUY — AND THE BOUNDARY THAT DOES.
+  # Rebinding those four variables is ENV-LEVEL: the gate's target-controlled code runs as the SAME
+  # runner user, the runner's real command files stay under $RUNNER_TEMP/_runner_file_commands/
+  # (set_env_*, add_path_*, step_summary_*), and code that enumerates that directory appends to
+  # them directly — consumed at step end whatever the step's environment said. A workflow cannot
+  # prevent a same-uid write, so no assertion here may be read as containment.
+  #
+  # Round 1 answered that by INVENTORYING the fix lane's two post-gate token-bearing steps. An
+  # exposure census is not a guard: keeping the count at two left both targets reachable. So the
+  # steps moved — the push into the isolated `publish` job on a clean runner, the follow-up issues
+  # ahead of the gate — and what is asserted now is the property itself, on BOTH live files:
+  # NOTHING TOKEN-BEARING FOLLOWS THE GATE (#575). The rows below first prove the poisoning
+  # primitive is REAL (so the quarantine can never be re-read as containment), then prove there is
+  # nothing left in that job for it to steer. ---
+  #
+  # THE ADVERSARIAL HALF, executed rather than argued. The payload is gate-shaped: it is handed
+  # ONLY $RUNNER_TEMP — exactly what a target build script gets — knows nothing about the workflow,
+  # and runs with this step's $GITHUB_ENV already redirected into the quarantine directory. It
+  # still finds the runner's REAL set_env file and appends to it. The sentinel LANDS in the real
+  # file and the quarantined one stays empty: the redirection moved the documented channel and did
+  # not close the same-uid one.
+  local poison_rt="$tmp/cmdfile-runner-temp"
+  local poison_real="$poison_rt/_runner_file_commands/set_env_c0ffee"
+  mkdir -p "$poison_rt/_runner_file_commands" "$poison_rt/gate-quarantine"
+  : > "$poison_real"
+  : > "$poison_rt/gate-quarantine/env"
+  (
+    cd "$tmp"
+    RUNNER_TEMP="$poison_rt" GITHUB_ENV="$poison_rt/gate-quarantine/env" \
+      bash -c 'find "$RUNNER_TEMP/_runner_file_commands" -maxdepth 1 -type f -name "set_env_*" \
+                 -exec sh -c "printf %s\\\\n LD_PRELOAD=/tmp/attacker.so >> \"\$1\"" _ {} \;'
+  ) > /dev/null 2>&1
+  chk "(#91 r2) a gate-shaped writer DOES reach the runner's real set_env through \$RUNNER_TEMP" \
+    "$(grep -Fc 'LD_PRELOAD=/tmp/attacker.so' "$poison_real" || true):$([[ -s "$poison_rt/gate-quarantine/env" ]] && printf quarantine-written || printf quarantine-empty)" \
+    "1:quarantine-empty"
+  # ...and THIS is what makes the landed sentinel unable to reach anything that matters: in BOTH
+  # live lanes there is no token-bearing step left after the gate for a poisoned $GITHUB_ENV /
+  # $GITHUB_PATH to steer, and no write-capable credential in that job for one to capture.
+  chk "(#91 r2) BOTH lanes: ZERO token-bearing steps follow the gate (the #575 property, live)" \
+    "$(_tokens_after_gate "$wf" | wc -l | tr -d ' '):$(_tokens_after_gate "$rf_wf" | wc -l | tr -d ' ')" \
+    "0:0"
+  # NON-VACUITY, per lane: a zero read off a region the scan cannot see is worthless, so ONE added
+  # post-gate token step must be reported in EACH file. The mutant is the exact shape the exposure
+  # takes if someone re-adds a step there.
+  local rf_grow="$tmp/review-fix-token-grow.yml" wk_grow="$tmp/worker-token-grow.yml"
+  local grow_awk='{ print }
+       /worker-live\.sh gate$/ {
+         print "      - name: an added post-gate step carrying a write-capable token"
+         print "        env:"
+         print "          GH_TOKEN: ${{ steps.app-token-fix.outputs.token }}"
+       }'
+  awk "$grow_awk" "$rf_wf" > "$rf_grow"
+  awk "$grow_awk" "$wf" > "$wk_grow"
+  chk "(#91 r2) ...and ONE added post-gate token step is REPORTED in each (the scan is not blind)" \
+    "$(_tokens_after_gate "$rf_grow" | wc -l | tr -d ' '):$(_tokens_after_gate "$wk_grow" | wc -l | tr -d ' ')" \
+    "1:1"
+  # A zero reached by DELETING the push would read identically and be a total regression, so the
+  # push is asserted to still EXIST — in the `publish` job, which contains no gate step at all.
+  chk "(#91 r2) ...the fix push still exists, in a job that runs no gate (not merely deleted)" \
+    "$(grep -Fc 'run: bash ../registry/scripts/worker-live.sh push-fix' "$rf_wf" || true):$(_workflow_job_body "$rf_wf" publish | grep -Fc 'worker-live.sh gate' || true)" \
+    "1:0"
+  # CAPABILITY, not just ordering: the job that executes the gate no longer mints a token that
+  # could push at all, and the job that can push is the one that runs no target code.
+  chk "(#91 r2) ...target contents WRITE is minted only in the publisher, never in the run job" \
+    "$(_workflow_job_body "$rf_wf" run | grep -Fc 'permission-contents: write' || true):$(_workflow_job_body "$rf_wf" publish | grep -Fc 'permission-contents: write' || true)" \
+    "0:1"
+  # ...over a job body the extractor really found, and one that stops at the job boundary — else
+  # both counts above are properties of an empty (or of a whole-file) read.
+  chk "(#91 r2) ...the job extractor is bounded and non-empty (run sees the gate, publisher does not)" \
+    "$(_workflow_job_body "$rf_wf" run | grep -Fc 'run: bash ../registry/scripts/worker-live.sh gate' || true):$(_workflow_job_body "$rf_wf" publish | grep -Fc 'run: bash ../registry/scripts/worker-live.sh push-fix' || true)" \
+    "1:1"
+  # The publisher's admission, exact-match at the YAML seam (#956/#941: a substring check accepts
+  # `&& false` and a dropped conjunct alike). A staged sha ALONE must not admit it — the gate has to
+  # have passed — and neither may a review run.
+  chk "(#91 r2) ...the publisher admits ONLY a green gate plus a PRE-GATE staged sha (exact if:)" \
+    "$(_workflow_job_body "$rf_wf" publish | grep -Fc -- "if: \${{ always() && needs.claim.outputs.acquired == 'true' && inputs.mode == 'fix' && needs.run.outputs.staged_sha != '' && needs.run.outputs.gate_outcome == 'success' }}" || true)" \
+    "1"
+  # The lease must not be released while the publisher still has a push in flight, or the next
+  # dispatch tick re-plans this PR against a head that is about to move (worker.yml's release waits
+  # on its publisher for the same reason).
+  chk "(#91 r2) ...and the lease release + the outcome record both WAIT for the publisher" \
+    "$(grep -Fc 'needs: [claim, run, publish]' "$rf_wf" || true):$(grep -Fc 'needs: [resolve, claim, run, publish]' "$rf_wf" || true)" \
+    "1:1"
 
   # --- [issue #568] the re-check must accept the workflow's OWN label lifecycle, and the claim
   # step must establish ownership BEFORE it takes the shared label. The claim step moves the issue
@@ -6020,6 +6425,37 @@ print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcaplive/
   chk "(#232 r2) the residue scan sees both regions BEFORE the purge (its post-purge zero is earned)" \
     "$(_credential_residue "$purge_root" | sed "s#^$purge_root/##" | tr '\n' '|')" \
     ".credential-baseline|home|home/.claude|home/.claude/worker-token|"
+  # --- [issue #91] THE WITHHELD MODEL TRANSCRIPT is the other thing reachable at this path. It sits
+  # DIRECTLY under the root, so the `home` subtree removal never touched it, and `model-output.log`
+  # is exactly what the gate's target-controlled build scripts would base64 into the RETAINED job
+  # log — past GitHub's masking, which only ever matched the literal secret string. Given its OWN
+  # sentinel so the credential rows above keep measuring precisely what they measured before. ---
+  local transcript_sentinel='TRANSCRIPT-SENTINEL-00000000' ta
+  for ta in "${WORKER_TRANSCRIPT_ARTIFACTS[@]}"; do
+    printf '%s\n' "$transcript_sentinel" > "$purge_root/$ta"
+    chmod 600 "$purge_root/$ta"
+  done
+  chk "(#91) BEFORE the purge a gate-shaped reader finds the withheld transcript via \$RUNNER_TEMP" \
+    "$(_gate_shaped_reader "$purge_rt" "$transcript_sentinel")" \
+    "registry-worker/cli-stderr.log|registry-worker/error-signals.log|registry-worker/model-output.log|"
+  # ...and the residue scan the purge FAILS CLOSED on has to see all three, or its post-purge zero is
+  # again a property of a blind scan: deleting the removal loop from purge_credentials while leaving
+  # the scan narrow would report a clean purge over a transcript still sitting on the runner.
+  chk "(#91) the residue scan sees every transcript artifact BEFORE the purge (zero is earned)" \
+    "$(_credential_residue "$purge_root" | sed "s#^$purge_root/##" \
+       | grep -Fc -e model-output.log -e cli-stderr.log -e error-signals.log || true)" "3"
+  # RENAME-DRIFT GUARD. WORKER_TRANSCRIPT_ARTIFACTS is a list of literal basenames and run_model
+  # builds the same paths from its OWN literals, so renaming one side alone silently un-covers the
+  # transcript while every row above stays green — the exact failure shape this suite keeps finding.
+  # Derived from the declarations themselves: every `local x="$worker_root/<name>.log"` in this
+  # script must appear in the purge list, and vice versa. Renaming model-output.log in run_model
+  # only, or dropping an entry from the array, turns this red.
+  local declared_logs
+  declared_logs="$(grep -oE 'local [a-z_]+="\$worker_root/[A-Za-z0-9._-]+\.log"' \
+      "$SCRIPT_DIR/worker-live.sh" | sed -E 's#.*/([A-Za-z0-9._-]+\.log)"$#\1#' | sort -u \
+    | tr '\n' '|')"
+  chk "(#91) the purge list is EXACTLY the \$worker_root logs run_model declares (no rename drift)" \
+    "$declared_logs" "$(printf '%s\n' "${WORKER_TRANSCRIPT_ARTIFACTS[@]}" | sort -u | tr '\n' '|')"
   # The fix lane reads followups.jsonl AFTER the gate; the purge must not take it (or the pinned CLI)
   # with it. Written here so the survival assertion below is about the purge, not about absence.
   printf '{"title": "t", "body": "b", "labels": ["kind:bug"]}\n' > "$purge_root/followups.jsonl"
@@ -6032,6 +6468,13 @@ print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcaplive/
   chk "(#232 r2) the purge succeeds on a real prepared tree" "$purge_rc" "0"
   chk "(#232 r2) AFTER the purge the SAME reader finds nothing — no \$RUNNER_TEMP path to it" \
     "$(_gate_shaped_reader "$purge_rt" "$purge_sentinel")" ""
+  chk "(#91) ...and neither does the transcript reader — the exfil payload is gone, not redacted" \
+    "$(_gate_shaped_reader "$purge_rt" "$transcript_sentinel")" ""
+  # PRIVACY (locked decision 22b, issue #91). The prep log above is public and retained, and
+  # `acctNN` reverses directly to the `ACCTNN_TOKEN` secret reference the write-back already keeps
+  # out of its own success line. Restoring the handle to worker-prep's final printf turns this red.
+  chk "(#91, 22b) worker-prep's public log names no account handle" \
+    "$(grep -Eic 'acctexample' "$tmp/pf-purge.log" || true)" "0"
   chk "(#232 r2) ...the isolated HOME is gone and the residue scan agrees (nothing left to find)" \
     "$([[ -e "$purge_root/home" ]] && printf home-survives || printf gone):$(_credential_residue "$purge_root" | wc -l | tr -d ' ')" \
     "gone:0"
@@ -6098,11 +6541,302 @@ print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcaplive/
   chk "(#232 r2) ...and DOES report host-side artifacts with no mounted HOME beside them" \
     "$(_credential_residue "$res_root" | sed "s#^$res_root/##" | sort | tr '\n' '|')" \
     ".credential-durable|.selected-credential|"
+  # [issue #91] The transcript arm's own edge, and it is the one the rows above cannot reach: a run
+  # whose credential purge is otherwise complete still leaves `model-output.log` behind. The scan
+  # must report it ALONE — with no credential artifact and no mounted HOME beside it — or a purge
+  # that dropped only the transcript removal would go green.
+  rm -f -- "$res_root/.credential-durable" "$res_root/.selected-credential"
+  printf 'x\n' > "$res_root/model-output.log"
+  chk "(#91) ...and reports a transcript artifact ALONE (no credential, no HOME, beside it)" \
+    "$(_credential_residue "$res_root" | sed "s#^$res_root/##" | sort | tr '\n' '|')" \
+    "model-output.log|"
+  # SELECTIVITY, the direction that keeps the scan usable: `model-image.id` and `followups.jsonl`
+  # are still sitting in this root and are still not reported. A scan that matched by proximity or
+  # by "anything log-shaped" would make every purge look broken and get relaxed away.
+  rm -f -- "$res_root/model-output.log"
+  chk "(#91) ...but the widened scan stays SELECTIVE (model-image.id/followups still not residue)" \
+    "$(_credential_residue "$res_root" | tr '\n' '|')" ""
   chk "(#232 r2) ...an absent root is empty-and-clean, not an error (prepare never ran)" \
     "$(_credential_residue "$tmp/no-such-worker-root"; printf '|%s' "$?")" "|0"
   chk "(#232 r2) ...but the scan itself refuses an empty or root path (fail closed)" \
     "$( ( _credential_residue '' ) >/dev/null 2>&1; printf '%s' "$?"):$( ( _credential_residue / ) >/dev/null 2>&1; printf '%s' "$?")" \
     "1:1"
+
+  # --- [issue #91 review r2] THE PRE-GATE SEAL AND THE ISOLATED PUBLISHER, over REAL repositories.
+  # These two replaced the post-gate push, so the behaviour is exercised end to end rather than
+  # asserted from the workflow text alone: the seal must leave the gate exactly the tree the model
+  # left (a committed tree would empty run_gate's diff-derived selectors and make the whole gate
+  # VACUOUS), and the publisher must refuse every way the artifact can fail to be the commit that
+  # was recorded before the gate ran. Every refusal arm below runs in its OWN fresh clone, so a
+  # `defer` can never be an artefact of state a previous arm left behind. ---
+  local sf="$tmp/stagefix"
+  local sf_work="$sf/work" sf_pub="$sf/pub" sf_root="$sf/worker-root" sf_origin="$sf/origin.git"
+  local sf_branch='sparq-agent/issue-7-30000000001-1'
+  local sf_bot='sparq-orchestrator[bot]'
+  mkdir -p "$sf_work" "$sf_root"
+  git init --quiet --bare "$sf_origin"
+  git init --quiet "$sf_work"
+  git -C "$sf_work" symbolic-ref HEAD refs/heads/main
+  git -C "$sf_work" config user.name seed
+  git -C "$sf_work" config user.email seed@example.invalid
+  mkdir -p "$sf_work/.beads"
+  printf 'base\n' > "$sf_work/src.txt"
+  printf '{"b": 1}\n' > "$sf_work/.beads/state.json"
+  git -C "$sf_work" add -A
+  git -C "$sf_work" commit --quiet -m 'seed'
+  local sf_seed
+  sf_seed=$(git -C "$sf_work" rev-parse HEAD)
+  git -C "$sf_work" switch --quiet -c "$sf_branch"
+  printf 'pr head\n' >> "$sf_work/src.txt"
+  git -C "$sf_work" commit --quiet -am 'pr head'
+  local sf_head
+  sf_head=$(git -C "$sf_work" rev-parse HEAD)
+  git -C "$sf_work" remote add origin "$sf_origin"
+  git -C "$sf_work" push --quiet origin main "$sf_branch"
+  # The fixer's edits, left MODIFIED + UNTRACKED exactly as run_fix leaves them for verdict/ci.
+  printf 'fixed\n' >> "$sf_work/src.txt"
+  printf 'new\n' > "$sf_work/added.txt"
+
+  local sf_out="$tmp/stagefix.out" sf_rc=0
+  : > "$sf_out"
+  (
+    GITHUB_OUTPUT="$sf_out" TARGET_DIR="$sf_work" WORKER_ROOT="$sf_root" \
+    TARGET_BOT_LOGIN="$sf_bot" TARGET_BOT_ID=305236749 TARGET_DEFAULT_BRANCH=main \
+    WORKER_PR_NUMBER=7 WORKER_PR_HEAD_BRANCH="$sf_branch" WORKER_PR_HEAD_SHA="$sf_head" \
+    WORKER_FIX_ROUND=2 WORKER_FIX_KIND=verdict WORKER_MODEL_ALIAS=opus5 \
+    stage_fix
+  ) > "$tmp/stagefix.log" 2>&1 || sf_rc=$?
+  local sf_sha
+  sf_sha=$(grep -E '^staged_sha=' "$sf_out" | cut -d= -f2- || true)
+  chk "(#91 r2) stage_fix seals the fix pre-gate and records a 40-hex commit sha as a step output" \
+    "$sf_rc:$([[ "$sf_sha" =~ ^[0-9a-f]{40}$ ]] && printf sha || printf "not-a-sha[$sf_sha]")" \
+    "0:sha"
+  # THE LOAD-BEARING RESTORE. A seal that left the work COMMITTED would empty run_gate's
+  # `git diff` / `git status` selectors and turn the gate that follows it vacuous.
+  chk "(#91 r2) ...and RESTORES the pre-gate head plus the model's uncommitted tree (gate stays live)" \
+    "$(git -C "$sf_work" rev-parse HEAD):$(git -C "$sf_work" status --porcelain=v1 --untracked-files=all | tr -d ' ' | sort | tr '\n' '|')" \
+    "$sf_head:??added.txt|Msrc.txt|"
+  # It must also refuse to run at all where a token is in scope: this phase shares a runner with
+  # the hostile gate, so a token here means the workflow regressed.
+  local sf_tok_rc=0
+  (
+    GITHUB_OUTPUT="$tmp/stagefix-tok.out" TARGET_DIR="$sf_work" WORKER_ROOT="$sf_root" \
+    GH_TOKEN=surprise-token TARGET_BOT_LOGIN="$sf_bot" TARGET_BOT_ID=305236749 \
+    WORKER_PR_NUMBER=7 WORKER_PR_HEAD_BRANCH="$sf_branch" WORKER_PR_HEAD_SHA="$sf_head" \
+    WORKER_FIX_ROUND=2 WORKER_FIX_KIND=verdict WORKER_MODEL_ALIAS=opus5 \
+    stage_fix
+  ) > /dev/null 2>&1 || sf_tok_rc=$?
+  # ...and on a head that moved since dispatch, which is the sha the publisher later binds its
+  # lease to.
+  local sf_drift_rc=0
+  (
+    GITHUB_OUTPUT="$tmp/stagefix-drift.out" TARGET_DIR="$sf_work" WORKER_ROOT="$sf_root" \
+    TARGET_BOT_LOGIN="$sf_bot" TARGET_BOT_ID=305236749 \
+    WORKER_PR_NUMBER=7 WORKER_PR_HEAD_BRANCH="$sf_branch" WORKER_PR_HEAD_SHA="$sf_seed" \
+    WORKER_FIX_ROUND=2 WORKER_FIX_KIND=verdict WORKER_MODEL_ALIAS=opus5 \
+    stage_fix
+  ) > /dev/null 2>&1 || sf_drift_rc=$?
+  chk "(#91 r2) ...and it DIES on a token in scope, and on a head that drifted (fail closed, both)" \
+    "$sf_tok_rc:$sf_drift_rc" "1:1"
+
+  # Each publisher arm gets its own clone of the ORIGIN, detached at the dispatched head — the
+  # publisher's real position. `git clone` takes refs/heads only, so the staged commit (whose only
+  # ref is refs/sparq-fix/staged in the run checkout) is genuinely absent until the bundle supplies it.
+  local sf_try_n=0
+  _sf_try() {
+    sf_try_n=$(( sf_try_n + 1 ))
+    local dir="$sf/try$sf_try_n"
+    git clone --quiet "$sf_origin" "$dir" > /dev/null 2>&1
+    git -C "$dir" checkout --quiet --detach "$sf_head" > /dev/null 2>&1
+    ( cd "$dir" && _verify_staged_fix "$@" ) 2>/dev/null | sed -n '1{s/:.*//;p;}'
+  }
+  local sf_bundle="$sf_root/fix-bundle/fix.bundle"
+  git clone --quiet "$sf_origin" "$sf_pub" > /dev/null 2>&1
+  git -C "$sf_pub" checkout --quiet --detach "$sf_head" > /dev/null 2>&1
+  chk "(#91 r2) the sealed bundle exists and the publisher clone does NOT already hold the commit" \
+    "$([[ -f "$sf_bundle" ]] && printf bundle || printf missing):$(git -C "$sf_pub" cat-file -e "$sf_sha" 2>/dev/null && printf present || printf absent)" \
+    "bundle:absent"
+  chk "(#91 r2) the publisher ACCEPTS the bundle bound to the pre-gate recorded sha" \
+    "$(_sf_try "$sf_bundle" "$sf_sha" "$sf_head" '' verdict "$sf_bot" 20971520)" "ok"
+  # THE REFUSAL ARMS. Each is a distinct way the artifact can fail to be the recorded commit, and
+  # each is checked against the SAME accepting bundle above, so a `defer` measures that one input.
+  chk "(#91 r2) ...REFUSES a bundle whose tip is not the recorded sha (substituted artifact)" \
+    "$(_sf_try "$sf_bundle" "$sf_seed" "$sf_head" '' verdict "$sf_bot" 20971520)" "defer"
+  chk "(#91 r2) ...REFUSES an EMPTY recorded sha — no pre-gate seal means no push (fail closed)" \
+    "$(_sf_try "$sf_bundle" '' "$sf_head" '' verdict "$sf_bot" 20971520)" "defer"
+  chk "(#91 r2) ...REFUSES a missing artifact, and an artifact over the size limit" \
+    "$(_sf_try "$sf/no-such.bundle" "$sf_sha" "$sf_head" '' verdict "$sf_bot" 20971520):$(_sf_try "$sf_bundle" "$sf_sha" "$sf_head" '' verdict "$sf_bot" 64)" \
+    "defer:defer"
+  chk "(#91 r2) ...REFUSES a truncated bundle (git integrity/prerequisite verification)" \
+    "$(head -c 96 "$sf_bundle" > "$sf/truncated.bundle"; _sf_try "$sf/truncated.bundle" "$sf_sha" "$sf_head" '' verdict "$sf_bot" 20971520)" \
+    "defer"
+  chk "(#91 r2) ...REFUSES a commit that does not extend the DISPATCHED head (wrong parent)" \
+    "$(_sf_try "$sf_bundle" "$sf_sha" "$sf_seed" '' verdict "$sf_bot" 20971520)" "defer"
+  chk "(#91 r2) ...REFUSES a commit whose identity is not the target bot" \
+    "$(_sf_try "$sf_bundle" "$sf_sha" "$sf_head" '' verdict 'someone-else[bot]' 20971520)" "defer"
+  # The merge parent is required for exactly one kind and forbidden for the others, so neither a
+  # dropped nor a smuggled second parent rides through on the shape of another kind.
+  chk "(#91 r2) ...REFUSES a merge parent smuggled onto a verdict fix, and a rebase with none" \
+    "$(_sf_try "$sf_bundle" "$sf_sha" "$sf_head" "$sf_seed" verdict "$sf_bot" 20971520):$(_sf_try "$sf_bundle" "$sf_sha" "$sf_head" '' rebase "$sf_bot" 20971520)" \
+    "defer:defer"
+  # A hand-built commit that DOES touch .beads, bundled the same way. `_git_commit_fix` would have
+  # refused it upstream; the publisher restates the policy on the OBJECT, independently.
+  local sf_bd="$sf/beads" sf_bd_sha sf_bd_bundle="$sf/beads.bundle"
+  git clone --quiet "$sf_origin" "$sf_bd" > /dev/null 2>&1
+  git -C "$sf_bd" checkout --quiet --detach "$sf_head" > /dev/null 2>&1
+  printf '{"b": 2}\n' > "$sf_bd/.beads/state.json"
+  git -C "$sf_bd" -c user.name="$sf_bot" -c user.email="1+bot@users.noreply.github.com" \
+    commit --quiet -am 'fix: touches beads'
+  sf_bd_sha=$(git -C "$sf_bd" rev-parse HEAD)
+  git -C "$sf_bd" update-ref "$STAGED_FIX_REF" "$sf_bd_sha"
+  git -C "$sf_bd" bundle create "$sf_bd_bundle" "$STAGED_FIX_REF" "^$sf_head" > /dev/null 2>&1
+  chk "(#91 r2) ...and REFUSES a staged commit that changes .beads state" \
+    "$(_sf_try "$sf_bd_bundle" "$sf_bd_sha" "$sf_head" '' verdict "$sf_bot" 20971520)" "defer"
+  # THE SUBSTITUTION the whole SHA binding exists for: a DIFFERENT, internally valid bundle put in
+  # the artifact's place while the recorded sha is left alone. It defers on the tip comparison.
+  chk "(#91 r2) ...and REFUSES a wholesale artifact swap (valid bundle, wrong commit)" \
+    "$(_sf_try "$sf_bd_bundle" "$sf_sha" "$sf_head" '' verdict "$sf_bot" 20971520)" "defer"
+  # The .beads policy is written TWICE on purpose — once at the pre-gate commit, once on the object
+  # at publish time — so each copy is asserted where the other cannot reach it (#945: two copies of
+  # one guard make each individually unkillable unless they are killed at separate sites). The row
+  # above is the publisher's; this is the sealer's, and it must refuse BEFORE any commit exists.
+  local sf_bdseal_rc=0 sf_bdseal="$sf/beads-seal" sf_bdseal_root="$sf/beads-seal-root"
+  mkdir -p "$sf_bdseal_root"
+  git clone --quiet "$sf_origin" "$sf_bdseal" > /dev/null 2>&1
+  git -C "$sf_bdseal" checkout --quiet "$sf_branch" > /dev/null 2>&1
+  printf '{"b": 3}\n' > "$sf_bdseal/.beads/state.json"
+  (
+    GITHUB_OUTPUT="$tmp/stagefix-beads.out" TARGET_DIR="$sf_bdseal" WORKER_ROOT="$sf_bdseal_root" \
+    TARGET_BOT_LOGIN="$sf_bot" TARGET_BOT_ID=305236749 \
+    WORKER_PR_NUMBER=7 WORKER_PR_HEAD_BRANCH="$sf_branch" WORKER_PR_HEAD_SHA="$sf_head" \
+    WORKER_FIX_ROUND=2 WORKER_FIX_KIND=verdict WORKER_MODEL_ALIAS=opus5 \
+    stage_fix
+  ) > /dev/null 2>&1 || sf_bdseal_rc=$?
+  chk "(#91 r2) ...and the SEALER refuses a .beads edit before any commit exists (both copies live)" \
+    "$sf_bdseal_rc:$(git -C "$sf_bdseal" rev-parse HEAD):$([[ -e "$sf_bdseal_root/fix-bundle/fix.bundle" ]] && printf sealed || printf nothing-sealed)" \
+    "1:$sf_head:nothing-sealed"
+
+  # THE CONFLICT-REPAIR FLAVOUR: a genuine two-parent merge, whose second parent is RECORDED
+  # pre-gate so the publisher binds to the revision that was actually merged rather than to
+  # whatever the default branch has become by publish time.
+  local sf_rb="$sf/rebase" sf_rb_root="$sf/rebase-root" sf_rb_out="$tmp/stagefix-rb.out" sf_rb_rc=0
+  mkdir -p "$sf_rb_root"
+  git clone --quiet "$sf_origin" "$sf_rb" > /dev/null 2>&1
+  git -C "$sf_rb" checkout --quiet main > /dev/null 2>&1
+  printf 'main moved\n' >> "$sf_rb/src.txt"
+  git -C "$sf_rb" -c user.name=seed -c user.email=seed@example.invalid commit --quiet -am 'main moves'
+  local sf_rb_merge
+  sf_rb_merge=$(git -C "$sf_rb" rev-parse HEAD)
+  git -C "$sf_rb" checkout --quiet "$sf_branch" > /dev/null 2>&1
+  git -C "$sf_rb" -c user.name=seed -c user.email=seed@example.invalid \
+    merge --no-ff --no-commit main > /dev/null 2>&1 || true
+  printf 'resolved\n' > "$sf_rb/src.txt"
+  git -C "$sf_rb" add -A
+  : > "$sf_rb_out"
+  (
+    GITHUB_OUTPUT="$sf_rb_out" TARGET_DIR="$sf_rb" WORKER_ROOT="$sf_rb_root" \
+    TARGET_BOT_LOGIN="$sf_bot" TARGET_BOT_ID=305236749 TARGET_DEFAULT_BRANCH=main \
+    WORKER_PR_NUMBER=7 WORKER_PR_HEAD_BRANCH="$sf_branch" WORKER_PR_HEAD_SHA="$sf_head" \
+    WORKER_FIX_ROUND=2 WORKER_FIX_KIND=rebase WORKER_MODEL_ALIAS=opus5 \
+    stage_fix
+  ) > "$tmp/stagefix-rb.log" 2>&1 || sf_rb_rc=$?
+  local sf_rb_sha sf_rb_rec
+  sf_rb_sha=$(grep -E '^staged_sha=' "$sf_rb_out" | cut -d= -f2- || true)
+  sf_rb_rec=$(grep -E '^staged_merge_head=' "$sf_rb_out" | cut -d= -f2- || true)
+  chk "(#91 r2) the conflict-repair seal records the merge parent it ACTUALLY merged" \
+    "$sf_rb_rc:$([[ "$sf_rb_rec" == "$sf_rb_merge" ]] && printf recorded || printf "drift[$sf_rb_rec]")" \
+    "0:recorded"
+  chk "(#91 r2) ...the staged object is a real two-parent merge of the head and that parent" \
+    "$(git -C "$sf_rb" rev-list --parents -n 1 "$sf_rb_sha" | cut -d' ' -f2-)" \
+    "$sf_head $sf_rb_merge"
+  # ...and the STAGED index the conflict-repair path leaves is preserved for the gate too (the
+  # `--soft` arm of the restore; the verdict row above measured the `--mixed` one).
+  chk "(#91 r2) ...with the pre-gate head restored and the resolution still STAGED for the gate" \
+    "$(git -C "$sf_rb" rev-parse HEAD):$(git -C "$sf_rb" diff --cached --name-only | sort | tr '\n' '|')" \
+    "$sf_head:src.txt|"
+  local sf_rb_pub="$sf/rebase-pub" sf_rb_bundle="$sf_rb_root/fix-bundle/fix.bundle"
+  git clone --quiet "$sf_rb" "$sf_rb_pub" > /dev/null 2>&1
+  git -C "$sf_rb_pub" checkout --quiet --detach "$sf_head" > /dev/null 2>&1
+  chk "(#91 r2) ...the publisher ACCEPTS it with the recorded parent and REFUSES a substituted one" \
+    "$( ( cd "$sf_rb_pub" && _verify_staged_fix "$sf_rb_bundle" "$sf_rb_sha" "$sf_head" "$sf_rb_merge" rebase "$sf_bot" 20971520 ) 2>/dev/null | sed -n '1{s/:.*//;p;}'):$( ( cd "$sf_rb_pub" && _verify_staged_fix "$sf_rb_bundle" "$sf_rb_sha" "$sf_head" "$sf_seed" rebase "$sf_bot" 20971520 ) 2>/dev/null | sed -n '1{s/:.*//;p;}')" \
+    "ok:defer"
+
+  # push_fix end to end against a real remote. The guards that must stop it BEFORE any push run
+  # first, then the accepting run, then the SAME accepting run again — which must now fail on the
+  # --force-with-lease, because the branch it leased has moved to the commit it just pushed.
+  local sf_pf_root="$sf/pub-root" sf_pf_drift_rc=0 sf_pf_bad_rc=0 sf_pf_ok_rc=0 sf_pf_replay_rc=0
+  mkdir -p "$sf_pf_root"
+  _sf_publish() {
+    local expect_head=$1 staged=$2 out=$3
+    (
+      TARGET_DIR="$sf_pub" WORKER_ROOT="$sf_pf_root" GH_TOKEN=not-a-real-token \
+      GITHUB_OUTPUT="$out" WORKER_FIX_BUNDLE="$sf_bundle" WORKER_STAGED_SHA="$staged" \
+      WORKER_STAGED_MERGE_HEAD='' WORKER_PR_HEAD_SHA="$expect_head" \
+      WORKER_PR_HEAD_BRANCH="$sf_branch" WORKER_FIX_ROUND=2 WORKER_FIX_KIND=verdict \
+      TARGET_BOT_LOGIN="$sf_bot" push_fix
+    ) > /dev/null 2>&1
+  }
+  _sf_publish "$sf_seed" "$sf_sha" "$tmp/pf-drift.out" || sf_pf_drift_rc=$?
+  _sf_publish "$sf_head" "$sf_seed" "$tmp/pf-bad.out" || sf_pf_bad_rc=$?
+  chk "(#91 r2) push_fix REFUSES before pushing on a drifted head, and on an unbound bundle" \
+    "$sf_pf_drift_rc:$sf_pf_bad_rc:$(git -C "$sf_origin" rev-parse "refs/heads/$sf_branch")" \
+    "1:1:$sf_head"
+  _sf_publish "$sf_head" "$sf_sha" "$tmp/pf-ok.out" || sf_pf_ok_rc=$?
+  chk "(#91 r2) ...and pushes EXACTLY the pre-gate recorded object onto the PR head branch" \
+    "$sf_pf_ok_rc:$(git -C "$sf_origin" rev-parse "refs/heads/$sf_branch"):$(grep -E '^pushed_sha=' "$tmp/pf-ok.out" | cut -d= -f2- || true)" \
+    "0:$sf_sha:$sf_sha"
+  # THE LEASE, measured rather than assumed. Another party lands on the head branch (here the
+  # .beads fixture commit), then the identical publish is replayed: the recorded commit still
+  # verifies, so the ONLY thing that can stop it is the --force-with-lease against the dispatched
+  # head — and the branch must still carry the other party's commit afterwards.
+  git -C "$sf_bd" push --quiet --force "$sf_origin" "$sf_bd_sha:refs/heads/$sf_branch"
+  _sf_publish "$sf_head" "$sf_sha" "$tmp/pf-replay.out" || sf_pf_replay_rc=$?
+  chk "(#91 r2) ...and the CAS lease refuses the push once the branch moved off the leased head" \
+    "$sf_pf_replay_rc:$(git -C "$sf_origin" rev-parse "refs/heads/$sf_branch")" "1:$sf_bd_sha"
+
+  # [issue #91 review r3] THE CLI SEAM. Every row above calls the shell FUNCTIONS directly, so none
+  # of them can see the `case` arm that names them — and the subcommand names are a cross-repo
+  # contract, not an internal detail. dispatch-claim.py's identity-seam checks name
+  # `worker-live.sh push-fix` LITERALLY, twice: a behavioural probe that the push-capable path
+  # still REFUSES an ordinary head branch (the #657 self-attested waiver is `review`-only), and a
+  # scan asserting no `push-fix` step in review-fix.yml carries WORKER_SELF_ATTESTED. Neither
+  # fails loudly on a rename — the probe reads the usage line instead of the refusal, and the scan
+  # matches nothing and goes VACUOUS — so the reachability is pinned HERE, in the lane that owns
+  # the name. Executed as a SUBPROCESS on purpose: nothing else in this suite proves the dispatch
+  # table routes these two names at all.
+  #
+  # The three outcomes are distinguished by MESSAGE, never by exit status alone (all three exit 1):
+  # `unreachable` is the usage line, `refused` is the worker-namespace head gate, `past-gate` is
+  # the next check along. WORKER_SELF_ATTESTED is set on EVERY arm below because design record §3
+  # forbids the waiver from reaching either of these phases: they seal and push commits, and a
+  # self-attested record must never buy write access to its own branch.
+  _sf_cli_gate() {
+    local sub=$1 branch=$2 out
+    out=$(
+      (
+        unset GH_TOKEN
+        # push_fix refuses a missing token BEFORE the head gate; stage_fix refuses a PRESENT one.
+        [[ "$sub" != push-fix ]] || export GH_TOKEN=not-a-real-token
+        TARGET_DIR="$sf_work" WORKER_ROOT="$sf_root" WORKER_PR_NUMBER=7 \
+        WORKER_PR_HEAD_BRANCH="$branch" WORKER_SELF_ATTESTED=true \
+        bash "$SCRIPT_DIR/worker-live.sh" "$sub"
+      ) 2>&1
+    )
+    case "$out" in
+      *'usage: worker-live.sh'*) printf 'unreachable' ;;
+      *'unsafe pull request head branch'*) printf 'refused' ;;
+      *) printf 'past-gate' ;;
+    esac
+  }
+  chk "(#91 r3) both fix phases are REACHABLE BY NAME and refuse an ordinary head branch, self-attested" \
+    "$(_sf_cli_gate stage-fix fix/ordinary-branch):$(_sf_cli_gate push-fix fix/ordinary-branch)" \
+    "refused:refused"
+  # NON-VACUITY, and it is the row that keeps the one above honest: a phase that refused
+  # EVERYTHING — or that died before reaching its head gate for an unrelated reason — would read
+  # `refused` above and deliver nothing. The worker-namespace branch must get PAST that same gate.
+  chk "(#91 r3) ...and the seam is NON-VACUOUS: a worker-namespace branch gets PAST that same gate" \
+    "$(_sf_cli_gate stage-fix "$sf_branch"):$(_sf_cli_gate push-fix "$sf_branch")" \
+    "past-gate:past-gate"
 
   # HONESTY of the classification: a prep failure that is NOT a refresh failure (here a malformed
   # stored credential) must classify NOTHING — downstream then records the truthful `unknown`
@@ -6799,6 +7533,7 @@ case "${1:-}" in
   publish) publish_pr ;;
   review) run_review ;;
   fix) run_fix ;;
+  stage-fix) stage_fix ;;
   push-fix) push_fix ;;
   write-back) write_back ;;
   # issue #232 review r2: removes the materialized credential tree from the runner BEFORE any
@@ -6845,5 +7580,5 @@ case "${1:-}" in
     run_enrolled_selftest "$2"
     ;;
   self-test) self_test ;;
-  *) die 'usage: worker-live.sh <model|gate|bundle|verify-bundle|publish|review|fix|push-fix|write-back|purge-credentials|print-selftest-suite|preflight-selftest-env|run-selftest|self-test>' ;;
+  *) die 'usage: worker-live.sh <model|gate|bundle|verify-bundle|publish|review|fix|stage-fix|push-fix|write-back|purge-credentials|print-selftest-suite|preflight-selftest-env|run-selftest|self-test>' ;;
 esac

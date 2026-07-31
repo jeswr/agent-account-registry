@@ -98,28 +98,39 @@ class _NoRedirect(HTTPRedirectHandler):
         return None
 
 
-def _load_gh_403():
-    """Load scripts/gh_403.py (same checkout) — THE 403 taxonomy, shared with
-    dispatch-secrets-guard (registry #1208). By PATH, not `import gh_403`: `scripts/` is not a
-    package and the CWD a workflow step runs from is not this directory.
+def _load_retry_taxonomy(filename, module_name):
+    """Load a shared retry-classification helper out of scripts/ (same checkout), BY PATH, not by
+    `import <name>`: `scripts/` is not a package and the CWD a workflow step runs from is not this
+    directory.
 
-    A load failure is FATAL and loud. This module's whole 403 policy (#819: which 403 is retried,
-    which stops the sweep) is defined there, and a missing taxonomy must never degrade into
-    "classify nothing, retry everything" — that is the exact behaviour #819 removed."""
-    path = Path(__file__).resolve().parent / "gh_403.py"
-    spec = importlib.util.spec_from_file_location("registry_gh_403_for_snapshot", path)
+    A load failure is FATAL and loud. This module's whole retry policy — WHICH 403 is retried and
+    which stops the sweep (`gh_403`, #819), and which STATUSES it opts into replaying
+    (`http_transient`, #552) — is defined in these files, and a missing taxonomy must never degrade
+    into "classify nothing, retry everything": that is the exact behaviour #819 removed."""
+    path = Path(__file__).resolve().parent / filename
+    spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
-        raise SystemExit(f"cannot load registry helper {path} — the 403 taxonomy is unavailable")
+        raise SystemExit(f"cannot load registry helper {path} — a retry taxonomy is unavailable")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-gh_403 = _load_gh_403()
+gh_403 = _load_retry_taxonomy("gh_403.py", "registry_gh_403_for_snapshot")
+http_transient = _load_retry_taxonomy("http_transient.py", "registry_http_transient_for_snapshot")
 
-RETRYABLE = {429, 500, 502, 503, 504}
-# 403 is deliberately NOT in RETRYABLE (issue #819). It is not one status, it is three different
-# server answers wearing the same number, and only one of them is a blip worth retrying:
+# WHICH STATUSES THIS READ WALK REPLAYS. An ALIAS of the shared taxonomy's declared policy
+# (registry #552), never a second table: this set was written out by hand here and — with a
+# DIFFERENT, deliberately different membership — by hand in groom.py, with nothing anywhere
+# comparing the two. The difference is intentional (this walk opts 429 in because it must survive a
+# burst limiter to produce a plan at all; groom's cron sweep fails closed on every 4xx), and it is
+# now enumerated and asserted in ONE place. `RETRY_STATUS_POLICY.rationale` carries the reasoning;
+# `the_retry_status_policy_is_the_SHARED_one` below pins the delegation so it cannot be re-inlined.
+RETRY_STATUS_POLICY = http_transient.PLAN_SNAPSHOT_READ
+# 403 is deliberately NOT opted in (issue #819) — and since #552 it CANNOT be: the shared taxonomy
+# refuses a policy that names 403 at all, at construction time, precisely because it is not a status
+# decision. It is not one status, it is three different server answers wearing the same number, and
+# only one of them is a blip worth retrying:
 #
 #   secondary   GitHub is throttling a burst. Carries `Retry-After` (or says "secondary rate
 #               limit" / "abuse detection"). RETRYABLE, after the wait it asks for.
@@ -762,7 +773,7 @@ def make_fetch(token, store=None):
                     raise FetchError(
                         f"authenticated GitHub read failed (HTTP 403, {kind}) for "
                         + url.split("?")[0]) from exc
-                if exc.code in RETRYABLE and attempt < 2:
+                if RETRY_STATUS_POLICY.retries(exc.code) and attempt < 2:
                     time.sleep(_retry_delay(exc, attempt))
                     continue
                 raise FetchError(
@@ -1856,6 +1867,34 @@ def _self_test():
         # on it. A taxonomy that ships broken must not be adopted silently by its consumer.
         assert gh_403._self_test(), "the shared gh_403 taxonomy's self-test must pass"
 
+    def the_retry_status_policy_is_the_SHARED_one():
+        """#552. Same argument, one layer out: WHICH statuses this walk replays was a hand-written
+        `RETRYABLE = {429, 500, 502, 503, 504}` here, and a DIFFERENT hand-written table (the whole
+        5xx range, no 429) in groom.py, with nothing anywhere comparing them. The difference is
+        deliberate — this walk must survive a burst limiter to produce a plan at all, groom's cron
+        sweep fails closed on every 4xx — but a deliberate difference nobody can see is
+        indistinguishable from drift, and the drift direction is fail-CLOSED: a transient status
+        missing from a table is FATAL and costs a whole scheduled run.
+
+        Behaviour AND identity, because each catches what the other cannot. The membership check
+        below reds if the shared policy is widened or narrowed; the identity check reds if someone
+        re-inlines the set here (which every behavioural check in this file would stay green
+        against, exactly as it did before #552)."""
+        assert RETRY_STATUS_POLICY is http_transient.PLAN_SNAPSHOT_READ, \
+            "the retry status policy must BE the shared taxonomy's, not a local copy"
+        # The membership this file has always had, asserted as a whole VALUE over the FULL status
+        # surface — so a widening anywhere in 100..599 reds here, not just on a spot-checked code.
+        assert RETRY_STATUS_POLICY.retried_statuses() == (429, 500, 502, 503, 504), \
+            f"plan-snapshot's opt-in changed: {RETRY_STATUS_POLICY.retried_statuses()}"
+        # 403 and 304 are the two statuses a widening here would be MOST tempting and MOST wrong:
+        # 403 is `classify_403`'s (one of its three classes must never be replayed at all) and 304
+        # is this file's conditional-request CACHE HIT (#1207) — replaying it is a loop, not a
+        # retry. The shared taxonomy refuses both at construction; assert the outcome here too.
+        assert not RETRY_STATUS_POLICY.retries(403) and not RETRY_STATUS_POLICY.retries(304)
+        # ...and the shared module's OWN suite must pass, since this file's retry surface now rests
+        # on it.
+        assert http_transient._self_test(), "the shared http_transient taxonomy's self-test must pass"
+
     def budget_403_is_not_retried_and_is_sweep_fatal():
         """Two properties, and BOTH are load-bearing at the call site:
 
@@ -2634,6 +2673,7 @@ def _self_test():
         retry_after_is_honoured_and_capped,
         the_three_403s_are_told_apart,
         the_classifier_is_the_SHARED_one_not_a_local_copy,
+        the_retry_status_policy_is_the_SHARED_one,
         budget_403_is_not_retried_and_is_sweep_fatal,
         budget_403_is_never_downgraded_to_a_per_item_skip,
         the_reserve_stops_the_sweep_before_the_budget_is_gone,

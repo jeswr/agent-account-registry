@@ -1996,6 +1996,89 @@ def privileged_script_coverage_verdict(workflow_docs, surface_paths):
     return True, "ok"
 
 
+# ---- NO CREDENTIAL ON A COMMAND LINE (issue #417; #195 fixed the same class in Python) ----------
+# A bearer credential handed to a subprocess as an ARGUMENT is readable by every process on the
+# runner through /proc/<pid>/cmdline, is captured verbatim by any diagnostic that snapshots running
+# commands, and survives in `ps` output long enough to be scraped. #195 moved the probe credential
+# in scripts/account-usage.py onto curl's STDIN header stream (`-H @-`); #417 is the same leak in
+# the workflow SHELL — the fleet-wide account probes and the App-JWT verifier. The Python side had a
+# self-test to hold it; the shell side had nothing, which is why the class survived a fix.
+#
+# THE INVARIANT, asserted repo-wide over every workflow job body: a command-line HEADER FLAG
+# (`-H`/`--header`, including the joined `-H<value>` and `--header=<value>` forms) must never carry
+# an `Authorization:`/`Proxy-Authorization:` value. The credential must arrive over stdin (`-H @-`)
+# or from a mode-0600 file (`-H @path`) instead.
+#
+# Keyed on the FLAG, not on the command name, deliberately: shell_simple_commands drops a leading
+# `VAR=$(...)` as an assignment prefix, so the curl inside `code=$(curl … )` — the exact shape of
+# three of the five #417 sites — is NOT the command word and a command-name-keyed scan would be
+# blind to it. Keying on the flag also leaves `printf 'Authorization: …' | curl -H @-` (the fix)
+# clean: printf is a shell BUILTIN, forks no process, and its words are not a header flag's value.
+#
+# DECLARED LIMITATION: a header assembled into a variable first (`AUTH="Authorization: Bearer $T";
+# curl -H "$AUTH"`) reads as `-H $AUTH` and is NOT caught. The check is a floor against the shape
+# that has actually shipped twice, not a taint tracker.
+CREDENTIAL_HEADER_RE = re.compile(r"^\s*(proxy-authorization|authorization)\s*:", re.IGNORECASE)
+HEADER_FLAGS = ("-H", "--header")
+
+
+def command_line_header_values(run_text):
+    """Pure: every header value passed as a COMMAND-LINE argument in one shell body, in order.
+
+    Comments and here-document BODIES are stripped by the shared shell readers first (a header
+    inside a here-doc is data, not argv). A flag and its value cannot span an operator, so a
+    trailing `-H` before a `|`/`;`/newline yields nothing rather than swallowing the next command."""
+    values = []
+    pending = False
+    for kind, token in _shell_tokens(strip_shell_comments(strip_shell_heredocs(run_text))):
+        if kind == "op":
+            pending = False
+            continue
+        word = unquote_shell_word(token)
+        if pending:
+            values.append(word)
+            pending = False
+            continue
+        if word in HEADER_FLAGS:
+            pending = True                       # `-H <value>` / `--header <value>`
+        elif word.startswith("--header="):
+            values.append(word[len("--header="):])
+        elif word.startswith("-H") and len(word) > 2:
+            values.append(word[2:])              # the joined short form `-H<value>`
+    return tuple(values)
+
+
+def credential_argv_verdict(workflow_docs):
+    """Pure: (ok, reason) over {filename: workflow text}. Refuses when any workflow job passes an
+    Authorization header as a command-line argument, and refuses when the scan finds NO header
+    arguments at all — a scan that observed nothing proves nothing (fail closed: the reader or the
+    repository shape has drifted). Only the header NAME is ever reported: a refusal message is
+    printed into a PUBLIC Actions log, so the value — which is the credential — is never echoed."""
+    leaks, observed = [], 0
+    for filename in sorted(workflow_docs):
+        jobs = workflow_jobs(workflow_docs[filename])
+        if jobs is None:
+            return False, (f"cannot parse jobs in {filename} — refusing to certify that its "
+                           "command lines carry no credential (fail closed)")
+        for job_name, body_lines in sorted(jobs.items()):
+            for value in command_line_header_values("\n".join(body_lines)):
+                observed += 1
+                match = CREDENTIAL_HEADER_RE.match(value)
+                if match:
+                    leaks.append(f"{filename}::{job_name} (`{match.group(1)}:`)")
+    if not observed:
+        return False, ("scanned ZERO command-line header arguments repo-wide — the scan proves "
+                       "nothing (fail closed: the shell reader or the repository shape has "
+                       "drifted, and a silent zero would certify a leak as clean)")
+    if leaks:
+        return False, (
+            "credential header(s) passed on a COMMAND LINE: " + ", ".join(sorted(set(leaks)))
+            + " — argv is readable by every process on the runner (/proc/<pid>/cmdline) and is "
+            "captured by diagnostic command capture; feed the header through curl's stdin "
+            "(`-H @-`) or a mode-0600 `-H @file` instead (issue #417, issue #195)")
+    return True, "ok"
+
+
 # ---- the ROTATION WRITE-BACK must be reachable from the FAILURE path (retro-review of #614) ------
 # #614 moved the credential refresh HOST-SIDE, into worker-prep.sh, and made the rotation write-back
 # key on "the pre-flight produced new durable material". It also gated the write-back step on
@@ -2889,6 +2972,102 @@ def _self_test():
     chk("workflow: every script run with secrets or write permission is covered by the registry "
         "policy human-arm surface",
         privileged_script_coverage_verdict(live_docs, policy_surfaces), (True, "ok"))
+
+    # ---- NO CREDENTIAL ON A COMMAND LINE (issue #417) ------------------------------------------
+    # The pre-#417 shape is written out BY HAND here, never derived from CREDENTIAL_HEADER_RE: an
+    # input built from the same constant the code reads cannot fail (AGENTS.md pre-flight 2c). It
+    # reproduces the real fingerprint-accounts.yml/account-whoami.yml shape — the curl lives inside
+    # a `VAR=$(…)` command substitution, which is exactly the shape a command-name-keyed scan
+    # cannot see, so this fixture is also the reject direction for that design choice.
+    argv_leak_run = 'code=$(curl -s -H "Authorization: Bearer $TOK" https://api.example/x)'
+    argv_clean_run = ("code=$(printf 'Authorization: Bearer %s\\n' \"$TOK\" "
+                      "| curl -s -H @- https://api.example/x)")
+
+    def argv_doc(run_line):
+        return "\n".join([
+            "jobs:",
+            "  probe:",
+            "    steps:",
+            "      - run: |",
+            "          " + run_line,
+            "        env:",
+            "          TOK: ${{ secrets.ACCT02_TOKEN }}",
+        ])
+
+    chk("argv credential: the STDIN header form (`-H @-`) is accepted",
+        credential_argv_verdict({"probe.yml": argv_doc(argv_clean_run)}), (True, "ok"))
+    leak = credential_argv_verdict({"probe.yml": argv_doc(argv_leak_run)})
+    chk("argv credential: `-H \"Authorization: …\"` inside a `VAR=$(curl …)` substitution is "
+        "REFUSED, naming the job and the header — and NEVER echoing the value (the reason is "
+        "printed into a PUBLIC Actions log)",
+        (leak[0], "probe.yml::probe" in leak[1], "authorization:" in leak[1].lower(),
+         "TOK" in leak[1], "Bearer" in leak[1]),
+        (False, True, True, False, False))
+    # Each alternate-form fixture also carries a HARMLESS header argument, so the scan observes
+    # something even when the form under test stops being read. Without it, deleting that form's
+    # branch merely empties the scan, the zero-observation refusal returns False anyway, and a
+    # `[0] == False` row passes for the wrong reason — both of these mutants SURVIVED until the
+    # REASON was asserted too (AGENTS.md pre-flight 2b).
+    joined = credential_argv_verdict({"probe.yml": argv_doc(
+        'curl -s -H "Accept: application/json" -H"Authorization: Bearer $TOK" https://x/y')})
+    chk("argv credential: the JOINED short form `-H<value>` is refused AS A LEAK (a reader that "
+        "only understands `-H <value>` is bypassed by deleting one space)",
+        (joined[0], "probe.yml::probe" in joined[1], "authorization:" in joined[1].lower()),
+        (False, True, True))
+    long_form = credential_argv_verdict({"probe.yml": argv_doc(
+        'curl -s -H "Accept: application/json" --header="Authorization: Bearer $TOK" https://x/y')})
+    chk("argv credential: the long `--header=<value>` form is refused AS A LEAK too",
+        (long_form[0], "probe.yml::probe" in long_form[1], "authorization:" in long_form[1].lower()),
+        (False, True, True))
+    # HTTP header names are case-insensitive, and `Proxy-Authorization` carries a credential just as
+    # `Authorization` does. Both spellings must land as leaks, or the rule is one lowercase letter
+    # away from being bypassed by a workflow that never intended to bypass anything.
+    lower = credential_argv_verdict({"probe.yml": argv_doc(
+        'curl -s -H "authorization: Bearer $TOK" https://x/y')})
+    proxy = credential_argv_verdict({"probe.yml": argv_doc(
+        'curl -s -H "Proxy-Authorization: Basic $TOK" https://x/y')})
+    chk("argv credential: the lowercase `authorization:` spelling and `Proxy-Authorization:` are "
+        "leaks too",
+        (lower[0], "probe.yml::probe" in lower[1],
+         proxy[0], "proxy-authorization" in proxy[1].lower()),
+        (False, True, False, True))
+    # The READER itself, exact-match on the extracted values — a reader that silently returns ()
+    # would make every accept above pass for the wrong reason.
+    chk("argv credential reader: the fix's own shape yields ONLY the stdin marker; the printf "
+        "words (a shell BUILTIN, no argv) are not header arguments",
+        command_line_header_values(argv_clean_run), ("@-",))
+    chk("argv credential reader: a header flag never spans an operator, and a bare header word "
+        "with no flag is not an argument",
+        command_line_header_values("curl -H\ncurl 'Authorization: Bearer x'"), ())
+    chk("argv credential reader: the leak shape extracts the header VALUE (so the refusal above "
+        "is about this value, not about the word `curl`)",
+        command_line_header_values(argv_leak_run), ("Authorization: Bearer $TOK",))
+    chk("argv credential: ZERO header arguments repo-wide -> refuse (a scan that observed "
+        "nothing proves nothing)",
+        credential_argv_verdict({"probe.yml": argv_doc("curl -s https://api.example/x")})[0],
+        False)
+    chk("argv credential: an unparseable jobs block -> refuse, file named",
+        (credential_argv_verdict({"a.yml": "name: no jobs key here"})[0],
+         "a.yml" in credential_argv_verdict({"a.yml": "name: no jobs key here"})[1]),
+        (False, True))
+    # LIVE. This row is what goes RED if any workflow reverts to a credential on the command line.
+    chk("workflow: NO job in ANY workflow passes an Authorization header as a command-line "
+        "argument (issue #417; #195 fixed the same class in scripts/account-usage.py)",
+        credential_argv_verdict(live_docs), (True, "ok"))
+    # …and the parser-rot anchor: the live scan must still SEE each of the three #417 credential
+    # probes handing curl its bearer header OUT-OF-BAND — `@-` (stdin) or `@path` (a mode-0600
+    # file), the two remediations #417 allows. Without this, the row above would also pass on a
+    # scan that had stopped finding these files' header arguments at all.
+    live_indirect_headers = {}
+    for name in ("account-whoami.yml", "fingerprint-accounts.yml", "verify-app.yml"):
+        jobs = workflow_jobs(live_docs.get(name, "")) or {}
+        live_indirect_headers[name] = sorted(
+            value for body in jobs.values()
+            for value in command_line_header_values("\n".join(body)) if value.startswith("@"))
+    chk("workflow: each #417 credential probe still hands curl its bearer header out-of-band "
+        "(`-H @-` / `-H @file`), so the repo-wide row above is not passing on an empty scan",
+        {name: bool(values) for name, values in sorted(live_indirect_headers.items())},
+        {"account-whoami.yml": True, "fingerprint-accounts.yml": True, "verify-app.yml": True})
 
     # ---- the GATE: a FAILING guard must PREVENT the privileged jobs from running (issue #618) --
     # The pre-existing suite passed in full while the control was fail-OPEN, so every assertion

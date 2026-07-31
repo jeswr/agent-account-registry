@@ -6,7 +6,11 @@ minutes. **Token VALUES never live in the repo** — each account's token is an 
 **secret** (masked in logs, blocked from fork PRs); account **emails / PII are not published**
 (redacted from issues; the private handle→email map lives only in a maintainer secret + gist).
 Account handles, limits, live-usage probing, and the selection logic ARE public — they carry no
-secrets. Read-only to non-collaborators; only maintainer/bot-triggered workflows touch secrets.
+secrets — though handles only on the **account-catalog / enrollment** surfaces (`policy/repos.toml`,
+the account issue title, `ACCTNN_TOKEN` secret names, and the `set-up-account` run that mints all
+three): every **operational** surface — ledger leases, model-health records, the dashboard, the
+identity diagnostics — names an account by its salted fingerprint instead (see § Security posture).
+Read-only to non-collaborators; only maintainer/bot-triggered workflows touch secrets.
 
 A worker (a GitHub Actions job in some codebase, e.g. `sparq-org/sparq`) asks this registry for an
 account to use; the registry applies per-account limits, a cross-codebase concurrency lock, model
@@ -290,6 +294,32 @@ a rolling `data/cache-affinity.json`), never in the public repos.
   `python3 scripts/cross-resolver-agreement.py --target-root <checkout>`, which drives **both**
   resolvers over a 22-row label matrix and reports any row they decide differently.
   Live instance: the maintainer's 2026-07-26 `area:gui` carve-out (sparq PR #4211).
+
+- **Whether a persona may run a MUTATING lane is DECLARED, never inferred from its name** (#285).
+  `review-fix.yml`'s fix lane runs the model under the persona the source issue's own route names,
+  so a docs/CI PR is fixed under the brief it was implemented under rather than the general
+  implementer's. But a route may name a **verdict-only** persona — this repo's security override
+  routes to `registry-reviewer`, whose brief is read-only and says its job is "never a fix" —
+  and handing that brief to a fixer instructs it not to edit the PR at all. So adoption is gated
+  on a capability the target declares beside its routes:
+
+  ```toml
+  [agents.registry-impl]
+  fix_capable = true          # brief authorises editing the checkout -> adoptable by the fix lane
+  [agents.registry-reviewer]
+  fix_capable = false         # verdict-only brief -> never adopted, and never the fix fallback
+  ```
+
+  `policy-resolve.agent_fix_capable` reads it **fail-closed**: undeclared, malformed, or anything
+  that is not the boolean `true` is not adoptable, and the lane keeps its `--role impl`
+  implementer. The same rule then binds that fallback (`agent_fix_refused`): the persona the lane
+  finally **publishes** must be declared `fix_capable = true` too, so an explicit `false`, a
+  malformed row, or a `role = "impl"` persona this table simply never names fails the resolve job
+  closed rather than fixing under a brief that may forbid fixing. **Declare a row for every agent
+  your routes name** — the opt-in is the whole table, so a target with no `[agents]` table behaves
+  exactly as it did before this existed, while one that has it cannot reach the fixer through
+  silence. `dispatch-claim.py`'s self-test pins each declaration against the brief
+  `worker-live.sh` actually loads.
 
 ## Adding an account — step-by-step runbook (an agent can follow this verbatim)
 
@@ -791,9 +821,33 @@ the parsed document in memory and required to come back named.
     short-circuits and `if`/`while`/`case` constructs treated as unreachable — so a commented-out or
     short-circuited invocation is a refusal that names the fact. The text of a command is not its
     execution.
-- Account metadata + selection logic: only in this repo — which is **public**, so handles, limits and
-  the selection logic are published deliberately (they carry no secrets), token VALUES stay in GitHub
+- Account metadata + selection logic: only in this repo — which is **public**, so limits and the
+  selection logic are published deliberately (they carry no secrets), token VALUES stay in GitHub
   secrets, and account emails/PII are redacted from everything written here (locked decision 22).
+  Raw account **handles** are the deliberate exception in the *other* direction, and the SCOPE of
+  that exception is what matters. A handle is public on the account **catalog and the enrollment
+  path that writes it** — `policy/repos.toml`'s `account_pool`, the account issue's TITLE (and the
+  `secret_ref` in its body), the `ACCTNN_TOKEN` secret NAMES, and `set-up-account.yml`, which derives
+  `acctNN`, titles the issue with it, opens the `account-pool/acctNN` policy PR, and names it in its
+  own Actions log lines and request-issue comments. On that surface the handle IS the identifier, it
+  is generated as well as hand-edited, and nothing there is fingerprinted — deliberately.
+  Every **operational** surface is the opposite, and there the rule is **enforced, not merely
+  documented**: each ledger record, health record, dashboard payload and identity diagnostic names an
+  account by the salted fingerprint `sha256(handle + ':' + PROVENANCE_SALT)[:16]` ONLY (locked
+  decision 22a) — `model-health.account_hash` refuses to derive without both handle and salt and
+  `make_record` fail-closed validates the assembled record so a raw `acctNN` can never be written
+  (#202); `dashboard-gen` validates the observability lease label against the fingerprint shape and
+  `_assert_private` backstops every known raw handle over the FINISHED public document;
+  `lease_schema.ACCOUNT` and `select-and-claim.ACCOUNT_FINGERPRINT_RE` `fullmatch` 16 hex characters
+  in the ledger and nothing else; and `account-whoami.yml` /
+  `fingerprint-accounts.yml` salt every identity-bearing value before it can reach a public Actions
+  log, printing header COUNTS only when no salt is available (fail closed, never raw). Those four
+  are the guarantee, and its scope is exactly them: there is no repo-wide "no generated handle
+  anywhere" invariant, and this README cannot create one — only code with a seam test can. This
+  bullet previously said *handles* were "published deliberately" with no scope at all, which read as
+  licensing exactly what those paths fail closed on (#1091) — the #958 shape applied to the security
+  posture. **The code is the contract**: widening what an operational surface may carry is a locked
+  decision, reopened by a maintainer only, never by an agent making prose and code agree downward.
 - Script convention: retry via `scripts/gh_retry.py` for idempotent reads; **NEVER** wrap a CAS/ledger
   write or a mutation-confirmation in `gh_retry.run_gh` (their conflict/fail-loud semantics are
   caller-owned — a replayed mutation can double-dispatch a worker, #559/#558). A ledger CAS writer
