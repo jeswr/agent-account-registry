@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5419,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0f641c618bad91f11377b8fedea7e1549dc72255",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding. The new SingleForgedShareAtOpen deviation mutates exactly one party's final value share while preserving all honest value shares and the MAC sharing, and the dedicated test drives that mutation through auth_equal_verdicts_with/mac_check_and_open at n=3,5,7. Its assertions correctly distinguish the real degree-t robust-open outcomes (Tampered when the correction budget is zero; correction to the honest verdict when it is positive) and explicitly establish that sigma is not credited for this case. The separate all-share consistent-codeword test is now accurately labeled above-threshold, while the within-threshold RS-invisible threat remains covered by the in-reduction mutation tests. Claims and documentation are correspondingly narrowed, including the open-before-check confidentiality residual and pending external audit. No blocking correctness, soundness, test-validity, or security issue remains in the diff-scoped evidence.",
+  "verdict": "approve"
+ }
+}
