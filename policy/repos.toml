@@ -112,6 +112,8 @@ cross_provider_fallback = false  # honest default: stay queued + alert, never si
 # backlog bar sits above a healthy steady-state (dozens of open + draft PRs is normal); the alert
 # is for GROWTH-with-no-drain, which the 2026-07-18T09:10Z snapshot already trips (52 open PRs,
 # open-rate 5/hr, close-rate 0/hr, 0 merges this hour despite 51 in 24h => review lane stalled).
+review_enrolment_authors = ["jeswr"]
+
 [repos."sparq-org/sparq".throughput]
 target_ready            = 30   # stocked frontier for the standing 60/hr throughput goal
 open_pr_alert_threshold = 40   # backlog-growing needs open PRs above this AND close-rate < open-rate
