@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5217,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6e8d088a4b8e170922e7c0087e321910fd005822",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "fetch_runs() requests every completed run without filtering conclusion, and decompose_run() excludes only null, cancelled, and skipped conclusions. A failed job is therefore included even though it commonly stops at the first failing step and never executes the rest of the leg. Such a truncated observation can be medianed as an unusually fast run, understate total/test time, create false family imbalance or fold candidates, and omit later steps from the slowest-step inventory. The existing test explicitly treats any conclusion other than cancelled/skipped/null as eligible, so this failure mode is not covered.",
+    "file": "scripts/ci_leg_inventory.py",
+    "fix_hint": "For topology steering, include only successful jobs (and preferably successful runs), or separate failed observations so they cannot enter duration medians and derived findings. Add a test containing a short failed job beside successful observations and assert that the failed job is excluded from aggregation. If failed work is intentionally measured, document and report it separately rather than mixing truncated and complete executions.",
+    "severity": "major",
+    "title": "Failed jobs are sampled as representative completed work"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 1's wait-anchor defect is fixed: first attempts now use the run's created_at, reruns use run_started_at, and the live collection test keeps those timestamps distinct. However, the live sampler still admits failed workflow runs and failed jobs. Those observations can end early at the failing step and therefore appear artificially fast, corrupting medians, family imbalance, fold-candidate, and slowest-step steering data. Because this is a new major measurement-validity finding, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
