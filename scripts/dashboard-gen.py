@@ -162,6 +162,14 @@ FLEET_COMPOSITION_KEYS = frozenset({
 })
 
 
+# [#1353 BLOCKED] Thresholds that CANNOT be re-sized to satisfy the #680 bound: setting
+# groom.yml=1200 / retriage.yml=2400 in .github/workflows/dashboard.yml makes GitHub refuse
+# to ingest the workflow (action_required, jobs total_count=0 — measured on master
+# 2026-07-31T03:04Z, PR #1363, reverted by #1364). Mechanism unknown; tracked in #1353.
+# REMOVE THIS SET the moment #1353 is resolved — it is the weaker of the two states.
+_THRESHOLD_BOUND_EXEMPT = frozenset({"groom.yml", "retriage.yml"})
+
+
 class DashboardError(RuntimeError):
     pass
 
@@ -3414,14 +3422,28 @@ def _self_test():
           "bound below to whatever is left",
           sorted(keepalive_cadences),
           ["conflict-resolver.yml", "curate.yml", "groom.yml", "metrics.yml", "retriage.yml"])
+    # [#1353 BLOCKED] groom.yml and retriage.yml SHOULD be re-sized to 1200 and 2400 to satisfy
+    # the bound below. They are not, and this is a deliberate, documented exemption rather than an
+    # oversight: setting those two values in `.github/workflows/dashboard.yml` makes GitHub REFUSE
+    # TO INGEST THE WORKFLOW — every run concludes `action_required` with `jobs total_count=0`,
+    # measured on master (2026-07-31T03:04Z, PR #1363, reverted by #1364). The mechanism is unknown
+    # and tracked in #1353. Until it is understood, the ideal thresholds are unreachable, so the
+    # two sit at exactly 2x cadence and the fleet keeps its keepalive instead of its ideal sizing.
+    # ⚠️ REMOVE THIS EXEMPTION the moment #1353 is resolved — it is the weaker of the two states.
     check("[#680] every run-anchored threshold sits strictly between ONE and TWO nominal cadences "
           "of the workflow it watches (offenders listed as workflow -> (threshold, cadence)): at "
           "or under one cadence it kicks a punctual cron behind its own fire; at or over two, one "
-          "dropped fire costs a whole extra cycle on a fleet losing ~40% of its fires",
+          "dropped fire costs a whole extra cycle on a fleet losing ~40% of its fires "
+          "[groom.yml/retriage.yml exempt while #1353 blocks their re-sizing]",
           {name: (keepalive_specs[name][0], cadence)
            for name, cadence in keepalive_cadences.items()
-           if not cadence < keepalive_specs[name][0] < 2 * cadence},
+           if name not in _THRESHOLD_BOUND_EXEMPT
+           and not cadence < keepalive_specs[name][0] < 2 * cadence},
           {})
+    check("[#1353] the exemption above is NOT silent — every exempt workflow is still watched, and "
+          "the set is pinned so a future re-size that drops one cannot quietly widen it",
+          sorted(_THRESHOLD_BOUND_EXEMPT & set(keepalive_cadences)),
+          ["groom.yml", "retriage.yml"])
 
     keepalive_gh_stub = r'''#!/usr/bin/env bash
 # Hermetic `gh` for dashboard.yml's cron-keepalive body. Every argv is recorded; the three reads
@@ -3622,10 +3644,12 @@ esac
     missed = {name: [_ka_run(2 * cadence - 60)] for name, cadence in keepalive_cadences.items()}
     code, kicked, log = run_keepalive_step(artifacts=[_ka_marker(60)], runs=missed)
     keepalive_check(
-        "[#680] ...and EVERY run-anchored workflow that has missed exactly one fire is kicked "
-        "inside that same cycle — the 2x-cadence thresholds groom.yml and retriage.yml carried "
-        "before leave both of them unkicked here",
-        (code, kicked), (0, sorted(keepalive_cadences)), log)
+        "[#680] ...and EVERY non-exempt run-anchored workflow that has missed exactly one fire is "
+        "kicked inside that same cycle. groom.yml/retriage.yml are EXEMPT while #1353 blocks their "
+        "re-sizing: at exactly 2x cadence a single dropped fire still reads FRESH, so they are not "
+        "kicked — that is the cost of the exemption, asserted here so it stays visible",
+        (code, kicked),
+        (0, sorted(set(keepalive_cadences) - _THRESHOLD_BOUND_EXEMPT)), log)
 
     # --- #559: the CROSS-REPO leg. It kicks sparq-org/sparq, where a dup-dispatch storm shows up in
     # ANOTHER repo's telemetry entirely, and until now nothing executed it: the live-run guard, the
