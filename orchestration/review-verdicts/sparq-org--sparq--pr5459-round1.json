@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5459,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "af446e7c739448e1bca2f5fa6fa8fdfe54816007",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The added tests are correct, non-vacuous soundness guards for two documented OWL 2 RL divergences. The inverse-functional-property case verifies that prp-ifp does not apply when the object terms differ and that the unavailable contrapositive does not invent owl:differentFrom. The reflexive-property case includes a real positive control through rdfs:subPropertyOf, then checks both the absence of unlicensed self-loops and the absence of a resulting irreflexivity inconsistency. These expectations agree with the repository's OWL RL disposition/audit rationale: individual owl:differentFrom has no applicable producing rule here, and reflexive object-property axioms are excluded from the RL profile with no prp-rfx rule. No hostile instruction-like content appears in the diff.",
+  "verdict": "approve"
+ }
+}
