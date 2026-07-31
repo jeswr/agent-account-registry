@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1466,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "86736deefc1e48fa49f855b7e8434403a2a3df0e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The path is keyed only by PR, generation, and value, while the JSON body is specified to contain run-specific audit detail such as run id and verdict back-link. Two writers that list the same maximum generation and bind the same SHA (or both retract to `none`) therefore target the exact same path with different bytes. `_registry_put_file`'s create-or-keep contract treats an existing different body as a permanent provenance conflict; this is neither the two-filename tie handled by step 3 nor a retryable generation race. The writer can fail even though the desired binding landed, and the bind/bind and bind/retract table does not cover same-value operations.",
+    "file": "research/389-reviewed-sha-bind-store.md",
+    "fix_hint": "Give each immutable write a stable operation identity that makes concurrent operations distinct, and define resolution independently of that nonce, or make the body canonical and byte-identical for a given PR/generation/value. Add an interleaving test for two same-value writers with different audit metadata and require both callers to converge without a permanent conflict.",
+    "severity": "major",
+    "title": "Concurrent identical bindings collide on one immutable path"
+   },
+   {
+    "body": "The record claims that replaying a bind is a byte-identical keep, but step 1 always computes `max(gen)+1`. If a PUT lands and its response is lost, or the job restarts before recording completion, replay lists the landed record and writes the same intent at a new generation and new path. The triple is unique only after choosing `gen`; the protocol provides no stable operation key with which a retry can rediscover its prior record. Repeated uncertain retries can fabricate audit transitions, consume generations and directory entries, and invalidate the steady-state assumption behind the 1,000-entry ceiling.",
+    "file": "research/389-reviewed-sha-bind-store.md",
+    "fix_hint": "Define a stable idempotency/operation identifier before choosing a generation, persist enough information for a retry to recognize its already-landed operation, and specify how an ambiguous PUT result is reconciled. Add a test where the create lands but the caller observes failure, then retries; assert that no additional generation or audit record is created.",
+    "severity": "major",
+    "title": "A retry is not idempotent because it recomputes the generation"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 directly fixes the prior create/delete lost-update blocker: retraction is now a tombstone, maximum-generation records cannot be deleted casually, ties are fail-closed and swept, and the document honestly identifies the disarm-side fail-open interval. However, the proposed filename does not uniquely identify a write operation. Concurrent same-value writers collide on one path while carrying different audit bodies, and retries of a landed operation allocate new generations rather than replaying the same immutable record. Those cases contradict the claimed create-or-keep/idempotence property and are missing from the interleaving requirements, so this design is not complete enough to constrain a trust-plane implementation safely.",
+  "verdict": "request_changes"
+ }
+}
