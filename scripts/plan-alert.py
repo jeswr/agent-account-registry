@@ -6,10 +6,12 @@
 # script, which keys on needs.plan.result and upserts/auto-closes a rolling `ops-alert` issue.
 #
 # Cross-provider review r1 (GPT-5.6 codex) hardening, mirroring usage-alert.py (issue #39):
-#  - _alert_route: the private ALERT_REPO is the destination ONLY when ALERT_TOKEN can write there;
-#    a half-configured deployment (repo set, token missing) falls back to the registry repo under
-#    the ambient token instead of silently failing the private write. The plan-alert body carries
-#    NO account handles, so the fallback needs no redaction variant.
+#  - _alert_route: locked decision 22c / issue #39 — the private ALERT_REPO is the destination ONLY
+#    when ALERT_TOKEN can write there; a half-configured deployment (repo set, token missing) falls
+#    back to the registry repo under the ambient token instead of silently failing the private
+#    write. The plan-alert body carries NO account handles, so the fallback needs no redaction
+#    variant. Issue #591: the decision itself now lives ONCE, in scripts/alert_route.py, and this
+#    name is bound to it rather than restating it.
 #  - decide(): close ONLY on an explicit `success` — needs.<job>.result also permits `skipped`,
 #    which proves nothing about recovery, so an open alert must survive a skipped PLAN.
 #  - _gh(check=True): a non-zero gh returncode is surfaced as a sanitized ::warning:: (op +
@@ -42,6 +44,7 @@
 # RUN-level cancellation, which cancels this job too — nothing inside the run can observe that.
 #
 # Pure decide()/_alert_route() + a stubbed-gh flow test run under --self-test (registry-selftest).
+import importlib.util
 import json
 import os
 import subprocess
@@ -69,13 +72,30 @@ _BAD_RESULTS = ("failure", "cancelled")
 _STAGE_TITLE = {STAGE_PLAN: ALERT_TITLE, STAGE_CLAIM: CLAIM_ALERT_TITLE}
 
 
-def _alert_route(alert_repo, alert_token, registry_repo):
-    """(repo, token) for the alert issue — same semantics as usage-alert.py's router (privacy
-    d22c + issue #39): private ALERT_REPO only when ALERT_TOKEN is present; otherwise the registry
-    repo under the ambient token (token=None means "use the ambient GH_TOKEN")."""
-    if alert_repo and alert_token:
-        return alert_repo, alert_token
-    return registry_repo, None
+def _load_alert_route():
+    """The shared ops-alert destination router (scripts/alert_route.py, issue #591), loaded BY
+    PATH: the plan-alert job sparse-checks-out an explicit file list, so there is no importable
+    package here and the module can simply be absent from the working copy.
+
+    An absent module is a sparse-checkout omission in dispatch.yml, NOT a "route unavailable" to be
+    guessed around — picking a default destination is exactly the fail-open locked decision 22c
+    forbids. Die, and name the fix. (alert_route.py's own --self-test asserts the other direction:
+    a sparse job that names this script without naming the module goes red in pr-gate.)"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert_route.py")
+    spec = importlib.util.spec_from_file_location("registry_alert_route", path)
+    if not os.path.exists(path) or spec is None or spec.loader is None:
+        raise SystemExit(
+            "plan-alert: cannot load scripts/alert_route.py — add it to the plan-alert job's "
+            "sparse-checkout list in .github/workflows/dispatch.yml")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# Locked decision 22c / issue #39, defined ONCE in scripts/alert_route.py and bound to the private
+# name every call site and self-test row below already uses.
+_alert_route_module = _load_alert_route()
+_alert_route = _alert_route_module.alert_route
 
 
 def failing_stage(plan_result, claim_result):
@@ -306,7 +326,26 @@ def _self_test():
         ok = ok and good
         print(f"  {'ok  ' if good else 'FAIL'} {n}: {got} (want {want})")
 
-    # Routing (mirrors usage-alert.py's audited matrix)
+    # The loader's fail-closed branch: an ABSENT scripts/alert_route.py must DIE naming the fix,
+    # never fall back to a guessed destination — guessing is the fail-open locked decision 22c
+    # forbids, and this branch is otherwise never executed by anything.
+    _saved_exists = os.path.exists
+    os.path.exists = lambda p: False if p.endswith("alert_route.py") else _saved_exists(p)
+    try:
+        _load_alert_route()
+        _loader_verdict = "loaded a module that is not there"
+    except SystemExit as error:
+        _loader_verdict = ("alert_route.py" in str(error), "dispatch.yml" in str(error))
+    finally:
+        os.path.exists = _saved_exists
+    chk("loader: absent scripts/alert_route.py -> SystemExit naming the module and the fix",
+        _loader_verdict, (True, True))
+    # Routing (mirrors usage-alert.py's audited matrix). The rows below now exercise the SHARED
+    # router; this first row is what reds if a private copy is ever reintroduced below and shadows
+    # the binding — the drift issue #591 exists to close.
+    chk("route: bound to the shared scripts/alert_route.py, not a local copy",
+        (_alert_route is _alert_route_module.alert_route,
+         os.path.basename(_alert_route_module.__file__)), (True, "alert_route.py"))
     chk("route: repo+token -> private + token",
         _alert_route("org/private", "tok", "org/registry"), ("org/private", "tok"))
     chk("route: repo but NO token -> registry fallback",
