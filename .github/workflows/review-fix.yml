@@ -118,9 +118,10 @@ jobs:
       model_chain: ${{ steps.policy.outputs.model_chain }}
       account_pool: ${{ steps.policy.outputs.account_pool }}
       # [#285] The system-prompt persona for the model step. review = the `--role review` reviewer;
-      # fix = the SOURCE ISSUE's own live-re-derived route persona UNLESS that route names the
-      # verdict-only review persona, which a mutation lane cannot run under — then the `--role
-      # impl` implementer (see the resolution + its refusal in the `policy` step).
+      # fix = the SOURCE ISSUE's own live-re-derived route persona, but ONLY when the target's
+      # routing DECLARES that persona `fix_capable = true` (a mutation lane cannot run a
+      # verdict-only brief) — otherwise the `--role impl` implementer (see the resolution + its
+      # capability gate in the `policy` step).
       agent: ${{ steps.policy.outputs.agent }}
       gate_profile: ${{ steps.policy.outputs.gate_profile }}
       arm_auto_merge: ${{ steps.policy.outputs.arm_auto_merge }}
@@ -656,46 +657,58 @@ jobs:
           # from that same resolution keeps the fix leg no more privileged than the leg it is
           # fixing. worker-live.sh resolves it to `.claude/agents/<agent>.md` in the target.
           #
-          # WITH ONE REFUSAL, and it is the case that motivated this change ([#285] review r1).
-          # A `[[route]]` may name a VERDICT-ONLY persona: on THIS repo the security override
+          # ADOPTION IS CAPABILITY-GATED, NOT NAME-GATED ([#285] review r2). A `[[route]]` may
+          # name a VERDICT-ONLY persona: on THIS repo the security override
           # (`review-loop`/`dispatch`/`worker`/...) routes to `registry-reviewer`, whose checked-in
           # brief is read-only (Read/Glob/Grep), mutates nothing but `.review-verdict.json` and
           # says its job is "never a fix". Handing THAT brief to the `worker-live.sh fix` step
           # instructs the fixer not to edit the PR at all: a compliant model produces no diff and a
-          # model that does edit is violating its own system prompt. So the route persona is
-          # adopted only when it is NOT the persona this target's routing assigns to the REVIEW
-          # role — that row IS the target's own machine-readable declaration of which brief is the
-          # verdict-only one (it is the persona this very workflow runs its review lane under).
-          # Refusal (and any resolver refusal that leaves the review persona underivable) falls
-          # back to `policy["agent"]`, the `--role impl` implementer: mutation-capable by
-          # construction of the role, no wider than the lane already had before this change, and
-          # named in the audit line below. It grants nothing — the alternative, parking every
-          # trust-surface fix to a human, would disable the fix lane for the majority of this
-          # repo's PRs, which is a bigger regression than the drift it removes.
+          # model that does edit is violating its own system prompt.
+          #
+          # So the persona must be DECLARED able to mutate: the target's routing table carries an
+          # `[agents.<name>] fix_capable` row per persona and `agent_fix_capable` reads it, FAIL
+          # CLOSED (undeclared / malformed / anything but the boolean `true` -> not adoptable).
+          # Round 1 instead compared the route's agent NAME to the persona the `role = "review"`
+          # row selects, and that inference is unsound BOTH ways: a SECOND verdict-only persona
+          # under any other name was adopted, and repointing the review row would have made the
+          # reviewer adoptable with its brief unchanged. Capability is a property of the BRIEF, so
+          # it is declared beside the routes, not derived from one route's choice of name.
+          #
+          # WHO CAN WRITE IT: the same party, in the same file, at the same protected tip that
+          # already writes the `[[route]]` model chains and `match_labels` this step reads — the
+          # `target-routing` checkout of the target's DEFAULT branch. It adds no new author and no
+          # new trust anchor; a party that could forge a capability row could already re-point the
+          # route itself.
+          #
+          # A refusal falls back to `policy["agent"]`, the `--role impl` implementer — no wider
+          # than the lane had before this change, and named in the audit line below. It grants
+          # nothing: the alternative, parking every trust-surface fix to a human, would disable the
+          # fix lane for the majority of this repo's PRs. But "retain a known fix-capable persona"
+          # has to be KNOWN, so a fallback the target EXPLICITLY declares `fix_capable = false`
+          # (a `role = "impl"` row repointed at a verdict-only brief) fails this job closed instead
+          # — same class as the docs-only-model refusal above: a routing-document defect a human
+          # must fix. Silence is not a refusal; a target with no [agents] table keeps exactly the
+          # behaviour it had before this change.
           #
           # REVIEW MODE NEVER ENTERS THIS: `route_agent` is empty there (no route is consumed), so
-          # the persona stays the `--role review` reviewer. A fix-lane resolver refusal also leaves
-          # it empty — and that refusal has ALREADY emptied `chain` above, so that run is parked to
-          # a human by the `unresolvable` job and no model consumes this value at all.
+          # the persona stays the `--role review` reviewer — which is DECLARED not fix-capable and
+          # must stay selectable, hence the `mode == "fix"` guard on the fallback refusal. A
+          # fix-lane resolver refusal also leaves `route_agent` empty — and that refusal has
+          # ALREADY emptied `chain` above, so that run is parked to a human by the `unresolvable`
+          # job and no model consumes this value at all.
           persona_source = "role-resolved"
           resolved_agent = policy["agent"]
+          if mode == "fix" and policy_resolve.agent_fix_forbidden(routing, resolved_agent):
+              raise SystemExit(
+                  "the role-resolved fix persona is declared fix_capable = false in the target's "
+                  "routing: a mutating lane cannot run a verdict-only brief")
           if route_agent:
-              persona_error = ""
-              try:
-                  review_persona = policy_resolve.resolve(
-                      target_repo, ["role:review"], policy_doc, routing)["agent"]
-              except (ValueError, TypeError, KeyError) as exc:
-                  review_persona = None
-                  persona_error = f": {exc.__class__.__name__}: {exc}"
-              if not isinstance(review_persona, str) or not review_persona.strip():
-                  persona_source = ("role-resolved (route persona UNVERIFIABLE: this target "
-                                    f"resolves no review persona to check it against{persona_error})")
-              elif route_agent.strip() == review_persona.strip():
-                  persona_source = ("role-resolved (route persona REFUSED: it is this target's "
-                                    "verdict-only review persona)")
-              else:
+              if policy_resolve.agent_fix_capable(routing, route_agent):
                   resolved_agent = route_agent
                   persona_source = "source-issue route"
+              else:
+                  persona_source = ("role-resolved (route persona REFUSED: the target's routing "
+                                    "does not declare it fix_capable)")
           models = routing.get("models", {})
           chain = []
           for alias in wanted:
@@ -769,7 +782,7 @@ jobs:
                     f"{f' (resolver refusal: {route_error})' if route_error else ''}")
           print(f"{mode} chain for {impl_provider}-implemented PR: {','.join(chain) or 'UNRESOLVABLE'}")
           # [#285] Audit line: WHICH persona this lane resolved and WHERE it came from — including
-          # a route persona that was REFUSED for being this target's verdict-only reviewer.
+          # a route persona REFUSED for not being DECLARED fix-capable by the target's routing.
           print(f"{mode} agent: {resolved_agent} ({persona_source})")
           PY
 

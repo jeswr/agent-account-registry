@@ -291,6 +291,29 @@ a rolling `data/cache-affinity.json`), never in the public repos.
   resolvers over a 22-row label matrix and reports any row they decide differently.
   Live instance: the maintainer's 2026-07-26 `area:gui` carve-out (sparq PR #4211).
 
+- **Whether a persona may run a MUTATING lane is DECLARED, never inferred from its name** (#285).
+  `review-fix.yml`'s fix lane runs the model under the persona the source issue's own route names,
+  so a docs/CI PR is fixed under the brief it was implemented under rather than the general
+  implementer's. But a route may name a **verdict-only** persona — this repo's security override
+  routes to `registry-reviewer`, whose brief is read-only and says its job is "never a fix" —
+  and handing that brief to a fixer instructs it not to edit the PR at all. So adoption is gated
+  on a capability the target declares beside its routes:
+
+  ```toml
+  [agents.registry-impl]
+  fix_capable = true          # brief authorises editing the checkout -> adoptable by the fix lane
+  [agents.registry-reviewer]
+  fix_capable = false         # verdict-only brief -> never adopted, and never the fix fallback
+  ```
+
+  `policy-resolve.agent_fix_capable` reads it **fail-closed**: undeclared, malformed, or anything
+  that is not the boolean `true` is not adoptable, and the lane keeps its `--role impl`
+  implementer — so a target with no `[agents]` table behaves exactly as it did before this
+  existed. The complement is explicit too: a persona declared `fix_capable = false` sitting in the
+  fix lane's `role = "impl"` fallback fails the resolve job closed rather than fixing under a
+  brief that forbids fixing. Declare a row for every agent your routes name; `dispatch-claim.py`'s
+  self-test pins each declaration against the brief `worker-live.sh` actually loads.
+
 ## Adding an account — step-by-step runbook (an agent can follow this verbatim)
 
 > Goal: make one more model account usable by the workers. There are **five** required steps; the
