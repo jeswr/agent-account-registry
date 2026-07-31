@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5320,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "dc33d866574dc6e4495a0e3865380fbd5b9867a3",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The documentation-only change remains correct, scoped, and appropriately caveated. The cited engine test genuinely exercises SPARQL AVG over an empty match and establishes a single bound integer-zero result. The verifier path rejects both GraphPattern::Group and Extend-over-Group via aggregates_error, supporting the stated current unreachability from sparq, and the audit dossier explicitly confirms that zk/compose does not consume the external noir_XPath repository. The differential README accurately limits its evidence to scalar cases, and both files preserve the research-grade, not-externally-audited posture. No implementation, security regression, vacuous test, or unsupported soundness/privacy claim is introduced.",
+  "verdict": "approve"
+ }
+}
