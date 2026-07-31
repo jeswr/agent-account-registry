@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5217,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bef9bf4f2601d974abfe5c2793f58e1acd12714c",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "decompose_run() includes any job whose conclusion is not null, cancelled, or skipped. This still admits failure, timed_out, action_required, and similar non-success outcomes. Such jobs can terminate before later steps execute, yielding truncated totals and incomplete step inventories; including them in per-leg medians can understate runtime, distort family imbalance and fold candidates, and omit slow steps. The round-3 defect is unchanged, and the new test named test_incomplete_jobs_are_excluded_from_the_sample does not include a failed job, so it cannot detect this case.",
+    "file": "scripts/ci_leg_inventory.py",
+    "fix_hint": "Restrict topology-steering observations to jobs with conclusion == \"success\". If non-success jobs are useful diagnostically, keep them in a separate population that cannot affect aggregation or derived findings. Add a fixture containing successful observations plus a short failed job and assert that the failed job is excluded from decompose_run()/collect_fixture aggregation.",
+    "severity": "major",
+    "title": "Failed jobs still contaminate representative timing observations"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3's major measurement-validity defect remains unresolved. decompose_run() still accepts every conclusion except null, cancelled, and skipped, so failed, timed-out, action-required, and other non-success jobs can influence medians and derived topology recommendations even though those jobs may stop early with truncated durations and step inventories. The added fixture test still covers only cancelled, skipped, and running jobs; it provides no failed-job counterexample. The finding therefore remains materially unchanged at the same severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
