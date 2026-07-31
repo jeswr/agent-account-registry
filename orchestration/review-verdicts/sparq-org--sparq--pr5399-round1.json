@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5399,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "836fd4c89fb14c1bf10b156ad2f32eb5bbfe2b0b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The workflow change correctly gives the capability probe a stable step id and gates the terminal mutation step with `!cancelled()` plus the probe's raw successful outcome, allowing it to run after an intervening failure while remaining suppressed on cancellation or failed capability probing. The added tests inspect the parsed workflow, pin the sole vetted conditional exactly, reject failure-swallowing command forms and continue-on-error settings, verify the referenced probe id, and mutation-test each protected seam. No correctness, soundness, security, or vacuity issue is apparent in the diff.",
+  "verdict": "approve"
+ }
+}
