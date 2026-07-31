@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1392,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6a6b69b58e2b8e97892fc6e0825bc7556ac9895a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The only adoption guard is `route_agent.strip() == review_persona.strip()`. A route can name an arbitrary agent; `role = \"review\"` identifies one selected review persona, but it is not a machine-readable declaration that this is the only verdict-only or mutation-forbidden persona. Consequently, a second read-only/soundness/audit persona with a different name is accepted and passed to `worker-live.sh fix`, recreating the round-1 contradiction. Conversely, changing which persona the review role selects can make the old reviewer name adoptable without changing its brief. The fallback fixes today's `registry-reviewer` row but does not make route-persona adoption generally sound.",
+    "file": ".github/workflows/review-fix.yml",
+    "fix_hint": "Declare agent capabilities in one machine-readable source (for example, an explicit mutation/fix capability associated with each persona) and permit route adoption only when that capability authorizes fix-mode mutation; otherwise retain a known fix-capable persona or fail closed. Do not infer capability from inequality with one role-selected name.",
+    "severity": "major",
+    "title": "Persona refusal is name-based rather than capability-based"
+   },
+   {
+    "body": "The new tests inspect the real briefs for `registry-reviewer`, `registry-impl`, and `registry-ci`, but `_persona_rows285` accepts `registry-ci` because its name differs from the review agent. No red row supplies a different agent whose brief forbids mutation, so the unsound identity proxy remains green. `_verdict_only_markers285` is also a three-phrase substring heuristic used only in the test; the production workflow never evaluates it, and absence of those phrases is not proof that a brief authorizes edits. Thus the test is stronger than round 1 at the consumer seam but still does not establish the marquee invariant for all values the route may produce.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Drive the test from the same machine-readable capability declaration used by production. Add a differently named non-mutation persona and require fix mode to refuse it, plus a mutation-capable persona that must be adopted. Mutate/delete the capability check and show the non-mutation row turns red; avoid treating prose-marker absence as authorization.",
+    "severity": "major",
+    "title": "Self-test validates only three names, not the adoption invariant"
+   }
+  ],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 fixes the concrete motivating failure: the checked-in trust-surface route's `registry-reviewer` persona is now refused, the fix leg retains `registry-impl`, and the executable test follows that result through the real routing table, real prompt files, published output, and `WORKER_AGENT` seam. However, the runtime guard still infers mutation capability solely from inequality with the `role:review` persona. The routing format permits any agent name, so a second verdict-only/read-only persona under another name would be adopted by fix mode. The tests reproduce that assumption by checking only the current reviewer, implementer, and CI briefs rather than validating every adopted route persona through a capability contract. This is materially improved from round 1, but the general route-driven behavior remains unsound.",
+  "verdict": "request_changes"
+ }
+}
