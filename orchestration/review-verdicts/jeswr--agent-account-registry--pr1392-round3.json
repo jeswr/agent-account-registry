@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1392,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1e91307c818e9399dd657dc9e6f80ad802adb447",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The route persona is adopted only when `agent_fix_capable(...)` is true, but the role-resolved fallback is rejected only when `agent_fix_forbidden(...)` sees an explicit boolean `false`. If a target has an `[agents]` table but omits the `role = \"impl\"` persona, gives it a malformed row/value, or renames that role without adding a declaration, the route persona can be refused and the undeclared fallback still reaches `worker-live.sh fix`. This is not the claimed \u201cknown fix-capable persona\u201d and makes malformed/silent capability data permissive at the final selection point. The synthetic rows demonstrate the hole: their default `policy_agent=\"role-resolved-agent\"` is absent from `_cap285`, yet false and undeclared route personas fall back to it successfully. Preserving legacy behavior for targets with no `[agents]` table does not require treating omissions or malformed declarations as authorization once a target has opted into the capability table.",
+    "file": ".github/workflows/review-fix.yml",
+    "fix_hint": "Distinguish legacy documents with no `[agents]` table from capability-enabled documents. When the table exists, require the final role-resolved fallback to satisfy `agent_fix_capable(...) is True`; otherwise fail closed. Keep legacy fallback only when the entire table is absent if backward compatibility is required. Add red rows for an existing table with an undeclared fallback, a malformed fallback row/value, and a declared-true fallback, and mutate the final capability requirement to show those rows change.",
+    "severity": "major",
+    "title": "Undeclared or malformed fallback personas still run the mutating lane"
+   }
+  ],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 replaces the name comparison with a real route-persona capability declaration and adds useful non-vacuity coverage for differently named, false, undeclared, and malformed route personas. That resolves both round-2 findings for route adoption. One fail-closed gap remains on the other side of the selection: the role-resolved fallback is rejected only for an explicit boolean false, so it can still run undeclared or malformed whenever an [agents] table exists. The tests actually encode that permissive fallback. The capability contract is therefore enforced for the adopted persona but not for the persona the mutating lane ultimately runs. This is fewer than round 2's two major findings, so progress is improving, but the remaining trust-plane hole requires changes.",
+  "verdict": "request_changes"
+ }
+}
