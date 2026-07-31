@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1479,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "48aedbffcbe7ca113da0015d3abfefc7c0fe3878",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new row sets `gate_profile = \"node-workspace\"`, but `scripts/policy-resolve.py` accepts only `none`, `lint-only`, `crate-scoped`, `workspace`, and `registry-selftest`, and `scripts/worker-live.sh` has no `node-workspace` gate branch. The row escapes that validation only because `_policy_row` rejects disabled targets before validating their remaining fields. Consequently the documented follow-up of flipping only `enabled` to true will fail closed during policy resolution rather than onboard the target. The comment that the target's existing `gate` check makes this profile valid does not create a resolver/worker implementation.",
+    "file": "policy/repos.toml",
+    "fix_hint": "Use an existing gate profile whose worker behavior is correct for this repository, or add and non-vacuously test a complete `node-workspace` implementation across the resolver, worker gate, and schema documentation. Validate the staged row with `enabled=true` in a test so the promised one-line activation is proven before merge.",
+    "severity": "major",
+    "title": "The staged target uses an unsupported gate profile"
+   },
+   {
+    "body": "`probe_repo = sorted(_enabled_rows)[0]` deterministically selects `jeswr/agent-account-registry`, which the immediately preceding shipped-policy assertion already requires to contain `review_enrolment_authors = [\"jeswr\"]`. Assigning `[\"jeswr\"]` again does not change the fixture. The check therefore remains green if the intended empty-to-enrolled probe setup is removed, and it cannot support the comment that the reader \"WOULD surface one\" for an un-enrolled row. This is the value-identical mutation failure mode called out by the repository pre-flight rules.",
+    "file": "scripts/mint-provenance.py",
+    "fix_hint": "Select a known enabled, un-enrolled row (currently `sparq-org/sparq`), assert its baseline reader result is empty, mutate that same row to a sentinel canonical login not present in shipped policy, and assert the reader returns that sentinel. Avoid deriving the expected value from production policy constants.",
+    "severity": "major",
+    "title": "The positive enrolment probe is value-identical and vacuous"
+   }
+  ],
+  "progress": null,
+  "summary": "The disabled target is safely inert today, but the submitted staging is not complete enough for the documented one-line enablement: `node-workspace` is not a supported policy or worker gate profile. The accompanying self-test edit also retains a value-identical positive probe, so it does not establish the transition its comment claims. Both defects are directly in changed lines and require correction before approval.",
+  "verdict": "request_changes"
+ }
+}
