@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1383,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7553c2f820426f1106ecaff1891503443d8799e4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly adds a fail-closed dependency preflight immediately after deriving the exact enrolled suite and before any row executes. The CLI arm preserves the helper's nonzero verdict, emits actionable ENV-BLOCKED diagnostics, rejects an unquoted/multi-argument suite, and remains quiet of failure markers on success. The workflow seam is pinned by an exact adjacent-pair assertion, while separate executed fixtures cover present, absent, multi-missing, diagnostic, and arity behavior with validation that the fixture rewrites actually occurred. I found no correctness, soundness, test-validity, or security defect in the diff.",
+  "verdict": "approve"
+ }
+}
