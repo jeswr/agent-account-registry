@@ -780,8 +780,26 @@ def make_fetch(token, store=None):
                 raise FetchError(
                     f"authenticated GitHub read failed (HTTP {exc.code}) for "
                     + url.split("?")[0]) from exc
-            except (URLError, TimeoutError, json.JSONDecodeError,
-                    RemoteDisconnected) as exc:
+            except (URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+                # WHICH OSErrors RETRY IS NOT DECIDED HERE (round-1 review). `http_transient` is
+                # already this module's status-policy source, and `is_transient_network` is the
+                # OTHER HALF of the same question — its docstring says a caller that shares the
+                # status table but keeps a private copy of this predicate "has only
+                # half-consolidated", which is exactly what naming RemoteDisconnected in the arm
+                # above did. The OSError family is therefore routed through the SHARED taxonomy,
+                # and anything it does not call transient stays FATAL on the first attempt.
+                #
+                # URLError / TimeoutError / JSONDecodeError keep their pre-#552 handling
+                # BYTE-FOR-BYTE and are deliberately NOT narrowed through the classifier: it
+                # rules a DNS failure, a refused connection and a bad certificate fatal, so
+                # routing them through it would be a separate behaviour change riding along on a
+                # retry fix. TimeoutError is excluded explicitly because it is itself an OSError
+                # subclass and would otherwise be re-decided by this branch.
+                if (isinstance(exc, OSError)
+                        and not isinstance(exc, (URLError, TimeoutError))
+                        and not http_transient.is_transient_network(exc)):
+                    raise FetchError(
+                        "authenticated GitHub read failed for " + url.split("?")[0]) from exc
                 # [#552] RemoteDisconnected subclasses ConnectionResetError -> OSError and is
                 # NOT a URLError, so it escaped this arm and killed the whole tick — measured
                 # twice on 2026-07-31 (PLAN 05:10:15Z, and again 09:44:22Z alongside the GUARD
@@ -1940,6 +1958,86 @@ def _self_test():
             assert got is want_type, (label, got, want_type)
             assert attempts["n"] == want_attempts, (label, attempts)
 
+    def remote_disconnected_is_retried_at_the_call_site():
+        """[#552] THE CALL SITE, not the taxonomy — round-1 review measured this exact gap.
+
+        `http_transient`'s own self-test already proves `is_transient_network(RemoteDisconnected)`
+        is True. That says NOTHING about whether `make_fetch` ever consults it, and the first cut
+        of this fix named the exception directly in the except tuple: **deleting that one tuple
+        member left the whole suite green while restoring the tick-killing bug**. A guard whose
+        marquee behaviour survives its own deletion is vacuous, so this drives make_fetch through
+        a urlopen that raises a REAL RemoteDisconnected and pins the attempt count, the delay
+        schedule and the terminal type."""
+        module = sys.modules[__name__]
+
+        class _Ok:
+            def __init__(self, body=b'{"ok": true}'):
+                self._b, self.headers = body, {}
+
+            def read(self, *a):
+                return self._b
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        # (a) PERSISTENT drop -> exactly 3 attempts, 5s then 10s, terminal FetchError.
+        seen = {"n": 0}
+        slept = []
+
+        def drop(request, timeout=None):
+            seen["n"] += 1
+            raise RemoteDisconnected("Remote end closed connection without response")
+
+        with patch.object(module, "urlopen", drop), \
+                patch.object(time, "sleep", lambda s: slept.append(s)):
+            try:
+                make_fetch("t")("https://api.github.com/x")
+            except FetchError:
+                pass
+            else:
+                raise AssertionError("a persistent RemoteDisconnected must raise FetchError")
+        assert seen["n"] == 3, seen
+        assert slept == [5, 10], slept
+
+        # (b) ...and a LATER attempt SUCCEEDING returns the payload, so the retry is a real
+        #     recovery rather than a more slowly reported failure. Without this leg, (a) would
+        #     also pass for an arm that retried and could never succeed.
+        later = {"n": 0}
+
+        def drop_then_ok(request, timeout=None):
+            later["n"] += 1
+            if later["n"] == 1:
+                raise RemoteDisconnected("Remote end closed connection without response")
+            return _Ok()
+
+        with patch.object(module, "urlopen", drop_then_ok), patch.object(time, "sleep"):
+            assert make_fetch("t")("https://api.github.com/x") == {"ok": True}
+        assert later["n"] == 2, later
+
+        # (c) THE CONTROL. An OSError the SHARED taxonomy does not call transient is fatal on the
+        #     FIRST attempt — so (a) cannot be passed by an arm that simply retries every OSError,
+        #     which is what widening the tuple to `OSError` alone would have done.
+        fatal = {"n": 0}
+
+        def not_a_directory(request, timeout=None):
+            fatal["n"] += 1
+            raise NotADirectoryError(20, "Not a directory")
+
+        with patch.object(module, "urlopen", not_a_directory), patch.object(time, "sleep"):
+            try:
+                make_fetch("t")("https://api.github.com/x")
+            except FetchError:
+                pass
+            else:
+                raise AssertionError("a NON-transient OSError must not be retried")
+        assert fatal["n"] == 1, fatal
+        # ...and the decision above is the SHARED one, not a local opinion that could drift.
+        assert http_transient.is_transient_network(RemoteDisconnected("x")) is True
+        assert http_transient.is_transient_network(NotADirectoryError(20, "x")) is not True
+
     def budget_403_is_never_downgraded_to_a_per_item_skip():
         """THE COMPOSITION TRAP. `_fetch_check_runs` converts every FetchError into a per-PR
         `check-runs-read-failed` skip, and `snapshot_one` swallows that. A budget failure raised as
@@ -2686,6 +2784,7 @@ def _self_test():
         the_classifier_is_the_SHARED_one_not_a_local_copy,
         the_retry_status_policy_is_the_SHARED_one,
         budget_403_is_not_retried_and_is_sweep_fatal,
+        remote_disconnected_is_retried_at_the_call_site,
         budget_403_is_never_downgraded_to_a_per_item_skip,
         the_reserve_stops_the_sweep_before_the_budget_is_gone,
         a_304_is_answered_from_the_store_and_carries_the_conditional_header,
