@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1380,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "365f2358e9f435427a923ade68ab5bab891210a1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nApproved. The generator now derives the census row set from the fixed, repository-owned policy path and fails closed on unreadable, malformed, incomplete, non-boolean, invalid, or wholly disabled policy data. It seeds explicit zero-count rows while retaining live evidence for repositories outside the serviced set. The dashboard renders an explicit total for quiet rows and preserves the existing live-lease total cross-check. The self-tests independently pin the policy path, exercise parser refusal and acceptance cases, verify the default production wiring, directly reach the activity guards, execute the real JavaScript renderer against quiet/mixed/empty/mismatched payloads, and assert the final render call site. No instruction-like text directed at the reviewer was found in the diff.",
+  "verdict": "approve"
+ }
+}
