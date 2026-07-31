@@ -151,10 +151,27 @@ PROBE_MAX_SKEW_SECONDS = 300
 # stated to be, never stronger; nothing that was safe becomes unsafe. Do not restore the cap-1
 # reasoning: a future minimization pass that trusts it would be reading a false invariant, and the
 # suite pins the counter-example (one account, three concurrent leases, `active_agents` 3).
-# It is kept because it is the dashboard's core operational number and
-# because the same count is already public on the `ledger` branch (`data/leases.json`); removing it
-# is a product call for the maintainer, tracked separately, not something to decide inside a
-# minimization pass.
+#
+# KEPT — and #840 settles WHY, rather than leaving the disposition open. It is the dashboard's core
+# operational number, and the two alternatives it weighed (bucket it `1-3 / 4-9 / 10+`, or drop it)
+# would withhold NOTHING: `data/leases.json` on the public `ledger` branch already carries ONE ROW
+# PER LIVE LEASE, and each row is strictly more informative than anything published here — holder
+# (`owner/repo#issue@run`), model, role, package, the salted account fingerprint and the exact
+# expiry. What this page publishes is a LOSSY PROJECTION of a document any reader can already fetch
+# and count exactly, so bucketing or dropping costs the operational number and buys no privacy at
+# all. The residual's disposition is therefore not an independent product call: it is ENTAILED by
+# the `ledger`-branch question, and only a decision to stop publishing per-lease rows THERE could
+# make bucketing or dropping here mean anything. That is a data-plane decision, out of scope for the
+# dashboard.
+#
+# The one thing that would quietly falsify the paragraph above is a future live-agent field folding
+# in something the ledger does NOT carry (a capacity term, a per-account breakdown, anything only
+# the catalog/usage/probe knows) — the prose would still claim "already public" while the page had
+# started disclosing something new. So the ground is PINNED, not asserted: the suite holds the
+# ledger and the serviced set fixed at non-zero load, varies every other build input, and requires
+# the live-agent surface to come out identical — while proving that same variation really did move
+# the rest of the payload. If that row goes red, this justification has stopped holding and the
+# residual has to be re-decided, not re-worded.
 #
 # So the property this change actually establishes is "the public payload carries no ACCOUNT CENSUS
 # and no per-account row", NOT "no fleet count" — and both halves are load-bearing statements that
@@ -2622,6 +2639,76 @@ def _self_test():
            (clone_fleet(3, busy=3)["fleet"]["active_agents"],
             clone_fleet(3, busy=3)["active_by_repository"]["repositories"][0]["counts"])],
           [(3, {"opus": 3}), (3, {"opus": 3})])
+
+    # --- Issue #840: the residual is KEPT, and the ground for keeping it is pinned here. --------
+    # That ground (see the FLEET-COMPOSITION block) is that the live-agent surface is a strictly
+    # lossier projection of `data/leases.json` on the public `ledger` branch — so bucketing or
+    # dropping it withholds nothing. It holds only while the surface is a pure function of the
+    # LEDGER (plus `now` and the serviced set, itself public in policy/repos.toml). Below: one
+    # ledger at non-zero load, built twice with every OTHER input disagreeing, required to publish
+    # the same live-agent surface. Goes red on `len(live) + eligible`, on a per-account breakdown,
+    # on gating the count behind the probe verdict, and on a "publish 0 when unmeasured" degradation
+    # — each of which would put something on the page that the ledger branch does not already carry.
+    residual_leases = {"leases": [
+        {"account": lease_account, "claim_id": "c" * 32, "holder": "owner/repo#11@run.1",
+         "package": "pkg", "role": "impl", "model": "opus",
+         "issued_at": now - 60, "expires_at": now + 60},
+        {"account": lease_account, "claim_id": "d" * 32, "holder": "owner/repo#12@run.1",
+         "package": "pkg", "role": "review", "model": "haiku",
+         "issued_at": now - 60, "expires_at": now + 60},
+        {"account": lease_account, "claim_id": "e" * 32, "holder": "owner/other#13@run.1",
+         "package": "pkg", "role": "impl", "model": "opus",
+         "issued_at": now - 60, "expires_at": now + 60},
+        # On the ledger but EXPIRED: the projection is of the LIVE rows, so a reader counting rows
+        # blind would get 4 where the page says 3. Keeps the expected value below hand-counted
+        # rather than "however many rows the fixture happens to have".
+        {"account": lease_account, "claim_id": "f" * 32, "holder": "owner/repo#14@run.1",
+         "package": "pkg", "role": "impl", "model": "opus",
+         "issued_at": now - 600, "expires_at": now - 1},
+    ]}
+
+    def residual_build(catalog, account_usage, sweeps, health, sidecar):
+        return build_dashboard(catalog, residual_leases, account_usage, sweeps, health, now,
+                               "fixture-salt", probe_status=sidecar, serviced=("owner/repo",))
+
+    def agent_surface(built):
+        return {"active_agents": built["fleet"]["active_agents"],
+                "active_by_repository": built["active_by_repository"]}
+
+    residual_baseline = residual_build(issues, usage, history, None, measured_sidecar)
+    residual_varied = residual_build(
+        [{"title": f"acct-840-{index}", "labels": [{"name": "status:available"}],
+          "body": (f"provider: openai\nmodels: [haiku]\nsecret_ref: ACCT840{index}_TOKEN\n")}
+         for index in range(3)],
+        {}, [], {"models": [{"model": "haiku", "status": "degraded"}]},
+        {"schema": PROBE_SCHEMA, "outcome": "failed", "detail": "probe-failed",
+         "attempted_at": now - 30})
+    residual_surface = {
+        "active_agents": 3,
+        "active_by_repository": {
+            "models": ["haiku", "opus"],
+            "repositories": [{"repository": "owner/other", "counts": {"opus": 1}},
+                             {"repository": "owner/repo", "counts": {"opus": 1, "haiku": 1}}],
+        },
+    }
+    check("[#840] the live-agent surface is exactly the ledger's LIVE rows (3 of 4 fixture rows)",
+          agent_surface(residual_baseline), residual_surface)
+    check("[#840] ...and is unchanged by every input the `ledger` branch does not carry: a "
+          "3-account openai catalog, no usable usage, a DISTRUSTED probe, model health, no sweeps",
+          agent_surface(residual_varied), residual_surface)
+    # Non-vacuity: an invariance row proves nothing if the variation was inert. Each axis varied
+    # above is shown to have MOVED the rest of the document, so the equality above is a real
+    # separation and not two identical builds compared with extra steps.
+    check("[#840] ...and that variation really did move the rest of the payload (non-vacuity)",
+          (residual_baseline["fleet"]["capacity"] == residual_varied["fleet"]["capacity"],
+           residual_baseline["provider_quota"] == residual_varied["provider_quota"],
+           residual_baseline["usage_probe"]["measured"],
+           residual_varied["usage_probe"]["measured"],
+           residual_baseline["model_health"] == residual_varied["model_health"],
+           residual_baseline["fleet"]["dispatch_outcomes"]
+           == residual_varied["fleet"]["dispatch_outcomes"]),
+          (False, False, True, False, False, False))
+
     check("[#374] ...and that payload still reports the headroom honestly (not blanked out)",
           (clone_fleet(3)["provider_quota"][0]["headroom"],
            clone_fleet(3)["provider_quota"][0]["windows"][0]["remaining_fraction"],
