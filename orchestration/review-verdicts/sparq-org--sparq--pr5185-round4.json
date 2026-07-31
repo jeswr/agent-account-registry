@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5185,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "939c9b997627b2acf4c60b64e7d59b31938a8ead",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new drift gate consistently binds the inference report heading and headline total to the emitter, the active CI extraction commands, both binary-runner RATCHET literals, the generated scoreboard registry, and the Rust scoreboard documentation. Its checks fail closed on missing inputs or malformed registry JSON, avoid counting commented-out shell commands, and the hermetic mutation table exercises each claimed binding rather than merely asserting success. Both the 16-case self-test and the gate against the PR checkout pass. The report edit restores the exact emitted heading and keeps the totals inside CI's -A2 parse window. No correctness, soundness, security, or vacuous-test defect was found in the diff.",
+  "verdict": "approve"
+ }
+}
