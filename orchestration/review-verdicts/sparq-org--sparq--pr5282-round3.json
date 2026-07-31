@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5282,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b16ecfc4973a3cbe58760a04180e03444e14aae2",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The comment says the fuzz lane's randomized/replay legs are push- and schedule-driven, but `.github/workflows/fuzz.yml` runs deterministic corpus replay on pull requests as well. The stable-toolchain coverage and compile-time seed linkage remain valid reasons for this regression test, so this is documentation accuracy rather than a correctness defect.",
+    "file": "crates/sparq-canon/tests/fuzz_seed_dedup.rs",
+    "fix_hint": "State that randomized fuzzing is push/schedule driven while deterministic corpus replay also runs on pull requests, and retain the distinction that the fuzz lane needs nightly whereas this regression runs in the stable workspace test gate.",
+    "severity": "minor",
+    "title": "Module comment still misstates corpus replay trigger coverage"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The regression test is non-vacuous: it loads the committed five-line seed at compile time, confirms parsing retains five quads and four distinct quads, then confirms canonicalization produces four parseable and distinct quads. The path-ownership update correctly associates the compile-time seed consumer with sparq-canon. The prior minor documentation finding remains: the module comment describes the fuzz lane's randomized/replay legs together as push- and schedule-driven, although deterministic corpus replay also runs for pull requests. This wording does not undermine correctness, soundness, test validity, or security.",
+  "verdict": "approve"
+ }
+}
