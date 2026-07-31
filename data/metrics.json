@@ -1,10 +1,10 @@
 {
-  "generated_at": "2026-07-31T18:15:13Z",
+  "generated_at": "2026-07-31T18:24:10Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
       "issues_open": 1899,
-      "issues_ready": 324,
+      "issues_ready": 323,
       "issues_closed_1h": 5,
       "issues_closed_24h": 58,
       "prs_open": 104,
@@ -15,8 +15,8 @@
       "prs_merged_24h": 49,
       "review_changes_backlog": 10,
       "needs_user_parked": 14,
-      "review_lane_health": "unknown",
-      "review_lane_runs_1h": null,
+      "review_lane_health": "ok",
+      "review_lane_runs_1h": 9,
       "worker_attempts_1h": 2,
       "worker_success_rate_1h": 1.0,
       "pr_open_rate": 2.0,
@@ -30,19 +30,19 @@
       "issues_closed_24h": 37,
       "prs_open": 44,
       "prs_draft": 32,
-      "prs_opened_1h": 2,
+      "prs_opened_1h": 1,
       "prs_closed_1h": 2,
       "prs_merged_1h": 1,
       "prs_merged_24h": 31,
       "review_changes_backlog": 9,
       "needs_user_parked": 6,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 10,
+      "review_lane_runs_1h": 8,
       "worker_attempts_1h": 2,
       "worker_success_rate_1h": 1.0,
-      "pr_open_rate": 2.0,
+      "pr_open_rate": 1.0,
       "pr_close_rate": 3.0,
-      "net_pr_flow": -1.0
+      "net_pr_flow": -2.0
     }
   },
   "alerts": []
