@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5170,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "47d3108f7a7431ee3611d20d98f31f39540e1695",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete on the reviewed scope. The CI wiring narrows coverage only when the upstream selector explicitly reports mode=selected with a non-empty JSON string list; all other modes, malformed/empty affected data, metadata failures, and output-write failures preserve an empty filter and therefore a full shard run. coverage.sh applies the cone as a pure intersection, preserves explicit COVERAGE_CRATES remeasurement, treats whitespace-only filters as absent, and records skipped crates as inherited. The gate continues to fail measured below-floor crates even if listed as inherited, while the report honestly marks enforce-mode divergence detection unavailable. The focused 49-test selector/report suite passes and exercises the real coverage.sh --print-crates path, including empty, whitespace, disjoint, cross-shard, and explicit-remeasurement cases. No correctness, soundness, security, or test-validity defect is evident. Relative to round 2, the finding set remains empty, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
