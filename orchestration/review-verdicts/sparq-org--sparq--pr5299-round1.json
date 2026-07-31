@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5299,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9b489ee6a11ea9e65b9568696315da6903944f6c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`numeric_value` treats `as_numeric(...) == None` as non-numeric/ill-formed, but the shared `Num` tower cannot represent every valid XSD integer or decimal: its exact representation is bounded by `i128` (and the substrate explicitly documents that values beyond this range are classified out). Thus distinct lexical forms of the same valid large value, such as a >i128 `xsd:integer` with and without a leading `+`, fail with `DistinctGroundEqual`; unequal large values also fail instead of making the rule vacuous. This contradicts the module docs and skill statement that any pair of well-formed numeric literals is decided, and means the advertised numeric half is incomplete.",
+    "file": "crates/sparq-reason/src/rif.rs",
+    "fix_hint": "Either implement a sound comparison fallback for well-formed integer/decimal lexicals outside the `Num` representation (without lossy float conversion), or narrow every public/doc claim to the representable substrate subset and explicitly document overflow as fail-closed. Add real-path tests for value-equal and value-unequal valid numerics beyond `i128`, asserting the chosen behavior.",
+    "severity": "major",
+    "title": "Valid large numeric literals are incorrectly left undecidable despite the claimed numeric coverage"
+   }
+  ],
+  "progress": null,
+  "summary": "The new equality path is fail-closed, but it does not implement the documented scope. It classifies numerics through `as_numeric`, whose exact integer/decimal representation is bounded by `i128`; valid XSD numeric values outside that bound return `None` and are rejected as `DistinctGroundEqual`. The diff repeatedly claims that all well-formed numeric literal pairs are decided, and the tests do not cover this boundary.",
+  "verdict": "request_changes"
+ }
+}
