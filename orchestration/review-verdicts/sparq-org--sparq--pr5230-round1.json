@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5230,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "932dcfef241eb6825cfe668cb28e19a539e525a7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The diff is limited to CI cache-key documentation and attribution plus the intended consolidation of the coverage-measure matrix onto a single rust-cache shared-key. The explanation accurately distinguishes dependency artifacts from workspace artifacts, acknowledges the partial-restore/save-race tradeoff across non-identical shards, preserves main-only cache saving, and makes clear that shard selection remains controlled independently by COVERAGE_SHARD. No correctness, soundness, security, or test-validity defect is evident in the scoped change.",
+  "verdict": "approve"
+ }
+}
