@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5357,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "600f355f69d2691c81f7bca437bfa0c9ca1a62dc",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 8 labels eight items as future beads but provides no bead IDs, while section 6.1 identifies a live attacker-triggerable factorial-allocation defect. AGENTS.md requires follow-up work to be created in beads rather than left as a Markdown plan, and newly discovered out-of-scope bugs to be filed through the self-improvement issue lane. As committed, these actionable findings can be lost and the research deliverable is incomplete.",
+    "file": "research/sparq-canon-oxrdf03-bridge-removal.md",
+    "fix_hint": "Create or link the corresponding beads for the planned phases, deduplicating first. File or link a self-improvement issue for the live permutation/resource-exhaustion defect if it is outside this PR's task, then replace the untracked 'future bead' wording with the concrete IDs/URLs.",
+    "severity": "major",
+    "title": "The phased plan leaves discovered work untracked"
+   },
+   {
+    "body": "Section 8 marks the upstream draft as `needs:user \u2014 owner-filed` and sections 1/5 treat inability to file upstream from the investigation environment as a maintainer-decision reason to stop at a record. The authoritative standing rule explicitly removes `needs:user`/awaiting-greenlight as a blocking state and requires a best-judgment implementation plus documentation, with only literal external credential/access blocks remaining valid. The record does not establish that drafting the patch or preparing the contribution is credential-blocked.",
+    "file": "research/sparq-canon-oxrdf03-bridge-removal.md",
+    "fix_hint": "Rewrite the phase so all locally possible porting, patch preparation, and validation proceed autonomously. Isolate only the exact credential-dependent publication action as blocked, if credentials are genuinely unavailable, and document the chosen default rather than assigning the whole phase `needs:user`.",
+    "severity": "major",
+    "title": "Phase 3 contradicts the repository's proceed-without-greenlight rule"
+   }
+  ],
+  "progress": null,
+  "summary": "The investigation is technically detailed and its central bridge/permutation findings are grounded in the tree, but the committed plan is not complete under the repository's task-tracking and autonomy rules. It records multiple concrete future tasks, including a live resource-exhaustion defect, without linking created beads/issues, and it explicitly parks an upstream phase as `needs:user` even though the standing policy forbids that state except for credentials the agent cannot obtain.",
+  "verdict": "request_changes"
+ }
+}
