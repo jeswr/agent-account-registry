@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1418,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "15f9386ddf87639d0d203affde4c4836dee1131c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`grant_pr_disposition` validates only that each entry is a dict. For a PR whose head/base exactly match the grant branch, an absent or non-string `state`, malformed `merged_at`, or malformed head/base object is not refused; most such shapes fall through to `none`, and a truthy non-timestamp `merged_at` is accepted as merged. That contradicts the function's fail-closed contract and can publish a healthy enrollment as abandoned (or suppress an abandoned one) when the listing is unreadable. The tests cover malformed containers but not malformed fields on a matching record.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Validate the fields needed to classify every relevant matching entry: require readable head/base refs, a recognized state, and `merged_at` to be null or a valid timestamp/string consistent with the API contract; raise `GroomError` on an unreadable matching record. Add tests where exact-matching PRs have missing/wrong-typed state, head/base refs, and merged_at, and assert refusal rather than `none`/`merged`.",
+    "severity": "major",
+    "title": "Malformed matching PR records are silently classified as abandoned"
+   },
+   {
+    "body": "The seam locates and validates the command with substring checks (`needle in ...` and `\"python3 scripts/groom.py --report-stale-pending\" in ...`). Therefore `--report-stale-pending-DROPPED` still satisfies both assertions even though argparse rejects it every tick. The test also checks only a step-level `if:` and never rejects an `if: false` (or equivalent inert condition) on the whole `groom` job. These are precisely the YAML call-site mutations the seam is meant to catch, so the added self-test is non-protective for two ways the report can be completely disabled.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Parse/tokenize the run command and assert exact flag membership and required adjacency, rather than substring containment. Inspect the `groom` job keys as well as the selected step and reject a job-level disabling condition. Add non-crashing mutants/tests for a suffixed/renamed flag and for `if: false` on both the step and job, proving each turns the pristine self-test red with the same total check count.",
+    "severity": "major",
+    "title": "Workflow seam assertions allow a dead or renamed stale-pending report"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe report is read-only and its normal-path classification is well scoped, but it is not yet fail-closed for malformed pull-request entries, and the workflow seam tests do not prove that the new mode remains executable. Both gaps contradict explicit claims in the change and permit misleading clean/abandoned output or an entirely dead scheduled report while the self-test remains green.",
+  "verdict": "request_changes"
+ }
+}
