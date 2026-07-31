@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5299,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9ea583f6d120ff0dea38107133d32f15154e3331",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 4 resolves the prior major finding: the exact comparison path delegates to `cmp_plain_decimal`, whose shared lexical splitter trims surrounding whitespace before validating and comparing, while derived-integer facet checks use that same normalized comparison. Consequently whitespace-padded derived-integer boundaries and out-of-i128 integer/decimal values are no longer rejected for the reason identified in round 3. The implementation preserves fail-closed handling for malformed, facet-invalid, non-numeric, NaN, and unsupported mixed exact/float cases; validates range restriction even for numerically unsatisfiable bodies; and drops such bodies only during lowering. The added validation and closure tests exercise the real path with positive, negative, boundary, arbitrary-precision, and control cases. No hostile instruction is present in the diff.",
+  "verdict": "approve"
+ }
+}
