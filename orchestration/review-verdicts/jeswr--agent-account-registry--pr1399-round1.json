@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1399,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ba3591c2aae8bd7753eed764c3da9d6551ae3343",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new ring-efficiency signal is sound and conservatively bounded by the artifact horizon: it counts only concluded dispatch runs for which marker visibility is adjudicable, treats insufficient or zero-execution samples as unknown, and preserves live alerts when evidence is unknown. The alert path reuses the existing two API payloads, keeps the existing fail-closed issue-list behavior and authority ceiling, and exercises the new sampling, threshold boundary, unknown/no-close behavior, live call site, request count, and end-to-end issue creation with non-vacuous assertions. Cross-file checks bind the ratio's structural premise to the live dispatch floor and cron. I found no correctness, security, or trust-check regression in the diff.",
+  "verdict": "approve"
+ }
+}
