@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1421,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "874eb2f905b60b07b29d79bdd2be8edb88ab565d",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`assert_agent_capability` remains referenced only by `policy-resolve.py`'s `_self_test`; none of the production resolver call sites or the dispatch, worker, fix, and review execution boundaries invokes it. The live-table checks prove that today's checked-in routes and briefs agree when CI runs, but another target can still resolve an implementation lane to a `verdict-only`, missing, malformed, or undeclared brief and hand that persona onward without a runtime refusal. This is materially the same round-3 gap, while the new module documentation and AGENTS.md continue to say the helper refuses an unauthorized lane and makes such a brief unroutable.",
+    "file": "scripts/policy-resolve.py",
+    "fix_hint": "Invoke `assert_agent_capability` at every production boundary that hands a resolved persona to an implementation/fix or verdict-only review lane, using the target checkout and the required lane capability. Add end-to-end red tests proving missing, malformed, and mismatched declarations prevent execution. If this is intentionally only a repository-local CI invariant, narrow the documentation and acceptance claim instead.",
+    "severity": "major",
+    "title": "Capability declarations still are not enforced by a production lane"
+   },
+   {
+    "body": "PLAN now implements persona selection with `if r.get(\"persona_from_role\")`, but it still does not validate the routing key. A security route containing `persona_from_role = \"true\"` therefore enables the behavior in PLAN while CLAIM raises `PolicyError`; the key remains silently inert when placed on a role route or `[defaults]`, while CLAIM rejects both placements. The new malformed-key tests exercise only `policy-resolve.py`, and the cross-resolver agreement test covers only a valid boolean on a security route, so neither detects this seam. This is the same round-3 major finding.",
+    "file": "scripts/route-resolve.py",
+    "fix_hint": "Validate the complete routing document in `route-resolve.py` before matching: permit `persona_from_role` only as a boolean on `match_labels` routes and reject it on role routes and defaults. Add cross-resolver cases for a non-boolean value and both misplaced forms, requiring PLAN and CLAIM to reject each one.",
+    "severity": "major",
+    "title": "PLAN still accepts persona_from_role forms that CLAIM rejects"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 adds the PLAN-side persona selection behavior, but it still does not close either prior major finding. Capability declarations remain checked only by `policy-resolve.py`'s self-test; no production dispatch, worker, fix, or review boundary invokes `assert_agent_capability`, despite the documentation claiming incompatible briefs are unroutable. PLAN also still treats `persona_from_role` by truthiness and does not validate its type or placement, while CLAIM rejects malformed forms. Thus malformed target routing can still be planned differently from CLAIM, and the review remains stagnant.",
+  "verdict": "request_changes"
+ }
+}
