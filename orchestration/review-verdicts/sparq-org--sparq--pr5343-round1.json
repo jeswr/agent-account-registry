@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5343,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "52af8ac33416925197514de7a9e2c95f1af3082a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is documentation plus a non-vacuous regression test that accurately pins three semantic mismatches between D-entailment value identity and the substrate's SPARQL/XPath-style numeric relational comparator. The test exercises the real d_value_key/d_value_eq and as_numeric/Num::cmp_relational paths: arbitrary-magnitude decimal representation loss, decimal-vs-double value-space separation, and integer subtype facet enforcement. These assertions are consistent with the D-entailment design record and current implementation, introduce no runtime behavior change, and appropriately reject the proposed behavior-changing delegation.",
+  "verdict": "approve"
+ }
+}
