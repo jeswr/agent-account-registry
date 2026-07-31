@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5289,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f5bacb8edaedebbadaa9b8d9a3ed8c0d755502ee",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4.1 defines one indexed timestamp per COMMIT record and phase 2 requires TemporalIndex::as_of to agree with GenerationRing::as_of on their overlap. ChangeLog::record_commit records the destination generation of a transition, so the ring's initial generation has no commit record. For any t at or after that initial generation's published_at but before the first commit (or for a store with no commits), GenerationRing::as_of returns the initial generation while the proposed index has no qualifying entry and retained_min is undefined. The status table's claim that t >= retained_min means some retained record qualifies also does not cover this state.",
+    "file": "research/point-in-time-temporal-index.md",
+    "fix_hint": "Specify a durable, timestamped baseline entry for the initial generation (and for each post-rebase lineage baseline where appropriate), or explicitly compose TemporalIndex resolution with a retained/base-backup anchor that carries the authoritative published_at. Define retained_min and HTTP behavior for an empty commit log, and add acceptance tests for no commits and timestamps between initial publication and the first commit.",
+    "severity": "major",
+    "title": "The initial published generation is absent from the temporal index"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 resolves the three prior major findings: lookup is now sequence-ordered with timestamp bounds used only for pruning, commit records are designed to use the generation publication clock with an explicit compatibility decision, and the HTTP horizon/future rules use retained_min and an indeterminate trimmed-history outcome. However, the durable index still cannot meet its stated overlap-equivalence contract because it indexes only change-log commit records: the ring's initial published generation has no commit record. Queries before the first commit (and stores with no commits) therefore have a valid GenerationRing::as_of answer but no TemporalIndex answer or retained_min. This new major completeness gap makes progress regressing under the required scale, despite the substantial correction of the earlier issues.",
+  "verdict": "request_changes"
+ }
+}
