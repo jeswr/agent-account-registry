@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5308,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c0ac360a03e956e74dd9f157afe5476f5307b8b4",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 5.2 still says `subjects` updates only the written document's entries and `deps` is recomputed for the written document only, while section 5.3 derives `affected` from the pre-write `rdeps(D)`. If origin P already reaches subject `<o#pol>`, but control graph Q previously contains no triple for that subject, Q is absent from P's dependency closure. A PUT to Q adding `<o#pol> acp:allow acl:Read` changes `subjects[<o#pol>]`, but recomputing only Q's dependencies cannot discover that P must now read Q, and old `rdeps(Q)` does not include P. The scoped path therefore omits P although full materialization changes P's slice. The analogous WAC case occurs when Q adds facts for an Authorization subject already declared elsewhere.",
+    "file": "research/solid-scoped-materializer-design.md",
+    "fix_hint": "On every subject-occurrence-set change, invalidate and recompute all dependency closures whose reachable frontier contains the changed subject before deriving `affected`, or conservatively fall back to full materialization. Specify ordering for both additions and deletions. Add named ACP and WAC regressions where P already references/declares a subject, Q initially does not mention it, and a PUT to Q introduces allow/agent facts; require scoped/full auth-view equality and prove the test reds when only the written document's deps are recomputed.",
+    "severity": "major",
+    "title": "New subject occurrences still do not invalidate existing dependency closures"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 leaves the round-3 incremental-invalidation defect materially unchanged. The occurrence-based dependency closure is sound when rebuilt globally, but the proposed update rule still recomputes `deps` only for the written document and computes `affected` from existing reverse dependencies. Adding the first occurrence of an already-reachable subject to another control document can therefore create a new dependency that the old index cannot report, leaving an origin slice stale. With the same major finding remaining, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
