@@ -4554,11 +4554,73 @@ WFFIX
   # BRANCH REF (the ref this script fetches, edits and pushes back to) and publishes THAT, so the
   # guard compares one store against itself and an abort implies a push happened in between.
   #
-  # THE GUARD IS NOT RELAXED, and that is asserted first: `run_fix`'s equality check must still be
-  # the exact-match it always was, or "the head moved" stops meaning anything.
-  local head_guard_re='^ +\[\[ "\$(base|head)_sha" == "\$expected_head" \]\] \|\|$'
-  chk "#1345: the pre-flight head guard is still EXACT equality on both live lanes (not relaxed)" \
-    "$(grep -Ec "$head_guard_re" "$SCRIPT_DIR/worker-live.sh" || true)" "2"
+  # THE GUARD IS NOT RELAXED, and that is asserted first: the live lanes' equality check must still
+  # be the exact-match it always was, or "the head moved" stops meaning anything.
+  #
+  # Stated as a PROPERTY over the population, never as a pinned population SIZE. A literal count
+  # measures the wrong thing in both directions: it reds when a lane is legitimately ADDED (#1446
+  # split the fix lane into `stage_fix`/`push_fix`, so a pinned `2` went red on a guard that had
+  # not moved), and it stays GREEN when a guard inside an existing lane is relaxed, as long as the
+  # total holds. Two independent rows instead:
+  #   (a) every `[[ … "$expected_head"` test in this file is the exact-equality-then-`die` shape at
+  #       the function's own indentation — a prefix glob (`"$expected_head"*`), an inverted test,
+  #       an `|| true`, or a guard buried one level deeper inside an `if` all show up as a LOOSE
+  #       match with no EXACT twin, which is the whole relaxation family in one comparison;
+  #   (b) the two lanes this fix is about each still carry one, so a DELETION cannot hide inside a
+  #       shrinking population, and two drifted anchors cannot agree vacuously at 0 == 0.
+  local head_loose_re='^ +\[\[ .+ "\$expected_head"'
+  # ONE source for the guard shape (#945: two copies of one pattern make each copy unkillable).
+  # `_shell_function_body` strips indentation, so the file-scope form re-adds the leading anchor.
+  local head_lane_re='^\[\[ "[^"]+" == "\$expected_head" \]\] \|\|( die .*)?$'
+  local head_guard_re="^  ${head_lane_re#^}"
+  chk "#1345: every \$expected_head comparison is EXACT equality then die (none relaxed)" \
+    "$(grep -Ec "$head_loose_re" "$SCRIPT_DIR/worker-live.sh" || true)" \
+    "$(grep -Ec "$head_guard_re" "$SCRIPT_DIR/worker-live.sh" || true)"
+  local head_lane
+  for head_lane in run_review run_fix; do
+    chk "#1345: the '$head_lane' lane still carries its exact-equality pre-flight head guard" \
+      "$(_shell_function_body "$SCRIPT_DIR/worker-live.sh" "$head_lane" \
+          | grep -Ec "$head_lane_re" || true)" "1"
+  done
+  # NON-VACUITY for both rows above, on THREE mutants of this file. Each is well-formed shell (the
+  # `die` continuation is kept or removed with its guard), so nothing here is a false kill.
+  local hg_src="$SCRIPT_DIR/worker-live.sh"
+  # (1) RELAXED: the review lane's guard becomes a PREFIX match — still exits, still reads as a
+  #     head check, and accepts any sha sharing the dispatched prefix.
+  local hg_relaxed="$tmp/worker-live-relaxed-head-guard.sh"
+  awk '!done && /^  \[\[ "\$head_sha" == "\$expected_head" \]\] \|\|$/ {
+         sub(/"\$expected_head" \]\]/, "\"$expected_head\"* ]]"); done = 1 }
+       { print }' "$hg_src" > "$hg_relaxed"
+  chk "#1345: relax-mutant really applied (exactly one exact guard fewer, same line count)" \
+    "$(( $(grep -Ec "$head_guard_re" "$hg_src") - $(grep -Ec "$head_guard_re" "$hg_relaxed") )):\
+$(( $(wc -l < "$hg_src") - $(wc -l < "$hg_relaxed") ))" "1:0"
+  chk "#1345: ...and the population row REDS on it (loose no longer equals exact)" \
+    "$([[ "$(grep -Ec "$head_loose_re" "$hg_relaxed")" \
+        == "$(grep -Ec "$head_guard_re" "$hg_relaxed")" ]] && echo agrees || echo differs)" "differs"
+  chk "#1345: ...and the run_review lane row REDS on it too" \
+    "$(_shell_function_body "$hg_relaxed" run_review | grep -Ec "$head_lane_re" || true)" "0"
+  # (2) DELETED: the guard and its `die` continuation removed outright.
+  local hg_deleted="$tmp/worker-live-no-head-guard.sh"
+  awk 'skip { skip = 0; next }
+       !done && /^  \[\[ "\$head_sha" == "\$expected_head" \]\] \|\|$/ { done = 1; skip = 1; next }
+       { print }' "$hg_src" > "$hg_deleted"
+  chk "#1345: delete-mutant really removed the guard AND its die continuation (2 lines)" \
+    "$(( $(wc -l < "$hg_src") - $(wc -l < "$hg_deleted") ))" "2"
+  chk "#1345: ...and the run_review lane row reports it MISSING (a deletion cannot hide)" \
+    "$(_shell_function_body "$hg_deleted" run_review | grep -Ec "$head_lane_re" || true)" "0"
+  # (3) CONDITIONALLY INERT (AGENTS.md item 3): the guard survives verbatim but one level deeper,
+  #     under a condition that is false in production. A pinned count cannot see this at all.
+  local hg_inert="$tmp/worker-live-inert-head-guard.sh"
+  awk '!done && /^  \[\[ "\$head_sha" == "\$expected_head" \]\] \|\|$/ {
+         print "  if [[ -n \"${WORKER_STRICT_HEAD:-}\" ]]; then"; print "  " $0; done = 1; next }
+       done == 1 && /^    die / { print "  " $0; print "  fi"; done = 2; next }
+       { print }' "$hg_src" > "$hg_inert"
+  chk "#1345: inert-mutant really applied (guard kept verbatim, wrapped, +2 lines)" \
+    "$(( $(wc -l < "$hg_inert") - $(wc -l < "$hg_src") )):\
+$(grep -Ec "$head_loose_re" "$hg_inert")" "2:$(grep -Ec "$head_loose_re" "$hg_src")"
+  chk "#1345: ...and the population row REDS on it (an indented guard is not the shipped guard)" \
+    "$([[ "$(grep -Ec "$head_loose_re" "$hg_inert")" \
+        == "$(grep -Ec "$head_guard_re" "$hg_inert")" ]] && echo agrees || echo differs)" "differs"
   chk "#1345: resolve reads the head BRANCH REF as well as the pulls API copy" \
     "$(grep -Fc 'git/ref/heads/' "$rf_wf" || true)" "1"
   # PRESENCE of the call is not the property — the REBIND is. A resolve step that computed the
