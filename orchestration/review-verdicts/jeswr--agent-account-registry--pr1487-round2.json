@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1487,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "addb612199d8d57bf08b0c2e861546a19edcf307",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_live_issue_labels` validates that `labels` is a list but filters out any element that is not a dict with a string `name`. The result is then used as complete negative evidence by `_assert_status_landed`: a malformed entry is indistinguishable from proof that a dropped status label is gone. For example, a response such as `{\"labels\":[null,{\"name\":\"role:impl\"}]}` lets a removal-only transition pass even though the API response is not readable enough to establish the absence of every dropped label. This contradicts the helper's fail-closed confirmation purpose. The added unreadable-reread test only returns a malformed top-level string, so it remains green if nested entries continue to be discarded.",
+    "file": "scripts/worker-issue.py",
+    "fix_hint": "Require every element of `item[\"labels\"]` to be an object with a string `name`; raise `WorkerIssueError` on the first malformed element. Add a self-test that supplies a labels list containing a malformed element after a status write and asserts a diagnosable `cannot be confirmed` refusal.",
+    "severity": "major",
+    "title": "Malformed label entries are silently treated as absent"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The delete-before-add ordering and live postcondition are otherwise sound, but the new confirmation reader does not fail closed on malformed entries inside GitHub's labels array. Because it silently drops every non-object label and every object whose name is not a string, it can accept an incompletely readable response as proof that all removed labels are absent. The unreadable-response self-test exercises only a malformed top-level object and therefore does not catch this path. This is a new major finding relative to round 1's clean approval, so progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
