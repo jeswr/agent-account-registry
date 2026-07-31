@@ -2305,14 +2305,22 @@ def _deliver_alerts(actions, maintainer, fallback_open=frozenset()):
     BOTH routes and counts as delivered only when each route it targets confirms (review #340).
     Beyond that explicit binding, recoveries never fall back cross-repo — "no open issue" on a
     repository whose marker was never seen is a no-op that cannot confirm a close (review round
-    2). A FIRING action that lands on the primary while its marker is still open on the fallback
-    closes the superseded fallback copy (issue #344), so a recovered primary route never leaves
-    two divergent open copies of one alert. Returns the actions still undelivered (empty == all
+    2). A FIRING action that lands on the primary while its marker is still open on a fallback
+    that is a DIFFERENT REPOSITORY closes the superseded fallback copy (issue #344), so a recovered
+    primary route never leaves two divergent open copies of one alert; a fallback that differs only
+    by token names the same issue, so it is never closed here (round 1 of #1455). Returns the actions still undelivered (empty == all
     delivered) so the caller can exit nonzero — an unusable alert token must fail the run, never
     silently drop the alert."""
     repo, token = _alert_target()
     fb_repo, fb_token = _registry_fallback()
     fb_distinct = (repo, token) != (fb_repo, fb_token) and bool(fb_token)
+    # ...but the CREDENTIAL fallback and the CROSS-REPOSITORY dedup need different tests (review
+    # round 1 of #1455). `fb_distinct` compares (repo, token) PAIRS, so ALERT_REPO == REGISTRY_REPO
+    # with a distinct ALERT_TOKEN — a supported configuration — keeps the retry route armed while
+    # both routes name ONE repository. `_cmd_decide` then enumerates that repository's own markers
+    # into `fallback_open`, where the "superseded fallback copy" IS the live primary alert: closing
+    # it would erase the only open firing issue. Dedup is therefore keyed on the repository NAME.
+    fb_other_repo = fb_distinct and repo.strip().lower() != fb_repo.strip().lower()
     # A DETAILED body (failure/fleet counts + reset hints + diagnostics) is emitted ONLY over a
     # POSITIVELY VERIFIED private route (sol-audit issue #204, hardened in #432 round 1): an
     # ALERT_REPO distinct from the public registry repo (case-insensitive) AND confirmed
@@ -2342,14 +2350,15 @@ def _deliver_alerts(actions, maintainer, fallback_open=frozenset()):
                 print(f"::warning::model-health: {action['condition']}/{action['provider']} alert "
                       "delivery failed on the private route — retrying on the registry")
                 delivered = _upsert_alert(action, fb_repo, fb_token, maintainer, redact=True)
-            elif delivered and fb_distinct and (action["condition"],
-                                                action["provider"]) in fallback_open:
+            elif delivered and fb_other_repo and (action["condition"],
+                                                  action["provider"]) in fallback_open:
                 # The primary took the alert, but a PRIOR tick's #175 retry left a copy open on
                 # the fallback: every tick from here refreshes the primary while that copy rots
                 # with the body it was created with. Close it as superseded (issue #344) so one
-                # condition never shows two divergent open issues. Only reachable when the
-                # PRIMARY write confirmed — the retry above owns the other branch, and closing
-                # the copy the alert actually landed on would erase the alert.
+                # condition never shows two divergent open issues. Guarded by fb_other_repo, not
+                # fb_distinct: only reachable when the PRIMARY write confirmed AND the fallback is
+                # a genuinely DIFFERENT repository — the retry above owns the other branch, and
+                # closing a copy on the repository the alert actually landed on would erase it.
                 _close_superseded_alert(action, fb_repo, fb_token)
         elif fb_distinct and (action["condition"], action["provider"]) in fallback_open:
             # The marker was SEEN open on the fallback repo (a prior firing retry created it):
@@ -5404,7 +5413,11 @@ def _test_firing_supersede(chk):
     the FAILED-primary retry just delivered to (that erases the alert outright), reaching for the
     fallback when its marker was never enumerated, and folding the dedup result into `undelivered`
     (a cosmetic duplicate must not turn a delivered alert into a red run — it retries next tick).
-    Deleting the supersede branch turns phase 2 red with the duplicate still open."""
+    Deleting the supersede branch turns phase 2 red with the duplicate still open.
+
+    Phase 6 pins the same-repository-distinct-token configuration, where the credential fallback is
+    armed but there is only ONE issue to speak of: keying the dedup on the (repo, token) pair
+    instead of the repository name closes the live firing alert (round 1 of #1455)."""
     import types
     global _gh
     real_gh = _gh
@@ -5502,6 +5515,22 @@ def _test_firing_supersede(chk):
         fail_close["repos"] = set()
         chk("supersede: the next tick closes the still-open duplicate",
             (_deliver_alerts([fire], "m", {key}), states(reg_repo)), ([], ["closed"]))
+
+        # phase 6 (review round 1 of #1455): ALERT_REPO == REGISTRY_REPO with a DISTINCT
+        # ALERT_TOKEN. The credential fallback stays armed (the pairs differ), but both routes name
+        # ONE repository, so _cmd_decide enumerates the PRIMARY's own markers into `fallback_open`
+        # and the "superseded copy" is the live firing issue. Keying the dedup on the (repo, token)
+        # pair closes it and erases the only open alert; keying it on the repository NAME leaves it
+        # alone. Phases 1-5 fix the two repos to different names and cannot see this.
+        repos[reg_repo] = {}
+        os.environ.update(ALERT_REPO=reg_repo)
+        chk("supersede: same-repo distinct-token route files the firing alert as usual",
+            (_deliver_alerts([fire], "m"), states(reg_repo)), ([], ["open"]))
+        calls[:] = []
+        chk("supersede: a same-repo fallback marker never closes the live firing alert",
+            (_deliver_alerts([fire], "m", {key}), states(reg_repo)), ([], ["open"]))
+        chk("supersede: and no close/comment is issued against the primary's own repository",
+            [c for c in calls if c[0] in ("close", "comment")], [])
     finally:
         _gh = real_gh
         for k, v in saved.items():
