@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5247,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "87fc83950c72a9d4e7befbb59cace2175be3e52e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "TestDeployPathsAreRustInert claims to re-derive the deploy/ non-interference proof, and scripts/ci_select.py explicitly cites absence of include_str!/include_bytes!/path reads as part of that proof. However, test_deploy_tree_is_not_read_by_any_rust_ci_workflow only scans a hard-coded subset of workflow files. It never scans crate Rust sources, Cargo manifests/build scripts, or other build inputs for deploy/ references. A later include_str!(\"../../../deploy/...\") (or equivalent build-script dependency) would make deploy changes affect the Rust artifact while this test stayed green and merge-group CodeQL/Rust lanes continued to skip.",
+    "file": "scripts/tests/test_ci_select_wiring.py",
+    "fix_hint": "Add a fail-closed source/build-input audit for references or path escapes into deploy/ (covering Rust sources, build.rs, and Cargo manifests), or remove deploy/ from _ORCHESTRATION_SAFE until such an enforceable proof exists. The test should include a mutation/witness showing that introducing a representative crate-side deploy/ dependency makes the audit fail.",
+    "severity": "major",
+    "title": "Deploy inertness test does not verify crate/source references"
+   }
+  ],
+  "progress": null,
+  "summary": "The merge-group gate is fail-safe at runtime and delegates classification appropriately, but the new deploy/ allowlist is justified by a test that does not actually re-derive its stated non-interference proof. The test checks only a fixed workflow-name list and never checks Rust/Cargo sources for compile-time or runtime consumption of deploy/. That leaves the allowlist able to become unsound while its claimed guard remains green.",
+  "verdict": "request_changes"
+ }
+}
