@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5234,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f35a1c1003e1f585e50792a478ea7d501ac8354a",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete. The diff consistently documents that only emitted leg-name-set changes require the fragment plus golden, while non-name fragment edits remain single-file. The exact-output regression test exercises the assembler's real main path with --names, captures stdout, restores sys.argv in a finally block, and compares byte-for-byte against the golden. The documentation-presence tests are non-vacuous and cover the README contract and every YAML fragment. No correctness, soundness, security, or test-validity issue is evident. With zero findings in both rounds 3 and 4, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
