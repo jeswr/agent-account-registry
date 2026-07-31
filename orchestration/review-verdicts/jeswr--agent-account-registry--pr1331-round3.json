@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1331,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "efa6153a42a8e2755eebee4fb393191314c0f461",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`migration_record` proves that a bot comment is structurally well formed and carries a matching corrected receipt, while `migration_is_current` proves only that its timestamp is newer than every park application. Neither check requires an actual pre-migration park receipt whose generation, cause, and head equal the record's `from_gen`, `cause`, and `head`, nor requires `record['to_gen'] == groom.age_park_generation(comments, bot_login)` on the fresh mutation-boundary read. In `verdict`, the `if migration:` branch still runs before the stale-receipt, grant-support, and cap-spent checks. Thus a well-formed record with invented evidence, or a formerly valid record made inconsistent by later grant markers, can select `converge` and delete `needs:user`; the inserted low-generation receipt can then expose another automatic exit even when the live grant-derived generation is over cap. The added race tests cover newer park applications and a different migration record, but no grant-marker race or mismatch between the record and the actual stale receipt.",
+    "file": "scripts/reconcile-age-park-escalation.py",
+    "fix_hint": "At each `_decide`, especially the post-POST mutation-boundary read, bind convergence to the complete live evidence: require a pre-migration park receipt matching `from_gen`, cause, and head; require `to_gen` to equal the current `age_park_generation`; and require that generation to remain within the cap. Add entry-point tests for mismatched from-gen/cause/head and for grant markers arriving after POST, including a cap-spent corrected generation; each must issue no DELETE.",
+    "severity": "major",
+    "title": "Convergence still trusts an unbound migration claim"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 remains blocked by the same authorization gap as round 2. The new `migration_is_current` check proves only that the migration comment is newer than park-label applications. It still does not bind the record's claimed stale and corrected generations, cause, and head to the PR's actual stale receipt and current grant-derived generation. Because any accepted migration record takes the convergence branch before the ordinary receipt, supported-generation, and cap checks, stale or fabricated bot-authored evidence can still authorize deletion of the human-owned hold.",
+  "verdict": "request_changes"
+ }
+}
