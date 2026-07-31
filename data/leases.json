@@ -18,7 +18,7 @@
    "role": "impl",
    "model": "opus5",
    "issued_at": 1785538126,
-   "expires_at": 1785540826
+   "expires_at": 1785541882
   },
   {
    "account": "51bde6688e140866",
@@ -28,7 +28,7 @@
    "role": "ci",
    "model": "opus5",
    "issued_at": 1785538125,
-   "expires_at": 1785540825
+   "expires_at": 1785541882
   },
   {
    "account": "51bde6688e140866",
