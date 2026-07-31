@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5207,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b6d5068793437ebd11a8237f33113fc3dd84a1ff",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete. The documentation consistently matches scripts/perf-gate.py and bench/perf-baseline.json: parse_ns_per_byte is the sole mode:noise metric and a timing-only regression is advisory/non-blocking, while regressions in mode:auto metrics hard-fail. The edits preserve the distinction between deterministic ratchets and the pinned-but-advisory timing floor, accurately scope example mode:auto metrics, and introduce no correctness, soundness, security, honesty, or test-validity issue. Because round 2 also had no findings, progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
