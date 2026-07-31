@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1402,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b9d2814330426da3c971c0463ba2fd07478310a1",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`reconcile_dispatch_head` validates only `object.sha` and ignores `object.type`. Consequently payloads such as `{\"object\":{\"sha\":\"<40 lowercase hex>\",\"type\":\"tag\"}}` or even a missing `type` are accepted and published as the authoritative head. This contradicts the function and outcome contracts, which say a payload that is not a commit must fail closed. It can also make dispatch bind an object SHA that does not match the commit checked out/reported by the worker. The self-test fixtures always include `type: \"commit\"`, but no negative row changes or removes that field, so this trust check is currently untested.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Require `node.get(\"type\") == \"commit\"` together with the 40-hex SHA before returning. Add negative self-test rows for a valid 40-hex SHA with `type: \"tag\"` and with a missing/invalid type, asserting `WorkerPrError`; also exercise the outcome path to confirm such a payload defers as `malformed-head` with no mutation.",
+    "severity": "major",
+    "title": "Branch-ref reducer accepts non-commit Git objects"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe branch-ref store alignment and token split are otherwise carefully fail-closed and exercised in both stale/live directions, but the new reducer does not enforce its own key trust condition: it accepts any 40-hex Git object ID without proving that the ref resolved to a commit. That leaves a non-commit payload on the authoritative-head path and makes the advertised malformed-payload coverage incomplete.",
+  "verdict": "request_changes"
+ }
+}
