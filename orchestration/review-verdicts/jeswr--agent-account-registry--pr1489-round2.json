@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1489,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9144553becbddda94a5c1ed4a7cdb14e94569d61",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe scheduled certification remains correct, fail-closed, and non-vacuously tested. The certified set follows every role-producing derivation rung and independently accounts for the planner's non-role writes plus the quarantine producer. Empty label input is refused, missing labels are named with a non-zero result, the job has read-only label permissions, and the exact workflow step is executed against both complete and deficient repositories. I found no diff-supported correctness, soundness, test-validity, or security issue requiring changes.",
+  "verdict": "approve"
+ }
+}
