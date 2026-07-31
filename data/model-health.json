@@ -1,78 +1,6 @@
 {
  "records": [
   {
-   "ts": 1785475972,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30606990644.1"
-  },
-  {
-   "ts": 1785475996,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30606999060.1"
-  },
-  {
-   "ts": 1785476051,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30607084917.1"
-  },
-  {
-   "ts": 1785476066,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30607053939.1"
-  },
-  {
-   "ts": 1785476091,
-   "provider": "fleet",
-   "account": "5f5b2dc3fb8e231b",
-   "model_alias": "",
-   "exit_class": "success",
-   "run_id": "30606702289.1"
-  },
-  {
-   "ts": 1785476143,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "unknown",
-   "run_id": "30607113647.1"
-  },
-  {
-   "ts": 1785476181,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30607177057.1"
-  },
-  {
-   "ts": 1785476194,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30607184718.1"
-  },
-  {
-   "ts": 1785476240,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30607191244.1"
-  },
-  {
    "ts": 1785476609,
    "provider": "openai",
    "account": "dc2d751954080e13",
@@ -1862,6 +1790,14 @@
    "model_alias": "opus5",
    "exit_class": "success",
    "run_id": "30629033250.1"
+  },
+  {
+   "ts": 1785501540,
+   "provider": "openai",
+   "account": "dc2d751954080e13",
+   "model_alias": "sol",
+   "exit_class": "success",
+   "run_id": "30631253174.1"
   }
  ]
 }
