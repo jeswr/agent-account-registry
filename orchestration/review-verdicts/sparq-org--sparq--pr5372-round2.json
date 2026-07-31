@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5372,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ce06f4057a2cd5364d144980b548b5ad611d4c17",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior major findings. RuleVars::VarIris now recursively converts variables inside quoted formula terms, and the public-path regression test exercises the real parser/serializer path while pinning the no-syntactic-variable rule invariant. Premise blank-node provenance now uses an internal name containing '.', which the source variable lexer cannot accept; the regression test confirms legal lookalike variables remain variables, conclusion-only occurrences retain their meaning, and an attempted forged internal name fails parsing. This is improving versus round 1: both major findings are fixed with non-vacuous integration coverage, and no new correctness, soundness, or security issue is evident in the diff-scoped review.",
+  "verdict": "approve"
+ }
+}
