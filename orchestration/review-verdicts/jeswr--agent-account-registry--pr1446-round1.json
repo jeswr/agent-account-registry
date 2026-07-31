@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1446,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f1459d737c2a313be8d87138131323b8e026756c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The preserve step uses `needs.worker.outputs.gate_outcome != 'success'`. The bundle is sealed before toolchain setup and the gate, so a toolchain/setup failure can leave a valid bundle while causing the gate step to be skipped; an absent/skipped outcome also satisfies this inequality. The isolated publisher can then mint a write token and push candidate content even though the policy-selected gate never executed. That violates the stated FAILED-gate scope and the fail-closed requirement for a missing gate verdict. The new self-tests only grep for the `!= 'success'` substring, so they positively encode this widening and would also pass conditions made inert with an added disjunct/conjunct.",
+    "file": ".github/workflows/worker.yml",
+    "fix_hint": "Require the exact, explicit failure outcome for preservation (and account for any deliberately supported outcome separately), so empty/skipped/cancelled gate evidence performs no target write. Parse and pin the complete normalized `if:` expression, with negative cases for an empty/skipped gate outcome and mutations such as an appended `|| true` / `&& false`, rather than checking clause substrings.",
+    "severity": "major",
+    "title": "Skipped or missing gate outcomes are treated as gate failures and allowed to write"
+   },
+   {
+    "body": "This change creates and pushes `sparq-agent/gate-failed/...`, but adds no discovery, checkout, or base-binding path that feeds that ref into `run_model`, a fix loop, or a subsequent attempt. `run_model` continues from the freshly checked-out default-branch HEAD and creates a new per-attempt publishable branch. The deliberately non-enumerable preservation ref is therefore also invisible to every automated recovery path. The README and notices promise that the fix loop or next attempt can resume from the failing state, but the transition delivers only an orphan salvage ref; it does not avoid recomputing the work.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Implement a fail-closed, SHA/base-bound recovery consumer that deliberately discovers the correct prior preservation ref and reconstructs it before the next model/fix attempt, with end-to-end tests proving the prior diff is present at model entry and that refs from another issue/run/base cannot be consumed. Otherwise narrow the feature and documentation to diagnostic retention and do not claim resumability or avoided model cost.",
+    "severity": "major",
+    "title": "Nothing consumes the preserved branch, so the claimed resume path does not exist"
+   }
+  ],
+  "progress": null,
+  "summary": "The preservation write is not fail-closed on proof that the policy gate actually ran and failed: its `!= 'success'` predicate also accepts skipped or missing gate outcomes after a pre-gate bundle was sealed. The added workflow tests are substring checks and therefore do not detect that widening (or common inert-condition mutations). In addition, the advertised recovery outcome is not delivered: the branch is written, but no worker/fix path discovers or checks it out on a later attempt, which still starts from the default-branch base. These are major correctness/completeness defects in a target-repository write path.",
+  "verdict": "request_changes"
+ }
+}
