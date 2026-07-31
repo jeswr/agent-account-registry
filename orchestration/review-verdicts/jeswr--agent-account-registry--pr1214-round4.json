@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1214,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7a94b69bbabbff75721e1d59fa231a89eb78e7ba",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The round-three fail-open pipelines are unchanged. `gh api .../secrets --jq ... | sort` returns `sort`'s status, so an API failure can exit zero with empty output. Likewise, `! gh api ... | grep -vE ...` treats an API failure as no input, lets `grep` return 1, and negates that to success. Therefore the runbook can proceed without proving the source enumeration or sink inventory. `_test_fleet_step_never_copies_unrelated_credentials` still gives the stub a successful `names` response and contains no row where `gh api` itself exits nonzero.",
+    "file": "scripts/diagnostic-sink.py",
+    "fix_hint": "Make every inventory pipeline propagate `gh api` failure, such as by executing it under `set -o pipefail` or by capturing output only after a successful API call. Preserve the exact-name filtering and add executed fixtures where the API stub exits nonzero, asserting nonzero for the source enumeration, sink display read-back, and unexpected-name enforcement.",
+    "severity": "blocker",
+    "title": "Sink secret read-backs still succeed when the GitHub API fails"
+   },
+   {
+    "body": "Step 1 still ends with a bare `gh api .../deployment-branch-policies` command. Despite the note saying the result must be one `branch`-typed entry naming exactly the selected default branch, the command exits zero for an empty list, extra policies, the wrong branch, or the wrong policy type whenever the request succeeds. No executed self-test covers this read-back or any invalid policy response, so the claimed fail-closed deployment restriction is not established.",
+    "file": "scripts/diagnostic-sink.py",
+    "fix_hint": "Turn the complete policy response into an assertion requiring exactly one entry, exact type `branch`, and exact name equal to `sink_default_branch`, while propagating API failure. Add executed tests for the valid response and for empty, extra, wrong-name, wrong-type, and API-failure responses.",
+    "severity": "major",
+    "title": "Deployment-policy read-back still does not enforce the exact branch policy"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round four leaves both round-three findings materially unchanged. The fleet sink read-backs are still pipelines without `pipefail`, so a failed `gh api` can be masked by `sort` or by the negated `grep` pipeline and reported as success. The deployment-policy read-back still only prints the API response; it does not assert exactly one branch-typed policy with the selected default-branch name. The added self-tests still exercise successful API responses and dirty secret inventories, but not API failure or the deployment-policy response states. Because the same blocker and major remain at the same severities, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
