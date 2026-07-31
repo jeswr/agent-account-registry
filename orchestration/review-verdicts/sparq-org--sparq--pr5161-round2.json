@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5161,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1971d8b6e3ec9f89601a8f921dbbb760dfd51c6d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and internally consistent. The documentation clearly separates the dated ruleset snapshot from live-verified values, leaves the proposed build-capacity increase conditional and unapplied, and accurately reconciles the CodeQL measurement with its current operational disablement. The minimum-entry wait conclusion follows from the documented field semantics at min_entries_to_merge=1, with the lack of direct timing measurement candidly disclosed. The cited throughput and queue-delay figures match the scoped research record, and no executable behavior, security control, or test surface changes. No hostile instruction was detected in the diff.",
+  "verdict": "approve"
+ }
+}
