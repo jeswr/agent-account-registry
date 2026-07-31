@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5333,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b52139489a1fedf35b58092a5ea337ec62d9475d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The custom Debug implementation correctly preserves useful public grant output while replacing both bare private-key seed fields with a zero-sized redaction stand-in; Option presence remains visible without formatting the underlying bytes. Secret32 already owns a redacting Debug implementation, and the added test exercises all three secret-bearing fields through the real Capability constructors. No correctness, soundness, or security defect is evident in the scoped change.",
+  "verdict": "approve"
+ }
+}
