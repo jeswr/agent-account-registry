@@ -1,0 +1,51 @@
+{
+ "host_envelope": {
+  "pr": 5411,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3735d1bcec62e75b4db16859f358f98e8cf3b210",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The header now says an unlabelled PR reserves nothing on the PLAN leg. The pre-correction framing survives unchanged in: scripts/pr-area-labels.py:8 ('A PR with NO `area:` label maps to the SERIALIZING `__global__` partition, so one such PR defers EVERY issue') \u2014 which is the very file this header's 'WHO CONSUMES THIS' block points a reader to; .github/workflows/pr-area-label.yml:7 and its :105 `::warning` string; .github/workflows/routing-self-tests.yml:126 and :241; and AGENTS.md:663 ('maps to the serializing `__global__` partition and defers **every** issue'). After this PR the repository asserts both readings of the same mechanism, and the reader most likely to hit the stale one is the reader who follows this file's own pointer. (.github/workflows/triage-area.yml:7 is NOT in this class \u2014 it describes a no-area CANDIDATE, which `packages_of` really does map to `__global__`.) Not a blocker: it is documentation, and the amended text is the correct half of the pair.",
+    "file": "ci/area-labels.toml",
+    "fix_hint": "Either extend the same PLAN/CLAIM split to scripts/pr-area-labels.py:8, .github/workflows/pr-area-label.yml:7, routing-self-tests.yml:126/241 and AGENTS.md:663 in this PR, or add one line to this header naming them as knowingly-stale ('the same paragraph in scripts/pr-area-labels.py and AGENTS.md still states the pre-`_reserving_packages` framing; tracked in <bead>'), so the divergence is deliberate and dated rather than silent.",
+    "severity": "minor",
+    "title": "The corrected claim is fixed in one place only \u2014 four sibling surfaces, including this file's own named consumer, still state the old version"
+   },
+   {
+    "body": "Two separate problems in 'CLAIM's `busy_packages_of_pulls` instead maps that PR to the SERIALIZING `__global__` partition because its blast radius is unknowable.'\n\n(1) Mechanism: the only form of that fail-closed step recorded anywhere in this tree is `areas |= issue_areas or {GLOBAL_PACKAGE}` (ready-issues.py:765; research/unit-occupancy-and-the-frontier.md:68). That fallback keys on the linked SOURCE ISSUE's area set being empty, not on the PR carrying no `area:` label. Those populations are not the same \u2014 research/unit-occupancy-and-the-frontier.md counts 6 pairs where the source issue declares no `area:` at all while the PR does. So the sentence's trigger condition is not the one the repo has written down.\n\n(2) Epistemics: `busy_packages_of_pulls` lives in the PRIVATE registry's dispatch.yml, and this repository's standing convention is to hedge every such claim \u2014 scripts/dispatch-plan.py:53-57 ('PER sparq#4365 \u2014 which is a statement about the PRIVATE `jeswr/agent-account-registry`, not something this repository can check') and orchestration/registry-contract.toml:52 ('a claim about the PRIVATE registry, which nothing in this repository can verify'). The new sentence drops that hedge and asserts present-tense registry behaviour, in a header whose stated purpose is to be the honest account of the mechanism.",
+    "file": "ci/area-labels.toml",
+    "fix_hint": "Restate to match both the recorded mechanism and the convention, e.g.: 'CLAIM (registry `dispatch.yml::busy_packages_of_pulls` \u2014 per reg#677/sparq#4365, not verifiable from this repository) applies an extra fail-closed step, `areas |= issue_areas or {GLOBAL_PACKAGE}`, so a unit whose SOURCE ISSUE declares no area falls back to the serializing `__global__` partition; applied to this population it drives the live frontier to 0 (ready-issues.py:765).'",
+    "severity": "minor",
+    "title": "The CLAIM-leg sentence states an unverifiable private-registry behaviour as flat fact, and states it in a form the repo's own record does not support"
+   },
+   {
+    "body": "The new sentence states PLAN's occupancy behaviour in the present tense, then the very next clause is the 2026-07-26 14:45Z measurement ('84 of 87 open PRs carried no `area:` label' ... 'candidates 12 -> frontier 3 ... i.e. min = 3'). Those frontier numbers were produced BEFORE `_reserving_packages` was split out of `packages_of` \u2014 ready-issues.py:505 `declared_packages` records exactly that: 'the old rule let a single unlabelled PR hold __global__ and reduce the whole frontier to zero'. Both statements are individually true, but juxtaposed without a date qualifier the frontier=3 reads as evidence for the behaviour described immediately above it, which is precisely the behaviour that was later changed.",
+    "file": "ci/area-labels.toml",
+    "fix_hint": "Date the measurement relative to the rule change: '... Measured 2026-07-26, BEFORE `_reserving_packages` split occupancy out of `packages_of` (scripts/ready-issues.py:526) and while the PLAN leg still applied the candidate-side empty->GLOBAL fallback to occupants: 84 of 87 open PRs carried no `area:` label ...'.",
+    "severity": "minor",
+    "title": "Carried over from round 1 (unaddressed): present-tense PLAN description sits directly above a measurement taken under the OLD occupancy rule"
+   },
+   {
+    "body": "`_reserving_packages` (scripts/ready-issues.py:552) returns `{key for key in declared_packages(labels) if reserves_partition(key)}`, and NON_RESERVING_PARTITIONS = {'ci', 'docs'} (scripts/ready-issues.py:385) route work without occupying it. PLAN reserves the declared areas MINUS those two. The imprecision is more consequential in this file than elsewhere: the large majority of [[map]] rows here resolve to `ci` or `docs`, so a maintainer reading this header could conclude that adding a row for a shared path buys a PLAN-side reservation when it buys none.",
+    "file": "ci/area-labels.toml",
+    "fix_hint": "Qualify to match the code: '... reserves only the PR's declared areas \u2014 and of those, only the RESERVING ones; the cross-cutting `ci`/`docs` lanes route work without occupying it (NON_RESERVING_PARTITIONS, scripts/ready-issues.py:385).'",
+    "severity": "nit",
+    "title": "Carried over from round 1 (unaddressed): 'reserves ONLY the PR's declared areas' omits the NON_RESERVING_PARTITIONS filter"
+   },
+   {
+    "body": "The edit leaves '# carried no `area:` label,' alone on its own line, far short of the surrounding ~95-column comment block \u2014 an artifact of editing in place rather than rewrapping the paragraph. Cosmetic only; no gate reads the comment block.",
+    "file": "ci/area-labels.toml",
+    "fix_hint": "Rewrap the paragraph to the block's existing column width so 'Measured: 84 of 87 open PRs carried no `area:` label, because NOTHING in the pipeline ever applied one.' flows without the orphan.",
+    "severity": "nit",
+    "title": "Carried over from round 1 (unaddressed): rewrap leaves an orphaned short comment line"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2. The diff is byte-identical to round 1 \u2014 no prior finding was addressed and nothing new was introduced. Still a comment-only edit to the 'WHY THIS FILE EXISTS' header: no [[map]] rows, no [policy]/[lanes] values, no behaviour change; it still parses (tomllib: 97 rows), so scripts/pr-area-labels.py and its tests are unaffected.\n\nI re-verified the claims against the code, not against the prior review. ready-issues.py:526 `_reserving_packages` is the OCCUPANCY rule \u2014 'reserves ONLY the areas it declares' \u2014 deliberately asymmetric with `packages_of` (:518), which applies the empty->GLOBAL fallback on the CANDIDATE side only. I also checked the one way the PLAN sentence could be wrong: research/unit-occupancy-and-the-frontier.md 'Finding 3' says dispatch.yml strips PR rows, which would mean PLAN never applies the rule to a PR. That does NOT hold \u2014 `occupancy_parity` (ready-issues.py:1505) records that as of registry #773 the orchestrator does NOT strip. The PLAN half is accurate and more honest than the text it replaces, which asserted a whole-fleet seizure the engine deliberately does not do.\n\nAll findings are documentation precision \u2014 no blocker, no major, so approve stands. The strongest is new this round and concerns completeness: the exact claim corrected here survives verbatim in the deriver this header names as its consumer (scripts/pr-area-labels.py:8), in pr-area-label.yml:7, routing-self-tests.yml, and AGENTS.md:663, so the repo now states two things about one mechanism. Three carry over: the 2026-07-26 measurement was taken under the OLD rule yet sits under a present-tense description of the NEW one; the sentence omits the NON_RESERVING_PARTITIONS ('ci'/'docs') filter, which bites here because most rows map to those lanes; and the rewrap leaves an orphaned line. Progress is 'stagnant': the PR did not change or worsen \u2014 the extra finding reflects a deeper read, not an author regression. Nothing in the diff read as an instruction to the reviewer.",
+  "verdict": "approve"
+ }
+}
