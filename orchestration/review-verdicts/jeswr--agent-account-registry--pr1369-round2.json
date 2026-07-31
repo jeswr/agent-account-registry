@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1369,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c853a99a7e9a7332dd8206aeaba7425c51ac7f60",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4.1 says the machine probes and surfaces a \"pre-validated\" request naming the exact draft-conversion command, then claims the human's press is atomic with the human's own observation. But A1 never requires that own observation: its only specified probe is performed by the starvation sweep, potentially well before the human executes the command. In that interval the PR can become queued, armed, or review-passed, and `gh pr ready N --undo` can still evict or un-arm it. The fresh immediate re-probe obligation is applied only to A2, even though the underlying GitHub requests are non-atomic regardless of who invokes the mutation. Human authorization may make the action permissible, but it does not make stale evidence a sound safety guard, so calling the request pre-validated is unsafe and the prior TOCTOU finding remains.",
+    "file": "research/1012-parked-non-draft-queue-membership.md",
+    "fix_hint": "Make A1 an explicit human confirmation protocol: the surfaced item must require the human to inspect or re-probe queue, arm, and `review:pass` state immediately before conversion, and must not present an earlier sweep result as current validation. Prefer a helper or documented command sequence that performs the strict read and conversion contiguously while clearly naming the residual race; otherwise surface only a diagnosis and require the human to decide from current GitHub state. Add the stale-surface case to the mandatory design tests or acceptance criteria.",
+    "severity": "major",
+    "title": "A1 lets a stale machine probe pre-validate a later human conversion"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The revision correctly acknowledges the probe-to-mutation race and prevents the fleet from automatically taking the preferred A1 mutation. However, A1 still describes the surfaced request as \"pre-validated\" and names an exact conversion command without requiring the human to obtain a fresh queue/arm/review-pass observation immediately before executing it. The starvation-sweep probe may be arbitrarily stale by the time the human acts, so the preferred remedy can still induce the same queue eviction or un-arming that the record identifies. Moving the executor from machine to human changes authority and recoverability, but does not make a prior observation atomic with a later command. The prior load-bearing race therefore remains in the recommended protocol.",
+  "verdict": "request_changes"
+ }
+}
