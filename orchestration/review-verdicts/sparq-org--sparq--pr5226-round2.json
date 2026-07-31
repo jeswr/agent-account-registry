@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5226,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "16dc2b5870723be2ec9f235dd0de9a64e96f1eef",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and complete for the explicitly limited, opt-in host-only slice. The parallel DualLeafV1 builder follows the design's value-first term shapes, reuses RDFC10 canonical ordering and the existing flat sponge, retains salt-scoped blank-node encoding, and routes the three enabled hookable datatypes through their established same-leaf encoders. Rejected hookable lexicals and RDF 1.2 triple terms fail the whole commitment rather than falling back. The load-bearing fail-closed test exercises commit_triples_dual on the real path and distinguishes the forbidden downgrade from a valid sibling; the ordering test independently recomputes canonical leaves and the sponge while comparing canonical order with the established pipeline. Documentation accurately limits this to a parallel host builder, explicitly leaves circuit recomputation and verifier dispatch open, preserves the default pipeline, and retains the research-grade, INV-VL, and pending-external-audit caveats. No hostile review-directed instruction appears in the diff. With no prior or current findings, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
