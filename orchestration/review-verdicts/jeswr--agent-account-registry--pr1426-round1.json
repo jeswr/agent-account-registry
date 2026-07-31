@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1426,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "62a586a78b378b200a0f48cc6d7dab77d62e6672",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nApproved. The change preserves the fail-closed decision while separating a missing YAML parser from a measured workflow-wiring failure. The new sentinel remains falsy at all interlock consumers, mixed unmeasurable/unwired states retain both diagnostics, and workflow parse/anchor/job failures still follow the ordinary seam-finding path. The policy-resolve mutation fixtures now use a literal all-ready baseline, removing their dependency on live environment results. The added tests exercise both affected review-fix probes, verify restoration of the real YAML module, and pin the exception split without weakening trust checks or workflow security controls.",
+  "verdict": "approve"
+ }
+}
