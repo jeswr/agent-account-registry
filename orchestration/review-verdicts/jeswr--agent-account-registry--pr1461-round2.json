@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1461,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c8e6b7fe8d2aa6cc0bfb42b3d58c54ba4acbfb6b",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-1 fail-open is corrected: the collaborator permission adapter now accepts only string values in the complete documented permission domain, raises on missing, null, non-string, and unknown values, records those failures for the deletion-side conservative inversion, and preserves valid non-maintainer permissions as completed negative results. The new end-to-end rows exercise each malformed-value class through the production entrypoint and include quiet positive and negative controls, so the fix is non-vacuous. I found no remaining correctness, soundness, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
