@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5234,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f35a1c1003e1f585e50792a478ea7d501ac8354a",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding: the assembler header now limits the two-file requirement specifically to changes in the emitted leg-name set and explicitly classifies features, test, tier, tier-reason, and comment edits as single-file changes, matching the README and fragment comments. The exact-output regression test remains non-vacuous: it invokes the assembler's real main path with --names, captures stdout, restores sys.argv in a finally block, and compares the result byte-for-byte with the golden. The documentation-presence tests exercise the intended contract across every fragment. No correctness, soundness, security, or test-validity issue remains in the supplied diff. The targeted test command could not execute in this checkout because PyYAML is not installed, but that environment dependency does not reveal a defect in the change.",
+  "verdict": "approve"
+ }
+}
