@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5212,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9e04e3a06db9617eca127ce368506b2498217e9a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The workflow now correctly has one `save-if` in each affected cache mapping, but its repeated claim that this posture is pinned by `scripts/tests/test_mergequeue_cache_posture.py` remains stronger than the test provides. That test's `with_value` helper returns the first matching key and never rejects a second non-comment key, so the exact duplicate-key regression from round 1 would still pass.",
+    "file": ".github/workflows/ci.yml",
+    "fix_hint": "Extend the structural posture test to count non-comment `save-if:` entries in each rust-cache `with:` mapping and assert the count is exactly one. This can be a follow-up because the workflow mappings in this revision are already deduplicated.",
+    "severity": "minor",
+    "title": "Cited posture test still does not pin mapping-key uniqueness"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 removes the duplicate `save-if` entries from both coverage-engine cache mappings, resolving the prior major YAML-validity issue. The coverage-shard cache consolidation is internally consistent: all measurement shards now use one `shared-key`, saving remains main-only, and workspace artifacts are not claimed to be shared. One prior minor test-coverage gap remains: the cited posture test still accepts duplicate mapping keys because it returns the first match without checking uniqueness. This does not make the corrected workflow itself unsound, so approval is appropriate with the minor follow-up noted.",
+  "verdict": "approve"
+ }
+}
