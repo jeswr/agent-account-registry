@@ -1968,6 +1968,15 @@ jobs:
         if: ${{ inputs.mode == 'review' && steps.reverify.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
+          # [registry #1345] The freshness gate revalidates against `refs/heads/<head.ref>` — the
+          # store dispatch resolved and the worker fetched/pushed — instead of the pulls API's
+          # lagging COPY of it. That git-database read is not in the outcome App token's scope
+          # (issues + pull-requests; "no target contents" is the point of that mint), so it takes
+          # the token this repo already uses for idempotent TARGET READS, exactly as
+          # dispatch-claim.py reads compare/contents/check-runs. Its own name, not
+          # REGISTRY_ALERT_TOKEN's: one literal, one meaning (#958). Unset => the read fails =>
+          # the outcome DEFERS on an unproven head; it never falls back to the pulls copy.
+          TARGET_READ_TOKEN: ${{ github.token }}
           REGISTRY_REPO: ${{ github.repository }}
           REGISTRY_ALERT_TOKEN: ${{ github.token }}
           # Privacy routing (locked decision 22c): maintainer-set ALERT_REPO sends the
@@ -2116,6 +2125,9 @@ jobs:
         if: ${{ inputs.mode == 'fix' && needs.run.outputs.fix_done == 'success' }}
         env:
           GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
+          # [registry #1345] Same branch-ref freshness read as the review outcome above, and the
+          # same token split — see the comment there.
+          TARGET_READ_TOKEN: ${{ github.token }}
           REGISTRY_REPO: ${{ github.repository }}
           REGISTRY_ALERT_TOKEN: ${{ github.token }}
           ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}

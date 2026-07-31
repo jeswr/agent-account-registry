@@ -5873,10 +5873,95 @@ def reconcile_dispatch_head(head_branch, pull_api_sha, branch_ref, log=print):
             "the pulls API copy of the head (that two-store mismatch is registry #1345)")
     if ref_sha != pull_api_sha:
         log(f"::warning::head store disagreement on refs/heads/{head_branch}: the pulls API "
-            f"reports head.sha={pull_api_sha}, the branch ref is {ref_sha}. Dispatching against "
-            "the BRANCH REF — the ref the worker fetches, edits and pushes back to (registry "
-            "#1345).")
+            f"reports head.sha={pull_api_sha}, the branch ref is {ref_sha}. Using the BRANCH REF "
+            "— the ref the worker fetches, edits and pushes back to (registry #1345).")
     return ref_sha
+
+
+TARGET_READ_TOKEN_ENV = "TARGET_READ_TOKEN"
+
+
+def target_read_env():
+    """The env override for an idempotent READ of the TARGET repo's GIT DATABASE, or ``None``.
+
+    WHY A SECOND TOKEN, and why this direction. The outcome job's ambient `GH_TOKEN` is the
+    outcome-scoped App token, minted with `issues`+`pull-requests` only — deliberately, and the
+    step that mints it says so in its NAME ("no target contents"); `contents` lives on the
+    arm-scoped token alone. A `git/ref` read under it would 403. So the read takes the token this
+    repo already uses for target reads: idempotent target READS run under the registry workflow
+    token (`github.token`), target MUTATIONS under the narrow App token. That split is not
+    invented here — `dispatch-claim.py` reads `…/compare/…`, `…/contents/…` and
+    `…/commits/…/check-runs` on target repos under exactly that token today, and
+    `_run_target_helper` states the rule: "the ambient GH_TOKEN stays the registry workflow
+    token". Widening the outcome App token instead would grant a mutation credential a new scope
+    to buy one read.
+
+    UNSET => ``None`` => no override, i.e. the read runs under whatever `GH_TOKEN` is ambient.
+    That keeps a manual `worker-pr.py review-outcome` under a human PAT working exactly as it did;
+    under the App token it simply fails the read, which `outcome_head_ref_sha` turns into a DEFER
+    on an unproven head — never a fallback to the pulls copy. review-fix.yml supplies it on both
+    outcome steps (pinned by worker-live.sh's #1345 seam checks)."""
+    token = os.environ.get(TARGET_READ_TOKEN_ENV, "")
+    return {"GH_TOKEN": token} if token else None
+
+
+def outcome_head_ref_sha(repo, live, log=print):
+    """The live head an OUTCOME must revalidate against: the head BRANCH REF's commit, or ``""``.
+
+    ``live`` is the fresh `GET /repos/{repo}/pulls/{n}` payload the outcome already read.
+
+    THE OTHER HALF OF #1345, and without it the first half only MOVES the loop. `resolve` now
+    publishes the branch ref and `worker-live.sh` binds `reviewed_sha` to `git rev-parse HEAD` of
+    that same ref — but both outcome reducers re-derived "the live head" from a fresh PULLS read,
+    i.e. from the other store. While the pulls copy lags (over an hour on sparq #4212) that
+    comparison returns `head-moved` for a head that never moved: the round is VOIDED, no
+    findings/label/state are applied, reviewed-sha is left unbound, and the sweep re-derives a
+    byte-identical world next tick — the same fixed point as the pre-flight abort, one layer
+    later and now costing a whole completed review per tick. So the outcome asks the SAME store
+    the worker operated on.
+
+    Nothing else about the freshness gate moves: state, author, draft, the hold surfaces and the
+    EXACT-sha equality are all still read/enforced by the caller from `live`. This narrows WHICH
+    store answers "what is the head"; it does not relax what must be true of the answer.
+
+    FAIL CLOSED, and NEVER toward the pulls copy. Every way of not getting an authoritative
+    commit — a fork head (whose `refs/heads/<ref>` names a DIFFERENT repository's branch, so
+    reading it here would compare this PR against an unrelated same-named branch), an unsafe ref
+    name (it reaches a URL path), a deleted/unreadable ref, a payload that is not a commit —
+    returns ``""``, which `revalidate_outcome_head` can only classify as `malformed-head`: DEFER
+    with the round still CHARGED, zero mutation, so the budget still exhausts to a human park
+    instead of the failure recurring forever. Returning the pulls sha on any of these paths would
+    reinstate exactly the two-store mismatch this exists to remove; ``""`` cannot equal any
+    reviewed sha, so no outcome can ever be applied off an unproven head. The refusal is LOGGED —
+    on #4212 the disagreement was invisible until the two values were compared by hand."""
+    head = (live if isinstance(live, dict) else {}).get("head")
+    head = head if isinstance(head, dict) else {}
+    head_repo = head.get("repo")
+    if (head_repo if isinstance(head_repo, dict) else {}).get("full_name") != repo:
+        log("::warning::refusing to resolve the live head: this pull request's head repository is "
+            f"not {repo} (fork or unreadable). The outcome defers on an unproven head rather than "
+            "falling back to the pulls API copy (registry #1345).")
+        return ""
+    branch = str(head.get("ref", ""))
+    if not safe_head_ref(branch):
+        log("::warning::refusing to resolve the live head: the pull request head branch is not a "
+            "safe ref name. The outcome defers on an unproven head rather than falling back to "
+            "the pulls API copy (registry #1345).")
+        return ""
+    try:
+        return reconcile_dispatch_head(
+            branch, str(head.get("sha", "")),
+            _gh_json(["api", f"repos/{repo}/git/ref/heads/{branch}"], env=target_read_env()),
+            log=log)
+    except WorkerPrError as exc:
+        # The ref did not answer with a commit — deleted (a PR merged mid-review), unreadable, or
+        # a payload of the wrong shape. Unanswerable is NOT "unchanged": defer on an unproven
+        # head. (A closed PR still reports `closed` rather than this, because
+        # revalidate_outcome_head checks state before it looks at the head at all.)
+        log(f"::warning::could not resolve refs/heads/{branch} in {repo} ({exc}); the outcome "
+            "defers on an unproven head rather than falling back to the pulls API copy "
+            "(registry #1345).")
+        return ""
 
 
 # ---- composite outcomes (thin workflow steps, testable decisions) --------------------------------
@@ -5959,9 +6044,14 @@ def review_outcome(args):
     # DEFER on any mismatch: mutate nothing, leave reviewed-sha unbound (the workflow keys the
     # bind step off decision != 'stale'), and let the sweep re-review the new head — reviewed
     # sha != live head guarantees it is re-enumerated.
+    # [registry #1345] The head comes from the BRANCH REF, not from `live["head"]["sha"]`: this
+    # comparison's other side (`--reviewed-sha`) is `git rev-parse HEAD` of the ref the worker
+    # fetched, and dispatch resolved that same ref, so reading the pulls copy here would compare
+    # two stores that lag each other and void a round for a head that never moved — see
+    # outcome_head_ref_sha. State/author/draft still come from this same fresh read.
     freshness = revalidate_outcome_head(
         live.get("state"), str((live.get("user") or {}).get("login", "")),
-        live.get("draft"), str((live.get("head") or {}).get("sha", "")),
+        live.get("draft"), outcome_head_ref_sha(args.repo, live),
         args.reviewed_sha, args.bot_login,
         self_attested=getattr(args, "self_attested", False))
     if freshness != "ok":
@@ -6128,9 +6218,13 @@ def fix_outcome(args):
     # head is something else, another push raced this fix — a stale `re-review` or `needs-user`
     # would act on a head this run never touched (terminally parking a replacement head). DEFER:
     # mutate nothing; the sweep re-derives the current head.
+    # [registry #1345] ...and from the BRANCH REF, for the same reason as review_outcome above —
+    # doubly so here, because `--reviewed-sha` on this lane is the sha this fix's own push just
+    # created, and the pulls copy is at its most stale immediately after a push. See
+    # outcome_head_ref_sha; state/author/draft still come from this same fresh read.
     freshness = revalidate_outcome_head(
         live.get("state"), str((live.get("user") or {}).get("login", "")),
-        live.get("draft"), str((live.get("head") or {}).get("sha", "")),
+        live.get("draft"), outcome_head_ref_sha(args.repo, live),
         args.reviewed_sha, args.bot_login)
     if freshness != "ok":
         _write_outputs({"decision": "stale", "stale_reason": freshness})
@@ -7959,6 +8053,31 @@ def _self_test():
             ("x.lock", False), ("has space", False), ("semi;colon", False), ("dollar$sign", False),
     ):
         check(f"[#1345] safe_head_ref({_h1345_ref!r})", safe_head_ref(_h1345_ref), _h1345_want)
+    # [#1345 review r1] THE TOKEN SPLIT the outcome-side branch-ref read depends on. The outcome
+    # job's ambient GH_TOKEN is the App token minted WITHOUT target contents, so the git-database
+    # read must run under the registry workflow token instead — and an EMPTY value must be treated
+    # as absent, never handed to `gh` as an empty GH_TOKEN (which authenticates as nobody and
+    # fails in a way that reads like a permission bug).
+    # The NAME is one literal with two definitions — this constant and review-fix.yml's `env:` key
+    # (#958). Every row below reads the constant, so a rename would keep them all green while the
+    # workflow kept exporting the old key and the read silently lost its token. Pin the literal
+    # here; worker-live.sh pins the other copy, per outcome step, exact-match.
+    check("[#1345] the target-read token env key is exactly what review-fix.yml exports",
+          TARGET_READ_TOKEN_ENV, "TARGET_READ_TOKEN")
+    _h1345_saved_token = os.environ.pop(TARGET_READ_TOKEN_ENV, None)
+    try:
+        check("[#1345] target_read_env: UNSET => no override (a manual run keeps its own token)",
+              target_read_env(), None)
+        os.environ[TARGET_READ_TOKEN_ENV] = ""
+        check("[#1345] ...EMPTY is treated as unset, never as an empty GH_TOKEN",
+              target_read_env(), None)
+        os.environ[TARGET_READ_TOKEN_ENV] = "t-1345-pure"
+        check("[#1345] ...SET => the git-database read runs under the target-read token",
+              target_read_env(), {"GH_TOKEN": "t-1345-pure"})
+    finally:
+        os.environ.pop(TARGET_READ_TOKEN_ENV, None)
+        if _h1345_saved_token is not None:
+            os.environ[TARGET_READ_TOKEN_ENV] = _h1345_saved_token
 
     # GUARD 9 — the YAML SEAM, structurally on parsed nodes. A substring or `count(...) == N`
     # assertion over workflow text does not catch `if: false`, `continue-on-error: true`, a deleted
@@ -8445,11 +8564,17 @@ def _self_test():
     try:
         # [round-5 P1] the outcome now probes the live hold surfaces before mutating; this
         # block exercises the budget machinery, so its fake serves an UNHELD PR + source issue.
+        # [#1345] ...and an UNMOVED head: the branch ref (which the outcome now revalidates
+        # against) answers with the same sha the pulls copy carries, so this block keeps
+        # exercising the budget machinery and nothing else.
         wiring_globals["_gh_json"] = lambda args, **_kw: (
             {"labels": []} if "/issues/" in (args[1] if len(args) > 1 else "")
+            else {"object": {"sha": "b" * 40, "type": "commit"}}
+            if "/git/ref/heads/" in (args[1] if len(args) > 1 else "")
             else {"state": "open", "labels": [], "draft": True,
                   "user": {"login": bot},
-                  "head": {"ref": "sparq-agent/issue-7-1-1", "sha": "b" * 40}})
+                  "head": {"ref": "sparq-agent/issue-7-1-1", "sha": "b" * 40,
+                           "repo": {"full_name": "o/r"}}})
         wiring_globals["_paginated_comments"] = (
             lambda repo, pr: fake_state.get("comments", []))
         wiring_globals["set_review_state"] = (
@@ -12227,6 +12352,10 @@ def _self_test():
     # `oc_reasons` by both runners: a stale kwargs list would let a #869 row read the PREVIOUS
     # run's park and pass for the wrong reason.
     oc_kwargs = []
+    # [registry #1345] every `gh api` READ this harness served, as (path, env-override) — the
+    # material for the token-split call-site check (the branch-ref read is the ONLY one that may
+    # leave the outcome-scoped App token).
+    oc_reads = []
     emitted_injection_prose = {}
     real_oc = {name: globals()[name] for name in (
         "_gh_json", "_paginated_comments", "set_review_state", "needs_user",
@@ -12235,13 +12364,27 @@ def _self_test():
 
     def oc_gh_json(args, **_kw):
         path = args[1] if len(args) > 1 else ""
+        # [#1345] Which token each read ran under, for the call-site split asserted below.
+        oc_reads.append((path, _kw.get("env")))
         if "/issues/" in path:
             return {"labels": [{"name": name} for name in oc_state.get("issue_labels", ())]}
+        # [#1345] THE HEAD BRANCH REF — the store `resolve` dispatched against, the store
+        # `worker-live.sh` fetched/edited/pushed, and therefore the store both outcomes now
+        # revalidate against. It DEFAULTS to agreeing with the pulls copy below, so every
+        # pre-existing expectation in this block is unchanged; `branch_ref` drives the two apart
+        # in either direction, and `ref_unreadable` makes the ref refuse to answer at all.
+        if "/git/ref/heads/" in path:
+            if oc_state.get("ref_unreadable"):
+                raise WorkerPrError("GitHub API request failed for " + path)
+            return {"object": {"sha": oc_state.get("branch_ref",
+                                                   oc_state.get("head", "b" * 40)),
+                               "type": "commit"}}
         return {"state": oc_state.get("state", "open"),
                 "draft": oc_state.get("draft", True),
                 "user": {"login": oc_state.get("login", "sparq[bot]")},
                 "labels": [{"name": name} for name in oc_state.get("labels", ())],
-                "head": {"ref": "sparq-agent/issue-7-1-1",
+                "head": {"ref": oc_state.get("head_ref", "sparq-agent/issue-7-1-1"),
+                         "repo": {"full_name": oc_state.get("head_repo", "o/r")},
                          "sha": oc_state.get("head", "b" * 40)}}
 
     def run_review_outcome(verdict, labels=(), issue_labels=(), injection=False,
@@ -12326,6 +12469,68 @@ def _self_test():
         check("unheld injection outcome still parks needs-user",
               (oc_calls, oc_outputs.get("decision")),
               (["post-findings", "needs-user"], "needs-user"))
+
+        # ---- [registry #1345 r1] ONE SOURCE OF TRUTH FOR "THE HEAD", AT THE OUTCOME ---------
+        # `resolve` dispatches against the branch ref and `--reviewed-sha` is `git rev-parse HEAD`
+        # of that same ref. An outcome that re-derived the head from the PULLS copy therefore
+        # compared two stores that lag each other: during the #4212-class lag it answers
+        # `head-moved` for a head that never moved, VOIDS the round, applies nothing, leaves
+        # reviewed-sha unbound — and the sweep re-derives an identical world next tick. The loop
+        # would merely have moved from the worker pre-flight to here, at a whole review per tick.
+        # These two runs are exact mirrors of each other, and each kills the other's mutant.
+        #
+        # (i) THE DEFECT: the pulls copy is STALE and the branch ref is the reviewed commit ->
+        #     the outcome APPLIES. Reading `live["head"]["sha"]` here (the shipped behaviour
+        #     before this fix, and the tempting revert) turns this row red with `head-moved`.
+        run_review_outcome("request_changes", head="c" * 40, branch_ref="b" * 40)
+        check("[#1345] a lagging pulls-API head does NOT void an outcome whose BRANCH REF is the "
+              "reviewed commit",
+              (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
+              (["post-findings", "state:changes"], "changes", None))
+        # (ii) THE MIRROR, which is what keeps (i) from being a blanket relaxation of freshness:
+        #      the BRANCH REF genuinely advanced while the pulls copy still reports the reviewed
+        #      sha -> STALE, round voided, nothing applied. A fix that simply stopped checking the
+        #      head, or that kept reading the pulls copy, turns this row red.
+        run_review_outcome("request_changes", branch_ref="d" * 40)
+        check("[#1345] ...and a genuinely advanced BRANCH REF is still stale, even while the "
+              "pulls copy still reports the reviewed sha",
+              (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
+              (["round-void"], "stale", "head-moved"))
+        # (iii) FAIL CLOSED, never toward the pulls copy. In every row below the PULLS head IS the
+        #       reviewed sha, so a resolver that fell back to it — on a fork head, on an unsafe ref
+        #       name, or when the ref refuses to answer — would APPLY the outcome and turn the row
+        #       red. `""` cannot equal any reviewed sha, so the only reachable verdict is
+        #       `malformed-head`: defer, round still CHARGED (no round-void row), zero mutation.
+        for oc_1345_over, oc_1345_name in (
+                ({"head_repo": "someone-else/r"}, "a FORK head"),
+                ({"head_repo": None}, "an unreadable head repository"),
+                ({"head_ref": "../../etc/passwd"}, "an unsafe head ref name"),
+                ({"head_ref": ""}, "an empty head ref name"),
+                ({"ref_unreadable": True}, "a ref that cannot be read (deleted/5xx)"),
+                ({"branch_ref": "not-a-sha"}, "a ref that resolved to no commit")):
+            run_review_outcome("request_changes", **oc_1345_over)
+            check(f"[#1345] {oc_1345_name} DEFERS on an unproven head instead of falling back to "
+                  "the pulls API copy",
+                  (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
+                  ([], "stale", "malformed-head"))
+        # (iv) ...and the CALL SITE's token split, which the direct test of `target_read_env`
+        #      cannot reach (AGENTS.md item 2a — it can only pin that function's own return). The
+        #      outcome's ambient token is the App token minted WITHOUT target contents, so
+        #      dropping `env=` from that one call puts the git-database read back under it: a 403
+        #      that this function converts into `malformed-head`, deferring EVERY outcome forever.
+        #      The PR/issue reads must NOT carry it — they are what the App token exists for.
+        os.environ[TARGET_READ_TOKEN_ENV] = "t-1345-callsite"
+        try:
+            oc_reads.clear()
+            run_review_outcome("request_changes")
+        finally:
+            os.environ.pop(TARGET_READ_TOKEN_ENV, None)
+        check("[#1345] the BRANCH-REF read is the one read that leaves the outcome App token",
+              [env for path, env in oc_reads if "/git/ref/heads/" in path],
+              [{"GH_TOKEN": "t-1345-callsite"}])
+        check("[#1345] ...and every PR/issue read still runs under the ambient outcome token",
+              sorted({repr(env) for path, env in oc_reads if "/git/ref/heads/" not in path}),
+              ["None"])
 
         # ---- [registry #657] THE ORCHESTRATOR CLASS, THROUGH THE REAL OUTCOME PATH -------
         # (a) BASELINE, and the whole reason the outcome leg is part of the #657 enable
@@ -12447,6 +12652,27 @@ def _self_test():
         check("stale-head fix outcome defers with no mutation",
               (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
               ([], "stale", "head-moved"))
+        # [registry #1345 r1] ...and it reads the SAME store, on the lane the #4212 incident
+        # actually looped in (five consecutive FIX runs). `--reviewed-sha` here is the sha this
+        # fix's own push just created, so the pulls copy is at its most stale exactly when this
+        # runs. Both directions, mirroring the review rows above: a lagging pulls copy must not
+        # defer a fix whose branch ref IS the pushed commit, and a genuinely advanced branch ref
+        # (another push raced this fix) must still defer.
+        run_fix_outcome(head="c" * 40, branch_ref="b" * 40)
+        check("[#1345] a lagging pulls-API head does NOT defer a fix outcome whose BRANCH REF is "
+              "the pushed commit",
+              (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
+              (["state:needs"], "re-review", None))
+        run_fix_outcome(branch_ref="d" * 40)
+        check("[#1345] ...and a fix outcome whose BRANCH REF advanced past the pushed commit "
+              "still defers with no mutation",
+              (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
+              ([], "stale", "head-moved"))
+        run_fix_outcome(ref_unreadable=True)
+        check("[#1345] ...and an unreadable head ref defers the fix outcome instead of falling "
+              "back to the pulls API copy",
+              (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
+              ([], "stale", "malformed-head"))
         # a HELD PR still drops as 'hold' even when the head also moved (hold is checked first)
         run_review_outcome("request_changes", labels=("review:needs-user",), head="d" * 40)
         check("hold wins over stale-head (hold checked first)",

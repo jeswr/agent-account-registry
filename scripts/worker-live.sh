@@ -4636,6 +4636,37 @@ handed the differential an EMPTY predicate that accepts everything)" "$case_rc" 
   chk "#1345: ...over a table that exercises BOTH verdicts (an all-reject table agrees vacuously)" \
     "$([[ "$h1345_py" == *ok* && "$h1345_py" == *no* ]] && echo both || echo one-sided)" "both"
 
+  # --- [registry #1345 review r1] THE OUTCOME SIDE'S TOKEN. Dispatch resolving the branch ref only
+  # MOVES the loop unless the outcome revalidates against that same store — so worker-pr's outcome
+  # reducers now read `refs/heads/<head.ref>` too. That is a git-DATABASE read, and the outcome job's
+  # ambient token is the outcome-scoped App token, minted `issues`+`pull-requests` with NO target
+  # contents (the arm-scoped mint is the one that carries contents). Under it the read 403s and
+  # worker-pr fails closed — deferring EVERY outcome, forever. So both outcome steps hand it the
+  # registry workflow token, the same target-read/target-mutate split dispatch-claim.py uses.
+  #
+  # Pinned PER STEP and BY VALUE: a repo-wide `grep -c` would pass with both copies on one step, and
+  # a containment check would pass with the App token substituted — which is the 403 this prevents.
+  local rf_step rf_step_block
+  for rf_step in "Apply the review outcome (findings, labels, escalation)" \
+                 "Apply the fix outcome (host-side markers, labels, escalation)"; do
+    rf_step_block="$(awk -v want="      - name: $rf_step" \
+      '$0 == want { on = 1; next } on && /^      - name: / { exit } on' "$rf_wf")"
+    # The extraction FIRST: a renamed step yields an empty block, and every value assertion over an
+    # empty block passes vacuously (AGENTS.md item 4's masking shape at the YAML seam).
+    chk "#1345: the '$rf_step' step block was really extracted" \
+      "$([[ -n "$rf_step_block" ]] && echo found || echo empty)" "found"
+    chk "#1345: ...and it hands the branch-ref read the REGISTRY WORKFLOW token (the outcome App \
+token has no target contents, so the read would 403 and defer every outcome)" \
+      "$(grep -Ec '^          TARGET_READ_TOKEN: \$\{\{ github\.token \}\}$' <<< "$rf_step_block" \
+          || true)" "1"
+  done
+  # NON-VACUITY of the extractor itself: a step that does not exist must yield NOTHING, otherwise
+  # the two `found` rows above are measuring the whole file rather than one step.
+  chk "#1345: ...and the step extractor matches nothing for a step name that does not exist" \
+    "$(awk -v want="      - name: no such step in this workflow" \
+        '$0 == want { on = 1; next } on && /^      - name: / { exit } on' "$rf_wf" \
+        | wc -l | tr -d ' ')" "0"
+
   # --- [issue #232 review r2] ...and the half of the containment the ROUTING scan above cannot
   # measure. Which steps are HANDED `steps.prepare.outputs.credential_path` is a routing fact; which
   # steps can FIND the credential is a FILESYSTEM fact. worker-prep materializes it under
