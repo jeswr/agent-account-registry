@@ -11,6 +11,8 @@
 > on the `ledger` data-plane branch, resolved by ONE directory listing per target repo per tick.**
 > §5 states the linearization rule and its recovery invariant, because per-path CAS alone does
 > *not* serialize a PR-level binding and an earlier draft of this record wrongly claimed it did.
+> §5 also states the per-operation identity `{op}`, without which two writers that agree on the
+> binding collide permanently on one immutable path and a retry fabricates a generation.
 > §6 is the
 > maintainer's confirm-or-overrule. §7 states what must be true before any code is written, and §8
 > is the honest list of what this record does *not* settle.
@@ -154,17 +156,51 @@ Two repairs are possible, and choosing between them is this record's actual deci
 
 ## 5. Recommendation — (b′): write-once, generation-fenced, one listing per repo
 
-**Layout.** `orchestration/reviewed-sha/{owner}/{repo}/{pr}-{gen}-{value}.json` on `ledger`, where
-`{value}` is either the 40-hex reviewed head or the literal `none`, and `{gen}` is a zero-padded
-monotonic generation counter. The JSON body carries the audit detail (round, run id, verdict record
-back-link); **the binding itself is entirely in the filename.** Records for a PR are selected by
-the exact `{pr}-` prefix — `1-` never matches `12-`, since `{pr}` is unpadded and `-` is the
-separator.
+**Layout.** `orchestration/reviewed-sha/{owner}/{repo}/{pr}-{gen}-{value}-{op}.json` on `ledger`,
+where `{value}` is either the 40-hex reviewed head or the literal `none`, `{gen}` is a zero-padded
+monotonic generation counter, and `{op}` is the **operation identity** defined immediately below.
+The JSON body carries the audit detail (round, run id, verdict record back-link); **the binding
+itself is entirely in the filename**, and the resolver never reads `{op}` except as the tie-break
+key, so resolution is defined independently of it. Records for a PR are selected by the exact
+`{pr}-` prefix — `1-` never matches `12-`, since `{pr}` is unpadded and `-` is the separator.
+
+**Why the path cannot be keyed by the triple alone.** With a `{pr}-{gen}-{value}` path, two writers
+that list the same maximum generation and intend the *same* value — two lanes both retracting to
+`none`, or two runs both binding the same head — target the SAME path with DIFFERENT bytes, because
+the body carries per-run audit detail. That is neither the two-filename tie step 3 handles nor a
+retryable generation race: `_registry_put_file`'s create-or-keep contract (`worker-pr.py:2683-2686`)
+raises `RegistryRecordConflictError` — a PERMANENT provenance conflict, by design — for an existing
+different body. The desired binding lands and the writer fails anyway, unrecoverably. So the path
+must carry an identity that makes distinct operations distinct objects.
+
+**`{op}`.** A short hex digest of `(run identity, lane, pr, value)`, where *run identity* is the
+workflow run WITHOUT its attempt — the same run-vs-attempt split `_run_key_identity`
+(`worker-pr.py:2592-2606`) already draws — and *lane* is the fixed call site (`bind`,
+`carry-forward`, `fix-defer`, `stranded`, `readmit`). Two properties are required and both are
+load-bearing:
+
+- **stable across every retry and restart of one logical bind**, so a re-run of a failed job
+  re-derives the same digest — this is what makes step 0 work;
+- **distinct across independent binds**, so a later run rebinding the same value is a new operation
+  with its own record rather than a silent no-op.
+
+`{op}` is derived *inside* the write primitive and never supplied by callers, for the same reason
+the delete guard is (§7): a caller that passes an unstable key loses idempotence silently.
+
+**The body must be a pure function of the operation.** A retry of one operation targets one path,
+and create-or-keep only reads as "keep" when the bytes match. Anything that varies between attempts
+of the same operation — a wall-clock timestamp, an attempt counter — is therefore FORBIDDEN in the
+body, with one exception: the record carries `recorded_at_run` in the `<run>.<attempt>` shape and
+the writer passes `volatile_fields={"recorded_at_run"}`, exactly as provenance does (issue #131,
+`_registry_record_equivalent` at `worker-pr.py:2633`), so a re-run that flips `100.1` → `100.2` is
+an idempotent keep while a DIFFERENT run id still fails closed as a divergence.
 
 Two properties do the work, and the second is the one an earlier draft of this record was missing:
 
 - every record is genuinely write-once, so `_registry_put_file`'s create-or-keep contract is
-  exactly right and a replayed bind is idempotent for free;
+  exactly right — but a replayed bind is idempotent because of `{op}` and step 0, **not "for
+  free"**: an earlier draft claimed the replay was a byte-identical keep while step 1
+  unconditionally recomputed `max(gen)+1`, which sends the replay to a *new* path;
 - **retraction is a `none` record, never a deletion**, and **no delete may ever remove the winning
   record at the maximum generation**. Absence therefore means *never bound*, and cannot be produced
   by an interrupted or racing transition.
@@ -181,18 +217,36 @@ plus the never-delete-the-winner invariant below, not the contents-API precondit
 
 **Write** — bind PR N to value V (a 40-hex head, or `none` to retract):
 
-1. Re-list the directory — never write from the tick's cached map — and let
-   `g = max(gen over records of N) + 1`, or `0` if there are none.
-2. `_registry_put_file` at `{N}-{g}-{V}.json`, unchanged and unmodified. The path is unique to the
-   triple, so a rerun of the same intent is a byte-identical keep.
-3. Re-list. Exactly one record at gen `g` ⇒ landed. Two or more ⇒ a concurrent bind at the same
+0. Derive `{op}`, re-list the directory — never write from the tick's cached map — and **look for a
+   record for N carrying this `{op}`. If one exists, the operation has already landed: return it
+   and write nothing.** This is the step that makes a retry idempotent. Step 1 recomputes the
+   generation, so without it a PUT whose response was lost, or a job that restarted before
+   recording completion, would list its own landed record and write the same intent again at a new
+   generation and a new path — fabricating an audit transition, consuming a generation and a
+   directory entry, and invalidating the steady-state assumption behind the 1,000-entry ceiling
+   below. **Invariant: at most one record per `(N, op)`.**
+1. From that same listing, let `g = max(gen over records of N) + 1`, or `0` if there are none.
+2. `_registry_put_file` at `{N}-{g}-{V}-{op}.json`, unchanged and unmodified. The path is unique to
+   the quadruple and the body is a pure function of the operation, so the one interleaving that can
+   still find an existing file — two concurrent attempts of the SAME operation, both past step 0 —
+   is a genuine byte-identical keep, not a conflict.
+3. Re-list. Exactly one record at gen `g` ⇒ landed. Two or more at gen `g` **all carrying the same
+   `{value}`** ⇒ also landed: independent operations that agree are agreement, not ambiguity, the
+   PR resolves to that value (see the table below) and collapsing the tie is GC rather than
+   correctness. Two or more with DIFFERING values ⇒ a genuine concurrent bind at the same
    generation: **the lexicographically smallest filename at the maximum generation wins**, a rule
    every observer computes identically from the listing alone. A loser deletes ONLY ITS OWN record,
    and only while it can see the winner in that same listing.
-4. If we lost and our intent is still live, re-derive it from live state and retry from (1) at a
+4. If we lost and our intent is still live, re-derive it from live state and retry from (0) at a
    fresh generation — the "re-read and re-derive the expected SHA every time" discipline
    `select-and-claim.py` already uses, under `scripts/ledger_retry.py`'s classifier and wait
    schedule. Never a hand-rolled sleep loop; never `run_gh` around any of these writes.
+   **Step 3's own-record delete is what re-arms step 0 here**: rediscovery asks only "did my PUT
+   land?", never "is my binding current", so a rebind under the same `{op}` is possible only once
+   the losing record is gone. If that delete FAILS, the operation **defers** rather than writing a
+   second record under the same `{op}` — the `(N, op)` invariant is not negotiable, and the next
+   tick is a different run and therefore a different `{op}`, which rebinds cleanly. Deferring costs
+   a tick; violating the invariant costs rediscovery, permanently.
 5. GC, which is never load-bearing: a writer that can see a record for N at a higher generation in
    the same listing may delete records for N at strictly lower generations, each with its own
    read-sha precondition. A GC delete that fails leaks an inert record — it can never change a
@@ -219,7 +273,8 @@ one layout that does not make an already-overdrawn budget worse.
 | none | `unbound` | never bound; NOT reachable as a race artifact, by the invariant above |
 | one at max gen, 40-hex value | bound to that sha | the current binding |
 | one at max gen, value `none` | retracted | the explicit tombstone |
-| two or more tied at max gen | **UNKNOWN — never acts** | a same-generation bind race, not yet collapsed |
+| two or more tied at max gen, ALL the same value | bound to that value (or retracted, if `none`) | independent operations that agree; `{op}` makes them distinct objects rather than one colliding path, and every observer reads the same value |
+| two or more tied at max gen with DIFFERING values | **UNKNOWN — never acts** | a same-generation bind race, not yet collapsed |
 
 Readers may collapse `unbound` and retracted into today's single "no reviewed sha" decision — it is
 the same outcome at all of R1-R10. The distinction exists for the *resolver*, not the readers: a
@@ -238,10 +293,13 @@ defined order, or be UNKNOWN and recoverable. The cases:
 | interleaving | reachable state | resolves |
 |---|---|---|
 | bind/bind, W2 lists after W1's create | records at `g` and `g+1` | max gen = W2, the later intent. W1's record is inert and GC-able |
-| bind/bind, both list before either creates | two records tied at `g` | UNKNOWN for the tick; each writer sees the tie on re-list, the lexicographic loser deletes its OWN record, resolution collapses to the winner |
-| bind/retract | identical to bind/bind — a retraction is a `none` record, so neither writer ever deletes the peer's record | max gen, or a tie resolved as above |
+| bind/bind, both list before either creates, DIFFERENT values | two records tied at `g` | UNKNOWN for the tick; each writer sees the tie on re-list, the lexicographic loser deletes its OWN record, resolution collapses to the winner |
+| bind/bind, both list before either creates, SAME value (two lanes both retracting to `none`, or two runs binding the same head) | two records tied at `g`, distinct `{op}`, same value | resolves to that value immediately — no permanent path conflict, no UNKNOWN, and nothing has to collapse it |
+| bind/retract | identical to bind/bind — a retraction is a `none` record, so neither writer ever deletes the peer's record | max gen, or a differing-value tie resolved as above |
+| a create lands but the caller observes failure (lost response, job restart) and retries | one record, unchanged | step 0 rediscovers it by `{op}`: no second record, no new generation, no fabricated audit transition |
+| two concurrent attempts of the SAME operation both pass step 0 | one record | same path, and the body is a pure function of the operation, so the second PUT is create-or-keep's byte-identical keep (a bumped `recorded_at_run` attempt is the declared volatile field) |
 | GC delete fails, or writer dies after step 5 | leaked lower-gen records | no effect: resolution reads only the max generation |
-| writer dies between step 2 and its losing delete | a tie at max gen that no live writer will collapse | **UNKNOWN indefinitely** — see below |
+| writer dies between step 2 and its losing delete | a DIFFERING-value tie at max gen that no live writer will collapse | **UNKNOWN indefinitely** — see below |
 
 The same-generation tie-break may award the binding to the *earlier* intent. That is acceptable
 precisely because the loser does not simply resend: it re-derives from live state and rebinds at
@@ -250,7 +308,9 @@ precisely because the loser does not simply resend: it re-derives from live stat
 **The one unrecoverable-without-help state, stated plainly.** An earlier draft claimed the
 multi-record window "is bounded by one tick and resolves without intervention". That is false: it
 holds only while a writer survives to run step 3. A writer that dies between its create and its
-losing delete leaves a tie at the maximum generation that nothing collapses. So **UNKNOWN must be a
+losing delete leaves a **differing-value** tie at the maximum generation that nothing collapses.
+(A same-value tie is not in this class: it already resolves, so a dead writer there costs nothing
+but a leaked entry.) So **UNKNOWN must be a
 swept state**: a groom lane resolves ties whose record set is unchanged across N ticks by applying
 the same deterministic tie-break, and alerts. That sweep is a correctness requirement of this
 migration, not an optimisation — without it a single dead writer parks one PR's binding in
@@ -269,7 +329,9 @@ negative is merely late.
 
 **Directory-listing ceiling.** The contents API returns at most 1,000 entries for a directory. With
 one live record per open PR and best-effort GC of superseded generations, steady state is
-O(open PRs) — two orders of magnitude clear. But GC is deliberately not load-bearing, so leaked
+O(open PRs) — two orders of magnitude clear. That bound rests on step 0: records accumulate per
+distinct *operation*, not per *attempt*, and a protocol whose retries each burn a generation has no
+steady state to speak of. But GC is deliberately not load-bearing, so leaked
 lower-generation records accumulate at whatever rate deletes fail; the ceiling is a real liability
 and the migration owes it a bound: fail closed (treat the whole listing as UNKNOWN and alert) at a
 low-water mark well under 1,000, rather than silently truncating. The same groom lane that sweeps
@@ -316,12 +378,28 @@ A single PR that does all four is not reviewable and should be refused.
   AND refuses any delete the §5 rule does not permit: never a record at the maximum generation
   unless it is the caller's own and a lexicographically smaller sibling is present in the same
   listing. The guard lives in the primitive so no caller can re-derive it wrongly.
+- **`{op}` is derived in the write primitive, and a test proves the path is not keyed by the triple
+  alone.** Two writers that list the same maximum generation, intend the SAME value, and carry
+  different audit metadata must BOTH converge on the intended binding with neither raising
+  `RegistryRecordConflictError`. Dropping `{op}` from the path must turn that test red — with a
+  triple-keyed path both writers target one immutable object and the second takes a permanent
+  provenance conflict while its binding has already landed.
+- **A test that the create lands but the caller observes failure, then retries** — the lost-response
+  and job-restart case. Assert the retry writes NOTHING: the record count for that PR is unchanged,
+  no new generation exists, and the resolution is identical. Removing step 0's `(N, op)` rediscovery
+  must turn it red; a test that only re-runs a *successful* bind is vacuous, because step 2's path
+  is already unique for that case.
+- **A test that a body varying per attempt outside the declared volatile field is a CONFLICT, not a
+  keep** — the determinism requirement must be enforced by the store, not assumed of the caller.
 - **Interleaving self-tests, driven against an in-memory store, not a stub that always succeeds**:
-  (i) two same-generation binds ⇒ UNKNOWN, and the record set is NEVER empty for a PR that was
-  bound — the assertion that would have caught the create-then-delete design; (ii) bind racing a
-  retraction ⇒ the tombstone or the bind wins by the stated order, never zero records; (iii) a
-  delete that would remove the max-generation winner is REFUSED — this case must go red if the
-  guard is deleted; (iv) a failed GC delete leaves resolution unchanged.
+  (i) two same-generation binds with DIFFERING values ⇒ UNKNOWN, and the record set is NEVER empty
+  for a PR that was bound — the assertion that would have caught the create-then-delete design;
+  (i-bis) two same-generation binds with the SAME value ⇒ resolves to that value, never UNKNOWN and
+  never a conflict; (ii) bind racing a retraction ⇒ the tombstone or the bind wins by the stated
+  order, never zero records; (iii) a delete that would remove the max-generation winner is REFUSED —
+  this case must go red if the guard is deleted; (iv) a failed GC delete leaves resolution
+  unchanged; (v) a tie loser whose own-record delete FAILS **defers** — assert no second record is
+  written under the same `{op}`, since that is the one way to break step 0's rediscovery.
 - **R5 stays PURE and TOTAL.** The resolution map is passed *in* (like `pr_status` is today); the
   predicate must not acquire I/O. If the map is absent, every PR resolves UNKNOWN.
 - **The mirrored regex** at `dispatch-claim.py:349` (kept in sync with `worker-pr.py:352` by
@@ -332,8 +410,10 @@ A single PR that does all four is not reviewable and should be refused.
 ## 8. What this record does not decide
 
 It does not decide the JSON schema of the record body, the alert thresholds for step 1's divergence
-counter, the generation field's width and its overflow behaviour, the sweep interval for stale
-UNKNOWN ties, or whether the same-generation tie-break should stay lexicographic-lowest (chosen
+counter, the generation field's width and its overflow behaviour, the digest width of `{op}` (nor
+what a collision between two operations' digests should do — it must be sized so that outcome is
+not a live concern, and the fail-closed answer if it ever were is UNKNOWN), the sweep interval for
+stale UNKNOWN ties, or whether the same-generation tie-break should stay lexicographic-lowest (chosen
 here only because every observer computes it identically from the listing alone) rather than
 something intent-aware. It does settle that retraction is a tombstone record and not a delete —
 that is a correctness requirement of §5's invariant, not the auditability preference §5 previously
