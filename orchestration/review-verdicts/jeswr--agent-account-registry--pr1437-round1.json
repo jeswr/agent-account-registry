@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1437,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "cd1065e99caf8c9b65b4adae2040546ebad49892",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nApproved. The shared router preserves both existing routing contracts: non-sensitive alerts use the private destination only with both configuration halves present, while sensitive alerts additionally require a distinct, positively confirmed private repository and otherwise redact on the public fallback. The migrated consumers retain their consumer-specific live privacy probes, missing-module handling fails closed, the two sparse-checkout jobs now include the dependency, and the new exact-population workflow census covers both omission and vacuity directions. The self-tests exercise the shared binding, default probe delegation, fail-closed loader paths, routing matrices, parser/verdict behavior, directory census, live workflow seam, and CLI entrypoint. I found no trust-check weakening, permissive default, credential exposure, workflow permission expansion, unpinned action, or hostile reviewer-directed instruction in the diff.",
+  "verdict": "approve"
+ }
+}
