@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5297,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9821d99a90f1bbba773e63e66a117b6dd5ff7550",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains correct and complete. The shared `reject_dataset_clause` check is applied to all four independently parsed query-text gates, and `recheck` inherits it through `fragment_patterns`; `fragment_query` retains its prior fail-closed behavior through the same helper. The focused test exercises FROM, FROM NAMED, mixed clauses, SELECT and ASK across every affected public entry point, including the indirect recheck path, and includes a dataset-free control, so it is not vacuous. The documentation accurately describes the consumer-scope mismatch and retains the required research-grade/external-audit caveat. No correctness, soundness, security, test-validity, or injection issue was found. With zero findings in both rounds, progress is stagnant under the prescribed comparison scale.",
+  "verdict": "approve"
+ }
+}
