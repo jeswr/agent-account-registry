@@ -1,0 +1,44 @@
+{
+ "host_envelope": {
+  "pr": 5364,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9c1599af37668dcffa3f26b12edfb56db1bac32b",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "mutateIds's doc comment claims it serializes index mutations \"without wedging after a failed write\". That behaviour is load-bearing \u2014 it is the sole reason for `this.indexMutationTail = operation.catch(() => {})` rather than `= operation` \u2014 but only the happy path is covered by the new test.\n\nI confirmed the line is load-bearing by running both variants in a standalone harness: with the first index write forced to throw, the current form rejects that caller and the NEXT mutation still completes (index ends [\"b\"]); the simplified `= operation` form leaves the tail rejected forever, so the next mutation rejects with the stale \"disk full\" and the index is never written again. If someone later simplifies that line, the added test still passes while a single failed __index__.json write permanently wedges every subsequent save and remove on that store instance \u2014 total, silent loss of persistence for the session.\n\nThe repo already treats this exact contract as test-worthy for the sibling mechanism at site/test/workspace.test.mjs:402, \"createSerializedWorkspaceSaver: a failing save rejects its caller but does NOT wedge the chain\". Coverage gap, not a defect \u2014 non-blocking.\n\nSeparately (not a finding in itself): the new test asserts over `new Set(...)`, which is insensitive to duplicate entries and to order. Since mutateIds makes the write order deterministic (A then B), a plain deepEqual against [a.id, b.id] would be a strictly stronger assertion at no cost.",
+    "file": "site/test/workspace.test.mjs",
+    "fix_hint": "Add a sibling test mirroring the line-402 shape: wrap fs.writeTextFile so the FIRST write to workspaces/__index__.json throws, then assert both that store.save(a) rejects with that error AND that a subsequent `await store.save(b)` resolves with b.id present in the index. That pins the .catch(() => {}) and goes red if it is dropped. Optionally tighten the existing assertion to `assert.deepEqual(JSON.parse(...), [a.id, b.id])`.",
+    "severity": "minor",
+    "title": "Unaddressed from round 1: the mutateIds no-wedge contract is asserted only in a comment, never tested"
+   },
+   {
+    "body": "indexMutationTail is instance state (workspace.ts:520), so serialization holds only for mutations issued through one TauriWorkspaceStore object. createWorkspaceStore is exported from the package index and constructs a fresh TauriWorkspaceStore per call (workspace.ts:685), so a Tauri app with more than one webview window \u2014 or any host that builds a second store over the same app-local-data dir \u2014 gets two independent tails and the original interleaved read-modify-write on the shared __index__.json reappears unchanged.\n\nThat is an acceptable scope for this fix: the reported bug is in-process interleaving from the GUI's fire-and-forget mutators, and cross-process safety would need a lock file or atomic temp+rename. The concern is only that the comment at workspace.ts:553, \"Serialize index mutations across workspace ids\", reads as unqualified, so a future reader may assume the index is protected in general and build on that assumption.",
+    "file": "packages/sparq-client/src/workspace.ts",
+    "fix_hint": "Scope the claim, e.g. \"Serialize index mutations across workspace ids WITHIN THIS STORE INSTANCE (a second store over the same dir \u2014 another Tauri window, say \u2014 is not covered) without wedging after a failed write.\" If cross-instance safety is actually wanted, file it as a bead rather than widening this PR.",
+    "severity": "minor",
+    "title": "Unaddressed from round 1: the index lock is per-store-instance, but the comment reads as an unqualified guarantee"
+   },
+   {
+    "body": "mutateIds inherits readIds()'s failure mode (workspace.ts:538-546): any read or JSON-parse failure yields [] rather than an error. Because mutateIds is now the canonical read-modify-write for the index, a transient bad read is upgraded from a read-time symptom into a durable one \u2014 save immediately writes back [ws.id], permanently dropping every other workspace from the index (record files survive on disk but stop appearing in list()). Reachable on the Tauri backend because writeIds is a plain overwrite with no temp-file + rename (workspace.ts:548-551), so a crash or a concurrent reader can observe a truncated __index__.json.\n\nPre-existing behaviour with exposure unchanged by this diff \u2014 the old save() did the same readIds \u2192 writeIds. Flagged only because this diff touches exactly that read-modify-write and the PR's subject is index integrity. Non-blocking and arguably out of scope.",
+    "file": "packages/sparq-client/src/workspace.ts",
+    "fix_hint": "Out of scope for this PR \u2014 file it as a bead. Two candidate fixes: (a) have readIds() distinguish \"file absent\" (legitimately []) from \"present but unparseable\", and make mutateIds refuse to write on the latter; and/or (b) make writeIds durable via write-to-temp + rename so a reader never observes a partial index.",
+    "severity": "minor",
+    "title": "Unaddressed from round 1: a corrupt or partially-written index is silently rewritten as truncated by the next mutation"
+   },
+   {
+    "body": "The store calls this.fs.writeTextFile(path, contents, this.opts) (workspace.ts:550, :586), but the wrapper installed by the new test is `async (path, contents) => { ...; await rawWrite(path, contents); }` \u2014 the opts argument is dropped in transit. Harmless today because fakeFs().writeTextFile ignores opts entirely, but it makes the double diverge from the TauriFsApi signature it stands in for, so a future assertion on baseDir plumbing would silently pass against this test.",
+    "file": "site/test/workspace.test.mjs",
+    "fix_hint": "Forward the remaining arguments: `fs.writeTextFile = async (path, contents, opts) => { ...; await rawWrite(path, contents, opts); };`",
+    "severity": "nit",
+    "title": "Unaddressed from round 1: the writeTextFile test double silently drops the third opts argument"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2: the diff is UNCHANGED from round 1 and none of its four non-blocking findings were addressed \u2014 hence \"stagnant\", not \"improving\". I re-verified from scratch rather than trusting the prior round. The fix is correct and minimal for a real lost-update race: createSerializedWorkspaceSaver serializes PER WORKSPACE ID, so two saves for different ids could interleave their read-modify-write of the shared workspaces/__index__.json on the async Tauri fs backend and drop an entry (the record file survives but list() stops showing it). mutateIds chains every index mutation onto one instance-level tail \u2014 the right granularity, since the contended resource is the one index file, not the per-id record. The `string[] | null` sentinel is safe ([] is truthy, so removing the last workspace still writes []). Both call sites are behaviour-preserving. EMPIRICALLY VERIFIED (no node_modules, so npm run test:unit is unrunnable; I hand-ported the store, the saver and the new test into a standalone Node harness): against the PRE-diff save() body the index ends [a.id] and the assertion FAILS; against the POST-diff body it ends [a.id, b.id] and PASSES. The test is non-vacuous, and its gating is deterministic \u2014 the release is ordered by a setImmediate macrotask that runs only after all pending microtasks drain, not by a timer. I also probed the load-bearing `indexMutationTail = operation.catch(() => {})`: a bare `= operation` WEDGES every later mutation after one failed write, while the current form rejects the caller and lets the next proceed \u2014 the doc comment is accurate. A fire-and-forget mutateIds whose write fails raises NO unhandled rejection. Remaining items are non-blocking, carried over from round 1: an untested no-wedge branch, an instance-scoped lock described in unqualified terms, a pre-existing corrupt-index hazard, and a test-double signature drift. No blocker or major issue; nothing in the diff read as an instruction to the reviewer.",
+  "verdict": "approve"
+ }
+}
