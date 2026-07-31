@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5365,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c46a3f992d4b6e135737361a6eac3beb50c2e5bf",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The load-bearing claim is that a thread is resolved only when its producing analysis is provably not running. `analysis_state()` authorizes every mutation solely from the workflow object's disabled state. Disabling a workflow prevents future triggers, but does not establish that an already-started or queued run has finished. `last_run_at()` fetches only `created_at` and is explicitly non-decision-bearing. Consequently a run can be in progress while this sweep resolves its threads, violating the documented invariant and racing the analysis that still owns them. The self-test's run fixture contains no `status` and therefore cannot catch this case.",
+    "file": "scripts/stale-analysis-threads.py",
+    "fix_hint": "Make authorization require both an explicitly disabled workflow state and proof that there are no queued/in-progress runs for that workflow (fail closed on missing, malformed, truncated, or unreadable run-state data). Add a test where the workflow is disabled but its latest run is queued/in_progress and assert that PRs are not enumerated and no mutation occurs; retain a completed-run disabled case that does sweep.",
+    "severity": "major",
+    "title": "Disabled workflow state does not prove that no analysis run is still active"
+   },
+   {
+    "body": "`OPEN_PR_THREADS_QUERY` reads only the first 50 review threads per PR. When `reviewThreads.pageInfo.hasNextPage` is true, `open_pr_threads()` merely sets `truncated_enumeration` and still passes the first page to `sweep_pr()`. The self-test explicitly expects one known thread to be resolved in this state. This contradicts the stated rule that a PR is swept whole or not at all, can leave a PR partially swept, and can never reach threads beyond the first 50 because nested review-thread pagination is not implemented.",
+    "file": "scripts/stale-analysis-threads.py",
+    "fix_hint": "Either paginate review threads for each PR until the full set is known, or fail closed for that PR and resolve none of its threads when `hasNextPage` is true. Change the truncation test to assert zero mutations unless complete nested pagination is implemented.",
+    "severity": "major",
+    "title": "Truncated review-thread pages are mutated despite whole-PR policy"
+   }
+  ],
+  "progress": null,
+  "summary": "The sweep is carefully fail-closed for unknown workflow states and for truncated comment-author lists, but its central authorization test is weaker than the stated invariant: a disabled workflow can still have an already-started run in progress. The implementation reads the latest run only for receipt metadata and never checks its status, so it can resolve threads while the producing analysis is still running. The self-test does not cover this race. In addition, PRs with more than 50 review threads are knowingly only partially enumerated yet still mutated, contradicting the whole-PR sweep policy and leaving later threads permanently unreachable.",
+  "verdict": "request_changes"
+ }
+}
