@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5421,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "786ca79bac12cbf10baae159a632e36efbb5a368",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains correct and complete. The cache restore precedes the pinned fetch, saves only from main on misses, and keys on the script containing both corpus pins. The extracted helper preserves digest-gated offline hits, fail-closed downloads, checksum validation, and temporary-file cleanup. The focused hermetic suite passes all 13 tests and exercises the real shell helper with non-vacuous cache-miss, stale-content, and digest-drift cases while also pinning workflow ordering, action SHA usage, and the fatal conformance ratchet. No correctness, soundness, security, or test-validity issue was found.",
+  "verdict": "approve"
+ }
+}
