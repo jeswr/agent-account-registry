@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1458,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c11b5c5dd25a19dc9db95e17e299d7b825a369da",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change consistently validates every proposed add and independently written role target against the fetched repository label set immediately before the shared applier. Unsafe reductions are converted to attributable no-ops, while safe reductions still preserve the single-lane and classifier-readiness invariants. Existing genuine write failures remain isolated per issue and make the workflow fail after the loop. The added tests include negative and positive controls, exercise the real CLI/workflow seams, and assert both no-write behavior for an unsafe missing label and continued processing after real failures. I found no diff-supported correctness, soundness, test-validity, or security defect.",
+  "verdict": "approve"
+ }
+}
