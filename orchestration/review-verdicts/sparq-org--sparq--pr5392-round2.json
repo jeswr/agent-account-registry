@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5392,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bf32ab0ffdd2b5b310c7727fa68fd85e54213430",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Unchanged from round 1. With reuseExistingServer:false, a `serve` process orphaned by an interrupted prior run (a Ctrl-C that leaves the child alive) will now make every subsequent local `npm test` fail at webServer startup instead of silently reusing the listener. That is the intended trade-off, and the inline comment at playwright.config.ts:91-94 explains the WHY, but gui/e2e-playwright/README.md's \"Run it\" section (lines 18-27) documents neither the new failure mode nor its two remedies (free the port, or set PLAYWRIGHT_PORT). A developer hitting the collision error for the first time has to read the config to learn PLAYWRIGHT_PORT exists \u2014 the variable is only described in a config comment at line 18-20.\n\nNon-blocking: CI is unaffected (the flip is a no-op under CI, where `!process.env.CI` was already false), and Playwright's own \"is already used, make sure that nothing is running on the port\" message is reasonably self-explanatory.",
+    "file": "gui/e2e-playwright/playwright.config.ts",
+    "fix_hint": "Optionally add one line to the \"Run it\" section of gui/e2e-playwright/README.md, e.g.: \"The lane never reuses an existing listener (reuseExistingServer:false) so a stale export from another worktree can't be tested silently. If port 3007 is already held, either free it or run with PLAYWRIGHT_PORT=<n> npm test.\" No code change needed; the README is not currently in this diff, so adding it would widen the diff by one file.",
+    "severity": "nit",
+    "title": "Local recovery path (orphaned `serve` on 3007) is still undocumented in the lane README (carried from round 1)"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2. The PR head is UNCHANGED from round 1: `git diff main...HEAD --stat` shows exactly one file, gui/e2e-playwright/playwright.config.ts, +5/-1 \u2014 the flip of webServer.reuseExistingServer from `!process.env.CI` to a constant `false` plus a four-line rationale comment (sq-vgq0o). No code was added in response to the round-1 nit, and no new code was added at all.\n\nRe-verified against the checkout at head: (1) CI behavior is unchanged \u2014 with CI set, `!process.env.CI` already evaluated to false, and .github/workflows/gui.yml's gui-mock-ipc job runs only `npm test` (build:tauri export, playwright install, no-timeout gate, then `npm test`) with no externally pre-started `serve`, so Playwright already owned the server lifecycle there. A repo-wide grep for `3007` / `PLAYWRIGHT_PORT` across .github/workflows and scripts returns no other producer of a listener on that port. (2) The escape hatch named in the new comment is real: SERVE_PORT (line 21) is derived from PLAYWRIGHT_PORT and feeds webServer.command (line 89), webServer.url (line 90), and use.baseURL (line 39) consistently, so a parallel worktree run on a distinct port remains coherent end-to-end. (3) Playwright's semantics for reuseExistingServer:false are to fail with a port-in-use error, which matches the stated intent of failing loudly rather than silently testing another worktree's stale gui/app/out export. (4) webServer.timeout (15s) is the startup timeout and is unaffected by the flip.\n\nNo correctness, soundness, or security concern. No tests are added or changed, and none are warranted \u2014 this is a harness policy knob, not testable logic, so there is no vacuous-test risk. The accepted trade-off remains local ergonomics: an orphaned `serve` from an interrupted prior run now blocks subsequent local runs until the developer frees the port or sets PLAYWRIGHT_PORT.\n\nProgress is \"stagnant\": the diff is byte-identical to round 1, so the single round-1 nit (gui/e2e-playwright/README.md's \"Ru\u2026 [truncated 483 chars]",
+  "verdict": "approve"
+ }
+}
