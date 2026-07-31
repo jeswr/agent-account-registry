@@ -313,6 +313,58 @@ MODE_INGESTION = "M4-workflow-ingestion-rejected"
 # The conclusion GitHub records on a run it created but never executed. Held as a constant
 # for the call sites; every fixture below writes the LITERAL, so mutating this reds.
 INGESTION_REJECTED_CONCLUSION = "action_required"
+# CONCLUSIONS THAT ARE NOT A VERDICT ON INGESTION (#1457). `completed/cancelled` is the shape
+# a run takes when a concurrency group killed it BEFORE any job was created: it carries
+# `jobs.total_count == 0` — the very zero this mode's fingerprint keys on — and it sits NEWER
+# than the run that actually said something. MEASURED on this repo 2026-07-31: groom's
+# post-revert 14:45:25Z run concluded `cancelled`, and dispatch carried FOUR consecutive
+# cancelled rows sitting above a `success` with jobs=5.
+#
+# Read as a verdict it is simply "not action_required", so the lane exits as `ingesting` and is
+# reported HEALTHY — masking a rejection still in force underneath it. So the newest VERDICT is
+# the newest run whose conclusion is not in this set. Stepping over one is fail-closed in both
+# directions: it can never mute (a lane whose entire sample is cancelled has no verdict at all
+# and exits as `no-concluded-run`, which HOLDS the alert), and the evidence it falls back to is
+# older, never invented.
+#
+# `skipped` is deliberately NOT here: a run whose jobs were all skipped by their own `if:` had
+# its file ingested and its job graph evaluated, which is exactly what this mode measures.
+NON_VERDICT_CONCLUSIONS = frozenset({"cancelled"})
+# SELF-OBSERVATION — M4 COULD NOT SEE ITS OWN LANE (#1457). This watchdog is hosted in
+# groom.yml, and groom.yml is one of the lanes it inspects. Its own run cannot have concluded
+# while it is doing the reading, so on its own lane the newest-verdict read always returns the
+# PREVIOUS scheduled run: the alert is right on the way UP and one full cron period stale on
+# the way DOWN. MEASURED 2026-07-31 — the offending commit was reverted at 14:45Z, groom's
+# 15:33:35Z scheduled run concluded SUCCESS, and that very run re-published alert #1444 at
+# 15:34:44Z still naming the 14:37Z rejection. A recovery detector that lags a full cron period
+# every time trains readers to discount it, which is the failure this whole mode exists
+# against.
+#
+# WHAT DOES NOT FIX IT: excluding `GITHUB_RUN_ID` from the listing. An in-flight run carries no
+# `conclusion` and is ALREADY excluded — the staleness is not caused by reading our own run, it
+# is caused by NOT reading it. The freshest evidence about this lane is this process.
+#
+# THE INFERENCE, and it is a stronger read than the one it replaces: if this code is executing
+# inside a `schedule` run of lane X, then GitHub ingested X's file and created at least one job
+# for that run — the exact NEGATION of the fingerprint (`action_required` with
+# `jobs.total_count == 0`), stated about the NEWEST run of the lane instead of about the
+# previous one. The all-clear then lands on the same tick as the recovery, and it costs zero
+# extra requests.
+#
+# FOUR CONDITIONS, ALL REQUIRED, because the expensive direction here is a MUTE:
+#   1. `GITHUB_EVENT_NAME == "schedule"`. A manual `workflow_dispatch` groom says nothing about
+#      the SCHEDULE lane, which is M4's entire population.
+#   2. `GITHUB_REPOSITORY` equals the repo being scanned — a watchdog hosted in one repo must
+#      never credit a lane in another.
+#   3. The workflow path is parsed out of `GITHUB_WORKFLOW_REF` and must be a DIRECT child of
+#      `.github/workflows`; anything else fails closed to the old reading.
+#   4. `GITHUB_RUN_ID` must equal the id of the NEWEST run in that lane's own sampled
+#      `event=schedule` listing. This is both the anti-mis-derivation guard — our id appearing
+#      in the lane's runs proves the parsed path really is this lane — and the anti-race guard:
+#      a scheduled run NEWER than this one may carry a verdict we have not read, and we must
+#      not talk over it.
+# Any one of them unmet and the lane is read exactly as it was before.
+SELF_EXECUTING_STATE = "self-executing"
 # Every state a lane can exit M4 through, seeded at zero so the census emits a row for each
 # on EVERY tick — including the all-clear. A census that only prints what it saw cannot
 # answer "would this alarm fire if this branch took 100% of the population?".
@@ -326,6 +378,7 @@ M4_CENSUS_STATES = (
     "not-scheduled",
     "not-sampled",
     "no-concluded-run",
+    SELF_EXECUTING_STATE,
     "ingesting",
     "approval-gated-with-jobs",
     "rejected-zero-jobs",
@@ -600,21 +653,29 @@ def find_cron_deficits(lanes: list[dict], now: dt.datetime,
     return findings, census
 
 
-def find_ingestion_rejections(lanes: list[dict],
-                              job_counts: dict) -> tuple[list[dict], dict]:
-    """M4. `lanes` carry {runs_sampled, newest_concluded}; `job_counts` maps the run id of
-    an apparently-rejected run (as a STRING — JSON object keys are strings, and a dict keyed
-    by int here would silently miss every entry that came back through --state-file) to its
-    `jobs.total_count`, or to None when that read failed.
+def find_ingestion_rejections(lanes: list[dict], job_counts: dict,
+                              self_lane: dict | None = None) -> tuple[list[dict], dict]:
+    """M4. `lanes` carry {runs_sampled, newest_concluded, newest_schedule_run_id};
+    `job_counts` maps the run id of an apparently-rejected run (as a STRING — JSON object keys
+    are strings, and a dict keyed by int here would silently miss every entry that came back
+    through --state-file) to its `jobs.total_count`, or to None when that read failed.
 
-    The lane's NEWEST CONCLUDED scheduled run is the whole signal. Rejection is not a flaky
-    event: once GitHub refuses a file every subsequent run of it is refused the same way, so
-    the newest concluded run states the CURRENT condition and the alert self-clears one cycle
-    after a fix lands. An `in_progress` newest run is skipped rather than treated as evidence
-    either way — a run with no conclusion has not said anything yet.
+    The lane's NEWEST VERDICT — its newest concluded scheduled run, stepping over the
+    conclusions that state nothing (NON_VERDICT_CONCLUSIONS) — is the signal for every lane
+    except the one hosting this run. Rejection is not a flaky event: once GitHub refuses a file
+    every subsequent run of it is refused the same way, so the newest verdict states the
+    CURRENT condition and the alert self-clears one cycle after a fix lands. An `in_progress`
+    newest run is skipped rather than treated as evidence either way — a run with no conclusion
+    has not said anything yet.
+
+    `self_lane` is {workflow, run_id} for the run EXECUTING this watchdog, or None. On THAT
+    lane the newest-verdict read is structurally one cron period stale (#1457), and this
+    process executing is fresher, stronger evidence — see the SELF-OBSERVATION note above.
     """
     findings: list[dict] = []
     census: dict[str, int] = {state: 0 for state in M4_CENSUS_STATES}
+    self_workflow = (self_lane or {}).get("workflow")
+    self_run_id = str((self_lane or {}).get("run_id") or "")
 
     def bump(state: str) -> None:
         census[state] += 1
@@ -627,6 +688,15 @@ def find_ingestion_rejections(lanes: list[dict],
             # "carries a cron and its runs were never listed", which is the disabled lane —
             # indeterminate, and the one that must not be read as a recovery.
             bump("not-sampled" if lane.get("in_scope") else "not-scheduled")
+            continue
+        # SELF-OBSERVATION (#1457), condition 4 of the four: this run is the NEWEST scheduled
+        # run of THIS lane, and it is executing — so GitHub ingested this lane's file and
+        # created a job for it. That is fresher than anything the lane's newest concluded run
+        # can say about it, and it is why the all-clear no longer waits a full cron period.
+        # Both ids are compared as non-empty strings, so two absent ids can never match.
+        if (self_workflow and self_run_id and lane["workflow"] == self_workflow
+                and str(lane.get("newest_schedule_run_id") or "") == self_run_id):
+            bump(SELF_EXECUTING_STATE)
             continue
         newest = lane.get("newest_concluded")
         if not newest:
@@ -846,15 +916,18 @@ def fetch_baseline(repo, workflow_path, event):
 
 
 def newest_concluded_run(runs):
-    """M4. -> {id, conclusion, created_at} for the newest run in `runs` that has CONCLUDED,
-    or None. Pure, so the ordering rule is testable without the network.
+    """M4. -> {id, conclusion, created_at} for the newest run in `runs` carrying a VERDICT on
+    ingestion, or None. Pure, so the ordering rule is testable without the network.
 
     The listing arrives newest-first, but that is GitHub's promise rather than this file's,
     and reading position 0 would key on a promise: `max` over the parsed timestamp costs
-    nothing and cannot be wrong. Runs missing a `created_at` are unorderable and dropped.
+    nothing and cannot be wrong. Runs missing a `created_at` are unorderable and dropped, and
+    runs whose conclusion states nothing about ingestion are stepped over — see
+    NON_VERDICT_CONCLUSIONS.
     """
     concluded = [r for r in runs
                  if r.get("status") == "completed" and r.get("conclusion")
+                 and r.get("conclusion") not in NON_VERDICT_CONCLUSIONS
                  and r.get("created_at")]
     if not concluded:
         return None
@@ -863,6 +936,53 @@ def newest_concluded_run(runs):
     # --state-file route key it the same way (JSON object keys are always strings).
     return {"id": str(newest.get("id")), "conclusion": newest.get("conclusion"),
             "created_at": newest.get("created_at")}
+
+
+def newest_schedule_run_id(runs):
+    """M4 self-observation (#1457). -> the id (STRINGIFIED, to match `GITHUB_RUN_ID`) of the
+    newest run in `runs` by creation time, CONCLUDED OR NOT, or None.
+
+    The `or not` is the entire point: the run this watchdog executes inside is by definition
+    unconcluded, so a concluded-only maximum could never match it and the self-observation
+    seam would be permanently inert. Runs missing a `created_at` (unorderable) or an `id`
+    (unmatchable) are dropped rather than guessed at.
+    """
+    dated = [r for r in runs if r.get("created_at") and r.get("id") is not None]
+    if not dated:
+        return None
+    return str(max(dated, key=lambda r: _ts(r["created_at"]))["id"])
+
+
+def self_run_context(env=None, repo=None):
+    """M4 self-observation (#1457). -> {"workflow": ".github/workflows/<f>.yml", "run_id":
+    "<digits>"} for the run EXECUTING this watchdog, or None when any of conditions 1-3 above
+    is unmet. Pure over `env`, so every refusal is testable without a runner.
+
+    It returns a claim about IDENTITY only. Condition 4 — the binding of that claim to a lane,
+    against that lane's own sampled run listing — is made in the detector, where that
+    listing is.
+    """
+    env = os.environ if env is None else env
+    if env.get("GITHUB_EVENT_NAME") != "schedule":
+        return None
+    host_repo = env.get("GITHUB_REPOSITORY") or ""
+    if not host_repo or (repo and host_repo != repo):
+        return None
+    run_id = str(env.get("GITHUB_RUN_ID") or "")
+    if not run_id.isdigit():
+        return None
+    # `<owner>/<name>/.github/workflows/<file>@refs/heads/<branch>`; the ref, not the path,
+    # is what carries the `@`.
+    path = (env.get("GITHUB_WORKFLOW_REF") or "").split("@", 1)[0]
+    prefix = f"{host_repo}/{WORKFLOWS_DIR}/"
+    if not path.startswith(prefix):
+        return None
+    leaf = path[len(prefix):]
+    # A DIRECT child only: `fetch_lanes` keys lanes by `.github/workflows/<file>`, so a nested
+    # or empty leaf could never match a lane and must fail closed rather than fabricate a key.
+    if not leaf or "/" in leaf:
+        return None
+    return {"workflow": f"{WORKFLOWS_DIR}/{leaf}", "run_id": run_id}
 
 
 def fetch_job_count(repo, run_id):
@@ -913,7 +1033,10 @@ def fetch_lanes(repo, root, window_hours, now):
                 # from `in_scope` because `in_scope` is ALSO cleared by M1's truncation
                 # guard below — and a truncated sample still states the newest run perfectly
                 # well, which is all M4 reads.
-                "runs_sampled": False, "newest_concluded": None}
+                "runs_sampled": False, "newest_concluded": None,
+                # M4 self-observation: the newest sampled scheduled run of this lane,
+                # concluded or not, which is what `GITHUB_RUN_ID` is matched against (#1457).
+                "newest_schedule_run_id": None}
         if in_scope and lane["state"] == "active":
             payload = _api(repo, f"actions/workflows/{path.name}/runs"
                                  f"?event=schedule&per_page=100")
@@ -922,6 +1045,7 @@ def fetch_lanes(repo, root, window_hours, now):
                 raise AlarmError(f"{path.name}: schedule-run response carries no runs")
             lane["runs_sampled"] = True
             lane["newest_concluded"] = newest_concluded_run(runs)
+            lane["newest_schedule_run_id"] = newest_schedule_run_id(runs)
             times = [_ts(r["created_at"]) for r in runs if r.get("created_at")]
             # COVERAGE GUARD: the sample is the newest 100 runs. If the OLDEST sampled run
             # is NEWER than the window start the count is TRUNCATED and would manufacture a
@@ -1080,19 +1204,24 @@ def capped_expectation(window_hours=CRON_WINDOW_HOURS):
 
 def _lane(workflow="a.yml", crons=("*/10 * * * *",), cron_only=False, in_scope=True,
           state="active", fires=0, now=None, spacing_min=20, created_hours_ago=None,
-          runs_sampled=True, newest_conclusion="success", run_id="1"):
+          runs_sampled=True, newest_conclusion="success", run_id="1",
+          newest_run_id=None):
     """`created_hours_ago` gives the lane a birth date, for the NEW-LANE WINDOW. `None`
     means an established lane (no `created_at`), which must behave exactly as before.
 
     The M4 fields default to a HEALTHY lane — sampled, newest scheduled run concluded — so
     every pre-existing fixture below keeps meaning what it meant. `newest_conclusion=None`
     is the lane whose newest scheduled run has not concluded yet.
+
+    `newest_run_id` is the lane's newest sampled scheduled run, concluded or not — what the
+    self-observation seam matches `GITHUB_RUN_ID` against (#1457). It defaults to None so no
+    pre-existing fixture can be self-credited by accident.
     """
     now = now or dt.datetime(2026, 7, 28, 12, 0, tzinfo=dt.timezone.utc)
     first = now - dt.timedelta(minutes=CRON_GRACE_MINUTES + 1)
     lane = {"workflow": workflow, "crons": list(crons), "cron_only": cron_only,
             "in_scope": in_scope, "state": state,
-            "runs_sampled": runs_sampled,
+            "runs_sampled": runs_sampled, "newest_schedule_run_id": newest_run_id,
             "newest_concluded": ({"id": run_id, "conclusion": newest_conclusion,
                                   "created_at": "2026-07-28T11:50:00Z"}
                                  if newest_conclusion else None),
@@ -1499,6 +1628,20 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     # close on the live repo and the hold would be indistinguishable from a stuck alarm.
     chk("an out-of-population lane does NOT block M4's recovery",
         recovery_blockers(MODE_INGESTION, {**_blk, "not-scheduled": 9}) == [])
+    # THE ROW #1457 TURNS ON. A self-executing lane is the STRONGEST read this detector has,
+    # not an absence of one. If it blocked, the fix would have swapped a one-cron-period-stale
+    # alarm for a permanently held one, which is strictly worse.
+    chk("a self-executing lane does NOT block M4's recovery",
+        recovery_blockers(MODE_INGESTION, {**_blk, "self-executing": 1}) == [])
+    # THE MARQUEE CLAIM of #1457, verified on the EVIDENCE path (decide + recovery_blockers)
+    # rather than on the census that feeds it: a tick whose only M4 read is the lane hosting
+    # this run must CLOSE the open alert — the all-clear lands on the same tick as the
+    # recovery instead of one full cron period later.
+    chk("the all-clear lands on the SAME tick: a self-executing lane closes the open M4 alert",
+        decide([], 7, recovery_blockers(
+            MODE_INGESTION,
+            {**{s: 0 for s in M4_CENSUS_STATES}, "self-executing": 1,
+             "not-scheduled": 5})) == "close")
     chk("M1 and M3 have no recovery blockers — their transport is unchanged",
         recovery_blockers(MODES[0], {"delivering": 1, "not-sampled": 4}) == []
         and recovery_blockers(MODES[1], {"not-sampled": 4, "no-concluded-run": 2}) == [])
@@ -1533,9 +1676,9 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
         MODES == ("M1-cron-firing-deficit", "M3-execution-overrun",
                   "M4-workflow-ingestion-rejected"))
     chk("M4's census names every exit, in order, so the all-clear prints a row per state",
-        M4_CENSUS_STATES == ("not-scheduled", "not-sampled", "no-concluded-run", "ingesting",
-                             "approval-gated-with-jobs", "rejected-zero-jobs",
-                             "rejected-jobs-unreadable"))
+        M4_CENSUS_STATES == ("not-scheduled", "not-sampled", "no-concluded-run",
+                             "self-executing", "ingesting", "approval-gated-with-jobs",
+                             "rejected-zero-jobs", "rejected-jobs-unreadable"))
     chk("the states that hold a recovery are exactly the two M4 never read the lane in",
         M4_INDETERMINATE_STATES == ("not-sampled", "no-concluded-run"))
     # A blocker naming a state the census cannot emit is a PERMANENTLY INERT hold: it reads
@@ -1571,6 +1714,79 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
                                          status="in_progress")]) is None)
     chk("M4 reports NO newest-concluded run over an empty listing",
         newest_concluded_run([]) is None)
+
+    # --- `completed/cancelled` IS NOT A VERDICT (#1457) --------------------------------
+    # The concurrency group killed the run before job creation, so it carries the same
+    # `jobs.total_count == 0` the fingerprint keys on and it sits NEWER than the run that
+    # actually said something. Treated as a verdict it reads "not action_required" and reports
+    # the lane HEALTHY, masking a rejection still in force underneath it. Every expected id
+    # below is hand-chosen and appears nowhere else in this harness.
+    _cancelled_over = [_sched_run(22, "action_required", "2026-07-28T11:00:00Z"),
+                       _sched_run(44, "cancelled", "2026-07-28T11:30:00Z")]
+    chk("M4 steps OVER a cancelled run to the newest real verdict — a cancelled row sitting "
+        "above a rejection must never read as a recovery",
+        (newest_concluded_run(_cancelled_over) or {}).get("id") == "22")
+    chk("...and the step-over is not a blanket skip: a SUCCESS above the cancelled row is "
+        "still the verdict, so the lane stays closeable",
+        (newest_concluded_run(_cancelled_over
+                              + [_sched_run(55, "success", "2026-07-28T11:45:00Z")])
+         or {}).get("id") == "55")
+    chk("a lane whose entire sample is cancelled states NOTHING — no verdict, which exits as "
+        "`no-concluded-run` and HOLDS the alert rather than clearing it",
+        newest_concluded_run([_sched_run(44, "cancelled", "2026-07-28T11:30:00Z"),
+                              _sched_run(45, "cancelled", "2026-07-28T11:40:00Z")]) is None)
+    chk("a `skipped` run IS a verdict — its file was ingested and its job graph evaluated, so "
+        "widening the skip set would blind M4 to a real recovery",
+        (newest_concluded_run([_sched_run(46, "skipped", "2026-07-28T11:40:00Z")])
+         or {}).get("id") == "46")
+    chk("the non-verdict set is exactly `cancelled`, written as a literal",
+        NON_VERDICT_CONCLUSIONS == {"cancelled"})
+
+    # --- SELF-OBSERVATION: identifying the run doing the evaluating (#1457) -------------
+    # Pure over the environment mapping, so every refusal is a row here rather than a claim.
+    _ENV_OK = {"GITHUB_EVENT_NAME": "schedule", "GITHUB_REPOSITORY": "o/r",
+               "GITHUB_RUN_ID": "30643401462",
+               "GITHUB_WORKFLOW_REF": "o/r/.github/workflows/groom.yml@refs/heads/master"}
+    chk("self-context: a scheduled run of the scanned repo identifies its own lane and run id",
+        self_run_context(_ENV_OK, "o/r")
+        == {"workflow": ".github/workflows/groom.yml", "run_id": "30643401462"})
+    for _label, _mut in (
+            ("a workflow_dispatch run — it proves nothing about the SCHEDULE lane, which is "
+             "M4's whole population", {"GITHUB_EVENT_NAME": "workflow_dispatch"}),
+            ("no event name at all", {"GITHUB_EVENT_NAME": None}),
+            ("a run id that is not a run id", {"GITHUB_RUN_ID": "not-a-run-id"}),
+            ("no run id", {"GITHUB_RUN_ID": None}),
+            ("no workflow ref", {"GITHUB_WORKFLOW_REF": None}),
+            ("a ref naming ANOTHER repository's workflow",
+             {"GITHUB_WORKFLOW_REF": "other/repo/.github/workflows/groom.yml@refs/heads/x"}),
+            ("a ref that is not under .github/workflows",
+             {"GITHUB_WORKFLOW_REF": "o/r/scripts/groom.yml@refs/heads/master"}),
+            ("a ref nested BELOW .github/workflows, which could never key a lane",
+             {"GITHUB_WORKFLOW_REF": "o/r/.github/workflows/sub/groom.yml@refs/heads/x"}),
+            ("no host repository", {"GITHUB_REPOSITORY": None}),
+    ):
+        _env = {k: v for k, v in {**_ENV_OK, **_mut}.items() if v is not None}
+        chk(f"self-context FAILS CLOSED on {_label}", self_run_context(_env, "o/r") is None)
+    chk("self-context refuses to credit a lane in a repo it is not scanning — the HOST repo "
+        "and the SCANNED repo must be the same",
+        self_run_context(_ENV_OK, "other/repo") is None)
+
+    # The id the seam matches against must include an UNCONCLUDED run, or it can never match
+    # the run doing the reading and the whole seam is inert with a green suite.
+    chk("the newest sampled scheduled run includes an IN-PROGRESS run — the run doing the "
+        "evaluating is by definition unconcluded",
+        newest_schedule_run_id([
+            _sched_run(11, "success", "2026-07-28T09:00:00Z"),
+            _sched_run(33, None, "2026-07-28T11:59:00Z", status="in_progress")]) == "33")
+    chk("the newest sampled scheduled run is ORDERED, not positional, and stringified to "
+        "match GITHUB_RUN_ID",
+        newest_schedule_run_id([
+            _sched_run(33, None, "2026-07-28T11:59:00Z", status="in_progress"),
+            _sched_run(11, "success", "2026-07-28T09:00:00Z")]) == "33")
+    chk("an empty listing, or a run carrying no created_at, yields NO id rather than a "
+        "fabricated one the seam could match on",
+        newest_schedule_run_id([]) is None
+        and newest_schedule_run_id([{"id": 5}]) is None)
 
     _M4_CLEAN = {s: 0 for s in M4_CENSUS_STATES}
 
@@ -1630,6 +1846,70 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
                run_id="77")], _rt["job_counts"])
     chk("M4 still resolves the job count after a JSON round-trip (string keys)",
         len(_f) == 1 and _f[0]["jobs"] == 0)
+
+    # --- THE #1457 REGRESSION ROWS: M4 reading its OWN lane ---------------------------
+    # Fixture = the measured 2026-07-31 shape. The lane's newest VERDICT is the 14:37Z
+    # rejection with the measured zero job count — every input the pre-fix detector alarmed on
+    # — while the run doing the evaluating is the lane's newest scheduled run, in flight.
+    _SELF = {"workflow": GROOM_WORKFLOW, "run_id": "30643401462"}
+
+    def _self_lane(**kw):
+        return _lane(**{"now": NOW, "workflow": GROOM_WORKFLOW,
+                        "newest_conclusion": "action_required", "run_id": "30639419850",
+                        "newest_run_id": "30643401462", **kw})
+
+    _f, _c = find_ingestion_rejections([_self_lane()], {"30639419850": 0}, _SELF)
+    chk("M4 reads its OWN lane from the run doing the evaluating — the stale rejection below "
+        "the executing run is no longer alarmed on (#1457)",
+        _f == [] and _c == {**_M4_CLEAN, "self-executing": 1})
+    # ANTI-VACUITY for the row above, and the four ways the credit must be refused. Each is a
+    # separate experiment: the fixture is IDENTICAL and only the binding changes, so none of
+    # them can pass on a fixture that was simply unable to alarm.
+    _f, _c = find_ingestion_rejections([_self_lane()], {"30639419850": 0}, None)
+    chk("...and with NO self-context the same lane still alarms — the row above measures a "
+        "credit, not a fixture that cannot fire",
+        len(_f) == 1 and _c == {**_M4_CLEAN, "rejected-zero-jobs": 1})
+    _f, _ = find_ingestion_rejections(
+        [_lane(now=NOW, workflow=".github/workflows/dead.yml",
+               newest_conclusion="action_required", run_id="77", newest_run_id="77")],
+        {"77": 0}, _SELF)
+    chk("self-observation credits ONLY the lane hosting this run — a rejection in a SIBLING "
+        "lane is untouched",
+        len(_f) == 1 and _f[0]["workflow"] == ".github/workflows/dead.yml")
+    # THE MEASURED SURVIVOR of this file's own mutation battery: with the row above alone,
+    # deleting the `lane["workflow"] == self_workflow` half of the binding left the whole suite
+    # green, because the sibling's newest-run id did not collide with ours. Here it does. The
+    # credit must be bound to the LANE as well as to the run, or a lane can be cleared by a run
+    # that was never its own.
+    _f, _c = find_ingestion_rejections(
+        [_lane(now=NOW, workflow=".github/workflows/dead.yml",
+               newest_conclusion="action_required", run_id="77",
+               newest_run_id="30643401462")], {"77": 0}, _SELF)
+    chk("a SIBLING lane whose newest run id collides with ours is still read on its own "
+        "evidence — the binding is (lane, run), never the run alone",
+        len(_f) == 1 and _c == {**_M4_CLEAN, "rejected-zero-jobs": 1})
+    _f, _c = find_ingestion_rejections([_self_lane(newest_run_id="30650000000")],
+                                       {"30639419850": 0}, _SELF)
+    chk("a scheduled run NEWER than this one REVOKES the credit — it may carry a verdict we "
+        "never read, and we must not talk over it",
+        len(_f) == 1 and _c == {**_M4_CLEAN, "rejected-zero-jobs": 1})
+    _f, _c = find_ingestion_rejections([_self_lane(newest_run_id=None)],
+                                       {"30639419850": 0}, _SELF)
+    chk("a lane carrying no newest-run id is never credited on a workflow-name match alone — "
+        "two absent ids must not compare equal",
+        len(_f) == 1 and _c == {**_M4_CLEAN, "rejected-zero-jobs": 1})
+    # The OTHER half of that same pair of absent ids, and it needs its own row: the row above
+    # keeps its id on the self-context, so dropping the `self_run_id` half of the guard leaves
+    # it green. Here neither side has one.
+    _f, _c = find_ingestion_rejections([_self_lane(newest_run_id=None)],
+                                       {"30639419850": 0}, {"workflow": GROOM_WORKFLOW})
+    chk("a self-context carrying no RUN ID credits nothing either — the identity is the run, "
+        "not the workflow name",
+        len(_f) == 1 and _c == {**_M4_CLEAN, "rejected-zero-jobs": 1})
+    _f, _c = find_ingestion_rejections([_self_lane(runs_sampled=False)],
+                                       {"30639419850": 0}, _SELF)
+    chk("an UNSAMPLED lane is never self-credited — nothing was listed, so nothing places "
+        "this run inside it", _f == [] and _c == {**_M4_CLEAN, "not-sampled": 1})
 
     # THE READ ITSELF. `fetch_job_count` is the one place `0` and "could not tell" can be
     # confused, and confusing them is not a missed alarm — it is a FABRICATED one: the alert
@@ -1702,13 +1982,14 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     # `tempfile` is imported at module scope (the schedule-map rows above use it too). A local
     # `import tempfile` here would rebind the name for the WHOLE function, so the earlier use
     # would raise UnboundLocalError before this line ever ran.
-    def _state_path(lanes, live=(), job_counts=None):
+    def _state_path(lanes, live=(), job_counts=None, self_run=None):
         state = {"repo": "o/r",
                  "lanes": [dict(x, schedule_run_times=[
                      t.strftime("%Y-%m-%dT%H:%M:%SZ") for t in x["schedule_run_times"]])
                      for x in lanes],
                  "live_runs": list(live), "baselines": {},
-                 "job_counts": dict(job_counts or {})}
+                 "job_counts": dict(job_counts or {}),
+                 "self_run": self_run}
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
             json.dump(state, fh)
             return fh.name
@@ -1867,6 +2148,31 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
               "--now", "2026-07-28T12:00:00Z"])
         chk("an unread lane never mutes a measured rejection — M4 still upserts",
             applied == ["close", "close", "upsert"])
+        # #1457 END TO END, with an alert ALREADY OPEN — the state the live repo was in at
+        # 15:33Z on 2026-07-31. The groom lane's newest VERDICT is the pre-revert rejection;
+        # the scheduled run executing this watchdog is that lane's newest run. The alert must
+        # CLOSE on this tick rather than be re-published stale. The pure rows above cannot see
+        # this: the self-context has to survive the JSON state file, classify() and the
+        # per-mode transport loop to get here.
+        _self_state = [_healthy, _lane(workflow=GROOM_WORKFLOW, fires=CAP, now=NOW,
+                                       newest_conclusion="action_required",
+                                       run_id="30639419850",
+                                       newest_run_id="30643401462")]
+        applied.clear()
+        main(["--state-file",
+              _state_path(_self_state, job_counts={"30639419850": 0},
+                          self_run={"workflow": GROOM_WORKFLOW,
+                                    "run_id": "30643401462"}),
+              "--now", "2026-07-28T12:00:00Z"])
+        chk("end to end: the run doing the evaluating clears its OWN lane on the same tick — "
+            "M4's alert CLOSES instead of being re-published a cron period stale (#1457)",
+            applied == ["close", "close", "close"])
+        applied.clear()
+        main(["--state-file", _state_path(_self_state, job_counts={"30639419850": 0}),
+              "--now", "2026-07-28T12:00:00Z"])
+        chk("...and the identical tick WITHOUT the self-observation context re-publishes it, "
+            "so the row above measures the fix and not a fixture that cannot alarm",
+            applied == ["close", "close", "upsert"])
     finally:
         globals()["_find_open_alert"], globals()["_apply"] = _real_find, _real_apply
 
@@ -1888,7 +2194,12 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
                 return {"workflows": [{"path": GROOM_WORKFLOW, "state": "active",
                                        "created_at": "2026-07-01T00:00:00Z"}]}
             if path.startswith(f"actions/workflows/{_GROOM_FILE}/runs"):
+                # The LIVE shape the self-observation seam has to survive (#1457): the newest
+                # scheduled run is IN PROGRESS — it is the one doing the reading — sitting
+                # above the newest concluded verdict.
                 return {"workflow_runs": [
+                    {"id": 88, "status": "in_progress", "conclusion": None,
+                     "created_at": "2026-07-28T11:55:00Z", "event": "schedule"},
                     {"id": 77, "status": "completed", "conclusion": conclusion,
                      "created_at": "2026-07-28T11:50:00Z", "event": "schedule"}]}
             if "/jobs?" in path:
@@ -1912,6 +2223,13 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
             _fetched.get(GROOM_WORKFLOW, {}).get("newest_concluded")
             == {"id": "77", "conclusion": "action_required",
                 "created_at": "2026-07-28T11:50:00Z"})
+        # The field the self-observation seam matches GITHUB_RUN_ID against. It must be the
+        # newest run INCLUDING the in-flight one (88), not the newest concluded one (77) —
+        # wire it to `newest_concluded` and the seam can never match, so it goes permanently
+        # inert while every pure assertion above stays green (#1457).
+        chk("fetch_lanes carries the lane's newest sampled scheduled run id, unconcluded runs "
+            "included",
+            _fetched.get(GROOM_WORKFLOW, {}).get("newest_schedule_run_id") == "88")
         _asked_rejected.clear()
         _live_out = io.StringIO()
         with contextlib.redirect_stdout(_live_out):
@@ -1922,6 +2240,40 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
             "job count", _live_rc == 0
             and GROOM_WORKFLOW in _live_out.getvalue()
             and "jobs.total_count = 0" in _live_out.getvalue())
+        # THE LIVE WIRING of the self-observation seam: `run()` reading the RUNNER
+        # ENVIRONMENT, which is the one link no state-file row reaches. Without this the whole
+        # `self_run_context(repo=repo)` call could be deleted and every row above stays green
+        # — the seam would be dead in production with a full suite passing (#1457).
+        _env_saved = {_k: os.environ.get(_k) for _k in
+                      ("GITHUB_EVENT_NAME", "GITHUB_REPOSITORY", "GITHUB_RUN_ID",
+                       "GITHUB_WORKFLOW_REF")}
+        try:
+            os.environ.update({"GITHUB_EVENT_NAME": "schedule", "GITHUB_REPOSITORY": "o/r",
+                               "GITHUB_RUN_ID": "88",
+                               "GITHUB_WORKFLOW_REF":
+                                   f"o/r/{GROOM_WORKFLOW}@refs/heads/master"})
+            _self_out = io.StringIO()
+            with contextlib.redirect_stdout(_self_out):
+                main(["--repo", "o/r", "--dry-run"])
+            chk("the LIVE path credits the lane hosting THIS run — run 88 is groom's newest "
+                "scheduled run, so the stale rejection concluded below it is not alarmed on",
+                "self-executing: 1" in _self_out.getvalue()
+                and "jobs.total_count" not in _self_out.getvalue())
+            # ANTI-VACUITY: the identical live tick, read by a DIFFERENT run id, still alarms.
+            # The credit is bound to this RUN, never to the lane's name.
+            os.environ["GITHUB_RUN_ID"] = "77"
+            _other_out = io.StringIO()
+            with contextlib.redirect_stdout(_other_out):
+                main(["--repo", "o/r", "--dry-run"])
+            chk("...and the same live tick evaluated by a run that is NOT the lane's newest "
+                "still alarms", "self-executing: 0" in _other_out.getvalue()
+                and "jobs.total_count = 0" in _other_out.getvalue())
+        finally:
+            for _k, _v in _env_saved.items():
+                if _v is None:
+                    os.environ.pop(_k, None)
+                else:
+                    os.environ[_k] = _v
         # THE COST CLAIM, asserted instead of merely written down: M4 is documented as
         # costing ZERO extra requests on a healthy repo. A job-count read per lane per tick
         # would be a real budget change on a repo that has measured a 403 at ~7969
@@ -2027,6 +2379,15 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
         wf = yaml.safe_load((root / GROOM_WORKFLOW).read_text())
         jobs = wf.get("jobs", {})
         chk("seam: groom.yml hosts a `ci-latency` job", "ci-latency" in jobs)
+        # THE SELF-OBSERVATION SEAM (#1457) rests on the HOST lane being inside M4's
+        # population: the run doing the evaluating can only credit a lane whose scheduled runs
+        # are sampled. If groom.yml lost its `schedule:` — or this watchdog were rehosted in a
+        # cron-less workflow — condition 1 could never hold and the whole seam would be dead
+        # code with every assertion above it still green. Read off the live tree.
+        chk("seam: groom.yml — the host of this watchdog, and the lane the self-observation "
+            "seam credits — carries a `schedule:`, so it is inside M4's population",
+            m1_scope(workflow_triggers(
+                (root / GROOM_WORKFLOW).read_text(encoding="utf-8")))[0] is True)
         job = jobs.get("ci-latency", {})
         # A watcher hosted inside the watched job cannot observe the watched job's absence.
         chk("seam: the watchdog job has NO `needs:`", "needs" not in job)
@@ -2114,12 +2475,12 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
 MODES = ("M1-cron-firing-deficit", "M3-execution-overrun", MODE_INGESTION)
 
 
-def classify(lanes, live, baselines, now, window_hours, job_counts=None):
+def classify(lanes, live, baselines, now, window_hours, job_counts=None, self_lane=None):
     """Pure: -> {mode: (findings, census)} for every detected mode."""
     return {
         MODES[0]: find_cron_deficits(lanes, now, window_hours),
         MODES[1]: find_execution_overruns(live, baselines, now),
-        MODES[2]: find_ingestion_rejections(lanes, job_counts or {}),
+        MODES[2]: find_ingestion_rejections(lanes, job_counts or {}, self_lane),
     }
 
 
@@ -2139,10 +2500,16 @@ def run(args):
         baselines = {tuple(k.split("|", 1)): v
                      for k, v in (state.get("baselines") or {}).items()}
         job_counts = {str(k): v for k, v in (state.get("job_counts") or {}).items()}
+        # The hermetic equivalent of the runner environment (#1457): the state file states who
+        # is doing the reading, so the self-observation seam is drivable end to end offline.
+        self_lane = state.get("self_run")
     else:
         repo = registry_repo
         if "/" not in repo:
             raise AlarmError(f"no usable repo slug: {repo!r}")
+        # Established BEFORE anything is fetched, from the runner environment alone, and
+        # `None` on every path that is not a scheduled run of this repo (#1457).
+        self_lane = self_run_context(repo=repo)
         root = Path(__file__).resolve().parents[1]
         lanes = fetch_lanes(repo, root, args.window_hours, now)
         live = fetch_live_runs(repo)
@@ -2181,7 +2548,7 @@ def run(args):
                          "every scheduled lane is disabled, or the sampling broke. "
                          "Refusing to report ingestion health over an empty population.")
 
-    results = classify(lanes, live, baselines, now, args.window_hours, job_counts)
+    results = classify(lanes, live, baselines, now, args.window_hours, job_counts, self_lane)
 
     # CENSUS EVERY RUN, including the all-clear.
     print(f"ci-latency census for {repo} at {now:%Y-%m-%dT%H:%M:%SZ} "
