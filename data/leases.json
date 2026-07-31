@@ -21,16 +21,6 @@
    "expires_at": 1785502554
   },
   {
-   "account": "51bde6688e140866",
-   "claim_id": "8fd25753b60148c688f47653ac868737",
-   "holder": "fix:jeswr/agent-account-registry#1424@dispatch-30625652154.1",
-   "package": "workflows",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785496262,
-   "expires_at": 1785502562
-  },
-  {
    "account": "9e13ea21abf27e68",
    "claim_id": "5550bc4b0e144f6bab0eb149a578ce8e",
    "holder": "review:sparq-org/sparq#5318@dispatch-30626476669.1",
