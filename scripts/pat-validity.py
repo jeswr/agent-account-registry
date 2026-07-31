@@ -90,7 +90,6 @@
 # and an Environments-only PAT: env read 200 + repo-scope listing 403); the CLI wraps them over
 # urllib + `gh`.
 import base64
-import importlib.util
 import json
 import os
 import re
@@ -100,30 +99,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-
-
-def _load_alert_route():
-    """The shared ops-alert destination router (scripts/alert_route.py, issue #591), loaded BY
-    PATH — the sibling-module idiom this repo uses everywhere, so the file is found relative to
-    this script rather than via sys.path.
-
-    An absent module is a checkout defect, NOT a "route unavailable" to be guessed around: picking
-    a destination without the verified-private decision is exactly the fail-open that issue #204
-    forbids for a CREDENTIAL alert. Die, and name the fix. (This script's jobs take a FULL
-    checkout, which is why it is deliberately absent from alert_route.py's LIVE_SPARSE_SITES; that
-    census reds if a future sparse job checks this script out without the module.)"""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert_route.py")
-    spec = importlib.util.spec_from_file_location("registry_alert_route", path)
-    if not os.path.exists(path) or spec is None or spec.loader is None:
-        raise SystemExit(
-            "pat-validity: cannot load scripts/alert_route.py — the shared ops-alert destination "
-            "router is missing from this checkout")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-_alert_route_module = _load_alert_route()
 
 API = "https://api.github.com"
 # The write probe's target: a secret that exists ONLY to be overwritten by this probe. Its value
@@ -533,14 +508,13 @@ def _alert_route(alert_repo, alert_token, registry_repo, confirmed_private=None)
     validity/expiry, so they stay on the registry with the ambient token — this route governs
     only the credential alert. `confirmed_private` is injectable for the self-test; the default
     performs the live lookup, and it is only consulted once both halves of the route are set (a
-    half-configured route needs no API call to be rejected).
-
-    Issue #591: the DECISION above is implemented ONCE, in scripts/alert_route.py; this wrapper
-    exists only to bind the default probe. `_confirmed_private` is this script's own fail-closed
-    GET /repos reader, so it cannot move into the shared module."""
-    check = confirmed_private if confirmed_private is not None else _confirmed_private
-    return _alert_route_module.alert_route_verified(
-        alert_repo, alert_token, registry_repo, check)
+    half-configured route needs no API call to be rejected)."""
+    if alert_repo and alert_token:
+        same_repo = alert_repo.strip().lower() == (registry_repo or "").strip().lower()
+        check = confirmed_private if confirmed_private is not None else _confirmed_private
+        if not same_repo and check(alert_repo, alert_token):
+            return alert_repo, alert_token, False
+    return registry_repo, None, True
 
 
 def _gh(args, check=False, token=None):
@@ -1784,41 +1758,11 @@ def _self_test():
         chk("main(): a single transient unknown -> rc=0 (green) and ZERO issue operations",
             (green_rc, silent_issue_ops), (0, []))
 
-        # --- issue #591: the loader's fail-closed branch. An ABSENT scripts/alert_route.py must
-        #     DIE naming the module, never fall back to a guessed destination — guessing is the
-        #     fail-open issue #204 forbids, and this branch is otherwise never executed at all.
-        _saved_exists = os.path.exists
-        os.path.exists = lambda p: False if p.endswith("alert_route.py") else _saved_exists(p)
-        try:
-            _load_alert_route()
-            _loader_verdict = "loaded a module that is not there"
-        except SystemExit as error:
-            _loader_verdict = "alert_route.py" in str(error)
-        finally:
-            os.path.exists = _saved_exists
-        chk("loader: absent scripts/alert_route.py -> SystemExit naming the module",
-            _loader_verdict, True)
         # --- sol-audit issue #204 (+ #432 round 1): the DETAILED credential alert routes ONLY
         #     to a POSITIVELY VERIFIED private repo — distinct from the registry AND confirmed
         #     `"private": true` under the route token; the PUBLIC-registry fallback carries ONLY
         #     a generic signal (no verdict, detail, or expiry). Pure route + render first, then
-        #     END-TO-END through main(). The rows now exercise the SHARED router (issue #591); the
-        #     first two are what red if a private copy is reintroduced and shadows the delegation,
-        #     and they pin the DEFAULT probe — the half a "just delegate" regression drops, since
-        #     calling with no `confirmed_private` must reach _confirmed_private, not assume True.
-        chk("route: delegates to the shared scripts/alert_route.py",
-            os.path.basename(_alert_route_module.__file__), "alert_route.py")
-        default_probe_seen = []
-        saved_probe = _confirmed_private
-        globals()["_confirmed_private"] = (
-            lambda r, t: default_probe_seen.append((r, t)) or False)
-        try:
-            default_route = _alert_route("org/private", "tok", "org/registry")
-        finally:
-            globals()["_confirmed_private"] = saved_probe
-        chk("route: no probe passed -> the LIVE _confirmed_private decides (refusal redacts)",
-            (default_route, default_probe_seen),
-            (("org/registry", None, True), [("org/private", "tok")]))
+        #     END-TO-END through main().
         vis_calls = []
         chk("route: repo+token+CONFIRMED private -> private + token, no redact",
             _alert_route("org/private", "tok", "org/registry",

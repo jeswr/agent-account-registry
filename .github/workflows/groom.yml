@@ -30,8 +30,6 @@ jobs:
       actions: read       # inspect registry worker run state
       contents: write     # CAS data/leases.json + read data/model-health.json (both on the `ledger` branch)
       issues: write       # upsert/close the model-access health alert issues (model-health decide)
-      pull-requests: read # #384: LIST the account-pool/acctNN grant PRs. READ, never write — the
-                          # abandoned-enrolment report only classifies open/merged/closed-unmerged.
     steps:
       - name: Checkout registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -139,30 +137,6 @@ jobs:
           set -euo pipefail
           printf '::add-mask::%s\n' "$REGISTRY_GH_TOKEN"
           python3 scripts/groom.py --report-orphan-claims \
-            --registry-repo "$GITHUB_REPOSITORY"
-
-      # Issue #384 — the OTHER half of the enrollment-hygiene picture. The burned-slot report above
-      # cannot see an abandoned #185 two-phase enrollment: that slot HAS an acctNN issue and HAS an
-      # ACCTNN_TOKEN secret, which is exactly what makes it not-orphaned there. It is nevertheless
-      # stuck forever — `set-up-account`'s `activate` job fires only on a MERGED account_pool PR, so
-      # a grant PR closed unmerged (or never merged) leaves the account `status:pending`,
-      # non-allocatable, with nothing counting it.
-      #
-      # REPORT-ONLY, with no gate or reclaim mode, for a reason stronger than the claim-ref one:
-      # deleting the orphaned credential secret would destroy the #211 idempotent RESUME (re-apply
-      # `set-up-account` on the request issue and the SAME enrollment completes), turning a
-      # recoverable abandonment into an unrecoverable one. The ambient token suffices — account
-      # issues and account_pool PRs are public on this repo — and every field this report names
-      # (handle, request issue, secret NAME) is on the documented handle-public enrollment surface.
-      - name: Report abandoned status:pending enrollments
-        continue-on-error: true
-        env:
-          REGISTRY_GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          printf '::add-mask::%s\n' "$REGISTRY_GH_TOKEN"
-          # The age floor lives in groom.py (--stale-pending-days) as a single source of truth.
-          python3 scripts/groom.py --report-stale-pending \
             --registry-repo "$GITHUB_REPOSITORY"
 
       # Per-owner target token mint (issue #168): policy enables targets under TWO distinct owners
@@ -750,22 +724,15 @@ jobs:
       contents: read  # minimum for the sparse checkout below — the job runs a script from the repo
       issues: write   # upsert/close the rolling groom-failure ops-alert issue
     steps:
-      # The alert logic lives in scripts/groom-alert.py, and the only other file it needs is the
-      # ops-alert destination router it imports — sparse-checkout scopes the working copy to those
-      # two, pinned and with no persisted token, so nothing else from the repo reaches this job.
-      # scripts/alert_route.py is the shared home for locked decision 22c (issue #591);
-      # groom-alert.py loads it by path and DIES if it is absent, so dropping it from this list
-      # disables the alert inside a continue-on-error step. That is asserted the other way round
-      # too: alert_route.py's own --self-test reds if any sparse job names a consumer without
-      # naming the module.
-      - name: Check out ONLY the groom-alert script + its router (pinned, sparse, no persisted token)
+      # The alert logic lives in scripts/groom-alert.py, but only that one file is needed —
+      # sparse-checkout scopes the working copy to it, pinned and with no persisted token, so
+      # nothing else from the repo reaches this job.
+      - name: Check out ONLY scripts/groom-alert.py (pinned, sparse, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           path: registry
           persist-credentials: false
-          sparse-checkout: |
-            scripts/groom-alert.py
-            scripts/alert_route.py
+          sparse-checkout: scripts/groom-alert.py
           sparse-checkout-cone-mode: false
 
       - name: Alert maintainer that the scheduled GROOM job hard-failed

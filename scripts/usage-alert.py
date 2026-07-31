@@ -37,7 +37,6 @@
 #
 # Pure classify()/_policy_pool_margin() are unit-tested (--self-test); the CLI wraps them over the
 # usage file + `gh`.
-import importlib.util
 import json
 import os
 import re
@@ -143,30 +142,6 @@ def _util(value):
     return parsed
 
 
-def _load_alert_route():
-    """The shared ops-alert destination router (scripts/alert_route.py, issue #591), loaded BY
-    PATH — the sibling-module idiom this repo uses everywhere, so the file is found relative to
-    this script rather than via sys.path.
-
-    An absent module is a checkout defect, NOT a "route unavailable" to be guessed around: picking
-    a destination without the verified-private decision is exactly the fail-open that issues
-    #107/#204 forbid. Die, and name the fix. (This script's job takes a FULL checkout, which is why
-    it is deliberately absent from alert_route.py's LIVE_SPARSE_SITES; that census reds if a future
-    sparse job checks this script out without the module.)"""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert_route.py")
-    spec = importlib.util.spec_from_file_location("registry_alert_route", path)
-    if not os.path.exists(path) or spec is None or spec.loader is None:
-        raise SystemExit(
-            "usage-alert: cannot load scripts/alert_route.py — the shared ops-alert destination "
-            "router is missing from this checkout")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-_alert_route_module = _load_alert_route()
-
-
 def _repo_confirmed_private(repo, token):
     """True ONLY on a definitive `"private": true` from GET /repos/{repo} read under the route
     token (sol review round 1 of #432). A configured ALERT_REPO+ALERT_TOKEN pair alone must never
@@ -201,14 +176,13 @@ def _alert_route(alert_repo, alert_token, registry_repo, confirmed_private=None)
     1: presence of a token is not privacy). token=None means "use the ambient GH_TOKEN"; the
     write still fails loud via _gh(check=True) (review r1). `confirmed_private` is injectable
     for the self-test; the default performs the live lookup, consulted only once both halves of
-    the route are set.
-
-    Issue #591: the DECISION above is implemented ONCE, in scripts/alert_route.py; this wrapper
-    exists only to bind the default probe. `_repo_confirmed_private` is this script's own
-    fail-closed GET /repos reader, so it cannot move into the shared module."""
-    check = confirmed_private if confirmed_private is not None else _repo_confirmed_private
-    return _alert_route_module.alert_route_verified(
-        alert_repo, alert_token, registry_repo, check)
+    the route are set."""
+    if alert_repo and alert_token:
+        same_repo = alert_repo.strip().lower() == (registry_repo or "").strip().lower()
+        check = confirmed_private if confirmed_private is not None else _repo_confirmed_private
+        if not same_repo and check(alert_repo, alert_token):
+            return alert_repo, alert_token, False
+    return registry_repo, None, True
 
 
 def classify(pool, usage, margin, now=None):
@@ -704,37 +678,6 @@ def _self_test():
     # CONFIRMED private; a half-configured deployment (repo set, token missing) falls back to the
     # registry repo so the write can't fail silently under the ambient token. token=None means
     # "use the ambient GH_TOKEN".
-    # The loader's fail-closed branch: an ABSENT scripts/alert_route.py must DIE naming the
-    # module, never fall back to a guessed destination — guessing is the fail-open that issue
-    # #204 forbids, and this branch is otherwise never executed by anything.
-    _saved_exists = os.path.exists
-    os.path.exists = lambda p: False if p.endswith("alert_route.py") else _saved_exists(p)
-    try:
-        _load_alert_route()
-        _loader_verdict = "loaded a module that is not there"
-    except SystemExit as error:
-        _loader_verdict = "alert_route.py" in str(error)
-    finally:
-        os.path.exists = _saved_exists
-    chk("loader: absent scripts/alert_route.py -> SystemExit naming the module",
-        _loader_verdict, True)
-    # The rows below now exercise the SHARED router (issue #591). This first row is what reds if a
-    # private copy is ever reintroduced and shadows the delegation — the drift #591 exists to
-    # close — and it pins the DEFAULT probe, which is the half a "just delegate" regression drops:
-    # calling with no `confirmed_private` must reach _repo_confirmed_private, not an assumed-True.
-    chk("route: delegates to the shared scripts/alert_route.py",
-        os.path.basename(_alert_route_module.__file__), "alert_route.py")
-    _default_probe_seen = []
-    _saved_probe = _repo_confirmed_private
-    globals()["_repo_confirmed_private"] = (
-        lambda r, t: _default_probe_seen.append((r, t)) or False)
-    try:
-        _default_route = _alert_route("org/private", "tok", "org/registry")
-    finally:
-        globals()["_repo_confirmed_private"] = _saved_probe
-    chk("route: no probe passed -> the LIVE _repo_confirmed_private decides (refusal redacts)",
-        (_default_route, _default_probe_seen),
-        (("org/registry", None, True), [("org/private", "tok")]))
     vis_calls = []
     chk("route: repo+token+CONFIRMED private -> private + token, no redaction",
         _alert_route("org/private", "tok", "org/registry",

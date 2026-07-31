@@ -51,14 +51,11 @@
 # routing, close-ONLY-on-explicit-success, sanitized fail-loud `gh` wrapper, and a soft-fail on a
 # successful-but-malformed `gh issue list`.
 #
-# DEBT (issue #591): `_alert_route` is another private copy of the same locked decision (22c). The
-# shared home `scripts/alert_route.py` now EXISTS on master with the IDENTICAL signature
-# `(alert_repo, alert_token, registry_repo)` — #591 migrated the four emitters it named and stopped
-# there, because this file's self-test cannot run where PyYAML is absent and an unverifiable
-# migration of a live alerting path is not worth the swap. Discharging this is
-# `_alert_route = <module>.alert_route` plus adding `scripts/alert_route.py` to BOTH sparse-checkout
-# lists (groom.yml's metrics-stale job and metrics.yml's metrics-alert job), which alert_route.py's
-# own census then enforces once this file is added to its CONSUMERS tuple.
+# DEBT (issue #591, PR #590): `_alert_route` is the SIXTH private copy of the same locked decision
+# (22c). PR #590 introduces `scripts/alert_route.py` as the shared home. It is not on master yet, so
+# this file carries a byte-compatible private copy with the IDENTICAL signature
+# `(alert_repo, alert_token, registry_repo)` — migration is a one-line import swap plus adding
+# `scripts/alert_route.py` to both sparse-checkout lists.
 import ast
 import json
 import os
