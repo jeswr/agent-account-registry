@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1372,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "cfa8e4fc95f43988e036f317b3d306fdf390dd40",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`find_ingestion_rejections` returns no finding for both `not-sampled` and `no-concluded-run`, and the shared `decide(findings, open_issue)` therefore closes an existing M4 issue whenever no other lane is currently rejected. The aggregate `any(runs_sampled)` guard does not protect an individual affected lane: with two scheduled lanes, one healthy sampled lane satisfies the guard while a previously rejected lane that is disabled, has its schedule removed, or temporarily has no concluded run is classified indeterminate and omitted. The open rolling M4 alert is then treated as recovered and closed without evidence that the rejected workflow executed successfully. This contradicts the existing `decide` contract that an indeterminate read must be a noop and creates a fail-open recovery path.",
+    "file": "scripts/ci-latency-alert.py",
+    "fix_hint": "Carry an explicit per-mode determinacy/recovery signal into the transport decision. For M4, do not close an open alert while any relevant lane is `not-sampled` or `no-concluded-run`; require affirmative ingestion evidence for recovery (and define how a deliberately removed/disabled schedule is resolved). Add an end-to-end test with one healthy sampled sibling plus one indeterminate formerly rejected lane and an open M4 issue, asserting that `_apply` is not called with `close`.",
+    "severity": "major",
+    "title": "Indeterminate M4 lanes can close an active rejection alert"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nM4 detects the positive rejection fingerprint, but its recovery path is not fail-closed. An existing ingestion alert can be closed when the affected lane becomes indeterminate rather than demonstrably healthy. Because this is a trust-plane liveness alert and the implementation explicitly promises indeterminate reads are no-ops, this requires changes.",
+  "verdict": "request_changes"
+ }
+}
