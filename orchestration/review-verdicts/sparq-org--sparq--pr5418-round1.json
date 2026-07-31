@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5418,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "66019cad7a9819b47a4569b6e628be1b34c2a329",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The verifier change correctly closes the within-pattern repeated-variable gap by deriving repeated slots from the parsed query and checking every active row of every constant-compatible scan with canonical field equality. The check is placed on the flat-manifest query-binding path, while the documented extended-fragment path already binds repeated variable names through its solution/coherence maps. The negative witness exercises the real prefilter entry point and pins the structured error; the genuine-self-loop and distinct-variable controls guard against over-rejection. The audit and public skill text retain the research-grade, not-externally-audited caveat. No correctness, soundness, security, or test-validity defect was found in the diff-scoped review.",
+  "verdict": "approve"
+ }
+}
