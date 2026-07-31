@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5380,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ce2d672728ab34a7bacf3fd713cdb8b922239adc",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 finds no correctness, soundness, test-validity, or security regression. The authorization path remains fail-closed: credential holdings enter only through the caller-trusted channel, forged reserved-predicate facts are filtered, holder principals are validated, and acp:vc intersects with the existing agent constraint while preserving within-attribute disjunction and noneOf behavior. The opt-in verifier checks the signed graph before any mutation, requires exactly one distinct named credentialSubject, binds issuer/type/exact claims, and records nothing on ambiguity or reserved subjects. The signed two-order regression exercises the real verification and authorization path and is non-vacuous. Documentation accurately limits the backend to trust-the-issuer plaintext verification and explicitly disclaims privacy, selective disclosure, revocation, and expiry. No embedded reviewer-directed instruction was detected.",
+  "verdict": "approve"
+ }
+}
