@@ -8950,6 +8950,24 @@ def _review_fix_workflow_values(source=None):
     # would still read green. Pin the wiring, not just the number.
     cap_wired = re.search(r'--max-holder-concurrent "\$cap"', claim_span)
     assert cap_wired, "claim job does not pass $cap to --max-holder-concurrent (#581)"
+    # Issue #363: the ADOPT step now CAS-transfers the dispatcher's lease to this run and RE-BASES
+    # its expiry to now+ttl, so it carries a second copy of the same trust-critical TTL — a drift
+    # axis of exactly the #159 shape (a re-based lease shorter than the run re-expires a live
+    # account). Parse it and pin it to the self-claim / dispatcher pair below. `adopt_ttl` is
+    # deliberately a distinct shell name so neither ttl regex can read the other step's literal.
+    adopt_review_ttl = re.search(r'prefix="review:";[^\n]*\badopt_ttl=(\d+)', claim_span)
+    adopt_fix_ttl = re.search(r'prefix="fix:";[^\n]*\badopt_ttl=(\d+)', claim_span)
+    assert adopt_review_ttl and adopt_fix_ttl, "adopt step review/fix adopt_ttl= literals not found"
+    # The TTL only means anything while the adoption is a CAS OWNERSHIP TRANSFER. A regression to
+    # the read-only `--inspect` (or a dropped --holder/--ttl) leaves both literals intact and every
+    # equality assert green while restoring the defect: the dispatcher keeps the lease, the expiry
+    # is never re-based, and the validation-failure branch releases a claim this run does not own.
+    # Pin the WIRING, not just the numbers.
+    adopt_cas = re.search(
+        r'--adopt "\$CLAIM_ID"[\s\S]*?--holder "\$holder"[\s\S]*?--ttl "\$adopt_ttl"', claim_span)
+    assert adopt_cas, ("claim job's adopt step does not CAS-transfer the lease (#363): it must "
+                       'call --adopt "$CLAIM_ID" with --holder "$holder" and --ttl "$adopt_ttl", '
+                       "not the read-only --inspect")
     # Issue #560 lane-hand-over wiring, pinned to the WORKFLOW (the python halves cannot see it):
     # the `run` job must EXPORT stage-verdict's staged/stale_reason, the `outcome` job must ADMIT
     # the staged-nothing path (its old `if` skipped the whole job, which is why review:changes was
@@ -8974,6 +8992,8 @@ def _review_fix_workflow_values(source=None):
         "local_fix_ttl": int(ttl_fix.group(1)),
         "local_review_cap": int(cap_review.group(1)),
         "local_fix_cap": int(cap_fix.group(1)),
+        "adopt_review_ttl": int(adopt_review_ttl.group(1)),
+        "adopt_fix_ttl": int(adopt_fix_ttl.group(1)),
         "run_exports_staged": "verdict_staged: ${{ steps.stage-verdict.outputs.staged }}"
                               in run_span,
         "run_exports_stale_reason":
@@ -9772,6 +9792,16 @@ def _self_test():
     # would hold the same account for different windows.
     assert _wf["local_review_ttl"] == REVIEW_TTL, _wf["local_review_ttl"]
     assert _wf["local_fix_ttl"] == FIX_TTL, _wf["local_fix_ttl"]
+    # ---- ISSUE #363: THE ADOPT STEP'S RE-BASED TTL, PINNED TO THE SAME PAIR ---------------------
+    # Adoption CAS-transfers the dispatcher's lease to the run and re-bases its expiry to now+ttl.
+    # That window has to cover the SAME claim -> run -> release DAG the self-claim's does (the
+    # asserts above), so it is the same number; a one-sided edit re-expires a live account
+    # mid-review exactly as #159 did. The wiring (`--adopt`, not the read-only `--inspect`) is
+    # asserted inside the extractor, which fails closed when it is gone.
+    assert _wf["adopt_review_ttl"] == REVIEW_TTL == _wf["local_review_ttl"], (
+        _wf["adopt_review_ttl"], _wf["local_review_ttl"], REVIEW_TTL)
+    assert _wf["adopt_fix_ttl"] == FIX_TTL == _wf["local_fix_ttl"], (
+        _wf["adopt_fix_ttl"], _wf["local_fix_ttl"], FIX_TTL)
     # ---- ISSUE #581: THE SELF-CLAIM CAPS, PINNED THE SAME WAY THE TTLs ARE ----------------------
     # The `cap=` literals sat beside the now-pinned `ttl=` literals with nothing asserting them, so
     # the self-claim path's concurrency bound could drift silently while every sibling number in
@@ -9817,6 +9847,37 @@ def _self_test():
                          "FAIL the #581 extractor, but it parsed cleanly")
     except AssertionError:
         pass
+    # NON-VACUITY for the #363 adopt pins, by the same mutation idiom: an equality assert against a
+    # literal the extractor stopped finding reads green forever.
+    for _adopt_from, _adopt_to, _adopt_field in (
+            ('prefix="review:"; adopt_ttl=4200', 'prefix="review:"; adopt_ttl=99',
+             "adopt_review_ttl"),
+            ('prefix="fix:"; adopt_ttl=6300', 'prefix="fix:"; adopt_ttl=99', "adopt_fix_ttl")):
+        _adopt_mutant = _rf_text_caps.replace(_adopt_from, _adopt_to)
+        assert _adopt_mutant != _rf_text_caps, (
+            f"the #363 adopt-ttl mutation {_adopt_from!r} matched nothing — the anchor drifted, "
+            "re-point it")
+        assert _review_fix_workflow_values(source=_adopt_mutant)[_adopt_field] == 99, (
+            f"an edited adopt {_adopt_field} must FLIP the #363 assertion red, but the extractor "
+            "did not report the mutated ttl")
+    # The regression this issue exists to prevent: the adopt step going back to the read-only
+    # `--inspect`, which leaves both ttl literals in place (so the equality asserts stay green)
+    # while the dispatcher keeps the lease, the expiry is never re-based, and the
+    # validation-failure branch releases a claim this run does not own. Require that mutant to
+    # raise, and require dropping the `--holder` wiring to raise too.
+    for _adopt_unwired, _adopt_why in (
+            (_rf_text_caps.replace('--adopt "$CLAIM_ID"', '--inspect "$CLAIM_ID"'),
+             "an adopt step that regresses to the read-only --inspect"),
+            (_rf_text_caps.replace('--holder "$holder" \\\n            --ttl "$adopt_ttl"',
+                                   '--ttl "$adopt_ttl"'),
+             "an adopt step that stops passing --holder (no ownership transfer)")):
+        assert _adopt_unwired != _rf_text_caps, (
+            "the #363 adopt-wiring mutation matched nothing — the anchor drifted, re-point it")
+        try:
+            _review_fix_workflow_values(source=_adopt_unwired)
+            raise SystemExit(f"{_adopt_why} must FAIL the #363 extractor, but it parsed cleanly")
+        except AssertionError:
+            pass
     # Issue #560 lane-hand-over wiring (see _review_fix_workflow_values). Without these the fix
     # lane silently re-acquires the SAME deferred PR every dispatch tick: the enumerator's bucket
     # is the review:changes label, and only this wiring clears it.
