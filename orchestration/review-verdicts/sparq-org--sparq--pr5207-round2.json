@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5207,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b6d5068793437ebd11a8237f33113fc3dd84a1ff",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The revised documents consistently state the data-driven rule implemented by scripts/perf-gate.py: regressions in mode:auto metrics are hard failures, while mode:noise timing metrics are advisory/non-blocking. The broader examples now include the previously omitted deterministic non-byte and byte metrics, and metric lists are explicitly scoped to the proposals rather than presented as exhaustive. The parse_ns_per_byte wording is also consistently qualified as the sole mode:noise advisory signal. No correctness, security, honesty, or test-validity issue remains in this documentation-only diff.",
+  "verdict": "approve"
+ }
+}
