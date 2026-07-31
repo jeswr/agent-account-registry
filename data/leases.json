@@ -12,26 +12,6 @@
   },
   {
    "account": "9e13ea21abf27e68",
-   "claim_id": "7abc954be6294ad1bf37ae0cc0d3e594",
-   "holder": "review:sparq-org/sparq#5318@dispatch-30623508231.1",
-   "package": "gui",
-   "role": "review",
-   "model": "opus5",
-   "issued_at": 1785494145,
-   "expires_at": 1785498345
-  },
-  {
-   "account": "dc2d751954080e13",
-   "claim_id": "b81c626c826c454e9e5dff78a1e0f8e7",
-   "holder": "review:jeswr/agent-account-registry#1421@dispatch-30623508231.1",
-   "package": "worker",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785494226,
-   "expires_at": 1785498426
-  },
-  {
-   "account": "9e13ea21abf27e68",
    "claim_id": "0336c8ad7ac645d9bddd363f612e21cc",
    "holder": "sparq-org/sparq#2966@30625347760.1",
    "package": "sparq-zk",
