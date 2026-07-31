@@ -1,0 +1,44 @@
+{
+ "host_envelope": {
+  "pr": 5364,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9c1599af37668dcffa3f26b12edfb56db1bac32b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`mutateIds`'s doc comment claims it serializes index mutations \"without wedging after a failed write\", and that behaviour is load-bearing: it is the entire reason for the `this.indexMutationTail = operation.catch(() => {})` line rather than simply `this.indexMutationTail = operation`. Only the happy path is covered by the new test. If someone later simplifies that line to assign `operation` directly, the added test still passes while a single failed `__index__.json` write permanently wedges every subsequent save and remove on that store instance \u2014 a silent, total loss of persistence for the session.\n\nThis is a coverage gap rather than a defect: I ported `mutateIds` into a standalone harness and confirmed the current behaviour is correct \u2014 with the first index write forced to throw, `save(a)` rejects with the underlying error and the following `save(b)` still completes and writes the index. The repo already treats this exact contract as test-worthy for the sibling mechanism: site/test/workspace.test.mjs:402, \"createSerializedWorkspaceSaver: a failing save rejects its caller but does NOT wedge the chain\".",
+    "file": "site/test/workspace.test.mjs",
+    "fix_hint": "Add a sibling test next to the new one, mirroring the shape of the existing line-402 test: wrap `fs.writeTextFile` so the FIRST write to `workspaces/__index__.json` throws, then assert both that `store.save(a)` rejects with that error and that a subsequent `await store.save(b)` resolves and leaves `b.id` in the index. That pins the `.catch(() => {})` on the tail assignment and goes red if it is ever dropped.",
+    "severity": "minor",
+    "title": "The `mutateIds` no-wedge contract is asserted in a comment but has no test"
+   },
+   {
+    "body": "`indexMutationTail` is instance state, so the serialization holds only for mutations issued through one `TauriWorkspaceStore` object. A Tauri app with more than one webview window, or any code path that constructs a second store over the same app-local-data dir (`createWorkspaceStore` is called per host), gets two independent tails and the original interleaved read-modify-write on the shared `__index__.json` reappears unchanged.\n\nThat is an acceptable scope for this fix \u2014 the reported bug is in-process interleaving from the GUI's fire-and-forget mutators, and cross-process locking would need a lock file or an atomic temp+rename. The concern is only that the comment \"Serialize index mutations across workspace ids\" reads as unqualified, so a future reader may assume the index is protected in general and build on that assumption.",
+    "file": "packages/sparq-client/src/workspace.ts",
+    "fix_hint": "Scope the claim in the doc comment, e.g. \"Serialize index mutations across workspace ids WITHIN THIS STORE INSTANCE (a second store over the same dir, e.g. another Tauri window, is not covered) without wedging after a failed write.\" If cross-instance safety is actually wanted, file it as a bead rather than widening this PR.",
+    "severity": "minor",
+    "title": "The index lock is per-store-instance; the comment reads as an unqualified guarantee"
+   },
+   {
+    "body": "`mutateIds` inherits `readIds()`'s failure mode: any read or JSON parse failure yields `[]` rather than an error. Because `mutateIds` now performs the canonical read-modify-write for the index, a transient bad read is upgraded from a read-time symptom into a durable one \u2014 `save` immediately writes back `[ws.id]`, permanently dropping every other workspace from the index (the record files survive on disk but stop appearing in `list()`). This is reachable in the Tauri backend because `writeTextFile` is a plain overwrite with no temp-file + rename, so a crash or a concurrent reader can observe a truncated `__index__.json`.\n\nPre-existing behaviour, not introduced here \u2014 flagging it because this diff touches exactly that read-modify-write and the PR's subject is index integrity, so it is the natural place to note it.",
+    "file": "packages/sparq-client/src/workspace.ts",
+    "fix_hint": "Out of scope for this PR \u2014 file it as a bead. Two candidate fixes: (a) have `readIds()` distinguish \"file absent\" (legitimately `[]`) from \"present but unparseable\" and make `mutateIds` refuse to write on the latter; and/or (b) make `writeIds` durable via write-to-temp + rename so a reader never sees a partial index.",
+    "severity": "minor",
+    "title": "A corrupt or partially-written index is silently rewritten as truncated by the next mutation"
+   },
+   {
+    "body": "The store calls `this.fs.writeTextFile(path, contents, this.opts)`, but the wrapper installed by the test is `async (path, contents) => { ...; await rawWrite(path, contents); }` \u2014 the `opts` argument is dropped on the way through. Harmless today because `fakeFs().writeTextFile` ignores `opts` entirely, but it makes the double diverge from the `TauriFsApi` signature it is standing in for, so a future assertion on `baseDir` plumbing would silently pass against this test.",
+    "file": "site/test/workspace.test.mjs",
+    "fix_hint": "Forward the rest of the arguments: `fs.writeTextFile = async (path, contents, opts) => { ...; await rawWrite(path, contents, opts); }`.",
+    "severity": "nit",
+    "title": "The `writeTextFile` test double silently drops the third `opts` argument"
+   }
+  ],
+  "progress": null,
+  "summary": "Correct, minimal fix for a real lost-update race. `createSerializedWorkspaceSaver` serializes saves PER WORKSPACE ID only, so two saves for DIFFERENT ids could interleave their `__index__.json` read-modify-write on the async Tauri fs backend and drop an index entry (the workspace file survives but becomes invisible to list()). The new `mutateIds` chains every index mutation onto a single instance-level promise tail, which is the right granularity: the shared resource is the one index file, not the per-id record. The `operation` / `this.indexMutationTail = operation.catch(() => {})` split is the correct idiom \u2014 the caller still sees the rejection while the tail resolves so a failed write cannot wedge later mutations. The `string[] | null` sentinel is safe: an empty array is truthy in JS, so removing the last workspace still writes `[]` rather than skipping the write. Both call sites are behaviour-preserving (save skipped the write when the id was already present; remove always wrote). VERIFIED EMPIRICALLY: I could not run `npm run test:unit` (no node_modules \u2014 `typescript` is unresolvable for the ts-loader), so I hand-ported TauriWorkspaceStore, createSerializedWorkspaceSaver and the new test into a standalone harness and ran the test body against BOTH the pre-diff and post-diff save() bodies. Pre-diff the index ends as [a.id] (b's entry lost) and the assertion FAILS; post-diff it ends as [a.id, b.id] and PASSES. The test is therefore a genuine, non-vacuous regression test, and its gating is deterministic (the release is ordered by a macrotask `setImmediate` after all pending microtasks drain, not by a timer). I also probed the 'without wedging after a failed write' claim: a rejected index write propagates to its own caller and the next mutation still proceeds \u2014 the comment is accurate. Remaining items are non-blocking: an untested no-wedge branch, an instance-scoped (not cross-window/process) lock, and a pre-existing corrupt-index hazard adjacent to the new code.",
+  "verdict": "approve"
+ }
+}
