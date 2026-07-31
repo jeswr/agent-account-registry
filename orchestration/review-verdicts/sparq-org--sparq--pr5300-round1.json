@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5300,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e1fca83a3bf87bf648979291d9335b2d29337cb9",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "pick_cache_seeds uses enumerate(groups) and includes idx in rank. When two groups for the same cache_crate have equal feature breadth and weight, reversing or otherwise reordering the groups changes which group is selected. This contradicts the documented/tested invariant that selection is independent of group order. Although normal assembly is currently ordered, the helper's claimed deterministic behavior and regression contract are not actually satisfied.",
+    "file": "scripts/assemble-feature-matrix.py",
+    "fix_hint": "Use a stable property of the group as the final tie-breaker, such as the group identifier or a canonical tuple derived from its legs, rather than enumerate position. Add a synthetic equal-breadth/equal-weight case and verify the same group wins after reordering.",
+    "severity": "major",
+    "title": "Cache-seed tie-breaker depends on group list order"
+   },
+   {
+    "body": "list(reversed(groups)) copies only the list. pick_cache_seeds mutates each shared group dictionary, so it also overwrites cache_save in the original groups. The final comparison therefore compares two views of the same mutated objects and passes even if reordering changes the chosen seed. The first comparison checks only cache_crate keys and likewise cannot identify which group won.",
+    "file": "scripts/tests/test_feature_matrix_assemble.py",
+    "fix_hint": "Capture the original seed group IDs before calling pick_cache_seeds, or deepcopy the groups before reversing. Include tied breadth and weight so the current idx tie-break fails the test.",
+    "severity": "major",
+    "title": "Determinism regression test is vacuous due to shared mutable dictionaries"
+   }
+  ],
+  "progress": null,
+  "summary": "The single-writer cache gating is wired through correctly, but the new determinism test is vacuous because it reverses a shallow copy whose group dictionaries are shared, and pick_cache_seeds mutates those dictionaries in place. It therefore cannot detect a changed seed. The implementation also explicitly uses input position as its final tie-breaker, contradicting the test's stated invariant that group order must not decide the seed. Make the tie-break independent of list order and repair the test to compare immutable seed identities captured before reselection (or use deep copies), including a tied breadth/weight case.",
+  "verdict": "request_changes"
+ }
+}
