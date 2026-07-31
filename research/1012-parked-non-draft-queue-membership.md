@@ -6,10 +6,11 @@
 > next author "fixes" by relaxing a trust check.
 >
 > **Recommendation: do NOT add a queue-membership read to `_pull_inactivity_decision`. Spend the
-> same GraphQL probe on the other side of the problem — as the safety guard on DRAFTING a
-> machine-parked `__global__` holder, which moves the PR into the state the existing test already
-> proves.** §6 is the maintainer's confirm-or-overrule; §7 is what an overrule obliges before any
-> code is written.
+> same GraphQL probe on the other side of the problem — as the safety guard on converting a
+> machine-parked `__global__` holder to DRAFT, which moves the PR into the state the existing test
+> already proves. The probe does NOT license the machine to issue that conversion itself — §4.1 —
+> so the conversion is human-executed.** §6 is the maintainer's confirm-or-overrule; §7 is what an
+> overrule obliges before any code is written.
 
 ## 1. The question
 
@@ -133,13 +134,17 @@ in this repository**: `REVIEW_STATE_QUERY` / `parse_review_state` / `review_stat
 **un-arms** a merge that passed review, so the probe exists precisely to refuse both, and an
 unreadable probe skips the conversion.
 
-Failure directions, all closed:
+Failure directions the probe closes **at the instant it is read**:
 
 | probe answer | action | resulting occupancy |
 |---|---|---|
-| unknown / unreadable / malformed | **do not draft** | busy — identical to today |
-| queued, or armed, or `review:pass` | **do not draft** | busy — and no live merge is evicted |
-| not-queued and not-armed | draft it | the PR now carries the **draft** proof; the existing carve-out frees it next tick |
+| unknown / unreadable / malformed | **do not convert** | busy — identical to today |
+| queued, or armed, or `review:pass` | **do not convert** | busy — and no live merge is evicted |
+| not-queued and not-armed | convert to draft | the PR now carries the **draft** proof; the existing carve-out frees it next tick |
+
+That table is **not** a claim that the remedy is race-free, and an earlier revision of this section
+wrongly captioned it as one ("all closed"). The probe and the conversion are two separate requests;
+§4.1 is the correction, and it is what decides *who executes* the last row.
 
 Three further properties this shape has and the §2 proposal does not:
 
@@ -163,6 +168,65 @@ out of the label that exists to mean "a human decides this one". The measured ho
 scope: registry #677 recorded sparq#3628 as `review:parked` + non-draft, holding `__global__` across
 ticks. A human-parked non-draft holder stays busy — which is correct, and is a human's to release.
 
+### 4.1 The probe-to-mutation race — and why the conversion is HUMAN-EXECUTED
+
+`review_state` and the conversion are **two separate requests with nothing binding them**. Between
+them the PR can be enqueued, armed, or labelled `review:pass`, and the conversion then does exactly
+the damage the probe exists to refuse: `gh pr ready N --undo`
+(`scripts/backfill-provenance.py:756`) evicts a live queue entry or un-arms a merge that passed
+review (`scripts/backfill-provenance.py:578-596`). Calling the read "point-in-time evidence
+licensing an action taken *now*" (§4) quietly assumes `now` is atomic. It is not.
+
+**No compare-and-swap can close it.** This estate's one atomic merge-state primitive is
+`enablePullRequestAutoMerge`, whose `expectedHeadOid` is a CAS evaluated at arm time
+(`scripts/regate-sweep.py:90-92`). The conversion path has no counterpart — worker-pr says it
+outright: "`pr ready` (undraft) carries no CAS" (`scripts/worker-pr.py:5468-5472`). And a head CAS
+would be the **wrong** CAS even if one existed: enqueuing, arming and labelling all happen
+**without moving the head**, which is precisely why worker-pr re-probes holds on every arm attempt
+instead of leaning on `expectedHeadOid` (`scripts/worker-pr.py:5390-5396`), and why the same class
+of window is still open as #294 — "no atomic label/base CAS exists"
+(`scripts/worker-pr.py:4271-4280`).
+
+**Detect-and-recover is not available either.** After the conversion the queue entry and the
+auto-merge request are simply *gone*, so a re-probe cannot distinguish "was never queued" from "I
+just evicted it" without a timeline read whose completeness nobody here has demonstrated. And the
+repair for either harm is a **re-arm** — an arm-class mutation, human-gated on this estate. A loop
+that re-armed to undo its own eviction would be a machine arming a PR, the one thing this fleet
+must never do. There is therefore no protocol under which the machine both causes this harm and
+safely undoes it.
+
+**What genuinely narrows the window — stated as narrowing, not as closure.** In scope the holder
+carries `review:parked`, which is a live hold that `ready_and_arm` aborts on before any
+undraft/arm (`scripts/worker-pr.py:4246-4258`, `:5484-5490`). So **no machine in this fleet can arm
+or enqueue a holder in scope**; the only actor that can transition it inside the gap is a **human**
+— pressing Merge, enqueuing by hand, or unparking and then arming. Narrow. Not zero.
+
+That asymmetry decides the executor rather than the mechanism. §2's objection to #1012's proposal
+was that a point-in-time read must not license an outcome that has to hold *later*; here "later" is
+milliseconds rather than minutes, but the loss it risks — a reviewed, queued merge destroyed — is
+**not machine-recoverable**, while the thing bought is a throughput optimisation the estate
+demonstrably survives without (§5). An optional gain must not carry an irreversible-by-machine
+downside. **So the machine probes and does not mutate**: on a measured starved lane it surfaces a
+pre-validated, human-executable request naming the exact command, and the human's press is atomic
+with that human's own observation. That is §6 **(A1)**.
+
+If the maintainer prefers the loop to execute the conversion (§6 **(A2)**), these bind before any
+code is written:
+
+1. **A fresh re-probe immediately before the mutation, with nothing between.** The #139 pattern
+   (`scripts/worker-pr.py:5468-5490`) — the tightest boundary GitHub's API allows. A probe taken
+   earlier in the tick may not license a conversion.
+2. **Post-mutation verification that ESCALATES, never repairs.** Re-read after converting; on any
+   evidence the PR was queued/armed/`review:pass` at conversion time, apply a human hold and say so
+   loudly. Do **not** re-arm, re-enqueue, or un-draft to "put it back".
+3. **The residual window is NAMED, not claimed closed** — in the code comment and in the follow-up
+   issue, in the shape #294 is named, with its worst case written out.
+4. **Mandatory adversarial cases, non-vacuous, both directions**: a queue entry appearing between
+   probe and mutation; an arm appearing between probe and mutation; `review:pass` appearing between
+   probe and mutation. Each must assert the *implemented* response (refused at the re-probe, or
+   detected-and-escalated) and each must go **RED** if the re-probe or the post-mutation check is
+   deleted.
+
 ## 5. What this leaves unfixed, stated plainly
 
 - A **human-parked** non-draft holder still never frees its crates. By design (§4), not by
@@ -174,15 +238,22 @@ ticks. A human-parked non-draft holder stays busy — which is correct, and is a
   recovery is the backfill workflow.
 - The measured holder is still **counted and named** every tick after #677, and still does not
   self-heal until the remedy in §4 (or an overrule per §7) is built.
+- Under **(A1)** it does not self-heal even then: its exit is still a human press. What the remedy
+  buys is that the press becomes one pre-validated click on a measured starved lane instead of a
+  diagnosis. Self-healing is what **(A2)** buys, and §4.1 is its price.
 
 ## 6. Maintainer decision
 
 Confirm **one**:
 
-- [ ] **(A) Confirm the recommendation.** `_pull_inactivity_decision` keeps `non-draft` as an
-      unconditional BUSY. A follow-up implements the §4 draft-conversion remedy, reusing
-      `backfill-provenance.review_state` as the guard, MACHINE parks only, triggered by the
-      starvation sweep. #1012 closes on this record; the follow-up is a separate issue.
+- [ ] **(A1) Confirm the recommendation.** `_pull_inactivity_decision` keeps `non-draft` as an
+      unconditional BUSY. A follow-up implements the §4 remedy with the conversion
+      **human-executed**: the starvation sweep probes with `backfill-provenance.review_state`,
+      MACHINE parks only, and *surfaces* the conversion rather than issuing it (§4.1).
+      #1012 closes on this record; the follow-up is a separate issue.
+- [ ] **(A2) As (A1), but the loop executes the conversion** — accepting the named probe-to-
+      mutation window of §4.1 and bound by its four obligations, which are as non-negotiable as
+      §7's.
 - [ ] **(B) Overrule — build the positive queue proof anyway.** Then §7 binds it.
 - [ ] **(C) Neither — leave the hold in place, unremedied.** #1012 closes as `wontfix` and the
       counted/named holder is accepted as the standing cost.
