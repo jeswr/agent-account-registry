@@ -1,46 +1,6 @@
 {
  "records": [
   {
-   "ts": 1785470688,
-   "provider": "anthropic",
-   "account": "9e13ea21abf27e68",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "30602813179.1"
-  },
-  {
-   "ts": 1785470714,
-   "provider": "fleet",
-   "account": "5f5b2dc3fb8e231b",
-   "model_alias": "",
-   "exit_class": "success",
-   "run_id": "30602967061.1"
-  },
-  {
-   "ts": 1785470747,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30603156804.1"
-  },
-  {
-   "ts": 1785470763,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30603172551.1"
-  },
-  {
-   "ts": 1785470769,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30603166709.1"
-  },
-  {
    "ts": 1785470882,
    "provider": "openai",
    "account": "dc2d751954080e13",
@@ -1958,6 +1918,14 @@
    "model_alias": "opus5",
    "exit_class": "success",
    "run_id": "30622780103.1"
+  },
+  {
+   "ts": 1785496035,
+   "provider": "anthropic",
+   "account": "51bde6688e140866",
+   "model_alias": "opus5",
+   "exit_class": "success",
+   "run_id": "30625354183.1"
   }
  ]
 }
