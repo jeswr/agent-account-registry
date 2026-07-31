@@ -478,7 +478,7 @@ jobs:
           # This leg is NOT retired in favour of that watchdog: dispatch-stall-alert PAGES A HUMAN,
           # the keepalive RE-DISPATCHES. Losing it would turn every cron-delivery gap on the
           # busiest workflow in the fleet into a manual recovery.
-          for spec in metrics.yml:1200 conflict-resolver.yml:1500 curate.yml:2400 dispatch.yml:1200:dispatch-tick groom.yml:1800 retriage.yml:3600; do
+          for spec in metrics.yml:1200 conflict-resolver.yml:1500 curate.yml:2400 dispatch.yml:1200:dispatch-tick groom.yml:1200 retriage.yml:2400; do
             wf="${spec%%:*}"; rest="${spec#*:}"; limit="${rest%%:*}"
             if [ "$rest" != "$limit" ]; then marker="${rest#*:}"; else marker=""; fi
             # LIVE-RUN GUARD (#559): a QUEUED or IN_PROGRESS run of the target counts as FRESH —
