@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5073,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5cadf35ad5b8685dbfe5d45bf4e4e59deb42bc30",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly closes the no-default-features rustdoc coverage gap for sparq-server. The new CI step uses RUSTDOCFLAGS=-D warnings with cargo doc --no-deps --no-default-features, so unresolved intra-doc links in the async-stack-less configuration become gating failures. Each edited documentation reference targets an item unavailable without the server feature and is appropriately converted from an intra-doc link to a code span; this preserves readable documentation without creating cfg-dependent rustdoc failures. The workflow syntax and command are consistent with the stated invariant, and no runtime behavior or public API is changed.",
+  "verdict": "approve"
+ }
+}
