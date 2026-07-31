@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5361,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "79ac7953043d845043a5a235f88ff4c93a8fd21e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new matrix leg correctly enumerates all six features declared by sparq-solid and sets test: true, so the existing matrix runner executes cargo test with the unified feature set. This covers the documented odrl-bridge/legacy-union-default-graph interaction that isolated feature legs cannot exercise. The golden leg-name update matches the added leg and remains correctly ordered. No correctness, soundness, security, or test-validity issue was found in the diff.",
+  "verdict": "approve"
+ }
+}
