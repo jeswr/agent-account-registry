@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5126,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "aca8f54e606fe2b00c1ccb225a01c5c0b46bbf30",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "crate_labels_to_provision still derives manifests from bare path strings, while fetch_changed_files deliberately discards each REST entry's status and combines filename with previous_filename. Consequently, crates/<name>/Cargo.toml can qualify when it was deleted or is only the source of a rename away. An added file at that path also qualifies without being a valid Cargo manifest or identifying a crate consistent with <name>. This contradicts the load-bearing claim that the PR establishes the crate and can create permanent area-label state for a nonexistent crate. The added tests do not cover any of these cases.",
+    "file": "scripts/pr-area-labels.py",
+    "fix_hint": "Preserve structured changed-file records including status and distinguish current filename from previous_filename for provisioning. Accept only an added manifest or the destination of a rename at crates/<name>/Cargo.toml. Fetch that PR-head blob as inert data, parse it without executing PR code, and verify that it is a valid package/workspace crate manifest whose identity is consistent with the directory. Add tests proving deletions and rename-away sources never provision, malformed or identity-mismatched manifests never provision, and a valid newly added manifest does.",
+    "severity": "major",
+    "title": "Manifest-path evidence still accepts deleted, renamed-away, or invalid manifests"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant. The round-4 major finding remains: provisioning still treats a bare normalized path equal to crates/<name>/Cargo.toml as proof that a crate exists. fetch_changed_files discards REST status and merges filename with previous_filename into one path list, so a deleted manifest or the old side of a rename can qualify. It also never validates the PR-head manifest as inert data, so malformed content or a package identity inconsistent with the directory can create durable repository label state. The new tests still cover only path shapes and do not exercise deletion, rename-away, malformed manifests, or identity mismatch.",
+  "verdict": "request_changes"
+ }
+}
