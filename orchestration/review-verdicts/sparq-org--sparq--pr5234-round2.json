@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5234,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e6ac28429429bb4e4388fefd6ce10ce1416d77a8",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The header first correctly says adding, renaming, or removing a leg is a two-file change, but then states that any bead, issue, or PR that scopes a fragment MUST also scope the golden. That includes features, test, tier, tier-reason, and comment-only edits, directly contradicting the new README and every fragment comment, which correctly classify those as single-file changes. This preserves the substantive round-1 scope contradiction in another authoritative-looking location.",
+    "file": "scripts/assemble-feature-matrix.py",
+    "fix_hint": "Qualify the sentence by emitted leg-name changes, for example: 'Any bead / issue / PR that changes the emitted leg-name set MUST also scope the golden.' Explicitly note that fragment edits which cannot change name remain single-file, matching the README and fragment comments.",
+    "severity": "major",
+    "title": "Assembler header still broadens the two-file rule to every fragment task"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 fixes the central README and fragment comments by consistently limiting the two-file rule to additions, removals, and renames of emitted leg names. The exact-output regression test remains non-vacuous and restores sys.argv correctly. However, the same prior contradiction remains in the newly added assembler header: it says any task that scopes a fragment must also scope the golden, which conflicts with the README's explicit rule that features/test/tier/tier-reason/comment-only edits are single-file changes. Because this text is part of the scope contract and can still cause needless shared-golden scope, the prior major finding is materially unresolved.",
+  "verdict": "request_changes"
+ }
+}
