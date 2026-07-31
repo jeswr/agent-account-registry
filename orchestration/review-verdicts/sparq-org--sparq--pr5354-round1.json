@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5354,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0c28f0252d07678c385bb3903c2f40c98af2914c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new text says distinctness does not rest on VALUE_NONE and that datatype routing alone separates degenerate and real value components. But research/zk-field-native-encoding.md section 14.1 explicitly requires VALUE_NONE to be outside the complete reachable handle band, including signed field encodings, with host and Noir assertions; it says this defense remains required even though current fail-closed routing separates datatype constants. The implementation still uses VALUE_NONE = 2, which lies inside the documented [0, 2^64) reachable band. Thus the skill now presents a disputed relaxation as a resolved design fact while the relevant audit record requires the opposite invariant. The scoped routing test only proves current routing and the two unrouted boolean values; it does not prove the audit record's cross-lane reserved-tag invariant.",
+    "file": "skills/zk-query-proofs/SKILL.md",
+    "fix_hint": "Either retain the section 14.1 invariant and avoid claiming that routing supersedes it, or update the design/audit record in the same reviewed change with a sound argument for retiring that obligation and consistent host/circuit tests. Do not describe Q1 as resolved while the authoritative record still mandates an out-of-band VALUE_NONE. Keep README wording consistent with that resolution as well.",
+    "severity": "major",
+    "title": "Collision rationale contradicts the audit record's required VALUE_NONE invariant"
+   }
+  ],
+  "progress": null,
+  "summary": "The documentation is careful about the research-grade and external-audit posture, and the cited seam is reflected by the real routing test. However, the new collision rationale contradicts the controlling encoding design record's explicit reserved-tag invariant. The PR must reconcile that inconsistency before presenting the revised rationale as resolved.",
+  "verdict": "request_changes"
+ }
+}
