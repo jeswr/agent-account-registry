@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5303,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "706b1716005d00525275302099062c0bc010db47",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The workflow change correctly replaces the gating js lane's source-built wasm-pack installation with the same SHA-pinned prebuilt action pattern already used in ci.yml, retains an exact release version, and preserves installation before npm ci. The new hermetic regression test exercises all four stated posture invariants against the real workflow and passes; its step parsing delegates to the repository's existing shared workflow parser rather than duplicating it. No correctness, soundness, security, or vacuous-test issue was found in the diff.",
+  "verdict": "approve"
+ }
+}
