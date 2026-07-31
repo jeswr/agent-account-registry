@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5203,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ef24a46d8a1aa2cdce559815720e4bd582fec54e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly restores the lld flag at job scope for all four cargo-llvm-cov jobs, keeps the engine run/merge values identical, and adds a focused static gate with non-vacuous live-workflow coverage. The parser is intentionally limited to the repository's block-style workflow conventions, and the tests exercise missing, step-only, divergent, direct-invocation, CSV-tool, scalar-parsing, and live engine-pair cases. The documentation is appropriately candid that cargo-llvm-cov's preservation of an existing RUSTFLAGS value still requires confirmation from CI rather than presenting that behavior or a speedup as measured fact. The focused 17-test suite and live enforcement scan both pass at the PR head.",
+  "verdict": "approve"
+ }
+}
