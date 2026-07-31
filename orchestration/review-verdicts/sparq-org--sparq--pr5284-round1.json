@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5284,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8fefa55abea1027086ba6360396431b072149abb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new Solid MCP aggregate tools consistently derive their data from PodStore::view_for(Read) via a GRAPH-variable CONSTRUCT, preserving the same named-graph authorization boundary as session-scoped queries and an empty default graph. The tests exercise the load-bearing security invariant with disjoint principals, distinct private vocabulary, a grant-less session, public dispatch, and post-write freshness; widening the projection to the whole store would make those assertions fail. The projection is rebuilt per call and CONSTRUCT returns an RDF graph, so the documented merge/deduplication semantics match the implementation. Public tool metadata and the matching agent-tools skill are updated. No hostile reviewer-directed instruction was present in the diff. There is a harmless duplicate listing of the three new specs in tool_spec_consts_serialize_with_schema, but it does not affect correctness or coverage enough to warrant a finding.",
+  "verdict": "approve"
+ }
+}
