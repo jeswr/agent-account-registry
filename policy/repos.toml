@@ -148,7 +148,7 @@ worker_success_floor    = 0.5  # worker-failing below 50% success with any worke
 # axis had only one repo left to drive it (see registry PR #1451 / issue #1454). A third row keeps
 # that control driven by SHIPPED policy data rather than a fixture.
 #
-# gate_profile "node-workspace": the repo's own .github/workflows/gate.yml already lands a `gate`
+# gate_profile "lint-only": the repo's own .github/workflows/gate.yml already lands a `gate`
 # check on pull_request, so the merge contract matches sparq's without any new CI.
 [repos."jeswr/solid-sdk"]
 enabled = false
@@ -156,7 +156,16 @@ routing = "orchestration/routing.toml"
 account_pool = ["acct01", "acct02", "acct04", "acct2css", "acct3css", "acct4css", "acct05", "acct07"]
 max_concurrent = 6            # conservative first bound for a new target; raise on evidence
 worker_timeout_minutes = 45   # a TS/pnpm workspace builds far faster than the cargo workspace
-gate_profile = "node-workspace"
+gate_profile = "lint-only"    # NOT a cargo profile: this is a TypeScript/pnpm monorepo, and the
+                              # repo's OWN .github/workflows/gate.yml lands the real `gate` check on
+                              # every pull_request. `lint-only` is worker-live.sh's deliberate no-op
+                              # pass, which is the honest encoding of "the target's own CI is the
+                              # gate" — the worker must not pretend to run a crate-scoped cargo gate
+                              # on a repo with no Cargo workspace. (`node-workspace` was invented and
+                              # is NOT in policy-resolve.GATE_PROFILES; it survived only because
+                              # _policy_row rejects a disabled row BEFORE validating its other
+                              # fields, so the promised one-line enable would have failed closed.
+                              # Round-1 review caught this; the test below now proves the enable.)
 arm_auto_merge = false        # NEVER auto-arm a target whose review lane has no track record here
 require_usage = true          # fail-closed if the usage probe is unavailable
 usage_safety_margin = 0.15

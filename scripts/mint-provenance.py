@@ -1854,9 +1854,20 @@ def _self_test():                                                       # noqa: 
 
 
     probe_doc = copy.deepcopy(policy_doc)
-    # ...and the probe must pick an ENABLED row for the same reason: a disabled one raises
-    # rather than reporting an empty allowlist, which would test the exception, not the reader.
-    probe_repo = sorted(_enabled_rows)[0]
+    # ...and the probe must pick an ENABLED row that does NOT already carry the key. Round-1
+    # review: picking `sorted(_enabled_rows)[0]` selects the registry, which ALREADY resolves to
+    # ["jeswr"], so setting it to ["jeswr"] is a value-identical no-op and the check below proves
+    # nothing about the reader. A real transition needs a row whose CURRENT value is empty.
+    # (A disabled row cannot serve either: it RAISES instead of reporting empty, testing the
+    # exception rather than the reader.)
+    _probe_candidates = [name for name in sorted(_enabled_rows)
+                         if not policy_resolve.review_enrolment_authors(name, policy_doc)]
+    assert _probe_candidates, (
+        "the positive-transition probe needs an ENABLED policy row with NO review_enrolment_authors; "
+        "every enabled row already carries one, so this probe can no longer prove a transition")
+    probe_repo = _probe_candidates[0]
+    check("...the probe row genuinely starts EMPTY, so the check below is a real transition",
+          sorted(policy_resolve.review_enrolment_authors(probe_repo, policy_doc)), [])
     probe_doc["repos"][probe_repo]["review_enrolment_authors"] = ["jeswr"]
     check("...and the same reader WOULD surface one",
           sorted(policy_resolve.review_enrolment_authors(probe_repo, probe_doc)), ["jeswr"])
