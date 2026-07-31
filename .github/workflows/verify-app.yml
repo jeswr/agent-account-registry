@@ -37,11 +37,19 @@ jobs:
           PY
           )
           echo "== stored App identity (this is the app the registry secrets belong to) =="
-          curl -s -H "Authorization: Bearer $JWT" -H "Accept: application/vnd.github+json" \
+          # ARGV LEAK (issue #417, the same class issue #195 fixed in scripts/account-usage.py):
+          # a command line is world-readable on the runner (`ps` / /proc/<pid>/cmdline) and is
+          # captured verbatim by diagnostic command capture, so this App JWT — a live credential
+          # that can mint installation tokens — is fed through curl's STDIN header stream (`-H @-`)
+          # and never appears as an argument. `printf` is a shell BUILTIN: it forks no process whose
+          # argv could carry the JWT.
+          printf 'Authorization: Bearer %s\n' "$JWT" \
+            | curl -s -H @- -H "Accept: application/vnd.github+json" \
             https://api.github.com/app \
             | python3 -c 'import sys,json;d=json.load(sys.stdin);print("  slug:",d.get("slug")," app_id:",d.get("id")," owner:",(d.get("owner") or {}).get("login"))'
           echo "== where the stored App is currently installed =="
-          curl -s -H "Authorization: Bearer $JWT" -H "Accept: application/vnd.github+json" \
+          printf 'Authorization: Bearer %s\n' "$JWT" \
+            | curl -s -H @- -H "Accept: application/vnd.github+json" \
             https://api.github.com/app/installations \
             | python3 -c 'import sys,json;xs=json.load(sys.stdin);print("  (none)") if not xs else [print("  on:",i.get("account",{}).get("login")," type:",i.get("target_type")," repos:",i.get("repository_selection")) for i in xs]'
 
