@@ -888,24 +888,28 @@ the parsed document in memory and required to come back named.
   mutating human-owned issue state; `final_state` returns the issue to the pool.
 
 - A FAILED local gate no longer discards the model's work — it RETAINS it for diagnosis (issue #33).
-  The publisher opens no pull request — that is unchanged — but it reconstructs the same
-  digest-verified, pre-gate bundle and pushes it to
-  `sparq-agent/gate-failed/issue-<N>-<run>-<attempt>`, so a human debugging a systematic gate
-  failure still has the failing tree instead of a 1-day artifact nothing ever reads. The namespace
-  is the safety property: that ref does not match the `sparq-agent/issue-<N>-…` head pattern that
-  provenance reconciliation, the review enumerator and `groom` key on, so preserved work can never
-  be enumerated, reviewed, provenance-recorded or armed — and `worker-live.sh preserve-gate-failed`
-  makes no `gh` call at all, so no pull request of any kind can come out of that lane. It fires only
-  on a gate that RAN and returned `failure` (a skipped/absent verdict — e.g. a toolchain step that
-  died after the pre-gate seal — is not a failure and writes nothing), and it carries the SAME
-  guards as publication (verified bundle + the live-trust attestation): a closed, rewritten or
-  human-parked issue receives no push either. The issue still converges to `status:deferred`; the
-  branch is a diagnostic artefact, never a proposal, and is not merged.
+  The publisher writes nothing whatsoever to the target — that is unchanged — but it keeps the same
+  digest-verified, pre-gate bundle as a 30-day artifact of the failing run
+  (`gate-failed-issue-<N>-<run>-<attempt>`), so a human debugging a systematic gate failure still
+  has the failing tree instead of a 1-day artifact nothing ever reads. It fires only on a gate that
+  RAN and returned `failure` (a skipped/absent verdict — e.g. a toolchain step that died after the
+  pre-gate seal — is not a failure and retains nothing), and only for a bundle that matched the
+  pre-gate record. The issue still converges to `status:deferred`.
 
-  **Scope: nothing consumes that ref automatically.** The next attempt still starts the model from a
-  fresh default-branch checkout and the fix loop only ever operates on an existing pull request's
-  head, so this lane does NOT resume a failed attempt and does NOT avoid re-paying the model cost.
-  A recovery consumer that discovers and base-binds the correct prior ref is separate, unbuilt work.
+  **The diagnostic is an ARTIFACT, not a branch, and that is the security property.** Retaining the
+  work as a Git ref in the target — even under a namespace invisible to provenance reconciliation,
+  the review enumerator and `groom` — would not make it inert: the push carries a
+  contents+workflows-write App token, so it raises a `push` event in the target and any `on: push`
+  workflow there runs as a consequence, including one the candidate bundle itself adds under
+  `.github/workflows/`. That would let gate-FAILED, unreviewed content reach target-side execution
+  with the target's own Actions capabilities and secrets. An artifact executes nothing, is scoped to
+  this run in this repository, and the retention step is ordered BEFORE the App-token mint, so a
+  failed gate never holds a write credential at all.
+
+  **Scope: nothing consumes that artifact automatically.** The next attempt still starts the model
+  from a fresh default-branch checkout and the fix loop only ever operates on an existing pull
+  request's head, so this lane does NOT resume a failed attempt and does NOT avoid re-paying the
+  model cost. A recovery consumer is separate, unbuilt work.
 
 ## Registering a new account (web-login broker)
 
