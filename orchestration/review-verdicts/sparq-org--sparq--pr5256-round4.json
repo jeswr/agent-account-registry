@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5256,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1fe4d5b12c29928c3e0e106d0a959f0d94fa7f08",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly adds an explicit feature-matrix leg for the default-off vc-bridge tests and supplies non-vacuous W3C interoperability coverage for both supported rdfc suites. The fixtures are pinned by published SHA-256 values; the tests independently check canonical bytes, proof-config/document hash ordering, proofValue decoding, both public verification entry points, and end-to-end ingest. Signature, credential, proof-config, and suite-confusion mutations exercise fail-closed behavior. Claims remain accurately limited to off-circuit ingest-time verification and explicitly disclaim in-circuit/query soundness and external audit. The implementation is consistent with the scoped VC bridge design. Targeted execution could not be repeated in this environment because cargo is unavailable, but no correctness, soundness, test-validity, or security defect is evident in the diff and narrowly inspected implementation/design context.",
+  "verdict": "approve"
+ }
+}
