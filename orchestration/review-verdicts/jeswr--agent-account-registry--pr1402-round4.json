@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1402,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b9d2814330426da3c971c0463ba2fd07478310a1",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`reconcile_dispatch_head` still extracts and validates only `object.sha`; it never checks `object.type`. A payload such as `{\"object\":{\"sha\":\"<40 lowercase hex>\",\"type\":\"tag\"}}`, or the same payload with `type` absent, is therefore accepted as the authoritative commit head. This is materially the same major finding as round 3. The new self-tests put `type: \"commit\"` in positive fixtures, but none changes or removes that field, so the missing trust check remains untested. Outcome-path fakes have the same blind spot because the reducer ignores their type value.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Require `node.get(\"type\") == \"commit\"` in addition to the exact 40-lowercase-hex SHA check. Add negative reducer rows for a valid SHA with `type: \"tag\"`, missing `type`, and another invalid type, asserting `WorkerPrError`; also drive at least one such payload through each relevant outcome path and assert `malformed-head` with no mutation.",
+    "severity": "major",
+    "title": "Branch-ref reducer still accepts non-commit Git objects"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 trust failure remains unchanged. The reducer still validates only the SHA syntax and never verifies the Git object's `type`, despite its contract and callers treating the returned value as a commit. The added fixtures include `type: \"commit\"` on successful payloads but do not add the requested negative tag/missing-type cases, so they cannot detect this defect.",
+  "verdict": "request_changes"
+ }
+}
