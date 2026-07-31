@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5272,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ea1be2f3561980d56dec0dd435d1257e2af948e8",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change narrowly authorizes repository-label creation only when the paginated PR-files payload witnesses an added, copied, or renamed crate-root Cargo.toml; names are constrained before use, incomplete or otherwise unresolved change sets remain fail-closed, dry-run remains non-mutating, and creation failures propagate except for a live-set-verified concurrent-create race. The implementation also keeps the known-label set current during backfills. Tests exercise the real planning and effect paths, including creation/application ordering, idempotence, concurrency, truncation, non-witness cases, permanent-write permission scope, and explicit POST parameters. No correctness, soundness, security, or vacuity issue requiring changes was found.",
+  "verdict": "approve"
+ }
+}
