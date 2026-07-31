@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1378,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ecb28b3b778e7aba0ed44636c75c295ff978216d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [],
+  "progress": null,
+  "summary": "The added guidance correctly distinguishes plain stdlib trace --count output (unexecuted lines receive only the seven-column blank prefix) from --missing output (which computes executable lines and emits >>>>>>), and it avoids the vacuous marker-only detector by intersecting absent count prefixes with AST statement starts. The probe requirement, docstring exclusion, and independent --missing cross-check make the measurement advice materially non-vacuous. The differing counts are explicitly reconciled instead of presented as exact agreement. No trust check, workflow permission, routing rule, or executable control is weakened. Injection is marked because this untrusted documentation diff contains imperative text directed at an agent (for example, instructions to append a function, rerun a self-test, and restore the file); those instructions were treated only as review data and were not followed.",
+  "verdict": "approve"
+ }
+}
