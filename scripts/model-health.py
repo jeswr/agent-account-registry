@@ -2305,11 +2305,22 @@ def _deliver_alerts(actions, maintainer, fallback_open=frozenset()):
     BOTH routes and counts as delivered only when each route it targets confirms (review #340).
     Beyond that explicit binding, recoveries never fall back cross-repo — "no open issue" on a
     repository whose marker was never seen is a no-op that cannot confirm a close (review round
-    2). Returns the actions still undelivered (empty == all delivered) so the caller can exit
-    nonzero — an unusable alert token must fail the run, never silently drop the alert."""
+    2). A FIRING action that lands on the primary while its marker is still open on a fallback
+    that is a DIFFERENT REPOSITORY closes the superseded fallback copy (issue #344), so a recovered
+    primary route never leaves two divergent open copies of one alert; a fallback that differs only
+    by token names the same issue, so it is never closed here (round 1 of #1455). Returns the actions still undelivered (empty == all
+    delivered) so the caller can exit nonzero — an unusable alert token must fail the run, never
+    silently drop the alert."""
     repo, token = _alert_target()
     fb_repo, fb_token = _registry_fallback()
     fb_distinct = (repo, token) != (fb_repo, fb_token) and bool(fb_token)
+    # ...but the CREDENTIAL fallback and the CROSS-REPOSITORY dedup need different tests (review
+    # round 1 of #1455). `fb_distinct` compares (repo, token) PAIRS, so ALERT_REPO == REGISTRY_REPO
+    # with a distinct ALERT_TOKEN — a supported configuration — keeps the retry route armed while
+    # both routes name ONE repository. `_cmd_decide` then enumerates that repository's own markers
+    # into `fallback_open`, where the "superseded fallback copy" IS the live primary alert: closing
+    # it would erase the only open firing issue. Dedup is therefore keyed on the repository NAME.
+    fb_other_repo = fb_distinct and repo.strip().lower() != fb_repo.strip().lower()
     # A DETAILED body (failure/fleet counts + reset hints + diagnostics) is emitted ONLY over a
     # POSITIVELY VERIFIED private route (sol-audit issue #204, hardened in #432 round 1): an
     # ALERT_REPO distinct from the public registry repo (case-insensitive) AND confirmed
@@ -2339,6 +2350,16 @@ def _deliver_alerts(actions, maintainer, fallback_open=frozenset()):
                 print(f"::warning::model-health: {action['condition']}/{action['provider']} alert "
                       "delivery failed on the private route — retrying on the registry")
                 delivered = _upsert_alert(action, fb_repo, fb_token, maintainer, redact=True)
+            elif delivered and fb_other_repo and (action["condition"],
+                                                  action["provider"]) in fallback_open:
+                # The primary took the alert, but a PRIOR tick's #175 retry left a copy open on
+                # the fallback: every tick from here refreshes the primary while that copy rots
+                # with the body it was created with. Close it as superseded (issue #344) so one
+                # condition never shows two divergent open issues. Guarded by fb_other_repo, not
+                # fb_distinct: only reachable when the PRIMARY write confirmed AND the fallback is
+                # a genuinely DIFFERENT repository — the retry above owns the other branch, and
+                # closing a copy on the repository the alert actually landed on would erase it.
+                _close_superseded_alert(action, fb_repo, fb_token)
         elif fb_distinct and (action["condition"], action["provider"]) in fallback_open:
             # The marker was SEEN open on the fallback repo (a prior firing retry created it):
             # close it there too, and require BOTH routes to confirm — a steady no-op on the
@@ -2483,6 +2504,49 @@ def _upsert_alert(action, repo, token, maintainer, redact=False):
               "(will retry next tick without commenting)")
         return False
     # Steady no-alert with no open issue: nothing to deliver.
+    return True
+
+
+def _close_superseded_alert(action, repo, token):
+    """Close the FALLBACK copy of a still-FIRING alert that has just been delivered on the primary
+    route (issue #344).
+
+    The #175 firing retry CREATES the alert on the public registry while the primary route is
+    transiently unusable. Once the primary recovers, later firing ticks refresh the primary copy
+    while the fallback copy stays open carrying the body it was created with — two divergent open
+    issues for one condition, until the eventual recovery closes both (review #340). Closing the
+    fallback copy as superseded leaves exactly one open copy, on the route that is being kept
+    current, and is self-healing: if the primary fails again the #175 retry finds this closed
+    marker issue and REOPENS it (the flap path in _upsert_alert), so no alert is lost.
+
+    Best-effort by design, and the caller does NOT fold the result into `undelivered`: the alert
+    itself reached the maintainer on the primary, so a failed dedup must not turn a delivered
+    alert into a red run. An unreadable tracker or a failed close simply leaves the duplicate for
+    the next tick to retry (the marker is still open, so it is still enumerated).
+
+    The comment names no repository and carries no fleet/failure detail — this write lands on the
+    PUBLIC registry (sol-audit #204). Returns True iff nothing is left open here: no copy found,
+    or the close CONFIRMED."""
+    marker = _marker(action["condition"], action["provider"])
+    try:
+        num = _find_marker_issue(repo, token, marker, "open")
+    except HealthError as exc:
+        print(f"::warning::model-health: cannot read the {action['condition']} fallback tracker "
+              f"({exc}) — the superseded duplicate stays open (will retry next tick)")
+        return False
+    if num is None:
+        # The snapshot is a tick old and fail-open-to-empty; nothing open here now, nothing to do.
+        return True
+    if _gh(["issue", "close", str(num), "-R", repo], token).returncode != 0:
+        print(f"::warning::model-health: close of the superseded {action['condition']} fallback "
+              "alert FAILED (will retry next tick without commenting)")
+        return False
+    # Comment only after a CONFIRMED close, so a failing close cannot spam the issue every tick.
+    _gh(["issue", "comment", str(num), "-R", repo, "--body",
+         "↩️ Superseded — this alert is being delivered on the primary alert route again, so this "
+         "duplicate copy is auto-closed. It reopens here automatically if delivery fails again."],
+        token)
+    print(f"model-health: closed the superseded {action['condition']} fallback alert copy")
     return True
 
 
@@ -2699,8 +2763,10 @@ def _cmd_decide(args):
     # of the window. Feed the union to classify_records so such an alert still earns an explicit
     # recovery, and pass the fallback's markers to _deliver_alerts so each recovery closes the
     # marker on the repository it was found on (route binding — a no-op on the primary is never
-    # proof the fallback issue closed). Each enumeration stays fail-open-to-empty, so an
-    # unreadable/truncated list only defers a recovery to the next tick, never fabricates one.
+    # proof the fallback issue closed). The same fallback markers let a FIRING action delivered on
+    # a recovered primary close its superseded fallback copy (issue #344). Each enumeration stays
+    # fail-open-to-empty, so an unreadable/truncated list only defers a recovery (or a dedup) to
+    # the next tick, never fabricates one.
     alert_repo, alert_token = _alert_target()
     open_alerts = _open_alert_markers(alert_repo, alert_token)
     fb_repo, fb_token = _registry_fallback()
@@ -4211,6 +4277,9 @@ def _self_test():
     # ---- review #340: an alert created on the fallback route is still recovered --------------
     ok = _test_fallback_orphan(chk) and ok
 
+    # ---- #344: a firing alert on a recovered primary closes its superseded fallback copy ------
+    ok = _test_firing_supersede(chk) and ok
+
     # ---- provider fleet resolution (account catalog -> salted provider map) ------------------
     chk("provider parsed from YAML body",
         _provider_of("harness: claude\nprovider: anthropic\nmodels: [fable]"), "anthropic")
@@ -5326,6 +5395,144 @@ def _test_fallback_orphan(chk):
         _gh = real_gh
         (GitHubAPI, _enabled_provider_accounts, annotate_provider_status,
          prune, read_ledger) = real
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return True
+
+
+def _test_firing_supersede(chk):
+    """Issue #344: while a condition keeps FIRING, a recovered primary route must not leave the
+    copy the #175 retry created on the fallback open with a stale body. Against the same stateful
+    two-repo gh fake, the tick after the primary recovers must close the fallback copy (with a
+    comment) while the primary carries the live alert.
+
+    The red directions this pins, each of which survived the rest of the suite: closing the copy
+    the FAILED-primary retry just delivered to (that erases the alert outright), reaching for the
+    fallback when its marker was never enumerated, and folding the dedup result into `undelivered`
+    (a cosmetic duplicate must not turn a delivered alert into a red run — it retries next tick).
+    Deleting the supersede branch turns phase 2 red with the duplicate still open.
+
+    Phase 6 pins the same-repository-distinct-token configuration, where the credential fallback is
+    armed but there is only ONE issue to speak of: keying the dedup on the (repo, token) pair
+    instead of the repository name closes the live firing alert (round 1 of #1455)."""
+    import types
+    global _gh
+    real_gh = _gh
+    saved = {k: os.environ.get(k) for k in
+             ("REGISTRY_REPO", "ALERT_REPO", "ALERT_TOKEN", "REGISTRY_ALERT_TOKEN", "GH_TOKEN")}
+    priv_repo, reg_repo = "jeswr/agent-account-data", "jeswr/agent-account-registry"
+    repos = {priv_repo: {}, reg_repo: {}}
+    seq = {"n": 200}
+    bad_tokens = set()
+    fail_close = {"repos": set()}
+    calls = []
+
+    def state_gh(args, token, capture=False):
+        repo = args[args.index("-R") + 1] if "-R" in args else None
+        calls.append((args[1] if args[0] == "issue" else args[0], repo))
+        if args[0] == "label":
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        if token in bad_tokens:
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+        if args[0] == "api":
+            return types.SimpleNamespace(returncode=0,
+                                         stdout=json.dumps({"private": True}), stderr="")
+        verb, issues = args[1], repos[repo]
+        if verb == "list":
+            state = args[args.index("--state") + 1]
+            out = [{"number": n, "body": i["body"]}
+                   for n, i in sorted(issues.items()) if i["state"] == state]
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(out), stderr="")
+        if verb == "create":
+            seq["n"] += 1
+            issues[seq["n"]] = {"body": args[args.index("--body") + 1], "state": "open"}
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        num = int(args[2])
+        if verb == "close":
+            if repo in fail_close["repos"]:
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+            issues[num]["state"] = "closed"
+        elif verb == "edit":
+            issues[num]["body"] = args[args.index("--body") + 1]
+        elif verb == "reopen":
+            issues[num]["state"] = "open"
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def states(repo):
+        return [i["state"] for _, i in sorted(repos[repo].items())]
+
+    fire = {"condition": "provider-outage", "provider": "anthropic", "fire": True, "reason": "r"}
+    key = (fire["condition"], fire["provider"])
+    try:
+        os.environ.update(REGISTRY_REPO=reg_repo, ALERT_REPO=priv_repo, ALERT_TOKEN="priv",
+                          REGISTRY_ALERT_TOKEN="amb")
+        os.environ.pop("GH_TOKEN", None)
+        _gh = state_gh
+
+        # phase 1 (#175): the primary is transiently unusable -> the alert is CREATED on the
+        # fallback. This is the only way the duplicate arises.
+        bad_tokens.add("priv")
+        chk("supersede: the firing retry creates the fallback copy",
+            (_deliver_alerts([fire], "m"), states(reg_repo)), ([], ["open"]))
+
+        # phase 2: the primary recovers and takes the still-firing alert. Pre-fix this refreshed
+        # the primary and left the fallback copy open with the body it was created with — two
+        # divergent open issues for one condition until the eventual recovery closed both.
+        bad_tokens.clear()
+        calls[:] = []
+        chk("supersede: the recovered primary takes the alert and closes the fallback copy",
+            (_deliver_alerts([fire], "m", {key}), states(priv_repo), states(reg_repo)),
+            ([], ["open"], ["closed"]))
+        chk("supersede: the closed copy is explained by exactly one comment, on the fallback",
+            [c for c in calls if c[0] == "comment"], [("comment", reg_repo)])
+
+        # phase 3: no fallback marker enumerated -> the fallback repo is never touched at all
+        # (the snapshot is the whole trigger; nothing goes hunting cross-repo every tick).
+        calls[:] = []
+        chk("supersede: a firing tick with no fallback marker never touches the fallback repo",
+            (_deliver_alerts([fire], "m"), [c for c in calls if c[1] == reg_repo]), ([], []))
+
+        # phase 4: the primary fails again -> the #175 retry REOPENS the fallback copy, which is
+        # now where the alert lives. The marker is in the snapshot, so the supersede branch must
+        # stay out of the way: closing here would erase the only copy of a firing alert.
+        bad_tokens.add("priv")
+        chk("supersede: never closes the copy the failed-primary retry just delivered to",
+            (_deliver_alerts([fire], "m", {key}), states(reg_repo)), ([], ["open"]))
+
+        # phase 5: a FAILED dedup close is not a delivery failure — the alert reached the
+        # maintainer on the primary — so the action stays delivered and the duplicate is left for
+        # the next tick, which closes it.
+        bad_tokens.clear()
+        fail_close["repos"] = {reg_repo}
+        calls[:] = []
+        chk("supersede: a FAILED dedup close leaves the alert DELIVERED, duplicate still open",
+            (_deliver_alerts([fire], "m", {key}), states(reg_repo)), ([], ["open"]))
+        chk("supersede: no comment is posted on a failed close",
+            any(c[0] == "comment" for c in calls), False)
+        fail_close["repos"] = set()
+        chk("supersede: the next tick closes the still-open duplicate",
+            (_deliver_alerts([fire], "m", {key}), states(reg_repo)), ([], ["closed"]))
+
+        # phase 6 (review round 1 of #1455): ALERT_REPO == REGISTRY_REPO with a DISTINCT
+        # ALERT_TOKEN. The credential fallback stays armed (the pairs differ), but both routes name
+        # ONE repository, so _cmd_decide enumerates the PRIMARY's own markers into `fallback_open`
+        # and the "superseded copy" is the live firing issue. Keying the dedup on the (repo, token)
+        # pair closes it and erases the only open alert; keying it on the repository NAME leaves it
+        # alone. Phases 1-5 fix the two repos to different names and cannot see this.
+        repos[reg_repo] = {}
+        os.environ.update(ALERT_REPO=reg_repo)
+        chk("supersede: same-repo distinct-token route files the firing alert as usual",
+            (_deliver_alerts([fire], "m"), states(reg_repo)), ([], ["open"]))
+        calls[:] = []
+        chk("supersede: a same-repo fallback marker never closes the live firing alert",
+            (_deliver_alerts([fire], "m", {key}), states(reg_repo)), ([], ["open"]))
+        chk("supersede: and no close/comment is issued against the primary's own repository",
+            [c for c in calls if c[0] in ("close", "comment")], [])
+    finally:
+        _gh = real_gh
         for k, v in saved.items():
             if v is None:
                 os.environ.pop(k, None)
