@@ -1,142 +1,6 @@
 {
  "records": [
   {
-   "ts": 1785462015,
-   "provider": "anthropic",
-   "account": "9e13ea21abf27e68",
-   "model_alias": "opus5",
-   "exit_class": "unknown",
-   "run_id": "30596891409.1"
-  },
-  {
-   "ts": 1785462103,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30596908793.1"
-  },
-  {
-   "ts": 1785462137,
-   "provider": "fleet",
-   "account": "5f5b2dc3fb8e231b",
-   "model_alias": "",
-   "exit_class": "success",
-   "run_id": "30596601812.1"
-  },
-  {
-   "ts": 1785462167,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30596970656.1"
-  },
-  {
-   "ts": 1785462263,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30597040378.1"
-  },
-  {
-   "ts": 1785462272,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30597019691.1"
-  },
-  {
-   "ts": 1785462284,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30597026787.1"
-  },
-  {
-   "ts": 1785462515,
-   "provider": "fleet",
-   "account": "5f5b2dc3fb8e231b",
-   "model_alias": "",
-   "exit_class": "success",
-   "run_id": "30597051734.1"
-  },
-  {
-   "ts": 1785462533,
-   "provider": "anthropic",
-   "account": "51bde6688e140866",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "30597033609.1"
-  },
-  {
-   "ts": 1785462535,
-   "provider": "anthropic",
-   "account": "51bde6688e140866",
-   "model_alias": "opus5",
-   "exit_class": "unknown",
-   "run_id": "30597279010.1"
-  },
-  {
-   "ts": 1785462601,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30597290691.1"
-  },
-  {
-   "ts": 1785462766,
-   "provider": "anthropic",
-   "account": "9e13ea21abf27e68",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "30596857652.1"
-  },
-  {
-   "ts": 1785462937,
-   "provider": "anthropic",
-   "account": "9e13ea21abf27e68",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "30596865006.1"
-  },
-  {
-   "ts": 1785463203,
-   "provider": "anthropic",
-   "account": "9e13ea21abf27e68",
-   "model_alias": "opus5",
-   "exit_class": "unknown",
-   "run_id": "30597763302.1"
-  },
-  {
-   "ts": 1785463285,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30597784952.1"
-  },
-  {
-   "ts": 1785463314,
-   "provider": "fleet",
-   "account": "5f5b2dc3fb8e231b",
-   "model_alias": "",
-   "exit_class": "success",
-   "run_id": "30597533977.1"
-  },
-  {
-   "ts": 1785463398,
-   "provider": "anthropic",
-   "account": "51bde6688e140866",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "30597007803.1"
-  },
-  {
    "ts": 1785463646,
    "provider": "anthropic",
    "account": "51bde6688e140866",
@@ -1814,6 +1678,19 @@
    "model_alias": "opus5",
    "exit_class": "success",
    "run_id": "30615547546.1"
+  },
+  {
+   "ts": 1785488830,
+   "provider": "openai",
+   "account": "dc2d751954080e13",
+   "model_alias": "sol",
+   "exit_class": "no_change",
+   "run_id": "30618589196.1",
+   "input_tokens": 361487,
+   "output_tokens": 1211,
+   "wall_seconds": 48,
+   "issue": 3056,
+   "why_no_diff": "underspecified"
   }
  ]
 }
