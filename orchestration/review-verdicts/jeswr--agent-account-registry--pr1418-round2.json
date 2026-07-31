@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1418,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "86ec75999bb3a3c315dc694469c00c0d0291c022",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "For an exact head/base match, `grant_pr_disposition` validates `state` and validates a non-null `merged_at` timestamp independently, but never checks that they form a valid GitHub PR state. A record with `state: \"open\"` and a valid non-null `merged_at` is returned as `merged`. That contradicts the stated field-consistency/fail-closed contract and lets malformed listing evidence suppress an abandoned-enrollment row. The new malformed-field test set covers invalid values but omits this cross-field inconsistency.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Require a non-null `merged_at` to be consistent with `state == \"closed\"` (and refuse any inconsistent matching record with `GroomError`). Add a test for an exact-matching PR with `state: \"open\"` and a valid timestamp in `merged_at`, asserting refusal rather than `merged`.",
+    "severity": "major",
+    "title": "Inconsistent open-and-merged PR records are trusted instead of refused"
+   }
+  ],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 fixes the prior workflow-seam finding with exact argv tokenization and a job-level disabling-condition assertion, and it adds broad malformed-field coverage for matching grant PRs. The classifier still accepts one internally inconsistent matching record: an open PR with a non-null valid `merged_at`. Because `merged_at` is allowed to dominate without checking its consistency with `state`, malformed API evidence can suppress a genuinely abandoned enrollment instead of refusing the report. This is narrower than round 1, so progress is improving, but the fail-closed contract is not yet complete.",
+  "verdict": "request_changes"
+ }
+}
