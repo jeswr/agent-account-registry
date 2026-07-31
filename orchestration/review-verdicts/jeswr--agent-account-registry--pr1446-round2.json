@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1446,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "823ad7126027e9ca4068cd7257b6b2e4ccd94d40",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The namespace only prevents this registry's PR/provenance/review enumerators from selecting the ref; it does not make a Git ref inert. `preserve` mints a contents/workflows-write App token and pushes the reconstructed candidate into the target repository after the policy-selected gate returned failure. Any target workflow triggered by `push` for that branch can run as a consequence, and the candidate bundle may itself add or modify `.github/workflows/*`. Thus gate-failed, unapproved content can cross from diagnostic data into target-controlled execution. The tests prove only that no `gh` call/PR occurs and that the publishable branch is absent; they do not observe or exclude push-event execution. This contradicts the trust-plane requirement that failed-gate work not be published/executed and can expose repository Actions capabilities or secrets according to the target's workflow configuration.",
+    "file": ".github/workflows/worker.yml",
+    "fix_hint": "Keep failed-gate diagnostics outside target Git refs (for example, a longer-retention artifact or another non-executable storage plane with access controls). If a target ref is indispensable, first provide a sound repository-wide mechanism proving that pushes to this namespace cannot trigger any workflow or other automation, including workflows introduced by the candidate, and add end-to-end negative tests for that boundary; branch-name invisibility to registry consumers alone is insufficient.",
+    "severity": "blocker",
+    "title": "A gate-failed candidate push can execute target-side push workflows"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 fixes both prior findings: preservation now requires the exact recorded `failure` outcome with whole-expression and negative-outcome tests, and the code, workflow, commit message, and README consistently describe diagnostic retention rather than a nonexistent resume path. However, the replacement design still crosses a more fundamental execution boundary: it turns a gate-FAILED candidate into a repository push. A pushed candidate ref is not inert merely because registry provenance/review consumers ignore its name; target-side `push` workflows can react to it. That permits code which failed the policy-selected local gate\u2014including candidate workflow changes\u2014to reach GitHub Actions before approval. Because this is a new blocker finding, progress is regressing under the required rubric despite the clear remediation of round 1.",
+  "verdict": "request_changes"
+ }
+}
