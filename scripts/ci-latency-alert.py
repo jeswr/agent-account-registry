@@ -13,7 +13,7 @@ LIVENESS. None measures CI EXECUTION LATENCY, and a full-tree grep for
 latenc|duration|elapsed|run_started_at|percentile over every script on master finds no
 workflow-run-duration or queue-wait consumer. This is new ground here.
 
-TWO DETECTED MODES plus ONE DOCUMENTED GAP. The mode that is runner availability proper —
+THREE DETECTED MODES plus ONE DOCUMENTED GAP. The mode that is runner availability proper —
 queue wait, the maintainer's literal ask — is NOT detected, because the variable it would
 read never moves on this corpus. That is recorded rather than filled with a check that
 cannot see the thing:
@@ -30,6 +30,10 @@ cannot see the thing:
                            constants before adding a detector.
   M3 EXECUTION OVERRUN     a run `in_progress` far past its own lane's measured duration.
                            It consumes capacity while looking perfectly healthy.
+  M4 INGESTION REJECTION   GitHub CREATES the run and executes NO JOB — `action_required`,
+                           `jobs.total_count == 0`, ~1 second. The workflow is off, and
+                           every liveness watcher in the ring above still reads it as
+                           alive, because a run WAS created. See the M4 note below.
 
 =============================================================================
 THE MEASUREMENT TRAP — read before editing
@@ -271,6 +275,76 @@ BASELINE_MIN_N = 5
 RUNS_PAGE_CAP = 10
 
 INVISIBLE_TRIGGERS = frozenset({"schedule", "workflow_dispatch"})
+
+
+# --- M4 -----------------------------------------------------------------------------
+# WORKFLOW REJECTED AT INGESTION (issue #1353). GitHub accepts the trigger, CREATES a
+# workflow run, and executes NO JOB: conclusion `action_required`, `jobs.total_count == 0`,
+# about one second. The workflow is dead and the run list reads "waiting for approval".
+#
+# WHY NOTHING IN THE RING SEES IT. Every existing watcher here — `cron-keepalive`,
+# `metrics-alert --stale-check`, `dispatch-stall-alert` (B), and M1 above — answers "did a
+# run happen recently?". A rejected workflow KEEPS PRODUCING RUNS on its own cron, each with
+# a fresh `created_at`, so every one of those reads it as alive. That is the #922 lesson —
+# a run no longer implies the work — recurring in a form none of them was built for. It cost
+# this estate an 18-hour dispatcher outage (#1313 -> #1320, the whole fleet idle) and a
+# ~90-minute outage of dashboard.yml (c67c7cdf6 -> #1352), which is the HOST of
+# `cron-keepalive` and therefore of the revival mesh for every other scheduled lane. Both
+# landed on master through review, and both were found by a human, not by a check.
+#
+# THE MECHANISM IS UNKNOWN and tracked in #1353 — deliberately, this detector does not need
+# one. It keys on the OBSERVABLE OUTCOME, so it fires for any cause that produces it.
+#
+# WHY `event=schedule` IS THE POPULATION, and what that excludes. A scheduled fire is never
+# legitimately held for approval: `action_required` on a fork PR waiting for a maintainer is
+# the conclusion's normal meaning, and no fork PR can produce a `schedule` run. This also
+# costs ZERO extra requests — `fetch_lanes` already pulls exactly this listing for M1 and
+# discarded everything but `created_at`. DOCUMENTED GAP, in this file's tradition: a lane
+# rejected while carrying only `workflow_dispatch` is NOT sampled. It is censused as
+# `not-scheduled` — outside this mode's population — rather than silently counted healthy.
+#
+# THE FALSE POSITIVE THAT REMAINS, and why the job count closes it: a scheduled run held by
+# an ENVIRONMENT protection rule can also conclude `action_required` — and this repo does
+# gate privileged jobs on the `dispatch-secrets` environment. That run HAS jobs. Zero jobs is
+# what separates "GitHub refused to ingest the file" from "a human has not approved a
+# deployment", so the count is confirmed before alarming. It is fetched ONLY for a lane that
+# already looks rejected, so the healthy repo pays nothing.
+MODE_INGESTION = "M4-workflow-ingestion-rejected"
+# The conclusion GitHub records on a run it created but never executed. Held as a constant
+# for the call sites; every fixture below writes the LITERAL, so mutating this reds.
+INGESTION_REJECTED_CONCLUSION = "action_required"
+# Every state a lane can exit M4 through, seeded at zero so the census emits a row for each
+# on EVERY tick — including the all-clear. A census that only prints what it saw cannot
+# answer "would this alarm fire if this branch took 100% of the population?".
+#
+# `not-scheduled` and `not-sampled` are TWO DIFFERENT THINGS and were one state until the
+# recovery path needed to tell them apart. A workflow carrying no `schedule:` is OUTSIDE M4's
+# population — most of this repo's workflows, on every healthy tick. A workflow that DOES
+# carry a cron but whose runs were never listed (it is disabled) is INSIDE the population and
+# UNREAD, which is not the same as healthy. See M4_INDETERMINATE_STATES.
+M4_CENSUS_STATES = (
+    "not-scheduled",
+    "not-sampled",
+    "no-concluded-run",
+    "ingesting",
+    "approval-gated-with-jobs",
+    "rejected-zero-jobs",
+    "rejected-jobs-unreadable",
+)
+# The census states in which M4 did NOT read the lane's ingestion condition. They are not
+# findings — nothing was measured — but they are not evidence of RECOVERY either, and the
+# alert is one rolling issue for the whole mode: with either of these non-zero an empty
+# finding list means "no lane was OBSERVED rejected", not "the rejected lane recovered".
+# The fail-open path this closes: a rejected lane is disabled (or its newest run has not
+# concluded yet), a healthy sibling keeps the pass alive, M4 reports no findings, and the
+# live alert is closed with nobody having seen the rejected workflow execute anything.
+#
+# HOW A DELIBERATE RETIREMENT RESOLVES, since a hold that nothing can clear is its own bug:
+# delete the workflow file or delete its `schedule:` and the lane leaves M4's population
+# (`not-scheduled`), so the alert closes on the next tick. A lane left DISABLED while still
+# declaring a cron is genuinely unread — the alert is HELD and a maintainer closes it by
+# hand; the tick prints which state held it.
+M4_INDETERMINATE_STATES = ("not-sampled", "no-concluded-run")
 
 
 # ---------------------------------------------------------------------------------
@@ -526,6 +600,62 @@ def find_cron_deficits(lanes: list[dict], now: dt.datetime,
     return findings, census
 
 
+def find_ingestion_rejections(lanes: list[dict],
+                              job_counts: dict) -> tuple[list[dict], dict]:
+    """M4. `lanes` carry {runs_sampled, newest_concluded}; `job_counts` maps the run id of
+    an apparently-rejected run (as a STRING — JSON object keys are strings, and a dict keyed
+    by int here would silently miss every entry that came back through --state-file) to its
+    `jobs.total_count`, or to None when that read failed.
+
+    The lane's NEWEST CONCLUDED scheduled run is the whole signal. Rejection is not a flaky
+    event: once GitHub refuses a file every subsequent run of it is refused the same way, so
+    the newest concluded run states the CURRENT condition and the alert self-clears one cycle
+    after a fix lands. An `in_progress` newest run is skipped rather than treated as evidence
+    either way — a run with no conclusion has not said anything yet.
+    """
+    findings: list[dict] = []
+    census: dict[str, int] = {state: 0 for state in M4_CENSUS_STATES}
+
+    def bump(state: str) -> None:
+        census[state] += 1
+
+    for lane in lanes:
+        if not lane.get("runs_sampled"):
+            # `in_scope` is exactly m1_scope's verdict HERE: the truncation guard that also
+            # clears it only ever fires on a lane that WAS sampled. So it separates "carries
+            # no cron, outside this mode's population" (the documented gap above) from
+            # "carries a cron and its runs were never listed", which is the disabled lane —
+            # indeterminate, and the one that must not be read as a recovery.
+            bump("not-sampled" if lane.get("in_scope") else "not-scheduled")
+            continue
+        newest = lane.get("newest_concluded")
+        if not newest:
+            bump("no-concluded-run")
+            continue
+        if newest.get("conclusion") != INGESTION_REJECTED_CONCLUSION:
+            bump("ingesting")
+            continue
+        jobs = job_counts.get(str(newest.get("id")))
+        if isinstance(jobs, int) and jobs > 0:
+            # An environment protection rule, not a rejection. Counted, never alarmed on.
+            bump("approval-gated-with-jobs")
+            continue
+        # UNREADABLE COUNTS AS REJECTED. The two directions are not symmetric: a false alarm
+        # costs one maintainer glance at a run list, a miss costs the 18 hours #1313 cost.
+        # So an unreadable job count alarms and SAYS it was unreadable, rather than resolving
+        # an indeterminate read into "healthy".
+        bump("rejected-zero-jobs" if isinstance(jobs, int) else "rejected-jobs-unreadable")
+        findings.append({
+            "mode": MODE_INGESTION,
+            "workflow": lane["workflow"],
+            "run_id": newest.get("id"),
+            "created_at": newest.get("created_at"),
+            "conclusion": newest.get("conclusion"),
+            "jobs": jobs if isinstance(jobs, int) else None,
+        })
+    return findings, census
+
+
 def max_worker_timeout_minutes(text: str) -> int:
     """The LARGEST `worker_timeout_minutes` any target configures in policy/repos.toml.
 
@@ -715,6 +845,49 @@ def fetch_baseline(repo, workflow_path, event):
     return {"p90": percentile(durations, 0.90), "n": len(durations)}
 
 
+def newest_concluded_run(runs):
+    """M4. -> {id, conclusion, created_at} for the newest run in `runs` that has CONCLUDED,
+    or None. Pure, so the ordering rule is testable without the network.
+
+    The listing arrives newest-first, but that is GitHub's promise rather than this file's,
+    and reading position 0 would key on a promise: `max` over the parsed timestamp costs
+    nothing and cannot be wrong. Runs missing a `created_at` are unorderable and dropped.
+    """
+    concluded = [r for r in runs
+                 if r.get("status") == "completed" and r.get("conclusion")
+                 and r.get("created_at")]
+    if not concluded:
+        return None
+    newest = max(concluded, key=lambda r: _ts(r["created_at"]))
+    # The id is stringified HERE, once, so both the job-count map and the hermetic
+    # --state-file route key it the same way (JSON object keys are always strings).
+    return {"id": str(newest.get("id")), "conclusion": newest.get("conclusion"),
+            "created_at": newest.get("created_at")}
+
+
+def fetch_job_count(repo, run_id):
+    """M4. -> the run's `jobs.total_count`, or None when the read failed or was malformed.
+
+    None is NOT zero and must never collapse into it: zero is the rejection fingerprint and
+    None is "we could not tell", and the detector reports them as different census states.
+    A failure here is swallowed rather than raised because the count is only ever needed for
+    a lane that ALREADY looks rejected — letting it abort the pass would take M1 and M3 down
+    with it at exactly the moment the repo is in trouble.
+    """
+    try:
+        payload = _api(repo, f"actions/runs/{run_id}/jobs?per_page=1")
+    except AlarmError as exc:
+        print(f"::warning::ci-latency: M4 could not read jobs for run {run_id}: {exc}")
+        return None
+    total = payload.get("total_count")
+    # `isinstance(True, int)` is True in Python, and `True > 0`, so a boolean would sail
+    # through the detector as "this run executed a job" — a malformed payload silencing the
+    # alarm. Refuse it here, where the value is still identifiable as not-a-count.
+    if isinstance(total, bool) or not isinstance(total, int):
+        return None
+    return total
+
+
 def fetch_lanes(repo, root, window_hours, now):
     wf_dir = Path(root) / WORKFLOWS_DIR
     if not wf_dir.is_dir():
@@ -735,13 +908,20 @@ def fetch_lanes(repo, root, window_hours, now):
         lane = {"workflow": rel, "crons": crons, "cron_only": cron_only,
                 "in_scope": in_scope, "state": state_by_path.get(rel, "active"),
                 "created_at": created_by_path.get(rel),
-                "schedule_run_times": []}
+                "schedule_run_times": [],
+                # M4: whether this lane's scheduled runs were actually listed, kept separate
+                # from `in_scope` because `in_scope` is ALSO cleared by M1's truncation
+                # guard below — and a truncated sample still states the newest run perfectly
+                # well, which is all M4 reads.
+                "runs_sampled": False, "newest_concluded": None}
         if in_scope and lane["state"] == "active":
             payload = _api(repo, f"actions/workflows/{path.name}/runs"
                                  f"?event=schedule&per_page=100")
             runs = payload.get("workflow_runs")
             if runs is None:
                 raise AlarmError(f"{path.name}: schedule-run response carries no runs")
+            lane["runs_sampled"] = True
+            lane["newest_concluded"] = newest_concluded_run(runs)
             times = [_ts(r["created_at"]) for r in runs if r.get("created_at")]
             # COVERAGE GUARD: the sample is the newest 100 runs. If the OLDEST sampled run
             # is NEWER than the window start the count is TRUNCATED and would manufacture a
@@ -762,20 +942,43 @@ def marker(mode):
 
 
 def title_for(mode):
+    # M4 has no threshold to breach — it reports a workflow that is OFF — and the title is
+    # what the maintainer triages from, so it says that instead. M1's and M3's titles are
+    # deliberately byte-unchanged: `_find_open_alert` falls back to a title match when a
+    # marker is absent, so re-wording them would orphan any alert already open.
+    if mode == MODE_INGESTION:
+        return ("ci-latency: a workflow is REJECTED at ingestion — GitHub is creating runs "
+                "that execute NO JOB")
     return f"ci-latency: {mode} breached its measured threshold"
 
 
 def render_body(mode, repo, findings, census, now, run_url):
+    # M4 reports a workflow that is OFF, not a threshold that moved, so it needs its own
+    # lead sentence. A NAMED local rather than a `lines[3] = ...` patch: an index into the
+    # literal below silently rewrites the wrong element the day anyone adds a header line.
+    lead = (f"`{mode}` breached its measured threshold in `{repo}` at "
+            f"`{now:%Y-%m-%dT%H:%M:%SZ}`.")
+    if mode == MODE_INGESTION:
+        lead = (f"A workflow in `{repo}` is being REJECTED at ingestion as of "
+                f"`{now:%Y-%m-%dT%H:%M:%SZ}` — GitHub creates the run and executes no job, "
+                f"so every liveness watcher in the ring still reads the lane as alive. "
+                f"Mechanism tracked in #1353; the remedy that has worked twice is to REVERT "
+                f"the last change to the named workflow file.")
     lines = [
         marker(mode),
         "> 🤖 SPARQ agent — automated ops-alert (CI execution latency)",
         "",
-        f"`{mode}` breached its measured threshold in `{repo}` at "
-        f"`{now:%Y-%m-%dT%H:%M:%SZ}`.",
+        lead,
         "",
     ]
     for f in findings:
-        if mode.startswith("M1"):
+        if mode == MODE_INGESTION:
+            jobs = "UNREADABLE" if f["jobs"] is None else f["jobs"]
+            lines.append(
+                f"- `{f['workflow']}` — newest concluded `schedule` run {f['run_id']} "
+                f"(created {f['created_at']}) concluded **{f['conclusion']}** with "
+                f"**jobs.total_count = {jobs}**")
+        elif mode.startswith("M1"):
             lines.append(
                 f"- `{f['workflow']}` fired **{f['actual']}** of an achievable "
                 f"**{f['expected']}** in {f['window_hours']:g}h (nominal "
@@ -839,13 +1042,30 @@ def _apply(action, repo, token, num, mode, body, note):
     return 0
 
 
-def decide(findings, open_issue):
-    """Pure: -> 'upsert' | 'close' | 'noop'. Closing happens ONLY on an explicit
-    recovery (findings empty AND an alert is open); an indeterminate read is a noop, so a
-    transient API failure can never silently close a live alert."""
+# Per-mode census states that make an EMPTY finding list indeterminate rather than a
+# recovery. Keyed rather than global: M1 and M3 read their whole population or the pass
+# fail-louds before it reaches here, so neither has one and neither changes behaviour.
+RECOVERY_BLOCKING_STATES = {MODE_INGESTION: M4_INDETERMINATE_STATES}
+
+
+def recovery_blockers(mode, census):
+    """Pure: -> the sorted, NON-ZERO census states that stop `mode`'s empty finding list from
+    being read as a recovery. An empty list means this tick actually read the population."""
+    return sorted(state for state in RECOVERY_BLOCKING_STATES.get(mode, ())
+                  if census.get(state))
+
+
+def decide(findings, open_issue, blockers=()):
+    """Pure: -> 'upsert' | 'close' | 'noop'. Closing happens ONLY on an explicit recovery
+    (findings empty AND an alert is open AND this tick READ the whole population); an
+    indeterminate read is a noop, so neither a transient API failure nor a lane that went
+    unread can silently close a live alert. `blockers` never suppresses an alarm — a finding
+    is measured evidence and still upserts."""
     if findings:
         return "upsert"
-    return "close" if open_issue else "noop"
+    if open_issue and not blockers:
+        return "close"
+    return "noop"
 
 
 # ---------------------------------------------------------------------------------
@@ -859,13 +1079,23 @@ def capped_expectation(window_hours=CRON_WINDOW_HOURS):
 
 
 def _lane(workflow="a.yml", crons=("*/10 * * * *",), cron_only=False, in_scope=True,
-          state="active", fires=0, now=None, spacing_min=20, created_hours_ago=None):
+          state="active", fires=0, now=None, spacing_min=20, created_hours_ago=None,
+          runs_sampled=True, newest_conclusion="success", run_id="1"):
     """`created_hours_ago` gives the lane a birth date, for the NEW-LANE WINDOW. `None`
-    means an established lane (no `created_at`), which must behave exactly as before."""
+    means an established lane (no `created_at`), which must behave exactly as before.
+
+    The M4 fields default to a HEALTHY lane — sampled, newest scheduled run concluded — so
+    every pre-existing fixture below keeps meaning what it meant. `newest_conclusion=None`
+    is the lane whose newest scheduled run has not concluded yet.
+    """
     now = now or dt.datetime(2026, 7, 28, 12, 0, tzinfo=dt.timezone.utc)
     first = now - dt.timedelta(minutes=CRON_GRACE_MINUTES + 1)
     lane = {"workflow": workflow, "crons": list(crons), "cron_only": cron_only,
             "in_scope": in_scope, "state": state,
+            "runs_sampled": runs_sampled,
+            "newest_concluded": ({"id": run_id, "conclusion": newest_conclusion,
+                                  "created_at": "2026-07-28T11:50:00Z"}
+                                 if newest_conclusion else None),
             "schedule_run_times": [first - dt.timedelta(minutes=spacing_min * i)
                                    for i in range(fires)]}
     if created_hours_ago is not None:
@@ -1242,6 +1472,36 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     chk("findings => upsert even when an alert is open", decide([{"x": 1}], 7) == "upsert")
     chk("recovery with an open alert => close", decide([], 7) == "close")
     chk("clean with no alert => noop", decide([], None) == "noop")
+    # AN INDETERMINATE READ IS NOT A RECOVERY. Findings-empty says "nothing was OBSERVED
+    # rejected", and with a lane unread that is not the same claim as "the rejected lane
+    # recovered". The pair is stated both directions so neither row can pass alone.
+    chk("an unread lane HOLDS an open alert — findings-empty is not recovery evidence",
+        decide([], 7, ["not-sampled"]) == "noop")
+    chk("...and the same call with nothing blocking still closes (the hold is not a "
+        "permanent stick)", decide([], 7, []) == "close")
+    chk("a blocker never SUPPRESSES an alarm — a finding is measured evidence and upserts",
+        decide([{"x": 1}], 7, ["not-sampled"]) == "upsert")
+    chk("a blocker with no alert open is still a noop, not a spurious write",
+        decide([], None, ["not-sampled"]) == "noop")
+    # WHICH states block, asserted against the literal names rather than against
+    # M4_INDETERMINATE_STATES — reading the expected value out of the constant the code reads
+    # would be a tautology that stays green whatever that tuple says.
+    _blk = {**{s: 0 for s in M4_CENSUS_STATES}, "ingesting": 3}
+    chk("a fully-read M4 population blocks nothing",
+        recovery_blockers(MODE_INGESTION, _blk) == [])
+    chk("an unsampled scheduled lane blocks M4's recovery",
+        recovery_blockers(MODE_INGESTION, {**_blk, "not-sampled": 1}) == ["not-sampled"])
+    chk("a lane with no concluded run blocks M4's recovery",
+        recovery_blockers(MODE_INGESTION, {**_blk, "no-concluded-run": 1})
+        == ["no-concluded-run"])
+    # THE ROW THAT KEEPS M4 CLOSEABLE AT ALL: this repo's push-only workflows are
+    # `not-scheduled` on every single tick. If that state blocked, the alert could never
+    # close on the live repo and the hold would be indistinguishable from a stuck alarm.
+    chk("an out-of-population lane does NOT block M4's recovery",
+        recovery_blockers(MODE_INGESTION, {**_blk, "not-scheduled": 9}) == [])
+    chk("M1 and M3 have no recovery blockers — their transport is unchanged",
+        recovery_blockers(MODES[0], {"delivering": 1, "not-sampled": 4}) == []
+        and recovery_blockers(MODES[1], {"not-sampled": 4, "no-concluded-run": 2}) == [])
     body = render_body(MODES[1], "o/r", [{"workflow": "a", "run_id": 1, "event": "push",
                                           "age_seconds": 99, "threshold_seconds": 60,
                                           "basis": "floor"}],
@@ -1259,20 +1519,203 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     chk("route: unconfigured uses the registry",
         _alert_route(None, None, "reg/reg") == ("reg/reg", None))
 
+    # --- M4: workflow REJECTED at ingestion (#1353) ----------------------------------
+    # Every fixture below writes the LITERAL "action_required" and the LITERAL job counts,
+    # never MODE_INGESTION/INGESTION_REJECTED_CONCLUSION, so the constants are pinned by
+    # values that do not derive from them: mutating either constant reds these rows instead
+    # of rescaling with them.
+    chk("M4 keys on the literal conclusion GitHub records for an unexecuted run",
+        INGESTION_REJECTED_CONCLUSION == "action_required")
+    chk("M4's mode name is stable — it is the ops-alert marker key, so renaming it orphans "
+        "any open alert", MODE_INGESTION == "M4-workflow-ingestion-rejected")
+    chk("M4 is REGISTERED, and M1/M3's names are unchanged beside it (exact tuple, so a "
+        "dropped mode cannot pass as a reordering)",
+        MODES == ("M1-cron-firing-deficit", "M3-execution-overrun",
+                  "M4-workflow-ingestion-rejected"))
+    chk("M4's census names every exit, in order, so the all-clear prints a row per state",
+        M4_CENSUS_STATES == ("not-scheduled", "not-sampled", "no-concluded-run", "ingesting",
+                             "approval-gated-with-jobs", "rejected-zero-jobs",
+                             "rejected-jobs-unreadable"))
+    chk("the states that hold a recovery are exactly the two M4 never read the lane in",
+        M4_INDETERMINATE_STATES == ("not-sampled", "no-concluded-run"))
+    # A blocker naming a state the census cannot emit is a PERMANENTLY INERT hold: it reads
+    # as implemented and never fires once, which is the fail-open this row exists to prevent.
+    chk("M4's recovery-blocking states are wired to states its census actually emits",
+        set(RECOVERY_BLOCKING_STATES[MODE_INGESTION]) <= set(M4_CENSUS_STATES))
+
+    def _sched_run(rid, conclusion, created, status="completed"):
+        return {"id": rid, "status": status, "conclusion": conclusion,
+                "created_at": created, "event": "schedule"}
+
+    # newest_concluded_run: ORDERING, not position. A `runs[0]` implementation passes on a
+    # newest-first list and silently keys on a stale run the moment GitHub's order changes,
+    # so the list here is deliberately OLDEST-first.
+    _ordered = [_sched_run(11, "success", "2026-07-28T09:00:00Z"),
+                _sched_run(22, "action_required", "2026-07-28T11:00:00Z")]
+    chk("M4 picks the NEWEST concluded run by timestamp, not by list position",
+        (newest_concluded_run(_ordered) or {}).get("id") == "22")
+    # A DISTINCT question from the row above, not a restatement of it: that one would pass
+    # on an int id too. GitHub sends the id as an INTEGER and the job-count map is keyed by
+    # STRINGS (it round-trips through JSON), so a passthrough here reads correctly at every
+    # glance and resolves nothing — the detector would report every rejection as
+    # `rejected-jobs-unreadable`, alarming with fabricated evidence instead of a real count.
+    chk("M4 stringifies the run id at the source, from GitHub's integer",
+        _ordered[1]["id"] == 22
+        and isinstance((newest_concluded_run(_ordered) or {}).get("id"), str))
+    chk("M4 ignores a run that has not concluded — no conclusion has said nothing yet",
+        (newest_concluded_run([
+            _sched_run(33, None, "2026-07-28T11:59:00Z", status="in_progress"),
+            _sched_run(11, "success", "2026-07-28T09:00:00Z")]) or {}).get("id") == "11")
+    chk("M4 reports NO newest-concluded run when every run is still live",
+        newest_concluded_run([_sched_run(33, None, "2026-07-28T11:59:00Z",
+                                         status="in_progress")]) is None)
+    chk("M4 reports NO newest-concluded run over an empty listing",
+        newest_concluded_run([]) is None)
+
+    _M4_CLEAN = {s: 0 for s in M4_CENSUS_STATES}
+
+    def _m4(lane_kwargs, job_counts):
+        return find_ingestion_rejections([_lane(now=NOW, **lane_kwargs)], job_counts)
+
+    # THE ACCEPT PATH: the exact shape both outages produced.
+    _f, _c = _m4({"workflow": "rejected.yml", "newest_conclusion": "action_required",
+                  "run_id": "77"}, {"77": 0})
+    chk("M4 ALARMS on the measured fingerprint — newest scheduled run `action_required` "
+        "with zero jobs", len(_f) == 1 and _f[0]["workflow"] == "rejected.yml")
+    chk("M4's finding carries the run id and job count a maintainer needs to confirm it",
+        _f and _f[0]["run_id"] == "77" and _f[0]["jobs"] == 0)
+    chk("M4's census counts the rejection and nothing else",
+        _c == {**_M4_CLEAN, "rejected-zero-jobs": 1})
+    # THE REJECT PATH, and the reason this detector is not just a conclusion grep: a
+    # scheduled run held by an environment protection rule concludes `action_required` too.
+    # It HAS jobs. Deleting the job-count confirmation makes this row red.
+    _f, _c = _m4({"workflow": "gated.yml", "newest_conclusion": "action_required",
+                  "run_id": "78"}, {"78": 4})
+    chk("M4 does NOT alarm on an environment-approval hold — that run executed jobs",
+        _f == [] and _c == {**_M4_CLEAN, "approval-gated-with-jobs": 1})
+    # UNREADABLE IS NOT HEALTHY. Distinct census state, and it still alarms: a miss here
+    # costs the 18 hours #1313 cost, a false alarm costs one glance at a run list.
+    _f, _c = _m4({"workflow": "unknown.yml", "newest_conclusion": "action_required",
+                  "run_id": "79"}, {"79": None})
+    chk("M4 alarms when the job count is UNREADABLE, and says so in its own census row",
+        len(_f) == 1 and _f[0]["jobs"] is None
+        and _c == {**_M4_CLEAN, "rejected-jobs-unreadable": 1})
+    _f, _c = _m4({"workflow": "unknown.yml", "newest_conclusion": "action_required",
+                  "run_id": "80"}, {})
+    chk("M4 treats a MISSING job-count entry as unreadable, never as zero and never as OK",
+        len(_f) == 1 and _c == {**_M4_CLEAN, "rejected-jobs-unreadable": 1})
+    # THE HEALTHY POPULATION, stated so "no findings" cannot be reached by a detector that
+    # stopped looking: the census must place the lane in `ingesting`.
+    _f, _c = _m4({"workflow": "live.yml"}, {})
+    chk("M4 is quiet on a lane whose newest scheduled run concluded normally, and PLACES it",
+        _f == [] and _c == {**_M4_CLEAN, "ingesting": 1})
+    _f, _c = _m4({"workflow": "unsampled.yml", "runs_sampled": False}, {})
+    chk("M4 counts a SCHEDULED lane whose runs were never listed as unsampled — never as "
+        "healthy", _f == [] and _c == {**_M4_CLEAN, "not-sampled": 1})
+    # The other side of that split. A workflow carrying no `schedule:` is not unread, it is
+    # OUTSIDE M4's population — and it is most of this repo on every tick, so collapsing the
+    # two would hold M4's alert open forever (see the recovery rows below).
+    _f, _c = _m4({"workflow": "push-only.yml", "runs_sampled": False, "in_scope": False}, {})
+    chk("M4 counts a lane carrying no `schedule:` as out of its population, NOT as unread",
+        _f == [] and _c == {**_M4_CLEAN, "not-scheduled": 1})
+    _f, _c = _m4({"workflow": "fresh.yml", "newest_conclusion": None}, {})
+    chk("M4 counts a lane with no concluded run as such — never as healthy",
+        _f == [] and _c == {**_M4_CLEAN, "no-concluded-run": 1})
+    # The `--state-file` route round-trips through JSON, where every object key becomes a
+    # STRING. An int-keyed lookup reads nothing there and the detector goes permanently
+    # quiet on the live-equivalent path while every in-process assertion above stays green.
+    _rt = json.loads(json.dumps({"job_counts": {"77": 0}}))
+    _f, _ = find_ingestion_rejections(
+        [_lane(now=NOW, workflow="rejected.yml", newest_conclusion="action_required",
+               run_id="77")], _rt["job_counts"])
+    chk("M4 still resolves the job count after a JSON round-trip (string keys)",
+        len(_f) == 1 and _f[0]["jobs"] == 0)
+
+    # THE READ ITSELF. `fetch_job_count` is the one place `0` and "could not tell" can be
+    # confused, and confusing them is not a missed alarm — it is a FABRICATED one: the alert
+    # body would state `jobs.total_count = 0` as measured evidence of a rejection nobody
+    # read. A mutant returning 0 on a failed read survived every other assertion here.
+    _real_jobs_api = globals()["_api"]
+    try:
+        globals()["_api"] = lambda repo, path: {"total_count": 3}
+        chk("fetch_job_count returns the count GitHub reported",
+            fetch_job_count("o/r", 77) == 3)
+        globals()["_api"] = lambda repo, path: {"total_count": 0}
+        chk("fetch_job_count reports a real zero as a real zero",
+            fetch_job_count("o/r", 77) == 0)
+
+        def _raising_api(repo, path):
+            raise AlarmError("boom")
+
+        globals()["_api"] = _raising_api
+        chk("a FAILED job read is None, never 0 — a read that did not happen must not be "
+            "published as measured evidence of zero jobs",
+            fetch_job_count("o/r", 77) is None)
+        globals()["_api"] = lambda repo, path: {}
+        chk("a payload carrying no total_count is None, never 0",
+            fetch_job_count("o/r", 77) is None)
+        globals()["_api"] = lambda repo, path: {"total_count": "0"}
+        chk("a non-integer total_count is None, never coerced",
+            fetch_job_count("o/r", 77) is None)
+        globals()["_api"] = lambda repo, path: {"total_count": True}
+        chk("a boolean total_count is refused — `True` IS an int in Python and `True > 0`, "
+            "so it would silently reclassify a rejection as approval-gated",
+            fetch_job_count("o/r", 77) is None)
+    finally:
+        globals()["_api"] = _real_jobs_api
+
+    # RENDERING. M4 must not fall through to M3's line format, which would print a
+    # threshold and an age this mode does not have.
+    _m4_body = render_body(MODE_INGESTION, "o/r",
+                           [{"mode": MODE_INGESTION, "workflow": ".github/workflows/d.yml",
+                             "run_id": "77", "created_at": "2026-07-28T11:50:00Z",
+                             "conclusion": "action_required", "jobs": 0}],
+                           {**_M4_CLEAN, "rejected-zero-jobs": 1}, NOW, "u")
+    chk("M4's body names the workflow, the run and the zero job count",
+        ".github/workflows/d.yml" in _m4_body and "jobs.total_count = 0" in _m4_body
+        and "77" in _m4_body)
+    chk("M4's body does NOT render through M3's execution-overrun format",
+        "in progress" not in _m4_body and "threshold" not in _m4_body)
+    chk("M4's body points at the tracking issue and the remedy that has worked twice",
+        "#1353" in _m4_body and "REVERT" in _m4_body)
+    _unreadable_body = render_body(MODE_INGESTION, "o/r",
+                                   [{"mode": MODE_INGESTION, "workflow": "d.yml",
+                                     "run_id": "78", "created_at": "x",
+                                     "conclusion": "action_required", "jobs": None}],
+                                   dict(_M4_CLEAN), NOW, "u")
+    chk("M4's body says UNREADABLE rather than printing a job count it never read",
+        "jobs.total_count = UNREADABLE" in _unreadable_body)
+    chk("M4 gets its own triage title — it reports a workflow that is OFF, not a threshold",
+        title_for(MODE_INGESTION)
+        == ("ci-latency: a workflow is REJECTED at ingestion — GitHub is creating runs "
+            "that execute NO JOB"))
+    # ANTI-VACUITY on the branch above: M1's and M3's titles must be byte-unchanged, or the
+    # title fallback in `_find_open_alert` orphans alerts that are already open.
+    chk("M1's alert title is unchanged by M4's title branch",
+        title_for(MODES[0]) == "ci-latency: M1-cron-firing-deficit breached its measured "
+                               "threshold")
+    chk("M3's alert title is unchanged by M4's title branch",
+        title_for(MODES[1]) == "ci-latency: M3-execution-overrun breached its measured "
+                               "threshold")
+
     # --- exit codes + the empty-scan-set fail-loud ---
     # `tempfile` is imported at module scope (the schedule-map rows above use it too). A local
     # `import tempfile` here would rebind the name for the WHOLE function, so the earlier use
     # would raise UnboundLocalError before this line ever ran.
-    def _rc(lanes, live=()):
+    def _state_path(lanes, live=(), job_counts=None):
         state = {"repo": "o/r",
                  "lanes": [dict(x, schedule_run_times=[
                      t.strftime("%Y-%m-%dT%H:%M:%SZ") for t in x["schedule_run_times"]])
                      for x in lanes],
-                 "live_runs": list(live), "baselines": {}}
+                 "live_runs": list(live), "baselines": {},
+                 "job_counts": dict(job_counts or {})}
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
             json.dump(state, fh)
-            path = fh.name
-        return main(["--state-file", path, "--now", "2026-07-28T12:00:00Z", "--dry-run"])
+            return fh.name
+
+    def _rc(lanes, live=(), job_counts=None):
+        return main(["--state-file", _state_path(lanes, live, job_counts),
+                     "--now", "2026-07-28T12:00:00Z", "--dry-run"])
 
     chk("a bad repo slug is fail-loud exit 2",
         main(["--repo", "not-a-slug", "--dry-run"]) == 2)
@@ -1295,6 +1738,29 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     chk("a scan set with nothing in scope is fail-loud exit 2",
         _rc([_lane(in_scope=False, now=NOW)]) == 2)
     chk("a populated, healthy scan set is exit 0", _rc([_lane(fires=CAP, now=NOW)]) == 0)
+    # Same 100% question for M4, and it needs its own row: `in_scope` is satisfied by a
+    # DISABLED lane, whose runs are never listed, so the M1 guard above does not cover it.
+    chk("a scan set in which no lane's runs were sampled is fail-loud exit 2",
+        _rc([_lane(fires=CAP, now=NOW, runs_sampled=False)]) == 2)
+    chk("...and the SAME lane sampled is exit 0 (the guard above is not vacuous)",
+        _rc([_lane(fires=CAP, now=NOW, runs_sampled=True)]) == 0)
+    # END TO END through main(): the finding has to survive the JSON state file, classify(),
+    # the census print and render_body. Every assertion above is in-process.
+    _e2e = io.StringIO()
+    with contextlib.redirect_stdout(_e2e):
+        _rc([_lane(fires=CAP, now=NOW),
+             _lane(workflow=".github/workflows/dead.yml", fires=CAP, now=NOW,
+                   newest_conclusion="action_required", run_id="77")],
+            job_counts={"77": 0})
+    chk("end to end: a rejected lane reaches the rendered alert body by name",
+        ".github/workflows/dead.yml" in _e2e.getvalue()
+        and "jobs.total_count = 0" in _e2e.getvalue())
+    chk("end to end: the healthy sibling lane is NOT named as rejected "
+        "(the run is not alarming over the whole population)",
+        _e2e.getvalue().count("jobs.total_count") == 1)
+    chk("end to end: M4's census prints on the all-clear too, every state, including zeros",
+        all(f"{state}: 0" in _e2e.getvalue() or f"{state}: 1" in _e2e.getvalue()
+            for state in M4_CENSUS_STATES))
 
     # --- THE CONSUMER of the hard/soft read (NOT just decide() in isolation) ----------
     # `decide()` is exercised above as a pure function, but the guard that actually
@@ -1334,27 +1800,138 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
         globals()["_find_open_alert"] = lambda repo, token, mode: (None, False, False)
         main(argv)
         chk("a clean issue read DOES upsert the M1 alert (guard test is not vacuous)",
-            applied == ["upsert", "noop"])
+            applied == ["upsert", "noop", "noop"])
+        # M4 REACHES THE SAME TRANSPORT. Its detector is proved pure above; a detector whose
+        # findings never reach `_apply` alarms into a void, and this per-mode loop is the
+        # only thing that carries them there. Exact list, so M4's POSITION is pinned too —
+        # `_find_open_alert` is called per mode, and a reordered loop would file M4's body
+        # under another mode's marker.
+        applied.clear()
+        rejected = {"repo": "o/r", "baselines": {}, "live_runs": [],
+                    "job_counts": {"77": 0},
+                    "lanes": [dict(_lane(fires=CAP, now=NOW,
+                                         workflow=".github/workflows/dead.yml",
+                                         newest_conclusion="action_required",
+                                         run_id="77"),
+                                   schedule_run_times=[])]}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump(rejected, fh)
+            rejected_path = fh.name
+        main(["--state-file", rejected_path, "--now", "2026-07-28T12:00:00Z"])
+        chk("a rejected lane upserts the M4 ops-alert, in M4's own slot",
+            applied == ["upsert", "noop", "upsert"])
+
+        # THE RECOVERY SIDE, end to end, with an alert ALREADY OPEN — the fail-open path a
+        # pure `decide()` row cannot see. The population is the reviewer's shape: one healthy
+        # sampled lane, which is enough to satisfy run()'s aggregate `any(runs_sampled)`
+        # guard, plus the formerly rejected lane now UNREAD. M4 reports no findings, and
+        # closing on that would retire a live alert with nobody having seen the rejected
+        # workflow execute anything. M1 and M3 DO close on the very same tick, so the exact
+        # list also proves the hold is M4's own and not a dead write path.
+        globals()["_find_open_alert"] = lambda repo, token, mode: (7, False, False)
+        _healthy = _lane(workflow=".github/workflows/healthy.yml", fires=CAP, now=NOW)
+        for _label, _kw in (("a DISABLED lane is never sampled", {"runs_sampled": False}),
+                            ("a lane's newest run has not concluded",
+                             {"newest_conclusion": None})):
+            applied.clear()
+            main(["--state-file",
+                  _state_path([_healthy, _lane(workflow=".github/workflows/dead.yml",
+                                               fires=CAP, now=NOW, **_kw)]),
+                  "--now", "2026-07-28T12:00:00Z"])
+            chk(f"an open M4 alert is HELD, not closed, while {_label} — M1 and M3 close on "
+                f"the same tick", applied == ["close", "close", "noop"])
+        # ANTI-VACUITY, both halves of the population split. The SAME tick with every lane
+        # read closes M4, so the rows above pin the hold rather than a permanently stuck
+        # alert; and a push-only lane (`not-scheduled`, most of this repo on every tick)
+        # must not hold either, or M4's alert could never close on the live repo.
+        for _label, _extra in (
+                ("every lane READ", []),
+                ("a push-only lane carrying no `schedule:`",
+                 [_lane(workflow=".github/workflows/push-only.yml", fires=CAP, now=NOW,
+                        in_scope=False, runs_sampled=False)])):
+            applied.clear()
+            main(["--state-file", _state_path([_healthy] + _extra),
+                  "--now", "2026-07-28T12:00:00Z"])
+            chk(f"...and an open M4 alert DOES close on a tick with {_label}",
+                applied == ["close", "close", "close"])
+        # A hold must never MUTE a measured rejection: this tick carries BOTH an unread lane
+        # and a lane measured rejected, and the alarm still reaches `_apply`.
+        applied.clear()
+        main(["--state-file",
+              _state_path([_healthy,
+                           _lane(workflow=".github/workflows/dead.yml", fires=CAP, now=NOW,
+                                 newest_conclusion="action_required", run_id="77"),
+                           _lane(workflow=".github/workflows/off.yml", fires=CAP, now=NOW,
+                                 runs_sampled=False)],
+                          job_counts={"77": 0}),
+              "--now", "2026-07-28T12:00:00Z"])
+        chk("an unread lane never mutes a measured rejection — M4 still upserts",
+            applied == ["close", "close", "upsert"])
     finally:
         globals()["_find_open_alert"], globals()["_apply"] = _real_find, _real_apply
 
     # `fetch_lanes` must carry the birth date the NEW-LANE WINDOW reads, or that guard is
     # permanently unreachable in production while its unit tests stay green. (This check
     # was collateral damage when the M2 region was cut; the battery caught its absence.)
+    # M4's detector is proved pure above; everything it reads is assembled on the LIVE path,
+    # which no pure assertion reaches. A detector wired to a field nothing populates is
+    # permanently quiet with a green suite, so the live route is driven here against a
+    # stubbed `_api` — including the job-count confirmation, which is the only thing between
+    # M4 and alarming on every environment-approval hold.
     _real_lanes_api = globals()["_api"]
-    try:
-        def _lanes_api(repo, path):
+    _GROOM_FILE = GROOM_WORKFLOW.split("/")[-1]
+
+    def _lanes_api_for(conclusion, asked):
+        def _stub(repo, path):
+            asked.append(path)
             if path.startswith("actions/workflows?"):
                 return {"workflows": [{"path": GROOM_WORKFLOW, "state": "active",
                                        "created_at": "2026-07-01T00:00:00Z"}]}
+            if path.startswith(f"actions/workflows/{_GROOM_FILE}/runs"):
+                return {"workflow_runs": [
+                    {"id": 77, "status": "completed", "conclusion": conclusion,
+                     "created_at": "2026-07-28T11:50:00Z", "event": "schedule"}]}
+            if "/jobs?" in path:
+                return {"total_count": 0}
             return {"workflow_runs": []}
+        return _stub
 
-        globals()["_api"] = _lanes_api
+    try:
+        _asked_rejected = []
+        globals()["_api"] = _lanes_api_for("action_required", _asked_rejected)
         _fetched = {lane["workflow"]: lane for lane
                     in fetch_lanes("o/r", Path(__file__).resolve().parents[1],
                                    CRON_WINDOW_HOURS, NOW)}
         chk("fetch_lanes carries each lane's created_at off the workflow listing",
             _fetched.get(GROOM_WORKFLOW, {}).get("created_at") == "2026-07-01T00:00:00Z")
+        chk("fetch_lanes marks a lane whose scheduled runs it listed as SAMPLED — M4's "
+            "entire population, and its fail-loud, key on this flag",
+            _fetched.get(GROOM_WORKFLOW, {}).get("runs_sampled") is True)
+        chk("fetch_lanes carries the newest CONCLUDED scheduled run into the lane, with "
+            "the id already stringified",
+            _fetched.get(GROOM_WORKFLOW, {}).get("newest_concluded")
+            == {"id": "77", "conclusion": "action_required",
+                "created_at": "2026-07-28T11:50:00Z"})
+        _asked_rejected.clear()
+        _live_out = io.StringIO()
+        with contextlib.redirect_stdout(_live_out):
+            _live_rc = main(["--repo", "o/r", "--dry-run"])
+        chk("the LIVE path confirms the job count for a lane that looks rejected",
+            any("/jobs?" in p for p in _asked_rejected))
+        chk("the LIVE path reaches M4's alert body, naming the rejected lane and its zero "
+            "job count", _live_rc == 0
+            and GROOM_WORKFLOW in _live_out.getvalue()
+            and "jobs.total_count = 0" in _live_out.getvalue())
+        # THE COST CLAIM, asserted instead of merely written down: M4 is documented as
+        # costing ZERO extra requests on a healthy repo. A job-count read per lane per tick
+        # would be a real budget change on a repo that has measured a 403 at ~7969
+        # requests/h, and nothing except this row would notice it had happened.
+        _asked_healthy = []
+        globals()["_api"] = _lanes_api_for("success", _asked_healthy)
+        with contextlib.redirect_stdout(io.StringIO()):
+            main(["--repo", "o/r", "--dry-run"])
+        chk("a HEALTHY repo pays NOTHING for M4 — no job-count request is made at all",
+            _asked_healthy and not [p for p in _asked_healthy if "/jobs?" in p])
     finally:
         globals()["_api"] = _real_lanes_api
 
@@ -1534,14 +2111,15 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
 # ---------------------------------------------------------------------------------
 # orchestration
 # ---------------------------------------------------------------------------------
-MODES = ("M1-cron-firing-deficit", "M3-execution-overrun")
+MODES = ("M1-cron-firing-deficit", "M3-execution-overrun", MODE_INGESTION)
 
 
-def classify(lanes, live, baselines, now, window_hours):
-    """Pure: -> {mode: (findings, census)} for all three modes."""
+def classify(lanes, live, baselines, now, window_hours, job_counts=None):
+    """Pure: -> {mode: (findings, census)} for every detected mode."""
     return {
         MODES[0]: find_cron_deficits(lanes, now, window_hours),
         MODES[1]: find_execution_overruns(live, baselines, now),
+        MODES[2]: find_ingestion_rejections(lanes, job_counts or {}),
     }
 
 
@@ -1560,6 +2138,7 @@ def run(args):
         live = state.get("live_runs", [])
         baselines = {tuple(k.split("|", 1)): v
                      for k, v in (state.get("baselines") or {}).items()}
+        job_counts = {str(k): v for k, v in (state.get("job_counts") or {}).items()}
     else:
         repo = registry_repo
         if "/" not in repo:
@@ -1574,6 +2153,14 @@ def run(args):
             key = (r["path"], r.get("event"))
             if key not in baselines:
                 baselines[key] = fetch_baseline(repo, r["path"], r.get("event") or "push")
+        # M4's ONLY extra request, and only for a lane that already looks rejected: on a
+        # healthy repo this loop makes zero calls.
+        job_counts = {}
+        for lane in lanes:
+            newest = lane.get("newest_concluded") or {}
+            if (newest.get("conclusion") == INGESTION_REJECTED_CONCLUSION
+                    and newest.get("id")):
+                job_counts[str(newest["id"])] = fetch_job_count(repo, newest["id"])
 
     # EMPTY SCAN SET IS FAIL-LOUD. A detector watching nothing is not a healthy repo; it is
     # a broken detector, and the two must never look alike. 100% question: if no workflow
@@ -1585,8 +2172,16 @@ def run(args):
         raise AlarmError("empty M1 scan set: no workflow carries a usable `schedule:` — "
                          "either the repo changed shape or the scope predicate broke. "
                          "Refusing to report health over an empty population.")
+    # Same 100% question for M4, and it needs its OWN guard: `in_scope` above is satisfied by
+    # a lane that carries a cron but is DISABLED, and a disabled lane's runs are never listed.
+    # A pass in which no lane's runs were sampled would print an all-zero M4 census that is
+    # indistinguishable from a clean one.
+    if not any(lane.get("runs_sampled") for lane in lanes):
+        raise AlarmError("empty M4 scan set: no lane's scheduled runs were sampled — "
+                         "every scheduled lane is disabled, or the sampling broke. "
+                         "Refusing to report ingestion health over an empty population.")
 
-    results = classify(lanes, live, baselines, now, args.window_hours)
+    results = classify(lanes, live, baselines, now, args.window_hours, job_counts)
 
     # CENSUS EVERY RUN, including the all-clear.
     print(f"ci-latency census for {repo} at {now:%Y-%m-%dT%H:%M:%SZ} "
@@ -1612,7 +2207,13 @@ def run(args):
         if hard or soft:
             rc = 1 if hard else rc
             continue
-        action = decide(findings, num)
+        blockers = recovery_blockers(mode, census)
+        if num and not findings and blockers:
+            print(f"::warning::ci-latency: HOLDING the open {mode} alert — "
+                  + ", ".join(f"{state}={census[state]}" for state in blockers)
+                  + ". No lane was observed rejected, but the population was not fully "
+                    "read, so this tick is not evidence of recovery.")
+        action = decide(findings, num, blockers)
         body = render_body(mode, repo, findings, census, now, run_url)
         note = (f"> 🤖 SPARQ agent — `{mode}` is back inside its measured threshold as of "
                 f"`{now:%Y-%m-%dT%H:%M:%SZ}`. Closing this rolling alert.")
