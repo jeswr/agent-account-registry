@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1277,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0738f5e4259fbbde57b02960bb863bc7c07b9ba2",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 diff remains correct and complete. The cron-minute map reads every scheduled workflow, rejects missing or unparseable inputs, and conservatively reserves minutes independent of wider cron fields. Its live-tree evidence is protected against thin-checkout vacuity by independent lane-set, lane-count, and nonempty-minute checks. Regate-sweep loads that single derivation, excludes only its own workflow, independently verifies its own parsed minutes, requires exact sparse-checkout membership for both the owner script and workflow directory, and fails its seam on load, parse, coverage, or collision errors. The moved :04/:24/:44 schedule avoids the previously hidden latch-watchdog overlap without colliding with another derived lane. The fixtures exercise full, partial, multi-lane, empty-map, missing-tree, and import-contract cases. I found no diff-supported correctness, soundness, test-validity, or security issue requiring changes.",
+  "verdict": "approve"
+ }
+}
