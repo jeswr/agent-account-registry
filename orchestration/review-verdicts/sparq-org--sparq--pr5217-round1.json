@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5217,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8d569024d1e285ae7cd5d3ee94c03cd476fc9566",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`collect()` passes `run_started_at` to `decompose_run()`, and `decompose_job()` then computes `job.started_at - run.run_started_at`. GitHub's run `run_started_at` is the execution start, not the time the run was created/queued, so the initial workflow queue interval is absent whenever the normal API field is present. The fallback to a job's `created_at` is never used on ordinary live payloads. This contradicts the module header and rendered report, both of which define `wait` as queue time plus time blocked on `needs:`, and can understate the reported wait for every leg by the run-level queue delay.",
+    "file": "scripts/ci_leg_inventory.py",
+    "fix_hint": "Anchor live runs at the run's `created_at` when computing queue-plus-dependency wait (and name the parameter accordingly), while retaining a clearly documented fallback for fixtures lacking it. Add a test with distinct run `created_at`, run `run_started_at`, and job `started_at` values that verifies the live collection path includes both the run queue interval and the later dependency delay. Alternatively, rename and document the metric as post-run-start dependency delay everywhere if excluding workflow queue time is intentional.",
+    "severity": "major",
+    "title": "Live wait measurements omit workflow queue time"
+   }
+  ],
+  "progress": null,
+  "summary": "The inventory and its hermetic tests are generally well structured, and the supplied 56-test suite passes. However, the new `wait` metric does not implement its documented meaning: the live collection path anchors it at the workflow run's `run_started_at`, which excludes the workflow's queue interval. Since the report explicitly presents `wait` as queue time plus dependency blocking, this makes a steering column materially incomplete and requires correction before approval.",
+  "verdict": "request_changes"
+ }
+}
