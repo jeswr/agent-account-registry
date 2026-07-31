@@ -1,0 +1,79 @@
+{
+ "host_envelope": {
+  "pr": 5271,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2d5bf932221c5e020555f7ac75c6d5b34677e196",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`refresh` is `useCallback(..., [endpointUrl, endpointToken])` and the polling effect is `useEffect(..., [refresh])`, so the effect's identity changes on every character typed into either the URL or the token input (both are plain undebounced controlled inputs in EndpointStrip). Each change aborts the old controller and immediately calls `refresh()` again, issuing `GET <origin>/queries` with `Authorization: Bearer <prefix-of-the-secret>`.\n\nTwo consequences:\n\n1. Token-prefix leak to unintended hosts. `endpointBlocked` only suppresses the monitor on level:\"error\" warnings, which are just `invalid-url` and `mixed-content` (packages/sparq-client/src/endpoint.ts:132-158). `parseEndpointUrl` accepts any `https://<label>` (endpoint.ts:86-97), so while the user types `https://example.com/sparql` the intermediate values `https://e`, `https://ex`, ... are all non-blocked and each fires a request carrying the token to that host.\n\n2. Unattended cleartext transmission. `token-over-plaintext` is level `warning`, not `error`, so a non-loopback `http://` endpoint is not blocked. Previously the token left the browser only when the user \u2014 having read that warning \u2014 clicked EXPLAIN/ANALYZE. Now merely typing the URL starts a 2-second-interval cleartext credential beacon, which is a strictly stronger exposure than the warning text describes.\n\nThis is a behavioural change to credential handling that the diff does not acknowledge anywhere in its prose.",
+    "file": "gui/app/src/components/workbench/plan-explorer.tsx",
+    "fix_hint": "Do not derive the poller's inputs directly from the live input state. Either (a) gate EndpointQueryMonitor behind an explicit user action \u2014 an enable toggle, or only mount it after a successful endpoint EXPLAIN/ANALYZE against that URL \u2014 or (b) feed it a committed value (onBlur / debounce >= 500ms on both fields) and additionally require `!hasBlockingWarning` AND no `token-over-plaintext` warning before sending the Authorization header. Splitting the effect so the token is read from a ref rather than a dependency would stop the per-keystroke restart, but on its own it does not fix the unattended-transmission half.",
+    "severity": "blocker",
+    "title": "Bearer token is auto-transmitted on every keystroke and then beaconed every 2s with no user action"
+   },
+   {
+    "body": "crates/sparq-server/Cargo.toml:124 defines `query-registry = [\"server\"]` and it is absent from `default = [\"server\", \"jsonld\", \"algebra-rewrite\", \"explain-json\", \"dp-planner\"]`. A stock sparq-server therefore has no `/queries` route and axum answers 404.\n\nThe client maps that to `throw new Error(\"Running-query list failed (HTTP 404).\")`, which EndpointQueryMonitor renders in `text-destructive` and re-renders every 2s forever. The expected, benign \"the operator did not opt into the registry\" state is presented to the user as a failure, with no hint that the fix is a server feature flag. A 401 (registry present, token wrong or missing \u2014 the read gate is fail-closed) is likewise indistinguishable.\n\nThis undercuts the honesty framing of the panel: the prose calls the registry \"opt-in\", but the UI has no opt-out state.",
+    "file": "gui/app/src/components/workbench/plan-explorer.tsx",
+    "fix_hint": "Distinguish the status codes in `fetchEndpointRunningQueries` (e.g. return a discriminated result or throw a typed error carrying `status`). On 404/405, render a muted informational line such as \"Server-side registry not enabled (start sparq-server with --features query-registry)\" and stop the interval instead of retrying; on 401/403 render a muted \"token not accepted for the registry read gate\". Reserve `text-destructive` for genuine transport/parse failures.",
+    "severity": "major",
+    "title": "`query-registry` is default OFF, so the normal case renders a permanent red error and polls forever"
+   },
+   {
+    "body": "The diff adds ~150 lines of React (polling lifecycle, AbortController teardown, loading/error/empty/loaded states, the kill flow and its `killing` latch) and tests none of it. The three new unit tests exercise only the two pure HTTP helpers.\n\nWorse, the existing e2e spec is now partially invalidated: gui/e2e-playwright/specs/plan-explorer.web.spec.ts:24 sets `MOCK_URL = \"http://127.0.0.1:7788/sparql\"` and the tests mock with `page.route(`${MOCK_URL}**`, ...)`. That glob does not match `http://127.0.0.1:7788/queries`, so from the moment the spec fills `[data-plan-endpoint-url]` (line ~172 and ~188) the new poller issues real, unmocked requests to port 7788 every 2 seconds. The current assertions still hold, but the spec now exercises unmocked network I/O on a timer \u2014 a flake source, and it means the panel's new default rendering in e2e is the untested error state.",
+    "file": "gui/app/src/components/workbench/plan-explorer.tsx",
+    "fix_hint": "Add a component-level or Playwright test covering: registry rows rendered from a mocked `/queries`, Kill issuing `DELETE /queries/{id}` and refreshing, and the error/empty branches. In plan-explorer.web.spec.ts, add an explicit `page.route(\"http://127.0.0.1:7788/queries**\", ...)` fulfilling `{\"queries\":[]}` (or a 404, to pin the not-enabled rendering) so the existing monitor tests no longer depend on unmocked connection-refused timing.",
+    "severity": "major",
+    "title": "New EndpointQueryMonitor component has zero test coverage; e2e mock does not cover /queries"
+   },
+   {
+    "body": "`setInterval(() => void refresh(controller.signal), 2000)` shares one AbortController for the component's whole lifetime; it is aborted only on unmount. If a poll takes longer than 2s (an overloaded server is precisely when this panel is used), a second poll starts while the first is in flight and neither is cancelled. Whichever resolves last calls `setState` last, so a stale snapshot can clobber a fresher one \u2014 rows that have already finished reappear, and the elapsed readouts go backwards.",
+    "file": "gui/app/src/components/workbench/plan-explorer.tsx",
+    "fix_hint": "Either skip a tick while one is in flight (an `inFlight` ref), or give each poll its own AbortController and abort the previous one before starting the next, or stamp each request with a monotonically increasing sequence number and drop responses whose sequence is below the last applied one.",
+    "severity": "minor",
+    "title": "Overlapping polls are unsequenced \u2014 a slow response can overwrite a newer one"
+   },
+   {
+    "body": "In `kill`, `await refresh()` is invoked without a signal, and `killEndpointRunningQuery` accepts no signal at all. If the user closes the panel or edits the endpoint while a kill is in flight, both the kill's own error branch and the follow-up refresh call `setState` on an unmounted component. The `if (signal?.aborted) return` guard inside `refresh` is inert here because no signal was passed.",
+    "file": "gui/app/src/components/workbench/plan-explorer.tsx",
+    "fix_hint": "Hold the effect's AbortController in a ref and thread it into both `killEndpointRunningQuery` (adding a `signal` parameter, symmetric with `fetchEndpointRunningQueries`) and the follow-up `refresh(signal)` call, then keep the existing aborted-guard on every setState path.",
+    "severity": "minor",
+    "title": "`kill()` calls `refresh()` with no AbortSignal, so it can setState after unmount"
+   },
+   {
+    "body": "The server documents `DELETE /queries/{id}` -> `404 Not Found` as \"no query with that id in the registry (already finished, or bad id)\" (crates/sparq-server/src/http.rs, cancel_query_handler). Because rows are polled at a 2s cadence, clicking Kill on a query that completed in the interim is an ordinary, expected outcome \u2014 but the UI renders `Kill failed (HTTP 404).` in `text-destructive` and, because `setState` replaces the whole state, it also wipes the currently displayed list until the next poll.",
+    "file": "gui/app/src/components/workbench/plan-explorer.tsx",
+    "fix_hint": "Treat a 404 from the kill path as success-by-race: refresh silently, or show a muted \"already finished\" note. Separately, keep kill errors in their own state slot so a failed kill does not discard the loaded row list.",
+    "severity": "minor",
+    "title": "A benign kill race (404 = query already finished) is surfaced as a red error"
+   },
+   {
+    "body": "`new URL(\"/queries\", endpoint)` is absolute-path relative, so it discards the endpoint's path entirely. For a direct sparq-server this is correct (the routes are mounted at the root \u2014 http.rs:3592-3593). But for the common deployment of a SPARQL endpoint behind a reverse proxy at a sub-path \u2014 `https://host/sparq/sparql` \u2014 it produces `https://host/queries` rather than `https://host/sparq/queries`, yielding a confusing 404 (which, per the issue above, is rendered as a hard error) or a request to an unrelated application on the same host.",
+    "file": "gui/app/src/lib/query-monitor.ts",
+    "fix_hint": "Derive the registry URL by replacing the final path segment rather than resetting to root \u2014 e.g. strip a trailing `/sparql` (or the last segment) from `endpoint.pathname` and append `queries` \u2014 and keep a unit test pinning both the root-mounted and sub-path cases.",
+    "severity": "minor",
+    "title": "`registryUrl` resolves `/queries` root-relative, dropping any reverse-proxy path prefix"
+   },
+   {
+    "body": "The three added tests cover the happy path, header/auth shaping, and one malformed-row rejection. Untested are exactly the branches this feature will spend most of its life in: the `!response.ok` throw (the 404 that a default-configured server always returns, and the 401 from the fail-closed read gate), the non-http/https protocol guard in `registryUrl`, the `!Array.isArray(queries)` envelope rejection, the kill path's `!response.ok` throw, and the forwarding of the `signal` argument to `fetchImpl` (test 1 never passes one, so the abort plumbing the component relies on is unverified).",
+    "file": "gui/app/src/lib/query-monitor.test.ts",
+    "fix_hint": "Add cases asserting: a 404/401 response rejects with the HTTP-status message; `fetchEndpointRunningQueries(\"ftp://h/sparql\", ...)` rejects on the protocol guard; a `{}` or `{queries: 3}` body rejects with the invalid-response message; a non-204 DELETE rejects; and that a supplied AbortSignal is passed through to `fetchImpl` in `init.signal`.",
+    "severity": "minor",
+    "title": "The failure paths the UI actually depends on are untested"
+   },
+   {
+    "body": "The fixture uses `fingerprint: \"fnv1a64:0123456789abcdef\"`, but `registry_fingerprint` emits a bare 16-hex-character FNV-1a digest with no `fnv1a64:` prefix (asserted by `fingerprint_is_stable` in crates/sparq-server/src/http.rs, which pins `a.len() == 16`). The client only passes the string through, so no behaviour is wrong \u2014 but a fixture that does not match the actual wire format makes the test read as a contract check it is not, and would mislead anyone later adding parsing or display logic keyed on the prefix.",
+    "file": "gui/app/src/lib/query-monitor.test.ts",
+    "fix_hint": "Use a bare 16-hex fixture, e.g. `fingerprint: \"0123456789abcdef\"`, matching `registry_fingerprint`'s output.",
+    "severity": "nit",
+    "title": "Test fixture fingerprint does not match the real server wire value"
+   }
+  ],
+  "progress": null,
+  "summary": "The server side is real: crates/sparq-server/src/http.rs registers `GET /queries` (read-gated) and `DELETE /queries/{id}` (write-gated) under `query-registry`, and the rows the client parses (id/kind/start/fingerprint/elapsed_ms, plus the `{\"queries\":[...]}` envelope) match `QueryRegistry::list()` exactly. The two HTTP helpers are well-shaped and their three tests are non-vacuous (derived URL, method, trimmed bearer header, malformed-row rejection). The honesty edits to the prose are accurate, and no instruction-like content appears in the diff.\n\nWhat blocks approval is the wiring, not the protocol. EndpointQueryMonitor turns the bearer token from a user-initiated transmission into an unattended one: `refresh` is memoised on `[endpointUrl, endpointToken]` and the effect depends on `[refresh]`, so every keystroke in either field restarts the poller and immediately fires `GET /queries` with `Authorization: Bearer <partial token>` \u2014 to a possibly partial hostname, since `parseEndpointUrl` accepts any `https://<label>`. The repo's `token-over-plaintext` warning is level `warning`, not `error`, so `endpointBlocked` does not stop this: the panel beacons the secret in cleartext every 2s with no click.\n\nSecond, `query-registry` is default OFF (crates/sparq-server/Cargo.toml:124). Against a stock server the result is a 404 rendered as a permanent `text-destructive` error, re-polled forever \u2014 the expected \"not enabled\" state shown as a failure.\n\nThird, the new React surface has no test at all; only the pure helpers are covered. gui/e2e-playwright/specs/plan-explorer.web.spec.ts routes `http://127.0.0.1:7788/sparql**`, which does not match `/queries`, so filling the URL there now issues real unmocked requests every 2s.\n\nI could not execute the unit tests (no node_modules in this checkout); test validity was assessed by reading.",
+  "verdict": "request_changes"
+ }
+}
