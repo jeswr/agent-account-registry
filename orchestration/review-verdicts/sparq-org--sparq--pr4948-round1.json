@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4948,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d8ef37f0aa76edbaa5bdaaa862f94c67d75fb58b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "tamper_value maps over the complete value_shares vector and adds delta to every share, producing a globally consistent sharing of a different secret. At n=3,t=1 this requires control of all three parties (or the trusted dealer), not one allowed corrupt party. Both tamper_on_the_difference_operand_is_caught and tamper_on_the_mask_operand_preserves_the_verdict rely on this helper, so the advertised operand-order mutation guard and adopted-mask boundary are not tested under the stated malicious model. In particular, a real corrupt party changes only its local multiplication/re-sharing messages; that does not generally correspond to replacing the secret mask by a single scalar r'. The current tests can pass while a <=t-party attack remains unexamined.",
+    "file": "crates/sparq-mpc/src/auth_equal.rs",
+    "fix_hint": "Add a production-path test hook that injects deviations for at most t selected parties inside the value and MAC multiplication/degree-reduction messages, analogous to the existing in-resharing auth_mul tamper harness. Demonstrate that difference-side attacks either preserve the verdict or abort, and explicitly test the strongest mask-side strategy available from a corrupt party's local view. Keep the all-share helper only as a clearly labeled corrupt-dealer residual test.",
+    "severity": "major",
+    "title": "Adversarial tests rewrite all parties' shares instead of exercising the claimed <=t-party attacker"
+   },
+   {
+    "body": "The module claims a second-operand tamper is adopted as d*r' and is harmless except when r'=0, and later gives a per-party sigma formula. auth_mul, however, multiplies local evaluations and independently degree-reduces [d]*[r] and [alpha*d]*[r]. With only corrupted parties changing their r_i/messages, the induced shifts are weighted combinations involving d_i and (alpha*d)_i; they are not automatically a consistent replacement of the shared secret r by one r'. Conversely, the test demonstrating adoption changes every r_i consistently and therefore does not validate the <=t-party derivation. Since this argument is the basis for returning AdversaryModel::Malicious, the descriptor is premature on the supplied evidence.",
+    "file": "crates/sparq-mpc/src/auth_equal.rs",
+    "fix_hint": "Provide and test the correct share-level derivation for arbitrary coordinated deviations by <=t parties through both reductions, including rushing behavior and the Fiat-Shamir check. If it reduces to a 1/p forgery bound, state the exact delta_v/delta_m relation and pin it with a <=t-party counterexample/mutation harness. Otherwise use multiplication-gate verification that binds both operands, or downgrade AuthenticatedEqualityJoin until that primitive exists.",
+    "severity": "major",
+    "title": "The malicious-security argument collapses local share deviations into an unjustified adopted mask value"
+   }
+  ],
+  "progress": null,
+  "summary": "The authenticated equality construction is carefully scoped as research-grade, but the load-bearing adversarial evidence does not exercise the claimed <=t-party threat model. Its tamper helper rewrites every share into a different valid sharing, i.e. models a corrupt dealer/global state rewrite. The resulting operand-order tests therefore do not establish the per-party malicious-with-abort guarantee that is exposed through OperatorClass::AuthenticatedEqualityJoin. The proof text also treats second-operand deviations as though they simply produce one adopted scalar r', which is not justified for deviations to only corrupted parties' local shares. This needs a real <=t-party deviation harness and argument before advertising AXIS-1 Malicious.",
+  "verdict": "request_changes"
+ }
+}
