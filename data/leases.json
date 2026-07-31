@@ -11,26 +11,6 @@
    "expires_at": 1785475706
   },
   {
-   "account": "51bde6688e140866",
-   "claim_id": "730f4bf99eba45909a41acc617a5a5e6",
-   "holder": "jeswr/agent-account-registry#78@30602869041.1",
-   "package": "dashboard",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785470240,
-   "expires_at": 1785472940
-  },
-  {
-   "account": "9e13ea21abf27e68",
-   "claim_id": "861a8b637a4e4bd4b9e8eb27aa531f83",
-   "holder": "jeswr/agent-account-registry#1371@30603200307.1",
-   "package": "ci",
-   "role": "ci",
-   "model": "opus5",
-   "issued_at": 1785470699,
-   "expires_at": 1785473399
-  },
-  {
    "account": "9e13ea21abf27e68",
    "claim_id": "2958417db441439fa85427a864112a27",
    "holder": "fix:jeswr/agent-account-registry#1366@dispatch-30602967061.1",
@@ -69,6 +49,16 @@
    "model": "sol",
    "issued_at": 1785471552,
    "expires_at": 1785475752
+  },
+  {
+   "account": "dc2d751954080e13",
+   "claim_id": "56dfe4a4026846d99cdd4df899df901e",
+   "holder": "review:sparq-org/sparq#4212@dispatch-30605172330.1",
+   "package": "sparq-core-nt-dict",
+   "role": "review",
+   "model": "sol",
+   "issued_at": 1785473701,
+   "expires_at": 1785477901
   }
  ]
 }
