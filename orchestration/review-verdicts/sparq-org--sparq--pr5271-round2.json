@@ -1,0 +1,58 @@
+{
+ "host_envelope": {
+  "pr": 5271,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3949738d86be01cf53046d8140c64e1b3283022c",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "PlanExplorer computes `tokenOverPlaintext={endpointWarnings.some((warning) => warning.code === \"token-over-plaintext\")}` - matching on `code` only.\n\n`connectionSafetyWarnings` emits that same code at two different levels (packages/sparq-client/src/endpoint.ts):\n- level \"warning\" for `!isTls && !loopback && hasToken` - the genuine cleartext-transit risk;\n- level \"info\" for `!isTls && loopback && hasToken`, whose own message says \"Bearer token sent over loopback http:// - it stays on this machine (no transit exposure).\"\n\nBecause the level is discarded, the benign loopback case sets `tokenOverPlaintext=true`, which makes `canMonitor` false, disables `[data-plan-endpoint-monitor-toggle]`, and renders \"Endpoint monitoring is unavailable while a bearer token would be sent over plaintext.\"\n\nThat is exactly the configuration this panel targets. sparq-server binds loopback by default, `GET /queries` is fail-closed READ-gated (crates/sparq-server/src/http.rs, list_queries_handler -> auth_gate(..., Operation::Read)) and `DELETE /queries/{id}` is WRITE-gated, so an operator who has enabled the registry with a read token and points the desktop app / local dev build at http://127.0.0.1:3030/sparql cannot open the monitor at all. The displayed reason contradicts the client's own classifier for that case, which is an honesty problem in user-facing prose, not just a UX one.\n\nNeither new e2e test sets a token (MOCK_URL is loopback http with an empty token field), so both pass with the bug present.",
+    "file": "gui/app/src/components/workbench/plan-explorer.tsx",
+    "fix_hint": "Match on level as well as code: `endpointWarnings.some((w) => w.code === \"token-over-plaintext\" && w.level !== \"info\")` (or `w.level === \"warning\"`). Since `SafetyCode` is deliberately reused across levels, consider renaming the prop to something level-explicit (e.g. `tokenTransitRisk`) so the next reader does not repeat the conflation. Add an e2e or component case that fills [data-plan-endpoint-token] against the loopback MOCK_URL and asserts the toggle stays ENABLED, plus one against a non-loopback http URL with a token asserting it is disabled - otherwise the two levels remain untested and indistinguishable.",
+    "severity": "major",
+    "title": "tokenOverPlaintext ignores warning.level, so loopback http + token (the default local server config) disables monitoring with a false message"
+   },
+   {
+    "body": "In \"endpoint registry monitoring is explicit, renders rows, and Kill refreshes\", the pre-toggle check is `await expect(page.locator(\"[data-plan-endpoint-monitor-row]\")).toBeHidden();`. `toBeHidden()` is satisfied by a non-existent element, so it passes trivially even at page load and would still pass if a future refactor re-introduced background polling that errored, returned an empty list, or transmitted the token without ever rendering a row.\n\nThe property that actually matters - filling the endpoint URL (and a token) issues ZERO requests to /queries until the user clicks - is measurable here (`listCalls` is already in scope) but is never asserted.",
+    "file": "gui/e2e-playwright/specs/plan-explorer.web.spec.ts",
+    "fix_hint": "After `fill(MOCK_URL)` and before the toggle click, assert `expect(listCalls).toBe(0)`. Strengthen it by also filling [data-plan-endpoint-token] with a sentinel first, so the test pins \"no request, and in particular no Authorization header, before the explicit click\".",
+    "severity": "minor",
+    "title": "The opt-in test asserts UI absence, not request absence - the round-1 blocker gets no regression guard"
+   },
+   {
+    "body": "\"endpoint registry disabled is informational and polling stops\" asserts `expect(calls).toBe(1)` right after the muted message becomes visible. The message appears within the first poll's round-trip - far under the 2000ms retry interval - so `calls` is 1 at that instant whether or not `retry:false` is honoured. The assertion therefore verifies the message and its class, but the \"polling stops\" half of the test name is not actually pinned.\n\nThe muted-vs-destructive class assertion and the message text assertion are real; only the counter is weak.",
+    "file": "gui/e2e-playwright/specs/plan-explorer.web.spec.ts",
+    "fix_hint": "The spec header forbids waitForTimeout, so poll the condition instead: `await expect.poll(() => calls, { timeout: 5000 }).toBe(1)` - which re-evaluates across the 2s window and fails if a retry fires. Alternatively assert via a web-first wait on some state that only advances on a retry. Consider the same for the 404 kill-race path if a test is added there.",
+    "severity": "minor",
+    "title": "\"polling stops\" is asserted with expect(calls).toBe(1) immediately, which cannot observe the 2s retry it is meant to exclude"
+   },
+   {
+    "body": "`setKillError(null)` runs only at the top of `kill`. A transient failure (e.g. a 401 because the write gate needs a token the read gate did not) leaves the red `[data-plan-endpoint-kill-error]` line rendered above a list that keeps refreshing correctly every 2s. The user has no way to dismiss it short of killing another query or toggling monitoring off and on, so a stale error is shown alongside known-good current state.\n\nRelated smaller point in the same callback: `finally { if (!signal?.aborted) setKilling(null); }` clears the latch unconditionally, so with two overlapping kills the first to settle clears the second's \"Killing\u2026\" label.",
+    "file": "gui/app/src/components/workbench/plan-explorer.tsx",
+    "fix_hint": "Clear killError on the next successful poll (e.g. `setKillError(null)` alongside `setState({kind:\"loaded\", ...})` in the poll success path), or key it to the query id and drop it when that id leaves the list. For the latch, store the in-flight id and only clear when `killing === id`.",
+    "severity": "minor",
+    "title": "killError is sticky - it is cleared only when another Kill starts, never by a subsequent successful poll"
+   },
+   {
+    "body": "`monitoredEndpoint` is captured once on click and the effect depends on those snapshot fields, which is the correct fix for the round-1 blocker. But once the user edits [data-plan-endpoint-url] or the token afterwards, the panel keeps listing and killing against the OLD host while the strip above it shows the NEW one, and the only affordance says \"Stop monitoring\". Kill actions are then dispatched to a host the user is no longer looking at.\n\nThis is not a credential-leak (the snapshot host was explicitly opted into), but the panel is otherwise scrupulous about stating its scope, and here the displayed scope and the actual scope silently diverge.",
+    "file": "gui/app/src/components/workbench/plan-explorer.tsx",
+    "fix_hint": "When `monitoredEndpoint.url !== endpointUrl` (or the token differs), render a short muted line naming the host actually being monitored, and offer a \"Monitor <new endpoint>\" re-arm - an explicit second click, so the opt-in property is preserved. Cheapest alternative: auto-stop monitoring when the endpoint field diverges from the snapshot.",
+    "severity": "minor",
+    "title": "The monitor silently keeps polling a stale endpoint snapshot after the URL/token fields change"
+   },
+   {
+    "body": "`registryUrl` pops the final path segment and appends `queries`. That is right for the two shapes the tests pin (`/sparql` -> `/queries`, `/sparq/sparql` -> `/sparq/queries`), and sparq-server does mount the routes at the root (crates/sparq-server/src/http.rs: `.route(\"/queries\", ...)`, `.route(\"/queries/{id}\", ...)`).\n\nIt is still a guess. A Fuseki-style `https://host/datasets/mydb/sparql` resolves to `https://host/datasets/mydb/queries` rather than the server root, and nothing in the code says the rule is heuristic or which shapes it assumes. Given a wrong guess now surfaces as the muted \"registry not enabled\" line, the failure is benign but misleading.",
+    "file": "gui/app/src/lib/query-monitor.ts",
+    "fix_hint": "Add a one-line comment stating the assumption (\"the registry is mounted as a sibling of the SPARQL endpoint; sparq-server mounts both at the server root, so a single-segment path resolves correctly\") and keep the two existing unit tests as the pin. If a wrong guess proves common, surface the derived URL in the \"registry not enabled\" message so the operator can see what was probed.",
+    "severity": "nit",
+    "title": "registryUrl's drop-the-last-segment rule is an undocumented heuristic that mis-resolves multi-segment dataset paths"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 1's blocker is genuinely fixed. EndpointQueryMonitor is now mounted only behind an explicit \"Monitor endpoint\" click that captures an immutable {url, token} snapshot, so no keystroke in either field can transmit a token prefix, and the poller's effect deps are the snapshot fields rather than live state. The two round-1 majors are also addressed: QueryRegistryHttpError carries `status`, 404/405 renders a muted \"start sparq-server with --features query-registry\" line and STOPS the chain, 401/403 renders a muted read-gate line, and the e2e spec now routes `/queries**` explicitly and covers rows + Kill + the disabled case. The remaining minors are resolved too: the poll is a self-scheduling setTimeout chain with a sequence guard (no overlapping/unsequenced polls), kill threads the effect's AbortSignal into both calls, a kill 404 is treated as success-by-race and only drops that row, registryUrl preserves a proxy path prefix, the failure paths have real tests, and the fixture fingerprint is now bare 16-hex matching registry_fingerprint.\n\nOne NEW major was introduced by the fix. The plaintext guard tests `warning.code === \"token-over-plaintext\"` without checking `warning.level`. That code is emitted at BOTH level \"warning\" (non-loopback http + token) and level \"info\" (LOOPBACK http + token, where endpoint.ts explicitly says \"it stays on this machine (no transit exposure)\"). So the normal local configuration - sparq-server on its default loopback bind with --auth-token-read, which the /queries read gate is fail-closed on - disables the Monitor toggle and displays a claim that is false for that case. The e2e tests never set a token, so nothing catches it.\n\nThe rest are minors around test strength and error-state stickiness. Unit tests were assessed by reading only: this checkout has no gui/app/node_modules, so `node --test` could not be run.",
+  "verdict": "request_changes"
+ }
+}
