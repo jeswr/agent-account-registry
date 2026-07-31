@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1455,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "94f27d2f11f8b6ab820224dc683773423b615672",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 approval remains supported. The repository-name guard correctly separates credential fallback eligibility from cross-repository deduplication, so same-repository routes with distinct tokens retain retry behavior without closing the live primary issue. The stateful regression test exercises that call-site configuration and asserts both retained open state and absence of close/comment mutations. The different-repository path rechecks the open marker before closing, comments only after a confirmed close, and leaves dedup best-effort without masking primary delivery. I found no correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
