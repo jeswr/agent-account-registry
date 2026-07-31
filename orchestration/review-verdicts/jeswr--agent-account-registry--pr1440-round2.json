@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1440,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7be65d7cb73425c4da29829f8e3bb99790579506",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The review/fix workflow now CAS-adopts dispatcher-owned claims into the exact run holder and refreshes the lease with the full lane-specific budget. The underlying adoption path rejects expired or missing claims, mismatched target prefixes, unavailable accounts/models, and claims already adopted by a different run; the workflow's validation-failure release is reached only after that ownership transfer succeeds. The extractor pins both adoption TTLs to the dispatcher and self-claim TTLs and pins the --adopt/--holder/--ttl wiring. Its targeted mutants show TTL edits, regression to --inspect, and loss of holder wiring are observable rather than vacuously green. I found no diff-scoped correctness, soundness, security, or test-validity defect. Relative to the prior clean approval, the result is materially unchanged.",
+  "verdict": "approve"
+ }
+}
