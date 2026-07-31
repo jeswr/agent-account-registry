@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 5289,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "807d653845429211c3714f16979b39b2ec0baf15",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4.1 says `as_of(t)` binary-searches segments on `max_timestamp` and scans one candidate segment, while also requiring robustness to wall-clock steps. Segment maxima are not ordered when timestamps can move backward. A later segment can contain the newest generation qualifying for `t` even when an earlier segment has a larger maximum, so searching a single candidate can silently return an older generation or no generation. The randomized non-monotonic acceptance test in phase 2 would expose this, but the proposed index cannot satisfy it as specified.",
+    "file": "research/point-in-time-temporal-index.md",
+    "fix_hint": "Specify a lookup structure whose search key remains ordered independently of wall-clock movement (for example, a timestamp-to-highest-sequence index maintained per record), or require searching all segment summaries that can contain a qualifying record and select the highest sequence/generation. Update the stated metadata, algorithm, complexity, and acceptance criteria consistently.",
+    "severity": "major",
+    "title": "Binary search on segment timestamp maxima is invalid for non-monotonic clocks"
+   },
+   {
+    "body": "The design requires `TemporalIndex::as_of` to agree with `GenerationRing::as_of` on their overlap, but the two currently index different timestamps. A generation stores `published_at` from the ring's configured clock, whereas `ChangeLog::record_commit` independently calls `SystemTime::now()` when recording the commit. Those instants can straddle a requested timestamp, and injected/custom clocks can disagree completely. Therefore the durable index cannot reproduce ring semantics merely by indexing existing `ChangeRecord::timestamp_unix_nanos` values.",
+    "file": "research/point-in-time-temporal-index.md",
+    "fix_hint": "Make the design explicitly persist the authoritative generation `published_at` value in each change record (and define migration/versioning implications), or redefine one shared timestamp authority and change both paths to consume it. Include a test where publication and log-recording times differ, not only tests where both happen to use the same clock.",
+    "severity": "major",
+    "title": "Change-log timestamps do not identify the generation publication instant"
+   },
+   {
+    "body": "Sections 4.1, 4.3, and phase 1 treat the oldest retained generation's timestamp as a temporal horizon and classify timestamps after the current generation as future. With non-monotonic publication timestamps, the oldest retained generation need not have the minimum retained timestamp, and a newer retained generation can qualify for a timestamp earlier than that alleged horizon. Likewise, the current generation's timestamp is not an upper bound on published timestamps. Returning 410 or 400 from those comparisons can reject a request that `GenerationRing::as_of` can answer, contradicting the promised overlap equivalence.",
+    "file": "research/point-in-time-temporal-index.md",
+    "fix_hint": "Define aged-out and not-yet-published semantics in sequence-aware terms that remain valid across clock steps, and specify what timestamp can honestly be advertised as a horizon. If an exact timestamp horizon cannot be derived after non-monotonic history and trimming, return an explicit indeterminate/gap outcome rather than a false 410/400. Add rollback cases to phase 1 and retention acceptance tests.",
+    "severity": "major",
+    "title": "410 horizon and future-time rules are undefined under clock rollback"
+   }
+  ],
+  "progress": null,
+  "summary": "The design is candid about its limitations and correctly keeps the proposed capability opt-in, but its load-bearing timestamp lookup is not sound under the non-monotonic clocks it explicitly promises to support. The proposed per-segment metadata cannot be binary-searched by timestamp, and the durable log timestamps are not the generation publication timestamps used by the existing ring. The horizon and future/aged-out HTTP classifications also assume an ordering that clock steps invalidate. These are architectural correctness issues that must be resolved before this record can safely drive implementation.",
+  "verdict": "request_changes"
+ }
+}
