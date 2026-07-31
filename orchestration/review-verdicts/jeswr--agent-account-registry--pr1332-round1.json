@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1332,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7b5bbbf0e061a4ed26864229e55bccc53bbb7384",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 2, 5, and 7 treat `__global__` occupancy as proof that the holder's true footprint is unnamed and conclude that there is nothing to differentiate per cause. But `busy_packages_of_pulls` initializes `areas` from the PR's own `area:*` labels, then unconditionally unions `{GLOBAL_PACKAGE}` for both `source-unlisted` and `source-no-areas`. Therefore an occupancy row may be `{__global__, crate_a, ...}` with machine path-derived PR areas that name its footprint; it remains global because the source-side/enumerator leg has not moved, not because no footprint evidence exists. The document itself later says `source-unlisted` can be narrowed if both legs move, which contradicts the load-bearing claim that 100% of holders are unknown-crate holders. This invalidates the stated reason that the answer cannot differ by cause and weakens the impossibility argument based on footprints being unmeasurable by construction.",
+    "file": "research/1011-global-partition-bounded-concurrency.md",
+    "fix_hint": "Separate reservation shape from footprint evidence. For each cause, state whether PR-path areas, source-issue areas, or neither are available, and distinguish safety-driven global fallback from linkage-parity global fallback. Rework the per-cause recommendation and any collision-measurement argument using those actual populations; retain exclusivity only if the revised evidence and hazard analysis supports it.",
+    "severity": "major",
+    "title": "The claim that all reachable global holders have unknown footprints is false"
+   }
+  ],
+  "progress": null,
+  "summary": "The record's central premise does not follow from the implementation it cites. A `__global__` reservation is not equivalent to an unnamed true footprint: for valid provenance, `busy_packages_of_pulls` starts with the PR's own `area:*` labels and then adds `__global__` when the source is unlisted or has no areas. Such a holder can therefore have path-derived, nameable PR areas while remaining globally reserved for PLAN/CLAIM linkage parity. That distinction is material to the requested per-cause analysis and to whether evidence-based narrowing or bounded concurrency is possible. The recommendation may still be defensible, but this draft has not established it with a sound cause-by-cause argument.",
+  "verdict": "request_changes"
+ }
+}
