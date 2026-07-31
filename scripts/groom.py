@@ -1553,46 +1553,31 @@ def _is_cas_conflict(code: int, detail: str, *, create: bool) -> bool:
 #
 # The loop/sleep MECHANICS (attempt bound, exponential-jitter schedule, Retry-After cap) are the
 # fleet-shared gh_retry policy (registry #563 adoption item 4 — one tuned copy, not N drifting
-# ones); the CLASSIFICATION predicates below (_is_transient_network, _is_transient_status,
-# _retry_after_seconds, the GET/HEAD-only guard) stay groom-owned exactly as reviewed in #494.
+# ones). The CLASSIFICATION predicates are groom's own POLICY, exactly as reviewed in #494 and
+# widened in #291 — but since registry #552 they are DECLARED, not re-implemented here: the
+# classifier and groom's opt-in live in the shared `http_transient` taxonomy, beside
+# plan-snapshot's, so the deliberate difference between the two (groom excludes 429 and the whole
+# 4xx family; plan-snapshot opts 429 in) is visible and asserted in ONE place instead of being
+# implied by two hand-written tables in two files that nothing compared.
+#
+# The names below are ALIASES of the shared definitions, never second copies — rebinding is what
+# makes divergence impossible, and `#552 the transient classifier IS the shared one` in the
+# self-test pins the delegation so nobody can quietly re-inline it.
 _gh_retry = _load_module(Path(__file__).resolve().with_name("gh_retry.py"), "registry_gh_retry")
+_http_transient = _load_module(
+    Path(__file__).resolve().with_name("http_transient.py"), "registry_http_transient"
+)
 _IDEMPOTENT_METHODS = {"GET", "HEAD"}
 _TRANSIENT_RETRIES = _gh_retry.MAX_ATTEMPTS  # total attempts before a transient failure fails loud
 _RETRY_AFTER_CAP = _gh_retry.RETRY_AFTER_CAP  # never let a hostile Retry-After stall the sweep
 
-
-def _is_transient_status(code: int) -> bool:
-    """True for the 5xx server-error family, which is safe to replay on an IDEMPOTENT read.
-
-    THE WHOLE 5xx RANGE, not the {502, 503, 504} allow-list this replaced (issue #291). That
-    allow-list named the three gateway codes #494 happened to observe, so GitHub's plain internal
-    error fell straight through to the loud raise: two sweeps died inside 4.5h on
-    ``target sparq-org GitHub API GET failed with HTTP 500`` — the same one-blip-kills-the-run class
-    #494 exists to remove, surviving only because 500 was not in the enumeration.
-
-    An allow-list is the wrong shape for this decision, and its failure direction is the bad one:
-    forgetting a code does not make a permanent failure retryable, it makes a TRANSIENT one fatal,
-    and each omission costs a whole scheduled sweep. The fleet-shared classifier groom already
-    borrows its schedule from (``gh_retry.classify_read_failure``) has always treated
-    ``status.startswith("5")`` as transient, so this also removes groom's silent drift from it.
-
-    4xx is NEVER transient here — INCLUDING 429, deliberately narrower than gh_retry. A 4xx is a
-    refusal (auth/permission/validation), and the fail-closed posture on it is the point: this
-    change must widen the class that gets a bounded replay, not the class that gets one at all.
-    The retry it feeds is additionally gated on ``_IDEMPOTENT_METHODS``, so no mutation reaches it.
-    """
-    return 500 <= code < 600
-
-
-def _is_transient_network(exc: BaseException) -> bool:
-    """True for the connection-dropped / timeout family that is safe to retry. RemoteDisconnected is
-    a ConnectionResetError subclass, so it is covered whether it propagates raw or wrapped in a
-    URLError; a URLError for anything else (DNS, refused, bad-cert) stays fatal exactly as before."""
-    if isinstance(exc, (ConnectionResetError, TimeoutError)):
-        return True
-    if isinstance(exc, URLError) and not isinstance(exc, HTTPError):
-        return isinstance(exc.reason, (ConnectionResetError, TimeoutError))
-    return False
+# groom's declared opt-in: the WHOLE 5xx range and no 4xx at all (429 and 403 excluded — see the
+# policy's own `rationale`, which carries the #291/#494 history that used to live in the docstring
+# of the predicate it replaces). The retry it feeds is additionally gated on `_IDEMPOTENT_METHODS`,
+# so no mutation ever reaches it.
+_TRANSIENT_STATUS_POLICY = _http_transient.GROOM_SWEEP
+_is_transient_status = _TRANSIENT_STATUS_POLICY.retries
+_is_transient_network = _http_transient.is_transient_network
 
 
 def _retry_after_seconds(headers: Any) -> float | None:
@@ -6464,6 +6449,23 @@ def _self_test() -> int:
     check("#291 success/redirect statuses are not transient either",
           [_is_transient_status(code) for code in (200, 201, 301, 304, 600)],
           [False, False, False, False, False])
+    # [registry #552] ...and the classifier those rows exercise must BE the shared taxonomy's, not a
+    # private re-implementation that happens to agree today. Every behavioural row above passes just
+    # as happily against an inlined copy, and an inlined copy is precisely the defect: this decision
+    # was written out by hand in groom AND in plan-snapshot with nothing comparing the two tables,
+    # so a change to one drifted from the other silently — in the fail-CLOSED direction, where each
+    # omission costs a whole scheduled sweep. So pin IDENTITY, not behaviour: re-inline
+    # `_is_transient_status` or `_is_transient_network` here and this row goes red while everything
+    # above stays green.
+    check("#552 the transient classifier IS the shared http_transient one, not a local copy",
+          (_is_transient_status == _TRANSIENT_STATUS_POLICY.retries,
+           _TRANSIENT_STATUS_POLICY is _http_transient.GROOM_SWEEP,
+           _is_transient_network is _http_transient.is_transient_network),
+          (True, True, True))
+    # ...and the shared taxonomy's OWN suite must pass, since groom's retry correctness now rests on
+    # it. A classifier that ships broken must not be adopted silently by its consumer.
+    check("#552 the shared http_transient taxonomy's own self-test passes",
+          _http_transient._self_test(), True)
     check("Retry-After is honoured and capped",
           (_retry_after_seconds({"Retry-After": "2"}),
            _retry_after_seconds({"Retry-After": "9999"}),
