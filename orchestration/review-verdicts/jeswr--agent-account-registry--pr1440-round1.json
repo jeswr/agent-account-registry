@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1440,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7be65d7cb73425c4da29829f8e3bb99790579506",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The workflow now CAS-adopts dispatcher-owned review/fix claims into a run-specific holder, refreshes the lease for the lane budget, and fails closed when the claim is expired, mismatched, or already adopted. The existing post-adoption validation and failure release are consistent with the transferred ownership. The added workflow extractor pins both lane TTLs and the essential --adopt/--holder/--ttl wiring, while its mutation checks demonstrate that TTL drift and regressions to inspection or missing holder wiring are observable. I found no diff-scoped correctness, security, or test-validity defect.",
+  "verdict": "approve"
+ }
+}
