@@ -168,6 +168,55 @@ jobs:
             exit 1
           fi
 
+  # CERTIFY THE PLANNER'S LABEL VOCABULARY AGAINST THE REPOSITORY'S LABEL SET (registry #582).
+  #
+  # Every other #582 control is per-ISSUE and REACTIVE — `triage()` refuses to strip a role for a
+  # replacement the repo does not define, `retriage.py --apply` drops an unknown suggested label
+  # before the write, `apply_triage` repairs a violated post-condition. Each of them fires only
+  # AFTER an issue has reached the hole, one issue at a time, and only for the labels that issue's
+  # own plan happens to name. None can answer the question #582 asked: *can this planner emit a
+  # label this repository does not define at all?* `role:soundness` was emittable by every
+  # trust-plane area — the whole orchestration surface — and nothing said so until issues had
+  # already landed `status:ready` with no role.
+  #
+  # So the vocabulary is certified on this workflow's schedule, independently of whether any issue
+  # is being triaged. NO `needs:` on purpose: the sweep and this guard are independent lanes, so a
+  # red sweep must not hide a drifted vocabulary, and a drifted vocabulary must not stop the sweep
+  # draining the board (the sweep's own per-issue validation already fails closed there). The step
+  # fails CLOSED in both directions and carries no `|| true`: an emittable label the repo does not
+  # define exits non-zero with the label NAMED, and so does an EMPTY/unreadable label set — "I
+  # could not read the label set" must never be reported as "no drift".
+  label-drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Narrower than the workflow default: this lane READS the label set and never writes a label.
+    permissions:
+      contents: read
+      issues: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Verify the triage planner
+        run: python3 scripts/triage.py --self-test
+
+      # `id:` so triage.py's self-test can EXTRACT and EXECUTE this exact step body against a
+      # stubbed `gh_retry` — once with a label set that defines the whole vocabulary (expects a
+      # clean exit) and once with one label missing (expects a red exit). A purely textual
+      # assertion here would survive a dropped `--known-labels`, a `|| true`, or a swap back to a
+      # hard-coded label list; those two executed rows do not.
+      - name: Certify the triage label vocabulary against the repository's label set
+        id: label-drift
+        run: |
+          set -euo pipefail
+          # The SAME oracle the sweep passes to `--apply` (scripts/gh_retry.py — bounded retry on
+          # an IDEMPOTENT read; its `read` CLI structurally refuses anything that is not a read).
+          known=$(python3 scripts/gh_retry.py read label list -R "$REPO" --limit 500 \
+            --json name --jq '[.[].name]|join(",")')
+          python3 scripts/triage.py --label-drift --known-labels "$known"
+
   # ALERT ON THE STOCK, NOT THE RUN.
   #
   # The `retriage` job above reported `success` on every one of its ~48 scheduled runs a day while
