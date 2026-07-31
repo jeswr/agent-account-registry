@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import zipfile
 
 
@@ -26,9 +27,16 @@ WINDOWS = (("5h", "5 hour"), ("7d", "7 day"), ("fable_7d_oi", "Fable 7 day"))
 ACCOUNT_REF_RE = re.compile(r"ACCT[A-Z0-9]+_TOKEN")
 SAFE_PROVIDER_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,31}")
 SAFE_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}")
+# The `owner/name` shape, defined ONCE. The holder grammar below embeds it, and the serviced-target
+# reader (issue #78) validates policy/repos.toml's table keys against the same pattern — so the
+# repositories the census SEEDS and the repositories it COUNTS can never be two different grammars.
+SAFE_REPOSITORY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
 HOLDER_RE = re.compile(
-    r"^(?:review:|fix:)?(?P<repository>"
-    r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)#\d+@\S+$")
+    r"^(?:review:|fix:)?(?P<repository>" + SAFE_REPOSITORY_RE.pattern + r")#\d+@\S+$")
+# The per-repository agent census reads its ROW SET from this repo's own worker policy (issue #78).
+# Not a CLI flag on purpose: the set of repositories this orchestrator services is a property of the
+# checkout the generator runs from, so there is no seam an invocation could point somewhere else.
+POLICY_PATH_PARTS = ("policy", "repos.toml")
 DISPATCH_COMPLETE_RE = re.compile(
     r"^\S+\s+dispatcher complete:\s+(\d+) worker/review/fix run\(s\) launched", re.MULTILINE)
 DISPATCHED_RE = re.compile(r"^\S+\s+dispatched\s", re.MULTILINE)
@@ -772,12 +780,16 @@ def _assert_no_fleet_composition(document):
 # cannot see polarity). Every helper raises DashboardError when it cannot resolve its target: a
 # wiring assertion that cannot find what it is asserting about must fail, never pass vacuously.
 def _repo_file(*parts):
-    """Text of a repository file addressed relative to the repo root, independent of cwd."""
+    """Text of a repository file addressed relative to the repo root, independent of cwd.
+
+    Used both by the wiring assertions below and, since issue #78, by the BUILD itself to read the
+    worker policy the per-repository census seeds its rows from — hence the neutral message: either
+    caller must fail loudly when the file is not there, never continue on a default."""
     path = Path(__file__).resolve().parent.parent.joinpath(*parts)
     try:
         return path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise DashboardError(f"wiring assertion cannot read {path}") from exc
+        raise DashboardError(f"cannot read the repository file {path}") from exc
 
 
 def _strip_yaml_comments(text):
@@ -1391,8 +1403,54 @@ def _live_leases(leases, now):
     return live
 
 
-def _repository_activity(live):
-    counts = {}
+def _serviced_repositories(policy_text):
+    """The ENABLED `[repos."owner/name"]` targets of this repo's worker policy.
+
+    Issue #78: these are the repositories the orchestrator SERVICES, and so the rows the
+    per-repository agent census must emit on EVERY tick. Before this, the census listed only the
+    repositories that happened to hold a live lease, which is the #938 shape — a serviced target
+    running zero agents was indistinguishable from a target that is not serviced at all, and on a
+    fully quiet tick the whole table vanished. That is exactly the state an operator interrogates
+    after a stall, so a zero row has to be published rather than omitted.
+
+    Every refusal below is fail-closed on the SET: a policy this reader cannot fully understand
+    would silently narrow the census (a hidden serviced repo reads as "not serviced"), so it
+    refuses the build instead of publishing the rows it did manage to parse."""
+    try:
+        document = tomllib.loads(policy_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise DashboardError(f"worker policy is not parseable TOML: {exc}") from exc
+    rows = document.get("repos")
+    if not isinstance(rows, dict) or not rows:
+        raise DashboardError("worker policy carries no [repos.*] targets")
+    serviced = []
+    for repository, row in rows.items():
+        if not isinstance(row, dict):
+            raise DashboardError(f"worker policy target {repository!r} is not a table")
+        enabled = row.get("enabled")
+        # A non-boolean `enabled` is NOT read as "disabled": guessing here drops a serviced
+        # repository off the census, which is the disclosure failure this function exists to close.
+        if not isinstance(enabled, bool):
+            raise DashboardError(
+                f"worker policy target {repository!r} has a non-boolean enabled flag")
+        if not enabled:
+            continue
+        if SAFE_REPOSITORY_RE.fullmatch(repository) is None:
+            raise DashboardError(
+                f"worker policy target {repository!r} is not an owner/name repository")
+        serviced.append(repository)
+    if not serviced:
+        raise DashboardError(
+            "worker policy has no ENABLED targets — refusing to publish an agent census with no "
+            "rows (an empty row set is what issue #78 closes)")
+    return sorted(serviced)
+
+
+def _repository_activity(live, serviced):
+    # Seeded from the SERVICED set, so an idle target publishes an explicit zero row rather than
+    # disappearing. A repository that holds a live lease without being serviced still gets its row
+    # below — live evidence is never dropped just because the policy did not predict it.
+    counts = {repository: {} for repository in serviced}
     models = set()
     for lease in live:
         holder = lease.get("holder")
@@ -1731,8 +1789,15 @@ def _normalize_observability(document):
 
 
 def build_dashboard(issues, leases_document, usage, dispatch_history, model_health, now, salt,
-                    observability=None, probe_status=None):
+                    observability=None, probe_status=None, serviced=None):
     accounts, private_values = _catalog(issues)
+    # Issue #78. `serviced=None` means "READ THE LIVE POLICY", never "no serviced repositories": an
+    # empty seed would silently restore the vanishing census this closes, which is the #612 review
+    # finding 1 shape (a `None` default that selects the fail-OPEN branch inside the very function
+    # that makes the decision). `_repo_file` raises when the policy is unreadable, so a checkout
+    # without one refuses the build rather than publishing a lease-only row set.
+    if serviced is None:
+        serviced = _serviced_repositories(_repo_file(*POLICY_PATH_PARTS))
     _require_salt(salt)
     usage = usage if isinstance(usage, dict) else {}
     try:
@@ -1792,7 +1857,10 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
             "last_sweep_at": history[0].get("at") if history else None,
             "dispatch_outcomes": history,
         },
-        "active_by_repository": _repository_activity(live),
+        # Issue #78: one row per SERVICED repository on every tick (zeroes included), plus a column
+        # per model that is live somewhere — "how many instances of each model are running on each
+        # repo we service", readable at a glance instead of inferred from which rows are absent.
+        "active_by_repository": _repository_activity(live, serviced),
         "model_health": _normalize_model_health(model_health),
     }
     # Degradation marker (issue #219): the page renders probe age + failure so a stale or failed
@@ -1837,6 +1905,65 @@ def _optional_usage_path(cli_path):
     candidates = [cli_path, os.environ.get("WORKER_USAGE_FILE"),
                   "data/usage.json", "data/account-usage.json"]
     return next((path for path in candidates if path and Path(path).is_file()), None)
+
+
+# Issue #78. The per-repository census is only observability if the PAGE renders it, and the #612
+# round-4 lesson is that a lexical assertion about `renderRepositoryAgents` is satisfiable by a
+# comment or a neighbouring occurrence. So the real function is EXECUTED against a stub DOM and the
+# rendered header/rows are compared cell by cell — including the quiet tick, where every count is
+# zero and the pre-#78 page named no repository at all.
+_REPO_AGENTS_PAGE_HARNESS = r"""
+const fs = require("fs");
+const source = fs.readFileSync(__APP_JS__, "utf8");
+const input = JSON.parse(fs.readFileSync(0, "utf8"));
+function element(tag) {
+  const self = {
+    tagName: tag, children: [], hidden: false, textContent: "", className: "",
+    append: (...kids) => { for (const kid of kids) self.children.push(kid); },
+    replaceChildren: (...kids) => { self.children = [...kids]; },
+    setAttribute: () => {},
+    classList: { add: () => {}, remove: () => {}, contains: () => false },
+  };
+  return self;
+}
+const ids = {};
+globalThis.document = {
+  getElementById: (id) => (ids[id] = ids[id] || element("div#" + id)),
+  createElement: element,
+  createElementNS: (_ns, tag) => element(tag),
+  createTextNode: (text) => ({ textContent: text, children: [] }),
+};
+globalThis.fetch = () => Promise.reject(new Error("network is not under test"));
+globalThis.setInterval = () => 0;
+(async () => {
+  const scope = new Function(source + "; return { renderRepositoryAgents };")();
+  await new Promise((resolve) => setImmediate(resolve));
+  const out = {};
+  for (const [name, spec] of Object.entries(input.cases)) {
+    for (const id of ["repo-agents-empty", "repo-agents-table", "repo-agents-head",
+                      "repo-agents-body"]) {
+      ids[id] = element(id);
+    }
+    let error = null;
+    try {
+      scope.renderRepositoryAgents(spec.activity, spec.active);
+    } catch (raised) {
+      error = String((raised && raised.message) || raised);
+    }
+    const head = ids["repo-agents-head"].children[0];
+    out[name] = {
+      error,
+      tableHidden: ids["repo-agents-table"].hidden === true,
+      emptyText: ids["repo-agents-empty"].hidden === true
+        ? null : ids["repo-agents-empty"].textContent,
+      header: head ? head.children.map((cell) => cell.textContent) : [],
+      rows: ids["repo-agents-body"].children.map((row) =>
+        row.children.map((cell) => cell.textContent)),
+    };
+  }
+  process.stdout.write(JSON.stringify(out));
+})().catch((error) => { console.error(error && error.stack || error); process.exit(1); });
+"""
 
 
 _LANE_PAGE_HARNESS = r"""
@@ -2332,8 +2459,10 @@ def _self_test():
     ]
     history = [{"at": "2025-06-15T15:05:00Z", "conclusion": "success",
                 "dispatched": 2, "deferred": 3, "lanes": fixture_lanes}]
+    # `serviced` is pinned to the fixture's own repository (#78) so this golden document stays
+    # hermetic: the default reads the live policy, which is exercised on its own rows further down.
     got = build_dashboard(issues, leases, usage, history, None, now, "fixture-salt",
-                          probe_status=measured_sidecar)
+                          probe_status=measured_sidecar, serviced=("owner/repo",))
     expected = {
         "schema": SCHEMA,
         "generated_at": "2025-06-15T15:06:40Z",
@@ -2440,8 +2569,12 @@ def _self_test():
                         "holder": f"owner/repo#{index + 1}@run.{slot + 1}",
                         "package": "pkg", "role": "impl", "model": "opus",
                         "issued_at": now - 60, "expires_at": now + 60})
+        # Hermetic serviced set (#78): the clone-invariance property is about the ACCOUNT fleet, so
+        # the census row set is pinned to the fixture's own repository rather than reading the live
+        # policy — which would make onboarding a target move this row's index.
         built = build_dashboard(clone_issues, {"leases": clone_leases}, clone_usage, history, None,
-                                now, "fixture-salt", probe_status=measured_sidecar)
+                                now, "fixture-salt", probe_status=measured_sidecar,
+                                serviced=("owner/repo",))
         return {"provider_quota": built["provider_quota"], "fleet": built["fleet"],
                 "active_by_repository": built["active_by_repository"]}
 
@@ -2567,9 +2700,15 @@ def _self_test():
         {"ts": now - 120, "provider": "anthropic", "account": "d" * 16,
          "model_alias": "", "exit_class": "zero-dispatch", "run_id": "r4"},
     ]}
+    # Issue #78: the serviced set handed in here is deliberately NOT the set of repositories the
+    # fixture's leases name. `org/alpha` is serviced AND busy, `org/idle` is serviced and quiet (so
+    # it must publish an explicit zero row), and `org/beta` holds a live lease WITHOUT being
+    # serviced (so live evidence must survive a policy that did not predict it). None of these three
+    # names appears anywhere else in this suite, so nothing here can pass by colliding with another
+    # fixture's value.
     ordered = build_dashboard(
         ordered_issues, activity_leases, ordered_usage, [], health_ledger, now, "fixture-salt",
-        probe_status=measured_sidecar)
+        probe_status=measured_sidecar, serviced=("org/alpha", "org/idle"))
     check("canonical records ledger -> per-provider/model checks", ordered["model_health"], {
         "generated_at": _utc_iso(now - 120),
         "checks": [
@@ -2595,17 +2734,162 @@ def _self_test():
     check("one alphabetical provider row, and no per-account rows at all",
           ([row["provider"] for row in ordered["provider_quota"]], "accounts" in ordered),
           (["anthropic", "future-provider", "openai"], False))
-    check("repo/model table parses impl + review + fix and excludes expired", [
+    check("repo/model table parses impl + review + fix and excludes expired, and [#78] emits a "
+          "ZERO row for a serviced-but-quiet repository while keeping a busy unserviced one", [
         ordered["fleet"]["active_agents"], ordered["active_by_repository"]
     ], [3, {
         "models": ["fable", "opus", "sol"],
         "repositories": [
             {"repository": "org/alpha", "counts": {"sol": 1, "fable": 1}},
             {"repository": "org/beta", "counts": {"opus": 1}},
+            {"repository": "org/idle", "counts": {}},
         ],
     }])
     check("expanded fixture preserves private account identities",
           all(account_handle not in json.dumps(ordered) for account_handle in ordered_handles), True)
+
+    # --- Issue #78: WHERE THE CENSUS ROW SET COMES FROM, and that it cannot narrow silently. -----
+    # The row set is the ENABLED targets of policy/repos.toml. Every leg below is either a hermetic
+    # policy literal or a claim about the LIVE file that is written here rather than read out of the
+    # reader (pre-flight item 2(b): an expected value taken from the code under test cannot fail).
+    # The path is written out LITERALLY here rather than taken from POLICY_PATH_PARTS (pre-flight
+    # item 2(c)): an input derived from the constant the code reads moves with it, so a repoint at
+    # some other readable TOML would keep this row green. The constant is pinned by equality instead.
+    check("[#78] the census reads THIS repo's worker policy, and nothing else can be substituted "
+          "for it", POLICY_PATH_PARTS, ("policy", "repos.toml"))
+    live_serviced = _serviced_repositories(_repo_file("policy", "repos.toml"))
+    check("[#78] the live worker policy resolves to owner/name targets, and the registry itself is "
+          "one of them — so the real board can never render a census with no rows",
+          ("jeswr/agent-account-registry" in live_serviced,
+           bool(live_serviced) and all(SAFE_REPOSITORY_RE.fullmatch(repo) is not None
+                                       for repo in live_serviced),
+           live_serviced == sorted(set(live_serviced))),
+          (True, True, True))
+    # The `enabled` filter, killed by its own row: a reader that ignored the flag would publish
+    # `off/two` as a serviced repository the pipeline never dispatches to.
+    check("[#78] only ENABLED targets become census rows, de-duplicated and sorted",
+          _serviced_repositories('[repos."on/one"]\nenabled = true\n'
+                                 '[repos."off/two"]\nenabled = false\n'
+                                 '[repos."on/three"]\nenabled = true\n'),
+          ["on/one", "on/three"])
+
+    def serviced_refused(text):
+        try:
+            _serviced_repositories(text)
+        except DashboardError:
+            return True
+        return False
+
+    # Each refusal narrows or fabricates the ROW SET if it is waved through, so each must die. The
+    # last leg is the non-vacuity control: the minimal well-formed policy is ACCEPTED, which is what
+    # stops a reader that simply refuses everything from passing the five rows above it.
+    #
+    # ⚠️ The malformed-row and non-boolean-`enabled` legs each pair their bad target with a VALID
+    # enabled one on purpose. Measured: with a lone bad target, a mutant that reads an unparseable
+    # `enabled` as "disabled" still refuses — via the no-enabled-targets guard below — and SURVIVED.
+    # Two guards masking each other is pre-flight item 4's fourth outcome; the valid neighbour is
+    # what makes each leg fail on its own guard rather than on the other one.
+    check("[#78] a policy this reader cannot fully understand refuses the build instead of "
+          "publishing the rows it did manage to parse — and a well-formed one is still accepted",
+          (serviced_refused("this is not = [ toml"),
+           serviced_refused("# a policy with no [repos.*] table at all\n"),
+           serviced_refused('[repos]\n"bad/one" = 1\n[repos."ok/one"]\nenabled = true\n'),
+           serviced_refused('[repos."ok/one"]\nenabled = true\n[repos."o/r"]\nenabled = 1\n'),
+           serviced_refused('[repos."o/r"]\nenabled = false\n'),
+           serviced_refused('[repos."ok/one"]\nenabled = true\n'
+                            '[repos."not-a-repository"]\nenabled = true\n'),
+           serviced_refused('[repos."o/r"]\nenabled = true\n')),
+          (True, True, True, True, True, True, False))
+    # THE DEFAULT IS NOT AN EMPTY SEED (#612 review finding 1 applied to this argument): omitting
+    # `serviced` must read the live policy, not skip the seeding. A build with no catalog, no leases
+    # and no history still names every repository we service, each at an explicit zero.
+    default_rows = build_dashboard([], {"leases": []}, None, [], None, now,
+                                   "fixture-salt")["active_by_repository"]
+    check("[#78] with NO serviced argument the build reads the LIVE policy — the default can never "
+          "be the lease-only row set this issue closes",
+          (default_rows["models"],
+           "jeswr/agent-account-registry" in [row["repository"]
+                                              for row in default_rows["repositories"]],
+           all(row["counts"] == {} for row in default_rows["repositories"])),
+          ([], True, True))
+
+    def activity_refused(lease):
+        try:
+            _repository_activity([lease], ())
+        except DashboardError:
+            return True
+        return False
+
+    # Measured with `python3 -m trace --count` before this change: BOTH refusal lines of
+    # `_repository_activity` were never executed by this suite. The one row that looked like it
+    # covered them ("malformed live lease fails loudly") is rejected earlier, by
+    # lease_schema.validate_ledger, so the census's own guards were untested.
+    activity_lease = {"holder": "org/gamma#9@run.1", "model": "sol"}
+    check("[#78] the census refuses a live lease whose holder or model it cannot read, and accepts "
+          "the well-formed one (so the five refusals are not a reader that refuses everything)",
+          (activity_refused(dict(activity_lease, holder="org/gamma#9")),
+           activity_refused(dict(activity_lease, holder="org/gamma#9@run.1 extra")),
+           activity_refused(dict(activity_lease, holder=None)),
+           activity_refused(dict(activity_lease, model="sol sol")),
+           activity_refused(dict(activity_lease, model=None)),
+           activity_refused(activity_lease)),
+          (True, True, True, True, True, False))
+
+    # --- the page. EXECUTED, not pattern-matched: what an operator can read off the table. -------
+    # First the LAST HOP (pre-flight item 11): a census that renders perfectly but is never called
+    # from `render()` delivers into a panel still reading "Loading agent activity…".
+    check("[#78] render() actually hands the payload's census and the published live-lease count to "
+          "the table renderer",
+          _js_code_count(_js_function_body(_repo_file("dashboard", "app.js"), "render"),
+                         "renderRepositoryAgents(data.active_by_repository, "
+                         "data.fleet.active_agents);"), 1)
+    repo_agents_page = _REPO_AGENTS_PAGE_HARNESS.replace("__APP_JS__", json.dumps(
+        str(Path(__file__).resolve().parent.parent / "dashboard" / "app.js")))
+    try:
+        rendered_agents = _node_json(repo_agents_page, {"cases": {
+            # A fully quiet fleet: no model is live anywhere, so there are no per-model columns and
+            # the row total is the ONLY number on the page. Pre-#78 this rendered no rows at all.
+            "quiet": {"active": 0, "activity": {"models": [], "repositories": [
+                {"repository": "quiet/one", "counts": {}},
+                {"repository": "quiet/two", "counts": {}}]}},
+            # The mixed tick the issue actually asks for: per-model counts per repository, with a
+            # serviced-but-idle repository reading zero rather than being absent.
+            "mixed": {"active": 3, "activity": {"models": ["opus5", "sol"], "repositories": [
+                {"repository": "busy/one", "counts": {"sol": 2, "opus5": 1}},
+                {"repository": "idle/two", "counts": {}}]}},
+            # A payload that names NO serviced repository is not evidence of an idle fleet.
+            "norows": {"active": 0, "activity": {"models": [], "repositories": []}},
+            # The row set and the fleet count must still be cross-checked.
+            "mismatch": {"active": 9, "activity": {"models": ["sol"], "repositories": [
+                {"repository": "busy/one", "counts": {"sol": 2}}]}},
+        }})
+    except DashboardError as exc:
+        rendered_agents = {"page script raised": str(exc)[:160]}
+
+    def agents_case(name, field):
+        case = rendered_agents.get(name)
+        return case.get(field) if isinstance(case, dict) else rendered_agents
+
+    check("[#78] EXECUTED page script: a quiet tick still publishes one row per serviced "
+          "repository, each carrying an explicit 0 — the table does not vanish",
+          (agents_case("quiet", "header"), agents_case("quiet", "rows"),
+           agents_case("quiet", "tableHidden"), agents_case("quiet", "emptyText")),
+          (["Repository", "Agents"], [["quiet/one", "0"], ["quiet/two", "0"]], False, None))
+    check("[#78] EXECUTED page script: one column per live model plus the row total, and the "
+          "header and every row agree on the column count",
+          (agents_case("mixed", "header"), agents_case("mixed", "rows"),
+           [len(row) for row in agents_case("mixed", "rows")]
+           if isinstance(agents_case("mixed", "rows"), list) else None),
+          (["Repository", "Agents", "opus5", "sol"],
+           [["busy/one", "3", "1", "2"], ["idle/two", "0", "0", "0"]], [4, 4]))
+    check("[#78] EXECUTED page script: a payload naming no serviced repository says so, rather "
+          "than reporting an idle fleet it never observed",
+          (agents_case("norows", "emptyText"), agents_case("norows", "tableHidden"),
+           agents_case("norows", "rows")),
+          ("No serviced repositories in this snapshot.", True, []))
+    check("[#78] EXECUTED page script: the zero rows do not weaken the cross-check against the "
+          "published live-lease count",
+          agents_case("mismatch", "error"), "repository activity does not match live lease count")
 
     # --- provider-cumulative quota (maintainer request 2026-07-18): 2 providers — one
     # multi-account anthropic with mixed capped/free (+ one fail-closed-omitted account), one
@@ -4284,11 +4568,16 @@ const degraded = (node) =>
         leak_rejected = False
     check("raw handle inside observability text is caught by the privacy assertion",
           leak_rejected, True)
-    empty = build_dashboard([], {"leases": []}, None, [], None, now, "fixture-salt")
+    empty = build_dashboard([], {"leases": []}, None, [], None, now, "fixture-salt",
+                            serviced=("solo/target",))
+    # [#78] Even the do-nothing case publishes a row: no catalog, no leases, no history — and the one
+    # serviced repository still reports an explicit ZERO rather than being omitted, which is the
+    # state pre-#78 rendered as "No agents currently active." with no repository named at all.
     check("do-nothing case", (empty["provider_quota"], empty["fleet"],
                               empty["active_by_repository"]),
           ([], {"active_agents": 0, "capacity": {}, "last_sweep_at": None,
-                "dispatch_outcomes": []}, {"models": [], "repositories": []}))
+                "dispatch_outcomes": []},
+           {"models": [], "repositories": [{"repository": "solo/target", "counts": {}}]}))
     try:
         build_dashboard([], {"leases": [{
             "account": "a" * 16, "holder": "malformed", "model": "sol",
