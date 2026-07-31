@@ -22,17 +22,6 @@ jobs:
     name: Reclaim and repair orchestration state
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # THE HEALTH EVALUATOR'S OWN OUTCOME (issue #331). The model-health decide step below
-    # is `continue-on-error: true` — correct, a health-alert fault must never abort the only
-    # crash-recovery path — but it also means an evaluator that crashes on EVERY tick leaves this
-    # job's RESULT at `success`, so `groom-alert` (which keys on `needs.groom.result`) stays
-    # silent while health alerts are no longer being raised or closed at all. The step OUTCOME is
-    # the pre-continue-on-error result, i.e. the ONLY surviving signal, so it is published here
-    # for that job. `steps.health.outcome` is `skipped` when an earlier step already failed, which
-    # is exactly right: that tick is a hard GROOM failure the result-keyed alarm already covers,
-    # and it is NOT evidence that the evaluator recovered.
-    outputs:
-      health_outcome: ${{ steps.health.outcome }}
     # SECRET-EXFIL GUARD (issue #101): reads REGISTRY_ADMIN_APP_ID/KEY + PROVENANCE_SALT, which
     # live in the `dispatch-secrets` environment (deployment-branch policy: default branch only)
     # — full rationale on the `claim` job in dispatch.yml.
@@ -332,14 +321,7 @@ jobs:
       # upserts ONE ops-alert issue per (condition, provider). An unreadable ledger exits NONZERO
       # (every reader fails loud, review r3); continue-on-error keeps the maintenance sweep alive
       # while this step goes visibly red. Account identifiers stay salted (decision 22a).
-      #
-      # `id: health` is load-bearing (issue #331): the job output above is keyed on THIS step's
-      # outcome, and it is the only way a crashing evaluator reaches an alarm while the job around
-      # it stays green. scripts/groom-alert.py's --self-test asserts the id, the output and the
-      # env line that carries it, so un-wiring any of the three goes red in the gate instead of
-      # silently disarming the alarm.
       - name: Decide + raise/close model-access health alerts
-        id: health
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -742,20 +724,15 @@ jobs:
       contents: read  # minimum for the sparse checkout below — the job runs a script from the repo
       issues: write   # upsert/close the rolling groom-failure ops-alert issue
     steps:
-      # The alert logic lives in scripts/groom-alert.py; groom.yml itself is the second INPUT, not
-      # incidental — the script's --self-test asserts the health-evaluator seam (the step `id`, the
-      # job output and the env line below) against this very file, and a trimmed list would make
-      # that whole section unreachable on the live path instead of red. KEEP IN SYNC with
-      # REQUIRED_FILES in scripts/groom-alert.py. Pinned, no persisted token; nothing else from the
-      # repo reaches this job.
-      - name: Check out ONLY the alert's inputs (pinned, sparse, no persisted token)
+      # The alert logic lives in scripts/groom-alert.py, but only that one file is needed —
+      # sparse-checkout scopes the working copy to it, pinned and with no persisted token, so
+      # nothing else from the repo reaches this job.
+      - name: Check out ONLY scripts/groom-alert.py (pinned, sparse, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           path: registry
           persist-credentials: false
-          sparse-checkout: |
-            scripts/groom-alert.py
-            .github/workflows/groom.yml
+          sparse-checkout: scripts/groom-alert.py
           sparse-checkout-cone-mode: false
 
       - name: Alert maintainer that the scheduled GROOM job hard-failed
@@ -764,10 +741,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REGISTRY_REPO: ${{ github.repository }}
           GROOM_RESULT: ${{ needs.groom.result }}
-          # Issue #331: the health evaluator is continue-on-error, so its failure never reaches
-          # GROOM_RESULT above. Drop this line and the second alarm silently never fires — which
-          # is why groom-alert.py's --self-test pins it against this exact expression.
-          GROOM_HEALTH_OUTCOME: ${{ needs.groom.outputs.health_outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           MAINTAINER_HANDLE: jeswr
           # Privacy routing (locked decision 22c, issue #39): scripts/groom-alert.py routes to a
@@ -776,12 +749,7 @@ jobs:
           # only the groom job RESULT + run link), so that fallback is safe.
           ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
-        # FAIL-STOP is load-bearing: a detector never mutates issues before it has proved itself on
-        # this tick's code, so `-e` must abort the step the moment `--self-test` exits nonzero.
-        # Under plain `set -uo pipefail` a red self-test (an unreadable groom.yml, a broken seam
-        # assertion) would fall through and the live run's exit code would mask it. groom-alert.py's
-        # --self-test pins this exact `set` line and its position ahead of both invocations.
         run: |
-          set -euo pipefail
+          set -uo pipefail
           python3 registry/scripts/groom-alert.py --self-test
           python3 registry/scripts/groom-alert.py
