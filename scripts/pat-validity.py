@@ -2037,9 +2037,18 @@ def _self_test():
             # main() invocations). Run on BOTH alert routes — the outputs contract is
             # route-independent — and the file is pre-created so a DROPPED write reds this row
             # instead of aborting the suite with FileNotFoundError.
+            # ALL FIVE verdict constants are exercised, not just the three coarse stdout classes
+            # (round 2): the coarse status is many-to-one — INVALID, INSUFFICIENT and EXPIRING
+            # all print "attention-required" — so covering one representative per stdout branch
+            # leaves the machine-readable identity of the other two unpinned, and a rewrite of
+            # just `insufficient-scope` or `expiring-soon` in the outputs write would survive.
+            # Each verdict is its own asserted `verdict=` value, so the domain is pinned
+            # element-wise.
             import tempfile
             for verdict, coarse in ((INVALID, "attention-required"), (VALID, "ok"),
-                                    (NETWORK_UNKNOWN, "unknown")):
+                                    (NETWORK_UNKNOWN, "unknown"),
+                                    (INSUFFICIENT, "attention-required"),
+                                    (EXPIRING, "attention-required")):
                 module["probe"] = lambda token, repo, v=verdict: {
                     "verdict": v, "detail": "DISTINCTIVE-DETAIL-NEVER-PUBLIC",
                     "expires_at": "2099-01-02 03:04:05 UTC", "days_left": 3.5}
