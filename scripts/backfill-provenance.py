@@ -784,7 +784,7 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
     pulls = flatten_pull_pages(pages)
     if pulls is None:
         raise BackfillError("pull listing is malformed")
-    written = skipped = needs_human = repaired = blocked = 0
+    written = skipped = needs_human = repaired = blocked = write_failed = 0
     # [registry #776] The POPULATION this run is accountable for: every open, same-repo,
     # bot-authored worker PR. Counted at the same branch that admits the PR into the loop, so
     # the seal below compares two numbers derived from ONE walk. Without it "skipped 76" was
@@ -965,9 +965,33 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
         repair = disposition == RECORD_INADMISSIBLE
         verb = "repair" if repair else "record"
         if apply_changes:
-            worker_pr.provenance_record(registry_repo, target_repo, number, opened_sha,
-                                        provider, alias, impl_account_h, issue, run_key,
-                                        supersede_legacy=repair)
+            try:
+                worker_pr.provenance_record(registry_repo, target_repo, number, opened_sha,
+                                            provider, alias, impl_account_h, issue, run_key,
+                                            supersede_legacy=repair)
+            except worker_pr.WorkerPrError as exc:
+                # [registry #1317] ONE PR's failed write is not the whole population's failure.
+                # `WorkerPrError` is NOT a `BackfillError`, so it flew straight past main()'s
+                # handler: the FIRST bad write aborted the run with a traceback, every PR after it
+                # in the walk was silently dropped, and neither the completion line nor the seal
+                # ever ran. Survivable for a human-watched dispatch; disqualifying for the
+                # unattended trigger this class needs, where nobody reads the traceback.
+                #
+                # Its OWN bucket, not `blocked`. `blocked` means "this run refused to write a
+                # record it judged unsound" and the response is to fix the evidence; this means
+                # "the write itself did not land" and the response is to look at the registry
+                # write path — the #712 lesson that reasons are reported apart because the
+                # responses are different. It is also the one gauge that says an unattended sweep
+                # is failing to write at all, which a bucket shared with routine refusals could
+                # never show.
+                write_failed += 1
+                print(f"WRITE-FAILED #{number}: could not {verb} the provenance record "
+                      f"({exc}); leaving fail-closed invisible — records are create-only, so the "
+                      "next run re-derives this PR and retries the write")
+                # Nothing was recorded, so no draft conversion: drafting here would mutate the
+                # target for a PR that stays invisible to the review lane either way. #726's
+                # independence runs ONE way — a failed draft must never withhold a record.
+                continue
         else:
             # Privacy: never print the raw handle, only the (public-anyway) salted hash.
             print(f"DRY-RUN #{number}: would {verb} impl={provider}/{alias} "
@@ -986,13 +1010,14 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
     # be able to tell "this run adjudicated N worker PRs" from "and declined M PRs that were never
     # its job", which is exactly the distinction folding the #657 class into `skipped` destroyed.
     print(f"backfill complete: {mode} {written}, repaired {repaired}, skipped {skipped}, "
-          f"needs-human {needs_human}, blocked {blocked} "
+          f"needs-human {needs_human}, blocked {blocked}, write-failed {write_failed} "
           f"(population {population}) out-of-scope {out_of_scope}")
     # [registry #776] THE SEAL. Every worker PR left this loop through exactly one counted exit,
     # or this raises. Bare statement on purpose — see seal_population's docstring: a
     # `reason = ...` / `if reason: raise` shape has a deletable seam, and a mutant that deleted
     # exactly that seam survived the whole suite.
-    seal_population(written + repaired + skipped + needs_human + blocked, population)
+    seal_population(written + repaired + skipped + needs_human + blocked + write_failed,
+                    population)
 
 
 def identity_from_run_log(log_readable, log_text, target_repo, pr_number, issue, live_author,
@@ -1748,8 +1773,8 @@ def _self_test():
           ("DRY-RUN #9002: would record" in e2e,
            "DRY-RUN #9002: would convert to draft" in e2e), (True, True))
     check("E2E: BOTH records are counted — draft policy never withholds a record",
-          "backfill complete: would record 2, repaired 0, skipped 0, needs-human 0, blocked 0 "
-          "(population 2)" in e2e, True)
+          "backfill complete: would record 2, repaired 0, skipped 0, needs-human 0, blocked 0, "
+          "write-failed 0 (population 2)" in e2e, True)
 
     # --- [registry #776] THE INADMISSIBLE-RECORD CLASS HAS A MACHINE EXIT ----------------------
     # Measured on the live estate 2026-07-27: 7 master records carry the attempt-less
@@ -1793,16 +1818,16 @@ def _self_test():
     check("a PR with NO ledger record but an ADMISSIBLE master one is already recorded — a "
           "ledger 404 alone never means recordless",
           ("skip #9002: provenance already recorded" in master_only,
-           "would record 0, repaired 0, skipped 1, needs-human 0, blocked 0 (population 1)"
-           in master_only), (True, True))
+           "would record 0, repaired 0, skipped 1, needs-human 0, blocked 0, write-failed 0 "
+           "(population 1)" in master_only), (True, True))
 
     repair_out = drive_backfill(e2e_pages, master={9001: STALE, 9002: HEALTHY},
                                 admission=real_admission)
     check("E2E: a PR whose record is present but INADMISSIBLE is REPAIRED, not left to a human",
           ("REPAIR #9001" in repair_out, "NEEDS-HUMAN #9001" in repair_out), (True, False))
     check("E2E: ...and the repair is COUNTED in its own bucket",
-          "would record 0, repaired 1, skipped 1, needs-human 0, blocked 0 (population 2)"
-          in repair_out, True)
+          "would record 0, repaired 1, skipped 1, needs-human 0, blocked 0, write-failed 0 "
+          "(population 2)" in repair_out, True)
     check("E2E: a PR whose record ALREADY ADMITS is skipped, never rewritten",
           ("skip #9002: provenance already recorded" in repair_out,
            "REPAIR #9002" in repair_out), (True, False))
@@ -1818,6 +1843,67 @@ def _self_test():
           "(e2e_run_gh raises on one), and still repairs",
           "repaired 1" in apply_out, True)
 
+    # --- [registry #1317] ONE FAILED WRITE MUST NOT ABORT THE POPULATION ----------------------
+    # The premise, re-derived from the REAL module rather than asserted in prose: `WorkerPrError`
+    # is not a `BackfillError`, so main()'s handler never saw it and the first failed write ended
+    # the run with a traceback mid-walk. If these two classes ever converge this whole block is
+    # measuring nothing, so the premise is checked before the behaviour is.
+    check("[#1317] worker_pr.WorkerPrError is NOT a BackfillError — main()'s handler cannot "
+          "catch it, which is why the write call site must",
+          issubclass(_load_worker_pr().WorkerPrError, BackfillError), False)
+    # ...and the catch must be spelled through the MODULE ATTRIBUTE. `drive_backfill`'s stub
+    # aliases WorkerPrError=BackfillError, so a mutant narrowing the handler to the local class
+    # would pass every behavioural check below while being the exact production bug again. Pinned
+    # here because no runtime test can see the difference. `except Exception` reds it too: this
+    # loop must stay loud for a TypeError, and soft only for an operational write failure.
+    write_handlers = [h for node in ast.walk(backfill_tree) if isinstance(node, ast.Try)
+                      for h in node.handlers
+                      if any(isinstance(c, ast.Call)
+                             and getattr(c.func, "attr", "") == "provenance_record"
+                             for c in ast.walk(node))]
+    check("[#1317] the write's except clause names worker_pr.WorkerPrError exactly — not the "
+          "local BackfillError the stub aliases it to, and not a bare Exception",
+          [(getattr(h.type, "attr", None), getattr(getattr(h.type, "value", None), "id", None))
+           for h in write_handlers],
+          [("WorkerPrError", "worker_pr")])
+
+    def failing_writer(fails_on):
+        def writer(*args, **kwargs):
+            if args[2] == fails_on:
+                raise BackfillError("HTTP 409 writing the record")   # stub's WorkerPrError
+            writes.append((args[2], kwargs.get("supersede_legacy")))
+        return writer
+
+    # No records anywhere, so BOTH PRs are RECORD_ABSENT and both would be written. Failing the
+    # FIRST one in the walk is the case that used to lose #9002 entirely.
+    writes.clear()
+    first_fails = drive_backfill(e2e_pages, apply_changes=True, writer=failing_writer(9001),
+                                 no_draft_convert=True)
+    check("[#1317] a failed write on the FIRST PR does not abort the walk — the SECOND PR is "
+          "still recorded (this call raised outright before the fix)",
+          writes, [(9002, False)])
+    check("[#1317] ...the failure is reported with its own reason and the create-only retry",
+          ("WRITE-FAILED #9001: could not record the provenance record "
+           "(HTTP 409 writing the record)" in first_fails,
+           "next run re-derives this PR and retries the write" in first_fails), (True, True))
+    check("[#1317] ...it lands in its OWN bucket, and the run still SEALS (drive_backfill "
+          "re-raises the unsealed BackfillError, so reaching this line is the seal passing)",
+          "recorded 1, repaired 0, skipped 0, needs-human 0, blocked 0, write-failed 1 "
+          "(population 2)" in first_fails, True)
+
+    # Now fail the DRAFTABLE PR with draft conversion ENABLED: a record that did not land must not
+    # be followed by a draft conversion. e2e_run_gh raises on any mutating gh call, so a lost
+    # `continue` blows this run up rather than passing quietly.
+    writes.clear()
+    second_fails = drive_backfill(e2e_pages, apply_changes=True, writer=failing_writer(9002))
+    check("[#1317] a PR whose write FAILED is not converted to draft — nothing was recorded, so "
+          "the target is left exactly as found",
+          ("converted #9002 to draft" in second_fails,
+           "WRITE-FAILED #9002" in second_fails), (False, True))
+    check("[#1317] ...and the PR whose write SUCCEEDED is unaffected by its neighbour's failure",
+          (writes, "recorded 1, repaired 0, skipped 0, needs-human 0, blocked 0, write-failed 1 "
+                   "(population 2)" in second_fails), ([(9001, False)], True))
+
     # IDEMPOTENCE — the run must converge. Second invocation over the state the first one leaves
     # behind (the repaired record now on `ledger`) must write NOTHING and skip both.
     REPAIRED = json.dumps({"pr_number": 9001, "impl_provider": "anthropic", "impl_alias": "fable",
@@ -1831,8 +1917,8 @@ def _self_test():
                             writer=recording_writer, no_draft_convert=True)
     check("IDEMPOTENT: a second run over the first run's output writes nothing at all", writes, [])
     check("IDEMPOTENT: ...and reports both PRs as skipped",
-          "recorded 0, repaired 0, skipped 2, needs-human 0, blocked 0 (population 2)" in second,
-          True)
+          "recorded 0, repaired 0, skipped 2, needs-human 0, blocked 0, write-failed 0 "
+          "(population 2)" in second, True)
     check("IDEMPOTENT: ...ledger-first — the repaired ledger copy beats the stale master one",
           "REPAIR #9001" in second, False)
 
@@ -1840,12 +1926,12 @@ def _self_test():
     no_commits = drive_backfill(e2e_pages, commits=[])
     check("a PR with no commits is a COUNTED terminal state, not a silent `continue`",
           ("BLOCKED #9001: PR has no commits" in no_commits,
-           "would record 0, repaired 0, skipped 0, needs-human 0, blocked 2 (population 2)"
-           in no_commits), (True, True))
+           "would record 0, repaired 0, skipped 0, needs-human 0, blocked 2, write-failed 0 "
+           "(population 2)" in no_commits), (True, True))
     bad_sha = drive_backfill(e2e_pages, commits=[{"sha": "nothex"}])
     check("a malformed first-commit sha is a COUNTED terminal state too",
           ("BLOCKED #9001: first commit sha is malformed" in bad_sha,
-           "blocked 2 (population 2)" in bad_sha), (True, True))
+           "blocked 2, write-failed 0 (population 2)" in bad_sha), (True, True))
     check("a record this run would write that is ITSELF inadmissible is refused, and counted",
           "BLOCKED #9001: the record this run would write is itself NOT admissible"
           in drive_backfill(e2e_pages, admission=lambda record, pr: "synthetic refusal"), True)
@@ -2055,7 +2141,7 @@ def _self_test():
     # population, every population counter is now byte-identical between the two runs and only the
     # out-of-scope bucket moves, which is what "enrolment must not move the worker lane" means.
     POPULATION_LINE = ("backfill complete: would record 1, repaired 0, skipped 0, "
-                       "needs-human 0, blocked 0 (population 1)")
+                       "needs-human 0, blocked 0, write-failed 0 (population 1)")
     check("[#657] FROZEN worker-class control: enrolment moves ONLY the out-of-scope bucket — "
           "every population counter is identical between the two runs",
           (f"{POPULATION_LINE} out-of-scope 1" in on_out,
