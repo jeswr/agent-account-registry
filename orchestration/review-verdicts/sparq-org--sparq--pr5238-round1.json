@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5238,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1a7edbe2d74dd3f2f10fe0f413c193626ce66958",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The verifier now fail-closes over every distinct slot at which the filtered variable occurs across all query patterns matched by a scan, while preserving the existing per-row, operator, bound, and true-verdict checks. The BTreeSet correctly deduplicates same-slot matches. The negative regression test exercises the real structural verification path and would have accepted before the find_map-to-all-slots change; the positive control covers deduplication when multiple patterns use the same slot. The audit record accurately limits the demonstrated impact to structural-gate reachability and does not overclaim a useful end-to-end forgery. No correctness, soundness, security, or test-validity defect was found. Tests could not be executed in this checkout because cargo is unavailable, so this approval is based on diff-scoped code and test inspection.",
+  "verdict": "approve"
+ }
+}
