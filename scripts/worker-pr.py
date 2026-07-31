@@ -488,19 +488,31 @@ def _alert_route(confirmed_private=None):
     ALERT_REPO — is NOT verification: it fails OPEN on a same-repo or public ALERT_REPO, silently
     degrading the channel the maintainer believes is private. EVERY other shape (unconfigured,
     tokenless, same-repo, public, or a failed/indeterminate visibility lookup) falls back to the
-    registry repo + workflow token, which is the pre-#436 unconfigured behaviour, so no alert is
-    lost. `confirmed_private` is injectable for the self-test; the default performs the live
-    lookup, consulted only once BOTH halves of the route are set (a tokenless route needs no API
-    call to be rejected — `_ops_alert` refuses to deliver without a token anyway)."""
+    registry repo + REGISTRY_ALERT_TOKEN, which is the pre-#436 unconfigured behaviour.
+
+    THE TWO TOKENS ARE NOT INTERCHANGEABLE and must never cross repos (#436 round 1). ALERT_TOKEN
+    is the maintainer's secret scoped to the PRIVATE destination; REGISTRY_ALERT_TOKEN is the
+    registry-scoped workflow token (`${{ github.token }}` at every call site). Returning the route
+    token beside the registry repo would hand `_ops_alert` a credential with no write access there
+    — and since `_ops_alert` is deliberately best-effort and swallows delivery errors, the alert
+    would vanish silently on exactly the rejection paths this hardening added. So the private route
+    carries the route token, and EVERY fallback carries the registry token (`None` when unset, which
+    `_ops_alert` refuses outright — a loud no-op beats a doomed cross-scope write). Sibling routers
+    (groom-alert.py/plan-alert.py) express the same rule as `(registry_repo, None)` = ambient.
+
+    `confirmed_private` is injectable for the self-test; the default performs the live lookup,
+    consulted only once BOTH halves of the route are set (a tokenless route needs no API call to be
+    rejected — `_ops_alert` refuses to deliver without a token anyway)."""
     registry_repo = os.environ.get("REGISTRY_REPO")
+    registry_token = os.environ.get("REGISTRY_ALERT_TOKEN")
     alert_repo = os.environ.get("ALERT_REPO")
-    token = os.environ.get("ALERT_TOKEN") or os.environ.get("REGISTRY_ALERT_TOKEN")
-    if alert_repo and token:
+    route_token = os.environ.get("ALERT_TOKEN") or registry_token
+    if alert_repo and route_token:
         same_repo = alert_repo.strip().lower() == (registry_repo or "").strip().lower()
         check = confirmed_private if confirmed_private is not None else _repo_confirmed_private
-        if not same_repo and check(alert_repo, token):
-            return alert_repo, token
-    return registry_repo, token
+        if not same_repo and check(alert_repo, route_token):
+            return alert_repo, route_token
+    return registry_repo, registry_token
 
 
 def _ops_alert(alert_repo, alert_token, title, body):
@@ -11054,11 +11066,20 @@ def _self_test():
     check("verdict scrub strips an issue email",
           "@" in _scrubbed["issues"][0]["body"], False)
     # ---- ops-alert routing (locked decision 22c; hardened for issue #436) ----------------------
-    # The private ALERT_REPO is selected ONLY over a POSITIVELY VERIFIED private route. Every
-    # rejection direction is asserted, and the same-repo direction is asserted on the PROBE (not
-    # on the returned tuple): when ALERT_REPO names the registry, both branches return the SAME
-    # (repo, token) pair, so dropping the same-repo guard is value-identical and invisible to a
-    # return-value check — only "the visibility probe was never issued" can kill it.
+    # The private ALERT_REPO is selected ONLY over a POSITIVELY VERIFIED private route, and every
+    # rejection direction is asserted.
+    #
+    # The two sentinels are DISTINCT ON PURPOSE (#436 round 1): ALERT_TOKEN="t1" is the
+    # private-destination secret, REGISTRY_ALERT_TOKEN="t0" the registry-scoped workflow token.
+    # Only the private route may return t1; every fallback must return t0 beside "reg/repo". A
+    # router that carried the route token into the fallback would hand `_ops_alert` a credential
+    # with no write access to the registry — and `_ops_alert` swallows delivery errors, so the
+    # alert would vanish silently. Each rejection assertion below therefore expects t0, and would
+    # go red against a `return registry_repo, route_token`.
+    #
+    # The same-repo direction is asserted on the PROBE as well as the tuple: the probe is a live
+    # API call against the public registry that the guard exists to prevent, and "no probe issued"
+    # kills the guard independently of the returned credential.
     os.environ["REGISTRY_REPO"] = "reg/repo"
     os.environ["REGISTRY_ALERT_TOKEN"] = "t0"
     os.environ.pop("ALERT_REPO", None)
@@ -11076,24 +11097,31 @@ def _self_test():
           ("private/alerts", "t1"))
     check("alert route probes the ALERT repo under the ALERT token",
           route_probes, [("private/alerts", "t1")])
-    check("[#436] an UNCONFIRMED-private ALERT_REPO falls back to the registry",
-          _alert_route(confirmed_private=lambda r, t: False), ("reg/repo", "t1"))
+    check("[#436] an UNCONFIRMED-private ALERT_REPO falls back to the registry under the REGISTRY "
+          "token, never the private-route token",
+          _alert_route(confirmed_private=lambda r, t: False), ("reg/repo", "t0"))
     same_repo_probes = []
     os.environ["ALERT_REPO"] = "reg/repo"
-    check("[#436] ALERT_REPO == the PUBLIC registry -> registry route, and the probe is NEVER "
-          "issued (the same-repo guard, killable only here)",
+    check("[#436] ALERT_REPO == the PUBLIC registry -> registry route under the REGISTRY token, "
+          "and the probe is NEVER issued (the same-repo guard)",
           (_alert_route(confirmed_private=lambda r, t: same_repo_probes.append(r) or True),
            same_repo_probes),
-          (("reg/repo", "t1"), []))
+          (("reg/repo", "t0"), []))
     os.environ["ALERT_REPO"] = "Reg/Repo"
     same_case_probes = []
     check("[#436] same-repo rejection is case-insensitive (GitHub repo names are)",
           (_alert_route(confirmed_private=lambda r, t: same_case_probes.append(r) or True),
            same_case_probes),
-          (("reg/repo", "t1"), []))
+          (("reg/repo", "t0"), []))
+    # A rejected route with NO registry token yields (registry, None) — `_ops_alert` then refuses
+    # outright. That loud no-op is the intended fail-closed shape: it must NOT degrade into a
+    # cross-scope write of the private-route token against the public registry.
     os.environ["ALERT_REPO"] = "private/alerts"
-    os.environ.pop("ALERT_TOKEN", None)
     os.environ.pop("REGISTRY_ALERT_TOKEN", None)
+    check("[#436] rejected route with ALERT_TOKEN but no REGISTRY_ALERT_TOKEN -> (registry, None), "
+          "never the private-route token",
+          _alert_route(confirmed_private=lambda r, t: False), ("reg/repo", None))
+    os.environ.pop("ALERT_TOKEN", None)
     tokenless_probes = []
     check("[#436] ALERT_REPO with NO token at all -> registry route, no probe",
           (_alert_route(confirmed_private=lambda r, t: tokenless_probes.append(r) or True),
