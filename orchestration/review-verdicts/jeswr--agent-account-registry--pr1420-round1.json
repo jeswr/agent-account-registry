@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1420,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7777cb12b29d265e13f5d8f91cf281e93ffecc05",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe pagination join now absorbs duplicate valid integer `number` identities with deterministic keep-first semantics while preserving keyless, malformed, and non-dict rows for downstream validation. It retains fail-closed behavior for non-list responses and the 5000-entry ceiling, and correctly uses the raw page length for walk termination. The added self-test is non-vacuous across the important seams: duplicate removal, keep-first selection, continuation beyond a raw full page, pass-through of unusable identities, end-to-end snapshot artifact contents, and loud warning emission. No reviewer-directed prompt injection was present in the diff.",
+  "verdict": "approve"
+ }
+}
