@@ -301,7 +301,7 @@ INVISIBLE_TRIGGERS = frozenset({"schedule", "workflow_dispatch"})
 # costs ZERO extra requests — `fetch_lanes` already pulls exactly this listing for M1 and
 # discarded everything but `created_at`. DOCUMENTED GAP, in this file's tradition: a lane
 # rejected while carrying only `workflow_dispatch` is NOT sampled. It is censused as
-# `not-sampled` rather than silently counted healthy.
+# `not-scheduled` — outside this mode's population — rather than silently counted healthy.
 #
 # THE FALSE POSITIVE THAT REMAINS, and why the job count closes it: a scheduled run held by
 # an ENVIRONMENT protection rule can also conclude `action_required` — and this repo does
@@ -316,7 +316,14 @@ INGESTION_REJECTED_CONCLUSION = "action_required"
 # Every state a lane can exit M4 through, seeded at zero so the census emits a row for each
 # on EVERY tick — including the all-clear. A census that only prints what it saw cannot
 # answer "would this alarm fire if this branch took 100% of the population?".
+#
+# `not-scheduled` and `not-sampled` are TWO DIFFERENT THINGS and were one state until the
+# recovery path needed to tell them apart. A workflow carrying no `schedule:` is OUTSIDE M4's
+# population — most of this repo's workflows, on every healthy tick. A workflow that DOES
+# carry a cron but whose runs were never listed (it is disabled) is INSIDE the population and
+# UNREAD, which is not the same as healthy. See M4_INDETERMINATE_STATES.
 M4_CENSUS_STATES = (
+    "not-scheduled",
     "not-sampled",
     "no-concluded-run",
     "ingesting",
@@ -324,6 +331,20 @@ M4_CENSUS_STATES = (
     "rejected-zero-jobs",
     "rejected-jobs-unreadable",
 )
+# The census states in which M4 did NOT read the lane's ingestion condition. They are not
+# findings — nothing was measured — but they are not evidence of RECOVERY either, and the
+# alert is one rolling issue for the whole mode: with either of these non-zero an empty
+# finding list means "no lane was OBSERVED rejected", not "the rejected lane recovered".
+# The fail-open path this closes: a rejected lane is disabled (or its newest run has not
+# concluded yet), a healthy sibling keeps the pass alive, M4 reports no findings, and the
+# live alert is closed with nobody having seen the rejected workflow execute anything.
+#
+# HOW A DELIBERATE RETIREMENT RESOLVES, since a hold that nothing can clear is its own bug:
+# delete the workflow file or delete its `schedule:` and the lane leaves M4's population
+# (`not-scheduled`), so the alert closes on the next tick. A lane left DISABLED while still
+# declaring a cron is genuinely unread — the alert is HELD and a maintainer closes it by
+# hand; the tick prints which state held it.
+M4_INDETERMINATE_STATES = ("not-sampled", "no-concluded-run")
 
 
 # ---------------------------------------------------------------------------------
@@ -600,7 +621,12 @@ def find_ingestion_rejections(lanes: list[dict],
 
     for lane in lanes:
         if not lane.get("runs_sampled"):
-            bump("not-sampled")
+            # `in_scope` is exactly m1_scope's verdict HERE: the truncation guard that also
+            # clears it only ever fires on a lane that WAS sampled. So it separates "carries
+            # no cron, outside this mode's population" (the documented gap above) from
+            # "carries a cron and its runs were never listed", which is the disabled lane —
+            # indeterminate, and the one that must not be read as a recovery.
+            bump("not-sampled" if lane.get("in_scope") else "not-scheduled")
             continue
         newest = lane.get("newest_concluded")
         if not newest:
@@ -1016,13 +1042,30 @@ def _apply(action, repo, token, num, mode, body, note):
     return 0
 
 
-def decide(findings, open_issue):
-    """Pure: -> 'upsert' | 'close' | 'noop'. Closing happens ONLY on an explicit
-    recovery (findings empty AND an alert is open); an indeterminate read is a noop, so a
-    transient API failure can never silently close a live alert."""
+# Per-mode census states that make an EMPTY finding list indeterminate rather than a
+# recovery. Keyed rather than global: M1 and M3 read their whole population or the pass
+# fail-louds before it reaches here, so neither has one and neither changes behaviour.
+RECOVERY_BLOCKING_STATES = {MODE_INGESTION: M4_INDETERMINATE_STATES}
+
+
+def recovery_blockers(mode, census):
+    """Pure: -> the sorted, NON-ZERO census states that stop `mode`'s empty finding list from
+    being read as a recovery. An empty list means this tick actually read the population."""
+    return sorted(state for state in RECOVERY_BLOCKING_STATES.get(mode, ())
+                  if census.get(state))
+
+
+def decide(findings, open_issue, blockers=()):
+    """Pure: -> 'upsert' | 'close' | 'noop'. Closing happens ONLY on an explicit recovery
+    (findings empty AND an alert is open AND this tick READ the whole population); an
+    indeterminate read is a noop, so neither a transient API failure nor a lane that went
+    unread can silently close a live alert. `blockers` never suppresses an alarm — a finding
+    is measured evidence and still upserts."""
     if findings:
         return "upsert"
-    return "close" if open_issue else "noop"
+    if open_issue and not blockers:
+        return "close"
+    return "noop"
 
 
 # ---------------------------------------------------------------------------------
@@ -1429,6 +1472,36 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     chk("findings => upsert even when an alert is open", decide([{"x": 1}], 7) == "upsert")
     chk("recovery with an open alert => close", decide([], 7) == "close")
     chk("clean with no alert => noop", decide([], None) == "noop")
+    # AN INDETERMINATE READ IS NOT A RECOVERY. Findings-empty says "nothing was OBSERVED
+    # rejected", and with a lane unread that is not the same claim as "the rejected lane
+    # recovered". The pair is stated both directions so neither row can pass alone.
+    chk("an unread lane HOLDS an open alert — findings-empty is not recovery evidence",
+        decide([], 7, ["not-sampled"]) == "noop")
+    chk("...and the same call with nothing blocking still closes (the hold is not a "
+        "permanent stick)", decide([], 7, []) == "close")
+    chk("a blocker never SUPPRESSES an alarm — a finding is measured evidence and upserts",
+        decide([{"x": 1}], 7, ["not-sampled"]) == "upsert")
+    chk("a blocker with no alert open is still a noop, not a spurious write",
+        decide([], None, ["not-sampled"]) == "noop")
+    # WHICH states block, asserted against the literal names rather than against
+    # M4_INDETERMINATE_STATES — reading the expected value out of the constant the code reads
+    # would be a tautology that stays green whatever that tuple says.
+    _blk = {**{s: 0 for s in M4_CENSUS_STATES}, "ingesting": 3}
+    chk("a fully-read M4 population blocks nothing",
+        recovery_blockers(MODE_INGESTION, _blk) == [])
+    chk("an unsampled scheduled lane blocks M4's recovery",
+        recovery_blockers(MODE_INGESTION, {**_blk, "not-sampled": 1}) == ["not-sampled"])
+    chk("a lane with no concluded run blocks M4's recovery",
+        recovery_blockers(MODE_INGESTION, {**_blk, "no-concluded-run": 1})
+        == ["no-concluded-run"])
+    # THE ROW THAT KEEPS M4 CLOSEABLE AT ALL: this repo's push-only workflows are
+    # `not-scheduled` on every single tick. If that state blocked, the alert could never
+    # close on the live repo and the hold would be indistinguishable from a stuck alarm.
+    chk("an out-of-population lane does NOT block M4's recovery",
+        recovery_blockers(MODE_INGESTION, {**_blk, "not-scheduled": 9}) == [])
+    chk("M1 and M3 have no recovery blockers — their transport is unchanged",
+        recovery_blockers(MODES[0], {"delivering": 1, "not-sampled": 4}) == []
+        and recovery_blockers(MODES[1], {"not-sampled": 4, "no-concluded-run": 2}) == [])
     body = render_body(MODES[1], "o/r", [{"workflow": "a", "run_id": 1, "event": "push",
                                           "age_seconds": 99, "threshold_seconds": 60,
                                           "basis": "floor"}],
@@ -1460,9 +1533,15 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
         MODES == ("M1-cron-firing-deficit", "M3-execution-overrun",
                   "M4-workflow-ingestion-rejected"))
     chk("M4's census names every exit, in order, so the all-clear prints a row per state",
-        M4_CENSUS_STATES == ("not-sampled", "no-concluded-run", "ingesting",
+        M4_CENSUS_STATES == ("not-scheduled", "not-sampled", "no-concluded-run", "ingesting",
                              "approval-gated-with-jobs", "rejected-zero-jobs",
                              "rejected-jobs-unreadable"))
+    chk("the states that hold a recovery are exactly the two M4 never read the lane in",
+        M4_INDETERMINATE_STATES == ("not-sampled", "no-concluded-run"))
+    # A blocker naming a state the census cannot emit is a PERMANENTLY INERT hold: it reads
+    # as implemented and never fires once, which is the fail-open this row exists to prevent.
+    chk("M4's recovery-blocking states are wired to states its census actually emits",
+        set(RECOVERY_BLOCKING_STATES[MODE_INGESTION]) <= set(M4_CENSUS_STATES))
 
     def _sched_run(rid, conclusion, created, status="completed"):
         return {"id": rid, "status": status, "conclusion": conclusion,
@@ -1531,8 +1610,14 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     chk("M4 is quiet on a lane whose newest scheduled run concluded normally, and PLACES it",
         _f == [] and _c == {**_M4_CLEAN, "ingesting": 1})
     _f, _c = _m4({"workflow": "unsampled.yml", "runs_sampled": False}, {})
-    chk("M4 counts an unsampled lane as unsampled — never as healthy",
-        _f == [] and _c == {**_M4_CLEAN, "not-sampled": 1})
+    chk("M4 counts a SCHEDULED lane whose runs were never listed as unsampled — never as "
+        "healthy", _f == [] and _c == {**_M4_CLEAN, "not-sampled": 1})
+    # The other side of that split. A workflow carrying no `schedule:` is not unread, it is
+    # OUTSIDE M4's population — and it is most of this repo on every tick, so collapsing the
+    # two would hold M4's alert open forever (see the recovery rows below).
+    _f, _c = _m4({"workflow": "push-only.yml", "runs_sampled": False, "in_scope": False}, {})
+    chk("M4 counts a lane carrying no `schedule:` as out of its population, NOT as unread",
+        _f == [] and _c == {**_M4_CLEAN, "not-scheduled": 1})
     _f, _c = _m4({"workflow": "fresh.yml", "newest_conclusion": None}, {})
     chk("M4 counts a lane with no concluded run as such — never as healthy",
         _f == [] and _c == {**_M4_CLEAN, "no-concluded-run": 1})
@@ -1617,7 +1702,7 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     # `tempfile` is imported at module scope (the schedule-map rows above use it too). A local
     # `import tempfile` here would rebind the name for the WHOLE function, so the earlier use
     # would raise UnboundLocalError before this line ever ran.
-    def _rc(lanes, live=(), job_counts=None):
+    def _state_path(lanes, live=(), job_counts=None):
         state = {"repo": "o/r",
                  "lanes": [dict(x, schedule_run_times=[
                      t.strftime("%Y-%m-%dT%H:%M:%SZ") for t in x["schedule_run_times"]])
@@ -1626,8 +1711,11 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
                  "job_counts": dict(job_counts or {})}
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
             json.dump(state, fh)
-            path = fh.name
-        return main(["--state-file", path, "--now", "2026-07-28T12:00:00Z", "--dry-run"])
+            return fh.name
+
+    def _rc(lanes, live=(), job_counts=None):
+        return main(["--state-file", _state_path(lanes, live, job_counts),
+                     "--now", "2026-07-28T12:00:00Z", "--dry-run"])
 
     chk("a bad repo slug is fail-loud exit 2",
         main(["--repo", "not-a-slug", "--dry-run"]) == 2)
@@ -1732,6 +1820,53 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
         main(["--state-file", rejected_path, "--now", "2026-07-28T12:00:00Z"])
         chk("a rejected lane upserts the M4 ops-alert, in M4's own slot",
             applied == ["upsert", "noop", "upsert"])
+
+        # THE RECOVERY SIDE, end to end, with an alert ALREADY OPEN — the fail-open path a
+        # pure `decide()` row cannot see. The population is the reviewer's shape: one healthy
+        # sampled lane, which is enough to satisfy run()'s aggregate `any(runs_sampled)`
+        # guard, plus the formerly rejected lane now UNREAD. M4 reports no findings, and
+        # closing on that would retire a live alert with nobody having seen the rejected
+        # workflow execute anything. M1 and M3 DO close on the very same tick, so the exact
+        # list also proves the hold is M4's own and not a dead write path.
+        globals()["_find_open_alert"] = lambda repo, token, mode: (7, False, False)
+        _healthy = _lane(workflow=".github/workflows/healthy.yml", fires=CAP, now=NOW)
+        for _label, _kw in (("a DISABLED lane is never sampled", {"runs_sampled": False}),
+                            ("a lane's newest run has not concluded",
+                             {"newest_conclusion": None})):
+            applied.clear()
+            main(["--state-file",
+                  _state_path([_healthy, _lane(workflow=".github/workflows/dead.yml",
+                                               fires=CAP, now=NOW, **_kw)]),
+                  "--now", "2026-07-28T12:00:00Z"])
+            chk(f"an open M4 alert is HELD, not closed, while {_label} — M1 and M3 close on "
+                f"the same tick", applied == ["close", "close", "noop"])
+        # ANTI-VACUITY, both halves of the population split. The SAME tick with every lane
+        # read closes M4, so the rows above pin the hold rather than a permanently stuck
+        # alert; and a push-only lane (`not-scheduled`, most of this repo on every tick)
+        # must not hold either, or M4's alert could never close on the live repo.
+        for _label, _extra in (
+                ("every lane READ", []),
+                ("a push-only lane carrying no `schedule:`",
+                 [_lane(workflow=".github/workflows/push-only.yml", fires=CAP, now=NOW,
+                        in_scope=False, runs_sampled=False)])):
+            applied.clear()
+            main(["--state-file", _state_path([_healthy] + _extra),
+                  "--now", "2026-07-28T12:00:00Z"])
+            chk(f"...and an open M4 alert DOES close on a tick with {_label}",
+                applied == ["close", "close", "close"])
+        # A hold must never MUTE a measured rejection: this tick carries BOTH an unread lane
+        # and a lane measured rejected, and the alarm still reaches `_apply`.
+        applied.clear()
+        main(["--state-file",
+              _state_path([_healthy,
+                           _lane(workflow=".github/workflows/dead.yml", fires=CAP, now=NOW,
+                                 newest_conclusion="action_required", run_id="77"),
+                           _lane(workflow=".github/workflows/off.yml", fires=CAP, now=NOW,
+                                 runs_sampled=False)],
+                          job_counts={"77": 0}),
+              "--now", "2026-07-28T12:00:00Z"])
+        chk("an unread lane never mutes a measured rejection — M4 still upserts",
+            applied == ["close", "close", "upsert"])
     finally:
         globals()["_find_open_alert"], globals()["_apply"] = _real_find, _real_apply
 
@@ -2072,7 +2207,13 @@ def run(args):
         if hard or soft:
             rc = 1 if hard else rc
             continue
-        action = decide(findings, num)
+        blockers = recovery_blockers(mode, census)
+        if num and not findings and blockers:
+            print(f"::warning::ci-latency: HOLDING the open {mode} alert — "
+                  + ", ".join(f"{state}={census[state]}" for state in blockers)
+                  + ". No lane was observed rejected, but the population was not fully "
+                    "read, so this tick is not evidence of recovery.")
+        action = decide(findings, num, blockers)
         body = render_body(mode, repo, findings, census, now, run_url)
         note = (f"> 🤖 SPARQ agent — `{mode}` is back inside its measured threshold as of "
                 f"`{now:%Y-%m-%dT%H:%M:%SZ}`. Closing this rolling alert.")
