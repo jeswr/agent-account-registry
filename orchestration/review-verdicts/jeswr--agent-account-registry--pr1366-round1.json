@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1366,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4f9fe6bc4f0efa7d3cd723280894fd4bfeba32a5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`worker_pr.provenance_record()` raises `WorkerPrError` for much more than an unsuccessful write: it also raises for malformed identity/head inputs and for a divergent existing ledger/default-branch record. The new handler catches every one of those conditions, reports that \"the write itself did not land\" and that the next run will retry, counts it as `write_failed`, and returns a successful sealed run. In particular, a concurrent divergent ledger record discovered by the write-side CAS probe is a permanent provenance conflict, not a transient write-path failure; retrying cannot resolve it. This makes the bucket and operational outcome misleading and softens conditions that previously failed loudly. The behavioral tests cannot expose the distinction because their stub deliberately aliases `WorkerPrError` to the local `BackfillError` and only raises a synthetic HTTP-write error.",
+    "file": "scripts/backfill-provenance.py",
+    "fix_hint": "Introduce or use a distinct exception that denotes only exhausted/failed registry writes, and catch only that at this call site. Let identity validation and divergent-record/invariant errors remain loud (or classify them explicitly into an appropriate fail-closed human/block bucket). Add a test using the real exception taxonomy that proves a retryable/operational write failure continues the walk while a divergent-record or validation `WorkerPrError` is not converted into `write_failed`.",
+    "severity": "major",
+    "title": "Broad WorkerPrError catch suppresses permanent trust/evidence conflicts"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe population walk now survives an individual exception, and the new counter/seal coverage is internally consistent. However, the caught exception is broader than the new bucket's claimed meaning. `WorkerPrError` also represents fail-closed identity and existing-record conflicts, not only a registry PUT that failed to land. Those permanent evidence conflicts are now mislabeled as retryable write outages and the run exits successfully, so the change is not sound as written.",
+  "verdict": "request_changes"
+ }
+}
