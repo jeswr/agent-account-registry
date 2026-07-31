@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1408,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f35328d8ad1aca6029d7ef1260bbd99edf9e228d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe consolidation preserves both callers' existing retry surfaces: groom retries exactly HTTP 500\u2013599 and no 4xx, while plan-snapshot retries exactly 429, 500, 502, 503, and 504. The plan-snapshot call site continues to route 403 through the dedicated taxonomy before consulting the shared status policy, and the retry attempt bound remains unchanged. The shared policy rejects empty policies, non-error statuses, 403, and the CAS-conflict 409; its full-surface assertions make unintended widening or narrowing observable. Both consumers assert delegation to the shared definitions and run the shared module's self-test, and the new module is enrolled in the repository self-test suite. I found no correctness, soundness, test-validity, or security defect in the diff.",
+  "verdict": "approve"
+ }
+}
