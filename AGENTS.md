@@ -49,6 +49,38 @@ unkillable.
    #756's counted docstring lines as covered, scored a never-called function at 6.2 %, and printed
    *"no code unit is entirely unexecuted"*; #956's reported zero uncovered lines from a mode that
    **cannot emit one**. An instrument that cannot fail has told you nothing.
+
+   ⚠️ **`trace --count` marks a never-executed line by OMITTING the count prefix — NOT with
+   `>>>>>>`** (#1073). This is the named instance of #956's "mode that cannot emit one", and the
+   vacuous detector is the one you would naturally reach for. In a `.cover` file from `python3 -m
+   trace --count --coverdir=<dir>`, an executed line carries a `"%5d: "` prefix and an unexecuted
+   line carries **seven blanks**; the `>>>>>>` marker is `trace --missing` and coverage.py, and
+   stdlib `trace` does not even *compute* the marker set unless `--missing` is passed (`lnotab = {}`
+   otherwise). So `[l for l in cover if l.lstrip().startswith('>>>>>>')]` returns **0 uncovered lines
+   for every file, always** — it read `scripts/park_policy.py` as fully covered by its own
+   `--self-test`, which in fact never executes **71** statement lines.
+
+   The detector that works is **"no count prefix", intersected with statement START lines from the
+   AST** — `stmts = {n.lineno for n in ast.walk(tree) if isinstance(n, ast.stmt)}`, then report `i`
+   where `i in stmts and not re.match(r"\s*\d+:", cover[i-1])`. The intersection is what keeps
+   comments, blank lines and a multi-line statement's continuation lines out of the count. **Subtract
+   docstrings** — they are `ast.Expr` statements that never execute, and leaving them in inflates
+   that same file from 71 to **130** phantom dead lines, which is #756's error with the sign flipped.
+
+   ⚠️ **The probe is what licenses the number — the detector code above does not.** Append a function
+   you never call, re-run the self-test under `trace`, assert its **body** lines come back REPORTED,
+   then restore the pristine file. Assert the **body**, never the `def`: the `def` line executes at
+   import and is always counted `1:`, which is precisely how a function-granular reading certifies a
+   never-called function as covered. **A detector that reports nothing on that probe has not measured
+   your module — discard the run, do not proceed to mutation.**
+
+   Then cross-check against a second instrument instead of trusting one: `--count --missing` marks
+   **83** lines on that same file, agreeing with the AST form on 70. They disagree only where they
+   must — `--missing` counts a multi-line statement's continuation lines where the AST form counts
+   its one start line, and the AST form over-reports `nonlocal`, which compiles to no bytecode.
+   **Non-zero and explainable is the pass condition; exact agreement between the two is not.**
+   (#1073 reported this region as 74 never-executed lines; re-measured with docstrings excluded it is
+   **71** — item 10.)
 2. **Ask FOUR independent questions of every assertion** — none subsumes another, and each found
    holes the others swept past (#941). (a) Does the **call site** recompute or re-wire this
    value? (#937 `Z6`: dropping one argument at the single production call site bound the wrong
