@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4909,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f26659dbfd243272ad642e3f0204a12a8cda6e4f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change consistently corrects the XPath F&O 3.1 section citations in the generator, generated Noir fixture, harness documentation, and README without altering executable semantics. The cited locations match F&O 3.1: op:numeric-divide is 4.2.4, op:numeric-integer-divide is 4.2.5, fn:round is 4.4.4, fn:substring is 5.4.3, and casting to xs:integer is 19.1.2.4. Generator output and the checked-in generated test remain synchronized, and the existing live assertions are unchanged rather than weakened or made vacuous.",
+  "verdict": "approve"
+ }
+}
