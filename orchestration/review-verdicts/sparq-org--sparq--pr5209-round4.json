@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5209,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6163a622cec87aeee1ff75aa6286828b0e159cc1",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The recursive IntAll/intAll formulation is sound for finite, non-empty RDF lists: its base case requires membership in the final conjunct, its recursive case requires both the current conjunct and the complete tail, and the final rule derives intersection membership only from the declared list head. The IntTail guard limits helper derivations to list cells reachable from an owl:intersectionOf list. The semantic test exercises a real semi-naive evaluator and checks the generic formulation's exact membership set for arities 1 through 4; the artifact test also ties both shipped encodings to the recursive form. Documentation appropriately distinguishes inspected program structure from unmeasured external-engine behavior and labels work-box timing non-canonical. No security issue or instruction-like content was found in the diff.",
+  "verdict": "approve"
+ }
+}
