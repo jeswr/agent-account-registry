@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1461,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c8e6b7fe8d2aa6cc0bfb42b3d58c54ba4acbfb6b",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The authorization returned by `live_park_clearable` is a point-in-time timeline result, but `apply_decision` later performs an unconditional `needs:area` removal. There is no compare-and-swap or equivalent verification that the issue revision and latest application event are still the ones on which the machine-owned verdict was based. If a maintainer removes and re-applies `needs:area` in the interval after `issue_timeline_events()` returns and before `edit(..., [\"needs:area\"])`, the edit deletes that newer human hold. The post-condition only checks role consistency, so it neither detects nor restores this trust violation. The end-to-end tests use a static timeline and do not exercise a timeline/ownership change at the mutation seam.",
+    "file": "scripts/retriage.py",
+    "fix_hint": "Bind the deletion to the ownership evidence. Revalidate the live revision and latest application immediately at the mutation seam, and fail without deleting if either changed; because GitHub label edits are not atomic CAS operations, also verify the post-write timeline/revision and restore the label (with a failing outcome) if a newer proven-human application raced the removal. Add an end-to-end test whose ownership view changes from bot-owned to human-owned between planning and edit, asserting that the human hold remains present and the run fails closed.",
+    "severity": "major",
+    "title": "Ownership proof is not bound to the label deletion"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe malformed-permission fail-open from round 1 remains corrected, but the new unpark authority is not bound to the state it mutates. `_apply_cli` reads the issue, later proves the latest `needs:area` application machine-owned, and then deletes the label through an unconditional edit. A maintainer can remove and re-apply the hold after the ownership read but before that edit; the sweep will then delete the newly human-owned hold. Because this is a new major finding after a clean prior round, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
