@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5459,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "af446e7c739448e1bca2f5fa6fa8fdfe54816007",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-two diff remains correct and complete. Both added tests are non-vacuous soundness guards: the inverse-functional-property test distinguishes unequal objects and checks that neither the unavailable contrapositive nor prp-ifp produces unsupported differentFrom/sameAs conclusions, while the reflexive-property test includes a real rdfs:subPropertyOf positive control before checking that the RL-excluded reflexivity rule produces neither self-loops nor a false irreflexivity inconsistency. No correctness, soundness, security, or test-validity defect is apparent. This is materially unchanged from round 1, which also found no issues, so progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
