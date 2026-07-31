@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1461,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "18cb8495d9d99b8d9fd9aec26aafc95a3b709bcb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "is_human_maintainer() treats only a non-object payload as malformed. For an object with a missing or invalid permission field, such as {} or {\"permission\": [\"admin\"]}, read_permission() returns None or the invalid value; park_policy.probe_maintainer() then completes normally and returns False. label_application_machine_owned() consequently classifies a latest event from a human-looking login as machine-owned and the new lane deletes needs:area. This contradicts the function's stated rule that a malformed/unverifiable permission payload must read as human at this deletion-authorizing call site. The self-test covers a malformed top-level list but not malformed/missing permission values, so it does not detect this fail-open.",
+    "file": "scripts/retriage.py",
+    "fix_hint": "Validate that the decoded object contains a permission value in the complete expected domain before returning it. Treat a missing, null, non-string, or unknown permission value as an unverifiable probe (record it and raise), while preserving an explicitly verified non-maintainer permission as the negative result. Add end-to-end refusal tests for at least {} and a non-string/unknown permission value, plus retain the existing valid read negative control.",
+    "severity": "major",
+    "title": "Malformed permission fields fail open as non-maintainer"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new unpark lane is carefully ordered and its timeline ownership checks otherwise fail closed, but the collaborator-permission adapter does not validate the permission field. A malformed successful GitHub response can therefore turn an unverifiable human actor into a non-maintainer and authorize removal of the park. Because this is the trust decision that permits a needs:* gate to be crossed, the change is not safe to approve yet.",
+  "verdict": "request_changes"
+ }
+}
