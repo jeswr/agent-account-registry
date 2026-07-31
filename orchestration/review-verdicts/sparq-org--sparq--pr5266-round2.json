@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5266,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "65dfb3c8f52c93f6a945786cf36e057d340aba45",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. PublicGrant::validate_structure now centralizes the in-memory invariants also enforced after decoding, and wrap_capability invokes it before encoding or encryption. The wire-only canonicality checks remain correctly confined to decode_from because signing_entries itself canonicalizes authority encoding and omits an empty extra-branch field. The new real-path regression test covers unsupported suite, inverted validity, invalid epoch ceiling, non-canonical branch scope, and a valid wrap/unwrap baseline, so the successful-wrap-is-openable invariant is no longer vacuous. No correctness, soundness, security, or test-validity issues remain in the supplied diff.",
+  "verdict": "approve"
+ }
+}
