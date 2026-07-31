@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5380,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d9a39872b237f330842c21835682e88a0048639e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The module docs and always-compiled `VerifiedCredentials` docs link to `VerifiedCredentials::admit_data_integrity`, but that method exists only under `cfg(feature = \"acp-vc\")`. With the feature off (the default and an explicitly required supported state), rustdoc cannot resolve these intra-doc links. Similar unconditional links appear in `lib.rs`. This is the feature-gated intra-doc-link failure class called out by the repository's gates.",
+    "file": "crates/sparq-solid/src/credentials.rs",
+    "fix_hint": "Make feature-neutral prose use code formatting rather than an intra-doc link, or gate the linked paragraphs/doc attributes with `cfg(feature = \"acp-vc\")`. Check both default-feature-off docs and `--all-features` docs after updating every unconditional link to the gated method/type.",
+    "severity": "major",
+    "title": "Feature-off rustdoc links target a nonexistent method"
+   },
+   {
+    "body": "`credential_subject` returns the first triple with the `credentialSubject` predicate anywhere in the signed graph. It neither anchors that predicate to a specific credential node nor rejects multiple distinct subjects. RDFC verification canonicalizes the graph, so the same valid signed triples can be presented in a different slice order and cause a different subject to be selected and credited. On an authorization boundary, ambiguous subject binding must fail closed rather than depend on caller-controlled input order. The current tests cover one subject only and do not expose this.",
+    "file": "crates/sparq-solid/src/credentials.rs",
+    "fix_hint": "Define and enforce an unambiguous credential root/subject model (for example, require exactly one distinct credentialSubject for the admitted credential and reject zero or multiple subjects), then add a test with two distinct credentialSubject triples that presents the same signed graph in both orders and confirms deterministic rejection rather than granting either agent.",
+    "severity": "major",
+    "title": "Credential subject binding is ambiguous and presentation-order dependent"
+   }
+  ],
+  "progress": null,
+  "summary": "The fail-closed ACP rule path and its end-to-end tests are substantive, but the new always-compiled public API contains intra-doc links to an item that does not exist when the default-off `acp-vc` feature is disabled. That violates the required feature-off documentation/build state. The verifier also selects the first credentialSubject predicate anywhere in the signed triple set, without identifying the credential node or rejecting ambiguity; because RDFC signatures are order-independent, callers can reorder a valid multi-subject presentation and change which agent receives the holding. Both issues should be fixed before approval.",
+  "verdict": "request_changes"
+ }
+}
