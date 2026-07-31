@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4948,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "423ecf5e1d99617c9514db8bacc6f6d5133af5fd",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The module reduces the check to sigma = sum_i lambda_i(delta'_i - alpha*delta_i) and says Delta_v=0 means \"not changing the answer.\" That is valid only for one checked product. malicious_secure_equal_batch checks a random linear combination, so the actual shifts also carry per-product challenge factors chi_j. Multiple nonzero product shifts can have sum_j chi_j Delta_v,j=0 while changing individual opened products and equality bits. Such cancellation should be unlikely when deviations are fixed before an unpredictable challenge, but that is a separate 1/p/Fiat-Shamir argument (and grinding residual), not a consequence of alpha secrecy. The new <=t tests exercise only one product at a time, so they do not pin the load-bearing all-pairs single-sigma claim.",
+    "file": "crates/sparq-mpc/src/auth_equal.rs",
+    "fix_hint": "State the batched equation with both recombination weights and Fiat-Shamir coefficients, and separate the two failure cases: nonzero aggregate value shift requires forging against alpha, while a zero aggregate shift with nonzero per-product shifts requires a random-linear-combination collision. Give the resulting bound (including the documented Fiat-Shamir/grinding scope) without saying aggregate zero implies unchanged answers. Add a production-path batch adversarial test with at least two products and <=t-party in-resharing deviations that would alter individual verdicts if accepted, and a mutation/witness showing the test fails when challenge binding or the batch check is removed.",
+    "severity": "major",
+    "title": "The malicious-security argument omits cross-pair cancellation in the batched MAC check"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 is improving: the two prior findings about modeling a <=t-party attacker are substantially addressed by the new in-resharing deviation hook, the clearly separated corrupt-dealer tests, and the share-level single-product argument. One load-bearing gap remains in the advertised batched API. The proof in auth_equal.rs drops the batch challenge coefficients and incorrectly equates a zero aggregate value shift with an unchanged answer. For a batch, distinct product shifts can cancel in the random linear combination while individual equality bits change; security then depends on the Fiat-Shamir random-combination bound, not solely on secrecy of alpha. The implementation may still have the intended bound, but the stated proof and adversarial tests do not establish the public single-sigma batch claim as written.",
+  "verdict": "request_changes"
+ }
+}
