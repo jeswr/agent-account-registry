@@ -52,16 +52,6 @@
   },
   {
    "account": "51bde6688e140866",
-   "claim_id": "d81674f48ac242749d22133b45c3feef",
-   "holder": "fix:sparq-org/sparq#5357@30673725273.1",
-   "package": "sparq-canon",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785541533,
-   "expires_at": 1785547833
-  },
-  {
-   "account": "51bde6688e140866",
    "claim_id": "01436c254d314ff3952737e0f2ecbd7d",
    "holder": "fix:sparq-org/sparq#5409@30673731906.1",
    "package": "sparq-vectors",
