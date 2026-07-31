@@ -1741,13 +1741,12 @@ jobs:
           mkdir -p "$WORKER_ROOT"
           bash registry/scripts/worker-live.sh publish
 
-      # [issue #33] THE GATE-FAILED LANE. A failed gate used to discard the model's completed work
-      # outright: the `pr` step is skipped, the run ends, and the only surviving copy of the diff was
-      # the 1-day pre-gate bundle artifact that nothing ever looks at. The next attempt then restarts
-      # from scratch and re-pays the full model cost for work that may have been one clippy warning
-      # from green, and the evidence needed to diagnose a systematic gate failure is gone.
+      # [issue #33] THE GATE-FAILED LANE — DIAGNOSTIC RETENTION ONLY. A failed gate used to discard
+      # the model's completed work outright: the `pr` step is skipped, the run ends, and the only
+      # surviving copy of the diff was the 1-day pre-gate bundle artifact that nothing ever looks at,
+      # so the evidence needed to diagnose a systematic gate failure expired unread.
       #
-      # So the work is PRESERVED instead of published: the same digest-verified bundle is
+      # So the work is RETAINED instead of published: the same digest-verified bundle is
       # reconstructed on the same pre-gate base, and pushed to a ref in the `sparq-agent/gate-failed/`
       # namespace. NO pull request of any kind is opened from it — not draft, not ready — and that is
       # structural rather than a promise: the preserved ref does NOT match the
@@ -1757,10 +1756,27 @@ jobs:
       # from the bundle's OWN recorded branch and refuses any other value, so this step cannot be
       # re-pointed at the publishable branch by editing the workflow alone.
       #
-      # Gated on exactly what the `pr` step is gated on, minus the gate verdict and inverted: a
-      # VERIFIED bundle plus the pre-publish live-trust re-check's positive attestation. A push is a
-      # write to the target repository, so a drifted (closed, rewritten, human-parked, superseded)
-      # issue must not receive one either.
+      # ⚠️ SCOPE: NOTHING CONSUMES THIS REF AUTOMATICALLY (review round 1 of #1446). The next attempt
+      # still checks out the default branch and re-runs the model from scratch; the fix loop only
+      # ever operates on an existing pull request's head. This lane buys a HUMAN a durable copy of
+      # the failing tree — it does not resume anything and it does not avoid re-paying model cost.
+      # An automated recovery consumer (discovery + SHA/base binding + cross-run/issue refusal) is
+      # deliberately out of scope here and is filed separately; do not document this as resumable
+      # until that consumer exists and is tested end to end.
+      #
+      # THE GATE MUST HAVE ACTUALLY RUN AND ACTUALLY FAILED. `== 'failure'` is exact on purpose:
+      # `gate_outcome` is `steps.gate.outcome` from the worker job, and the gate step carries an
+      # implicit `success()`, so a failed toolchain setup — or any earlier step failing between the
+      # PRE-gate bundle seal and the gate — leaves a perfectly valid bundle with the gate SKIPPED.
+      # Under a `!= 'success'` test (and likewise for an empty/cancelled outcome) that absent verdict
+      # would read as a gate failure and this step would mint a write token and push candidate
+      # content the policy-selected gate never judged at all. A missing verdict is not a verdict:
+      # anything other than a recorded `failure` performs NO target write on this lane.
+      #
+      # Otherwise gated on exactly what the `pr` step is gated on: a VERIFIED bundle plus the
+      # pre-publish live-trust re-check's positive attestation. A push is a write to the target
+      # repository, so a drifted (closed, rewritten, human-parked, superseded) issue must not
+      # receive one either.
       #
       # `continue-on-error`: preservation is a best-effort salvage of a run that has ALREADY failed.
       # It must never become the terminal signal for that run or mask the real cause — the gate's own
@@ -1768,7 +1784,7 @@ jobs:
       # preservation leaves exactly the (deferred) outcome this run had before.
       - name: Preserve the gate-FAILED diff on a non-publishable branch (no pull request)
         id: preserve
-        if: ${{ needs.worker.outputs.gate_outcome != 'success' && steps.verify.outcome == 'success' && steps.republish-trust.outcome == 'success' && steps.republish-trust.outputs.verified != '' && steps.republish-trust.outputs.verified == needs.worker.outputs.verifier_sha256 }}
+        if: ${{ needs.worker.outputs.gate_outcome == 'failure' && steps.verify.outcome == 'success' && steps.republish-trust.outcome == 'success' && steps.republish-trust.outputs.verified != '' && steps.republish-trust.outputs.verified == needs.worker.outputs.verifier_sha256 }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.app-token-pub.outputs.token }}

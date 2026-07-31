@@ -1577,6 +1577,83 @@ _workflow_step_run() {
     }'
 }
 
+# PURE (self-tested): EVALUATE a workflow step's `if:` expression against a supplied context and
+# print `fires`, `skipped`, or `unparseable`. The context is a JSON object mapping the full context
+# path (`needs.worker.outputs.gate_outcome`, `steps.verify.outcome`, …) to the string value the
+# runner would expand it to.
+#
+# The grammar is DELIBERATELY TINY: `${{ … }}` wrapping a flat `&&` conjunction of
+# `<name> == <operand>` / `<name> != <operand>`, where `<operand>` is a single-quoted literal or
+# another context name. Anything else — `||`, `!`, parentheses, a function call (`always()`,
+# `success()`), a bare `true`/`false`, or a name the caller supplied no value for — prints
+# `unparseable`, so the caller's assertion goes RED rather than silently passing. That refusal IS
+# the mutation detector: `… && false` and `… || true` both stop parsing.
+#
+# [#1446 review r1] WHY THIS EXISTS. Substring assertions on an `if:` are exactly the vacuity
+# AGENTS.md item 6 names: `grep -Fc "gate_outcome != 'success'"` is equally satisfied by
+# `… != 'success' || true`, and — worse — a containment check cannot distinguish a gate that RAN
+# and FAILED from one that never ran at all (a skipped step expands to `skipped`; an absent job
+# output to the empty string). A step that writes to the target repo must be testable for the
+# values it has to REFUSE, which means evaluating the whole condition, not grepping a clause.
+#
+# NOTE the asymmetry that keeps this fail-closed: GitHub additionally wraps a status-function-free
+# `if:` in an implicit `success()`, which this evaluator does NOT model. So `fires` here is a
+# NECESSARY condition for the real step to run, never a sufficient one — a `skipped` verdict is
+# therefore a sound proof that the real step does not run, which is the direction the trust
+# assertions need.
+_workflow_if_fires() {
+  local expr="$1" ctx="$2"
+  python3 - "$expr" "$ctx" <<'PY'
+import json, re, sys
+
+expr = sys.argv[1].strip()
+
+
+def refuse():
+    print("unparseable")
+    raise SystemExit(0)
+
+
+try:
+    ctx = json.loads(sys.argv[2])
+except Exception:
+    refuse()
+if not isinstance(ctx, dict):
+    refuse()
+
+m = re.fullmatch(r"\$\{\{(.+)\}\}", expr, re.S)
+if not m:
+    refuse()
+body = " ".join(m.group(1).split())
+
+NAME = r"[A-Za-z0-9_.\-]+"
+fires = True
+# ONE refusal guard, deliberately. The `fullmatch` (not `match`) below is the whole grammar: a term
+# with anything before or after the comparison — `|| true`, `&& false`, `always()`, a parenthesis, a
+# leading `!` — fails it and is refused. An earlier revision ALSO pre-scanned the body for `[|()!]`;
+# that was a second copy of this same guard, and AGENTS.md item 4 is explicit that duplicated guards
+# make each copy individually unkillable (neutering the pre-scan alone left the suite green, because
+# `fullmatch` still refused every input it was meant to catch). One killable guard beats two.
+for term in body.split("&&"):
+    t = re.fullmatch(rf"\s*({NAME})\s*(==|!=)\s*('[^']*'|{NAME})\s*", term)
+    if not t:
+        refuse()
+    lhs, op, rhs = t.groups()
+    if lhs not in ctx:
+        refuse()
+    if rhs.startswith("'"):
+        rhs_value = rhs[1:-1]
+    elif rhs in ctx:
+        rhs_value = ctx[rhs]
+    else:
+        refuse()
+    equal = ctx[lhs] == rhs_value
+    fires = fires and (equal if op == "==" else not equal)
+
+print("fires" if fires else "skipped")
+PY
+}
+
 # PURE (self-tested): print the JOB a workflow step belongs to, selected by its exact `id:` — the
 # job key (a two-space-indented mapping key) most recently seen above it. [#568 + #575] Which JOB a
 # trust-sensitive step lives in is now itself a security property: the pre-publish re-check is sound
@@ -2538,16 +2615,26 @@ publish_pr() {
 # does not match `^sparq-agent/issue-<N>-…`, which is the pattern every consumer of a worker head
 # keys on — worker-pr.select_reconcilable_pr / reconcile_provenance, the review enumerator, groom's
 # WORKER_BRANCH. So preserved work is structurally invisible to the publish/review/arm machinery: it
-# cannot be reconciled into a provenance record, enumerated for review, or armed. It is a salvage
-# artefact for the fix loop and for a human diagnosing a systematic gate failure, nothing else.
+# cannot be reconciled into a provenance record, enumerated for review, or armed. It is a DIAGNOSTIC
+# artefact for a human debugging a systematic gate failure, nothing else — the same invisibility
+# means no automated path reads it either (see preserve_gate_failed's scope note).
 _gate_failed_ref() {
   local branch=$1
   [[ "$branch" =~ ^sparq-agent/issue-[1-9][0-9]*-[A-Za-z0-9._-]+$ ]] || return 1
   printf 'sparq-agent/gate-failed/%s' "${branch#sparq-agent/}"
 }
 
-# PHASE 2c (publisher job, WITH the token, gate FAILED): preserve the completed model diff instead
-# of discarding it (issue #33).
+# PHASE 2c (publisher job, WITH the token, gate FAILED): retain the completed model diff for
+# diagnosis instead of discarding it (issue #33).
+#
+# ⚠️ SCOPE — DIAGNOSTIC RETENTION, NOT RESUMPTION (review round 1 of #1446). Nothing reads the ref
+# this writes. `run_model` always starts from a fresh default-branch checkout and mints a new
+# per-attempt publishable branch, and the fix loop only ever operates on an existing pull request's
+# head, so a later attempt does NOT continue from here and does NOT save model cost. What this buys
+# is that the failing tree still EXISTS after the run — the pre-gate bundle artifact expires in a
+# day and nothing reads it. Building the recovery consumer (deliberate discovery of the right prior
+# ref, SHA/base binding, refusal of a ref from another issue/run/base) is separate, unbuilt work; do
+# not describe this lane as resumable until that exists and is tested end to end.
 #
 # Same reconstruction as publish_pr — same digest-verified bundle, same pre-gate base, same
 # hooks-neutralised `git apply` — and then it STOPS. It pushes the branch and opens NO pull request
@@ -2607,18 +2694,19 @@ preserve_gate_failed() {
     die 'digest-verified patch did not apply cleanly to the pre-gate base'
   [[ -z "$(git status --porcelain=v1 -- .beads 2>/dev/null)" ]] || die 'refusing to preserve .beads changes'
   # NO `git diff --cached --check` here, deliberately. On the publish lane a whitespace error is a
-  # quality defect in something about to be proposed for merge; here it is one more thing the fix
-  # loop may need to SEE. Refusing to preserve a diff because of trailing whitespace would discard
-  # exactly the failing state this lane exists to keep.
+  # quality defect in something about to be proposed for merge; here it is one more thing the human
+  # reading this branch may need to SEE. Refusing to retain a diff because of trailing whitespace
+  # would discard exactly the failing state this lane exists to keep.
   [[ -n "$(git diff --cached --name-only)" ]] || die 'reconstructed patch staged no changes'
   # The subject says what this is, in the two places a human will look (branch name and log), and
   # deliberately carries NO closing keyword: nothing here may ever be read as resolving the issue.
   git -c core.hooksPath=/dev/null commit --no-verify \
     -m "chore: PRESERVED gate-FAILED work for issue #$issue_number [$model_alias]" \
-    -m "The policy-selected local gate did NOT pass for this work. This branch is not a proposal:
+    -m "The policy-selected local gate RAN and FAILED for this work. This branch is not a proposal:
 no pull request is opened from it, no provenance is recorded for it, and it must never be merged.
-It exists so the fix loop (or the next attempt) can resume from the failing state instead of
-restarting from scratch. The gate output is in the run that produced this branch." \
+It is a DIAGNOSTIC copy of the failing tree, kept so a human can debug the gate failure after the
+run's artifacts expire. Nothing consumes it automatically: no later attempt or fix run resumes from
+it. The gate output is in the run that produced this branch." \
     -m "Co-Authored-By: $(coauthor_for "$model_alias")"
 
   local head_sha
@@ -2630,7 +2718,7 @@ restarting from scratch. The gate output is in the run that produced this branch
   _git_push_authenticated "$worker_root" "$preserve_branch"
   write_output preserved_branch "$preserve_branch"
   write_output preserved_sha "$head_sha"
-  printf '::notice::gate-FAILED work preserved on branch %s (%s) — NO pull request was opened; the fix loop or the next attempt can resume from it instead of restarting\n' \
+  printf '::notice::gate-FAILED work retained for diagnosis on branch %s (%s) — NO pull request was opened and nothing consumes this ref automatically; check it out by hand to debug the gate failure\n' \
     "$preserve_branch" "$head_sha"
 }
 
@@ -4826,6 +4914,38 @@ WFFIX
   chk "#575: ...and still reads a step's OWN if: (the boundary fix is not a blanket empty)" \
     "$(_workflow_step_if "$wf_fixture" other)" '${{ never() }}'
 
+  # --- [#1446 review r1] THE `if:` EVALUATOR, tested on synthetic expressions before any live
+  # condition is measured through it. Its three verdicts must each be REACHABLE and must each be
+  # driven by the input — an instrument that always says `skipped` would pass every negative row
+  # below it, and one that always says `unparseable` would pass every mutation row. ---
+  local ev_ctx='{"a.b":"failure","c.d":"success","e.f":"x","g.h":"x"}'
+  chk "if-eval: a satisfied conjunction FIRES" \
+    "$(_workflow_if_fires "\${{ a.b == 'failure' && c.d == 'success' }}" "$ev_ctx")" "fires"
+  chk "if-eval: ...and flipping ONE operand's value alone makes it skip (the verdict tracks input)" \
+    "$(_workflow_if_fires "\${{ a.b == 'skipped' && c.d == 'success' }}" "$ev_ctx")" "skipped"
+  chk "if-eval: != is evaluated as inequality, not as a second equality" \
+    "$(_workflow_if_fires "\${{ a.b != 'success' }}" "$ev_ctx"):$(_workflow_if_fires "\${{ a.b != 'failure' }}" "$ev_ctx")" \
+    "fires:skipped"
+  chk "if-eval: a name-vs-NAME comparison reads both sides from the context" \
+    "$(_workflow_if_fires "\${{ e.f == g.h }}" "$ev_ctx"):$(_workflow_if_fires "\${{ e.f == a.b }}" "$ev_ctx")" \
+    "fires:skipped"
+  chk "if-eval: the empty-string literal is a real value (a skipped step's empty output)" \
+    "$(_workflow_if_fires "\${{ e.f != '' }}" "$ev_ctx"):$(_workflow_if_fires "\${{ e.f == '' }}" "$ev_ctx")" \
+    "fires:skipped"
+  # FAIL-CLOSED REFUSALS. Every one of these would otherwise be evaluated as something it is not;
+  # printing `unparseable` makes the caller's row red instead of quietly agreeing with it.
+  local ev_bad
+  for ev_bad in "\${{ a.b == 'failure' || true }}" "\${{ a.b == 'failure' && false }}" \
+                "\${{ !(a.b == 'failure') }}" "\${{ always() && a.b == 'failure' }}" \
+                "\${{ (a.b == 'failure') }}" "\${{ a.b == failure }}" \
+                "\${{ z.z == 'failure' }}" "a.b == 'failure'" ""; do
+    chk "if-eval: refuses what it cannot faithfully evaluate (${ev_bad:-<empty>})" \
+      "$(_workflow_if_fires "$ev_bad" "$ev_ctx")" "unparseable"
+  done
+  chk "if-eval: a non-object / malformed context is refused too (never read as an empty context)" \
+    "$(_workflow_if_fires "\${{ a.b == 'failure' }}" 'not json'):$(_workflow_if_fires "\${{ a.b == 'failure' }}" '[]')" \
+    "unparseable:unparseable"
+
   # --- [issue #575] THE WIRING INVARIANT, asserted on the LIVE workflow. The finding was that the
   # target's own gate ran on the same runner, in the same job, as a token-bearing publisher. These
   # lines are what make a regression to that shape a red tick rather than a silent reopening. ---
@@ -4984,38 +5104,94 @@ WFFIX
   chk "the publish/PR step is ALSO gated on the pre-publish trust re-check (issue #568)" \
     "$(_workflow_step_if "$wf" pr | grep -Fc "steps.republish-trust.outcome == 'success'" || true)" "1"
   # [issue #33] The re-check is deliberately NOT keyed on the gate verdict any more: it now guards
-  # BOTH writes to the target repository — the DRAFT PR (gate green) and the gate-failed
-  # preservation push (gate red) — so keying it on gate success would have left the second lane
+  # BOTH writes to the target repository — the DRAFT PR (gate green) and the gate-failed retention
+  # push (gate ran and failed) — so keying it on gate success would have left the second lane
   # writing from an unre-verified snapshot. Widening WHEN it runs cannot weaken WHAT it decides:
   # the gate verdict still lives on the two consuming steps, asserted as mutually exclusive below,
   # and both of them additionally demand this step's positive attestation.
-  chk "the pre-publish trust re-check is not keyed on the gate verdict (it guards BOTH lanes)" \
-    "$(_workflow_step_if "$wf" republish-trust | grep -Fc "needs.worker.outputs.gate_outcome" || true)" "0"
-  # ...and only on a bundle that VERIFIED, so a refused artifact aborts before the re-check spends
-  # an API round trip on an issue whose work can never be published anyway. This row is also what
-  # keeps the zero above honest: the extractor demonstrably reads a NON-EMPTY condition for this
-  # step, so the absence it reports is an absence in a real `if:`.
-  chk "the pre-publish trust re-check requires the bundle verification to have passed" \
-    "$(_workflow_step_if "$wf" republish-trust | grep -Fc "steps.verify.outcome == 'success'" || true)" "1"
+  #
+  # [#1446 review r1] Pinned as the COMPLETE expression rather than as a clause count. The old pair
+  # of rows (a `grep -Fc … gate_outcome` of 0, plus a containment check keeping that zero honest)
+  # could not see an added disjunct — `steps.verify.outcome == 'success' || true` satisfies both and
+  # runs the re-check on an unverified bundle. Exact match is one row and admits no such mutant.
+  chk "the pre-publish trust re-check's COMPLETE if: is pinned: verified bundle only, no gate verdict" \
+    "$(_workflow_step_if "$wf" republish-trust)" "\${{ steps.verify.outcome == 'success' }}"
 
-  # --- [issue #33] The gate-FAILED preservation lane, asserted on the LIVE workflow. A failed gate
+  # --- [issue #33] The gate-FAILED retention lane, asserted on the LIVE workflow. A failed gate
   # discarded the completed model diff outright (the `pr` step skipped, nothing else looking at the
-  # 1-day pre-gate artifact), so the next attempt re-paid the whole model cost. The salvage lane is
+  # 1-day pre-gate artifact), so a systematic gate failure lost its evidence. The retention lane is
   # a SIBLING of the publish step under the same guards — verified bundle, live-trust attestation —
-  # with the gate verdict INVERTED, and it never opens a pull request. ---
-  chk "the gate-failed preservation step fires exactly when the gate did NOT pass" \
-    "$(_workflow_step_if "$wf" preserve | grep -Fc "needs.worker.outputs.gate_outcome != 'success'" || true)" "1"
-  # MUTUAL EXCLUSION as a pair, read off both steps at once: whichever way the gate went, exactly
-  # one of the two lanes is eligible. A future edit that drops either conjunct flips this row.
-  chk "...and the publish lane and the preservation lane are mutually exclusive on that verdict" \
-    "$(_workflow_step_if "$wf" pr | grep -Fc "needs.worker.outputs.gate_outcome == 'success'" || true):$(_workflow_step_if "$wf" preserve | grep -Fc "needs.worker.outputs.gate_outcome == 'success'" || true)" \
-    "1:0"
-  # The preservation push is a WRITE to the target, so it carries the publish step's full trust
-  # gating: a verified bundle plus the re-check's positive attestation, non-empty and equal to the
-  # pre-model pin. Dropping any one of the three flips this row red.
-  chk "the preservation push carries the SAME trust gating as the publish step (all three clauses)" \
-    "$(_workflow_step_if "$wf" preserve | grep -Fc "steps.verify.outcome == 'success'" || true):$(_workflow_step_if "$wf" preserve | grep -Fc "steps.republish-trust.outcome == 'success'" || true):$(_workflow_step_if "$wf" preserve | grep -Fc "steps.republish-trust.outputs.verified != ''" || true):$(_workflow_step_if "$wf" preserve | grep -Fc "steps.republish-trust.outputs.verified == needs.worker.outputs.verifier_sha256" || true)" \
-    "1:1:1:1"
+  # keyed on the gate having RUN and FAILED, and it never opens a pull request.
+  #
+  # [#1446 review r1] These rows are EVALUATED, not grepped. The first revision asserted
+  # `grep -Fc "gate_outcome != 'success'"`, which (a) positively encoded a real widening — a
+  # toolchain step failing after the pre-gate seal SKIPS the gate, and `skipped != 'success'`, so an
+  # absent verdict would have minted a write token and pushed content the gate never judged — and
+  # (b) is satisfied verbatim by `… != 'success' || true`. Both are AGENTS.md item 6. So: pin the
+  # COMPLETE normalized expression, then evaluate it against the outcomes it must refuse. ---
+  local gf_if pub_if
+  gf_if=$(_workflow_step_if "$wf" preserve)
+  pub_if=$(_workflow_step_if "$wf" pr)
+  # EXACT MATCH on the whole condition — not containment. Any appended disjunct, any dropped or
+  # reordered conjunct, any relaxed comparison is a different string and flips this row. The
+  # expected value is written out here literally, so it comes from this test rather than from the
+  # file under test (AGENTS.md item 2b).
+  chk "#33 (LIVE): the retention lane's COMPLETE if: is pinned exactly (no appended disjunct)" \
+    "$gf_if" \
+    "\${{ needs.worker.outputs.gate_outcome == 'failure' && steps.verify.outcome == 'success' && steps.republish-trust.outcome == 'success' && steps.republish-trust.outputs.verified != '' && steps.republish-trust.outputs.verified == needs.worker.outputs.verifier_sha256 }}"
+  chk "#33 (LIVE): ...and the publish lane's COMPLETE if: is pinned exactly too" \
+    "$pub_if" \
+    "\${{ needs.worker.outputs.gate_outcome == 'success' && steps.republish-trust.outcome == 'success' && steps.republish-trust.outputs.verified != '' && steps.republish-trust.outputs.verified == needs.worker.outputs.verifier_sha256 }}"
+  # Now EVALUATE both, against a context in which every non-gate clause is satisfied, so the only
+  # thing moving between rows is the gate verdict itself. `_gf_ctx <gate_outcome> [verify]
+  # [recheck] [attested] [pinned]` — every parameter defaults to the value that SATISFIES its
+  # clause, so each falsification row below moves exactly one input.
+  local gf_outcome
+  _gf_ctx() {
+    printf '{"needs.worker.outputs.gate_outcome":"%s","steps.verify.outcome":"%s","steps.republish-trust.outcome":"%s","steps.republish-trust.outputs.verified":"%s","needs.worker.outputs.verifier_sha256":"%s"}' \
+      "$1" "${2-success}" "${3-success}" "${4-attested-digest}" "${5-attested-digest}"
+  }
+  chk "#33 (LIVE): a gate that RAN and FAILED is the one verdict that reaches the retention push" \
+    "$(_workflow_if_fires "$gf_if" "$(_gf_ctx failure)")" "fires"
+  # THE FINDING. Each of these is a gate verdict that is NOT a failure: the gate step was skipped
+  # (an earlier step — e.g. the toolchain setup that sits between the pre-gate bundle seal and the
+  # gate — failed, so the gate's implicit success() skipped it), cancelled, or the job output never
+  # materialised at all. A valid bundle exists in every one of them. None may write to the target.
+  for gf_outcome in '' skipped cancelled success; do
+    chk "#33 (LIVE): gate_outcome='${gf_outcome:-<empty>}' performs NO target write on the retention lane" \
+      "$(_workflow_if_fires "$gf_if" "$(_gf_ctx "$gf_outcome")")" "skipped"
+  done
+  # MUTUAL EXCLUSION, evaluated rather than grepped: on a genuine gate failure exactly the retention
+  # lane is eligible, on a green gate exactly the publish lane, and on a MISSING verdict neither.
+  chk "#33 (LIVE): the two lanes are mutually exclusive (failure -> retain only, success -> publish only)" \
+    "$(_workflow_if_fires "$gf_if" "$(_gf_ctx failure)")/$(_workflow_if_fires "$pub_if" "$(_gf_ctx failure)"):$(_workflow_if_fires "$gf_if" "$(_gf_ctx success)")/$(_workflow_if_fires "$pub_if" "$(_gf_ctx success)")" \
+    "fires/skipped:skipped/fires"
+  chk "#33 (LIVE): ...and a SKIPPED gate makes NEITHER lane eligible (no lane is the default)" \
+    "$(_workflow_if_fires "$gf_if" "$(_gf_ctx skipped)")/$(_workflow_if_fires "$pub_if" "$(_gf_ctx skipped)")" \
+    "skipped/skipped"
+  # The retention push is a WRITE to the target, so every non-gate clause of the publish step's
+  # trust gating is load-bearing here too — proven by FALSIFYING each one in turn rather than by
+  # counting substrings. Deleting any one conjunct from the workflow flips its row from skipped.
+  chk "#33 (LIVE): an unverified bundle blocks the retention push" \
+    "$(_workflow_if_fires "$gf_if" "$(_gf_ctx failure failure)")" "skipped"
+  chk "#33 (LIVE): a failed live-trust re-check (drifted issue) blocks the retention push" \
+    "$(_workflow_if_fires "$gf_if" "$(_gf_ctx failure success failure)")" "skipped"
+  chk "#33 (LIVE): an EMPTY attestation blocks it (a skipped re-check attests nothing)" \
+    "$(_workflow_if_fires "$gf_if" "$(_gf_ctx failure success success '' '')")" "skipped"
+  chk "#33 (LIVE): an attestation that does not match the PRE-MODEL pin blocks it" \
+    "$(_workflow_if_fires "$gf_if" "$(_gf_ctx failure success success attested-digest other-digest)")" \
+    "skipped"
+  # INERTING MUTANTS on the live condition (AGENTS.md item 3: delete a guard, and separately make it
+  # conditionally inert, in a non-crashing form). Both mutants leave every substring a `grep -Fc`
+  # row looks for intact — `|| true` re-opens the lane for a gate that never ran, `&& false` kills
+  # it entirely — and the evaluator refuses both, so the rows above go red rather than staying
+  # green over a widened or dead lane.
+  local gf_body=${gf_if#\$\{\{}
+  gf_body=${gf_body%\}\}}
+  chk "#33 (LIVE): an appended '|| true' is DETECTED, not waved through as it would be by a grep" \
+    "$(_workflow_if_fires "\${{$gf_body || true }}" "$(_gf_ctx skipped)")" "unparseable"
+  chk "#33 (LIVE): an appended '&& false' is DETECTED too (the lane made inert)" \
+    "$(_workflow_if_fires "\${{$gf_body && false }}" "$(_gf_ctx failure)")" "unparseable"
   # It must call the self-tested subcommand — the one proven above to make no `gh` call at all —
   # and NOT an inline reconstruction no self-test can reach.
   chk "the preservation step runs through the self-tested subcommand (not an inline push)" \
@@ -7215,11 +7391,12 @@ HOOK
     "$(git -C "$wpub2" rev-parse HEAD)" "$wbase"
 
   # ================================================================================================
-  # ISSUE #33 — a FAILED gate must not discard the completed model diff. The same fixtures, driven
-  # through the preservation lane against a REAL bare remote, so the push is observed rather than
-  # inferred from a failure to push. Two properties carry this lane: what it WRITES (the salvage
-  # branch, in the gate-failed namespace) and what it must NEVER write (the publishable branch, or
-  # any pull request).
+  # ISSUE #33 — a FAILED gate must not discard the completed model diff; it must RETAIN it for
+  # diagnosis (nothing consumes the ref automatically — see preserve_gate_failed's scope note). The
+  # same fixtures, driven through the retention lane against a REAL bare remote, so the push is
+  # observed rather than inferred from a failure to push. Two properties carry this lane: what it
+  # WRITES (the diagnostic branch, in the gate-failed namespace) and what it must NEVER write (the
+  # publishable branch, or any pull request).
   # ================================================================================================
   # The pure ref derivation first — every refusal arm against inputs that would otherwise look
   # plausible, so the namespace claim below cannot hold vacuously.
@@ -7308,6 +7485,14 @@ GFGH
   chk "#33: ...and the whole message uses no closing keyword (never auto-closes the issue)" \
     "$(git -C "$gfremote" log -1 --format='%B' "refs/heads/$gfref" | grep -cEi '\b(close[sd]?|fix(e[sd])?|resolve[sd]?) #[0-9]+' || true)" \
     "0"
+  # [#1446 review r1] ...and it must not OVERSTATE what the branch is for. The first revision's
+  # message told the reader "the fix loop (or the next attempt) can resume from the failing state",
+  # which is false: no discovery, checkout or base-binding path feeds this ref back into `run_model`
+  # or the fix loop, so a human who believes it waits for a resume that never comes. The message a
+  # future maintainer reads on the branch itself must carry the disclaimer, not just the README.
+  chk "#33: the message states nothing consumes the branch (no false resume promise on the ref)" \
+    "$(git -C "$gfremote" log -1 --format='%B' "refs/heads/$gfref" | grep -Fc 'Nothing consumes it automatically' || true)" \
+    "1"
   chk "#33: NOT ONE gh call was made on the preservation lane (no PR, draft or otherwise)" \
     "$(wc -l < "$gfcap" | tr -d ' ')" "0"
   # The emptiness above is only evidence if the recorder works: prove the fixture logs a real call.
@@ -7660,8 +7845,9 @@ case "${1:-}" in
   verify-bundle) verify_bundle ;;
   publish) publish_pr ;;
   # issue #33: the gate-FAILED lane of the same publisher — reconstruct and PUSH the completed diff
-  # to the non-publishable `sparq-agent/gate-failed/` namespace so the fix loop can resume from it.
-  # Never opens a pull request.
+  # to the non-publishable `sparq-agent/gate-failed/` namespace so a human can still debug the gate
+  # failure after the run's artifacts expire. Never opens a pull request, and nothing reads the ref
+  # it writes: this is diagnostic RETENTION, not resumption (see preserve_gate_failed's scope note).
   preserve-gate-failed) preserve_gate_failed ;;
   review) run_review ;;
   fix) run_fix ;;
