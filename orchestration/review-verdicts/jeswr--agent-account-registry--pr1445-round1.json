@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1445,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d9809d6ca9f22fb8bb2cf4ad827b06e0ecb4cb67",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The diff only adds this script. No workflow invokes it, and repository search finds no reference to `ingestion-detector.py`; it is also absent from `scripts/selftest-suite.txt`. Therefore no cron or other live path will run `main()`, and a refused workflow will still produce no alarm. This leaves the headline behavior entirely unreachable. The repository already runs `scripts/ci-latency-alert.py` from `groom.yml` and that script has an ingestion-rejection mode, but this new implementation is not wired into that path either.",
+    "file": "scripts/ingestion-detector.py",
+    "fix_hint": "Connect the detector to an independently running scheduled workflow (with the required checkout, `gh` authentication, permissions, and an alert-delivery path), and enroll its self-test in the gate. Add seam assertions that fail if the invocation or required flags are removed or made conditionally inert. Alternatively, implement the intended behavior in the existing invoked ingestion-alert path rather than adding an unreferenced second detector.",
+    "severity": "blocker",
+    "title": "Detector has no production invocation"
+   },
+   {
+    "body": "`check()` catches every `RuntimeError` from `latest_completed()`, logs only a warning, and continues. If authentication, permissions, the repository name, or the runs API is broken for every workflow, it returns `([], [])`; `main()` then prints `checked 0, rejected 0` and exits 0. The self-test explicitly locks in this fail-open behavior. A monitoring control cannot distinguish complete loss of evidence from a healthy fleet, and the existing repository detector explicitly refuses an empty sampled population for this reason. `job_count()` failures are inconsistently allowed to abort nonzero, so skipping runs-list failures is not needed to preserve a loud failure mode.",
+    "file": "scripts/ingestion-detector.py",
+    "fix_hint": "Track read failures and fail nonzero when any required lane cannot be evaluated, or at minimum when the checked population is empty/incomplete according to an explicit policy. Keep diagnostic warnings, but do not return the same successful status as an all-clear. Add tests for all-reads-fail and partial-read-fail exit behavior through `main()`.",
+    "severity": "major",
+    "title": "Total API blindness exits successfully"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe detector is not connected to any production or gate execution path, so the stated detection capability is not delivered. Its read-error handling can also turn a completely unobserved fleet into a successful exit, which is unsafe for an alarm on load-bearing workflows. Round 1 has no prior findings to compare.",
+  "verdict": "request_changes"
+ }
+}
