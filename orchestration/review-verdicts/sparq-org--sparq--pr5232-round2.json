@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5232,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1d59962e29b3442d1cf17704309a190b28d2dfdb",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The Docker exclusion premise is now machine-checked against each excluded Dockerfile's actual FROM directives: the declared base must remain in the first-party registry, must not be digest-pinned, and the parsed image list must exactly match the single declared floating base. Focused negative tests cover replacement with a third-party pinned base, editing the allowlist to bless that base, and adding an extra third-party build stage. The coverage checks remain non-vacuous through parser-count and tracked-file assertions. No correctness, soundness, test-validity, or security issue remains in the supplied diff.",
+  "verdict": "approve"
+ }
+}
