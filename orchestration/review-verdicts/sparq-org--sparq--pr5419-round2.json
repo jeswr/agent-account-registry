@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5419,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "14c27a3bfd90a64f364f9d439adea5f168ad5f0f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "ForgedProductShareAtOpen calls shift_value_shares, which adds 1 to every value share and therefore creates a consistent degree-t sharing of m+1. The test and surrounding claims describe this as a single forged product share and as the same attack suffered by the degree-2t semi-honest open at n=2t+1. Those are materially different adversaries and code shapes: one malicious party can alter its own transmitted share, not replace every party's final degree-t share with a coordinated codeword. Since authenticated multiplication has already reduced m to degree t, the test bypasses the real per-party opening behavior and does not demonstrate that the claimed Hole-1 deviation is caught on the production path. Its mutation half only proves the MAC rejects a wholesale inconsistent value/MAC substitution.",
+    "file": "crates/sparq-mpc/src/auth_equal.rs",
+    "fix_hint": "Inject a deviation attributable to one resharing/opening party at the actual transport/open boundary: mutate only that party's contribution/share while preserving all honest parties' messages, then drive auth_equal_verdicts through mac_check_and_open. Show the corresponding unauthenticated construction at the relevant degree accepts or yields the wrong verdict, and show the authenticated production construction aborts specifically on sigma. If the post-reduction degree-t robust open detects the single-share deviation before the MAC, narrow the Hole-1 claim and test to the actual threat the MAC uniquely closes rather than using an all-share codeword substitution.",
+    "severity": "major",
+    "title": "Hole-1 test substitutes the whole codeword instead of forging one party's share"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 is improving: the transcript-order/confidentiality claims are now appropriately narrowed, the probabilistic rerandomization test has been replaced with a deterministic algebraic test plus an explicitly bounded reproducible distribution check, and internal degree-reduction deviations now have real-path mutation tests. One major test-validity issue remains: the advertised Hole-1 single-party forged-product-share attack is modeled by shifting every final degree-t share, which is an all-share consistent-codeword substitution rather than the stated single malicious party deviation. Consequently the test does not establish the headline claim at the real equality open boundary.",
+  "verdict": "request_changes"
+ }
+}
