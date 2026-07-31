@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1366,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9382c85a54447e25e1ae9a2849746a507b687bd6",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-1 exception-taxonomy defect is resolved. The writer now distinguishes divergent existing records from exhausted/unlanded writes, while both remain WorkerPrError subclasses for existing callers. Backfill handles a divergence as a counted, fail-closed needs-human outcome, handles only the exhausted-write class as retryable write-failed, and leaves bare validation/integrity WorkerPrError failures loud. The population seal includes both new terminal paths. The tests use the real exception classes, exercise all three outcomes through the production call site, pin the handlers to the two narrow module-qualified classes, verify continued population processing and draft suppression, and add writer-side class assertions for ledger/default-branch divergence, contention exhaustion, and permanent PUT rejection. I found no remaining correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
