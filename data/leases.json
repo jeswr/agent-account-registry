@@ -62,16 +62,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "83269072a48743cd9904ce98c29c60cd",
-   "holder": "review:jeswr/agent-account-registry#1332@dispatch-30643121901.1",
-   "package": "dispatch",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785512210,
-   "expires_at": 1785516410
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "9853fe3188b342389a58c2a9fc8bcc95",
    "holder": "review:jeswr/agent-account-registry#1402@dispatch-30643121901.1",
    "package": "worker",
