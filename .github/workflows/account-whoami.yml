@@ -50,7 +50,13 @@ jobs:
             *)           echo "token_format=other" ;;
           esac
           echo "provider=anthropic"
-          code=$(curl -s -o /tmp/p.json -w '%{http_code}' --max-time 20 -H "Authorization: Bearer $TOK" -H "anthropic-version: 2023-06-01" https://api.anthropic.com/api/oauth/profile || echo curlfail)
+          # ARGV LEAK (issue #417, the same class issue #195 fixed in scripts/account-usage.py):
+          # a command line is world-readable on the runner (`ps` / /proc/<pid>/cmdline) and is
+          # captured verbatim by diagnostic command capture, so the bearer credential is fed through
+          # curl's STDIN header stream (`-H @-`) and never appears as an argument. The `printf` is a
+          # shell BUILTIN — it forks no process whose argv could carry the token.
+          code=$(printf 'Authorization: Bearer %s\n' "$TOK" \
+            | curl -s -o /tmp/p.json -w '%{http_code}' --max-time 20 -H @- -H "anthropic-version: 2023-06-01" https://api.anthropic.com/api/oauth/profile || echo curlfail)
           echo "http_status=$code"
           # PII policy (README line 4 + locked decision 22a): the raw email NEVER reaches the
           # log — only sha256(email:PROVENANCE_SALT)[:16], the exact account_hash convention
@@ -74,8 +80,9 @@ jobs:
           # email_hash above): the maintainer probes their candidate account privately and
           # hashes the same way to match. No salt => a header COUNT only (fail closed, never
           # raw). `status` is a generic non-identifying enum (allowed/rejected) and stays raw.
-          curl -s -D /tmp/rl.txt -o /dev/null --max-time 20 -X POST https://api.anthropic.com/v1/messages \
-            -H "Authorization: Bearer $TOK" -H "anthropic-version: 2023-06-01" -H "content-type: application/json" \
+          printf 'Authorization: Bearer %s\n' "$TOK" \
+            | curl -s -D /tmp/rl.txt -o /dev/null --max-time 20 -X POST https://api.anthropic.com/v1/messages \
+            -H @- -H "anthropic-version: 2023-06-01" -H "content-type: application/json" \
             -H "anthropic-beta: oauth-2025-04-20" \
             -d '{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' || true
           rl() { grep -i "^anthropic-ratelimit-unified-$1:" /tmp/rl.txt | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '\r'; }

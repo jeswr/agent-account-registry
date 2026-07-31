@@ -93,8 +93,14 @@ jobs:
             slot=$((slot+1))
             tok=$(jq -r --arg k "$name" '.[$k]' "$SECRETS_FILE")
             rm -f /tmp/h.txt
-            code=$(curl -s -D /tmp/h.txt -o /dev/null --max-time 20 -X POST https://api.anthropic.com/v1/messages \
-              -H "Authorization: Bearer $tok" -H "anthropic-version: 2023-06-01" -H "content-type: application/json" \
+            # ARGV LEAK (issue #417, the same class issue #195 fixed in scripts/account-usage.py):
+            # a command line is world-readable on the runner (`ps` / /proc/<pid>/cmdline) and is
+            # captured verbatim by diagnostic command capture, so the bearer credential is fed
+            # through curl's STDIN header stream (`-H @-`) and never appears as an argument. The
+            # `printf` is a shell BUILTIN — it forks no process whose argv could carry the token.
+            code=$(printf 'Authorization: Bearer %s\n' "$tok" \
+              | curl -s -D /tmp/h.txt -o /dev/null --max-time 20 -X POST https://api.anthropic.com/v1/messages \
+              -H @- -H "anthropic-version: 2023-06-01" -H "content-type: application/json" \
               -H "anthropic-beta: oauth-2025-04-20" \
               -d '{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' -w '%{http_code}')
             [ -z "$code" ] && code=curlfail
