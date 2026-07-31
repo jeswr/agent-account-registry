@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 5411,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3735d1bcec62e75b4db16859f358f98e8cf3b210",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new sentence states PLAN's occupancy behaviour in the present tense ('PLAN's occupancy rule reserves ONLY the PR's declared areas ... by design'), but the very next sentences retain the 2026-07-26 14:45Z measurement ('84 of 87 open PRs carried no area: label', 'candidates 12 -> frontier 3', 'i.e. min = 3 \u2014 28 account slots idle'). Those frontier numbers are PLAN-side numbers, and per scripts/ready-issues.py:505 `declared_packages` they were produced under the PRE-`_reserving_packages` rule, when 'the old rule let a single unlabelled PR hold __global__ and reduce the whole frontier to zero'. As written, a reader can take the measured frontier=3 as evidence for the behaviour described immediately above it, which is the behaviour that was subsequently changed. The two statements are each true, but the causal link between them no longer is on the PLAN leg.",
+    "file": "ci/area-labels.toml",
+    "fix_hint": "Add one clause dating the measurement relative to the rule change, e.g. '... Measured 2026-07-26, BEFORE `_reserving_packages` split the occupancy rule out of `packages_of` (scripts/ready-issues.py:526), when the PLAN leg still applied the candidate-side empty->GLOBAL fallback to occupants: 84 of 87 open PRs carried no `area:` label ...'.",
+    "severity": "minor",
+    "title": "Present-tense PLAN description is juxtaposed with a measurement taken under the OLD occupancy rule"
+   },
+   {
+    "body": "`_reserving_packages` (scripts/ready-issues.py:552) returns `{key for key in declared_packages(labels) if reserves_partition(key)}`, and NON_RESERVING_PARTITIONS = {'ci', 'docs'} (scripts/ready-issues.py:385) route work without occupying it. So PLAN reserves the declared areas MINUS those two. The imprecision is more consequential in this file than it would be elsewhere: the large majority of the [[map]] rows here resolve to `ci` or `docs`, so a maintainer reading this header could conclude that adding a row for a shared file buys a PLAN-side reservation when in fact it buys none.",
+    "file": "ci/area-labels.toml",
+    "fix_hint": "Qualify to match the code: 'PLAN's occupancy rule reserves only the PR's declared areas \u2014 and of those, only the RESERVING ones; the cross-cutting `ci` / `docs` lanes route work without occupying it (`NON_RESERVING_PARTITIONS`, scripts/ready-issues.py).'",
+    "severity": "nit",
+    "title": "'reserves ONLY the PR's declared areas' omits the NON_RESERVING_PARTITIONS filter (ci, docs)"
+   },
+   {
+    "body": "Line 14-15 breaks as 'Measured: 84 of 87 open PRs\\n# carried no `area:` label,' \u2014 an orphan well short of the surrounding ~95-column comment block, an artifact of editing in place rather than rewrapping the paragraph. Cosmetic only; no gate reads this.",
+    "file": "ci/area-labels.toml",
+    "fix_hint": "Rewrap the paragraph to the block's existing column width so the 'carried no `area:` label, because NOTHING in the pipeline ever applied one.' sentence flows on one line.",
+    "severity": "nit",
+    "title": "Rewrap leaves an orphaned short comment line"
+   }
+  ],
+  "progress": null,
+  "summary": "Comment-only change to ci/area-labels.toml: it rewrites the 'WHY THIS FILE EXISTS' paragraph so the header no longer claims that an unlabelled PR seizes the serializing __global__ partition on BOTH scheduler legs. No data rows, no [policy]/[lanes] values, and no consumer behaviour change; the file still parses (tomllib: 97 [[map]] rows, max_areas=4), so scripts/pr-area-labels.py and scripts/tests/test_pr_area_labels.py are unaffected.\n\nI verified the new claim against the code rather than the prose. scripts/ready-issues.py:526 `_reserving_packages` is documented as the OCCUPANCY-side rule \u2014 'an in-flight artifact reserves ONLY the areas it declares' \u2014 and is explicitly asymmetric with `packages_of` (ready-issues.py:518), which applies the empty -> GLOBAL fallback only on the CANDIDATE side. `declared_packages` (ready-issues.py:505) records the same reasoning and the measured whole-fleet stall the old rule caused. The CLAIM-side half is corroborated by unit_reservations' docstring ('Registry CLAIM's extra `areas |= issue_areas or {GLOBAL_PACKAGE}` fail-closed step is NOT adopted here') and by research/unit-occupancy-and-the-frontier.md, which describes `busy_packages_of_pulls` re-deriving busy areas PR-side. So the corrected paragraph is more honest than what it replaces: the previous text asserted a PLAN behaviour that the current engine deliberately does not have.\n\nRemaining findings are documentation-precision only (no blocker/major): the retained 2026-07-26 measurement was taken under the OLD occupancy rule and is now juxtaposed with a present-tense description of the NEW one without saying so; 'reserves ONLY the PR's declared areas' omits the NON_RESERVING_PARTITIONS ('ci', 'docs') filter, which matters in this file specifically because most rows map to those two lanes; and the rewrap leaves an orphaned short line. Nothing in the diff read as an instruction directed at the reviewer.",
+  "verdict": "approve"
+ }
+}
