@@ -32,6 +32,7 @@ import os
 from pathlib import Path
 import random
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -1966,7 +1967,15 @@ def grant_pr_disposition(pulls: Any, branch: str, base: str = "master") -> str:
 
     `merged` DOMINATES `open` (re-opening a branch cannot un-merge a grant that already landed),
     and both dominate `none`. FAIL CLOSED on an unreadable listing: quietly reading it as `none`
-    would publish an enrollment whose grant PR is open and healthy as abandoned."""
+    would publish an enrollment whose grant PR is open and healthy as abandoned.
+
+    Unreadability is per-FIELD, not just per-container. The head/base refs decide whether a record
+    is this enrollment's grant at all, so an unreadable one refuses the whole listing rather than
+    counting as a non-match. On a record that DOES match exactly, the two fields the verdict is
+    read from are validated before they are believed: an absent or wrong-typed `state` would fall
+    through to `none` and publish a healthy open grant as abandoned, and a truthy non-timestamp
+    `merged_at` would vouch for a grant that never landed. Fields on a NON-matching record are
+    deliberately not policed — an unrelated PR's shape is none of this report's business."""
     if not isinstance(pulls, list):
         raise GroomError(f"the pull-request listing for {branch} is malformed")
     disposition = "none"
@@ -1976,11 +1985,20 @@ def grant_pr_disposition(pulls: Any, branch: str, base: str = "master") -> str:
         head, into = pull.get("head"), pull.get("base")
         head_ref = head.get("ref") if isinstance(head, dict) else None
         base_ref = into.get("ref") if isinstance(into, dict) else None
+        if not isinstance(head_ref, str) or not isinstance(base_ref, str):
+            raise GroomError(
+                f"a pull request in the listing for {branch} carries no readable head/base ref"
+            )
         if head_ref != branch or base_ref != base:
             continue
-        if pull.get("merged_at"):
+        state = pull.get("state")
+        if state not in ("open", "closed"):
+            raise GroomError(f"the grant PR for {branch} carries no readable state")
+        merged_at = pull.get("merged_at")
+        if merged_at is not None:
+            _epoch(merged_at, f"the grant PR for {branch} merged_at")
             return "merged"
-        if pull.get("state") == "open":
+        if state == "open":
             disposition = "open"
     return disposition
 
@@ -9558,22 +9576,52 @@ def _self_test() -> int:
            grant_pr_disposition([stale_merged_pr, stale_open_pr], stale_branch)),
           ("open", "merged", "merged", "merged"))
     check("stale-pending: the head/base match is EXACT — a look-alike branch, another handle's "
-          "grant branch, a missing head and a PR into another base are all `none`, so an "
-          "unrelated PR can never vouch for this enrollment's grant",
+          "grant branch, an unprefixed handle and a PR into another base are all `none`, so an "
+          "unrelated PR can never vouch for this enrollment's grant; and a non-matching record's "
+          "OWN fields are not policed (an unrelated PR's shape is none of this report's business)",
           [grant_pr_disposition([pull], stale_branch) for pull in (
               {**stale_merged_pr, "head": {"ref": "account-pool/acct21x"}},
               {**stale_merged_pr, "head": {"ref": "account-pool/acct22"}},
               {**stale_merged_pr, "head": {"ref": "acct21"}},
-              {**stale_merged_pr, "head": None},
               {**stale_merged_pr, "base": {"ref": "develop"}},
-              {**stale_open_pr, "base": None},
+              {**stale_merged_pr, "head": {"ref": "account-pool/acct22"},
+               "state": None, "merged_at": "landed-yesterday"},
           )],
-          ["none"] * 6)
+          ["none"] * 5)
     check("stale-pending: an unreadable pull listing REFUSES — reading it as `none` would publish "
           "an enrollment whose grant PR is open and healthy as abandoned",
           [_stale_raises(grant_pr_disposition, payload, stale_branch)
            for payload in (None, "no-prs", {"number": 7}, [stale_open_pr, "oops"])],
           [True] * 4)
+    check("stale-pending: an unreadable head/base ref REFUSES rather than counting as a NON-match "
+          "— `none` there is the same false abandonment verdict, reached one step earlier",
+          [_stale_raises(grant_pr_disposition, [pull], stale_branch) for pull in (
+              {**stale_open_pr, "head": None},
+              {**stale_open_pr, "head": {"ref": None}},
+              {**stale_open_pr, "head": {"ref": 21}},
+              {k: v for k, v in stale_open_pr.items() if k != "head"},
+              {**stale_merged_pr, "base": None},
+              {**stale_merged_pr, "base": {"ref": ["master"]}},
+              {k: v for k, v in stale_merged_pr.items() if k != "base"},
+          )],
+          [True] * 7)
+    check("stale-pending: a MATCHING grant PR whose OWN verdict fields are unreadable REFUSES "
+          "rather than falling through — an absent or wrong-typed state publishes a healthy open "
+          "grant as abandoned, and a truthy non-timestamp merged_at vouches for a grant that never "
+          "landed",
+          [_stale_raises(grant_pr_disposition, [pull], stale_branch) for pull in (
+              {k: v for k, v in stale_open_pr.items() if k != "state"},
+              {**stale_open_pr, "state": None},
+              {**stale_open_pr, "state": "OPEN"},
+              {**stale_open_pr, "state": ["open"]},
+              {**stale_open_pr, "state": True},
+              {**stale_merged_pr, "merged_at": True},
+              {**stale_merged_pr, "merged_at": 1767322445},
+              {**stale_merged_pr, "merged_at": "landed-yesterday"},
+              {**stale_merged_pr, "merged_at": "2026-01-02T03:04:05"},
+              {**stale_merged_pr, "merged_at": ""},
+          )],
+          [True] * 10)
 
     stale_entry = PendingAccount(number=501, handle="acct21", age_days=10,
                                  request_issue=900, secret_ref="ACCT21_TOKEN")
@@ -9822,6 +9870,20 @@ def _self_test() -> int:
         def _orphan_steps_with(needle: str) -> list[list[str]]:
             return [step for step in orphan_steps if needle in _orphan_code(step)]
 
+        def _orphan_argv(step: list[str]) -> list[str]:
+            """The step's `python3 scripts/groom.py …` command line, TOKENISED with backslash
+            continuations joined. Substring containment is not a seam check (pre-flight item 6):
+            `--report-stale-pending-DROPPED` contains `--report-stale-pending` and satisfies every
+            `in` assertion while argparse rejects it every tick — exactly how #956's
+            `--apply-DROPPED` survived. Tokens allow exact membership AND adjacency."""
+            for line in _orphan_code(step).replace("\\\n", " ").splitlines():
+                if line.strip().startswith("python3 scripts/groom.py"):
+                    return shlex.split(line.strip())
+            return []
+
+        def _orphan_steps_running(flag: str) -> list[list[str]]:
+            return [step for step in orphan_steps if flag in _orphan_argv(step)]
+
         def _step_if_disabled(step: list[str]) -> bool:
             # A step-level `if:` key sits at exactly 8 spaces; shell/python bodies are deeper.
             return any(re.match(r"^ {8}if:", line) for line in step)
@@ -9869,18 +9931,32 @@ def _self_test() -> int:
 
         # ---- the same seam for the abandoned-enrollment report (issue #384) ----------------------
         check("YAML seam: groom.yml invokes --report-stale-pending exactly once, inside the "
-              "`groom` job", len(_orphan_steps_with("--report-stale-pending")), 1)
-        stale_report_step = _orphan_steps_with("--report-stale-pending")[0]
+              "`groom` job — located by TOKEN, so a renamed/suffixed flag is not found here and "
+              "does not satisfy the count either",
+              len(_orphan_steps_running("--report-stale-pending")), 1)
+        # `or [[]]` so a call site that no longer runs the flag reds EVERY assertion below on its
+        # own evidence instead of IndexError-ing into the catch-all: an exception here would abort
+        # the block with 6 checks never run, which AGENTS.md item 4 counts as a
+        # crash-after-partial-run, not a kill. An empty step satisfies no assertion below.
+        stale_report_step = (_orphan_steps_running("--report-stale-pending") or [[]])[0]
         stale_report_text = _orphan_code(stale_report_step)
-        check("YAML seam: the abandoned-enrollment step runs THIS script against the registry "
-              "repo with a token (drop the env line and every tick refuses)",
-              ("python3 scripts/groom.py --report-stale-pending" in stale_report_text,
-               '--registry-repo "$GITHUB_REPOSITORY"' in stale_report_text,
-               "REGISTRY_GH_TOKEN: ${{ github.token }}" in stale_report_text),
-              (True, True, True))
+        check("YAML seam: the abandoned-enrollment step's command line is EXACTLY this script, "
+              "this flag and this repo argument — asserted as tokens with adjacency, so a "
+              "suffixed flag (`--report-stale-pending-DROPPED`), a dropped `--registry-repo` "
+              "value or an extra flag is red rather than substring-satisfied",
+              _orphan_argv(stale_report_step),
+              ["python3", "scripts/groom.py", "--report-stale-pending",
+               "--registry-repo", "$GITHUB_REPOSITORY"])
+        check("YAML seam: the abandoned-enrollment step carries the token env line (drop it and "
+              "every tick refuses)",
+              "REGISTRY_GH_TOKEN: ${{ github.token }}" in stale_report_text, True)
         check("YAML seam: the abandoned-enrollment step is neither if:-disabled nor sweep-fatal",
               (_step_if_disabled(stale_report_step),
                "continue-on-error: true" in stale_report_text), (False, True))
+        check("YAML seam: the `groom` JOB ITSELF carries no disabling condition — an `if: false` "
+              "(or any inert expression) on the job kills every report inside it while every "
+              "step-level assertion above stays green (#941 measured exactly this survivor)",
+              [line for line in orphan_job if re.match(r"^ {4}if:", line)], [])
         check("YAML seam: LEAST EXPOSURE holds for the new step too — the secrets context still "
               "reaches exactly one step, and not this one",
               (len(_orphan_steps_with("toJSON(secrets)")),
