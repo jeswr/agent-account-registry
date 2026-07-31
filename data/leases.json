@@ -12,16 +12,6 @@
   },
   {
    "account": "51bde6688e140866",
-   "claim_id": "81b8c182604b4c22b3307fa750e6c484",
-   "holder": "jeswr/agent-account-registry#1180@30608947483.1",
-   "package": "dispatch",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785478346,
-   "expires_at": 1785481046
-  },
-  {
-   "account": "51bde6688e140866",
    "claim_id": "7eb56aa1de584b9a9807499a306dbc07",
    "holder": "jeswr/agent-account-registry#1324@30608953011.1",
    "package": "workflows",
