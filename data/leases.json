@@ -11,16 +11,6 @@
    "expires_at": 1785464479
   },
   {
-   "account": "9e13ea21abf27e68",
-   "claim_id": "d387d4c08e7643d5b1a3a112f3fffc19",
-   "holder": "fix:sparq-org/sparq#4212@dispatch-30593766449.1",
-   "package": "sparq-core-nt-dict",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785458175,
-   "expires_at": 1785464475
-  },
-  {
    "account": "dc2d751954080e13",
    "claim_id": "7ee26adb06664420b65928280328f33f",
    "holder": "review:sparq-org/sparq#5154@dispatch-30593766449.1",
