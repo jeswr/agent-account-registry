@@ -12,16 +12,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "24c5d338ab22482b87978d89aad7bd1e",
-   "holder": "review:sparq-org/sparq#4207@dispatch-30606702289.1",
-   "package": "sparq-canon",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785475769,
-   "expires_at": 1785479969
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "a1106340168344c79ff5db603e486a99",
    "holder": "review:sparq-org/sparq#4804@dispatch-30606702289.1",
    "package": "sparq-trust",
