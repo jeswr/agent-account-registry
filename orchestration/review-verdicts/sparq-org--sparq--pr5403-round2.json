@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 5403,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "91b16895efaf5f519b76a8d905750c40d4910242",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Both new markers in this PR stamp [SONNET-4.6] (gui/app/src/data/tools.ts:151 and the gui/README.md line ending '[SONNET-4.6] This is the honest live-wasm boundary'), but the commit carrying them is trailered 'Co-Authored-By: GPT-5.6 Sol <[redacted-email]>'. The marker and the trailer disagree inside a single commit.\n\nAGENTS.md item 5 requires the inline [MODEL] marker and the Co-Authored-By trailer to be derived from the harness's actual runtime model and to agree. AGENTS.md line 167 goes further and names this exact string as the canonical failure case: attribution must be correct 'not false markers (e.g. [SONNET-4.6]) left over from an earlier brief generation'.\n\nThis is metadata, not behaviour, so it does not block. It does matter for the repo's stated purpose of the rule: multi-model diffs are re-reviewed per model, and a mislabelled comment routes this work to the wrong re-review lane permanently, since these are durable source comments rather than commit metadata. The repo already uses [GPT-5.6] correctly in 53 places under gui/ and packages/, including neighbouring N3 comments in engine-context.tsx, so the correct marker for this author is well established.",
+    "file": "gui/app/src/data/tools.ts",
+    "fix_hint": "Replace [SONNET-4.6] with the marker for the model that actually authored the change \u2014 [GPT-5.6], matching the commit trailer and the existing [GPT-5.6] stamps in gui/app/src/lib/engine-context.tsx \u2014 in both gui/app/src/data/tools.ts:151 and the gui/README.md N3-mode paragraph. Do not rewrite the pre-existing [OPUS-4.8] stamps; per AGENTS.md item 5 those are accurate history.",
+    "severity": "minor",
+    "title": "Model-provenance marker [SONNET-4.6] contradicts the commit's Co-Authored-By: GPT-5.6 Sol trailer"
+   },
+   {
+    "body": "The new comment at gui/app/src/data/tools.ts:151 attributes the N3 work to 'sq-bfimm'. That id occurs exactly once in the entire repository \u2014 this line. Meanwhile the README hunk in this same PR attributes the same feature to 'sq-glo5r', and sq-glo5r is the id used by all existing N3 code: workspace-context.tsx, engine-context.tsx, packages/sparq-client/src/workspace.ts, inference-tool.tsx, workbench.tsx, the e2e spec, and research/gui-consolidation-fix-plan.md.\n\nSo this PR labels one feature with two different bead ids in two files. I could not confirm whether sq-bfimm is a typo or a real-but-unreferenced bead: the checked-in .beads/issues.jsonl contains neither sq-bfimm nor sq-glo5r, and the bd CLI is not on PATH in this environment, so the beads store could not adjudicate it. The finding is therefore the internal inconsistency, which is verifiable from the diff alone, not a claim that the bead is fabricated.\n\nImpact is traceability only: a future reader grepping sq-bfimm to find the design context gets a single self-referential hit.",
+    "file": "gui/app/src/data/tools.ts",
+    "fix_hint": "Change sq-bfimm to sq-glo5r at gui/app/src/data/tools.ts:151 so the blurb comment matches the README hunk in this PR and the ~30 existing sq-glo5r N3 references. If sq-bfimm is genuinely a distinct bead, cite both (e.g. 'sq-glo5r / sq-bfimm') so the link to the established id is not lost.",
+    "severity": "minor",
+    "title": "Bead id sq-bfimm appears nowhere else in the tree; every other N3 reference (including this PR's own README) uses sq-glo5r"
+   },
+   {
+    "body": "This PR updates the regime list to include N3 in gui/README.md, inference-control.tsx (both the header comment and the selector docstring), and the tools.ts blurb. Two comments describing the very same selector were not updated and now contradict the updated docstrings:\n\n- gui/app/src/components/workbench/query-workbench.tsx:71 \u2014 'the per-workspace inference (RDFS / OWL 2 RL) selector, in the action row', on the import of the InferenceControl component this PR just re-documented as Off / RDFS / OWL 2 RL / N3.\n- gui/app/src/components/workbench/query-workbench.tsx:843 \u2014 'the per-workspace inference regime (queries run with the chosen RDFS / OWL 2 RL entailment applied by the engine)', at the <InferenceControl /> render site.\n\nAlso worth a look: gui/app/src/lib/workspace-context.tsx:104 describes the persisted field as 'RDFS / OWL 2 RL entailment'.\n\nExcluded deliberately: gui/app/src/lib/reason-wasm.ts:89 is correct as written \u2014 it is narrowed to \"rdfs\" | \"owl-rl\" on purpose and already explains that N3 calls reasonN3 directly and never maps through modeToProfile.\n\nFiled against gui/README.md because those paths are outside this diff; the gap is in this PR's sweep, not in those files' original authorship.",
+    "file": "gui/README.md",
+    "fix_hint": "Extend the same one-line edit to query-workbench.tsx:71 and :843 (and optionally workspace-context.tsx:104), changing 'RDFS / OWL 2 RL' to 'RDFS / OWL 2 RL / N3'. Leave reason-wasm.ts:89 alone \u2014 its narrowing to rdfs|owl-rl is intentional and self-documented.",
+    "severity": "minor",
+    "title": "Doc-sync sweep misses two sibling comments that still describe the selector as RDFS / OWL 2 RL only"
+   }
+  ],
+  "progress": null,
+  "summary": "Doc-sync-only PR (README + two docstrings/blurb) recording that N3 entailment shipped in the GUI. I verified every substantive claim against the checkout rather than taking the prose at face value, since a doc-only diff asserting behaviour is exactly where overclaim hides. All of it holds: the selector really offers N3 (WORKSPACE_INFERENCE_MODES includes \"n3\", packages/sparq-client/src/workspace.ts:78-86); rules docs really are persisted per workspace (rulesDocs?: WorkspaceRulesDoc[], backward-compatible parseRulesDocs); the Inference tool really supports inline authoring, bulk .n3/.ttl upload, and independent enable/disable/remove (N3_ACCEPT, addRulesDocs, setRulesDocEnabled, removeRulesDoc in inference-tool.tsx); and query time really combines enabled rules with an N-Triples snapshot and calls reasonN3, loading base+derived as the closure (engine-context.tsx:894-926, cache-keyed by store epoch plus an FNV-1a hash of the enabled rules so a rules change invalidates the prior closure). The ground-triples-only caveat is an honest boundary statement matching reasonN3's documented contract, not a hedge over a gap. Tests backing the claims are real and non-vacuous: gui/e2e-playwright/specs/n3-inference.web.spec.ts covers derivation visible to queries, bulk two-file upload, toggling a rule off removing its derivations, and persistence across reload. No ZK/MPC or other honesty-gated claim is touched. The three findings are metadata hygiene, not correctness: a model-provenance marker that contradicts the commit trailer, a bead id that matches nothing else in the tree, and a doc-sync sweep that missed two sibling comments describing the same selector. None affects runtime behaviour or user-facing accuracy, so none blocks; all are cheap to fix in a follow-up commit on this branch.",
+  "verdict": "approve"
+ }
+}
