@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5380,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d928bfe6a08712ca24748681b2eea30d15356e6e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The prior round's authorization-boundary finding is still present: `credential_subject` uses `iter().find_map(...)` over every triple and accepts the first named-node object of any `credentialSubject` predicate. It neither identifies the admitted credential's root node nor rejects multiple distinct subjects. The proof verifies the graph canonically, so the same valid signed graph can be supplied in different slice orders and cause a different agent to receive the requirement holding. The added backend tests contain only one `credentialSubject`, so they do not validate deterministic fail-closed behavior for ambiguity.",
+    "file": "crates/sparq-solid/src/credentials.rs",
+    "fix_hint": "Require an unambiguous subject binding before recording any holding: anchor `credentialSubject` to a defined credential root and/or collect distinct candidate subjects and reject unless exactly one valid subject exists. Add an error variant for ambiguity and a signed test containing two distinct `credentialSubject` triples; submit the same graph in both orders and assert both admissions are rejected and no holding is recorded.",
+    "severity": "major",
+    "title": "Credential subject binding remains ambiguous and order-dependent"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 is improving: the feature-off rustdoc problem was addressed by replacing unconditional intra-doc links to the feature-gated method with code spans. However, the authorization-critical subject-binding defect remains unchanged. `credential_subject` still returns the first `credentialSubject` predicate found anywhere in the verified graph, without anchoring it to a credential root or rejecting multiple distinct subjects. Since RDFC verification authenticates an order-independent graph, presentation order can still choose which subject receives the holding. The backend tests still cover only a single subject and do not exercise ambiguous signed graphs.",
+  "verdict": "request_changes"
+ }
+}
