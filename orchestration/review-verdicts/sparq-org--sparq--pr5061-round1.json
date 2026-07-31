@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5061,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "887072a2185fdcd5e1f1ba37b7ca153d35bcad0a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 2 correctly distinguishes witness-generation failure from proof-system enforcement, and section 3.1 says the needed witness must observe the constraint system. But it then calls `nargo execute --force` versus `--force-brillig` the cheapest instrument for the property and section 4 requires adding such a red-on-wrong test. Both are execution paths; the new unconstrained assertion can make both reject during honest witness generation even if no constraint binds a malicious witness. Thus this differential can remain green under exactly the under-constrained implementation the review is meant to catch. The companion summary repeats the same mistake and additionally says the PR trades away the only constraint-level enforcement, contradicting the earlier argument that the array write may itself provide the dominating bound.",
+    "file": "research/noir-bounded-vec-capacity-assert-5027.md",
+    "fix_hint": "Require a test that bypasses or mutates honest witness generation and demonstrates verifier/constraint-system rejection of an out-of-range index, or explicitly state that no available test establishes this property and keep the upstream PR blocked pending one. Retain the force-vs-brillig differential only as an execution-equivalence check, not as the soundness regression guard. Make the companion record use the same precise wording and remove the claim that the explicit assert was the only constraint-level enforcement unless that has been established.",
+    "severity": "major",
+    "title": "Recommended differential does not test constraint-level enforcement"
+   },
+   {
+    "body": "Section 10.11 says the table's corpus rows match the program and therefore \"the numbers were plainly taken.\" The new detailed record similarly says they were \"evidently taken.\" Matching names or package counts does not establish that commands ran, that the reported values came from those runs, or what toolchain/commit produced them. This conflicts with the same change's explicit statement that provenance is unverified and the results are currently unreproducible. On a soundness-sensitive optimization record, provenance cannot be inferred as fact from labels alone.",
+    "file": "research/noir-optimization-program.md",
+    "fix_hint": "Replace the factual conclusion with the limited observation that the reported corpus labels/counts are consistent with \u00a75.2, while measurement execution and provenance remain unverified. Require confirmation or reproducible rerun before relying on the gate row.",
+    "severity": "major",
+    "title": "Corpus-name matching is presented as proof that measurements occurred"
+   }
+  ],
+  "progress": null,
+  "summary": "The tracking correction is useful, but the proposed pre-flip validation is internally inconsistent with the document's own soundness analysis. The record correctly explains that ordinary execution only checks honest witness generation and cannot establish constraint-level enforcement, yet it then presents an execution-mode differential as the regression test for that property. It also upgrades corpus-name correspondence into an unsupported claim that measurements were definitely taken. These are load-bearing review recommendations on a ZK soundness-sensitive change and should be corrected before this record is relied on.",
+  "verdict": "request_changes"
+ }
+}
