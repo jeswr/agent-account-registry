@@ -1,46 +1,6 @@
 {
  "leases": [
   {
-   "account": "58b7c92faa5b5ca5",
-   "claim_id": "a4e11b7630c642c6a246f9fa3d8c76aa",
-   "holder": "fix:sparq-org/sparq#5189@dispatch-30602087945.1",
-   "package": "sparq-mcp,sparq-py",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785469406,
-   "expires_at": 1785475706
-  },
-  {
-   "account": "9e13ea21abf27e68",
-   "claim_id": "2958417db441439fa85427a864112a27",
-   "holder": "fix:jeswr/agent-account-registry#1366@dispatch-30602967061.1",
-   "package": "review-loop",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785470693,
-   "expires_at": 1785476993
-  },
-  {
-   "account": "dc2d751954080e13",
-   "claim_id": "f9dbef6063d34ac3943fa66116128533",
-   "holder": "review:sparq-org/sparq#5170@dispatch-30603632102.1",
-   "package": "ci",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785471529,
-   "expires_at": 1785475729
-  },
-  {
-   "account": "dc2d751954080e13",
-   "claim_id": "95dc5d95fa31436db83f63e58a9b53bd",
-   "holder": "review:sparq-org/sparq#5209@dispatch-30603632102.1",
-   "package": "sparq-reason",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785471552,
-   "expires_at": 1785475752
-  },
-  {
    "account": "9e13ea21abf27e68",
    "claim_id": "7a07d0c89c8b407cbcda3254128280ca",
    "holder": "fix:jeswr/agent-account-registry#1372@dispatch-30605172330.1",
