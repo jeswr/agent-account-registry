@@ -49,6 +49,16 @@
    "model": "opus5",
    "issued_at": 1785526797,
    "expires_at": 1785533097
+  },
+  {
+   "account": "51bde6688e140866",
+   "claim_id": "f33c816d68fd47a9a41985ade2d99e89",
+   "holder": "sparq-org/sparq#5240@dispatch-30659654063.1",
+   "package": "zk",
+   "role": "soundness",
+   "model": "opus5",
+   "issued_at": 1785526803,
+   "expires_at": 1785533103
   }
  ]
 }
