@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1214,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7a94b69bbabbff75721e1d59fa231a89eb78e7ba",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The two sink inventory commands are pipelines without `pipefail`. If `gh api .../secrets` fails, the display pipeline exits with `sort`'s successful status, and the enforcement pipeline `! gh api ... | grep -vE ...` sees no input, makes `grep` return 1, then negates that to success. Thus an authentication, permission, network, or endpoint failure is indistinguishable from a clean sink and the runbook can proceed to dispatch without proving either provisioning or absence of unrelated credentials. `_test_fleet_step_never_copies_unrelated_credentials` stubs only successful API responses, so its rejection rows do not detect this fail-open path.",
+    "file": "scripts/diagnostic-sink.py",
+    "fix_hint": "Make each read-back propagate the `gh api` status before evaluating names, for example with a shell invocation that enables `set -o pipefail` or by capturing the API output in a temporary value/file only after a successful command. Then enforce both the expected-name constraint and the intended nonempty/provisioned inventory. Add an executed fixture where the `gh api` stub exits nonzero and assert that both the read-back and unexpected-name check exit nonzero.",
+    "severity": "blocker",
+    "title": "Sink secret read-backs succeed when the GitHub API fails"
+   },
+   {
+    "body": "Step 1 says the policy \"must be one `branch`-typed entry\" naming exactly the selected default branch, but its final command only prints the API response. It exits zero for an empty policy list, an extra admitted branch, a tag policy, or a wrong branch whenever the API request itself succeeds. Because environment deployment policy controls which refs may receive these secrets, an advisory display is not the fail-closed proof the runbook claims, and there is no executed self-test for these states.",
+    "file": "scripts/diagnostic-sink.py",
+    "fix_hint": "Turn the policy read-back into a machine assertion over the complete response: require exactly one policy, exact type `branch`, and exact name equal to `sink_default_branch`, with API failure also nonzero. Add executed tests for the valid response and for empty, extra, wrong-name, wrong-type, and API-failure responses.",
+    "severity": "major",
+    "title": "Deployment-policy read-back does not enforce the claimed exact branch policy"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round three addresses both round-two findings: the source enumeration is restricted to the probe-derived account-token allowlist, the sink inventory has an unexpected-name check, and step 0 now conditionally creates the repository and asserts its private bit. The runbook is still fail-open at two trust-boundary read-backs. Most critically, both sink-secret pipelines can report success when `gh api` fails because their status is taken from `sort` or from a negated `grep`; the tests exercise dirty inventory but not API failure. Separately, the deployment-policy read-back remains display-only even though the prose claims an exact one-branch assertion. These are new findings, so progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
