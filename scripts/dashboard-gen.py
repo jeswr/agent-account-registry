@@ -3819,7 +3819,8 @@ const degraded = (node) =>
   // Loading the page runs its own `refresh()`, whose stubbed fetch rejects into the page's catch
   // and writes to #warning; the tick below lets that settle so it cannot be mistaken for the
   // probe notice under test, and every render below starts from a fresh #warning element.
-  const scope = new Function(source + "; return { usageProbeCard, updateFreshness, render };")();
+  const scope = new Function(
+    source + "; return { usageProbeCard, updateFreshness, render, providerQuotaCard };")();
   await new Promise((resolve) => setImmediate(resolve));
   const cards = {};
   for (const [name, probe] of Object.entries(input.probes)) {
@@ -3851,7 +3852,15 @@ const degraded = (node) =>
       capacityNote: /Eligible capacity unmeasured/.test(text(ids.summary)),
     };
   }
-  process.stdout.write(JSON.stringify({ cards, warnings }));
+  // [#71] the quota card on its own, so a reset stamp can be placed either side of the wall clock
+  // the renderer compares against. `Date.now()` inside the page is the real clock here — the whole
+  // point of the assertions below is that the comparison happens at RENDER time — so the fixtures
+  // offset their stamps from that clock rather than pinning it.
+  const resets = {};
+  for (const [name, row] of Object.entries(input.quotaRows || {})) {
+    resets[name] = text(scope.providerQuotaCard(row));
+  }
+  process.stdout.write(JSON.stringify({ cards, warnings, resets }));
 })().catch((error) => { console.error(error && error.stack || error); process.exit(1); });
 """
     # A LIVE `now`: the page's own staleness notice fires on a year-old fixture stamp, and that
@@ -3870,6 +3879,22 @@ const degraded = (node) =>
         issues, leases, live_usage, history, None, now, "fixture-salt",
         probe_status={"schema": PROBE_SCHEMA, "outcome": "failed",
                       "detail": "secret-materialization-failed", "attempted_at": now})
+    # --- [#71] reset stamps, on BOTH sides of the wall clock the page renders against. A reset is
+    # the only FORWARD-looking instant the page shows, and `relative()` renders any instant, so a
+    # stamp that elapsed after the build printed "next reset 6 minutes ago" — a pending refill that
+    # had in fact already happened, next to a utilization figure the refill had invalidated. The
+    # stamps are offset from the WALL CLOCK (never from `now`/`live_now` as a rendering-time
+    # constant: the page compares against `Date.now()`, and a fixture that elapses only because the
+    # generator's clock says so would not exercise that comparison at all).
+    def reset_row(soonest_offset, oldest_offset):
+        wall = time.time()
+        soonest, oldest = _utc_iso(wall + soonest_offset), _utc_iso(wall + oldest_offset)
+        return {"provider": "anthropic", "headroom": "capped",
+                "signal": "live rate-limit-header probe (per-window utilization)",
+                "windows": [{"name": "5h", "remaining_fraction": 0.0,
+                             "soonest_reset": soonest, "oldest_reset": oldest}],
+                "soonest_reset": soonest, "oldest_reset": oldest}
+
     page = _node_json(
         page_harness.replace("__APP_JS__",
                              json.dumps(str(Path(__file__).resolve().parent.parent
@@ -3878,7 +3903,12 @@ const degraded = (node) =>
                     "failed": failed_document["usage_probe"],
                     "absent": None},
          "documents": {"measured": measured_document, "failed": failed_document,
-                       "staleFailed": stale_failed_document}})
+                       "staleFailed": stale_failed_document},
+         # -360 is the issue's own reading ("Resets 6 minutes ago"). `split` is the case a single
+         # per-CARD staleness flag gets wrong: the first window has refilled while the last known
+         # refill is still ahead, so the two stamps must be judged INDEPENDENTLY.
+         "quotaRows": {"future": reset_row(5400, 86400), "elapsed": reset_row(-360, -60),
+                       "split": reset_row(-360, 5400)}})
     check("[#612] EXECUTED page script: the probe card degrades exactly when nothing was measured",
           (page["cards"]["measured"]["degraded"],
            "NOT MEASURED" in page["cards"]["measured"]["text"],
@@ -3940,6 +3970,44 @@ const degraded = (node) =>
            re.search(r"\d+\s*/\s*\d+",
                      page["warnings"]["measured"]["capacityLines"]) is not None),
           (True, True, False))
+
+    # --- [#71] ...and the reset sentences those cards carry. Each direction asserts the OTHER
+    # direction's wording is ABSENT, so the three ways this regresses are all red: deleting the
+    # elapsed branch (the `elapsed` row loses "already refilled"), inverting the comparison (the
+    # `future` row gains it), and making `hasElapsed` constant either way (one row or the other).
+    # The wordings below are written out independently here — the page is never asked what it says.
+    future_reset = page["resets"]["future"]
+    elapsed_reset = page["resets"]["elapsed"]
+    split_reset = page["resets"]["split"]
+    check("[#71] EXECUTED page script: a reset still ahead of the render clock reads as a PENDING "
+          "refill, in both the window row and the provider note",
+          ("next reset" in future_reset, "last reset" in future_reset,
+           "all known windows reset by" in future_reset,
+           "was due" in future_reset, "already refilled" in future_reset,
+           "have refilled" in future_reset),
+          (True, True, True, False, False, False))
+    check("[#71] EXECUTED page script: a reset the render clock has passed says the window ALREADY "
+          "refilled and that the quota beside it predates the refill — never `next reset ... ago`",
+          ("reset was due" in elapsed_reset,
+           "already refilled, the quota above predates it" in elapsed_reset,
+           "all refilled by" in elapsed_reset,
+           "Soonest known reset was due" in elapsed_reset,
+           "all known windows have refilled" in elapsed_reset,
+           "next reset" in elapsed_reset, "last reset" in elapsed_reset,
+           "all known windows reset by" in elapsed_reset),
+          (True, True, True, True, True, False, False, False))
+    check("[#71] EXECUTED page script: every stamp is judged on its own — one elapsed and one "
+          "still-pending refill on the SAME card render as one of each, not as a card-wide verdict",
+          ("reset was due" in split_reset, "already refilled" in split_reset,
+           "last reset" in split_reset, "all known windows reset by" in split_reset,
+           "next reset" in split_reset, "all refilled by" in split_reset,
+           "have refilled" in split_reset),
+          (True, True, True, True, False, False, False))
+    # The fixtures above name the payload's reset keys by hand; this row is the same wording on the
+    # document build_dashboard really publishes, so a renamed/dropped key cannot leave them green.
+    check("[#71] the published document's own reset stamps reach the same sentence",
+          ("next reset" in quota_text, "already refilled" in quota_text),
+          (True, False))
 
     health = _normalize_model_health({
         "generated_at": now,

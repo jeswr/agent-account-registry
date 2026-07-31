@@ -36,6 +36,21 @@ function relative(value) {
   return relativeFormatter.format(seconds, "second");
 }
 
+// Issue #71: a reset stamp is the only FORWARD-looking instant on this page — every other stamp
+// (generated_at, attempted_at, fired_at, an outcome's `at`) is an observation that already
+// happened, so `relative()`'s "N minutes ago" is correct for those and a lie for a reset. The page
+// polls a data.json that dashboard-gen rebuilds far less often than REFRESH_MS, so a reset stamp
+// crossing `now` between two builds is ORDINARY, not exceptional — and when it does, "next reset 6
+// minutes ago" is not a reset time at all. What an elapsed stamp means is the opposite of what the
+// sentence says: that window has ALREADY refilled and the utilization beside it was measured
+// before the refill. Every caller composes its own sentence from this one predicate rather than
+// re-deriving the comparison, and it is evaluated at RENDER time (not at generation time) because
+// the stamp elapses while the page is open, with no new data.json involved.
+function hasElapsed(value) {
+  const date = parseTime(value);
+  return date !== null && date.getTime() <= Date.now();
+}
+
 function summaryCard(label, value, meta) {
   const card = node("article", "summary-card");
   card.append(node("p", "summary-label", label), node("p", "summary-value", value));
@@ -162,10 +177,20 @@ function quotaWindowRow(windowData) {
     meter.append(fill);
   }
   const notes = [];
-  if (windowData.soonest_reset) {
-    notes.push(`next reset ${relative(windowData.soonest_reset)}`
-      + (windowData.oldest_reset && windowData.oldest_reset !== windowData.soonest_reset
-        ? ` · last ${relative(windowData.oldest_reset)}` : ""));
+  const soonest = windowData.soonest_reset;
+  const oldest = windowData.oldest_reset;
+  if (soonest) {
+    // [#71] An elapsed soonest reset also dates the percentage rendered above it: the meter is
+    // left alone (a refilled window only ever has MORE quota than shown, so the reading stays
+    // conservative and the page still cannot advertise capacity dispatch would refuse) but it must
+    // not be read as current.
+    notes.push(hasElapsed(soonest)
+      ? `reset was due ${relative(soonest)} — already refilled, the quota above predates it`
+      : `next reset ${relative(soonest)}`);
+    if (oldest && oldest !== soonest) {
+      notes.push(hasElapsed(oldest)
+        ? `all refilled by ${relative(oldest)}` : `last reset ${relative(oldest)}`);
+    }
   }
   wrap.append(head, meter, node("p", "reset", notes.length ? notes.join(" · ") : "Reset unknown"));
   return wrap;
@@ -189,8 +214,15 @@ function providerQuotaCard(row) {
   }
   card.append(top, node("p", "quota-counts", QUOTA_HEADROOM_TEXT[headroom]), windows);
   if (row.soonest_reset) {
-    card.append(node("p", "quota-note",
-      `Soonest known reset ${relative(row.soonest_reset)} · all known windows reset by ${utc(row.oldest_reset)}`));
+    // [#71] Same predicate, provider-wide: `oldest_reset` is when the LAST known window refills, so
+    // once it has elapsed nothing on this card is waiting on a reset any more — saying it "resets
+    // by" a past instant reads as a pending refill that has in fact already happened.
+    card.append(node("p", "quota-note", (hasElapsed(row.soonest_reset)
+      ? `Soonest known reset was due ${relative(row.soonest_reset)}`
+      : `Soonest known reset ${relative(row.soonest_reset)}`)
+      + (hasElapsed(row.oldest_reset)
+        ? ` · all known windows have refilled (by ${utc(row.oldest_reset)})`
+        : ` · all known windows reset by ${utc(row.oldest_reset)}`)));
   }
   card.append(node("p", "quota-signal", `Signal: ${String(row.signal || "unknown")}`));
   return card;
