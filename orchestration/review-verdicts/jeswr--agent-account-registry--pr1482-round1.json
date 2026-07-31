@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1482,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "cfd10fd0e7967449e1f90653a1172ad1b4b1058c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe added self-test exercises the previously uncovered GITHUB_OUTPUT write for valid, invalid, and network-unknown results across both verified-private and redacted-public alert routes. Its exact single-line assertion detects a dropped, coarsened, unterminated, or widened machine output, while the paired stdout assertion independently confirms that verdict, detail, expiry, and days-left remain absent from the public log on the same invocation. Environment and probe state are restored by the existing finally blocks. I found no correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
