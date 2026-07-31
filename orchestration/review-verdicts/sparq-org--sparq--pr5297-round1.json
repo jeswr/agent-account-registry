@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5297,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9821d99a90f1bbba773e63e66a117b6dd5ff7550",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly centralizes fail-closed rejection of SPARQL dataset clauses and applies it to all four query-text fragment gates. `recheck` inherits the rejection through `fragment_patterns`, while the existing wave-1 behavior is preserved through the same helper. The added test covers FROM, FROM NAMED, mixed clauses, SELECT/ASK, every affected public entry point, the indirect recheck path, the shared rejection reason, and a dataset-free control. The documentation accurately explains the consumer-honesty issue and retains the required research-grade/external-audit caveat. No correctness, soundness, security, or test-validity defect was found.",
+  "verdict": "approve"
+ }
+}
