@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4909,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f26659dbfd243272ad642e3f0204a12a8cda6e4f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains a documentation-only correction of XPath F&O 3.1 citations across the generator, generated Noir fixture, harness script, and README. The corrected section references are consistent: op:numeric-divide \u00a74.2.4, op:numeric-integer-divide \u00a74.2.5, fn:round \u00a74.4.4, fn:substring \u00a75.4.3, and casting to xs:integer \u00a719.1.2.4. Generator strings and checked-in generated output remain synchronized, executable assertions are unchanged, and no test has been weakened or made vacuous. No prompt-injection-like instruction appears in the diff. With zero findings in both rounds, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
