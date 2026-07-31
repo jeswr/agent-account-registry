@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1346,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4e6fc2b5dd2b968aa833ebc4f1479c8f186542f4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "S6 tells the operator to run `ledger-invariant.py --root .`, but that program accepts the checkout root as a positional argument and has no `--root` option. S8 similarly invokes `backfill-provenance.py --policy-file policy/repos.toml`, while the program exposes `--routing-file` and no `--policy-file`. The former makes the pre-push invariant check fail before validating anything; the latter prevents the promised recovery of create-only provenance records. A note to check `--help` does not make an explicitly supplied destructive runbook command sound.",
+    "file": "research/536-ledger-history-purge-runbook.md",
+    "fix_hint": "Replace the examples with commands accepted by the checked-in CLIs (for example, pass `.` positionally to `ledger-invariant.py` and use the actual routing-file option for backfill), and verify both dry-run/apply sequences against `--help` before presenting them as the recovery path.",
+    "severity": "major",
+    "title": "Load-bearing validation and reconciliation commands use nonexistent options"
+   },
+   {
+    "body": "S2 deliberately leaves `worker.yml`, `review-fix.yml`, `mint-provenance.yml`, and `backfill-provenance.yml` enabled because they are workflow-dispatch-only, then S3 merely observes that the queues are empty twice. That observation does not prevent a maintainer, automation, retry, or API caller from dispatching one after the second check and before the force-update. These workflows contain lease and/or create-only ledger write paths, so the runbook's claimed write exclusion is not enforced. `--force-with-lease` only detects commits already present when the lease expectation is evaluated; it does not replace disabling every entry point, and a post-update writer based on stale state remains a separate risk.",
+    "file": "research/536-ledger-history-purge-runbook.md",
+    "fix_hint": "Disable every workflow capable of writing the ledger, including workflow-dispatch-only entry points, before draining. Record the complete disabled set, keep it disabled through verification, and re-enable that same set afterward. If any entry point cannot be disabled, add a concrete server-side or workflow-level maintenance gate that fails closed.",
+    "severity": "major",
+    "title": "Quiesce leaves manually dispatchable ledger writers armed"
+   }
+  ],
+  "progress": null,
+  "summary": "The design record has useful scope analysis, but the proposed operator procedure is not executable as written and does not actually establish the quiescent write window on which the destructive force-update depends. Two documented commands use nonexistent CLI options, and several manually dispatchable ledger writers remain enabled throughout the window. Because this is a history-destroying trust-plane runbook, those are major correctness defects rather than editorial nits.",
+  "verdict": "request_changes"
+ }
+}
