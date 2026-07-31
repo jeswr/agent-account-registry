@@ -1461,7 +1461,13 @@ def _self_test():
     policy_resolve = load_sibling("policy-resolve.py", "registry_policy_resolve")
     policy_doc = tomllib.load(open(os.path.join(root, "policy/repos.toml"), "rb"))
     SELF_REPO = "jeswr/agent-account-registry"
-    SOUNDNESS = (["opus5"], "registry-reviewer", True)
+    # The SOUNDNESS verdict a trust-plane label set must produce in BOTH resolvers: the security
+    # override's chain + human escalation. [#1397] The AGENT is `registry-impl`, not the reviewer:
+    # TRUST_PLANE_ROLE is `impl`, i.e. these are IMPLEMENTATION lanes, and both resolvers now take
+    # the persona from the role row so the run is handed a brief that authorises editing. The
+    # posture this block exists to pin — opus5-only + escalate=True — is unchanged, and the
+    # `match_labels` keyword list the arm-side classifier reads is asserted separately above.
+    SOUNDNESS = (["opus5"], "registry-impl", True)
 
     def resolved(labels):
         """(derived role, route-resolve verdict, policy-resolve verdict) for a POST-TRIAGE label

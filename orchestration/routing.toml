@@ -101,6 +101,25 @@ agent = "registry-impl"
 # consumed by dispatch (escalate_starved) AND the substring keywords here are read by the review
 # lane's arm-side classifier so an approved trust-surface PR is HUMAN-armed, never auto-armed.
 #
+# WHAT THE OVERRIDE DOES *NOT* DECIDE (#1397): the PERSONA. With `persona_from_role = true` both
+# resolvers take `agent` from the issue's ROLE row whenever it declares one, and fall back to the
+# `agent` below only for a ROLELESS issue. A security override answers "how much soundness does
+# this surface need?" — chain, escalate, and the arm-side keyword union. It does not answer "is
+# this run supposed to WRITE code?"; the `role:*` label does. While it did, every trust-plane
+# IMPLEMENTATION issue ({role:impl, area:worker|review-loop|dispatch|groom|set-up-account}) was
+# dispatched under `.claude/agents/registry-reviewer.md` — Read/Glob/Grep, byte-identical tree, "a
+# single honest verdict, never a fix" — so the areas this repo most needs implemented were the ones
+# instructed not to. `role:review`/`role:soundness` still resolve to registry-reviewer through
+# their own rows, and the keyword list below is untouched, so the arm gate is exactly as it was.
+#
+# DECLARED HERE, NOT DEFAULTED IN A RESOLVER, and that is load-bearing: PLAN runs the TARGET's own
+# scripts/route-resolve.py while CLAIM runs the registry's scripts/policy-resolve.py, and
+# dispatch-claim._route_matches requires EXACT equality of `agent`. A rule only one side
+# implemented would raise RouteDivergenceError for every matched issue on every tick. Because the
+# rule is DATA, a target whose table omits it (sparq-org/sparq today) keeps the pre-#1397 behaviour
+# on BOTH sides — mirror this key into a target's own routing.toml only once its briefs carry the
+# `capability:` declaration (AGENTS.md) and its route-resolve.py copy reads the key.
+#
 # `security` (PR #595 review finding 1) is a Phase-1 trigger in its OWN right, not only via an
 # area:* section: scripts/triage.py maps the `kind:security` label to the trust-plane role
 # (TRUST_PLANE_ROLE), and before this keyword existed such an issue matched NO security rule — so
@@ -116,8 +135,9 @@ match_labels = [
   "zk", "mpc", "crypto", "auth", "e2ee", "security",
 ]
 model_chain = ["opus5"]
-agent = "registry-reviewer"
+agent = "registry-reviewer"    # ROLELESS issues only (#1397) — a role:* label directs the persona.
 escalate = true
+persona_from_role = true       # #1397, see "WHAT THE OVERRIDE DOES *NOT* DECIDE" above.
 
 # ---------------------------------------------------------------------------------------------------
 # ROLE ROUTES. OPUS 5 is the primary code-writer (maintainer directive 2026-07-26: "Opus5 should
@@ -204,7 +224,8 @@ agent = "registry-impl"
 # "a starved pinned chain DEFERS (defer-not-fallback)" self-test. NOT `escalate = true` (that
 # flips a starved item to needs:user; this rule wants defer+retry). On THIS repo most infra
 # surfaces (dispatch/worker/set-up-account/review-loop/groom) are trust surfaces matched by the
-# security override above, which still WINS (opus + human arm) — correct and unchanged; role:ci
+# security override above, whose CHAIN still WINS (opus + human arm) — correct and unchanged;
+# the PERSONA comes from this row (#1397), so a trust-surface CI issue runs registry-ci; role:ci
 # covers the residual CI plumbing (.github/workflows etc., triage labels area:ci/area:workflows).
 # Repos onboarded to the registry inherit this rule — mirror a frontier-only `role = "ci"` chain
 # into each target's routing.toml (sparq-org/sparq carries it, PR #3422).

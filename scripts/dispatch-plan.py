@@ -203,8 +203,11 @@ def _self_test():
     sec = compute_ready([iss(2, R + ["priority:P0", "role:impl", "area:worker"])])
     row = plan_dispatch(sec, doc)[0]
     chk("worker -> opus5 only", row["model_chain"], ["opus5"])
-    chk("worker -> reviewer/escalate", (row["agent"], row["escalate"]),
-        ("registry-reviewer", True))
+    # [#1397] The override still supplies the soundness chain + the human-arm escalation; the
+    # PERSONA comes from `role:impl`, because a trust-surface IMPLEMENTATION row must be planned
+    # for a brief that authorises editing (`registry-reviewer` is verdict-only).
+    chk("worker -> implementing persona/escalate", (row["agent"], row["escalate"]),
+        ("registry-impl", True))
     chk("worker role stays declared", row["role"], "impl")
 
     # a docs issue -> its route (haiku-led).

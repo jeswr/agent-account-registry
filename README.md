@@ -262,8 +262,35 @@ a rolling `data/cache-affinity.json`), never in the public repos.
   (retried next tick, defer-not-fallback) instead of degrading tier — deliberately not
   `escalate = true`, which would flip a starved item to `needs:user`. Where an infra surface is
   also a trust surface (dispatch/worker/set-up-account/review-loop/groom), the security
-  `match_labels` override still wins (opus + trust-surface audit; Decision 7 revised 2026-07-18) — stricter than the frontier floor,
-  unchanged.
+  `match_labels` override's **chain** still wins (opus + trust-surface audit; Decision 7 revised 2026-07-18) — stricter than the frontier floor,
+  unchanged. Its **agent** does not: see the persona rule below.
+
+- **A security `match_labels` override supplies the chain and the escalation; the `role:*` label
+  supplies the PERSONA** (#1397). The override answers *how much soundness this surface needs* —
+  `model_chain`, `escalate`, and the keyword union the arm-side classifier reads; it does not
+  answer *whether this run is meant to write code*. While it did, every trust-plane
+  **implementation** issue on this repo
+  (`{role:impl, area:worker|review-loop|dispatch|groom|set-up-account}`) was dispatched under
+  `.claude/agents/registry-reviewer.md` — a verdict-only brief that forbids editing — so the areas
+  the registry most needs implemented were exactly the ones instructed not to. Machine-readable
+  form, in the target's own routing table, on the `match_labels` route:
+
+  ```toml
+  persona_from_role = true     # chain + escalate stay the override's; `agent` comes from the
+                               # issue's role route. ROLELESS issues keep the override's agent.
+  ```
+
+  Like `chain_preference`, it is **data, not a resolver default**, and for a sharper reason:
+  `dispatch-claim._route_matches` compares `agent` for **exact** equality, so a rule only one
+  resolver implemented would raise `RouteDivergenceError` for every security-labelled issue on
+  every tick. A target that omits the key (`sparq-org/sparq` today) resolves exactly as before on
+  both sides. `role:review` / `role:soundness` still resolve to `registry-reviewer` through their
+  own rows, and no keyword, chain or `escalate` value moved, so the arm gate is untouched. Each
+  brief declares the lane it can serve in its frontmatter (`capability: implement` |
+  `verdict-only`, see `AGENTS.md`); `policy-resolve.py --self-test` pins the live table against
+  the live briefs in both directions, and `cross-resolver-agreement.py` pins PLAN/CLAIM agreement
+  on the rule itself. Mirror the key into a target only once its briefs carry `capability:` and
+  its `route-resolve.py` copy reads it.
 
 - **A chain-ORDER preference belongs in the target's routing table, never in one repository's
   resolver.** Every dispatchable route is derived **twice**: PLAN runs the *target's*

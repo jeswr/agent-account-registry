@@ -12,6 +12,12 @@ state.
 Routing precedence is deterministic: security-label override > explicit role > defaults, with the
 first matching security rule winning. Defaults apply only when no role label is present. Unknown,
 disabled, malformed, or ambiguously labelled repositories/roles fail closed.
+
+That precedence governs the CHAIN. A security route that declares ``persona_from_role = true``
+yields the ``agent`` back to the issue's role route (#1397) — a soundness override says how much
+soundness a surface needs, not whether the run is meant to write code. The rule is DATA in the
+target's table, so a target that omits it resolves exactly as it did before. ``agent_capability``
+reads the resolved persona's own brief and refuses a lane it does not authorise.
 """
 import argparse
 import copy
@@ -49,6 +55,13 @@ POLICY_PATH = "policy/repos.toml"
 # bash -n / actionlint on touched shell + workflow files. Fail-closed.
 GATE_PROFILES = {"none", "lint-only", "crate-scoped", "workspace", "registry-selftest"}
 TRUST_MODES = {"collaborators"}
+# [#1397] PERSONA CAPABILITY — the machine-readable half of "may this brief run this lane?".
+# The role briefs live in the TARGET repo (worker-live.sh appends `.claude/agents/<agent>.md` as
+# the model's system prompt), so the declaration lives in that same file's frontmatter rather than
+# in a second table that could disagree with the prose. See `agent_capability`.
+AGENTS_DIR_PARTS = (".claude", "agents")
+AGENT_CAPABILITIES = {"implement", "verdict-only"}
+_CAPABILITY_RE = re.compile(r"^capability:[ \t]*([A-Za-z0-9][A-Za-z0-9_.-]*)[ \t]*$")
 # DOCS-ONLY model aliases (maintainer directive 2026-07-18): terra + sonnet may appear ONLY in a
 # docs-role route. Any OTHER resolved route (defaults, a security override, or a non-docs role)
 # carrying one is a routing-document defect and fails CLOSED at validation time — structural
@@ -372,6 +385,20 @@ def _reject_docs_only(chain, where):
             "terra/sonnet are docs-only (maintainer directive 2026-07-18)")
 
 
+def _reject_persona_from_role(route, where):
+    """`persona_from_role` is meaningful ONLY on a match_labels (security) route.
+
+    [#1397] It answers "does this OVERRIDE yield the persona back to the role row?", which is not a
+    question a role route or `[defaults]` can be asked — they ARE the role/roleless answer. A
+    declaration there would be silently inert, which is the shape that makes an operator believe a
+    rule is live when it is not, so it fails CLOSED at validation time instead.
+    """
+    if "persona_from_role" in route:
+        raise PolicyError(
+            f"{where} declares persona_from_role, which is only meaningful on a match_labels "
+            "(security) route")
+
+
 def _validated_routing(routing_doc):
     if not isinstance(routing_doc, dict):
         raise PolicyError("routing document must be a table")
@@ -384,6 +411,7 @@ def _validated_routing(routing_doc):
         raise PolicyError("routing defaults table is required")
     default_value = _route_value(defaults, "routing defaults", models)
     _reject_docs_only(default_value[0], "routing defaults")
+    _reject_persona_from_role(defaults, "routing defaults")
 
     routes = routing_doc.get("route", [])
     if not isinstance(routes, list):
@@ -405,7 +433,10 @@ def _validated_routing(routing_doc):
                     or any(not isinstance(keyword, str) or not keyword for keyword in keywords)):
                 raise PolicyError(f"{where} match_labels must be a non-empty string list")
             _reject_docs_only(value[0], where)
-            security_routes.append((tuple(keywords), value))
+            persona_from_role = route.get("persona_from_role", False)
+            if not isinstance(persona_from_role, bool):
+                raise PolicyError(f"{where} persona_from_role must be boolean")
+            security_routes.append((tuple(keywords), value, persona_from_role))
         else:
             role = route["role"]
             if not isinstance(role, str) or not role.strip():
@@ -414,6 +445,7 @@ def _validated_routing(routing_doc):
                 raise PolicyError(f"routing has duplicate role {role!r}")
             if role not in DOCS_ROLES:
                 _reject_docs_only(value[0], f"{where} (role {role!r})")
+            _reject_persona_from_role(route, f"{where} (role {role!r})")
             role_routes[role] = value
     # [OPUS-5] Chain-order preferences, declared BY THE TARGET in its protected routing table and
     # validated here against that table's own [models] catalog. A malformed declaration is raised
@@ -447,15 +479,46 @@ def resolve(target_repo, role_or_labels, policy_doc, routing_doc):
         raise PolicyError(f"unknown role {role!r} for target repo {target_repo!r}")
 
     routed = None
-    for keywords, value in security_routes:
+    persona_from_role = False
+    for keywords, value, from_role in security_routes:
         if any(keyword in label for label in labels for keyword in keywords):
             routed = value
+            persona_from_role = from_role
             break
     if routed is not None:
-        # A SECURITY surface is returned UNMODIFIED. An implementor-preference rule must never
-        # re-order a soundness chain: `area:gui` + `area:sparq-zk` is a ZK issue first. This
-        # matches the target-side resolver, which also returns its security route untouched.
+        # A SECURITY surface's CHAIN is returned UNMODIFIED. An implementor-preference rule must
+        # never re-order a soundness chain: `area:gui` + `area:sparq-zk` is a ZK issue first. This
+        # matches the target-side resolver, which also returns its security chain untouched.
         model_chain, agent, escalate = routed
+        # [#1397] ...but the PERSONA is ROLE-DIRECTED when the override DECLARES it so. The
+        # override answers "how much soundness does this surface need?" — its payload is
+        # `model_chain` + `escalate` + the arm-side keyword union. It does NOT answer "what LANE is
+        # this issue?"; the `role:*` label does, and only the role knows whether the run is meant
+        # to WRITE code or to return a verdict. Letting the override's own `agent` win both
+        # questions is what handed an IMPLEMENTATION run on `{role:impl, area:review-loop}` the
+        # verdict-only reviewer brief (Read/Glob/Grep, byte-identical tree, "never a fix") — so a
+        # compliant model produced no diff, and none of the implementer obligations (fail-closed
+        # posture, non-vacuous self-tests, the followups file, the draft-PR contract) reached it.
+        # The trust-plane areas are exactly the ones that most need implementing, and they were the
+        # ones told not to.
+        #
+        # DECLARED BY THE TARGET, not hard-coded here, for the reason the README states as doctrine:
+        # PLAN runs the TARGET's own `scripts/route-resolve.py` and `dispatch-claim._route_matches`
+        # requires EXACT equality of `agent`, so a rule only this side implements would raise
+        # RouteDivergenceError for every affected issue on every tick — the affected issues stop
+        # dispatching entirely. With no `persona_from_role` in the target's table this resolver
+        # returns exactly what it returned before #1397, which is what makes landing the registry
+        # side ahead of any target side a strict no-op (the `chain_preference` idiom, #730).
+        #
+        # `role_routes[role]` is total here: an unknown role already raised above. Nothing else
+        # moves — chain, escalate and `routing_security_keywords` (the arm-side classifier's
+        # source) are untouched, so a trust-surface PR is still HUMAN-armed and soundness-tiered.
+        #
+        # A ROLELESS issue keeps the override's own agent even under the declaration: with no lane
+        # declared there is nothing to direct the persona to, and this repo's override names the
+        # verdict-only reviewer, whose worst case is a run that changes nothing.
+        if persona_from_role and role is not None:
+            agent = role_routes[role][1]
     else:
         routed = role_routes[role] if role is not None else defaults
         model_chain, agent, escalate = routed
@@ -503,9 +566,80 @@ def routing_security_keywords(target_repo, policy_file=POLICY_PATH, target_root=
     routing_file = Path(target_root).joinpath(*PurePosixPath(policy["routing"]).parts)
     _, security_routes, _, _ = _validated_routing(_load_toml(routing_file, "routing file"))
     keywords = set()
-    for match_keywords, _value in security_routes:
+    for match_keywords, _value, _persona_from_role in security_routes:
         keywords.update(match_keywords)
     return sorted(keywords)
+
+
+def agent_capability(agent, target_root="."):
+    """Return the LANE a routed persona's brief authorises. FAIL-CLOSED.
+
+    [#1397] The role-directed persona above decides WHICH brief a lane gets; this is the
+    independent check that the brief it got actually authorises that lane. The declaration is a
+    `capability:` key in the YAML frontmatter of `<target_root>/.claude/agents/<agent>.md` — the
+    SAME file `worker-live.sh` appends as the model's system prompt, so the declaration and the
+    text it describes cannot drift into separate files. One of:
+
+      implement    — the brief authorises editing the checkout (the worker/fix lanes).
+      verdict-only — Read/Glob/Grep, byte-identical tree, output is a verdict (the review lane).
+
+    A missing file, missing frontmatter, missing key, duplicate key or unrecognised value RAISES
+    PolicyError. There is no "assume it can write" default: an undeclared brief is exactly the
+    state that let a verdict-only persona be handed an implementation run unnoticed.
+    """
+    if not isinstance(agent, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", agent):
+        raise PolicyError(f"unsafe routed agent name {agent!r}")
+    path = Path(target_root).joinpath(*AGENTS_DIR_PARTS) / f"{agent}.md"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PolicyError(f"agent brief {str(path)!r} is unreadable: {exc}") from exc
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise PolicyError(f"agent brief {str(path)!r} has no YAML frontmatter block")
+    declared = None
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        match = _CAPABILITY_RE.match(line)
+        if match is None:
+            continue
+        if declared is not None:
+            raise PolicyError(
+                f"agent brief {str(path)!r} declares `capability:` more than once")
+        declared = match.group(1)
+    else:
+        raise PolicyError(f"agent brief {str(path)!r} has an unterminated frontmatter block")
+    if declared is None:
+        raise PolicyError(
+            f"agent brief {str(path)!r} declares no `capability:` in its frontmatter — a persona "
+            f"with no declared lane is never routable (one of: {', '.join(sorted(AGENT_CAPABILITIES))})")
+    if declared not in AGENT_CAPABILITIES:
+        raise PolicyError(
+            f"agent brief {str(path)!r} declares unknown capability {declared!r} "
+            f"(one of: {', '.join(sorted(AGENT_CAPABILITIES))})")
+    return declared
+
+
+def assert_agent_capability(agent, required, target_root="."):
+    """Refuse a persona whose brief does not authorise ``required``. Returns the declared lane.
+
+    [#1397] The red case this exists for: `assert_agent_capability("registry-reviewer",
+    "implement", ...)` MUST raise. A worker run is an implementation lane by construction, and a
+    brief that says "your job is a single honest verdict, never a fix" cannot serve it — a
+    compliant model returns no diff and an obedient one acts against its own system prompt.
+    """
+    if required not in AGENT_CAPABILITIES:
+        raise PolicyError(
+            f"unknown required capability {required!r} "
+            f"(one of: {', '.join(sorted(AGENT_CAPABILITIES))})")
+    declared = agent_capability(agent, target_root)
+    if declared != required:
+        raise PolicyError(
+            f"routed agent {agent!r} declares capability {declared!r}, but this lane requires "
+            f"{required!r} — refusing to run a brief declared {declared!r} in the "
+            f"{required!r} lane")
+    return declared
 
 
 def _self_test():
@@ -555,6 +689,7 @@ match_labels = ["zk", "crypto"]
 model_chain = ["opus"]
 agent = "security-agent"
 escalate = true
+persona_from_role = true
 
 [[route]]
 role = "docs"
@@ -822,10 +957,57 @@ agent = "docs-agent"
         check("usage_safety_margin range validated", "accepted", "rejected")
     except PolicyError:
         check("usage_safety_margin range validated", "rejected", "rejected")
+    # [#1397] The security label still overrides the role's CHAIN and ESCALATE — and now takes the
+    # PERSONA from the role row. Non-vacuous both ways: the pre-#1397 resolver returned
+    # "security-agent" here (this line is the one that flips), and a resolver that dropped the
+    # override entirely would return ["fable", "haiku"] / escalate=False for the chain.
     secure = resolve("sparq-org/sparq", ["role:impl", "area:sparq-zk"], policy, routing)
-    check("security label overrides role", (secure["model_chain"], secure["agent"],
-                                             secure["escalate"]),
+    check("security label overrides the role CHAIN + escalate", (secure["model_chain"],
+                                                                 secure["escalate"]),
+          (["opus"], True))
+    check("...but the PERSONA comes from the ROLE row, not the override", secure["agent"],
+          "impl-agent")
+    check("a DIFFERENT role on the same security surface gets ITS OWN persona",
+          resolve("sparq-org/sparq", ["role:docs", "area:sparq-zk"], policy, routing)["agent"],
+          "docs-agent")
+    # ...and a ROLELESS security match still uses the override's own agent: with no lane declared
+    # there is nothing to direct the persona to.
+    roleless_secure = resolve("sparq-org/sparq", ["area:sparq-zk"], policy, routing)
+    check("a ROLELESS security match keeps the override's agent",
+          (roleless_secure["model_chain"], roleless_secure["agent"], roleless_secure["escalate"]),
           (["opus"], "security-agent", True))
+    # THE SAFE-TO-DEPLOY-FIRST PROPERTY (the #730 idiom, and here it is not a nicety): PLAN runs the
+    # TARGET's route-resolve.py and `dispatch-claim._route_matches` compares `agent` for EXACT
+    # equality, so a target whose table omits `persona_from_role` must resolve exactly as it did
+    # before #1397 — otherwise every security-labelled issue on that target raises
+    # RouteDivergenceError forever. Non-vacuous: this row returns "impl-agent" if the rule is ever
+    # made a resolver-side default instead of a declaration.
+    undeclared = copy.deepcopy(routing)
+    del undeclared["route"][1]["persona_from_role"]
+    check("a target that does NOT declare persona_from_role keeps the override's agent "
+          "(landing the registry side first is a strict no-op for such a target)",
+          resolve("sparq-org/sparq", ["role:impl", "area:sparq-zk"], policy,
+                  undeclared)["agent"], "security-agent")
+    explicit_false = copy.deepcopy(routing)
+    explicit_false["route"][1]["persona_from_role"] = False
+    check("...and an explicit `persona_from_role = false` is the same as omitting it",
+          resolve("sparq-org/sparq", ["role:impl", "area:sparq-zk"], policy,
+                  explicit_false)["agent"], "security-agent")
+    non_bool = copy.deepcopy(routing)
+    non_bool["route"][1]["persona_from_role"] = "true"
+    rejects("a non-boolean persona_from_role fails closed (a truthy STRING must not silently "
+            "enable a rule PLAN would not enable)", "persona_from_role must be boolean",
+            lambda: resolve("sparq-org/sparq", ["role:impl", "area:sparq-zk"], policy, non_bool))
+    misplaced_role = copy.deepcopy(routing)
+    misplaced_role["route"][0]["persona_from_role"] = True          # the role = "impl" route
+    rejects("persona_from_role on a ROLE route fails closed rather than sitting inert",
+            "only meaningful on a match_labels",
+            lambda: resolve("sparq-org/sparq", "impl", policy, misplaced_role))
+    misplaced_defaults = copy.deepcopy(routing)
+    misplaced_defaults["defaults"]["persona_from_role"] = True
+    rejects("persona_from_role in [defaults] fails closed rather than sitting inert",
+            "only meaningful on a match_labels",
+            lambda: resolve("sparq-org/sparq", ["area:misc"], policy, misplaced_defaults))
     fallback = resolve("sparq-org/sparq", ["area:docs"], policy, routing)
     check("no role uses deterministic defaults", (fallback["model_chain"], fallback["agent"]),
           (["fable"], "default-agent"))
@@ -945,11 +1127,12 @@ agent = "docs-agent"
            resolve("sparq-org/sparq", ["area:gui", "role:research"], policy,
                    pref_routing)["escalate"]),
           (["opus5"], True))
-    check("area:gui + a SECURITY surface -> soundness route, UNMODIFIED",
+    check("area:gui + a SECURITY surface -> the soundness CHAIN, UNMODIFIED by the preference "
+          "(#1397: the persona is the role's, the chain is the override's)",
           (pref_chain(["area:gui", "role:impl", "area:sparq-zk"]),
            resolve("sparq-org/sparq", ["area:gui", "role:impl", "area:sparq-zk"], policy,
                    pref_routing)["agent"]),
-          (["opus5"], "security-agent"))
+          (["opus5"], "impl-agent"))
     # ...AND THE SAME EXEMPTION WITH A CROSS-PROVIDER SOUNDNESS CHAIN. Found by mutation: with
     # today's single-model security chain (["opus5"]) the `requires` condition declines anyway, so
     # applying the preference to the security branch was an UNDETECTABLE mutation — the exemption
@@ -1044,6 +1227,117 @@ agent = "docs-agent"
            resolve("sparq-org/sparq", ["area:sparq-core", "role:impl"], policy,
                    live_shape)["model_chain"]),
           (["sol", "opus5"], ["opus5"]))
+
+    # -------------------------------------------------------------------------------------------
+    # [#1397] THE LANE INVARIANT, DRIVEN OVER THE REAL TABLE AND THE REAL BRIEFS.
+    #
+    # Enforcement lives HERE because the registry's gate profile IS the self-test suite
+    # (`registry-selftest`), exactly as triage.py enforces `SEC_KEYWORDS == match_labels` — a
+    # posture invariant over the live files, checked by the gate that every PR must pass. The
+    # fixtures above can only prove the resolver's SHAPE; only the real files can prove that this
+    # repo's own trust-plane issues now reach a brief that authorises editing.
+    repo_root = Path(__file__).resolve().parent.parent
+    live_routing = _load_toml(repo_root / "orchestration" / "routing.toml", "routing file")
+    live_policy = _load_toml(repo_root / "policy" / "repos.toml", "policy file")
+    SELF_REPO = "jeswr/agent-account-registry"
+
+    def live(labels):
+        row = resolve(SELF_REPO, labels, live_policy, live_routing)
+        return row["agent"], row["model_chain"], row["escalate"]
+
+    # DIRECTION 1 — an IMPLEMENTATION lane on a trust surface gets an EDITING brief. This is the
+    # acceptance sentence of #1397, asserted end to end: the resolved persona is read back out of
+    # `.claude/agents/<agent>.md` and its declared lane must be `implement`. Before this change
+    # the resolved agent here was `registry-reviewer`, whose brief declares `verdict-only`, so
+    # this row is red on the pre-fix resolver AND red on a brief whose declaration is wrong.
+    for trust_area in ("review-loop", "worker", "dispatch", "groom", "set-up-account"):
+        agent, chain, escalate = live(["role:impl", f"area:{trust_area}"])
+        check(f"role:impl + area:{trust_area} -> a persona that MAY EDIT",
+              (agent, agent_capability(agent, repo_root)), ("registry-impl", "implement"))
+        # ...and the soundness posture the override exists for is UNCHANGED (acceptance: the
+        # arm-side classifier + escalate behaviour for those labels are unchanged).
+        check(f"role:impl + area:{trust_area} keeps the OVERRIDE's chain + escalate",
+              (chain, escalate), (["opus5"], True))
+    # The CI persona is the second implementing lane the security override used to swallow.
+    ci_agent, ci_chain, ci_escalate = live(["role:ci", "area:dispatch"])
+    check("role:ci + area:dispatch -> registry-ci, still on the override's soundness chain",
+          (ci_agent, agent_capability(ci_agent, repo_root), ci_chain, ci_escalate),
+          ("registry-ci", "implement", ["opus5"], True))
+
+    # DIRECTION 2 — the REVIEW lane still resolves to the verdict-only reviewer. This is the half
+    # a naive "give the override an implementer" fix would have broken.
+    for review_role in ("review", "soundness"):
+        agent, chain, escalate = live([f"role:{review_role}", "area:review-loop"])
+        check(f"role:{review_role} -> registry-reviewer, verdict-only",
+              (agent, agent_capability(agent, repo_root), chain, escalate),
+              ("registry-reviewer", "verdict-only", ["opus5"], True))
+    check("role:review on a NON-trust area resolves to the reviewer too (the role row, not the "
+          "override, is what carries the review persona)",
+          live(["role:review", "area:usage"])[0], "registry-reviewer")
+
+    # THE RED CASE. A verdict-only persona is REFUSED for an implementation lane — this is the
+    # check that has teeth if some future edit points a trust route back at the reviewer.
+    rejects("a verdict-only brief is REFUSED for an implementation lane",
+            "requires 'implement'",
+            lambda: assert_agent_capability("registry-reviewer", "implement", repo_root))
+    rejects("...and the mirror: an implementing brief is REFUSED for the verdict-only lane",
+            "requires 'verdict-only'",
+            lambda: assert_agent_capability("registry-impl", "verdict-only", repo_root))
+    check("assert_agent_capability ACCEPTS the matching lane (so the two rows above are a "
+          "refusal, not a function that refuses everything)",
+          (assert_agent_capability("registry-impl", "implement", repo_root),
+           assert_agent_capability("registry-reviewer", "verdict-only", repo_root)),
+          ("implement", "verdict-only"))
+    rejects("an unknown required capability is refused, never treated as 'anything goes'",
+            "unknown required capability",
+            lambda: assert_agent_capability("registry-impl", "write", repo_root))
+
+    # EVERY persona this table can name declares a lane. A new route naming a brief with no
+    # `capability:` key must not resolve silently into either lane.
+    named_agents = sorted({live_routing["defaults"]["agent"]}
+                          | {route["agent"] for route in live_routing.get("route", [])})
+    check("every agent named by the live routing table declares a known capability",
+          {agent: agent_capability(agent, repo_root) for agent in named_agents},
+          {"registry-ci": "implement", "registry-docs": "implement",
+           "registry-impl": "implement", "registry-researcher": "implement",
+           "registry-reviewer": "verdict-only"})
+
+    # agent_capability itself fails CLOSED on every way a declaration can be absent or malformed.
+    # Without these the helper could silently return None/"" and the rows above would pass on a
+    # brief that declares nothing at all.
+    with tempfile.TemporaryDirectory() as tmp:
+        briefs = Path(tmp).joinpath(*AGENTS_DIR_PARTS)
+        briefs.mkdir(parents=True)
+        (briefs / "no-frontmatter.md").write_text("just prose\n", encoding="utf-8")
+        (briefs / "no-key.md").write_text("---\nname: x\n---\nbody\n", encoding="utf-8")
+        (briefs / "unterminated.md").write_text("---\nname: x\ncapability: implement\n",
+                                                encoding="utf-8")
+        (briefs / "twice.md").write_text(
+            "---\ncapability: implement\ncapability: verdict-only\n---\n", encoding="utf-8")
+        (briefs / "unknown-value.md").write_text("---\ncapability: whatever\n---\n",
+                                                 encoding="utf-8")
+        (briefs / "body-only.md").write_text(
+            "---\nname: x\n---\ncapability: implement\n", encoding="utf-8")
+        (briefs / "good.md").write_text("---\ncapability: implement\n---\n", encoding="utf-8")
+        rejects("a missing brief fails closed", "unreadable",
+                lambda: agent_capability("absent", tmp))
+        rejects("a brief with no frontmatter fails closed", "no YAML frontmatter",
+                lambda: agent_capability("no-frontmatter", tmp))
+        rejects("a brief with no capability key fails closed", "declares no `capability:`",
+                lambda: agent_capability("no-key", tmp))
+        rejects("an unterminated frontmatter block fails closed", "unterminated",
+                lambda: agent_capability("unterminated", tmp))
+        rejects("a duplicated capability key fails closed", "more than once",
+                lambda: agent_capability("twice", tmp))
+        rejects("an unrecognised capability value fails closed", "unknown capability",
+                lambda: agent_capability("unknown-value", tmp))
+        rejects("a `capability:` line in the BODY is not a declaration (frontmatter only)",
+                "declares no `capability:`", lambda: agent_capability("body-only", tmp))
+        rejects("a path-traversing agent name is refused before any read", "unsafe routed agent",
+                lambda: agent_capability("../../etc/passwd", tmp))
+        check("...and a well-formed brief in the same directory still reads (the rows above are "
+              "refusals, not an unreadable fixture directory)",
+              agent_capability("good", tmp), "implement")
 
     check("pure core leaves fixtures unchanged",
           policy == policy_before and routing == routing_before, True)

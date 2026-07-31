@@ -9,6 +9,24 @@ standing rules an authoring agent follows, defined here **once** so a role brief
 them instead of copying them. The role briefs under `.claude/agents/` carry their own lane
 deltas and cite this file; if a brief and this file disagree, **this file wins** — fix the brief.
 
+**Every brief declares its lane, machine-readably** (#1397). Its frontmatter carries exactly one
+`capability:` key, and it is the only place that fact is written down:
+
+- `capability: implement` — the brief authorises **editing the checkout**. It says nothing about
+  *how much* the brief may edit: `registry-docs` (prose only) and `registry-researcher` (one design
+  record) are `implement` too, because their deliverable is a diff. Bounds stay in the prose.
+- `capability: verdict-only` — Read/Glob/Grep, byte-identical tree, the deliverable is a verdict
+  (`registry-reviewer`).
+
+`scripts/policy-resolve.py` (`agent_capability` / `assert_agent_capability`) reads it and fails
+**closed** on a brief that declares nothing, declares it twice, or declares an unknown value, and
+its `--self-test` pins the live routing table against the live briefs: an implementation lane must
+resolve to an `implement` brief and the review lane to the `verdict-only` one. So **a new brief
+must declare a capability or it is unroutable**, and re-pointing a route at a persona that cannot
+serve its lane turns the gate red instead of producing a worker run that was told not to write.
+The routing side of the same fix is `persona_from_role` on the security override — see `README.md`
+§ *Standing routing rules*.
+
 A rule that is copied into several briefs drifts. This repo has a live bug of exactly that shape
 (#958: the literal `review:parked` has **four** independent definitions and two consumers are
 blind to a repoint, one of them fail-open). So: one definition, plus pointers.

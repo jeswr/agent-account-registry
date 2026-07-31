@@ -315,6 +315,36 @@ def _self_test():  # noqa: C901 — a flat sequence of assertions
     chk("PLAN and CLAIM agree on every matrix row for the cross-provider-security table",
         compare(xsec), [])
 
+    # (3b') [#1397] THE ROLE-DIRECTED PERSONA — the second rule both resolvers must implement from
+    # ONE declaration, and the one with the sharpest divergence cost: `_route_matches` compares
+    # `agent` for EXACT equality, so a rule implemented on only one side strands EVERY
+    # security-labelled issue on that target permanently, not merely mis-tiers it.
+    persona = tomllib.loads(
+        SPARQ_SHAPED.replace(SECURITY_CROSS_PROVIDER,
+                             SECURITY_CROSS_PROVIDER + "\npersona_from_role = true", 1))
+    assert persona["route"][0].get("persona_from_role") is True, \
+        "the persona_from_role fixture is stale — it no longer edits the security route"
+
+    def agent_of(doc, labels):
+        return _claim(labels, doc)[1][1]
+
+    chk("PLAN and CLAIM agree on EVERY matrix row for a table that DECLARES persona_from_role",
+        compare(persona), [])
+    chk("the declaration MOVES the persona on a security surface (so the agreement above is not "
+        "vacuous), and PLAN moves it identically",
+        (agent_of(undeclared, ("area:sparq-zk", "role:impl")),
+         agent_of(persona, ("area:sparq-zk", "role:impl")),
+         _plan(_ROUTE.resolve, ("area:sparq-zk", "role:impl"), persona)[1][1]),
+        ("sparq-reviewer", "sparq-rust-impl", "sparq-rust-impl"))
+    chk("...a ROLELESS security match keeps the override's OWN agent on both sides",
+        (agent_of(persona, ("area:sparq-zk",)),
+         _plan(_ROUTE.resolve, ("area:sparq-zk",), persona)[1][1]),
+        ("sparq-reviewer", "sparq-reviewer"))
+    chk("...and the CHAIN + escalate of that security route are untouched by the rule",
+        (_claim(("area:sparq-zk", "role:impl"), persona)[1][::2],
+         _plan(_ROUTE.resolve, ("area:sparq-zk", "role:impl"), persona)[1][::2]),
+        ((["opus5"], True), (["opus5"], True)))
+
     # (3c) [OPUS-5] THE OPUS5-ONLY `role:impl` CHAIN (registry #738) AND ITS COLLISION WITH THE
     # CARVE-OUT. Both halves are asserted, because the first is the defect and the second is the fix
     # and a table can only ship one of them.

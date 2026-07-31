@@ -124,12 +124,31 @@ def resolve(labels, doc):
             f"unknown role {role!r} — no matching role route in routing.toml")
 
     # Phase 1 — security-label overrides: any keyword is a substring of any label; first match wins.
-    # Returned UNMODIFIED: a chain-order preference expresses which IMPLEMENTOR is preferred and
-    # must never re-order a soundness chain. policy-resolve (CLAIM) makes the same exemption.
+    # The CHAIN is returned UNMODIFIED: a chain-order preference expresses which IMPLEMENTOR is
+    # preferred and must never re-order a soundness chain. policy-resolve (CLAIM) makes the same
+    # exemption.
+    #
+    # [#1397] The PERSONA, in contrast, is ROLE-DIRECTED when the override DECLARES
+    # `persona_from_role` — the identical rule, from the identical DATA, as policy-resolve.resolve
+    # (CLAIM), which `dispatch-claim._route_matches` compares for EXACT equality of
+    # (model_chain, agent, escalate). A security override says how much soundness the surface
+    # needs; the `role:*` label says whether the run is meant to WRITE code or to return a verdict.
+    # Taking the persona from the override made every trust-plane IMPLEMENTATION issue run under
+    # the verdict-only reviewer brief, which forbids editing.
+    #
+    # The rule is DATA in the target's protected routing table, never a resolver-side default, so a
+    # table that does not declare it resolves exactly as it did before #1397 and the two sides
+    # cannot split (the `chain_preference` idiom). `role_routes` membership was enforced above, so
+    # the role block always exists when `role` is not None; a ROLELESS issue keeps the override's
+    # own agent (no lane is declared, so there is nothing to direct the persona to).
     for r in routes:
         kws = r.get("match_labels")
         if kws and any(k in lb for lb in labels for k in kws):
-            return r["model_chain"], r["agent"], bool(r.get("escalate"))
+            agent = r["agent"]
+            if r.get("persona_from_role") and role is not None:
+                agent = next(rr["agent"] for rr in routes
+                             if "match_labels" not in rr and rr.get("role") == role)
+            return r["model_chain"], agent, bool(r.get("escalate"))
     # Phase 2 — explicit role route (only role blocks, never a security block).
     if role is not None:
         for r in routes:
@@ -169,11 +188,13 @@ def _self_test():
         ok = ok and good
         print(f"  {'ok  ' if good else 'FAIL'} {n}: {detail}")
 
-    # impl + a trust surface (area:worker) -> security rule wins over role -> Opus-5-led
-    # (opus tail fallback, 2026-07-24), escalate.
+    # impl + a trust surface (area:worker) -> the security rule's CHAIN wins over the role's, and
+    # escalates. [#1397] The PERSONA is the ROLE row's: an IMPLEMENTATION lane on a trust surface
+    # is still an implementation lane, and `registry-reviewer` is a verdict-only brief that
+    # forbids editing, so routing impl work to it produced no diff by construction.
     mc, ag, esc = resolve(["role:impl", "area:worker"], doc)
-    chk("impl+worker -> opus5-led/escalate", (mc, ag, esc),
-        (["opus5"], "registry-reviewer", True))
+    chk("impl+worker -> opus5-led/escalate, with an IMPLEMENTING persona", (mc, ag, esc),
+        (["opus5"], "registry-impl", True))
     # dispatch is a trust surface too.
     mc, ag, esc = resolve(["role:impl", "area:dispatch"], doc)
     chk("impl+dispatch -> opus5/escalate", (mc, esc), (["opus5"], True))
@@ -305,6 +326,18 @@ escalate = true
 ''')
     chk("security beats a role listed before it (order-independent)",
         resolve(["role:impl", "area:worker"], reordered), (["opus"], "security-agent", True))
+    # [#1397] ...and the row above doubles as the SAFE-TO-DEPLOY-FIRST proof: `reordered` declares
+    # no `persona_from_role`, so it resolves exactly as it did before #1397. That matters because
+    # PLAN runs the TARGET's copy of this file while CLAIM runs the registry's policy-resolve, and
+    # `dispatch-claim._route_matches` compares `agent` for EXACT equality — a resolver-side default
+    # would defer every security-labelled issue on an unmigrated target forever.
+    declared = _copy.deepcopy(reordered)
+    declared["route"][1]["persona_from_role"] = True
+    chk("[#1397] with persona_from_role DECLARED, the persona is the ROLE row's while the chain "
+        "and escalate stay the override's",
+        resolve(["role:impl", "area:worker"], declared), (["opus"], "impl-agent", True))
+    chk("[#1397] a ROLELESS security match still uses the override's own agent even when declared",
+        resolve(["area:worker"], declared), (["opus"], "security-agent", True))
     chk("role still resolves when no security label matches",
         resolve(["role:impl", "area:usage"], reordered), (["fable", "haiku"], "impl-agent", False))
     chk("no security + no matching role -> defaults",
