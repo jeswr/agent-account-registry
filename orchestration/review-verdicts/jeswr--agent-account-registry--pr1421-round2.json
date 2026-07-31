@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1421,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0d90f065c7665f8ec1e9cbd0a12abbee62bb200a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`assert_agent_capability` is only called from `_self_test`; no dispatch, claim, worker, fix, or review execution path invokes it. The live-table assertions protect this repository's current five personas at merge time, but they do not make an incompatible persona `unroutable` as AGENTS.md and this module claim. In particular, another target can adopt `persona_from_role`, route an implementation role to a brief declaring `verdict-only` (or lacking a declaration), and the production resolver still returns and dispatches that agent. A helper exercised only by a gate fixture is not a binding lane check.",
+    "file": "scripts/policy-resolve.py",
+    "fix_hint": "Invoke `assert_agent_capability` at the production boundary that hands a resolved persona to each mutating/review lane, using the target checkout and the lane's required capability, and add end-to-end red tests showing a mismatched or missing declaration prevents execution. If capability is intentionally only a repository-local CI invariant, narrow the documentation and remove the unsupported general unroutability claim.",
+    "severity": "major",
+    "title": "Capability declarations are never enforced by a production lane"
+   },
+   {
+    "body": "The CLAIM resolver requires `persona_from_role` to be boolean and rejects it on defaults or role routes. PLAN instead uses `r.get(\"persona_from_role\")` by truthiness and performs no placement validation. Thus `persona_from_role = \"true\"` silently enables role-directed persona selection in PLAN while CLAIM raises `PolicyError`; misplaced keys are silently inert in PLAN while CLAIM rejects the document. This violates the stated exact resolver agreement and can strand work at claim rather than failing at planning. The new tests cover these malformed cases only on policy-resolve, so cross-resolver-agreement cannot detect the seam.",
+    "file": "scripts/route-resolve.py",
+    "fix_hint": "Validate `persona_from_role` identically in route-resolve before matching: permit only booleans on `match_labels` routes, reject the key on role routes and defaults, and add cross-resolver tests for a non-boolean value and both misplaced forms that require both sides to reject.",
+    "severity": "major",
+    "title": "PLAN accepts malformed persona_from_role declarations that CLAIM rejects"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe live #1397 routing change sends implementation and review roles to the intended personas while preserving the security chain and escalation. However, the new lane declaration is not actually enforced in any production dispatch/claim path, and the PLAN resolver does not validate the new routing key with the same fail-closed rules as CLAIM. Those gaps make the documented unroutability and exact cross-resolver contract incomplete.",
+  "verdict": "request_changes"
+ }
+}
