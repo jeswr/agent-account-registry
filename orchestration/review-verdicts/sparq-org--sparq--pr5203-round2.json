@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5203,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ef24a46d8a1aa2cdce559815720e4bd582fec54e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 confirms the prior approval: all four cargo-llvm-cov jobs receive the same job-level RUSTFLAGS value, the engine run/merge compilation inputs remain aligned, and the static gate checks both presence and cross-job equality. The focused tests exercise missing and step-only settings, direct and install-action detection, divergent values, scalar parsing, live workflow coverage, and explicit non-vacuity for the engine pair. The 17-test suite, built-in self-test, and live workflow scan all pass at the PR head. Claims remain appropriately qualified where cargo-llvm-cov behavior was not measured locally, and no hostile instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
