@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4804,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9a39e41cb23832dd43fc3ff827c6c98a87d80524",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The bounded status delta is sound as scoped. It enumerates MSB-first changed slots, fails closed for non-newer snapshots, coverage changes, and limit overflow, and keeps freshness as a separate load-bearing precondition. The exhaustive differential test checks the key safety implication across every one-byte snapshot pair and relevant freshness states, while the real-gate test confirms the selected revoked slot is denied. Public exports and access-control documentation are updated, and the limitations around staleness, per-list scope, re-materialisation, and absent in-reasoner retraction are stated honestly.",
+  "verdict": "approve"
+ }
+}
