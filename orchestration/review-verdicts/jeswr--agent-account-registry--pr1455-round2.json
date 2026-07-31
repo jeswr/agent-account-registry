@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1455,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "94f27d2f11f8b6ab820224dc683773423b615672",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-1 blocker is fixed. The implementation now separates credential fallback eligibility from cross-repository deduplication: same-repository routes with distinct tokens can still retry credentials, but cannot enter the superseded-copy close path. The new stateful regression phase covers exactly that supported configuration and verifies that the live firing issue remains open and that no close or comment is issued. I found no remaining correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
