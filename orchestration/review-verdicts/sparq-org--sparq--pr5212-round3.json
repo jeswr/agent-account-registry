@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5212,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9e04e3a06db9617eca127ce368506b2498217e9a",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The diff repeatedly says the one-`save-if` posture is pinned by `scripts/tests/test_mergequeue_cache_posture.py`, but that test's `with_value` helper returns the first matching key and never rejects a second non-comment key. Thus the duplicate-key regression found in round 1 would still pass. This is materially the same minor finding as round 2.",
+    "file": ".github/workflows/ci.yml",
+    "fix_hint": "Extend the structural posture test to count non-comment `save-if:` entries in every rust-cache `with:` mapping and assert that the count is exactly one; alternatively narrow the comments so they do not claim key uniqueness is pinned.",
+    "severity": "minor",
+    "title": "Cited posture test still does not pin mapping-key uniqueness"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 leaves the workflow correction internally consistent: the affected rust-cache mappings each contain one main-only `save-if`, and the coverage measurement shards share `coverage-measure` without claiming workspace artifacts are cached. The prior minor finding remains unchanged: the newly repeated statement that `scripts/tests/test_mergequeue_cache_posture.py` pins this posture is stronger than the test, because `with_value` returns the first matching key and does not reject duplicate non-comment keys. The exact duplicate-key regression from round 1 would therefore still pass. This is a test-coverage/documentation precision gap rather than a defect in the corrected workflow, so approval remains appropriate.",
+  "verdict": "approve"
+ }
+}
