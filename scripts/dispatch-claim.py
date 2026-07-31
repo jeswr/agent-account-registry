@@ -3353,6 +3353,49 @@ def review_enrolment_class_error(record):
     return None
 
 
+class WorkflowSeamUnmeasurable(Exception):
+    """The workflow-seam extraction could not RUN — as distinct from running and reporting that the
+    seam is unwired.
+
+    [registry #1405] Raised by `_workflow_step_python` for a missing TOOLCHAIN dependency only
+    (PyYAML), never for anything the workflow itself can be wrong about. A missing anchor, a
+    reflowed step or a file that no longer parses are all real seam findings and keep raising
+    `AssertionError`; only "this container cannot parse YAML at all" is an ENVIRONMENT fact, and it
+    is the one fact the probes must not report as a wiring gap. MEASURED: without PyYAML,
+    `review_fix_admits_orchestrator_class` swallowed `ModuleNotFoundError` in its blanket
+    `except Exception: return False` and `enrolment_enable_error` then reported review-fix.yml's
+    resolve step as "not ready" on EVERY tree, master included — sending an operator to
+    research/657-orchestrator-pr-admission.md §7.4 to close a wiring gap that does not exist, and
+    (the worse direction) teaching them to dismiss a REAL un-wiring as "just the yaml thing"."""
+
+
+class Unmeasurable:
+    """A wiring fact that could not be MEASURED, as distinct from one measured and found absent.
+
+    [registry #1405] FALSY on purpose, so it is indistinguishable from a refusal to every `if not
+    ok` interlock downstream: the DECISION must not change (an unmeasurable seam is never proof of
+    wiring, so the interlock stays ARMED and the lane still fails closed). Only the MESSAGE changes,
+    and the message is the whole product — a gate whose red rows cannot tell an environment failure
+    from a wiring gap is a gate whose result is environment-dependent, which is the one property a
+    gate must not have.
+
+    `reason` names the missing dependency so the refusal is actionable without a traceback."""
+
+    __slots__ = ("reason",)
+
+    def __init__(self, reason):
+        self.reason = str(reason)
+
+    def __bool__(self):
+        return False
+
+    def __repr__(self):
+        return f"Unmeasurable({self.reason!r})"
+
+    def __str__(self):
+        return self.reason
+
+
 def enrolment_enable_error(policy_doc, claim_admits, rf_admits, outcome_admits, arm_refuses):
     """Why the tree must NOT ship an enabled `review_enrolment_authors` yet, or None.
 
@@ -3387,11 +3430,15 @@ def enrolment_enable_error(policy_doc, claim_admits, rf_admits, outcome_admits, 
     A PURE function of (policy document, four wiring facts) so the self-test can exercise it with
     a repo that DOES enable enrolment. Asserting only against the live policy — which enables it
     for nobody — makes the guard unfalsifiable: deleting it changes no outcome, and a mutation
-    run says so. The live policy is then one more input to the same function, not the only one."""
-    unwired = [name for name, ok in (
-        ("CLAIM", claim_admits), ("review-fix.yml resolve", rf_admits),
-        ("review-fix.yml outcome", outcome_admits),
-        ("the arm refuses the class", arm_refuses)) if not ok]
+    run says so. The live policy is then one more input to the same function, not the only one.
+
+    [#1405] A fact may also arrive as `Unmeasurable` — falsy, so the REFUSAL is identical, but
+    reported as "not measurable" rather than "not ready" and naming the missing dependency. The two
+    states have the same fail-closed answer and completely different operator actions."""
+    facts = (("CLAIM", claim_admits), ("review-fix.yml resolve", rf_admits),
+             ("review-fix.yml outcome", outcome_admits),
+             ("the arm refuses the class", arm_refuses))
+    unwired = [name for name, ok in facts if not ok]
     if not unwired:
         return None
     repos = (policy_doc or {}).get("repos") if isinstance(policy_doc, dict) else None
@@ -3400,6 +3447,18 @@ def enrolment_enable_error(policy_doc, claim_admits, rf_admits, outcome_admits, 
         if isinstance(row, dict) and row.get("review_enrolment_authors"))
     if not configured:
         return None
+    unmeasured = [f"{name} ({ok.reason})" for name, ok in facts
+                  if isinstance(ok, Unmeasurable)]
+    if unmeasured:
+        not_ready = [name for name, ok in facts
+                     if not ok and not isinstance(ok, Unmeasurable)]
+        return (f"policy enables review_enrolment_authors for {configured} while the review lane's "
+                f"wiring is NOT MEASURABLE here: {unmeasured}"
+                + (f"; and these consumers are not ready: {not_ready}" if not_ready else "")
+                + " — the interlock stays ARMED, because a seam that cannot be read is never proof "
+                  "that it is wired. But this is an ENVIRONMENT failure and NOT a wiring gap: "
+                  "install the missing dependency and re-run before reading "
+                  "research/657-orchestrator-pr-admission.md section 7.4.")
     return (f"policy enables review_enrolment_authors for {configured} while the review lane's "
             f"downstream consumers are not ready: {unwired} — every enrolled PR would be "
             "enumerated by PLAN and then refused, dropped, or (at the arm) MERGED on a "
@@ -8988,8 +9047,24 @@ _WK_ADOPT_PACKAGE_CALL = "lease_schema.plan_package(areas)"
 def _workflow_step_python(workflow, job, anchor, end_anchor, what, source=None):
     """`_review_fix_step_python` generalised over the WORKFLOW file, so the same PARSED extraction
     can pin worker.yml's two copies of the partition reduction (the review of #702 measured that
-    both could be reverted to the pre-#112 rule with the whole enrolled suite staying green)."""
-    import yaml  # self-test-only, same lazy import shape as resolve-conflicts.validate_syntax_blob
+    both could be reverted to the pre-#112 rule with the whole enrolled suite staying green).
+
+    [#1405] The lazy import is the ONE failure here that is about the container rather than about
+    the workflow, so it raises `WorkflowSeamUnmeasurable` instead of the bare `ModuleNotFoundError`
+    that every consumer of this helper used to inherit — the swallowing probes turned it into "the
+    workflow does not admit the class", and the direct self-test callers died on a traceback that
+    named neither the dependency nor the fix. Every OTHER failure below stays an `AssertionError`,
+    because every other failure IS a finding about the seam."""
+    try:
+        # self-test-only, same lazy import shape as resolve-conflicts.validate_syntax_blob
+        import yaml
+    except ImportError as exc:
+        raise WorkflowSeamUnmeasurable(
+            f"PyYAML is not installed, so {workflow} cannot be parsed and the {what} pin is NOT "
+            f"MEASURABLE — this says nothing about whether that seam is wired ({exc}). pr-gate.yml "
+            "installs PyYAML version+hash-locked before the enrolled suite runs; a local or "
+            "container run needs `pip install pyyaml` to exercise the workflow-seam pins."
+        ) from None
     if source is None:
         path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / workflow
         assert path.is_file(), f"{workflow} not found for the {what} pin: {path}"
@@ -9258,12 +9333,18 @@ def review_fix_admits_orchestrator_class(source=None):
          let a fix run inherit the waiver and PUSH COMMITS to the PR head on a self-attested
          record. Only driving the seam in BOTH modes can see it.
 
-    POSITIVE PROOF ONLY. Any extraction failure, exception, or ambiguity reads False, which keeps
-    the interlock ARMED."""
+    POSITIVE PROOF ONLY. Any extraction failure, exception, or ambiguity reads falsy, which keeps
+    the interlock ARMED.
+
+    [#1405] ...but "the seam refuses" and "the seam could not be read at all" are returned as
+    DIFFERENT falsy values. Both keep the interlock armed — the answer is unchanged — while only
+    the second can honestly be reported as an environment failure rather than a wiring gap."""
     try:
         block = _review_fix_step_python(_RF_ADMISSION_ANCHOR, _RF_ADMISSION_END,
                                         "provenance admission consumption", source=source)
         compiled = compile(block, "<review-fix.yml resolve admission>", "exec")
+    except WorkflowSeamUnmeasurable as exc:   # the toolchain, not the workflow — say which
+        return Unmeasurable(str(exc))
     except Exception:            # noqa: BLE001 — an unreadable seam is NOT proof of wiring
         return False
 
@@ -9358,14 +9439,20 @@ def review_fix_identity_admits_orchestrator_class(source=None):
          so fact 1 caught it. Now that the class no longer reaches this branch at all, that
          coincidence is gone and the case has to be probed on its own.
 
-    POSITIVE PROOF ONLY. Any extraction failure, exception or ambiguity reads False, which leaves
+    POSITIVE PROOF ONLY. Any extraction failure, exception or ambiguity reads falsy, which leaves
     the mint refusing. This function is the SELF-REMOVING half of the interlock: it re-derives its
     answer from the workflow on every call, so the day the identity gate changes again it follows
-    by itself and nothing has to be remembered and deleted."""
+    by itself and nothing has to be remembered and deleted.
+
+    [#1405] Same two-falsy-values split as `review_fix_admits_orchestrator_class`: a container that
+    cannot parse YAML reads `Unmeasurable`, which still refuses, but names the dependency instead
+    of accusing the identity gate."""
     try:
         block = _review_fix_step_python(_RF_IDENTITY_ANCHOR, _RF_IDENTITY_END,
                                         "target-App identity gate", job="run", source=source)
         compiled = compile(block, "<review-fix.yml run identity>", "exec")
+    except WorkflowSeamUnmeasurable as exc:   # the toolchain, not the workflow — say which
+        return Unmeasurable(str(exc))
     except Exception:            # noqa: BLE001 — an unreadable seam is NOT proof of wiring
         return False
 
@@ -13563,6 +13650,36 @@ def _self_test():
         "the refusal must NAME the offending repo — a generic message is not actionable"
     assert "the arm refuses the class" in _named and "CLAIM" in _named, \
         "the refusal must NAME which legs are not ready — a bare boolean is not actionable"
+    # (b1) [#1405] NOT MEASURABLE IS NOT NOT-READY. A container without PyYAML cannot parse the
+    #      workflow at all, so the review-fix probes cannot RUN — and the blanket `except
+    #      Exception: return False` reported that as "review-fix.yml resolve is not ready" on
+    #      EVERY tree, master included. Two operator errors follow from one message: a wiring gap
+    #      is chased in §7.4 where none exists, and (worse) a REAL un-wiring is later dismissed as
+    #      "just the yaml thing". The DECISION must not move — an unreadable seam is never proof of
+    #      wiring — so these rows pin that the refusal still happens and only the message changes.
+    _unmeasured = Unmeasurable("PyYAML is not installed")
+    assert not _unmeasured, \
+        ("the sentinel MUST be falsy: every interlock downstream is an `if not ok`, so a truthy "
+         "'could not measure' would stand the whole gate down on a missing dependency")
+    _um_error = enrolment_enable_error(_enabled_doc, True, _unmeasured, True, True)
+    assert _um_error is not None, \
+        "an UNMEASURABLE consumer must still refuse an enabling policy — fail closed, as before"
+    assert "NOT MEASURABLE" in _um_error and "PyYAML" in _um_error, (
+        "the refusal must say the seam could not be MEASURED and NAME the missing dependency, or "
+        "the operator cannot tell an environment failure from a wiring gap", _um_error)
+    assert "not ready" not in _um_error, (
+        "with the only gap unmeasurable, the refusal must NOT report a consumer as not ready — "
+        "that misdirection is the whole of #1405", _um_error)
+    #      ...and a MIXED tree reports both, separately: an unmeasurable leg must not swallow a
+    #      genuinely unwired one (that would trade one conflation for the other).
+    _mixed_error = enrolment_enable_error(_enabled_doc, False, _unmeasured, True, True)
+    assert ("NOT MEASURABLE" in _mixed_error and "not ready" in _mixed_error
+            and "CLAIM" in _mixed_error), (
+        "a tree with one unmeasurable and one unwired consumer must name BOTH", _mixed_error)
+    #      ...and the ordinary all-measured refusal is untouched: no "not measurable" wording
+    #      leaks onto a message about four honestly-unwired legs.
+    assert "NOT MEASURABLE" not in _named, \
+        "a measured refusal must not claim anything was unmeasurable"
     # (c) THE INPUT PROBES ARE THEMSELVES FALSIFIABLE, and they fail CLOSED. Each row drives the
     #     probe with a MUTATED consumer and demands the answer change.
     _probe_record = orchestrator_probe_record()
@@ -13635,6 +13752,59 @@ def _self_test():
          "`draft` "
          "dispatches a review run per tick and kills it — the exact outage the interlock exists "
          "to prevent. #759's probe reported this state as WIRED.")
+    # ...and [#1405] the probe distinguishes "the seam REFUSES" from "the seam could not be READ".
+    # Every row above runs on a tree that HAS PyYAML, so the distinction would be untested code
+    # exactly where it matters unless the missing dependency is simulated: `None` in `sys.modules`
+    # is the documented way to make an `import` raise `ImportError`, and it reproduces the
+    # container failure byte for byte. Both review-fix probes are driven, because both carry the
+    # same blanket handler that used to turn a missing dependency into a wiring accusation.
+    _saved_yaml_module = sys.modules.get("yaml")
+    sys.modules["yaml"] = None
+    try:
+        _um_probes = (("review-fix.yml resolve admission",
+                       review_fix_admits_orchestrator_class()),
+                      ("review-fix.yml target-App identity",
+                       review_fix_identity_admits_orchestrator_class()))
+    finally:
+        if _saved_yaml_module is None:
+            del sys.modules["yaml"]
+        else:
+            sys.modules["yaml"] = _saved_yaml_module
+    for _um_what, _um_answer in _um_probes:
+        assert isinstance(_um_answer, Unmeasurable), (
+            f"without PyYAML the {_um_what} probe must report NOT MEASURABLE, never a plain False "
+            "— False is the answer that means 'the workflow refuses the class', and reporting one "
+            f"as the other is #1405: got {_um_answer!r}")
+        assert not _um_answer, (
+            f"the {_um_what} probe's not-measurable answer must still be FALSY — the interlock "
+            "stays armed either way; only the message differs")
+        assert "PyYAML" in _um_answer.reason, (
+            f"the {_um_what} probe must NAME the missing dependency, or the operator is sent to "
+            f"research/657-orchestrator-pr-admission.md §7.4 for an environment failure: "
+            f"{_um_answer.reason!r}")
+    assert review_fix_admits_orchestrator_class() is True, \
+        "the missing-PyYAML fixture leaked — the probes no longer see the real workflow"
+    # ...and the split is NARROW, which is the half that keeps it honest in the OTHER direction: a
+    # moved anchor, a renamed job or a workflow that no longer parses are FINDINGS ABOUT THE SEAM,
+    # and a "not measurable" verdict on any of them would excuse a real un-wiring as an environment
+    # problem. Only the missing dependency may read unmeasurable, and that is asserted by execution
+    # rather than by the docstring that claims it.
+    try:
+        _workflow_step_python("review-fix.yml", "resolve", r"(?m)^no-anchor-matches-this-line$",
+                              r"(?m)^nor-this-one$", "the #1405 narrowness pin")
+    except WorkflowSeamUnmeasurable as _mis_split:
+        raise AssertionError(
+            "a missing ANCHOR must stay an AssertionError: reporting a seam finding as NOT "
+            "MEASURABLE is #1405 inverted — the next genuine un-wiring gets dismissed as an "
+            f"environment failure. Got: {_mis_split}") from None
+    except AssertionError as _seam_finding:
+        assert "no-anchor-matches-this-line" in str(_seam_finding), (
+            "the pin must fail on the ANCHOR assertion, which NAMES the anchor — otherwise it is "
+            f"passing on some unrelated failure and pins nothing: {_seam_finding}")
+    else:
+        raise AssertionError(
+            "the narrowness pin's anchor now MATCHES review-fix.yml, so it proves nothing — pick "
+            "an anchor the workflow cannot contain")
     # (c3) the OUTCOME step and (c4) the ARM — the two legs #759's interlock did not name at all.
     assert _outcome_admits is True, \
         "the review outcome step is wired by this PR — the probe must observe it"

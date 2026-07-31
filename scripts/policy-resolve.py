@@ -837,15 +837,32 @@ agent = "docs-agent"
     # NON-VACUOUS, and per-leg: the check above passes today because nothing is enabled, so prove
     # the predicate reds on an enabling policy for EVERY leg independently. A single truthy row
     # would let three of the four facts be dropped from the conjunction with nothing red.
+    #
+    # [#1405] The baseline is the LITERAL all-ready tuple, NOT `not _wiring[i]`. Negating the LIVE
+    # facts made each row's meaning depend on the container: when a leg reads falsy for any reason
+    # (measured: no PyYAML, so the review-fix probe cannot run), the negation hands the predicate
+    # an ALL-READY tuple, the refusal correctly disappears, and the row reds having asserted
+    # nothing about the guard it names. A gate row must test the predicate, not the environment.
     _enabling = {"repos": {"o/r": {"review_enrolment_authors": ["jeswr"]}}}
     for _index, _leg in enumerate(
             ("CLAIM", "review-fix.yml resolve", "review-fix.yml outcome", "the arm refusal")):
-        _broken = list(_wiring)
-        _broken[_index] = not _broken[_index]
+        _broken = [True, True, True, True]
+        _broken[_index] = False
         check(f"...and an enabling policy WOULD be refused with {_leg} not ready",
               _dc.enrolment_enable_error(_enabling, *_broken) is not None, True)
     check("...and an enabling policy is permitted once every leg is ready",
           _dc.enrolment_enable_error(_enabling, True, True, True, True), None)
+    # [#1405] ...and a leg that could NOT BE MEASURED still refuses, but says so in its own words.
+    # Both directions of the old conflation are pinned: an environment failure must not be reported
+    # as a wiring gap (which sends the operator to §7.4 for a gap that does not exist), and it must
+    # not stop refusing either (an unreadable seam is never proof that the lane is wired).
+    _unmeasurable = _dc.Unmeasurable("PyYAML is not installed")
+    _um_error = _dc.enrolment_enable_error(_enabling, True, _unmeasurable, True, True)
+    check("...and an enabling policy is STILL refused when a leg cannot be measured",
+          _um_error is not None, True)
+    check("...and that refusal reads NOT MEASURABLE, names the dependency, and accuses no consumer",
+          bool(_um_error) and "NOT MEASURABLE" in _um_error and "PyYAML" in _um_error
+          and "not ready" not in _um_error, True)
 
     # Issue #487: the exact actions-bot exception is a validated, per-repo opt-in. Missing means
     # false so a newly onboarded repository cannot inherit this author class accidentally.
