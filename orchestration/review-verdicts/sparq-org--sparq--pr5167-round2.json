@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5167,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7a47d4550d696e6cd0882b3aa288412584084cad",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and complete. Both Kani workflows enforce a suite-level wall-clock budget, clamp each harness to the remaining time, distinguish full-ceiling TIMEOUT from budget-clamped CUT, explicitly record later harnesses as NOT RUN, and fail closed on every missing verdict (including debt suites). The D5 manifest check validates both workflows, rejects missing or malformed knobs, ensures one harness fits within the suite budget, and preserves a 15-minute margin below each job backstop. Its focused self-tests cover both workflow overruns, undersized and missing budgets, and the safe raised-backstop case. No correctness, soundness, test-validity, security, or prompt-injection issue is evident. Relative to round 1, the finding set remains empty.",
+  "verdict": "approve"
+ }
+}
