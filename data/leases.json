@@ -1,36 +1,6 @@
 {
  "leases": [
   {
-   "account": "dc2d751954080e13",
-   "claim_id": "07954755fcd642608fcda4d0450c8311",
-   "holder": "sparq-org/sparq#3090@30627436108.1",
-   "package": "gui",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1785497618,
-   "expires_at": 1785503918
-  },
-  {
-   "account": "9e13ea21abf27e68",
-   "claim_id": "897782bbb83e4977996994a527b1793c",
-   "holder": "sparq-org/sparq#3713@30627442642.1",
-   "package": "sparq-canon",
-   "role": "research",
-   "model": "opus5",
-   "issued_at": 1785497637,
-   "expires_at": 1785503937
-  },
-  {
-   "account": "9e13ea21abf27e68",
-   "claim_id": "d3fce3867fc04d81a54a159c596e7d1b",
-   "holder": "sparq-org/sparq#3814@30627448615.1",
-   "package": "ci",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785497640,
-   "expires_at": 1785503940
-  },
-  {
    "account": "9e13ea21abf27e68",
    "claim_id": "58a0b1194eec44eface1e8121620f4f2",
    "holder": "fix:jeswr/agent-account-registry#1421@dispatch-30628639215.1",
