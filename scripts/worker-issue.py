@@ -970,6 +970,17 @@ def set_status(repo, issue, status):
         # "park suppressed:" line; mutate NOTHING.
         print(f"target issue state UNCHANGED: {status} park suppressed for {repo}#{issue}")
         return
+    # ORDER IS LOAD-BEARING [issue #1058]: every DELETE runs BEFORE the single add POST, and the
+    # add POST is one atomic call. The old order (add, then remove label-by-label) opened a window
+    # on EVERY status:ready <-> status:deferred flip in which both labels were live, and any
+    # failure in the remove half made that contradictory pair durable — a state no
+    # STATUS_TRANSITIONS entry describes, which is the measured producer of the contradictory rows
+    # on the live board. Removing first makes every intermediate and every crash state a SUBSET of
+    # the consistent state we started from: the issue can lose its positive attestation (fail
+    # CLOSED — the ready engine demands `status:ready`, so an issue with none is simply not
+    # dispatched) but it can never be dispatchable AND deferred at once, i.e. claimed by two lanes.
+    for label in sorted(remove - add):
+        _remove_label(repo, issue, label)
     for label in sorted(add):
         _ensure_label(repo, label)
     if add:
@@ -977,9 +988,41 @@ def set_status(repo, issue, status):
             ["api", "-X", "POST", f"repos/{repo}/issues/{issue}/labels", "--input", "-"],
             input_doc={"labels": sorted(add)},
         )
-    for label in sorted(remove - add):
-        _remove_label(repo, issue, label)
+    _assert_status_landed(repo, issue, status, add, remove - add)
     print(f"target issue state: {status}")
+
+
+def _assert_status_landed(repo, issue, status, add, drop):
+    """Re-read the LIVE label set and refuse to report a partial write as success [issue #1058].
+
+    The ordering above bounds the DAMAGE of a half-write; this bounds the LIE. A DELETE or POST
+    that fails without raising (an API success that did not land, an eventually-consistent read, a
+    concurrent writer) previously left the issue in a label state no STATUS_TRANSITIONS entry
+    describes while `set_status` printed the transition as done. The postcondition of
+    STATUS_TRANSITIONS[status] is exactly: every added label live, every dropped label gone. Fail
+    LOUDLY when it does not hold — the caller must see a failed status write, never a silent one.
+    """
+    live = _live_issue_labels(repo, issue)
+    missing = sorted(add - live)
+    residue = sorted(drop & live)
+    if missing or residue:
+        raise WorkerIssueError(
+            f"status {status!r} did not land on {repo}#{issue}: missing {missing}, still present "
+            f"{residue} — the live label set matches no STATUS_TRANSITIONS state and this "
+            f"partial write must not be reported as success")
+
+
+def _live_issue_labels(repo, issue):
+    item = _gh_json(["api", f"repos/{repo}/issues/{issue}"])
+    if not isinstance(item, dict) or not isinstance(item.get("labels"), list):
+        raise WorkerIssueError(
+            f"GitHub API returned no readable label set for {repo}#{issue} — the status write "
+            f"cannot be confirmed")
+    return {
+        label.get("name")
+        for label in item["labels"]
+        if isinstance(label, dict) and isinstance(label.get("name"), str)
+    }
 
 
 def claim_receipt(repo, issue, model, run_url, run_key, bot_login):
@@ -1809,10 +1852,21 @@ def _self_test():
         stderr = ""
 
     posts, deletes, timeline = [], [], []
+    # [issue #1058] The seam models the issue's LIVE label set, not just the calls made against
+    # it, so the order of those calls and the state they leave behind are both observable. `calls`
+    # is the interleaved log (ordering), `snapshots` the label set after every mutating call (the
+    # co-live invariant), and the two levers simulate an API call that reports success without
+    # landing — the exact half-write that made the contradictory pair durable.
+    live, snapshots, calls = set(), [], []
+    drop_deletes, drop_posts = [False], [False]
 
     def fake_run_gh(args, *, input_text=None, check=True):
         if args[1] == "-X" and args[2] == "DELETE":
             deletes.append(args[3])
+            calls.append(("DELETE", args[3].rsplit("/labels/", 1)[-1]))
+            if not drop_deletes[0]:
+                live.discard(args[3].rsplit("/labels/", 1)[-1])
+            snapshots.append(set(live))
         result = _Result()
         if "/collaborators/" in str(args[1]):
             # The strict maintainer probe (_is_human_maintainer): jeswr is a repo admin,
@@ -1823,6 +1877,13 @@ def _self_test():
     def fake_gh_json(args, *, input_doc=None):
         if input_doc is not None and "labels" in input_doc:
             posts.append(input_doc["labels"])
+            calls.append(("POST", tuple(input_doc["labels"])))
+            if not drop_posts[0]:
+                live.update(input_doc["labels"])
+            snapshots.append(set(live))
+            return {}
+        if "-X" not in args:                        # set_status's post-write label re-read
+            return {"labels": [{"name": name} for name in sorted(live)]}
         return {}
 
     def fake_paginated(repo, issue, resource):
@@ -1925,6 +1986,95 @@ def _self_test():
         ]
         set_status("o/r", 9, "parked")
         assert posts == [["status:deferred", "status:parked"]], posts
+
+        # (x-vii-b) [issue #1058] the DEFERRAL flip is the other half of the contradictory pair,
+        # and it is pinned by CONTENT, not by the ordering loop below: a `deferred` that left
+        # `status:ready` standing would mint status:ready + status:deferred no matter what order
+        # the calls went out in. Nothing else in this suite pinned it — emptying this entry's
+        # remove set left the whole self-test green — so ordering coverage alone would have read
+        # as table coverage it does not provide.
+        posts.clear(); deletes.clear(); timeline.clear()
+        live.clear()
+        live.update({"status:ready", "role:impl"})
+        set_status("o/r", 9, "deferred")
+        assert posts == [["status:deferred"]], posts
+        for cleared in ("status:ready", "status:in-progress", "status:in-progress-review"):
+            assert any(path.endswith(f"labels/{cleared}") for path in deletes), (cleared, deletes)
+        assert live == {"role:impl", "status:deferred"}, sorted(live)
+
+        # (x-viii) [issue #1058] the WRITE-ORDER invariant, over the WHOLE table rather than one
+        # hand-picked flip: for EVERY transition, seeded from the worst case (every label the
+        # transition drops is live), no observable state holds an added label and a dropped label
+        # at the same time, and every DELETE is issued before the add POST. The add-then-remove
+        # order this replaces put `add` on the issue while the whole drop set was still live, so
+        # it fails the co-live assertion on all seven status:ready <-> status:deferred flips —
+        # the assertion is load-bearing, not decorative.
+        for name, (added, removed) in sorted(STATUS_TRANSITIONS.items()):
+            dropped = removed - added
+            posts.clear(); deletes.clear(); calls.clear(); snapshots.clear(); timeline.clear()
+            live.clear()
+            live.update(dropped | {"role:impl"})
+            seeded = set(live)
+            set_status("o/r", 9, name)
+            for state in [seeded, *snapshots]:
+                assert not (state & added and state & dropped), (name, sorted(state))
+            verbs = [verb for verb, _ in calls]
+            if added and dropped:
+                assert "POST" in verbs and verbs.index("POST") > max(
+                    index for index, verb in enumerate(verbs) if verb == "DELETE"), (name, calls)
+            # ...and the transition still lands exactly what its table entry describes.
+            assert live == (seeded - dropped) | added, (name, sorted(live))
+
+        # (x-ix) [issue #1058] a HALF-write is never reported as success. Both halves are covered
+        # by a seam that returns 200 without landing the change: a DELETE that leaves the dropped
+        # label live (this is the durable status:ready + status:deferred pair measured on the live
+        # board) and a POST that never adds. Before the post-write re-read, both printed
+        # "target issue state: retry" over a label set no STATUS_TRANSITIONS entry describes.
+        for lever, needle in ((drop_deletes, "still present ['status:deferred']"),
+                              (drop_posts, "missing ['status:ready']")):
+            posts.clear(); deletes.clear(); calls.clear(); timeline.clear()
+            live.clear()
+            live.add("status:deferred")
+            lever[0] = True
+            try:
+                set_status("o/r", 9, "retry")
+                raise AssertionError(f"half-written flip reported as success ({needle})")
+            except WorkerIssueError as exc:
+                assert "must not be reported as success" in str(exc), exc
+                assert needle in str(exc), exc
+            finally:
+                lever[0] = False
+        # ...and the same flip over a HEALTHY seam raises nothing: the re-read is a confirmation,
+        # not a blanket veto that would fail every real status write.
+        posts.clear(); deletes.clear()
+        live.clear()
+        live.add("status:deferred")
+        set_status("o/r", 9, "retry")
+        assert live == {"status:ready"}, sorted(live)
+
+        # (x-x) a re-read that cannot be PARSED is a failure to confirm, never a pass — the write
+        # may well have half-landed, so it fails toward the maintainer.
+        live.clear()
+        live.add("status:deferred")
+
+        def unreadable_gh_json(args, *, input_doc=None):
+            if input_doc is not None and "labels" in input_doc:
+                return fake_gh_json(args, input_doc=input_doc)
+            return "not-an-issue-object"
+
+        globals()["_gh_json"] = unreadable_gh_json
+        landed = True
+        try:
+            set_status("o/r", 9, "retry")
+        except WorkerIssueError as exc:
+            landed = False
+            assert "cannot be confirmed" in str(exc), exc
+        except Exception as exc:        # a raw crash is malformedness, not a diagnosable refusal
+            raise AssertionError(
+                f"unreadable re-read crashed instead of refusing: {exc!r}") from exc
+        finally:
+            globals()["_gh_json"] = fake_gh_json
+        assert not landed, "unconfirmable status write reported as success"
     finally:
         globals().update(saved)
 
