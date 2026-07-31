@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1332,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2bb06ecce50857e252eef7a3c9b2a96903b70ba0",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 8.1 says both inputs are already computed and printed every tick and that a log read can determine whether busy occupants reserve any narrow atom; it then says the same log can split global holders into `__global__`-only versus `__global__` plus narrow atoms. The cited `record_partition_reservation`/`assemble-census` data classifies the rows being considered, not the occupancy rows, while the emitted starved-tick partition census aggregates occupancy only by `cause`. No emitted field preserves an occupant's reserved set or its joint `(cause, reserved-set shape)`. Although `busy_packages_of_pulls` has that information in memory, it is not present in old run logs, so the stated retrospective read cannot answer either holder-shape question. This is material because \u00a73.1 names narrow-free global-reserving ticks as the unmeasured condition that determines whether reading (B)'s release population is non-empty.",
+    "file": "research/1011-global-partition-bounded-concurrency.md",
+    "fix_hint": "Distinguish candidate-row census data from occupancy data. Either cite an existing emitted artifact that actually includes each busy occupant's reserved-set shape and cause, or state that the historical logs cannot answer these questions and specify the new zero-sealed aggregate/joint instrumentation and observation window required before an overrule. Revise the claims that no new code is needed and that runs already in the log suffice.",
+    "severity": "major",
+    "title": "The required release-population measurement is not available from the cited logs"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The revision correctly separates safety-driven global reservations from linkage-parity globals and resolves the prior round's central objection. However, the record now makes its required pre-overrule measurement appear executable from existing run logs when the cited emissions do not carry the necessary occupant evidence. `assemble-census` describes candidate-row reservation shapes and defer reasons; the starved-tick partition census describes holder counts by cause. Neither emits whether busy occupants reserve narrow atoms, nor the joint per-holder cause/reserved-set data needed to split `__global__`-only from `__global__`-plus-narrow holders. Because \u00a73.1 explicitly leaves the release population unmeasured and \u00a78.1 is the prescribed way to settle it, this evidence-path error must be corrected before the design record is complete.",
+  "verdict": "request_changes"
+ }
+}
