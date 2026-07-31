@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1446,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e40aec3ab83c2afb7265a544d877e5b445526a94",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 4 resolves the prior major finding. The contents/workflows/issues/pull-request write token is now minted only when the worker gate outcome is exactly `success` and the downloaded bundle verification step succeeded; a genuine failure, skipped/cancelled/empty verdict, or failed verification cannot reach that mint. The follow-up lane retains its required failed-gate behavior through a separate token limited to `issues: write`, and the token is routed only to the follow-up issue step. The live self-tests now include the previously missing mint in the evaluated failure/success matrix, pin the mint's complete condition literally, assert the exact consumers of both credentials, and check the restricted permission set with a positive control against the publish mint. The diagnostic remains an inert, SHA-pinned artifact upload before any token mint, with no target ref or shell execution. I found no remaining blocker, major, or lower-severity defect in the diff.",
+  "verdict": "approve"
+ }
+}
