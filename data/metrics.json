@@ -1,33 +1,33 @@
 {
-  "generated_at": "2026-07-31T02:39:33Z",
+  "generated_at": "2026-07-31T02:55:30Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
       "issues_open": 1840,
       "issues_ready": 366,
-      "issues_closed_1h": 1,
-      "issues_closed_24h": 13,
-      "prs_open": 99,
+      "issues_closed_1h": 2,
+      "issues_closed_24h": 14,
+      "prs_open": 98,
       "prs_draft": 82,
-      "prs_opened_1h": 3,
+      "prs_opened_1h": 2,
       "prs_closed_1h": 0,
-      "prs_merged_1h": 1,
-      "prs_merged_24h": 9,
+      "prs_merged_1h": 2,
+      "prs_merged_24h": 10,
       "review_changes_backlog": 10,
       "needs_user_parked": 24,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 7,
-      "worker_attempts_1h": 3,
+      "review_lane_runs_1h": 2,
+      "worker_attempts_1h": 2,
       "worker_success_rate_1h": 1.0,
-      "pr_open_rate": 3.0,
-      "pr_close_rate": 1.0,
-      "net_pr_flow": 2.0
+      "pr_open_rate": 2.0,
+      "pr_close_rate": 2.0,
+      "net_pr_flow": 0.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 637,
+      "issues_open": 639,
       "issues_ready": 236,
       "issues_closed_1h": 0,
-      "issues_closed_24h": 12,
+      "issues_closed_24h": 11,
       "prs_open": 35,
       "prs_draft": 25,
       "prs_opened_1h": 0,
@@ -37,7 +37,7 @@
       "review_changes_backlog": 6,
       "needs_user_parked": 6,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 7,
+      "review_lane_runs_1h": 4,
       "worker_attempts_1h": 3,
       "worker_success_rate_1h": 0.0,
       "pr_open_rate": 0.0,
@@ -46,18 +46,6 @@
     }
   },
   "alerts": [
-    {
-      "target": "sparq-org/sparq",
-      "classification": "backlog-growing",
-      "fire": true,
-      "summary": "open PRs 99 > 40 and net PR flow +2.0/hr (open 3.0 > close 1.0) sustained over 2 snapshots",
-      "metrics": {
-        "prs_open": 99,
-        "net_pr_flow": 2.0,
-        "pr_open_rate": 3.0,
-        "pr_close_rate": 1.0
-      }
-    },
     {
       "target": "jeswr/agent-account-registry",
       "classification": "ready-starved",
