@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 5455,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "836f985832053148342535aa970a6108287f1f64",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The title promises `xs:decimal` arbitrary-precision arithmetic, but section 2 deliberately restricts every value to `mag < 10^18` and `S <= 18`. Supporting the XSD minimum digit budget is a defensible bounded implementation, but it is not arbitrary precision and does not close the general arbitrary-precision gap claimed by the record. This is a material scope/claim mismatch on an honesty-sensitive design document.",
+    "file": "research/noir-xpath-xsd-decimal-design.md",
+    "fix_hint": "Rename and consistently frame the design as an 18-digit bounded/fixed-precision `xs:decimal` subset, explicitly document the implementation-defined range and failure behavior, or redesign the representation to provide genuine arbitrary precision. Ensure the parent-program wording uses the same bounded claim.",
+    "severity": "major",
+    "title": "The proposed type is bounded precision, not arbitrary precision"
+   },
+   {
+    "body": "Section 2.3 says values with different scales are aligned by a power-of-ten multiply followed by `mag < 10^18` assertion, but does not require a widened intermediate or a pre-multiply bound. A `u64` multiplication can wrap before the post-hoc assertion, admitting an incorrect aligned value. The document explicitly proves safe intermediates for add/mul/div, so leaving this conversion unsafe undermines the constructor-enforced invariant.",
+    "file": "research/noir-xpath-xsd-decimal-design.md",
+    "fix_hint": "Specify alignment in `u128` (or assert `mag < 10^18 / 10^delta` before multiplying), then range-check before narrowing to `u64`; add a should-fail boundary test whose unbounded aligned magnitude exceeds both 10^18 and `u64::MAX`.",
+    "severity": "major",
+    "title": "Scale alignment can wrap before the range assertion"
+   },
+   {
+    "body": "The `from_i64` construction uses `|n| * 10^S`. The absolute value of `i64::MIN` is not representable as an `i64`; a direct signed abs/negation can overflow before the declared decimal range assertion. Because this is a circuit value conversion, the record must prescribe an overflow-free construction rather than relying on an eventual assertion.",
+    "file": "research/noir-xpath-xsd-decimal-design.md",
+    "fix_hint": "Define magnitude extraction without signed negation overflow, for example by widening before negation or using an unsigned-absolute conversion, perform the scale multiplication in `u128`, range-check, and add an `i64::MIN` should-fail test.",
+    "severity": "major",
+    "title": "from_i64 does not define a safe i64::MIN magnitude conversion"
+   }
+  ],
+  "progress": null,
+  "summary": "The record is careful about audit status and lays out useful canonicality and mutation-testing obligations, but it is not internally correct as an arbitrary-precision decimal design. Its chosen representation is explicitly bounded to fewer than 10^18 magnitude units and a compile-time scale no greater than 18, while the title and framing call it arbitrary-precision. The arithmetic specification also leaves two concrete overflow-sensitive conversions underspecified, so an implementation following the record could wrap before enforcing its stated invariants.",
+  "verdict": "request_changes"
+ }
+}
