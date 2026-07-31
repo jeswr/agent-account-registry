@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1390,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f28102ca533606fc1a51e2b5823de83175309f9d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The alert step runs `set -uo pipefail`, then the self-test and live invocation as separate commands. Without `-e` (or `&&`), a nonzero `--self-test` continues into the live command; if that command returns zero, its status becomes the step status. Thus an unreadable workflow, a broken seam assertion, or any other self-test failure can be masked while unproved code still performs issue mutations. The Python seam test only asserts that the two command strings occur in order, so it also passes with this fail-open shell behavior. This contradicts the stated invariant that the detector must prove itself before it runs live.",
+    "file": ".github/workflows/groom.yml",
+    "fix_hint": "Make the shell fail immediately, for example with `set -euo pipefail`, or join the commands with `&&`. Add a non-vacuous assertion for that fail-stop property (or structure the workflow so the self-test is a separate non-continue-on-error step) so removing it turns the test red.",
+    "severity": "major",
+    "title": "A failing self-test does not stop the live alert invocation"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new health-outcome path is otherwise coherent, but the live watchdog does not actually gate execution on its self-test. Because the shell explicitly omits `-e`, a red seam/self-test can be followed by a successful live invocation and leave the step green. That makes the newly added wiring checks fail-open at the exact production boundary they are intended to protect.",
+  "verdict": "request_changes"
+ }
+}
