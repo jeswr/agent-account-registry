@@ -43,7 +43,7 @@ ChainPreferenceError = _chain_preference.ChainPreferenceError
 
 
 POLICY_PATH = "policy/repos.toml"
-# [OPUS-4.8] "registry-selftest" is the python/actions gate profile for a self-managed target
+# "registry-selftest" is the python/actions gate profile for a self-managed target
 # (the registry itself) — the crate-scoped cargo gate does not fit a python repo. worker-live.sh
 # run_gate implements it: run every touched script's --self-test, the full recent-wave suite, and
 # bash -n / actionlint on touched shell + workflow files. Fail-closed.
@@ -75,7 +75,7 @@ POLICY_FIELDS = {
     "max_attempts",
     "trust",
 }
-# [OPUS-4.8] Optional usage-aware-dispatch controls (default off / 0.10 -> backward compatible):
+# Optional usage-aware-dispatch controls (default off / 0.10 -> backward compatible):
 #   require_usage       = bool  — when true, a TOTAL usage-probe failure HOLDS the repo (fail-closed)
 #                                 rather than falling back to the ungated static cap.
 #   usage_safety_margin = float in [0,1) — fraction of EACH rate-limit window that must remain free to
@@ -89,7 +89,7 @@ POLICY_FIELDS = {
 #   review_queue_ttl_minutes = positive int — how long a PR may sit review:needs before alerting.
 #   cross_provider_fallback  = bool — opt-in same-provider degrade when the opposite provider is
 #                              starved; default False = stay queued + alert (the honest default).
-# [OPUS-4.8] security_paths (B3 / defects #2,#4): the additive FILE-level trust-surface control
+# security_paths (B3 / defects #2,#4): the additive FILE-level trust-surface control
 # for the review lane. A worker PR whose diff touches ANY listed path/prefix routes its ARM to a
 # HUMAN even for a benign-labelled PR — CONSUMED by review-fix.yml (review-outcome + ready-and-arm
 # pass it to worker-pr.trust_surface_paths_touched). NOT a dead tier: [issue #166] this list is

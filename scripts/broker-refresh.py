@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [OPUS-4.8] Token broker refresh core (maintainer decision 2026-07-15: private broker, and it must
+# Token broker refresh core (maintainer decision 2026-07-15: private broker, and it must
 # NEVER require re-authenticating sessions). "Private" scopes the CREDENTIAL, not the repo: this
 # registry is PUBLIC (README line 1) and holds no token values, so the refresh token lives only in
 # an encrypted registry secret that only the registry's own Actions can read; the worker receives a

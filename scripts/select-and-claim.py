@@ -412,7 +412,7 @@ def active_for(leases, account):
 
 
 # ---- usage-aware eligibility + expiry-priority (dynamic backoff) --------------------------------
-# [OPUS-4.8] A worker must NOT start on an account that could hit a rate limit mid-run — that burns
+# A worker must NOT start on an account that could hit a rate limit mid-run — that burns
 # credits on a half-finished agent. So an account is eligible to START only if we KNOW its live usage
 # (Anthropic anthropic-ratelimit-unified-* headers), its status is "allowed", and BOTH the 5h and 7d
 # windows have >= SAFETY_MARGIN headroom. Fail closed on any missing/unknown usage. Among eligible
