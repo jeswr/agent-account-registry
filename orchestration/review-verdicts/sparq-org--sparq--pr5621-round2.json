@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5621,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "57619680f1929fa71d17d13c313d9525a431ef77",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and internally consistent. The documentation clearly separates the stale 2026-07-10 snapshot from the operative pre-cutover windows; the reported deltas match the table arithmetic (median \u22121.5/\u22123.5 minutes and p90 \u22122.8/\u22123.0 minutes), and the sample exclusions and limitations are disclosed. The mechanism evidence is appropriately limited to verifying skipped coverage-measure legs while ratchet gates stayed active, and the single-run hop analysis is explicitly not presented as causal attribution. This is documentation-only and introduces no executable, test, or security behavior. No instruction-like prompt injection appears in the diff. With no prior-round findings and no new findings, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
