@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5259,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ca34006d7db5e3d647b4281d9682cdc97c42b3be",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`run_gate_once` only refuses a post-verdict re-invocation when `attempt >= max_total_polls`. Most verdicts occur earlier (clean convergence, fail-fast failure, fetch-failure cap, genuine-hang decision, or unsatisfiable hold), and the caller then persists an ordinary nonterminal-looking `GateState`. A duplicate/delayed event can reload it and evaluate again; changed observations can subsequently render a different verdict, including green after an earlier red. Thus `GateState` is not yet a complete durable decision carrier, and the claim that re-invocation after a rendered verdict is safely rejected only holds for budget-exhaustion verdicts. Phase-2 concurrency controls do not eliminate sequential duplicate delivery or retry after an ambiguous transport failure.",
+    "file": "scripts/ci_summary_gate.py",
+    "fix_hint": "Persist a versioned terminal marker plus the rendered exit code (or an explicit terminal outcome) whenever `run_gate_once` returns 0 or 1, and make every later invocation return/refuse deterministically without fetching or re-rendering. Include the marker in atomic validation and add a real-path test that reaches an early red below the absolute budget, saves/reloads state, changes the fetched sibling set to green, and proves the second invocation cannot produce or progress toward green. Add the symmetric early-green duplicate test as well.",
+    "severity": "major",
+    "title": "Persisted state does not record an already-rendered early verdict"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 1's partial-record bypass is substantially fixed: records are now accepted atomically, invalid records restart the full window, writes use same-directory atomic replacement, and the new real-path regression test exercises the reported premature-pass path. However, the persisted carrier still omits whether a verdict has already been rendered. A duplicate or delayed invocation after any early verdict can therefore resume evaluation and potentially render a different verdict. Because this is a new major carrier-completeness finding, progress is regressing under the required comparison scale.",
+  "verdict": "request_changes"
+ }
+}
