@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5496,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6bfa133a757615e4b2a7d8143aca27402bda2c48",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains sound as scoped. The holder-count and per-holder commitment-count words make the commitment-digest preimage structurally unambiguous, and the focused regression test is non-vacuous because it first demonstrates equality of the formerly flattened preimages before checking that the corrected digest and freshness tag differ. The public-input layout separately binds holder and row arities, freshness validation fails closed, and all prose consistently describes this as layout/out-of-circuit binding only: no proof or ZK-audit item is claimed complete, external audit sq-qhy4 remains pending, and the MPC trust model remains honest-majority semi-honest. This matches the M4-v1 feasibility record. No correctness, soundness, test-validity, security, or instruction-injection issue was found. With round 2 also clean, progress is stagnant rather than improving or regressing.",
+  "verdict": "approve"
+ }
+}
