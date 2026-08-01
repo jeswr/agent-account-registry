@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1519,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c31eb863e3654f56e0bf9ad57e1b1f71c0291c13",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change closes the workflow seam identified in #935 with non-vacuous, exact-value assertions. It verifies that the cross-repository dispatch step is gated on the minted token, that GH_TOKEN is wired to that same token-producing step, that the referenced step exists, and that the enclosing job is not gated. The new extractor is bounded to the step's own key indentation, refuses duplicate keys, and its absent, nested, own-key, first-sequence-key, and duplicate behavior is directly exercised with expectations independent of the implementation. The diff contains no reviewer-directed prompt injection and introduces no production permission or trust-path change.",
+  "verdict": "approve"
+ }
+}
