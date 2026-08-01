@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1643,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8547ad3a3c8f03d363029908bc690bbba87f9268",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 approval remains supported. The record is findings-only and accurately identifies the inert premium gate, the model/window coupling that makes a direct `opus5` addition unsafe, and the existing machine-park starvation terminal. Its proposed staged approach keeps observation separate from admission, then specifies the durable state needed to distinguish never-observed accounts, live shape drift, and probe outages. The load-bearing transitions and consumer rules are internally consistent: received malformed responses advance `last_probed`, true observation outages do not, freshness keys only on `last_probed`, and durable state cannot refuse without a live missing-window signal. The named mutation obligations cover the gate, retry state, TTL behavior, live-window override, malformed records, parking target, and YAML execution seam. No blocker, major, or other actionable diff-scoped issue is supported. Progress is stagnant because the prior round also had no findings; this is continued correctness, not a regression.",
+  "verdict": "approve"
+ }
+}
