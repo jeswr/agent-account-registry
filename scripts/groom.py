@@ -1084,13 +1084,14 @@ def stale_worker_pr_reason(
 ) -> str | None:
     """Return why an old worker PR needs HUMAN attention, or None when it should remain untouched.
 
-    Scope: this age sweep escalates (1) a NON-DRAFT worker PR wedged in a BAD_MERGE_STATE
-    (conflicting/dirty/behind/blocked/unstable/unknown) — a state no automation recovers — and
-    (2) a DRAFT worker PR with NO VALID registry provenance record (missing, unreadable, or
-    schema-invalid — worker_pr_provenance_enumerable), which no automated loop will ever pick
-    up (genuine orphan). A DRAFT worker PR with a VALID provenance record is review-loop-owned
-    and is NEVER escalated here — see the draft branch below. Together: no draft is ever
-    silently stranded, and no pipeline-owned draft is ever terminally parked."""
+    Scope: this age sweep escalates ONLY a worker PR that NO automated loop owns — one with NO
+    VALID registry provenance record (missing, unreadable, or schema-invalid —
+    worker_pr_provenance_enumerable). A DRAFT orphan parks on ORPHAN_DRAFT_REASON; a NON-DRAFT
+    orphan parks only when it is ALSO wedged in a BAD_MERGE_STATE
+    (conflicting/dirty/behind/blocked/unstable/unknown). A PR with a VALID provenance record is
+    REVIEW-LOOP-OWNED and is NEVER escalated here, DRAFT OR NOT — see the ownership branch below.
+    Together: no orphan is ever silently stranded, and no pipeline-owned PR is ever parked out of
+    the loop that repairs it."""
     updated = _epoch(pull.get("updated_at"), "pull request")
     if now - updated < threshold_seconds:
         return None
@@ -1106,24 +1107,36 @@ def stale_worker_pr_reason(
         or not body.lstrip().startswith(WORKER_PR_MARKER)
     ):
         return None
+    # [FABLE-5] A worker PR with a VALID registry provenance record is REVIEW-LOOP-OWNED and is
+    # never age-parked here (deadlock fix, live PRs jeswr/agent-account-registry#3472 / #3470).
+    # Draft is the NORMAL pre-review pipeline state: dispatch-claim.enumerate_review_items picks
+    # the draft up, the review-fix loop reviews it, then undrafts + arms it. A PR awaiting a lane
+    # gets NO `updated_at` bump, so it ages past worker_timeout_minutes purely by WAITING for a
+    # (backed-up) lane — being old is NOT being stuck. (A starved-but-owned review lane's paging
+    # mechanism — a NON-terminal alert keyed on policy `review_queue_ttl_minutes` — is NOT YET
+    # WIRED to any consumer; that future mechanism is tracked separately in issue #90 and is NOT
+    # relied on here.)
+    #
+    # [registry #171] AND OWNERSHIP IS NOT A DRAFT-ONLY PROPERTY — the carve-out is hoisted ABOVE
+    # the draft branch because the merge-state escalation below had exactly the same defect the
+    # draft branch was fixed for, one bit over. dispatch-claim owns the repair of a wedged
+    # NON-DRAFT worker PR too: enumerate_review_items emits `needs-rebase` on `conflicting is
+    # True` (the `dirty` state) and `needs-ci-fix` on a concluded-FAILURE gate (the `unstable`
+    # state), both REVIEW-STATE- AND DRAFT-AGNOSTIC. `blocked` is worse still — BAD_MERGE_STATES
+    # spells it "required checks are blocked or PENDING", i.e. the ordinary posture of a
+    # freshly-armed PR whose checks are simply running.
+    #
+    # Parking any of those removed the PR from the ONE loop that repairs it, and the park's own
+    # exit could then never be earned: age_park_cause_recovered's `merge-*` predicate waits for
+    # the merge state to recover, and nothing can recover it while the park label keeps the
+    # repairer out (enumerate_review_items excludes ANY live machine park, and `needs:user` is in
+    # HUMAN_HOLD_PR_LABELS). A soft hold whose recovery predicate is gated on the work its own
+    # existence prevents is an INVISIBLE permanent hold — the exact state AGE_PARK_CAUSES calls
+    # "strictly worse than a visible one". So ownership dominates the merge state in BOTH classes,
+    # and escalating a review-loop-owned PR is left to the review reconciler that can see it.
+    if has_valid_provenance:
+        return None
     if pull.get("draft") is True:
-        # [FABLE-5] A DRAFT worker PR with a VALID registry provenance record is
-        # REVIEW-LOOP-OWNED, never age-parked here (deadlock fix, live PRs
-        # jeswr/agent-account-registry#3472 / #3470). Draft is the NORMAL pre-review pipeline
-        # state: dispatch-claim.enumerate_review_items picks the draft up, the review-fix loop
-        # reviews it, then undrafts + arms it. A draft awaiting review gets NO `updated_at`
-        # bump, so it ages past worker_timeout_minutes purely by WAITING for a (backed-up)
-        # review lane — being old is NOT being stuck. Applying `needs:user` here is TERMINAL:
-        # it (and a `needs:` label on the source issue) is in
-        # dispatch-claim.HUMAN_HOLD_PR_LABELS, which EXCLUDES the PR from
-        # enumerate_review_items — so parking a pipeline-owned draft removes it from the exact
-        # loop that would otherwise drive it, a self-inflicted deadlock the maintainer reported
-        # as "can't be drained". (A starved-but-owned review lane's paging mechanism — a
-        # NON-terminal alert keyed on policy `review_queue_ttl_minutes` — is NOT YET WIRED to
-        # any consumer; that future mechanism is tracked separately in issue #90 and is NOT
-        # relied on here.)
-        if has_valid_provenance:
-            return None
         # A DRAFT with NO VALID provenance record is a GENUINE ORPHAN owned by no automated
         # loop: the review loop's PLAN, CLAIM, and review-fix.yml resolve all fail closed on a
         # missing/mismatched/malformed record via the ONE shared admission function
@@ -1135,6 +1148,11 @@ def stale_worker_pr_reason(
         # deadlock for the valid-provenance majority above. (Gating on FILE EXISTENCE alone
         # would strand the malformed-record case: groom-preserved, never enumerated.)
         return ORPHAN_DRAFT_REASON
+    # A NON-DRAFT ORPHAN (no admissible record either) wedged in a bad merge state: nothing
+    # enumerates it — provenance_admission_error refuses it before any repair branch is reached —
+    # so the hand-off stands, and it is the merge state that says the PR is actually stuck rather
+    # than merely unowned. Its machine exit is symmetric with the orphan draft's: either the merge
+    # state recovers or an admissible record appears (age_park_cause_recovered).
     merge_state = pull.get("mergeable_state")
     if merge_state is None:
         merge_state = "unknown"
@@ -2209,7 +2227,20 @@ def age_park_cause_recovered(
     - ``orphan-draft`` — an ADMISSIBLE registry provenance record now exists on the LIVE ledger
       ref. That is exactly the predicate _live_provenance_record already computes to CANCEL a
       park, reused to CLEAR one, so "the review loop will drive this PR" cannot mean two things.
-    - ``merge-*``      — the live ``mergeable_state`` is no longer one of BAD_MERGE_STATES.
+    - ``merge-*``      — EITHER that same admissible record now exists, OR the live
+      ``mergeable_state`` is no longer one of BAD_MERGE_STATES.
+
+    THE PROVENANCE EXIT ON ``merge-*`` IS NOT A WIDENING — it mirrors the park condition
+    (registry #171). Since that fix a merge-state park is written ONLY for a PR with NO
+    admissible record (stale_worker_pr_reason returns None for a review-loop-owned PR, draft or
+    not), so "an admissible record now exists" means the park condition has lapsed in exactly the
+    way it does for an orphan draft, and the SAME predicate proves it. It is also the only exit
+    the pre-#171 population has: those parks were written on PRs the review loop DOES own, and
+    the merge-state predicate alone can never fire for them — the label keeps
+    enumerate_review_items' `needs-rebase`/`needs-ci-fix` repair out, so the state it waits on is
+    the one the park itself prevents. Checked FIRST and falling THROUGH on anything short of
+    ``admits``, so an unreadable ledger still reports the merge state as the standing reason
+    rather than replacing it with a read failure.
 
     Every ambiguity fails toward STAYING PARKED: an unreadable/conflicting provenance read, a
     malformed merge state, and an unrecognised cause token all return False. An unrecognised
@@ -2223,6 +2254,9 @@ def age_park_cause_recovered(
             return False, "the live provenance read was unavailable or conflicting"
         return False, "still no admissible provenance record on the live ledger ref"
     if cause.startswith("merge-"):
+        if live_provenance()[0] == "admits":
+            return True, ("an admissible provenance record now exists on the live ledger ref, so "
+                          "the review loop owns this PR's repair and groom no longer parks it")
         merge_state = pull.get("mergeable_state")
         if merge_state is None:
             merge_state = "unknown"
@@ -3845,9 +3879,12 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             # record from the LIVE `ledger` ref immediately before the terminal park. A raced-in valid
             # record means the draft is review-loop-owned (cancel the park); an unavailable or
             # conflicting live read skips the park with an operational alert rather than terminally
-            # parking on an unusable read. Only the provenance-derived orphan reason is revalidated — a
-            # NON-draft PR wedged in a bad merge state is parked regardless of provenance, so its
-            # (unrelated) escalation is left untouched.
+            # parking on an unusable read. Only the ORPHAN-DRAFT reason takes this second live read.
+            # [registry #171] The merge-state reason is now provenance-gated too, so it can lose the
+            # same race — but it cannot lose it TERMINALLY: `merge-*` is a mapped AGE_PARK_CAUSES
+            # cause, so age_park_label writes the MACHINE soft hold, and age_park_cause_recovered's
+            # `merge-*` branch re-admits on exactly this record appearing. The race self-heals on the
+            # next tick instead of costing a live ledger read per wedged PR per tick.
             if reason == ORPHAN_DRAFT_REASON:
                 state, _record = _live_provenance_record(
                     registry_api, registry_repo, action.repo, action.number
@@ -4556,23 +4593,55 @@ def _self_test() -> int:
         "draft": False,
         "mergeable_state": "blocked",
     }
+    # [registry #171] `blocked` is BAD_MERGE_STATES' "required checks are blocked or PENDING" —
+    # the ordinary posture of a freshly-armed PR whose checks are still running. An ORPHAN
+    # (no admissible provenance record) in it is still handed off; a review-loop-owned one is not.
     check(
-        "stale blocked worker PR",
+        # The expected value is written out LITERALLY, not read from BAD_MERGE_STATES: an
+        # assertion that fetches its answer from the table the code returns from cannot fail
+        # (AGENTS.md pre-flight question (b)). At least one row here has to be independent.
+        "stale blocked ORPHAN worker PR is handed off",
+        stale_worker_pr_reason(
+            old_pr, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=False
+        ),
+        "required checks are blocked or pending",
+    )
+    check(
+        "stale blocked worker PR with VALID provenance is NOT parked (pipeline-owned)",
         stale_worker_pr_reason(
             old_pr, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=True
         ),
-        BAD_MERGE_STATES["blocked"],
+        None,
     )
     check(
-        "clean worker PR is preserved",
+        # has_valid_provenance=FALSE deliberately: with True the ownership carve-out returns None
+        # before the merge state is ever read, so the assertion would hold for a `clean` PR and a
+        # `dirty` one alike — a check that cannot see the lookup it names.
+        "clean worker PR is preserved (the merge-state lookup itself, orphan path)",
         stale_worker_pr_reason(
             {**old_pr, "mergeable_state": "clean"},
             "app[bot]",
             600,
             now,
-            has_valid_provenance=True,
+            has_valid_provenance=False,
         ),
         None,
+    )
+    # The AGE GUARD itself, which the line-coverage sweep for #171 found had never executed: a PR
+    # inside the threshold is untouched no matter how bad its merge state or how absent its
+    # record. Delete `if now - updated < threshold_seconds: return None` and this reds — without
+    # it every freshly-opened wedged PR is parked on the tick it is created.
+    check(
+        "a FRESH worker PR is never parked, orphan or not (the age threshold is load-bearing)",
+        [
+            stale_worker_pr_reason(
+                {**old_pr,
+                 "updated_at": datetime.fromtimestamp(now - 1, timezone.utc).isoformat(),
+                 "mergeable_state": "dirty"},
+                "app[bot]", limits.threshold_seconds, now, has_valid_provenance=owned)
+            for owned in (False, True)
+        ],
+        [None, None],
     )
     check("worker branch links issue", linked_issue_numbers(old_pr), {7})
 
@@ -5240,19 +5309,72 @@ def _self_test() -> int:
         ),
         ORPHAN_DRAFT_REASON,
     )
-    # (b) A stale NON-DRAFT worker PR wedged in a bad merge state STILL parks (unchanged; a state no
-    # automation recovers — the defensible, in-scope escalation the fix must not remove).
+    # (b) [registry #171] THE SAME DEADLOCK, ONE BIT OVER. A stale NON-DRAFT worker PR with a
+    # VALID provenance record is review-loop-owned too and must NOT be parked out of the repair
+    # loop that owns it: dispatch-claim.enumerate_review_items emits `needs-rebase` on a
+    # conflicting base (`dirty`) and `needs-ci-fix` on a concluded-FAILURE gate (`unstable`),
+    # neither of them draft-gated, while `blocked` is merely "checks pending".
+    #
+    # THE TWO ROWS BELOW ARE THE DISCRIMINATING PAIR, and they are asserted per state rather than
+    # once: the accept side (owned -> None) and the reject side (orphan -> the named reason) share
+    # every input except `has_valid_provenance`, so deleting the hoisted carve-out reds the first
+    # and inverting it reds the second. Each merge state is driven separately because the fix is a
+    # claim about ALL of BAD_MERGE_STATES, and a single `dirty` row could not see a mutant that
+    # exempted one state only.
+    # The loop below derives its INPUTS from the very table the function returns from, so a
+    # mutant that SHRINKS that table would silently stop testing the state it removed (AGENTS.md
+    # pre-flight question (c)). Pin the key set literally first: shrink it and this reds before
+    # the loop can quietly narrow its own coverage.
     check(
-        "stale NON-DRAFT bad-merge-state worker PR still parks (unchanged)",
-        stale_worker_pr_reason(
-            {**old_pr, "draft": False, "mergeable_state": "dirty"},
-            "app[bot]",
-            limits.threshold_seconds,
-            now,
-            has_valid_provenance=True,
-        ),
-        BAD_MERGE_STATES["dirty"],
+        "the bad-merge-state set under test is exactly the five GitHub reports",
+        sorted(BAD_MERGE_STATES),
+        ["behind", "blocked", "dirty", "unknown", "unstable"],
     )
+    for _state, _reason in sorted(BAD_MERGE_STATES.items()):
+        _wedged = {**old_pr, "draft": False, "mergeable_state": _state}
+        check(
+            f"NON-DRAFT worker PR in `{_state}` with VALID provenance is NOT parked "
+            "(dispatch owns its repair)",
+            stale_worker_pr_reason(
+                _wedged, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=True
+            ),
+            None,
+        )
+        check(
+            f"NON-DRAFT ORPHAN in `{_state}` is STILL handed off (closure guarantee kept)",
+            stale_worker_pr_reason(
+                _wedged, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=False
+            ),
+            _reason,
+        )
+    # An ABSENT `mergeable_state` reads as `unknown`, and that default must be provenance-gated
+    # the same way — a missing field is not a licence to park a pipeline-owned PR.
+    _no_state = {k: v for k, v in old_pr.items() if k != "mergeable_state"}
+    check(
+        "a MISSING merge state defaults to `unknown` on the orphan path and is exempt on the "
+        "owned path (the default is gated too)",
+        (
+            stale_worker_pr_reason(
+                _no_state, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=False
+            ),
+            stale_worker_pr_reason(
+                _no_state, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=True
+            ),
+        ),
+        (BAD_MERGE_STATES["unknown"], None),
+    )
+    # And the ownership carve-out must NOT swallow the malformed-shape refusal: a non-string merge
+    # state on an ORPHAN still raises. (It is unreachable on the owned path by construction — the
+    # carve-out returns first — which is why the orphan direction is the one asserted.)
+    _malformed_raised = False
+    try:
+        stale_worker_pr_reason(
+            {**old_pr, "draft": False, "mergeable_state": 7},
+            "app[bot]", limits.threshold_seconds, now, has_valid_provenance=False,
+        )
+    except GroomError:
+        _malformed_raised = True
+    check("a malformed merge state still fails closed on the orphan path", _malformed_raised, True)
     # (a3) The provenance VALIDITY lookup: mirrors worker-pr.provenance_path — the record for
     # <owner>/<name>#<N> lives at orchestration/provenance/<owner>--<name>--pr<N>.json under the
     # registry root — and validates the record with the review loop's OWN shared predicate
@@ -5399,14 +5521,19 @@ def _self_test() -> int:
                 "owner/repo", 99, registry_root, ledger_root=ledger_dir),
             False,
         )
-    # (c) Non-vacuity / mutation guards. The two draft tests above are mutually discriminating:
+    # (c) Non-vacuity / mutation guards. The draft tests above are mutually discriminating:
     # reverting the draft branch to master's UNCONDITIONAL park reds test (a) (valid-provenance
     # draft would park), and reverting it to an unconditional Return-None (the earlier revision of
     # this fix) reds test (a2) (the orphan draft would get silence). The modelled revert below
-    # additionally proves test (a) discriminates against the exact master behaviour — if the draft
-    # branch ever again returns a reason for a valid-provenance draft, run_sweep's pull_actions
-    # loop applies needs:user, re-arming the deadlock.
-    def _reverted_stale_worker_pr_reason(pull, bot, threshold, at):
+    # additionally proves tests (a) and (b) discriminate against the exact behaviour they replace
+    # — if the ownership carve-out ever again returns a reason for a valid-provenance PR,
+    # run_sweep's pull_actions loop parks it and re-arms the deadlock.
+    #
+    # `_reverted_...` is the PRE-#171 function: the draft branch's carve-out present, the
+    # merge-state branch reached by every non-draft regardless of provenance. It takes
+    # `has_valid_provenance` so the two functions are called identically and the comparison
+    # cannot be an artefact of a different argument list.
+    def _reverted_stale_worker_pr_reason(pull, bot, threshold, at, *, has_valid_provenance):
         updated = _epoch(pull.get("updated_at"), "pull request")
         if at - updated < threshold:
             return None
@@ -5423,24 +5550,38 @@ def _self_test() -> int:
         ):
             return None
         if pull.get("draft") is True:
-            return "the worker pull request is still a draft"  # the removed terminal-park
+            if has_valid_provenance:
+                return None
+            return ORPHAN_DRAFT_REASON
         merge_state = pull.get("mergeable_state") or "unknown"
-        return BAD_MERGE_STATES.get(merge_state)
+        return BAD_MERGE_STATES.get(merge_state)   # the #171 defect: provenance never consulted
 
+    _owned_dirty = {**old_pr, "draft": False, "mergeable_state": "dirty"}
     check(
-        "MUTATION: reverting the draft-fix re-parks the draft (non-vacuous)",
-        _reverted_stale_worker_pr_reason(
-            stale_draft_pr, "app[bot]", limits.threshold_seconds, now
+        "MUTATION: the PRE-#171 function parks a valid-provenance NON-DRAFT wedged PR while the "
+        "live one exempts it — the two disagree exactly where the fix lives",
+        (
+            _reverted_stale_worker_pr_reason(
+                _owned_dirty, "app[bot]", limits.threshold_seconds, now,
+                has_valid_provenance=True),
+            stale_worker_pr_reason(
+                _owned_dirty, "app[bot]", limits.threshold_seconds, now,
+                has_valid_provenance=True),
         ),
-        "the worker pull request is still a draft",
+        (BAD_MERGE_STATES["dirty"], None),
     )
     check(
-        "MUTATION guard agrees with the live fix on the non-draft park (only draft changed)",
-        _reverted_stale_worker_pr_reason(old_pr, "app[bot]", limits.threshold_seconds, now)
-        == stale_worker_pr_reason(
-            old_pr, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=True
-        ),
-        True,
+        "MUTATION guard: PRE-#171 and live agree on every ORPHAN, draft and non-draft alike — "
+        "only the OWNED class changed, so nothing was traded away for the fix",
+        [
+            _reverted_stale_worker_pr_reason(
+                pull, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=False)
+            == stale_worker_pr_reason(
+                pull, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=False)
+            for pull in (old_pr, stale_draft_pr, _owned_dirty,
+                         {**old_pr, "draft": False, "mergeable_state": "clean"})
+        ],
+        [True, True, True, True],
     )
 
     fixture_issues = {
@@ -7085,6 +7226,18 @@ def _self_test() -> int:
             refusal = terminal_sweep_env.get("http_failures", {}).get((method, path))
             if refusal is not None:
                 raise refusal
+            # [registry #171] A per-(method, path, Nth-call) SIDE EFFECT, so a fixture can make
+            # the WORLD change between the sweep's planning read and its mutation-boundary
+            # re-read. That race (issue #174) is the only situation in which the sweep's two
+            # provenance derivations can legitimately disagree — and therefore the only way each
+            # can be KILLED ON ITS OWN. Without it the two are mutually-masking duplicates:
+            # hard-coding either to False leaves the whole suite green, because whichever copy
+            # survives still stops the park (measured; AGENTS.md pre-flight item 4).
+            counts = terminal_sweep_env.setdefault("call_counts", {})
+            counts[(method, path)] = nth_call = counts.get((method, path), 0) + 1
+            effect = terminal_sweep_env.get("side_effects", {}).get((method, path, nth_call))
+            if effect is not None:
+                effect()
             if method == "GET" and path.startswith("/repos/owner/repo/issues/"):
                 number = int(path.rsplit("/", 1)[1])
                 return terminal_sweep_env["fresh_issues"].get(number)
@@ -7150,13 +7303,17 @@ def _self_test() -> int:
         name: globals()[name] for name in terminal_sweep_patched
     }
 
-    def _terminal_sweep() -> tuple[int, int, int, int]:
+    def _terminal_sweep(ledger_root: str = "") -> tuple[int, int, int, int]:
+        # `ledger_root` is the checkout run_sweep resolves provenance records from ([registry
+        # #171] — it is the ONLY way a sweep-level fixture can hand a PR a VALID record, which is
+        # what proves the ownership carve-out is actually WIRED at the two call sites rather than
+        # merely correct in the pure function).
         return run_sweep(argparse.Namespace(
             registry_repo="owner/registry",
             policy_file="unused-policy",
             policy_resolver="unused-resolver",
             bot_slug="app",
-            ledger_root="",
+            ledger_root=ledger_root,
             stale_hours=DEFAULT_STALE_HOURS,
         ))
 
@@ -7492,6 +7649,8 @@ def _self_test() -> int:
             paginate_seq_refusals: dict[tuple[str, int], GroomError] | None = None,
             leases: tuple[dict[str, Any], ...] | None = None,
             repos: tuple[str, ...] = ("owner/repo",),
+            ledger_root: str = "",
+            side_effects: dict[tuple[str, str, int], Callable[[], None]] | None = None,
         ) -> tuple[str, str, list[set[str]]]:
             """Run the REAL run_sweep with the given per-object refusals; report (log, error, releases).
 
@@ -7500,7 +7659,11 @@ def _self_test() -> int:
             refuses a LISTING (issue #649's snapshot and comments reads), `paginate_seq_refusals`
             refuses the Nth call to one listing path (the terminal-reap re-read, which is the SECOND
             read of `/pulls?state=open`), `repos`/`leases` widen the fixture to a second target so a
-            head-of-line claim about ONE repo can be witnessed.
+            head-of-line claim about ONE repo can be witnessed. `ledger_root` points run_sweep at a
+            provenance checkout, so a PR can be given a VALID record; `side_effects` fires a
+            callable on the Nth (method, path) request, so the world can CHANGE mid-sweep — the two
+            together are what make the sweep's duplicated provenance derivations separately
+            killable ([registry #171]).
             """
             terminal_sweep_leases[:] = list(leases) if leases is not None else [{
                 **base,
@@ -7523,6 +7686,8 @@ def _self_test() -> int:
                 },
                 writes=[],
                 paginated=[],
+                call_counts={},
+                side_effects=dict(side_effects or {}),
                 http_failures=dict(refusals),
                 paginate_failures=dict(paginate_refusals or {}),
                 paginate_seq_failures=dict(paginate_seq_refusals or {}),
@@ -7535,7 +7700,7 @@ def _self_test() -> int:
             sys.stdout = log
             error = ""
             try:
-                _terminal_sweep()
+                _terminal_sweep(ledger_root)
             except GroomError as exc:
                 error = str(exc)
             finally:
@@ -7543,7 +7708,7 @@ def _self_test() -> int:
                 globals()["load_limits"] = saved_limits
                 terminal_sweep_env.update(
                     pulls=[], gets={}, http_failures={}, planned_issues=[], fresh_issues={},
-                    paginate_failures={}, paginate_seq_failures={},
+                    paginate_failures={}, paginate_seq_failures={}, side_effects={},
                 )
             return log.getvalue(), error, [set(claims) for claims in terminal_sweep_releases]
 
@@ -7681,6 +7846,73 @@ def _self_test() -> int:
             [body for body in _park_bodies()
              if park_policy.HUMAN_PARK_LABEL in body.get("labels", [])],
             [],
+        )
+        # (A1b) [registry #171] THE CALL-SITE WIRING, END TO END. The pure function exempts a
+        # review-loop-owned PR; this proves run_sweep actually ASKS. The run below differs from
+        # (A1) in exactly ONE thing — an admissible provenance record exists in the ledger
+        # checkout the sweep resolves records from — and the SAME wedged non-draft PR that (A1)
+        # parks is now untouched. Hard-code `has_valid_provenance=False` at either call site (the
+        # detection loop's, or the mutation-boundary re-derivation just before the label write)
+        # and this reds while (A1) stays green; delete the carve-out and both change together.
+        # It is placed AFTER (A1)'s assertions on purpose — `_park_bodies()`/`_comment_bodies()`
+        # read the LAST sweep's writes, so an all-empty run interposed above would have made
+        # (A1)'s own emptiness checks pass for the wrong reason.
+        owned_provenance = json.dumps({
+            "pr_number": 31,
+            "head_sha_at_open": "1" * 40,
+            "impl_provider": "anthropic",
+            "impl_alias": "fable",
+            "impl_account_h": "ab" * 8,
+            "issue": 931,
+            "recorded_at_run": "29694084610.1",
+        })
+        with tempfile.TemporaryDirectory() as owned_ledger_dir:
+            owned_record = Path(owned_ledger_dir) / PROVENANCE_DIR / "owner--repo--pr31.json"
+            owned_record.parent.mkdir(parents=True)
+            owned_record.write_text(owned_provenance, encoding="utf-8")
+            owned_log, _e, _r = _sweep_with_refusals(
+                {}, pulls=(_stale_worker_pr(31),), ledger_root=owned_ledger_dir)
+        check(
+            # The LAST element is what kills the DETECTION copy on its own. Without it, hard-coding
+            # that copy to False leaves this green: the PR is detected, becomes a park action, and
+            # the mutation-boundary copy then cancels it — same empty writes, one extra log line.
+            # Asserting the PR never enters the hand-off loop pins the exemption to the layer that
+            # is supposed to make it (AGENTS.md pre-flight item 11).
+            "a wedged NON-DRAFT worker PR the review loop OWNS is not parked by the real sweep: "
+            "no label write, no hand-off comment, zero stale PRs — and it is exempted at "
+            "DETECTION, so it never becomes a park action at all",
+            (
+                _park_bodies(),
+                _comment_bodies(),
+                "stale_prs=0" in owned_log,
+                "SKIP PR owner/repo#31" in owned_log,
+            ),
+            ([], [], True, False),
+        )
+        # (A1c) [registry #174, extended to the merge reason by #171] THE MUTATION-BOUNDARY copy,
+        # killed on its own. The record LANDS DURING THE SWEEP — written on the SECOND GET of the
+        # PR detail, which is the hand-off loop's own re-read — so the planning derivation sees an
+        # orphan and plans a park while the boundary derivation sees a review-loop-owned PR and
+        # must cancel it. This is the only shape in which the two copies disagree, and it is a
+        # real one: a delayed provenance job or backfill lands mid-tick. Hard-code the boundary
+        # copy to False and the park is written; the two elements below then both red.
+        with tempfile.TemporaryDirectory() as raced_ledger_dir:
+            raced_record = Path(raced_ledger_dir) / PROVENANCE_DIR / "owner--repo--pr31.json"
+            raced_record.parent.mkdir(parents=True)
+            raced_log, _e, _r = _sweep_with_refusals(
+                {}, pulls=(_stale_worker_pr(31),), ledger_root=raced_ledger_dir,
+                side_effects={("GET", "/repos/owner/repo/pulls/31", 2):
+                              lambda: raced_record.write_text(owned_provenance, encoding="utf-8")})
+        check(
+            "a provenance record that lands BETWEEN planning and the label write cancels the "
+            "park at the mutation boundary: the PR was planned as stale, then skipped unwritten",
+            (
+                _park_bodies(),
+                _comment_bodies(),
+                "SKIP PR owner/repo#31: no longer stale/failing" in raced_log,
+                "stale_prs=0" in raced_log,
+            ),
+            ([], [], True, True),
         )
 
         # (A2) FAIL-CLOSED DEFAULT. A cause the taxonomy cannot name has no recovery predicate, so
@@ -8833,6 +9065,84 @@ def _self_test() -> int:
             age_park_cause_recovered("merge-blocked", {"mergeable_state": 7},
                                      lambda: ("denies", None))[0],
             False,
+        )
+        # An ABSENT live merge state defaults to `unknown`, which IS a BAD_MERGE_STATE — so the
+        # park stands. (Line-coverage sweep for #171: this default had never executed, and
+        # deleting it makes a record-less PR with no merge state re-admit on `None not in
+        # BAD_MERGE_STATES` — a re-admission earned by a field GitHub simply did not send.)
+        check(
+            "an ABSENT live merge state defaults to `unknown` and keeps the park",
+            age_park_cause_recovered("merge-dirty", {}, lambda: ("denies", None)),
+            (False, "the merge state is still unknown"),
+        )
+        # [registry #171] THE DRAIN FOR THE ALREADY-PARKED POPULATION. A `merge-*` park written
+        # before the ownership carve-out sits on a PR the review loop DOES own, and its
+        # merge-state predicate can never fire: the park label keeps enumerate_review_items'
+        # needs-rebase/needs-ci-fix repair out, so the state it waits on is the one the park
+        # itself prevents. An admissible live record therefore re-admits it — the SAME predicate
+        # and the SAME (cause, head, gen) consume-once budget the orphan-draft exit uses.
+        #
+        # Four rows, one per live-read outcome, on a merge state that is STILL BAD — so the
+        # merge-state predicate answers False for all four and every True below is attributable
+        # to the provenance exit alone. `admits` on a RECOVERED merge state is asserted too, to
+        # pin that the new branch did not displace the old one.
+        check(
+            "an admissible live record re-admits a `merge-*` park (the pre-#171 drain), while "
+            "`denies`/`indeterminate` leave it standing on its own merge state",
+            (
+                age_park_cause_recovered(
+                    "merge-dirty", {"mergeable_state": "dirty"}, lambda: ("admits", {}))[0],
+                age_park_cause_recovered(
+                    "merge-dirty", {"mergeable_state": "dirty"}, lambda: ("denies", None))[0],
+                age_park_cause_recovered(
+                    "merge-dirty", {"mergeable_state": "dirty"},
+                    lambda: ("indeterminate", None))[0],
+                age_park_cause_recovered(
+                    "merge-dirty", {"mergeable_state": "clean"}, lambda: ("admits", {}))[0],
+            ),
+            (True, False, False, True),
+        )
+        check(
+            # (b)-question: the WHY must come from the branch that decided, not from the other
+            # one — a caller posts it verbatim on the PR as the re-admission's stated cause, and
+            # `denies` must still name the merge state rather than the provenance read.
+            "each `merge-*` outcome states ITS OWN cause: the provenance exit names the record, "
+            "the standing park names the merge state",
+            (
+                "admissible provenance record" in age_park_cause_recovered(
+                    "merge-dirty", {"mergeable_state": "dirty"}, lambda: ("admits", {}))[1],
+                age_park_cause_recovered(
+                    "merge-dirty", {"mergeable_state": "dirty"}, lambda: ("denies", None))[1],
+            ),
+            (True, "the merge state is still dirty"),
+        )
+        # A `merge-*` park must NOT re-admit on an unrecognised live-read state: the exit is
+        # keyed on the exact `admits` verdict, never on "not denies".
+        check(
+            "an UNKNOWN live-read state never re-admits a `merge-*` park (exact `admits`, not "
+            "`not denies`)",
+            age_park_cause_recovered(
+                "merge-dirty", {"mergeable_state": "dirty"}, lambda: ("teleported", None))[0],
+            False,
+        )
+        # NON-VACUITY of the four rows above: modelled PRE-#171 predicate (merge state only).
+        # It answers False where the live one answers True, so deleting the provenance exit is a
+        # detectable mutant rather than a silent no-op.
+        def _reverted_merge_recovered(pull):
+            merge_state = pull.get("mergeable_state")
+            if not isinstance(merge_state, str):
+                return False
+            return merge_state not in BAD_MERGE_STATES
+
+        check(
+            "MUTATION: the PRE-#171 `merge-*` predicate leaves an owned, still-dirty PR parked "
+            "forever where the live one drains it",
+            (
+                _reverted_merge_recovered({"mergeable_state": "dirty"}),
+                age_park_cause_recovered(
+                    "merge-dirty", {"mergeable_state": "dirty"}, lambda: ("admits", {}))[0],
+            ),
+            (False, True),
         )
         # A malformed receipt still CONSUMES a generation — otherwise a corrupt comment buys an
         # extra automatic re-admission (park_policy's auto_marker_count rule). [#1292] The
