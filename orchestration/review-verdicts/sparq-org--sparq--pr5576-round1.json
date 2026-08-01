@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5576,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bfd2c96b94ed324b99c04075b020a56034aa80d6",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The module says seed locality is a checked invariant, and no_share_uses_a_seed_its_party_does_not_hold is presented as load-bearing. However, PrssRandomness owns one global vector containing every key, sharing_at evaluates prf_fp for every seed, and then applies each result to every party (including non-holders) with a zero coefficient. The test only inspects f_at and never observes which keys the generation path accesses. It therefore cannot detect a regression that evaluates or otherwise uses a non-held seed, and it does not demonstrate that independently held per-party seed views produce the emitted shares. This matters because seed-local computation is the central protocol property claimed by this PR, even with the trusted setup and in-process limitations honestly disclosed.",
+    "file": "crates/sparq-mpc/src/prss.rs",
+    "fix_hint": "Represent or derive explicit per-party seed views and generate each party's share using only that view, or add an instrumented generation path that records key accesses and fails on a non-held seed. Test that the real shared_mask generation agrees with the global polynomial construction while each party's access set is exactly the complement of A. Include a mutation-style assertion that deliberately exposing/using a forbidden seed makes the test fail.",
+    "severity": "major",
+    "title": "Seed-locality invariant is asserted but not exercised on the real generation path"
+   },
+   {
+    "body": "This module repeatedly cites research/mpc-distributed-randomness-design.md as its design and acceptance authority, but that record still states that the crate ships no dealer-less crypto and no PRSS implementor. Landing a soundness-sensitive MPC implementation while leaving its designated audit/status record describing the pre-implementation state makes the review evidence internally inconsistent and leaves the new PRF choice and simulation boundaries outside the record's implementation-status accounting.",
+    "file": "crates/sparq-mpc/src/prss.rs",
+    "fix_hint": "Update the cited design record in this PR to distinguish the implemented online PRSS generator from the simulated trusted seed setup, central nonzero test, missing VSS, non-deployable status, and pending external audit. Record the concrete PRF instantiation and why it matches the construction's PRF assumption.",
+    "severity": "major",
+    "title": "The cited design/audit record contradicts the new implementation status"
+   }
+  ],
+  "progress": null,
+  "summary": "The algebraic PRSS construction and fail-closed deployment gate are carefully caveated, but the load-bearing seed-locality claim is not actually established by the implementation or its named test. The source stores every seed centrally and sharing_at evaluates every PRF before applying zero coefficients; the test checks only those public coefficients. Thus the test would remain green if the generator continued to access seed material unavailable to a party, contrary to the stated checked invariant. The design record cited as authority also still states that no PRSS implementor ships, so the implementation and its audit/status record are inconsistent.",
+  "verdict": "request_changes"
+ }
+}
