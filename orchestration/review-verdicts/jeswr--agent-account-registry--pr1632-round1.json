@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1632,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "bd892b493332c205cd209334841791a9ed6bf6d7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Step Q disables the 17 workflows, waits out the longest worker lease TTL, and confirms that no queued runs remain. Disabling prevents new triggers but does not cancel runs that are already in progress, and a lease TTL is not a bound on workflow execution time (nor on the runtime of the non-worker ledger writers). Checking only queued runs therefore permits an in-progress job to PUT after the pre-push verification or after the force-update. The force-with-lease protects only against a write before its ref comparison; it cannot protect against a surviving job that writes afterward. This contradicts the record's own statement that an in-flight PUT is the race that silently loses data.",
+    "file": "research/536-ledger-history-rewrite.md",
+    "fix_hint": "Make quiescence explicit and fail-closed: after disabling every writer workflow, enumerate runs for all 17 and require zero runs in every non-terminal status (including in_progress, queued, waiting, pending, and requested), polling until that invariant holds or aborting the window. If runs are cancelled instead, wait for terminal completion and document how cancellation is verified. Re-check the ledger tip immediately before the force-with-lease push and retain the existing lease comparison.",
+    "severity": "major",
+    "title": "Quiesce step does not wait for in-progress writer runs"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe measurement and the rewrite/re-root tradeoff are carefully scoped, but the proposed maintenance sequence does not actually establish writer quiescence. That is the safety property on which the force-update depends, so the design record is not yet executable fail-closed as claimed.",
+  "verdict": "request_changes"
+ }
+}
