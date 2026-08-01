@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1519,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c31eb863e3654f56e0bf9ad57e1b1f71c0291c13",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The job check filters raw lines with `re.fullmatch(r\"    if:.*\", line)`. YAML permits separation whitespace before the mapping colon, so changing or adding the gate as `    if : false` still defines the job-level `if` key but does not match this regex. The expected `(True, [])` therefore remains green even though `cron-keepalive` is disabled and neither keepalive leg can run. This leaves the marquee job-gate claim non-vacuous only for one textual spelling, not for the YAML control it claims to protect.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Extract the job's own top-level mapping keys with indentation-bounded YAML-aware logic (including optional separation whitespace before `:`), refuse duplicates, and add an independent synthetic assertion showing that `if : false` is detected as a job gate. Keep the expectation independent of the extractor implementation.",
+    "severity": "major",
+    "title": "Job-level gate assertion misses a valid YAML spelling"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe step-level checks are exact-value and their extractor exercises the important absent, nested, first-key, and duplicate cases. However, the new enclosing-job assertion is still a textual spelling check rather than a semantic YAML-key check: it recognizes only `    if:`. A valid job key written as `    if : false` is invisible, so the whole keepalive job can be disabled while every new row remains green. Because round 1 had no findings and this round adds a major non-vacuity finding, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
