@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1565,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a718a1d17797294c527653b115be564b5bc448ae",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe evidence-based de-duplication remains correct and fail-safe: only an author-filtered, line-anchored notice suppresses reposting; unreadable or missing courtesy evidence falls toward retrying the comment; and the quarantine label mutation plus post-write verification remain fail-loud and ordered before courtesy work. The executable workflow-step tests cover cancellation after persisted mutation, comment-post failure and retry, third-party forgery, courtesy-read failure, and failed label verification. I found no blocker or major issue in the diff.",
+  "verdict": "approve"
+ }
+}
