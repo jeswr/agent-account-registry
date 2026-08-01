@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5576,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "56dcab1c53c2b502c6273dcd6414885fe3ac02cc",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "sharing_at_observed constructs prf by iterating self.seeds and calling prf_fp on every key before any per-party view is entered. The observe hook fires only in the later view_of(party) loop, when already-computed field elements are indexed. Consequently no_share_uses_a_seed_its_party_does_not_hold stays green even if the generation path evaluates every non-held key, exactly the round-one failure mode. The mutation guard merely adds a forbidden PRF output after independently evaluating its key; it does not mutate the real access path or demonstrate that a party-local generator lacks that key. Central evaluation is acceptable for the explicitly disclosed simulation oracle, but it cannot simultaneously serve as evidence for the claimed checked seed-local online generation property.",
+    "file": "crates/sparq-mpc/src/prss.rs",
+    "fix_hint": "Separate the simulation-only global oracle from party-local generation. Give each party an explicit seed view containing only its held key material and compute that party's PRFs from that view; compute the central value independently only for rejection/testing. Instrument key access at or inside prf_fp invocation, not after global evaluation, and have the real shared_mask path call the party-local routine. Add a mutation/test path that attempts a forbidden key lookup through the same party-local interface and is rejected or impossible, while still checking the resulting shares against the independently computed global polynomial. Alternatively, narrow the public claims and test name so they do not assert independently executable seed locality, but that would leave the central protocol property unestablished.",
+    "severity": "major",
+    "title": "Seed-locality instrumentation still begins after every seed has been evaluated globally"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 fixes the design-record contradiction, but the seed-locality finding remains materially unresolved. The revised share accumulation iterates over view_of(party), yet sharing_at_observed first evaluates prf_fp for every centrally stored seed into one global vector. Its observer is invoked only later while indexing that vector, so the named load-bearing test cannot see or reject forbidden/global key evaluation and does not establish that the real generation path can run from independently held per-party seed views. Because the implementation still claims generation is structurally seed-local and the test is presented as proving that security-critical property, this remains a major soundness/test-validity issue. Progress is improving because one of the two prior major findings was resolved by the authoritative implementation-status update.",
+  "verdict": "request_changes"
+ }
+}
