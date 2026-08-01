@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5586,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8e9a05436f9d7156f49361b226f654c33c5c3eca",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In `_enforce_unlegged`, the staleness sweep explicitly continues when `crate not in legged`. Therefore deleting a crate's last feature-matrix fragment also removes that crate from `declared_by_crate`, and every allowlist entry for it becomes permanently invisible. This contradicts the new file's promise that stale entries (including no-longer-live gaps) RED and that the registry can only shrink. It also creates a practical bypass: removing the fragment disables both candidate enumeration and cleanup while enforcement still succeeds.",
+    "file": "scripts/feature-matrix-tiers.py",
+    "fix_hint": "Validate every registry entry independently of `legged`: resolve its crate manifest and reject an entry when the crate/feature is absent or the crate no longer has a fragment. Add a hermetic test that starts with a registry entry for `fixture` but supplies legs for a different crate (or no fixture leg) and asserts enforcement fails. If fragmentless crates are intentionally out of scope, narrow the documentation and registry contract explicitly, but that leaves the guard bypass unresolved.",
+    "severity": "major",
+    "title": "Stale allowlist entries survive when a crate fragment is deleted"
+   }
+  ],
+  "progress": null,
+  "summary": "The zero-leg enforcement and its focused tests cover the primary blind spot, but the new registry does not actually satisfy its advertised bidirectional strictness. Entries for crates whose feature-matrix fragment is removed are silently skipped forever, allowing stale exceptions to accumulate and defeating the stated invariant that the registry can only shrink.",
+  "verdict": "request_changes"
+ }
+}
