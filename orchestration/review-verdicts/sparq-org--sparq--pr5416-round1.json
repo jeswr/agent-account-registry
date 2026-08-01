@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5416,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f991e3f1bfc76447002d41ea63f0be076c74cb39",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly exposes the existing validated non-reserving-partition policy through both the in-process planner module and the offline partition dump, while preserving fail-closed behavior for malformed declarations and containment-aware resolution such as ci-fragments -> ci. The contract fixture covers exempt, reserving, nested, global, and degenerate keys, and the tests exercise both channels rather than merely restating the raw set. The dispatch-plan self-test passes. The focused unittest could not run in this checkout because the PyYAML dependency is unavailable, but its assertions are non-vacuous and directly exercise a fresh CLI subprocess plus the real predicate.",
+  "verdict": "approve"
+ }
+}
