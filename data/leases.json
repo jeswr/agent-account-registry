@@ -82,16 +82,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "d26aa0e1abb346c5b6bb28a87d37d541",
-   "holder": "review:sparq-org/sparq#5473@30675577359.1",
-   "package": "upstream",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785544065,
-   "expires_at": 1785548265
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "5ac69729900d4db6bdde716b3943cb6d",
    "holder": "review:jeswr/agent-account-registry#1484@30675604165.1",
    "package": "groom",
