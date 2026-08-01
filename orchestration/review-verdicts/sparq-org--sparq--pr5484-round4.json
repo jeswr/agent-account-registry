@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5484,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "86ae4f32bc19c321aac050687cc5f5e05c962f52",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "require_one_side_bound remains a standalone helper whose documentation says callers should run it before wire::derive_grants. No changed production boundary invokes it, and the acceptance tests call the helper directly rather than submitting controller-authored rule text through the real admission path. Callers can therefore still pass unseedable .acr text directly to derive_grants despite the fail-closed guard language.",
+    "file": "crates/sparq-trust/src/cost.rs",
+    "fix_hint": "Enforce require_one_side_bound at the shared boundary where controller-authored .acr text enters derive_grants/evaluation, propagate denial fail-closed, and add an integration test proving an unseeded rule is rejected through that real path while a seeded rule succeeds. Alternatively, consistently narrow the public claims to an optional static-analysis helper and explicitly leave operational enforcement unresolved.",
+    "severity": "major",
+    "title": "Fail-closed seeding guard remains unenforced on the real .acr path"
+   },
+   {
+    "body": "is_var still recognizes only terms beginning with '?', so term_bound treats a blank-node label such as '_:x' as a bound constant. Within an N3 rule formula that label is formula-scoped/existential, not an externally fixed endpoint, and cannot conservatively supply the constant-side lookup promised by this analysis. For example, `{ _:x p:linkedTo ?o } => { ?o p:ok p:v }` can still pass incorrectly.",
+    "file": "crates/sparq-trust/src/cost.rs",
+    "fix_hint": "Treat blank-node labels as formula-scoped unbound terms for seeding analysis, or reject them as unsupported. Add a require_one_side_bound regression test proving a blank-node-labelled endpoint cannot seed an otherwise unbound atom.",
+    "severity": "major",
+    "title": "Blank-node labels are still incorrectly accepted as constant seeds"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is stagnant. Both prior major findings remain unchanged: require_one_side_bound is still only a public helper that documentation tells callers to invoke, while no production .acr admission boundary enforces it and the tests still call the helper directly. Blank-node labels remain classified as constants because is_var recognizes only '?' variables, so a formula-scoped existential endpoint can still incorrectly seed an atom. The new feature-matrix leg improves test execution coverage but does not resolve either correctness gap.",
+  "verdict": "request_changes"
+ }
+}
