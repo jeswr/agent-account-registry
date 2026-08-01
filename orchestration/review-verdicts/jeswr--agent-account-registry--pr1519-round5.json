@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1519,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "691e69e1f45dcde4b07e7ecc18700210e699933f",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_workflow_job_key` still bounds the job with `(?=^  \\S|\\Z)`. A two-space comment satisfies that lookahead even though YAML ignores comment-only lines for mapping structure. Placing `  # keepalive controls` after the captured `    runs-on: ubuntu-latest` and before `    if: false` truncates the block: `runs-on` supplies the positive control, while `if` incorrectly reads as absent, so the live row stays green although GitHub disables the job. The updated `synthetic_job` contains only `    # if: ...`, a four-space comment, and still does not test the round-4 boundary case.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Make job-boundary detection skip comment-only lines while still refusing missing or ambiguous job definitions. Add the exact independent regression fixture: a two-space comment between `    runs-on: ubuntu-latest` and `    if: false`, and assert that the gate is still returned while the positive control occurs before the comment.",
+    "severity": "major",
+    "title": "A job-indented comment still hides subsequent job gates"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-4 major remains unchanged. `_workflow_job_key` still terminates the selected job at `(?=^  \\S|\\Z)`, so a valid two-space comment is mistaken for the next job boundary. The revised `synthetic_job` still places its comment at four spaces inside the job and does not exercise the reported bypass. With `  # keepalive controls` after `    runs-on: ubuntu-latest` and before `    if: false`, the extractor retains the positive control but truncates away the disabling gate; the production assertion therefore stays green while GitHub skips the job. Because the same soundness defect remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
