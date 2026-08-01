@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5354,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9459f3c18d3f14ed0daadfc27563494b1804997b",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The README and skill now explicitly preserve research/zk-field-native-encoding.md \u00a714.1 as an open CR-G8/sq-qhy4 obligation, acknowledge that shipped VALUE_NONE = 2 lies inside the reachable handle band, and limit the scoped routing test's evidence to current routing plus the two unrouted boolean hooks. This is consistent with the audit record and does not overstate the test or retire the external-audit requirement. The diff remains clear that the feature is opt-in, partial, research-grade, and not externally audited.",
+  "verdict": "approve"
+ }
+}
