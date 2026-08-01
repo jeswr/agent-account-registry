@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1632,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5acf3a10312d2c4540cf3029bca07024c01b70d4",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Step C says `select-and-claim.py --claim` and `groom.py` should read the rewritten tip and obtain the same content. Neither is a read-only validation command. A valid `--claim` call executes `claim(...)`, which performs a lease-ledger CAS PUT when an account is available; `groom.py` without a report/self-test mode executes `run_sweep(args)`, whose purpose includes ledger reconciliation and writes. Running either with the credentials needed to exercise the real branch can advance the just-rewritten tip during the maintenance window. It also makes the stated last-resort signal (a tip advanced past the pushed SHA means a surviving writer) ambiguous, because the prescribed post-check itself may be the writer. Workflow disablement does not prevent these manual CLI invocations.",
+    "file": "research/536-ledger-history-rewrite.md",
+    "fix_hint": "Replace these commands with explicitly read-only checks. For example, fetch the rewritten tip's files through the contents API pinned to the post-push SHA, parse them with pure validation functions or a purpose-built no-write validation mode, compare their hashes/content with the archived pre-rewrite tip, and assert the remote ledger ref still equals the pushed SHA. Do not invoke `--claim`, the default groom sweep, or any other path capable of a contents-API PUT during post-checking.",
+    "severity": "major",
+    "title": "Post-check invokes mutating production entry points"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-1 quiescence finding is resolved: Q1 disables and verifies the full writer set, while Q2 checks all five non-terminal statuses from one coherent `--all` snapshot per workflow and fails closed. However, the new post-check procedure tells the operator to invoke two production writer entry points while validating the rewritten branch. Those invocations can mutate the ledger rather than merely prove that its tip is readable, undermining the controlled post-push state and the later tip-advance detection. The runbook therefore remains unsafe to execute as written.",
+  "verdict": "request_changes"
+ }
+}
