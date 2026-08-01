@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5505,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "465b637ef0c57a4e89795651ce9b5cda3a9ee6f1",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "ProofSummary says the store value is private and not disclosed to the verifier, while the prover publishes operand_enc. The only provable values are the four entries in the shipped OPERAND_ENC table (24, 25, 30, 42), making operand_enc a trivially enumerable identifier for the witness. The generic research-track/not-audited caveat does not make the panel's specific nondisclosure statement true. The E2E check only asserts that the numeric field 30 is absent; it does not test whether the public commitment identifies 30 by dictionary lookup.",
+    "file": "gui/app/src/components/workbench/zk-tool.tsx",
+    "fix_hint": "Remove or narrowly qualify the nondisclosure claim to state that the raw digits are private but the deterministic operand commitment may reveal low-entropy values by enumeration. Update the README and E2E description/assertions consistently. If actual value hiding is intended, use a hiding commitment with verifier-bound randomness and test the resulting disclosure model; do not claim it from absence of the literal integer alone.",
+    "severity": "major",
+    "title": "Public operand_enc reveals witnesses from the tiny shipped domain"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 4 regresses from the finding-free prior round: the ZK panel makes a concrete nondisclosure claim that its implementation and browser test do not establish. Although the raw integer is not a public input, operand_enc is a deterministic public encoding drawn from a shipped four-value table, so a verifier can enumerate the table and recover the selected value. The external-audit caveat does not cure the specific false claim that the value is hidden. The test is non-vacuous as an execution test, but its privacy assertion checks only that the integer field 30 is absent and misses this dictionary disclosure channel.",
+  "verdict": "request_changes"
+ }
+}
