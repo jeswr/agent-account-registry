@@ -1850,6 +1850,32 @@ def report_orphan_claims(args: argparse.Namespace) -> int:
     return 0
 
 
+# [#678] GitHub lists issues and pulls NEWEST FIRST by default (`sort=created&direction=desc`),
+# and this sweep walks that listing one page at a time. A row created while the walk is in flight
+# is inserted at the FRONT, which shifts every later row one position toward the back — so a row
+# already returned on page N reappears on page N+1. Run 30177208018 hit exactly that: four issues
+# were created in the target repo inside the snapshot window and the duplicate guard below took the
+# whole sweep down for a cycle, skipping dead-lease reclaim, stuck-issue repair and stale-PR
+# hand-off with it.
+#
+# Walking OLDEST FIRST removes the race rather than tolerating it: a concurrently created row lands
+# at the TAIL, past the cursor, where it cannot disturb a page already read. `direction=asc` is the
+# load-bearing token — `sort=created` merely pins the field the direction applies to, and matches
+# what GitHub already defaults to, so it is stated for readability and for the day that default
+# moves. The remaining shift — a row REMOVED mid-walk pulls later rows forward — costs at most a
+# SKIP, which the next tick picks up, and it is not the direction creation pushes.
+#
+# The duplicate guard stays. Under this ordering a duplicate is no longer a race, so it is evidence
+# of a genuinely inconsistent snapshot; groom mutates labels and state off this snapshot, and
+# silently collapsing two differing copies of one issue risks double-processing it.
+STABLE_LISTING_ORDER = "sort=created&direction=asc"
+
+
+def _stably_ordered(path: str) -> str:
+    """`path` with the front-insertion pagination race removed (see STABLE_LISTING_ORDER)."""
+    return f"{path}{'&' if '?' in path else '?'}{STABLE_LISTING_ORDER}"
+
+
 def _labels(item: dict[str, Any], where: str) -> set[str]:
     raw = item.get("labels")
     if not isinstance(raw, list):
@@ -1865,7 +1891,7 @@ def _labels(item: dict[str, Any], where: str) -> set[str]:
 
 def _issues(api: GitHubAPI, repo: str) -> dict[int, dict[str, Any]]:
     result: dict[int, dict[str, Any]] = {}
-    for item in api.paginate(f"/repos/{repo}/issues?state=open"):
+    for item in api.paginate(_stably_ordered(f"/repos/{repo}/issues?state=open")):
         if not isinstance(item, dict):
             raise GroomError(f"target issue snapshot is malformed for {repo}")
         if "pull_request" in item:
@@ -1888,7 +1914,7 @@ def _issues(api: GitHubAPI, repo: str) -> dict[int, dict[str, Any]]:
 
 def _pulls(api: GitHubAPI, repo: str) -> dict[int, dict[str, Any]]:
     result: dict[int, dict[str, Any]] = {}
-    for pull in api.paginate(f"/repos/{repo}/pulls?state=open"):
+    for pull in api.paginate(_stably_ordered(f"/repos/{repo}/pulls?state=open")):
         if not isinstance(pull, dict):
             raise GroomError(f"target pull request snapshot is malformed for {repo}")
         number = pull.get("number")
@@ -4084,6 +4110,17 @@ def _self_test() -> int:
         ok = ok and good
         print(f"  {'ok  ' if good else 'FAIL'} {name}: {got!r} (want {want!r})")
 
+    # [#678] The two listing paths the sweep ACTUALLY requests, spelled out as LITERALS here
+    # rather than through `_stably_ordered`. A fixture keyed off the production helper would
+    # follow the code wherever it went, so dropping the stable ordering would leave every sweep
+    # scenario below green (AGENTS.md pre-flight item 2c); keyed off these, the fixture stops
+    # answering and the scenarios red.
+    def _open_issues_path(repo: str = "owner/repo") -> str:
+        return f"/repos/{repo}/issues?state=open&sort=created&direction=asc"
+
+    def _open_pulls_path(repo: str = "owner/repo") -> str:
+        return f"/repos/{repo}/pulls?state=open&sort=created&direction=asc"
+
     # ---- _ensure_label: reconcile the PARK label descriptions, and ONLY those -----------------
     #
     # The twin of worker-pr's fix. groom already carried the CORRECT text in LABELS, but the
@@ -4186,6 +4223,156 @@ def _self_test() -> int:
         "direct holder active worker",
         classify_lease(direct, limits, now, {}, {456: active}).state,
         "live",
+    )
+
+    # ---- #678: the target snapshot pages over a STABLE ordering --------------------------------
+    #
+    # Run 30177208018 died on `target issue snapshot contains duplicates for sparq-org/sparq` while
+    # four issues were being created in that repo inside the snapshot window. Newest-first
+    # pagination is what makes that reachable: a row inserted at the FRONT between two page fetches
+    # pushes an already-returned row down onto the next page. These checks drive the SHIPPED
+    # `GitHubAPI.paginate` walk against a listing that does exactly that, once per ordering, so the
+    # fix is measured against the race it removes rather than against a re-description of it.
+    class _RacingListing(GitHubAPI):
+        """A GitHub-shaped listing that gains one row mid-walk.
+
+        Rows come back ordered by creation — issue and PR numbers are assigned monotonically, so
+        the number IS the creation order — and `direction` decides which END the concurrently
+        created row lands on. That is the one behaviour the fix turns on; the page slicing and the
+        short-page stop are the real `GitHubAPI.paginate`, reached through `request`."""
+
+        def __init__(self, rows: list[dict[str, Any]], newcomer: dict[str, Any]) -> None:
+            super().__init__("t", "target")
+            self.rows = list(rows)
+            self.newcomer = newcomer
+            self.queries: list[str] = []
+
+        def request(self, method, path, body=None, allow_404=False, retry_conflict=False):
+            self.queries.append(path)
+            query = dict(pair.split("=", 1) for pair in path.split("?", 1)[1].split("&"))
+            ordered = sorted(self.rows, key=lambda row: row["number"])
+            # GitHub's DEFAULT for both listings is newest-first, so an absent `direction` reads
+            # as `desc` here — a caller that stops asking for `asc` gets the racy order back.
+            if query.get("direction", "desc") != "asc":
+                ordered.reverse()
+            page, per_page = int(query["page"]), int(query["per_page"])
+            window = ordered[(page - 1) * per_page:page * per_page]
+            # The concurrent creation, landing between the first page being served and the second
+            # being requested — the window the live failure hit.
+            if page == 1 and self.newcomer not in self.rows:
+                self.rows.append(self.newcomer)
+            return window
+
+    def _race_issue(number: int) -> dict[str, Any]:
+        return {"number": number, "labels": [], "comments": 0,
+                "updated_at": "2026-08-01T00:00:00+00:00"}
+
+    def _race_pull(number: int) -> dict[str, Any]:
+        return {"number": number, "body": "", "updated_at": "2026-08-01T00:00:00+00:00"}
+
+    def _query_tokens(paths: list[str]) -> list[list[str]]:
+        """Each request's query as a SORTED TOKEN LIST — exact membership, not containment.
+
+        `direction=asc` is the load-bearing token and a substring assertion would accept
+        `direction=ascending-ish` or an appended second `direction=desc` (AGENTS.md item 6)."""
+        return [sorted(path.split("?", 1)[1].split("&")) for path in paths]
+
+    _OLDEST_FIRST_PAGE_1 = ["direction=asc", "page=1", "per_page=100", "sort=created",
+                           "state=open"]
+
+    class _FixedListing:
+        """One canned page, for the guard-side checks that need no page walk."""
+
+        def __init__(self, rows: list[dict[str, Any]]) -> None:
+            self.rows = list(rows)
+
+        def paginate(self, _path: str) -> list[dict[str, Any]]:
+            return list(self.rows)
+
+    def _snapshot_refusal(rows: list[dict[str, Any]], reader: Any = None) -> str:
+        # TOTAL: any exception is reported as a value, so a mutant that makes the reader blow up
+        # cannot abort the suite and score itself a kill (AGENTS.md item 4).
+        try:
+            (reader or _issues)(_FixedListing(rows), "owner/repo")
+        except GroomError as exc:
+            return str(exc)
+        except Exception as exc:  # noqa: BLE001
+            return f"raised {type(exc).__name__}"
+        return "ACCEPTED"
+
+    def _race_snapshot(api: Any, reader: Any) -> tuple[str, list[int]]:
+        try:
+            return "", sorted(reader(api, "owner/repo"))
+        except GroomError as exc:
+            return str(exc), []
+        except Exception as exc:  # noqa: BLE001
+            return f"raised {type(exc).__name__}", []
+
+    race_rows = [_race_issue(number) for number in range(1, 121)]
+    race_api = _RacingListing(race_rows, _race_issue(3801))
+    race_error, race_numbers = _race_snapshot(race_api, _issues)
+    check(
+        "#678: an issue CREATED between two page fetches cannot duplicate an already-read row — "
+        "the walk is oldest-first, so the newcomer lands at the TAIL, past the cursor: all 120 "
+        "rows plus the newcomer, each exactly once, and the sweep survives",
+        (race_error, len(race_numbers), race_numbers[:1], race_numbers[-1:]),
+        ("", 121, [1], [3801]),
+    )
+    check(
+        "#678: the issue listing is REQUESTED oldest-first, on every page — tokenised exact "
+        "membership, so a truncated or re-appended `direction` cannot satisfy it",
+        _query_tokens(race_api.queries),
+        [_OLDEST_FIRST_PAGE_1,
+         ["direction=asc", "page=2", "per_page=100", "sort=created", "state=open"]],
+    )
+    desc_walk = _RacingListing(race_rows, _race_issue(3801)).paginate(
+        "/repos/owner/repo/issues?state=open&sort=created&direction=desc"
+    )
+    desc_seen = [row["number"] for row in desc_walk]
+    check(
+        "#678 INSTRUMENT VALIDATION: the SAME listing walked NEWEST-FIRST really does re-serve a "
+        "row it already returned. Without this pair the check above would pass against a fixture "
+        "that could never have produced the live failure",
+        (len(desc_seen) - len(set(desc_seen)),
+         sorted({number for number in desc_seen if desc_seen.count(number) > 1})),
+        (1, [21]),
+    )
+    check(
+        "#678: and that raced snapshot still FAILS CLOSED through the real guard — the refusal "
+        "was always CORRECT, the newest-first ordering was the bug",
+        _snapshot_refusal(desc_walk),
+        "target issue snapshot contains duplicates for owner/repo",
+    )
+    check(
+        "#678: two DIFFERING copies of one issue number still FAIL CLOSED. Under a stable walk a "
+        "duplicate is no longer a race but an inconsistent snapshot, and groom mutates labels and "
+        "state off this view — a `set()`-style collapse would silently pick one of the two",
+        _snapshot_refusal([_race_issue(7),
+                           {**_race_issue(7), "labels": [{"name": "status:parked"}]}]),
+        "target issue snapshot contains duplicates for owner/repo",
+    )
+    check(
+        "#678: a BYTE-IDENTICAL duplicate fails closed too (the guard is not weakened in either "
+        "shape), while a clean snapshot is still ACCEPTED — the refusal is not universal",
+        (_snapshot_refusal([_race_issue(7), _race_issue(7)]),
+         _snapshot_refusal([_race_issue(7), _race_issue(8)])),
+        ("target issue snapshot contains duplicates for owner/repo", "ACCEPTED"),
+    )
+    pull_race_api = _RacingListing([_race_pull(number) for number in range(1, 121)],
+                                   _race_pull(3802))
+    pull_error, pull_numbers = _race_snapshot(pull_race_api, _pulls)
+    check(
+        "#678: the open-PR half of the same snapshot pages oldest-first too. The ordering is "
+        "written at BOTH listings, so this is what kills the pulls copy on its own — deleting "
+        "either one alone leaves the other's check green (AGENTS.md item 4)",
+        (pull_error, len(pull_numbers), pull_numbers[-1:],
+         _query_tokens(pull_race_api.queries[:1])),
+        ("", 121, [3802], [_OLDEST_FIRST_PAGE_1]),
+    )
+    check(
+        "#678: the PR-side duplicate guard is intact as well",
+        _snapshot_refusal([_race_pull(9), {**_race_pull(9), "body": "Fixes #4"}], _pulls),
+        "target pull request snapshot contains duplicates for owner/repo",
     )
 
     # ---- YAML seam: WORKER_RUN_NAME vs the title worker.yml actually renders (issue #1130) ----
@@ -7277,9 +7464,9 @@ def _self_test() -> int:
             sequenced = terminal_sweep_env.get("paginate_seq_failures", {}).get((path, nth))
             if sequenced is not None:
                 raise sequenced
-            if path == "/repos/owner/repo/issues?state=open":
+            if path == _open_issues_path():
                 return terminal_sweep_env["planned_issues"]
-            if path == "/repos/owner/repo/pulls?state=open":
+            if path == _open_pulls_path():
                 return terminal_sweep_env.get("pulls", [])
             return terminal_sweep_env.get("pages", {}).get(path, [])
 
@@ -9416,8 +9603,7 @@ def _self_test() -> int:
             repos=("owner/repo", "owner/other"),
             leases=(repo_lease, other_lease),
             paginate_refusals={
-                "/repos/owner/repo/issues?state=open":
-                    _refused_listing("/repos/owner/repo/issues?state=open")},
+                _open_issues_path(): _refused_listing(_open_issues_path())},
         )
         check(
             "MUTATION #649 (2 — per-repo snapshot): the unreadable repo's lease is RETAINED while "
@@ -9437,8 +9623,7 @@ def _self_test() -> int:
         snap_all_log, snap_all_error, snap_all_releases = _sweep_with_refusals(
             {},
             paginate_refusals={
-                "/repos/owner/repo/pulls?state=open":
-                    _refused_listing("/repos/owner/repo/pulls?state=open")},
+                _open_pulls_path(): _refused_listing(_open_pulls_path())},
         )
         check(
             "#649 (2) precedence rule 2: the ONLY target's snapshot failing is systemic — non-zero "
@@ -9514,12 +9699,11 @@ def _self_test() -> int:
             repos=("owner/repo", "owner/other"),
             leases=(repo_lease, other_lease),
             paginate_seq_refusals={
-                ("/repos/owner/repo/pulls?state=open", 2):
-                    _refused_listing("/repos/owner/repo/pulls?state=open")},
+                (_open_pulls_path(), 2): _refused_listing(_open_pulls_path())},
         )
         reval_pull_reads = sum(
             1 for path in terminal_sweep_env["paginated"]
-            if path == "/repos/owner/repo/pulls?state=open"
+            if path == _open_pulls_path()
         )
         check(
             "MUTATION #649 (3b — fresh PR listing): a listing that SUCCEEDED in the snapshot and "
@@ -9548,8 +9732,7 @@ def _self_test() -> int:
             repos=("owner/repo", "owner/other"),
             leases=(repo_lease, other_lease),
             paginate_seq_refusals={
-                (f"/repos/{repo}/pulls?state=open", 2):
-                    _refused_listing(f"/repos/{repo}/pulls?state=open")
+                (_open_pulls_path(repo), 2): _refused_listing(_open_pulls_path(repo))
                 for repo in ("owner/repo", "owner/other")},
         )
         check(
@@ -9575,7 +9758,7 @@ def _self_test() -> int:
         _sweep_with_refusals({}, leases=())
         quiet_pull_reads = sum(
             1 for path in terminal_sweep_env["paginated"]
-            if path == "/repos/owner/repo/pulls?state=open"
+            if path == _open_pulls_path()
         )
         check(
             "#649 (3b) CALL SITE: the reap-revalidation pull listing is read ONCE PER REAPING "
@@ -9621,7 +9804,7 @@ def _self_test() -> int:
             return {}
 
         def paginate(self, path):
-            if path == "/repos/owner/repo/pulls?state=open":
+            if path == _open_pulls_path():
                 sweep_env["pull_reads"] += 1
                 if sweep_env["pull_reads"] >= sweep_env["pr_visible_from"]:
                     # Which PR "appears" is a scenario knob (issue #279): the default is the
@@ -9646,7 +9829,7 @@ def _self_test() -> int:
         "/repos/owner/repo/collaborators/jeswr/permission": {"permission": "admin"},
     }
     sweep_env["pages"] = {
-        "/repos/owner/repo/issues?state=open": [sweep_issue],
+        _open_issues_path(): [sweep_issue],
         # Two durable bot attempt comments: the budget (max_attempts=2) is exhausted, so
         # planning emits the defer and the write-loop recount confirms it.
         "/repos/owner/repo/issues/8/comments": [
