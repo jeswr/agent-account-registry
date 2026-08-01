@@ -17,6 +17,10 @@ we want:
 
 > No per-account lease row array is ever readable at `data/observability.json` on the `ledger` ref.
 
+Read this as the **target**, not as something any option below delivers: it is a property about the
+branch, and §6/§7 conclude that nothing in this record establishes it — the achievable property is
+refusal and detection. The gap is stated precisely in §7.
+
 The property that actually holds today is much weaker:
 
 > If a per-account lease row array is present, each row's label must be the canonical salted
@@ -105,10 +109,13 @@ second schema validator. The repo's standing division is that *content* schemas 
 consumer (`lease_schema.validate_ledger`, model-health's `validate_ledger`,
 `_normalize_observability`) and *shape* lives in `ledger-invariant.py`. B erodes that.
 
-**C — producer-side guard in the collector.** The **only** option that actually delivers §1, because
-of §3(a): once the bytes are pushed, every other option is post-hoc. **Cost:** it cannot be written
-today (no collector), it cannot be self-tested from this repo, and if the collector ever lives
-outside this repo it is an unenforceable request. Necessary, insufficient alone.
+**C — producer-side guard in the collector.** The only option that acts *before* publication, because
+of §3(a): once the bytes are pushed, every other option is post-hoc. But it covers exactly one write
+path — the collector's. Nothing in this repo makes the contents API reachable only through that
+collector (§2: eleven scripts hold their own `PUT`, and the branch is writable by anything holding
+the token), so C bounds what *the collector* publishes, not what *the branch* carries. **Cost:** it
+cannot be written today (no collector), it cannot be self-tested from this repo, and if the collector
+ever lives outside this repo it is an unenforceable request. Necessary, insufficient alone.
 
 **D — tolerant drop + a printed line.** Rejected. A green build plus a log line nobody reads is
 exactly the failure `_obs_drop_queue` was written to end (`dashboard-gen.py:1617-1624`: *"published a
@@ -156,9 +163,14 @@ review-fix decided deliberately rather than inherited. I do not recommend it as 
 
 ## 6. What this does not buy, and what I do not know
 
-- **A does not achieve §1.** It refuses to *build a dashboard from* a document containing rows; it
-  cannot stop the rows being written or being public. Only C can, and only prospectively (§3(a)).
-  Anyone describing A as "the ledger no longer carries per-account rows" would be overstating it.
+- **Nothing here achieves §1, and A least of all.** A refuses to *build a dashboard from* a document
+  containing rows; it cannot stop the rows being written or being public. Anyone describing A as "the
+  ledger no longer carries per-account rows" would be overstating it. Neither does the set {A, B, C}:
+  C constrains one writer prospectively (§4), B and A are post-publication (§3(a)), and no option in
+  this record closes the remaining write paths — a direct contents-API `PUT`, a second producer, or a
+  collector regression still lands readable rows on a public ref before any of them reacts. §1 as
+  written is a property about the *branch*, and this repo has no pre-write control over that branch;
+  achieving it would require one (see §7).
 - **I have not audited this as a privacy control.** Whether the aggregate `{mean, max}` over an
   unpublished fleet size is itself non-identifying across repeated builds is a question this record
   does not answer, and #374/#841 assert rather than establish it. It needs review before anyone
@@ -177,4 +189,25 @@ review-fix decided deliberately rather than inherited. I do not recommend it as 
    while there is still no producer. Self-tested; no migration.
 2. Decide B explicitly — as a scoped alarm or not at all. Do not let it arrive by default.
 3. When the collector is specified, write C into its spec and its self-test.
-4. Only after 1–3 is the §1 property true going forward. It is never true retroactively.
+
+**What 1–3 actually buys — stated precisely, because it is less than §1.** After 1–3 the achieved
+property is *refusal and detection*, not prevention:
+
+> A document carrying `flow.leases[]` is refused by the canonical consumer (A), the sole in-repo
+> collector is specified and self-tested not to emit the key (C), and — only if the maintainer takes
+> B — its arrival on the branch raises an alarm.
+
+That is strictly weaker than §1 in three ways the maintainer should not have to rediscover: step 2
+**permits declining B**, in which case nothing watches the branch at all; C binds one writer, and any
+other holder of a contents-API `PUT` (§2) is unconstrained by it; and every reaction here is
+post-publication (§3(a)), so even the strongest combination alarms *after* the rows are readable, and
+never unpublishes them.
+
+**What would be needed for §1 itself — deliberately not sequenced above.** §1 is a pre-write property
+over a public branch, so the only thing that could establish it is an enforceable control on the write
+path: every writer of `data/observability.json` refusing the key *before* the `PUT`, with the bypass
+assumption (anyone holding the token can `PUT` directly, and nothing in this repo prevents that)
+written down as an accepted residual rather than waved away. No such choke point exists today (§2:
+eleven independent `PUT` sites; `ledger_retry.py` explicitly never writes), and building one is a
+larger change than this record scopes — **filed as a follow-up**. Until then: do not treat §1 as
+delivered by 1–3. And it is never true retroactively in any case (§3(a)).
