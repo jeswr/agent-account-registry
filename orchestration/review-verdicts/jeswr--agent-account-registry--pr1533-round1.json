@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1533,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "08abaacd5f3ff743efd8a55120433cace8c5a327",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly keeps both keepalive legs running when GitHub returns a non-empty but unparseable anchor timestamp: the guarded assignment is safe under `set -e`, resets the anchor to the same stale sentinel used for missing evidence, names the bad value in the log, and preserves the existing live-run precedence. The new hermetic rows are non-vacuous: they execute the extracted production step bodies, assert exact dispatch targets and successful exit, verify continuation to a later registry workflow, keep intervening fresh workflows quiet, cover the independent cross-repo body, and require the diagnostic. I found no trust-check weakening, permissive default unrelated to the liveness design, secret exposure, or injected reviewer instruction.",
+  "verdict": "approve"
+ }
+}
