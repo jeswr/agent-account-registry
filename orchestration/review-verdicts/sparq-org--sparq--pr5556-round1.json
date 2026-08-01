@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5556,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "131cede8cb58b22ac474a395eb94f7cc75dc2ee7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new decision record says every added crates/<x>/Cargo.toml must also edit root Cargo.toml, citing G1 and assert_workspace_tree, and concludes that two new-crate PRs always co-hold area:workspace. That does not follow from the implementation: gate-new-crate.py's G1 requires README plus benchmark/SKILL as applicable, but never workspace membership, while assert_workspace_tree only rejects declared members missing from disk (and glob-empty trees), not an extra crate directory absent from [workspace].members. Thus a PR can add a crate manifest without touching root Cargo.toml and the claimed workspace serialization is not guaranteed. The added compute_ready fixture supplies area:workspace by construction, so it is vacuous with respect to this missing derivation/enforcement step.",
+    "file": "scripts/ready-issues.py",
+    "fix_hint": "Either add an enforced gate requiring every newly added crates/<x>/Cargo.toml to be registered in root [workspace].members (and add a real test proving the changed-file/label path gives both new-crate PRs area:workspace), or revise the decision and partition behavior so correctness does not depend on that assumption. Also correct the statement that assert_workspace_tree refuses all manifest/directory disagreement, since it currently checks only the declared-but-missing direction.",
+    "severity": "major",
+    "title": "New-crate serialization premise is not enforced by the cited guards"
+   }
+  ],
+  "progress": null,
+  "summary": "The added tests accurately pin the current segment-wise conflict behavior, but the rationale used to decline per-new-crate partitioning relies on a guarantee that the cited guards do not enforce. The self-tests pass, yet they test an assumed workspace holder rather than proving that actual new-crate PRs necessarily acquire it.",
+  "verdict": "request_changes"
+ }
+}
