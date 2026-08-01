@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1569,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "54832f82a8e0866228f9d720f82556bc368c115d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The queue-normalization change is correct and complete for the stated failure mode. It preserves the existing tolerant drop behavior while making every malformed container or row observable, and accepted rows remain silent. Diagnostics expose only safe type names, fixed field text, or a class value passed through the existing printable/bounded sanitizer. The self-tests are non-vacuous: they use literal expected messages and independently exercise the integer-class regression, malformed containers and rows, missing/null fields, accepted input, continued publication after a total queue drop, per-reason diagnostics, and newline/oversize log-injection cases. No trust check is weakened, and the diff contains no reviewer-directed instruction.",
+  "verdict": "approve"
+ }
+}
