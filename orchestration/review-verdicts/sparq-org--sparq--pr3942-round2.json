@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3942,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "12eeccfb30fb6d19fdd6c2073e3d8ac8871ca724",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "term_to_ntriples still appends TermRef.direction verbatim after `--`. TermRef is public and deserializable, so a caller can reconstruct or mutate a form with a direction containing SPARQL punctuation; to_sparql_update then incorporates that payload as executable syntax. The round-1 fail-closed requirement has not been implemented.",
+    "file": "crates/sparq-forms/src/diff.rs",
+    "fix_hint": "Validate direction as exactly `ltr` or `rtl` before serialization, and validate the associated language tag. Make update construction reject invalid term metadata instead of emitting syntax, and add a test that supplies a malicious deserialized direction and proves no executable update is produced.",
+    "severity": "major",
+    "title": "Unvalidated base direction still permits SPARQL injection"
+   },
+   {
+    "body": "The test still uses assert_ne against exactly [\"stale\"]. Any other incorrect non-empty value passes, despite the documented default-build contract requiring an empty values vector. Because this test also runs with `computed` enabled, it still does not encode the distinct expectations for the two feature states.",
+    "file": "crates/sparq-forms/tests/rdf12_roles.rs",
+    "fix_hint": "Under `#[cfg(not(feature = \"computed\"))]`, assert `computed.values.is_empty()`. Under `#[cfg(feature = \"computed\")]`, assert the exact expected computed value (`Bob`) and separately assert that `stale` is absent.",
+    "severity": "minor",
+    "title": "Default-feature computed-field test remains vacuous"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 leaves both prior findings materially unchanged. The public, deserializable TermRef still allows an arbitrary direction string to be appended verbatim to SPARQL syntax, so a reconstructed form can inject update text. The default-feature computed-field test still proves only that the values are not exactly [\"stale\"], rather than proving the documented empty-vector invariant. The implementation therefore remains unsafe and its feature-state contract remains inadequately tested.",
+  "verdict": "request_changes"
+ }
+}
