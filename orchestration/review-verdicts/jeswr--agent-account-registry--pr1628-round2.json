@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1628,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "281a3013c8c804a154c6a33d5f122660eba54512",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`approval_probe_order()` exempts only `MAINTAINER_LOGIN` and `APP_BOT_LOGIN`; every other write/maintain/admin collaborator remains in `rest[:APPROVAL_REACTOR_PROBE_CAP]`. An attacker can add 50 lexicographically earlier valid reactors and push such a trusted collaborator beyond the cap, so the workflow never calls `trust_of` for that approval and re-quarantines the issue. This is the same deterministic public-input denial identified in round 1 for the supported write-role approval path. Merely warning that the authoritative evidence was discarded does not preserve the promised durable approval, and the new self-test explicitly locks in the defective result (`zzz` is trusted but expected to be unprobed and rejected).",
+    "file": "scripts/triage.py",
+    "fix_hint": "Use a bounded source/order that cannot be selected by public reactors\u2014for example, derive the eligible write+ identities authoritatively and intersect them with the reaction evidence before applying any bound. Alternatively, explicitly narrow the product contract and trust logic to only the exact-match identities instead of continuing to advertise and accept general write+ approvals. Add an executed crowd test with a non-exact-match write/maintain/admin reactor beyond 50 attacker-controlled logins and require that its approval is honored.",
+    "severity": "major",
+    "title": "Public reactors can still crowd out write-role approvals"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-two change prevents crowd-out only for the two exact-match identities. The advertised and implemented approval policy still accepts any write/maintain/admin collaborator, but those trusted reactors remain in the attacker-orderable capped population and can still be deterministically discarded. The prior major finding therefore remains materially unresolved.",
+  "verdict": "request_changes"
+ }
+}
