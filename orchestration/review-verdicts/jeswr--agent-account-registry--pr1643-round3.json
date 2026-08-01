@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1643,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8547ad3a3c8f03d363029908bc690bbba87f9268",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 major is resolved: the design now advances `last_probed` on every received malformed response, leaves it unchanged only when observation stops, and keys freshness exclusively on `last_probed`. It therefore keeps continuous shape drift in the refusing state beyond the TTL while allowing a genuine probe outage to decay to the never-observed/admitting state. The writer transitions, consumer rules, and named mutation obligation all agree on that behavior. The record remains findings-only, clearly separates observation from later arming, and specifies non-vacuous tests for the trust-sensitive seams. No blocker or major issue remains in this diff.",
+  "verdict": "approve"
+ }
+}
