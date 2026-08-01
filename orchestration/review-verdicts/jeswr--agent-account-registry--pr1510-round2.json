@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1510,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7b02cda227947aac8266e8f5839aaf1e50d5f568",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`LIMIT_KEYS` persists `opus5_premium_window`, but `persist_limits` writes it into a `limits:` line that the diff itself says `select-and-claim._parse_account` ignores. `_probe_account` also does not seed the next observation from that catalog value. Consequently, after one tick proves that an account has (for example) a `7d_oi` bucket, a later transport failure produces only `{\"opus5_probe\": \"error\"}`; the window key disappears and `_opus5_eligible` returns `True`. Healthy base 5h/7d values then admit work even if the already-known premium bucket is exhausted. The self-test codifies this fail-open path by expecting transport-error admission, so the claimed durable observation is decorative rather than binding.",
+    "file": "scripts/account-usage.py",
+    "fix_hint": "Make the persisted discovery an input to subsequent probe/admission records. Once an account has ever declared a premium window, a failed or headerless current probe must retain that known window and fail closed because its current utilization is unreadable. Add a cross-tick test: persist a discovered window, simulate the next opus5 probe failing, load the resulting production inputs, and assert `usage_eligible(..., model=\"opus5\")` is false. Preserve permissive behavior only for accounts for which no premium window has ever been observed.",
+    "severity": "blocker",
+    "title": "Persisted premium-window discovery is ignored after a probe error"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRequest changes: the round-1 base-window defect is fixed, but the new durable-observation path is disconnected from admission. A successful tick can persist that opus5 has a premium bucket, yet the allocator explicitly ignores the persisted field; any later opus5 probe error omits the window from the snapshot and `_opus5_eligible` admits on base headroom. Thus the exact known-bucket cliff this change is meant to prevent reopens on a transient probe failure. Because this is a new blocker relative to round 1, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
