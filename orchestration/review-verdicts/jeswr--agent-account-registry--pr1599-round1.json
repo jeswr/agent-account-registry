@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1599,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6385997123ca8a3227f9ffbe4abc92b33adec9d1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "_module_launcher_aliases recognizes only `name = subprocess.run` (ast.Assign with a direct Attribute) and `from subprocess import run`. Semantically equivalent bindings are missed. For example, `runner: object = subprocess.run; def f(run=runner): ...` uses ast.AnnAssign and produces no finding. So does the common transitive form `runner = subprocess.run; alias = runner; def f(run=alias): ...`. In both cases the default captures the real process launcher at import, exactly the hazard the new standing assertion claims to exclude, but scan_source returns an empty finding list. The known-positive tests cover only the resolver's implemented spellings, so none turns red if these unsafe forms are introduced.",
+    "file": "scripts/launcher-default-sweep.py",
+    "fix_hint": "Resolve launcher bindings across at least AnnAssign and transitive Name assignments (with scope/order semantics sufficient to avoid treating later or unrelated bindings as evidence), and add independent known-positive fixtures for each supported alias form. The tests should assert that these examples yield findings, using expected values not derived from the resolver under test. Alternatively narrow the stated/enrolled invariant explicitly, but that would not provide the promised prevention for launcher-bound defaults.",
+    "severity": "major",
+    "title": "Launcher aliases can bypass the standing sweep"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe call-time repair in pat-validity.py is sound and its omitted-argument test exercises the intended seam. However, the new standing sweep does not enforce its headline invariant for ordinary Python alias forms: its alias resolver only handles ImportFrom and plain ast.Assign nodes whose right side is a direct subprocess attribute. Consequently it can report a clean tree while a parameter default still captures a real launcher. Because this check is being enrolled as the durable source-level prevention for a live-write class, that false-clean path is a major completeness defect.",
+  "verdict": "request_changes"
+ }
+}
