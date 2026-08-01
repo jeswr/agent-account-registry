@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1529,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3ce4091f657fa30d30bcd6ff9b699efa47d39244",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-1 major finding is resolved. The workflow harness now controls labeled and orphan responses independently, keeps both labeled lanes healthy while exercising the orphan-only malformed-payload and request-ceiling failures, and verifies zero applies plus exact request/page counts. It also executes a multi-page orphan scan through a short terminal page and asserts each reduced page's distinct contents and the complete snapshot total, covering premature termination and page-advance regressions. The production change remains fail-closed: untrusted, gated, held, claim-owned, epic, and non-fingerprint lane-less issues are skipped; pull requests and issues carrying either status or priority are excluded; adoption parks on status:untriaged through the shared guarded applier rather than creating a second readiness path. I found no remaining blocker, major, or lower-severity diff-scoped issue.",
+  "verdict": "approve"
+ }
+}
