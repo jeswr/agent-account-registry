@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5484,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1b4c6764881d2ca0adb087d82d8201f7bd1310ae",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "require_one_side_bound is only a public helper. This diff does not call it from wire::derive_grants or any other real admission-path boundary, so controller-authored .acr text can still reach evaluation without the advertised refusal. That conflicts with the research/README claims that the guard refuses unbounded rules and leaves the stated P8 safety obligation unenforced unless every caller remembers an optional pre-check.",
+    "file": "crates/sparq-trust/src/cost.rs",
+    "fix_hint": "Invoke the guard at the single shared boundary before controller-authored rule text reaches derive_grants/evaluation, propagate denial fail-closed, and add an integration test proving an unseeded .acr rule is rejected by that real path (plus a seeded rule still succeeds). If this PR intentionally provides analysis only, remove claims that the operational path is guarded and explicitly leave enforcement as unresolved work.",
+    "severity": "major",
+    "title": "Fail-closed seeding guard is not enforced on the real .acr path"
+   },
+   {
+    "body": "is_var recognizes only '?' variables, so a rule-body blank-node label such as '_:x' is treated as a constant by term_bound. In N3 rule formulae blank nodes are existential/formula-scoped nodes, not a fixed externally bound endpoint. Consequently a body like `{ _:x p:linkedTo ?o } => { ?o p:ok p:v }` can pass the one-side-bound guard even though its subject does not provide a constant-side lookup, undermining the conservative fail-closed claim.",
+    "file": "crates/sparq-trust/src/cost.rs",
+    "fix_hint": "Model blank-node labels according to N3 formula semantics and do not count them as constant seeds (or reject them as unsupported). Add a regression test through require_one_side_bound showing that a blank-node-labelled body endpoint cannot make an otherwise unbound atom pass.",
+    "severity": "major",
+    "title": "Blank-node labels are incorrectly accepted as bound constants"
+   }
+  ],
+  "progress": null,
+  "summary": "The cost meter and its tests are internally consistent as a deterministic count of coarse gate operations, but the decidability guard is not connected to the controller-authored .acr execution path it is meant to protect. The change therefore does not complete the stated fail-closed safety obligation: existing callers can continue handing unseedable rules directly to derive_grants, while the documentation says the guard refuses them. The parser also treats blank-node labels in rule bodies as constants, although formula-scoped blank nodes are existential rather than fixed bound values, allowing an unsafe seed shape to be classified as one-side-bound.",
+  "verdict": "request_changes"
+ }
+}
