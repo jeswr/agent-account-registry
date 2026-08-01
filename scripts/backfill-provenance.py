@@ -35,6 +35,7 @@ prints a handle either.
 import argparse
 import ast
 import contextlib
+import copy
 import functools
 import importlib.util
 import inspect
@@ -1161,16 +1162,33 @@ def worker_yaml_shape_report():
     }
 
 
-def backfill_workflow_seam_report():
+def backfill_workflow_seam_report(workflow=None):
     """Findings about the LIVE backfill-provenance.yml invocation, each asserted by the
     self-test. Substring/count assertions do not catch YAML-seam mutations (`if: false`, a
-    deleted step, a reordered command), so every finding below is structural."""
-    workflow = _workflow("backfill-provenance.yml")
+    deleted step, a reordered command), so every finding below is structural.
+
+    Takes an optional PARSED document so the self-test can re-derive every finding from a
+    deliberately broken copy: asserting the shipped shape proves this report can read a correct
+    workflow, not that it would notice a neutered one.
+
+    The `#1544` block is what that issue exists for. This workflow was `workflow_dispatch`-only,
+    so an orphaned worker PR — fail-closed INVISIBLE to the review loop until its record exists —
+    stranded until a human remembered to run it, pointed at the right repo. A workflow that loses
+    its schedule, or whose matrix stops deriving from policy, is silently back in that state."""
+    workflow = _workflow("backfill-provenance.yml") if workflow is None else workflow
     # PyYAML parses a bare `on:` key as the boolean True.
     triggers = workflow.get("on") if "on" in workflow else workflow.get(True)
-    inputs = (((triggers or {}).get("workflow_dispatch") or {}).get("inputs") or {})
+    triggers = triggers or {}
+    inputs = ((triggers.get("workflow_dispatch") or {}).get("inputs") or {})
     job = workflow["jobs"]["backfill"]
     steps = job["steps"]
+    # The matrix half of #1544: the sweep covers every ENABLED target, and the enabled set is read
+    # from policy rather than copied into this file. `needs` is a string when there is one entry.
+    needs = job.get("needs")
+    needs = [needs] if isinstance(needs, str) else sorted(needs or [])
+    matrix = ((job.get("strategy") or {}).get("matrix") or {})
+    targets_job = workflow["jobs"].get("targets") or {}
+    targets_run = "\n".join(str(s.get("run") or "") for s in (targets_job.get("steps") or []))
     step = next((s for s in steps if "backfill-provenance.py" in str(s.get("run") or "")), None)
     run = str((step or {}).get("run") or "")
     guard = str(job.get("if") or "")
@@ -1198,6 +1216,28 @@ def backfill_workflow_seam_report():
         "no_draft_convert_default": inputs.get("no_draft_convert", {}).get("default"),
         "step_env_bindings": {key: step_env.get(key)
                               for key in ("TARGET_REPO", "APPLY", "NO_DRAFT_CONVERT")},
+        # --- issue #1544: this workflow must START ITSELF, across EVERY enabled target ----------
+        # THE FINDING THIS ISSUE EXISTS FOR: dispatch-only meant the population only ever drained
+        # when a human remembered. Reported as the cron LIST so a deletion reads as `[]`.
+        "schedule_crons": [str((entry or {}).get("cron")) for entry in triggers.get("schedule")
+                           or [] if isinstance(entry, dict)],
+        # `default:` is materialised for workflow_dispatch ONLY, so ANY default here makes
+        # "leave EMPTY to sweep every enabled target" unreachable from the UI/API — the manual
+        # half silently narrows to one repo, which is the second stall #1544 measured. Reported as
+        # (input present, default present) because a bare `.get("default")` reads None both when
+        # there is no default AND when the whole input has been deleted.
+        "target_repo_input": ("target_repo" in inputs,
+                              "default" in (inputs.get("target_repo") or {})),
+        # The matrix chain, link by link. Break any one and the sweep still "succeeds", over an
+        # EMPTY set of repos — a green run that records nothing is indistinguishable from a
+        # drained population, so each link is pinned to its exact expression.
+        "matrix_needs": needs,
+        "matrix_repo_expr": str(matrix.get("repo")),
+        "targets_repos_output": str((targets_job.get("outputs") or {}).get("repos") or ""),
+        # One source of truth. A hardcoded copy of the enabled set is the exact duplication that
+        # took dispatch fully down on 2026-08-01 (#1537/#1540: policy enabled a third repo, the
+        # workflow's manifest did not, CLAIM failed closed).
+        "targets_policy_sourced": "policy/repos.toml" in targets_run,
     }
 
 
@@ -1547,6 +1587,89 @@ def _self_test():
           "github.event_name == 'schedule'" in _apply_expr, True)
     check("...while a manual run still defaults to a DRY RUN (inputs.apply is still consulted)",
           "inputs.apply" in _apply_expr, True)
+
+    # --- ISSUE #1544: the sweep must START ITSELF, over EVERY enabled target -------------------
+    # An orphaned worker PR is fail-closed INVISIBLE to the review loop until its record exists,
+    # and nothing else in the estate writes that record — so while this workflow was
+    # dispatch-only, the population drained only when a human remembered to run it AND pointed it
+    # at the right repo. Both stalls measured on 2026-08-01 were "nobody pointed it at this repo
+    # lately", not "it never ran". The schedule and the policy-derived matrix are therefore the
+    # two halves of the fix, and each is pinned to its exact shipped expression: every link below
+    # can be broken in a way that still lints, still runs GREEN, and sweeps NOTHING.
+    check("THE #1544 FIX: the backfill is SELF-STARTING (it was workflow_dispatch-only)",
+          bool(seam["schedule_crons"]), True)
+    check("...on the shipped cadence", seam["schedule_crons"], ["23 */4 * * *"])
+    check("target_repo exists as a manual input and carries NO default, so 'leave EMPTY to sweep "
+          "every enabled target' is reachable (a default is materialised for dispatch only)",
+          seam["target_repo_input"], (True, False))
+    check("the backfill job waits on the target resolver", seam["matrix_needs"], ["targets"])
+    check("...and its matrix IS that resolver's output (never a hardcoded repo list)",
+          seam["matrix_repo_expr"], "${{ fromJSON(needs.targets.outputs.repos) }}")
+    check("...which the resolver actually publishes", seam["targets_repos_output"],
+          "${{ steps.resolve.outputs.repos }}")
+    check("...from policy/repos.toml — one source of truth for the enabled set (#1537/#1540)",
+          seam["targets_policy_sourced"], True)
+
+    # ---- the #1544 YAML-seam MUTANT TABLE ----------------------------------------------------
+    # The checks above prove this report can read a CORRECT workflow; they do not prove it would
+    # notice a neutered one. Every mutant below is a real way the recovery lane could go silently
+    # dead — the TRIGGER, the INPUT, and each link of the matrix chain — and each must flip a
+    # NAMED finding. None of them is a syntax error, and none would fail actionlint.
+    def _mutated_seam(edit):
+        doc = copy.deepcopy(_workflow("backfill-provenance.yml"))
+        edit(doc)
+        return backfill_workflow_seam_report(doc)
+
+    def _triggers_of(doc):
+        return doc.get("on") if "on" in doc else doc.get(True)
+
+    def _resolve_step(doc):
+        # An ANCHOR, not a search: if no step reads the policy file, the mutant is malformed and
+        # must say so rather than raise a bare StopIteration from inside the table.
+        hits = [s for s in doc["jobs"]["targets"]["steps"]
+                if "policy/repos.toml" in str(s.get("run") or "")]
+        assert len(hits) == 1, f"seam mutant anchor: {len(hits)} steps read policy/repos.toml"
+        return hits[0]
+
+    for _name, _edit, _key, _want in (
+            ("the schedule is deleted (back to dispatch-only, the #1544 defect)",
+             lambda d: _triggers_of(d).pop("schedule"), "schedule_crons", []),
+            # Deleting a guard and making it INERT are different experiments. A cron is still
+            # PRESENT here — `31 February` simply never comes — so the presence check above stays
+            # green and only the exact-cadence check reds. That is the shape a "small, careful"
+            # edit takes, and it is why the cadence is pinned by VALUE and not by `bool(...)`.
+            ("the schedule is made inert rather than deleted (a cron that can never fire)",
+             lambda d: _triggers_of(d).update(schedule=[{"cron": "0 0 31 2 *"}]),
+             "schedule_crons", ["0 0 31 2 *"]),
+            ("a target_repo default comes back (manual runs silently narrow to one repo)",
+             lambda d: _triggers_of(d)["workflow_dispatch"]["inputs"]["target_repo"].update(
+                 default="some-owner/some-name"), "target_repo_input", (True, True)),
+            ("the target_repo input is deleted outright (a default-only check misses this)",
+             lambda d: _triggers_of(d)["workflow_dispatch"]["inputs"].pop("target_repo"),
+             "target_repo_input", (False, False)),
+            ("the backfill job stops waiting on the resolver",
+             lambda d: d["jobs"]["backfill"].pop("needs"), "matrix_needs", []),
+            ("the matrix is hardcoded (policy enables a repo this list has never heard of)",
+             lambda d: d["jobs"]["backfill"]["strategy"]["matrix"].update(
+                 repo=["some-owner/some-name"]), "matrix_repo_expr", "['some-owner/some-name']"),
+            ("the resolver stops publishing its list (the matrix then expands to NOTHING)",
+             lambda d: d["jobs"]["targets"].pop("outputs"), "targets_repos_output", ""),
+            ("the enabled set is copied into the workflow instead of read from policy",
+             lambda d: _resolve_step(d).update(run=str(_resolve_step(d)["run"]).replace(
+                 "policy/repos.toml", "some-owner/some-name")),
+             "targets_policy_sourced", False),
+    ):
+        # A mutant that cannot be APPLIED (its anchor is gone — exactly what happens when the
+        # schedule or `needs:` this table edits has already been deleted) must red its OWN row and
+        # let the remaining rows run. Raising here instead would abort the suite mid-way: the run
+        # still fails, but every check below it silently never executes, so a single seam
+        # regression would also hide the #726 draft-predicate rows. Swallowing it is not an option
+        # either — the handler yields a value that can never equal `_want`, so the row still FAILS.
+        try:
+            _got = _mutated_seam(_edit)[_key]
+        except Exception as exc:   # noqa: BLE001 — reported as a failed row, never suppressed
+            _got = f"MUTANT NOT APPLICABLE ({type(exc).__name__}: {exc})"
+        check(f"seam mutant flips its finding: {_name}", _got, _want)
     check("two-page slurped listing flattens (sol r5)",
           flatten_pull_pages([[{"number": 1}], [{"number": 2}, {"number": 3}]]),
           [{"number": 1}, {"number": 2}, {"number": 3}])
