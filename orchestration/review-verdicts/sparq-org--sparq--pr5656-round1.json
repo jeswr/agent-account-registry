@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5656,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c84f41c574a436454b2229ceddd5427d37a4ab6b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The dispatch-only sccache experiment is correctly isolated from push, pull_request, and merge_group runs by exact per-step guards and an off-by-default choice input. The production cargo invocation remains unchanged, measurements are clearly labeled as experimental upper-bound data, and the research note avoids claiming an unmeasured result. The structural tests are non-vacuous and directly pin both load-bearing controls: every current sccache-enabling step must use the exact dispatch guard, and the input must default to the quoted string \"off\". No correctness, soundness, test-validity, or security defect requiring changes was found in the supplied diff.",
+  "verdict": "approve"
+ }
+}
