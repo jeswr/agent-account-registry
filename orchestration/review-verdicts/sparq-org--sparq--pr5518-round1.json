@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5518,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5b04839a9661f5f7cd658bbc6612564ce4501b64",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Evidence B says the table is reproducible with the supplied script, but that script merely sums `.mjs` bytes for every `node_modules/@radix-ui/*` entry in the lockfile. It cannot produce the used-primitives closure (24 packages / 98,419 bytes), the unused remainder (36 packages / 430,873 bytes), the 81.4% percentage, or establish that the 60 entries are exactly the monolith's dependency closure rather than packages introduced elsewhere. Those are the load-bearing numbers repeated in the proposed upstream comment, so a reader cannot validate the claimed evidence from the documented procedure.",
+    "file": "research/nextjs-optimize-package-imports-radix-upstream.md",
+    "fix_hint": "Replace or extend the script so it parses package dependency metadata, walks the closure from `radix-ui`, separately walks from `@radix-ui/react-slot`, `@radix-ui/react-dialog`, and `@radix-ui/react-tooltip`, verifies the closure/set-difference assertions, and prints every table value and percentage. Pin all queried versions from the lockfile and include explicit checks that fail if a package/version or artifact response is missing. Alternatively, remove the unreproducible subset figures and narrow the conclusions to what the current script actually demonstrates.",
+    "severity": "major",
+    "title": "Reproduction script does not reproduce the reported comparison"
+   }
+  ],
+  "progress": null,
+  "summary": "The record is careful about distinguishing artifact bytes from emitted bundle bytes, but its central measured comparison is not reproducible using the included procedure. The script computes only the total size of every locked @radix-ui package; it does not derive or verify the transitive closure of the three used primitives, the 24/98,419-byte subset, the 36/430,873-byte remainder, the 81.4% result, or the claim that all 60 packages are exactly radix-ui's closure. Because those figures are the stated evidence intended for an upstream comment, the record is incomplete as a reproducible evidence artifact.",
+  "verdict": "request_changes"
+ }
+}
