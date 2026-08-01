@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1639,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ee5c6e03d8b53a01a140a4ab018bae066d42dcb6",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`condition_is_live` treats every `!inputs.<name>` atom as satisfiable and validates only path distinctness. That assumption is false for this workflow's required non-empty string inputs. For example, changing the worker upload condition to `${{ !inputs.target_repo && steps.bundle.outcome == 'success' }}` matches both allowlisted atom regexes, uses distinct paths, and makes `_upload_step_line` certify the step; but `target_repo` is required and necessarily non-empty on an admitted run, so the upload never executes. The live row then still returns `ordered` while no artifact is handed to the service. The new fixtures cover language-level falsy literals and a same-path contradiction, but no contradiction induced by the workflow input schema, so they cannot detect this survivor.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Restrict accepted conditions to the exact proven-live forms used by these two upload steps (or validate input atoms against the workflow's declarations and admissible values), rather than accepting arbitrary input names. Add a named negative fixture using a negated required string input such as `!inputs.target_repo`, and verify it returns `upload-step-disabled`; also mutate the live condition to that form to demonstrate the live assertion turns red.",
+    "severity": "blocker",
+    "title": "Negated required inputs are accepted as proven-live conditions"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 correctly rejects the prior examples (`0`, `!true`, and the empty string), but the new allowlist still does not prove that every accepted condition can run in these workflows. It accepts arbitrary input paths without consulting the workflow input contract; a required non-empty string input can therefore be negated to create an always-disabled upload that is nevertheless certified as `ordered`. This is materially the same condition-seam blocker as round 2, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
