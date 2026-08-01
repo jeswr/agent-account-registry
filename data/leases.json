@@ -11,16 +11,6 @@
    "expires_at": 1785585926
   },
   {
-   "account": "51bde6688e140866",
-   "claim_id": "29bc46e764a748fd93a251a2909cd588",
-   "holder": "sparq-org/sparq#3531@30696170159.1",
-   "package": "sparq-mpc",
-   "role": "soundness",
-   "model": "opus5",
-   "issued_at": 1785580866,
-   "expires_at": 1785587166
-  },
-  {
    "account": "58b7c92faa5b5ca5",
    "claim_id": "42bd4c71daae4437b7ebb3c8c399613b",
    "holder": "sparq-org/sparq#55@30696551423.1",
