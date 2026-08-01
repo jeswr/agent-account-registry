@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5370,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "50814db2cd9936f35efd5ce8eb9aef78eb829184",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The negative lookbehind only rejects a field name preceded by `[a-z0-9_/-]`; whitespace is accepted anywhere in a sentence. Consequently `declared_areas(\"we changed the surface: sparq-core is one of them\", [\"sparq-core\"])` still returns `[\"sparq-core\"]`. Likewise `foo::surface: sparq-core` is accepted because `:` is absent from the left guard. This contradicts the new docstring's claim that a declaration-shaped fragment buried in a sentence falls through to T1/T2, and leaves the highest-trust false-positive class open. The added test is too narrow because it covers only a hyphenated compound, `crate::` on the separator side, and a newline value.",
+    "file": "scripts/triage-area.py",
+    "fix_hint": "Recognize declarations at a structural field boundary, preferably the start of a line (allowing only the exact indentation/list-prefix syntax used by generated issue templates), rather than merely checking the preceding character. Add negative tests for `we changed the surface: sparq-core is one of them` and for a namespace/path prefix such as `foo::surface: sparq-core`, while retaining positive tests for each supported declaration layout.",
+    "severity": "major",
+    "title": "Standalone `surface:` in ordinary prose still impersonates a T0 declaration"
+   }
+  ],
+  "progress": null,
+  "summary": "The new guards close the three tested spellings, and the focused tests pass, but the core prose-impersonation bug remains for ordinary sentence-level uses of the standalone word `surface`. The implementation therefore does not satisfy its stated invariant that a declaration-shaped fragment buried in prose must decline T0.",
+  "verdict": "request_changes"
+ }
+}
