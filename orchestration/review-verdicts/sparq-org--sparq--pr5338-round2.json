@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5338,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "33c69bd2a2f43b057d513121b2711e609ce25d03",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains correct and complete. The sparq-server mutation shard passes its selected default-off feature set through the existing matrix.features/FEATURES mechanism without introducing shell interpolation risk. Every selected feature exists, and the feature matrix provides test-enabled coverage for each selected surface; transitive relationships such as brtpf\u2192tpf and the authorization extensions\u2192solid-authz are compatible. The exclusions are explicitly scoped, and the comments accurately preserve the advisory seeding/ratchet behavior. No correctness, soundness, test-validity, or security issue is evident in the changed workflow lines.",
+  "verdict": "approve"
+ }
+}
