@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5649,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3f19a2358faa1dcde58b190ff3054f329a34d004",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The prior finding remains materially unchanged. `heads_name_evidenced_party_collection` still infers collection identity only from a non-empty `party_collection_members` result. For a real PartyCollection with zero request-supplied membership edges, a prohibition persists only the collection IRI as a deny head, and an ALLOW carve-out persists an exception matcher for that IRI. Member sessions match neither, so they escape the restriction. The new tests explicitly assert this unsafe outcome, and the new prose labels it a known gap, but neither makes the enforcement sound. This contradicts the bridge's fail-closed security purpose and leaves the exact round-1 vulnerability present.",
+    "file": "crates/sparq-solid/src/odrl_bridge.rs",
+    "fix_hint": "Carry collection identity/type separately from membership edges (for example, declared PartyCollection IRIs on `Request` or retained policy type metadata). Use that identity to route every collection-valued DENY head and ALLOW `neq`/`isNoneOf` carve-out to the one-shot path even when its supplied member set is empty. Replace the two gap-pinning tests with real enforcement-path tests proving that zero-edge collections emit no conditional deny/grant and cannot widen access. Update the public skill documentation to describe the closed behavior rather than instruct callers around a known fail-open condition.",
+    "severity": "major",
+    "title": "Unevidenced PartyCollections still bypass fail-closed enforcement"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 does not resolve the prior major correctness finding. The change now documents and tests the fail-open behavior when a PartyCollection has no supplied membership edges, but knowingly persisting an unenforceable deny head or carve-out is still unsafe. Documentation of the gap is not a correctness fix; collection identity must be represented independently from the non-empty member list so these cases take the sound one-shot path.",
+  "verdict": "request_changes"
+ }
+}
