@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5493,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "319ec731e99deeda4a9035fd06b29a7d44f9d976",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 7 item 1 still states that the differential lane verifies `XPATH_TAG: \"v0.2.0\"` and that the v0.2.0 to v0.3.0 bump remains open. This directly contradicts the updated provenance note in section 1.3 and the changed workflow/harness defaults. An audit-readiness document cannot simultaneously present the bump as completed and pending; an auditor following the phased plan would get the wrong verified version and work status.",
+    "file": "research/zk-audit-readiness-dossier.md",
+    "fix_hint": "Update section 7 item 1 in the same change: mark the pin bump completed, state that both `.github/workflows/xpath-differential.yml` and `zk/xpath/scripts/run_differential_harness.sh` pin v0.3.0, and retain the qualification that the resulting evidence depends on a green CI run. Search this dossier for any other remaining v0.2.0 statements and preserve only explicitly historical wording.",
+    "severity": "major",
+    "title": "Audit dossier still says the v0.3.0 pin bump is open"
+   }
+  ],
+  "progress": null,
+  "summary": "The workflow and harness defaults are aligned on noir_XPath v0.3.0, and the differential harness retains a non-vacuous per-test fault-injection check. However, the audit dossier is left internally contradictory: its phased plan still says the lane pins v0.2.0 and that the bump remains open. Because this PR explicitly updates the same dossier to describe the completed bump, that stale audit-facing statement makes the change incomplete and should be corrected before approval.",
+  "verdict": "request_changes"
+ }
+}
