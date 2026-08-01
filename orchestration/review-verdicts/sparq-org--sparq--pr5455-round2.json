@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5455,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "396ca36abf64e50db8d58b4c9c519314187f1d24",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 2.2 rejects the variable-scale alternative partly because Noir's signed integer tower stops at i64 and i128 would need emulation. Section 2.3 nevertheless specifies `(-(n as i128)) as u128` as the load-bearing i64::MIN-safe conversion. Those statements cannot both hold, and marking u128 availability verify-at-impl does not validate signed i128. As written, the prescribed constructor may be unimplementable on the pinned Noir version, so the record does not yet provide a sound implementation recipe.",
+    "file": "research/noir-xpath-xsd-decimal-design.md",
+    "fix_hint": "Specify an overflow-free conversion using only types confirmed on the pinned Noir toolchain, for example derive the unsigned magnitude without negating i64::MIN (`if n < 0 { ((-(n + 1)) as u64) + 1 } else { n as u64 }`) and then cast that magnitude to u128 before scaling. Alternatively, if signed i128 is actually available, verify it against the face repo toolchain and correct the contradictory Section 2.2 claim. Keep the i64::MIN should-fail test.",
+    "severity": "major",
+    "title": "from_i64 requires the signed i128 type the design says Noir lacks"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 fixes all three prior findings: the scope is now honestly bounded, scale alignment widens before multiplication, and i64::MIN is explicitly covered. However, the replacement from_i64 construction is internally inconsistent with the record's own target-language constraints: the design says Noir has no signed i128 and then requires an i128 cast/negation. An implementation following the specified construction therefore cannot be assumed to compile on the pinned toolchain. Because this is a new major implementability defect after the previous issues were addressed, progress is regressing under the mandated scale.",
+  "verdict": "request_changes"
+ }
+}
