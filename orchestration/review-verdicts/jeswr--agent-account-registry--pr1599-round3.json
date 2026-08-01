@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1599,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "879b903c029e128e70ccec34d9a9ec12aff4e464",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_index_scopes` publishes every assignment declared `global` or `nonlocal` into an enclosing table without modeling whether or when its function is called, and `_publish_into` pins that result against ordered rebinding. Thus executable safe code such as `_RUN = None; def install(): global _RUN; _RUN = subprocess.run; def go(run=_RUN): ...` is reported even though `install` is never called and `go` captures `None`. The same scope model passes a class's `nested_view` into method bodies, although methods do not lexically close over the class namespace: `runner = None; class C: runner = subprocess.run; def m(self): def inner(run=runner): ...` captures the module `None` when `m` runs, but the sweep resolves the class launcher. These are not cautious findings about possible runtime values; they are wrong answers for code whose execution is determinate. This is the prior round's scope/order defect in remaining binding forms.",
+    "file": "scripts/launcher-default-sweep.py",
+    "fix_hint": "Model effects at the statement/call sites that execute them instead of hoisting declarations from arbitrary function bodies. Resolve `nonlocal` to the nearest actual enclosing function binding, and do not expose class namespace bindings inside method bodies (while still evaluating method defaults in the class-body table). Add independent negative fixtures for an uncalled global publisher, a publisher called only after the default is created, and a method-local nested def with a same-named class attribute; ensure the fixtures execute and demonstrate their captured values.",
+    "severity": "major",
+    "title": "Scope resolution still invents bindings that defaults cannot observe"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe module-level assignment ordering and ordinary sibling-scope cases from round 2 are now covered, but the resolver still does not model Python binding semantics soundly. It hoists every syntactic `global`/`nonlocal` assignment regardless of whether the containing function can execute before the examined default, and it propagates class locals into method bodies as though classes were lexical closures. Both manufacture launcher bindings that the default cannot observe. The new positive fixtures only exercise cases where the publishing function is called and therefore do not constrain the false-positive direction. Because this standing gate can still reject safe scripts for the same scope/order reason as the prior round, the remaining finding stays major and progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
