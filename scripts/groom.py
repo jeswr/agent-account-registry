@@ -1190,6 +1190,23 @@ def _masked_detail(text: str, token: str) -> str:
     return text
 
 
+def _deferral_detail(exc: BaseException) -> str:
+    """The cause ONE object's per-object handler reports, through the masking contract above.
+
+    Every per-object loop in this module defers on the failure BOUNDARY rather than on a failure
+    CLASS (issue #774 — the canonical rationale is on _execute_age_unpark_actions' handler), so the
+    exception it reports may be ANY exception, not only a GroomError. GroomError is defined as
+    already single-line, bounded and credential-masked because it is only ever built through
+    _masked_detail; an arbitrary exception's ``str()`` has had none of that and still reaches the
+    operator log. This is the ONE place that applies the contract to it — written once rather than
+    at each handler, so the guard has a single killable definition (AGENTS.md pre-flight item 4:
+    two copies of one guard make each copy individually unkillable). No token is passed: the
+    handlers do not hold the call's credential, and _TOKEN_SHAPE masks any credential SHAPE
+    regardless of ownership.
+    """
+    return _masked_detail(str(exc), "")
+
+
 def _http_failure_detail(exc: HTTPError, token: str) -> str:
     """GitHub's own masked, bounded error envelope for a failed call, or "" when it carried none.
 
@@ -2650,16 +2667,29 @@ def _execute_age_unpark_actions(
                 _drop_label()
                 unparked += 1
             except Exception as exc:  # noqa: BLE001 — see below; this PR defers, the sweep runs on
-                # DELIBERATELY BROADER than the GroomError the sibling loops catch (issue #647).
-                # This phase calls into park_policy, whose timestamp primitives raise ValueError on
-                # a shape they reject — and a non-GroomError escaping here aborts the whole sweep
-                # before _release_claims, which is precisely the head-of-line abort #644/#647 exist
-                # to prevent, reachable from one malformed receipt on one PR. "Each PR defers
-                # ITSELF" has to mean every failure, not just the anticipated class. The deferral
-                # is LOUD: it is ALERTed and fed to the shared exit precedence, so a systemic
-                # failure still reds the run.
+                # THE CANONICAL STATEMENT OF THE PER-OBJECT FAILURE BOUNDARY (issues #647, #774).
+                # run_sweep's three sibling loops — stale-PR detection, issue status repair and
+                # stale-PR hand-off — cite this comment instead of restating it (AGENTS.md: one
+                # definition, plus pointers).
+                #
+                # A handler catches the BOUNDARY, never a failure CLASS. `except GroomError`
+                # asserts which exception types a per-object body can raise; anything else escapes
+                # the loop, propagates out of run_sweep and aborts the sweep BEFORE
+                # _release_claims — the exact head-of-line abort #644/#647 exist to prevent, in
+                # which dead leases are never reclaimed. These loops call into park_policy, whose
+                # timestamp primitives raise a plain ValueError on a shape they reject, so ONE
+                # malformed receipt on ONE PR is enough (measured on #769's branch: `parse_ts`
+                # given None). "Each PR/issue defers ITSELF" therefore has to mean EVERY failure,
+                # not just the anticipated class.
+                #
+                # Broadening must not buy SILENCE — the sibling defect class here is
+                # exit-zero-swallows-failure. The deferral stays LOUD: ALERTed per object,
+                # appended to the phase's `deferred` tuple, and judged by the shared
+                # phase_exit_failure precedence, so a systemic failure still reds the run — with
+                # the cause reported through `_deferral_detail`, which is where the masking
+                # contract is applied to an exception that has never been through it.
                 failed = True
-                detail = _masked_detail(str(exc), "")
+                detail = _deferral_detail(exc)
                 print(f"ALERT PR {repo}#{number}: {detail} — age un-park deferred")
                 deferrals.append(f"{repo}#{number}: {detail}")
                 continue
@@ -3491,9 +3521,12 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                     has_valid_provenance=worker_pr_provenance_enumerable(
                         repo, number, ledger_root=ledger_root),
                 )
-            except GroomError as exc:
-                print(f"ALERT PR {repo}#{number}: {exc} — stale PR detection deferred")
-                detect_deferrals.append(f"{repo}#{number}: {exc}")
+            except Exception as exc:  # noqa: BLE001 — the BOUNDARY, not a class (issue #774)
+                # See _execute_age_unpark_actions' handler for the canonical rationale: a
+                # non-GroomError escaping here aborts the sweep before _release_claims.
+                detail = _deferral_detail(exc)
+                print(f"ALERT PR {repo}#{number}: {detail} — stale PR detection deferred")
+                detect_deferrals.append(f"{repo}#{number}: {detail}")
                 continue
             detect_completed += 1
             if reason:
@@ -3833,15 +3866,18 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 reset += 1
             elif changed:
                 deferred += 1
-        except GroomError as exc:
+        except Exception as exc:  # noqa: BLE001 — the BOUNDARY, not a class (issue #774)
+            # See _execute_age_unpark_actions' handler for the canonical rationale: a
+            # non-GroomError escaping here aborts the sweep before _release_claims.
             repair_failed = True
+            detail = _deferral_detail(exc)
             print(
-                f"ALERT issue {action.repo}#{action.number}: {exc} — status repair deferred"
+                f"ALERT issue {action.repo}#{action.number}: {detail} — status repair deferred"
             )
-            repair_deferrals.append(f"{action.repo}#{action.number}: {exc}")
+            repair_deferrals.append(f"{action.repo}#{action.number}: {detail}")
             continue
         finally:
-            # This issue's work COMPLETED unless a GroomError deferred it. A deliberate SKIP
+            # This issue's work COMPLETED unless the handler above deferred it. A deliberate SKIP
             # (`continue`) is a completed decision, not a failure, so the accounting has to run on
             # every exit path except the deferral — which is what `finally` buys here, since a
             # `continue` inside the block would jump straight past a trailing statement. Rule 2 of
@@ -4051,12 +4087,17 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 comment_changed = True
             if label_changed or comment_changed:
                 stale_count += 1
-        except GroomError as exc:
+        except Exception as exc:  # noqa: BLE001 — the BOUNDARY, not a class (issue #774)
+            # See _execute_age_unpark_actions' handler for the canonical rationale: a
+            # non-GroomError escaping here aborts the sweep before _release_claims — and this
+            # loop's exposure is the most direct of the three, since _release_claims is the very
+            # next statement after it.
             stale_failed = True
+            detail = _deferral_detail(exc)
             print(
-                f"ALERT PR {action.repo}#{action.number}: {exc} — stale PR hand-off deferred"
+                f"ALERT PR {action.repo}#{action.number}: {detail} — stale PR hand-off deferred"
             )
-            stale_deferrals.append(f"{action.repo}#{action.number}: {exc}")
+            stale_deferrals.append(f"{action.repo}#{action.number}: {detail}")
             continue
         finally:
             # Same accounting as the issue-repair loop above: a deliberate SKIP is a completed
@@ -7890,6 +7931,15 @@ def _self_test() -> int:
                 _terminal_sweep(ledger_root)
             except GroomError as exc:
                 error = str(exc)
+            except Exception as exc:  # noqa: BLE001 — the ESCAPE is the observation (issue #774)
+                # A non-GroomError reaching here means the sweep ABORTED: some per-object loop let
+                # it past its handler. Recording it as this run's `error` — instead of letting it
+                # propagate — is what makes that a RED ROW rather than a suite abort. Narrowing
+                # any of the three loops back to `except GroomError` is otherwise a
+                # crash-after-partial-run (AGENTS.md pre-flight item 4): it would record as a kill
+                # while every check below it never ran, and the mutant run's total check count
+                # would no longer match the pristine run's.
+                error = f"SWEEP ABORTED {type(exc).__name__}: {exc}"
             finally:
                 sys.stdout = saved
                 globals()["load_limits"] = saved_limits
@@ -9511,6 +9561,278 @@ def _self_test() -> int:
             ),
             ("", [{"e" * 32}], True, True),
         )
+
+        # ---- issue #774: the same three loops, refused with a NON-GroomError --------------------
+        # Every #647 scenario above refuses with a GroomError, so all three loops stayed green
+        # under a handler that asserts a failure CLASS rather than a failure BOUNDARY. The defect
+        # pinned here is the other direction: a plain ValueError out of ONE object's body escaped
+        # the loop, propagated out of run_sweep and aborted the sweep BEFORE _release_claims —
+        # #644/#647's head-of-line abort, with dead leases never reclaimed, from one malformed
+        # receipt on one PR (measured on #769's branch).
+        #
+        # The injected exception is the REAL one park_policy raises, not a hand-written stand-in:
+        # park_policy's timestamp primitives are exactly what park-adjacent work in these loops
+        # reaches for, and its own message is what the ALERT has to carry through. Injecting it as
+        # a per-(method, path, Nth-call) SIDE EFFECT — not through the refusal map — is what puts
+        # it in ONE named loop at a time: the PR detail GET is read by BOTH the detection loop
+        # (1st) and the hand-off loop (2nd), so a path-keyed injection could never reach the
+        # second, and the hand-off scenario would be unrepresentable.
+        def _real_parse_ts_failure() -> ValueError:
+            try:
+                park_policy.parse_ts(None)
+            except ValueError as exc:
+                return exc
+            raise AssertionError("park_policy.parse_ts(None) must raise ValueError")
+
+        parse_ts_failure = _real_parse_ts_failure()
+
+        def _raise_parse_ts() -> None:
+            raise parse_ts_failure
+
+        check(
+            "#774: the injected failure really is a NON-GroomError — if park_policy's timestamp "
+            "primitive ever started raising GroomError, every scenario below would silently "
+            "degrade into a re-run of the #647 ones and prove nothing",
+            (isinstance(parse_ts_failure, ValueError),
+             isinstance(parse_ts_failure, GroomError)),
+            (True, False),
+        )
+
+        # (1) STALE-PR DETECTION LOOP.
+        vd_detect_log, vd_detect_error, vd_detect_releases = _sweep_with_refusals(
+            {},
+            pulls=(_stale_worker_pr(31), _stale_worker_pr(32)),
+            side_effects={("GET", "/repos/owner/repo/pulls/31", 1): _raise_parse_ts},
+        )
+        vd_detect_writes = terminal_sweep_env["writes"]
+        check(
+            "MUTATION #774 (stale-PR detection): a NON-GroomError out of the head-of-line PR's "
+            "body defers only THAT PR — dead-lease reclaim still runs, #32 is still handed off, "
+            "and #31 writes nothing past its failure (narrow the handler back to "
+            "`except GroomError` and run_sweep ABORTS before _release_claims, releasing NOTHING)",
+            (
+                vd_detect_releases,
+                ("POST", "/repos/owner/repo/issues/32/labels") in vd_detect_writes,
+                ("POST", "/repos/owner/repo/issues/32/comments") in vd_detect_writes,
+                ("POST", "/repos/owner/repo/issues/31/labels") in vd_detect_writes,
+            ),
+            ([{"e" * 32}], True, True, False),
+        )
+        check(
+            "#774 (stale-PR detection): the deferral is LOUD — the ALERT names the PR and carries "
+            "park_policy's OWN ValueError text (swallow the cause and this reds), the phase counts "
+            "it, and precedence rule 3 leaves the run GREEN because another PR was detected",
+            (
+                "ALERT PR owner/repo#31:" in vd_detect_log,
+                "stale PR detection deferred" in vd_detect_log,
+                str(parse_ts_failure) in vd_detect_log,
+                vd_detect_error,
+                "detect_deferred=1" in vd_detect_log,
+            ),
+            (True, True, True, "", True),
+        )
+        vd_detect_all_log, vd_detect_all_error, vd_detect_all_releases = _sweep_with_refusals(
+            {},
+            pulls=(_stale_worker_pr(31), _stale_worker_pr(32)),
+            side_effects={("GET", f"/repos/owner/repo/pulls/{number}", 1): _raise_parse_ts
+                          for number in (31, 32)},
+        )
+        check(
+            "#774 precedence rule 2 (stale-PR detection): a broader handler must not buy SILENCE "
+            "— EVERY PR failing with a non-GroomError is systemic, so the run exits NON-zero "
+            "naming both deferrals, while reclaim STILL ran first",
+            (
+                vd_detect_all_releases,
+                "every stale PR detection failed (2 attempted, 0 completed)"
+                in vd_detect_all_error,
+                "owner/repo#31" in vd_detect_all_error
+                and "owner/repo#32" in vd_detect_all_error,
+                "detect_deferred=2" in vd_detect_all_log,
+            ),
+            ([{"e" * 32}], True, True, True),
+        )
+
+        # (2) ISSUE STATUS REPAIR LOOP.
+        vd_repair_log, vd_repair_error, vd_repair_releases = _sweep_with_refusals(
+            {},
+            issues=(_repairable_issue(41), _repairable_issue(42)),
+            side_effects={("POST", "/repos/owner/repo/issues/41/labels", 1): _raise_parse_ts},
+        )
+        vd_repair_writes = terminal_sweep_env["writes"]
+        check(
+            "MUTATION #774 (issue repair): a NON-GroomError out of the head-of-line issue's body "
+            "defers only THAT issue — dead-lease reclaim still runs, #42 is still re-readied, and "
+            "#41's transition stops at its failure (narrow the handler back to `except GroomError` "
+            "and run_sweep ABORTS before _release_claims, releasing NOTHING)",
+            (
+                vd_repair_releases,
+                ("POST", "/repos/owner/repo/issues/42/labels") in vd_repair_writes,
+                ("DELETE", "/repos/owner/repo/issues/42/labels/status%3Ain-progress")
+                in vd_repair_writes,
+                ("DELETE", "/repos/owner/repo/issues/41/labels/status%3Ain-progress")
+                in vd_repair_writes,
+            ),
+            ([{"e" * 32}], True, True, False),
+        )
+        check(
+            "#774 (issue repair): the deferral is LOUD — the ALERT names the issue and carries "
+            "park_policy's OWN ValueError text, the phase counts it, and rule 3 leaves the run "
+            "GREEN because another issue was repaired",
+            (
+                "ALERT issue owner/repo#41:" in vd_repair_log,
+                "status repair deferred" in vd_repair_log,
+                str(parse_ts_failure) in vd_repair_log,
+                vd_repair_error,
+                "reset=1" in vd_repair_log,
+                "repair_deferred=1" in vd_repair_log,
+            ),
+            (True, True, True, "", True, True),
+        )
+        vd_repair_all_log, vd_repair_all_error, vd_repair_all_releases = _sweep_with_refusals(
+            {},
+            issues=(_repairable_issue(41), _repairable_issue(42)),
+            side_effects={("POST", f"/repos/owner/repo/issues/{number}/labels", 1): _raise_parse_ts
+                          for number in (41, 42)},
+        )
+        check(
+            "#774 precedence rule 2 (issue repair): EVERY issue failing with a non-GroomError is "
+            "systemic — the run exits NON-zero naming both deferrals — while reclaim STILL ran "
+            "first",
+            (
+                vd_repair_all_releases,
+                "every issue status repair failed (2 attempted, 0 completed)"
+                in vd_repair_all_error,
+                "owner/repo#41" in vd_repair_all_error
+                and "owner/repo#42" in vd_repair_all_error,
+                "repair_deferred=2" in vd_repair_all_log,
+            ),
+            ([{"e" * 32}], True, True, True),
+        )
+
+        # (3) STALE-PR HAND-OFF LOOP — the most direct exposure of the three, since
+        # _release_claims is the very next statement after it.
+        vd_park_log, vd_park_error, vd_park_releases = _sweep_with_refusals(
+            {},
+            pulls=(_stale_worker_pr(31), _stale_worker_pr(32)),
+            side_effects={("POST", "/repos/owner/repo/issues/31/labels", 1): _raise_parse_ts},
+        )
+        vd_park_writes = terminal_sweep_env["writes"]
+        check(
+            "MUTATION #774 (stale-PR hand-off): a NON-GroomError out of the head-of-line PR's "
+            "body defers only THAT PR — dead-lease reclaim still runs, #32 is still labelled AND "
+            "commented, and #31 never reaches its comment (narrow the handler back to "
+            "`except GroomError` and run_sweep ABORTS before _release_claims, releasing NOTHING)",
+            (
+                vd_park_releases,
+                ("POST", "/repos/owner/repo/issues/32/labels") in vd_park_writes,
+                ("POST", "/repos/owner/repo/issues/32/comments") in vd_park_writes,
+                ("POST", "/repos/owner/repo/issues/31/comments") in vd_park_writes,
+            ),
+            ([{"e" * 32}], True, True, False),
+        )
+        check(
+            "#774 (stale-PR hand-off): the deferral is LOUD — the ALERT names the PR and carries "
+            "park_policy's OWN ValueError text, the phase counts it, and rule 3 leaves the run "
+            "GREEN because another PR was handed off",
+            (
+                "ALERT PR owner/repo#31:" in vd_park_log,
+                "stale PR hand-off deferred" in vd_park_log,
+                str(parse_ts_failure) in vd_park_log,
+                vd_park_error,
+                "stale_prs=1" in vd_park_log,
+                "stale_pr_deferred=1" in vd_park_log,
+            ),
+            (True, True, True, "", True, True),
+        )
+        vd_park_all_log, vd_park_all_error, vd_park_all_releases = _sweep_with_refusals(
+            {},
+            pulls=(_stale_worker_pr(31), _stale_worker_pr(32)),
+            side_effects={("POST", f"/repos/owner/repo/issues/{number}/labels", 1): _raise_parse_ts
+                          for number in (31, 32)},
+        )
+        check(
+            "#774 precedence rule 2 (stale-PR hand-off): EVERY PR failing with a non-GroomError "
+            "is systemic — the run exits NON-zero naming both deferrals — while reclaim STILL ran "
+            "first",
+            (
+                vd_park_all_releases,
+                "every stale PR hand-off failed (2 attempted, 0 completed)" in vd_park_all_error,
+                "owner/repo#31" in vd_park_all_error and "owner/repo#32" in vd_park_all_error,
+                "stale_pr_deferred=2" in vd_park_all_log,
+            ),
+            ([{"e" * 32}], True, True, True),
+        )
+
+        # (4) THE MASKING CONTRACT, at EVERY ONE of the four widened handlers. GroomError is
+        # defined as never carrying a credential and always bounded, because it is only ever built
+        # through _masked_detail. An ARBITRARY exception has had no such treatment, and its text
+        # now reaches the operator log — so each widened handler routes it through
+        # _deferral_detail. That helper is SHARED, which is precisely why one scenario cannot
+        # stand for four: the residual defect is a WIRING defect. Put `str(exc)` back at ONE call
+        # site and the helper stays correct while that handler leaks arbitrary exception text —
+        # invisible to every boundary/continuation row above, whose refusals carry a short,
+        # single-line, non-secret message. So the leak is driven END TO END through each call
+        # site, one scenario per site, each asserted independently.
+        def _raise_leaky() -> None:
+            raise ValueError(
+                "malformed park receipt stamp\n(ghs_deferralleak87654321)\n" + "y" * 5000
+            )
+
+        class _LeakyPages(dict):
+            """The comments read the age-unpark loop makes, raising the leaky failure.
+
+            The unpark loop reaches its handler through the page store rather than through a
+            request, so it is injected here instead of via `side_effects`."""
+
+            def get(self, key, default=None):
+                if key == "/repos/owner/repo/issues/33/comments":
+                    _raise_leaky()
+                return super().get(key, default)
+
+        def _leaky_unpark_log() -> str:
+            terminal_sweep_env["pages"] = _LeakyPages(_bot_park_timeline(33))
+            try:
+                return _sweep_with_refusals({}, pulls=(recovered_pr,))[0]
+            finally:
+                terminal_sweep_env["pages"] = {}
+
+        # The whole expected line is a LITERAL: no term of it is read from `_TOKEN_SHAPE`,
+        # `GH_DETAIL_LIMIT` or the raiser (AGENTS.md pre-flight item 2b/2c). Widening the mask,
+        # raising the bound or dropping the collapse each moves the emitted line away from this
+        # fixed string instead of moving the expectation along with the code. `y * 365` is the
+        # truncation the 400-character bound performs on a 5035-character message, and the
+        # trailing `…` is the marker that says truncation happened at all.
+        leaky_detail = "malformed park receipt stamp (***) " + "y" * 365 + "…"
+        for site, prefix, tail, run_leaky in (
+            ("stale-PR detection", "ALERT PR owner/repo#31:", "stale PR detection deferred",
+             lambda: _sweep_with_refusals(
+                 {}, pulls=(_stale_worker_pr(31), _stale_worker_pr(32)),
+                 side_effects={("GET", "/repos/owner/repo/pulls/31", 1): _raise_leaky})[0]),
+            ("issue status repair", "ALERT issue owner/repo#41:", "status repair deferred",
+             lambda: _sweep_with_refusals(
+                 {}, issues=(_repairable_issue(41), _repairable_issue(42)),
+                 side_effects={
+                     ("POST", "/repos/owner/repo/issues/41/labels", 1): _raise_leaky})[0]),
+            ("stale-PR hand-off", "ALERT PR owner/repo#31:", "stale PR hand-off deferred",
+             lambda: _sweep_with_refusals(
+                 {}, pulls=(_stale_worker_pr(31), _stale_worker_pr(32)),
+                 side_effects={
+                     ("POST", "/repos/owner/repo/issues/31/labels", 1): _raise_leaky})[0]),
+            ("age un-park", "ALERT PR owner/repo#33:", "age un-park deferred", _leaky_unpark_log),
+        ):
+            leaky_log = run_leaky()
+            check(
+                f"#774 ({site}): THIS handler's deferral goes through the masking contract — "
+                "credential SHAPE masked, collapsed to ONE line, truncated at the bound (the "
+                "raiser's message spans three lines and is over 5000 characters). Wire this one "
+                "call site back to `str(exc)`, leaving the shared helper untouched, and the raw "
+                "token, both newlines and all 5000 characters reach the operator log",
+                (
+                    "ghs_deferralleak87654321" in leaky_log,
+                    [line for line in leaky_log.splitlines() if line.startswith(prefix)],
+                ),
+                (False, [f"{prefix} {leaky_detail} — {tail}"]),
+            )
 
         # ---- issue #649: the THREE residual head-of-line aborts, END TO END --------------------
         # #648 closed every loop whose fix was #644's mechanical record-and-continue. These three
