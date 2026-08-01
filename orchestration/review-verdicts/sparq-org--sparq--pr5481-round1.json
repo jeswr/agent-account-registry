@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5481,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "28a8a59a9c5c69e065c273ef421cf81599f8d56d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change consistently routes all subject-position blank-node inspection through exhaustive helpers, preserving existing behavior while creating the intended compile-time tripwire if the upstream subject enum gains a new variant. The depth calculation remains unchanged for both currently representable subject kinds, and the focused tests cover both helper arms plus the real canonicalization path for a blank node in an embedded triple subject. No correctness, soundness, security, or test-validity defect is apparent in the supplied diff.",
+  "verdict": "approve"
+ }
+}
