@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1506,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "13ba851a22ae70dcbafdd26ff140c5e392077618",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`ledger_entries()` validates paths and modes from `HEAD`, but `observability_violations()` reads `root/data/observability.json` from the mutable worktree. A repository whose committed observability blob contains `flow.leases` can therefore pass after that worktree file is deleted (the `FileNotFoundError` path returns `[]`) or replaced with row-free JSON. The validator certifies one Git object while examining different or absent bytes. The self-test always commits and validates identical worktree bytes, so it cannot detect this seam.",
+    "file": "scripts/ledger-invariant.py",
+    "fix_hint": "Read the observability blob from the same `HEAD` tree being enumerated, with explicit missing/type/error handling, and decode those returned bytes. Add tests where the committed blob contains rows but the worktree copy is deleted and separately replaced; both must still refuse based on `HEAD`, or explicitly reject any index/worktree divergence before reading it.",
+    "severity": "major",
+    "title": "Content validation is not bound to the HEAD tree being attested"
+   },
+   {
+    "body": "`json.loads` uses last-key-wins semantics. A committed snapshot with an initial `flow` object containing `leases`, followed by a second empty `flow` object, passes because `document.get(\"flow\")` sees only the final object. The public blob still literally contains the forbidden per-account array and labels. Because disclosure occurs when those bytes exist on the public branch, collapsing duplicate members is fail-open. The non-object test does not exercise this case.",
+    "file": "scripts/ledger-invariant.py",
+    "fix_hint": "Decode with an `object_pairs_hook` that rejects duplicate keys at every object level, or otherwise validate a representation that preserves every member; treat duplicates as violations. Add a self-test with an earlier `flow.leases` member shadowed by a later `flow` member and require a nonzero CLI exit.",
+    "severity": "major",
+    "title": "Duplicate JSON keys can hide publicly disclosed lease rows"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe dashboard consumer correctly refuses a present `flow.leases` key and the tests distinguish privacy-label failures from deprecated-row failures. The ledger-wide invariant is not sound yet: it can inspect different bytes from the HEAD tree it attests, and ordinary JSON parsing silently discards earlier duplicate keys even though those bytes remain publicly disclosed. Both seams can let the validator succeed while the ledger commit contains forbidden rows.",
+  "verdict": "request_changes"
+ }
+}
