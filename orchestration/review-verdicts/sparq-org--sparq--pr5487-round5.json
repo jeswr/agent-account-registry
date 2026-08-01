@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5487,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8228ff868daa91cdcd7a6b042f02c4dd6606d1c0",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "collect_json_chunks_capped checks chunk.len() only after query_json_stream_with_budget transfers an owned String to its callback. In the engine's real single-pattern path, write_row appends the entire row before the flush threshold is tested, so one stored literal larger than the budget creates the full oversized String before this callback can return Break. This contradicts the new HARD-cap and 'refused BEFORE it is made' claims; peak memory is not bounded by 8 MiB plus a bounded in-flight chunk. The integration test uses four 3 MiB rows and therefore cannot expose the one-row oversized-chunk case.",
+    "file": "crates/sparq-server/src/http.rs",
+    "fix_hint": "Move byte-budget enforcement into serialization through a capped writer/sink that rejects growth before copying a row or literal beyond the remaining budget, and add a regression test with one stored literal larger than the degraded budget that verifies the serializer aborts before materializing its full lexical form (using focused byte-write/allocation instrumentation). Alternatively remove the hard allocation-bound claims and describe this honestly as only an accumulated-body cap.",
+    "severity": "major",
+    "title": "The hard degraded-response allocation cap is still enforced after an oversized chunk is allocated"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 leaves the prior major allocation-bound defect unchanged. The degraded collector receives each chunk as an already-owned String, after the engine serializer has appended a complete row and only then checked its approximate 64 KiB flush threshold. A single dictionary-resident literal can therefore allocate and copy an arbitrarily large chunk before the server's 8 MiB check rejects it. The new test still uses four separate 3 MiB literals, so it demonstrates rejection after accumulated output crosses the cap, not the claimed hard pre-allocation bound. Progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
