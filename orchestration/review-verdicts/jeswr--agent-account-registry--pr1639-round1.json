@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1639,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "fd1ac7a58256422e7bef9336036d0130890a1ca5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_seal_before_target_code` sets `upload_ln` from the first exact `- name:` match and never inspects that step's body. Deleting its `uses: actions/upload-artifact@...` line, changing it to another action, changing/removing the sealed `path`, or adding `if: false` all leave the LIVE assertion returning `ordered`. An early inert step with the expected name can likewise mask a real renamed upload placed after target code. The non-vacuity fixtures only delete or move the name line, so none turns red for these defects. Thus the evidence path does not verify the stated invariant that the artifact is handed to the artifact service before target-controlled code.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Identify the complete, unique upload step and validate within its step body an executable SHA-pinned `actions/upload-artifact` invocation, the lane's exact sealed-directory path, and a non-disabled condition before comparing its location with both target-code anchors. Add named negative fixtures for deleting/replacing `uses`, changing/removing `path`, disabling the step, and an early same-name decoy masking a late real upload. Derive the ordered line from the validated upload invocation/step rather than from an unbound display name.",
+    "severity": "blocker",
+    "title": "Upload ordering is proved from a name line, not an artifact upload"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new invariant does not actually establish that either upload executes or hands the sealed directory to the artifact service. It only orders a step-name line, leaving straightforward workflow mutations that preserve an `ordered` verdict while disabling or replacing the upload. Because this is the marquee trust-plane claim and its evidence path is structurally incomplete, the change needs revision.",
+  "verdict": "request_changes"
+ }
+}
