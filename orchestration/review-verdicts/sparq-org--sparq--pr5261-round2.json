@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5261,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0544e06e00fb1225b1c7e700fab5269f20a39d70",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The round-1 blocker is still present in sections 10.4 and 10.5: individual run durations, an approximate selected-leg count, a projected '+4\u201310 m' median-wall effect, and fixed gate timings are embedded in durable prose and a table. Calling the range a projection does not cure the repository-policy violation: the reviewer contract forbids hard-coded performance numbers and says dated work-box/EC2/session timings are non-canonical. The companion changed record also repeats the projected range.",
+    "file": "research/change-based-test-selection.md",
+    "fix_hint": "Remove the literal durations, leg-count range, and projected minute range from both changed research records. Link to the profile or generated benchmark artifact, and state the conclusions qualitatively (for example, that forcing the full matrix restores the materially slower full-matrix shape and that the rejected candidates are parallel/non-critical-path work).",
+    "severity": "major",
+    "title": "Hard-coded performance figures remain after round 1"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 is stagnant: the prior major finding remains materially unchanged. Sections 10.4 and 10.5 still embed dated run durations, selected-leg counts, and a projected median-wall range as durable performance evidence, and the companion research record still repeats the projected range. This conflicts with the repository's explicit prohibition on hard-coded performance numbers and its rule that session/work-box/EC2 timings are non-canonical. The soundness memo otherwise states its remote ALLGREEN premise and residual risk clearly, but approval remains blocked until the fixed figures are removed in favor of links to generated/profile evidence and qualitative conclusions.",
+  "verdict": "request_changes"
+ }
+}
