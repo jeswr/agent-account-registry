@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5419,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0f641c618bad91f11377b8fedea7e1549dc72255",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The construction uses `r` as auth_mul's adopted second operand for `m=d*r` and as first operand for `u=r*s`. A malicious party may equivocate between gates: supply a consistently zero/adopted mask to the verdict multiplication, but the original nonzero mask to the witness multiplication. Then `m=0` is MAC-consistent, `u!=0` is MAC-consistent, the batch check and witness check pass, and unequal keys return `true`. The module itself acknowledges this attack in residual (2), saying a party presenting different `[r]` to the gates could flip a verdict, but nevertheless advertises `malicious-with-abort` and `Aborts, never a wrong answer`. Reusing one in-memory object only constrains this simulator; it is not a protocol-level binding against an actively deviating distributed party.",
+    "file": "crates/sparq-mpc/src/auth_equal.rs",
+    "fix_hint": "Do not claim AXIS-1 Malicious or `never a wrong answer` until multiplication-gate verification/commitment binds both operands and the same mask across both gates, with a real adversarial test that independently mutates the two gate invocations and demonstrates abort. Until then rename and document this as an experimental/tamper-evident trusted-dealer simulation, mirroring the containment applied to auth_disclose, and narrow the re-exports, SKILL, capability matrix, and design claims accordingly.",
+    "severity": "major",
+    "title": "The nonzero witness does not bind the mask across multiplication gates"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The new operator is internally consistent only under the in-process honest-dealer execution model, but its public API and documentation promote it to malicious-with-abort despite an admitted gate-equivocation attack that returns a wrong verdict. A corrupt party can use a zero/adopted mask in the verdict multiplication and the honest mask in the witness multiplication; the two authenticated products are each MAC-consistent, the witness is nonzero, and unequal keys are reported equal. Sharing one Rust AuthenticatedShare object does not bind a malicious distributed party's messages across two multiplication gates. This contradicts the public `Aborts, never a wrong answer` contract and the claimed AXIS-1 Malicious tier. Since round 3 had no findings, this newly identified major soundness issue makes progress regressing.",
+  "verdict": "request_changes"
+ }
+}
