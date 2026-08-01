@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4313,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9781815c3abe15844b1d172e29577d3c9b0dd96c",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The README says streaming serialization produces \"smaller peak memory\". Removing the whole-document String guarantees a smaller rendering allocation/live set, but does not guarantee a lower process peak: the PR's own benchmark documentation explains that larger earlier transients can set the high-water mark and mask the removed buffer. The CLI path may similarly have its peak set while loading the graph. This is an unsupported categorical performance claim, though it does not affect functional correctness.",
+    "file": "crates/sparq-cli/README.md",
+    "fix_hint": "Replace \"smaller peak memory\" with a precise structural claim such as \"avoids allocating the whole rendered document as one String\" or \"reduces serialization-time buffering\".",
+    "severity": "minor",
+    "title": "Peak-memory claim is stronger than the implementation guarantees"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 3 fixes the prior major finding: the broken-pipe test now constructs the pipe directly, closes the reader mid-document, and asserts both exit status 0 and empty stderr. The streaming implementation and its HTTP tests cover small buffered, large multi-chunk, Turtle state across chunks, HEAD, empty-result, and pre-stream budget-refusal behavior. One minor documentation overstatement remains: the CLI README promises smaller peak memory although the change guarantees reduced render buffering/allocation, not necessarily a lower process high-water mark.",
+  "verdict": "approve"
+ }
+}
