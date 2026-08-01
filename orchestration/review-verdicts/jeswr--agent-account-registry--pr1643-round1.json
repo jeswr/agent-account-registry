@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1643,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f536a02df7d2a919d3786c67cccbbd9bcf5ca9b1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4 requires `never observed on this account` to admit while `observed, unparseable (shape drift)` refuses, and Stage B additionally suggests refusing after N consecutive probe failures. The proposed Stage A data is only a per-tick header set in the ephemeral usage snapshot; the current producer/consumer contract has no per-account observation history or consecutive-failure counter. On a tick where the expected opus5 header is absent, that snapshot cannot tell a newly enrolled/never-observed account from an account that previously exposed the header and has now drifted. Nor can it count consecutive failures. This ambiguity is exactly at the gate's fail direction, so leaving the storage, transition, and reset semantics unspecified makes the central recommendation incomplete and invites either the fleet-wide self-latch the record warns about or fail-open drift.",
+    "file": "research/720-opus5-premium-quota-gating.md",
+    "fix_hint": "Define the durable, per-account state machine and its writer/reader seams: how first successful observation is recorded, how absent/malformed/transport-failed probes transition state, how consecutive failures are counted and reset, freshness/expiry rules, and how the consumer authenticates and fail-closes on malformed state. Add the corresponding non-vacuous test obligations and mutants for each transition. If no durable state is intended, revise the policy to use only states that a single snapshot can soundly distinguish.",
+    "severity": "major",
+    "title": "The proposed three-way fail direction has no durable state that can distinguish its cases"
+   },
+   {
+    "body": "Section 2.5 says one stale comment claims starvation reaches `needs:user` and names only the `role = \"ci\"` comment. The security-label override commentary earlier in `orchestration/routing.toml` also says chain exhaustion `ESCALATES to a human (needs:user)`, while the code path documented here applies machine-owned `status:parked`. The record's stated inventory and follow-up therefore leave another contradictory description in the same file.",
+    "file": "research/720-opus5-premium-quota-gating.md",
+    "fix_hint": "Enumerate both stale comment sites (and any others found by an exact search for the old terminal behavior) and include all of them in the follow-up recommendation.",
+    "severity": "minor",
+    "title": "The claim that only one routing comment is stale is false"
+   }
+  ],
+  "progress": null,
+  "summary": "The record correctly identifies the inert fable-only premium gate and the danger of binding opus5 to fable fields, but its central proposed three-way policy is not implementable from the state it proposes to retain. It also understates the stale routing commentary it claims to inventory. Because this is a design record intended to govern a later trust-plane gate, the missing state/transition design is a major completeness gap.",
+  "verdict": "request_changes"
+ }
+}
