@@ -252,14 +252,36 @@ write simply lands on the rewritten branch as a normal fast-forward commit, and 
 pre-#212 lease row it reintroduces the exposure. **Q2's zero, held open by Q1's disable, is the only
 thing that excludes that case**; the lease is a second line, not the defence. Step C's post-checks
 run before any `enable`, so a tip that has advanced past the pushed SHA when C runs is the detection
-of last resort.
+of last resort — which is exactly why **every** step-C check must be read-only. A post-check that can
+itself PUT makes that signal unreadable.
 
 **C. Post-checks, before resuming anything.**
 - `python3 scripts/ledger-invariant.py` against a fresh checkout of the rewritten branch — the
   data-only tree allowlist must still pass. Four workflows (`dashboard`, `dispatch`, `groom`,
   `review-fix`) run it immediately after checkout and will go red on any tree-shape damage.
-- `select-and-claim.py --claim` / `groom.py` read the tip and get the same content as before the
-  rewrite (the tip's *content* is unchanged; only its SHA moved).
+- Confirm the tip's *content* survived the rewrite (only its SHA moved) — but do it with
+  **read-only** steps only, in this order. **(i)** `GET /repos/{repo}/git/ref/heads/ledger` and
+  assert the SHA equals the one just pushed. **(ii)** `GET` `data/leases.json` and the other
+  `data/*.json` through the **contents API pinned to that SHA**, and diff them against the archive
+  taken at step B — the rewrite's blob callback only removes rows that were already legacy, so on a
+  correct rewrite the *tip* files are byte-identical. **(iii)** Parse the fetched ledger with
+  `lease_schema.validate_ledger` and `select-and-claim.validate_lease_account_identities`
+  (`scripts/lease_schema.py:156`, `select-and-claim.py:402`). Both are **pure** — `lease_schema`
+  imports only `argparse`/`re`/`typing`, performs no request and holds no ledger SHA — so running
+  them is the reader contract without the reader's process.
+- **Do not use `select-and-claim.py --claim` or a bare `groom.py` as the "does a reader still work"
+  post-check.** Neither is read-only. `--claim` calls `claim(...)`
+  (`select-and-claim.py:4799-4808`), which CAS-PUTs a lease as soon as an account is free; `groom.py`
+  with no `--self-test`/`--print-owner-repos`/`--report-orphan-claims` flag falls through to
+  `run_sweep(args)` (`groom.py:10328`), whose job includes ledger reconciliation writes. Invoked with
+  the credentials needed to exercise the real branch, either **advances the tip inside the
+  maintenance window** — which both re-opens the §5-P hazard the window exists to close and destroys
+  the last-resort signal, since a tip found past the pushed SHA can no longer be distinguished from a
+  surviving writer when the post-check *is* a writer. Q1's `gh workflow disable` gates workflow runs;
+  it gates no manual CLI invocation. Any end-to-end writer exercise belongs **after** step E, on the
+  resumed branch, where a new commit is expected. (A no-write validation mode on
+  `ledger-invariant.py` — §6 — is what would make an in-window structural check a single command
+  instead of three; it does not exist yet, which is why the above is spelled out by hand.)
 - Spot-check that a known `orchestration/provenance/*.json` and a known review verdict are still
   readable at the tip by path — `groom`'s live provenance read resolves `LEDGER_REF` and pins the
   commit SHA **at read time** (`groom.py:881`), so nothing durably references an old SHA; a read that
