@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5529,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6b8eba542da470e7ee92964ce870130a1c2757aa",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The test runs `env PATH=\"/nonexistent\" bash \"$SCRIPT\" ...`. Because `bash` is resolved through that same empty PATH, `env` itself fails to locate bash and returns 127. The assertion therefore passes even if `build-guide.sh` removes or breaks its `command -v mdbook` check, making this case vacuous.",
+    "file": "scripts/tests/test_build_guide.sh",
+    "fix_hint": "Invoke bash by an absolute path captured before replacing PATH (for example `BASH_BIN=$(command -v bash)` and then `env PATH=/nonexistent \"$BASH_BIN\" \"$SCRIPT\" ...`), and optionally assert the actionable `mdbook not found` message as well as exit status 127.",
+    "severity": "minor",
+    "title": "Missing-mdbook test passes without executing the builder"
+   }
+  ],
+  "progress": null,
+  "summary": "The guide is correctly built through one shared, fail-closed script in both validation and publishing lanes, overlaid into the single Pages artifact, and guarded for pin and mount drift. The mutation tests exercise the main wiring invariants and the builder tests cover clean, logged-error, nonzero-exit, and missing-render behavior. One minor test-validity defect remains in the missing-mdbook case, but it does not undermine the production path.",
+  "verdict": "approve"
+ }
+}
