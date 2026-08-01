@@ -1686,10 +1686,11 @@ def _provenance_read(args, *, target_repo, subject, env=None):
          + attempts — the same run-log substrate `scripts/backfill-provenance.py` already reads;
       2. an Actions `::error` annotation, which the checks API counts and attributes to the run;
       3. a `$GITHUB_STEP_SUMMARY` row, durable on the run itself and needing no extra permission;
-      4. a deduped ops-alert issue when — and ONLY when — an alert route is configured. It is NOT
-         configured on worker.yml's `provenance` job today (no `REGISTRY_REPO`/`ALERT_TOKEN`, and
-         that job deliberately holds no `issues: write` beside `PROVENANCE_SALT`), exactly like
-         `_registry_put_file`'s existing terminal alert. Artifacts 1-3 are the ones that fire there.
+      4. a deduped ops-alert issue when — and ONLY when — an alert route is configured. Registry
+         #296 configured one: worker.yml's `provenance` job now exports the four `_alert_route()`
+         names and holds `issues: write`, so this alert (and `_registry_put_file`'s terminal one)
+         delivers there instead of no-opping. Artifacts 1-3 still fire unconditionally, and a
+         route that is missing or refused degrades to them rather than failing the write path.
 
     It does NOT weaken the fail-closed rule downstream: a PR whose record is absent still takes
     `__global__` in dispatch-claim.busy_packages_of_pulls."""
@@ -6278,6 +6279,13 @@ def provenance_retry_budget_seconds(reads=2):
     return reads * per_read + _REGISTRY_CAS_DEADLINE_S
 
 
+# The four env names `_alert_route()` consults, in the order that function reads them. Named here
+# so the workflow-seam report and the runtime simulation in the self-test agree on WHAT has to be
+# exported; the EXPECTED bindings stay literal in the test, so neither side derives its expectation
+# from the other (registry #296).
+ALERT_ROUTE_ENV_KEYS = ("REGISTRY_REPO", "REGISTRY_ALERT_TOKEN", "ALERT_REPO", "ALERT_TOKEN")
+
+
 def provenance_workflow_seam_report():
     """Structural findings about the LIVE worker.yml `provenance` job, each asserted by the
     self-test. Read off PARSED YAML nodes: a substring or `count(...) == N` assertion over workflow
@@ -6297,6 +6305,13 @@ def provenance_workflow_seam_report():
         "timeout_minutes": job.get("timeout-minutes"),
         "retry_budget_seconds": provenance_retry_budget_seconds(),
         "step_has_gh_token": "GH_TOKEN" in ((step or {}).get("env") or {}),
+        # Registry #296: the terminal alert on BOTH failure paths this step can raise
+        # (`_provenance_read` exhaustion, `_registry_put_file` exhaustion) is delivered only when
+        # `_alert_route()` finds these names in the runner env. Reported as the EXACT binding of
+        # each name (never mere presence): `REGISTRY_ALERT_TOKEN: ${{ secrets.SOMETHING_ELSE }}`
+        # is valid YAML, lints clean, and restores the silent no-op.
+        "alert_route_env": {key: ((step or {}).get("env") or {}).get(key)
+                            for key in ALERT_ROUTE_ENV_KEYS},
         "job_needs_publish": "publish" in (job.get("needs") or []),
         "job_permissions": job.get("permissions"),
         # Registry #748: status recovery rides on `GH_DEBUG` containing `api` in gh's child env.
@@ -7947,7 +7962,68 @@ def _self_test():
     check("#677 YAML seam: the read is AUTHENTICATED (an unauthenticated read is a permanent "
           "401 that no retry can clear)", seam["step_has_gh_token"], True)
     check("#677 YAML seam: the retried read runs in the job that executes NO target code",
-          (seam["job_needs_publish"], seam["job_permissions"]), (True, {"contents": "write"}))
+          (seam["job_needs_publish"], seam["job_permissions"]),
+          # `issues: write` is the #296 grant: the ops-alert below upserts an issue in the
+          # registry under github.token, and without the scope the alert is refused. Pinned as
+          # the WHOLE permissions map, so an added scope on this PROVENANCE_SALT-bearing job is a
+          # deliberate, reviewed act rather than a quiet widening.
+          (True, {"contents": "write", "issues": "write"}))
+    # --- registry #296: the ops-alert ROUTE at the same seam ---------------------------------
+    # Exact bindings, not presence (pre-flight item 6): a re-pointed `REGISTRY_ALERT_TOKEN`
+    # restores the (None, None) no-op while every name is still spelled in the file.
+    check("#296 YAML seam: the provenance step EXPORTS the alert route _alert_route() reads, "
+          "each bound to the exact expression (a re-point silently restores the no-op)",
+          seam["alert_route_env"],
+          {"REGISTRY_REPO": "${{ github.repository }}",
+           "REGISTRY_ALERT_TOKEN": "${{ github.token }}",
+           "ALERT_REPO": "${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}",
+           "ALERT_TOKEN": "${{ secrets.ALERT_TOKEN || '' }}"})
+
+    # ...and what those bindings actually PRODUCE at runtime. The runner is replayed from the
+    # binding TEXT (never from the key name), then the REAL _alert_route() is called on the
+    # result. This is the check that survives a rename on either side: drop a binding in
+    # worker.yml, or teach _alert_route() to read some other name, and the route this job would
+    # resolve at runtime goes back to the silent (None, None) that #296 is about.
+    def _runner_resolves(expr):
+        if expr == "${{ github.repository }}":
+            return "jeswr/agent-account-registry"
+        if expr == "${{ github.token }}":
+            return "ghs-selftest-workflow-token"
+        # `secrets.X || vars.X || ''` — the UNCONFIGURED private route, i.e. the deployment
+        # shape that makes the registry fallback (and therefore `issues: write`) load-bearing.
+        if re.fullmatch(r"\$\{\{ secrets\.\w+(?: \|\| vars\.\w+)? \|\| '' \}\}", str(expr or "")):
+            return ""
+        return None  # deleted or unrecognised binding — the runner exports nothing
+
+    _route_saved = {key: os.environ.get(key) for key in ALERT_ROUTE_ENV_KEYS}
+    try:
+        for key in ALERT_ROUTE_ENV_KEYS:
+            os.environ.pop(key, None)
+        for key, expr in seam["alert_route_env"].items():
+            resolved = _runner_resolves(expr)
+            if resolved is not None:
+                os.environ[key] = resolved
+        check("#296 the route the LIVE provenance job resolves at runtime is DELIVERABLE — "
+              "the registry fallback, not the (None, None) that makes _ops_alert a no-op",
+              _alert_route(confirmed_private=lambda repo, token: False),
+              ("jeswr/agent-account-registry", "ghs-selftest-workflow-token"))
+        # Non-vacuity of the line above: the same replay over a provenance step that exports
+        # NOTHING (the pre-#296 shape) must produce the no-op route. Without this the check
+        # could be passing on ambient environment rather than on the workflow's bindings.
+        for key in ALERT_ROUTE_ENV_KEYS:
+            os.environ.pop(key, None)
+        check("#296 the same replay over the PRE-#296 step (no alert env at all) reproduces the "
+              "silent no-op route — so the assertion above is about the workflow, not ambient env",
+              (_alert_route(confirmed_private=lambda repo, token: False),
+               _ops_alert(*_alert_route(confirmed_private=lambda repo, token: False),
+                          "unreachable title", "unreachable body")),
+              ((None, None), None))
+    finally:
+        for key, value in _route_saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
     check("#748 YAML seam: NO workflow, job or step pins GH_DEBUG — status recovery depends on it "
           "reaching gh's child env, and this is the seam where a pin would silently restore the "
           "statusless blindness with nothing going red",
