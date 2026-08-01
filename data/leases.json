@@ -11,16 +11,6 @@
    "expires_at": 1785600085
   },
   {
-   "account": "dc2d751954080e13",
-   "claim_id": "9583bd1ffc4642a285688d995e32b343",
-   "holder": "review:sparq-org/sparq#3542@30704624188.1",
-   "package": "sparq-zk-compose",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785595861,
-   "expires_at": 1785600061
-  },
-  {
    "account": "51bde6688e140866",
    "claim_id": "1b29acf8c85448d2a0a0c82af2122635",
    "holder": "fix:sparq-org/sparq#3916@30704629884.1",
