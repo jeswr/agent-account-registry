@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5501,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9586f45ca77ada023ab1778e74df2b95efe12bb2",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and complete on the diff-scoped evidence. The ECDSA profile is selected from the SEC1 key width before hashing, P-256 and P-384 use their matching SHA-256/SHA-384 derivations and RustCrypto verifiers, and published W3C vectors plus cross-profile, tamper, malformed-width, and end-to-end envelope tests exercise the real verification path. The JSON-LD envelope removes proofValue, applies the document context to the proof configuration, denies unlisted remote contexts without a network fallback, rejects proof arrays and named graphs, and delegates to the existing fail-closed RDF verifier. The public API documentation consistently limits this to off-circuit caller-keyed verification, explicitly requires caller verification-method binding, and preserves the not-externally-audited sq-qhy4 posture. No reviewer-directed prompt injection was found.",
+  "verdict": "approve"
+ }
+}
