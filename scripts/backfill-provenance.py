@@ -1151,41 +1151,114 @@ def _ast_names(node):
     return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
 
 
+def _static_truth(test):
+    """`True`/`False` when a branch test is a plain LITERAL, else `None` (not decidable here).
+
+    Only literals are folded, and only so an UNREACHABLE seed can be rejected: `if False:` around
+    a policy read is valid Python, lints clean, and would otherwise donate its taint to a value
+    that was hardcoded before it."""
+    return bool(test.value) if isinstance(test, ast.Constant) else None
+
+
+def _derives_from(expr, source, tainted):
+    """Does this expression's value come from `source` — the literal itself, or a name already
+    holding something derived from it?"""
+    if any(isinstance(n, ast.Constant) and n.value == source for n in ast.walk(expr)):
+        return True
+    return bool(_ast_names(expr) & tainted)
+
+
+def _record_printed_keys(stmt, source, tainted, keys):
+    """Credit every `print("key=" …)` inside THIS ONE statement whose printed expression reads a
+    tainted name. Called with the taint in force where the statement sits, so a print parked in a
+    dead branch — or one above the assignment that would derive its value — is never credited.
+
+    Seeding is deliberately NOT accepted here: only a tainted NAME counts. A resolver that inlines
+    the whole read into the `print` call reads as not-derived, which reds the shipped assertion
+    loudly; accepting the literal instead would credit `print("repos=" + json.dumps(HARDCODED))`
+    for a step that merely names the policy file in an adjacent string."""
+    for call in ast.walk(stmt):
+        if not (isinstance(call, ast.Call) and getattr(call.func, "id", "") == "print"):
+            continue
+        printed = "".join(n.value for n in ast.walk(call)
+                          if isinstance(n, ast.Constant) and isinstance(n.value, str))
+        named = re.match(r"([A-Za-z_][A-Za-z0-9_-]*)=", printed)
+        if named and (_ast_names(call) & tainted):
+            keys.add(named.group(1))
+
+
+def _taint_block(body, source, tainted, keys):
+    """Fold a statement LIST **in order**, returning the names holding a `source`-derived value at
+    the end of it and adding every `key=` printed from one to `keys`.
+
+    Order and control flow ARE the check (round 2 of #1605). A monotone `ast.walk()` over every
+    `Assign` only ever ADDS names, so `repos = load(policy)` followed by `repos = ["a/b"]`, or a
+    policy read parked under `if False:`, still reads as policy-derived — and a resolver that
+    publishes a hand-copied enabled set passes while the shipped assertion stays green. So here:
+
+    * an assignment whose value is NOT derived **KILLS** its target's taint (strong update);
+    * a branch whose test is a literal `False` never runs and donates nothing;
+    * a `print` is judged against the taint in force where it appears, not at end of module.
+
+    Joins UNION rather than intersect: the shipped resolver derives `repos` from policy on the
+    scheduled path and from a policy-VALIDATED manual input on the other, so requiring derivation
+    on every path would call the live workflow unsourced. What that costs is bounded — a union
+    only ever survives a branch that really does read the file — and the kill above is what closes
+    the laundering case, since the hardcode has to be reached to be published.
+
+    Constructs this does not model (`def` bodies, a loop's binding target) contribute no taint,
+    which reads as NOT derived: that reds the shipped assertion loudly, where the opposite default
+    silently blesses a copied list. Every OTHER compound statement is folded through sequentially
+    rather than skipped, so a kill hidden inside a `with`/`try`/loop body is still seen."""
+    for stmt in body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue                     # defining is not running
+        if isinstance(stmt, ast.While) and _static_truth(stmt.test) is False:
+            continue                     # a dead loop is the same unreachable seed as `if False:`
+        if isinstance(stmt, ast.If):
+            live = _static_truth(stmt.test)
+            if live is None:
+                tainted = (_taint_block(stmt.body, source, set(tainted), keys)
+                           | _taint_block(stmt.orelse, source, set(tainted), keys))
+            else:
+                tainted = _taint_block(stmt.body if live else stmt.orelse, source, tainted, keys)
+        elif isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            _record_printed_keys(stmt, source, tainted, keys)
+            targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+            names = {n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name)}
+            if stmt.value is not None and _derives_from(stmt.value, source, tainted):
+                tainted = tainted | names
+            else:
+                tainted = tainted - names
+        else:
+            blocks = [n for n in ast.iter_child_nodes(stmt)
+                      if isinstance(n, (ast.stmt, ast.excepthandler))]
+            if blocks:
+                tainted = _taint_block(blocks, source, tainted, keys)
+            else:
+                _record_printed_keys(stmt, source, tainted, keys)
+    return tainted
+
+
 def _policy_derived_output_keys(run, source):
-    """The `key=` GITHUB_OUTPUT names this shell step PRINTS whose value is DERIVED, by assignment
-    dataflow, from the file `source` — as opposed to merely printed somewhere near a mention of it.
+    """The `key=` GITHUB_OUTPUT names this shell step PRINTS whose value is DERIVED, by ordered,
+    control-flow-aware assignment dataflow, from the file `source` — as opposed to merely printed
+    somewhere near a mention of it.
 
     Containment cannot tell a live resolver from one that hardcodes its answer while the literal
     survives in a COMMENT, a dead branch, a no-op, or a neighbouring step. All four are valid
     workflow YAML, all four lint clean, and a hardcoded copy of the enabled set is precisely the
-    duplication that took dispatch down on 2026-08-01 (#1537/#1540). Both cases read as NOT
-    derived here: a comment has no AST node to seed from, and a hardcoded `repos = [...]` severs
-    the chain between the file and the printed value.
-
-    Taint is seeded by the `source` literal appearing as a real Constant, propagated across simple
-    assignments to a fixpoint, and then REQUIRED of the printed expression."""
+    duplication that took dispatch down on 2026-08-01 (#1537/#1540). All read as NOT derived here:
+    a comment has no AST node to seed from, an unreachable branch never runs, and a hardcoded
+    `repos = [...]` severs the chain between the file and the printed value — including when it
+    OVERWRITES a real read that ran above it (see `_taint_block`)."""
     keys = set()
     for body in _heredoc_bodies(run):
         try:
             tree = ast.parse(body)
         except SyntaxError:      # not Python — it cannot be the resolver
             continue
-        assigns = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)]
-        tainted = set()
-        for _ in range(len(assigns) + 1):    # fixpoint: each pass taints at least one more target
-            for assign in assigns:
-                seeded = any(isinstance(n, ast.Constant) and n.value == source
-                             for n in ast.walk(assign.value))
-                if seeded or (_ast_names(assign.value) & tainted):
-                    tainted |= {t.id for t in assign.targets if isinstance(t, ast.Name)}
-        for call in ast.walk(tree):
-            if not (isinstance(call, ast.Call) and getattr(call.func, "id", "") == "print"):
-                continue
-            printed = "".join(n.value for n in ast.walk(call)
-                              if isinstance(n, ast.Constant) and isinstance(n.value, str))
-            named = re.match(r"([A-Za-z_][A-Za-z0-9_-]*)=", printed)
-            if named and (_ast_names(call) & tainted):
-                keys.add(named.group(1))
+        _taint_block(tree.body, source, set(), keys)
     return sorted(keys)
 
 
@@ -1735,6 +1808,79 @@ def _self_test():
     check("...and a heredoc that is not Python fails CLOSED, without aborting this suite",
           _derived_keys("cat <<'SH'\njq -r '.repos[]' policy/repos.toml\nSH\n",
                         "policy/repos.toml"), [])
+    # ORDER and CONTROL FLOW, the round-2 finding on this analyser. Taint that only ever
+    # accumulates cannot see a read whose result is thrown away or never runs, so each way of
+    # doing that is asserted separately — a hand-pinned list published after a real read, the same
+    # overwrite spelled as an annotated assignment or buried in a `try:` where a statement-list
+    # walk would miss it, and a read parked under `if False:`. Every one of these loads the policy
+    # file for real; only the ORDER or the REACHABILITY tells them apart from the resolver above.
+    check("order: a hand-pinned list assigned AFTER a real policy read is NOT sourced (the read "
+          "happened, its result is thrown away — a monotone walk credits it)",
+          _derived_keys(_heredoc % ('import json, tomllib\n'
+                                    'repos = sorted(tomllib.load('
+                                    'open("policy/repos.toml", "rb"))["repos"])\n'
+                                    'repos = ["some-owner/some-name"]\n'
+                                    'print("repos=" + json.dumps(repos))'),
+                        "policy/repos.toml"), [])
+    check("...including when that overwrite is an ANNOTATED assignment",
+          _derived_keys(_heredoc % ('import json, tomllib\n'
+                                    'repos = sorted(tomllib.load('
+                                    'open("policy/repos.toml", "rb"))["repos"])\n'
+                                    'repos: list = ["some-owner/some-name"]\n'
+                                    'print("repos=" + json.dumps(repos))'),
+                        "policy/repos.toml"), [])
+    check("...and when it is nested inside a `try:` (a skipped compound statement hides the kill)",
+          _derived_keys(_heredoc % ('import json, tomllib\n'
+                                    'repos = sorted(tomllib.load('
+                                    'open("policy/repos.toml", "rb"))["repos"])\n'
+                                    'try:\n    repos = ["some-owner/some-name"]\n'
+                                    'except Exception:\n    pass\n'
+                                    'print("repos=" + json.dumps(repos))'),
+                        "policy/repos.toml"), [])
+    check("reachability: a policy read parked under `if False:` seeds NOTHING, so the hand-pinned "
+          "list assigned above it is still what gets published",
+          _derived_keys(_heredoc % ('import json, tomllib\n'
+                                    'repos = ["some-owner/some-name"]\n'
+                                    'if False:\n    repos = sorted(tomllib.load('
+                                    'open("policy/repos.toml", "rb"))["repos"])\n'
+                                    'print("repos=" + json.dumps(repos))'),
+                        "policy/repos.toml"), [])
+    check("...nor does a policy read that only exists inside a `def` body seed anything (a "
+          "definition is not a run — the helper here is never called)",
+          _derived_keys(_heredoc % ('import json, tomllib\n'
+                                    'repos = ["some-owner/some-name"]\n'
+                                    'def _enabled():\n    repos = sorted(tomllib.load('
+                                    'open("policy/repos.toml", "rb"))["repos"])\n'
+                                    'print("repos=" + json.dumps(repos))'),
+                        "policy/repos.toml"), [])
+    check("...and `while False:` is the same dead code as `if False:` (one token apart, so "
+          "closing only the branch form leaves the loop form as a bypass)",
+          _derived_keys(_heredoc % ('import json, tomllib\n'
+                                    'repos = ["some-owner/some-name"]\n'
+                                    'while False:\n    repos = sorted(tomllib.load('
+                                    'open("policy/repos.toml", "rb"))["repos"])\n'
+                                    'print("repos=" + json.dumps(repos))'),
+                        "policy/repos.toml"), [])
+    check("...and a print parked in a dead branch is not credited either",
+          _derived_keys(_heredoc % ('import json, tomllib\n'
+                                    'enabled = sorted(tomllib.load('
+                                    'open("policy/repos.toml", "rb"))["repos"])\n'
+                                    'if False:\n    print("repos=" + json.dumps(enabled))'),
+                        "policy/repos.toml"), [])
+    # The other direction, which the three checks above would let an over-tight analyser break in
+    # silence: branches JOIN by union, because the shipped resolver derives `repos` from policy
+    # only on its scheduled path (the manual path takes a policy-VALIDATED input). Requiring
+    # derivation on every path would report the LIVE workflow as unsourced.
+    check("...while a policy read on ONE branch of a runtime conditional is still sourced (the "
+          "shipped resolver's own shape — joins union, they do not intersect)",
+          _derived_keys(_heredoc % ('import json, os, tomllib\n'
+                                    'enabled = sorted(tomllib.load('
+                                    'open("policy/repos.toml", "rb"))["repos"])\n'
+                                    'if os.environ.get("REQUESTED"):\n'
+                                    '    repos = [os.environ["REQUESTED"]]\n'
+                                    'else:\n    repos = enabled\n'
+                                    'print("repos=" + json.dumps(repos))'),
+                        "policy/repos.toml"), ["repos"])
 
     # ---- the #1544 YAML-seam MUTANT TABLE ----------------------------------------------------
     # The checks above prove this report can read a CORRECT workflow; they do not prove it would
@@ -1773,6 +1919,34 @@ def _self_test():
             'EOF\n')
         doc["jobs"]["targets"]["steps"].append(
             {"name": "Note", "run": 'echo "source of truth: policy/repos.toml"'})
+
+    def _resolver_script(doc):
+        """The LIVE resolver's script as (lines, first line of its Python body, its sole
+        `print("repos=` line). LINE anchors, each asserted unique, so the two mutants below edit
+        the SHIPPED text instead of a fixture — and say so loudly rather than silently editing
+        nothing if the resolver is ever rewritten (AGENTS.md mutation-run hygiene)."""
+        lines = str(_resolve_step(doc)["run"]).splitlines()
+        imports = [i for i, line in enumerate(lines) if line.startswith("import ")]
+        printed = [i for i, line in enumerate(lines) if line.startswith('print("repos=')]
+        assert len(imports) == 1 and len(printed) == 1, (
+            f"seam mutant anchors: {len(imports)} import lines, {len(printed)} `repos=` prints")
+        return lines, imports[0] + 1, printed[0]
+
+    def _overwrite_the_resolved_list(doc):
+        """ORDER: the live resolver still reads policy — the value it derived is then thrown away
+        by a hand-pinned list on the line before the print. Every literal, load and name survives,
+        so containment AND any taint that only ever accumulates read this as sourced."""
+        lines, _, printed = _resolver_script(doc)
+        lines.insert(printed, 'repos = ["some-owner/some-name"]')
+        _resolve_step(doc)["run"] = "\n".join(lines) + "\n"
+
+    def _park_the_policy_read_under_a_dead_branch(doc):
+        """REACHABILITY: the whole live derivation is parked under `if False:` beneath a
+        hand-pinned list. The policy read is still there, verbatim, and runs never."""
+        lines, body, printed = _resolver_script(doc)
+        lines[body:printed] = (['repos = ["some-owner/some-name"]', "if False:"]
+                               + [f"    {line}" for line in lines[body:printed]])
+        _resolve_step(doc)["run"] = "\n".join(lines) + "\n"
 
     for _name, _edit, _key, _want in (
             ("the schedule is deleted (back to dispatch-only, the #1544 defect)",
@@ -1821,6 +1995,16 @@ def _self_test():
             ("the resolver hardcodes its list while `policy/repos.toml` survives in a comment AND "
              "in a neighbouring step (containment reads this as sourced-from-policy)",
              _hardcode_resolver_keeping_the_literal, "resolve_policy_derived_outputs", []),
+            # ...and the two shapes where the resolver READS policy for real and publishes a
+            # hand-pinned list anyway. Nothing containment-shaped can see either — every literal
+            # is still present — and neither can taint that ignores statement ORDER or branch
+            # REACHABILITY, which is what round 2 of this PR found.
+            ("the resolver OVERWRITES what it read from policy with a hand-pinned list on the "
+             "line before it prints (the read still runs; its result is discarded)",
+             _overwrite_the_resolved_list, "resolve_policy_derived_outputs", []),
+            ("the resolver's whole policy read is parked under `if False:` above a hand-pinned "
+             "list (an UNREACHABLE seed: the file is still read in the source, by nothing)",
+             _park_the_policy_read_under_a_dead_branch, "resolve_policy_derived_outputs", []),
             ("the enabled set is copied into the workflow instead of read from policy",
              lambda d: _resolve_step(d).update(run=str(_resolve_step(d)["run"]).replace(
                  "policy/repos.toml", "some-owner/some-name")),
