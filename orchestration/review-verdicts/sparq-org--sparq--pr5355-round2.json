@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5355,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "88fdda477f083c470ff38525f7f1cbcbe42dd4bf",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The round-one finding remains unchanged: section 2.3 includes the inference legs among lanes protected by an existing whole-step two-attempt wrapper, but the D-entailment, RIF, EL, QL, and DL steps each execute cargo test once and only inspect PIPESTATUS. The added guard comment in .config/nextest.toml also says the existing wrappers cover the relevant fetch-abort class without distinguishing these single-attempt inference lanes.",
+    "file": "research/ci-nextest-leg-conversion-evaluation.md",
+    "fix_hint": "Remove inference legs from the wrapper claim and state explicitly that those inference lanes are currently single-attempt, or add the missing whole-step wrappers. Update the .config/nextest.toml guard comment to avoid implying universal wrapper coverage.",
+    "severity": "minor",
+    "title": "Inference ratchet legs still do not have the claimed whole-step retry wrappers"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The documentation-only conclusion remains broadly supported, but the sole round-one factual overstatement was not corrected. Section 2.3 still says the whole-step retry wrapper covers the inference legs, while the D-entailment, RIF, EL, QL, and DL workflow steps each invoke cargo test only once. The new guard comment in .config/nextest.toml repeats the same overly broad claim. This remains a minor documentation accuracy issue and does not invalidate the per-leg nextest conversion decision.",
+  "verdict": "approve"
+ }
+}
