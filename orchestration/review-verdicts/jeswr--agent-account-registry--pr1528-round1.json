@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1528,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a4ab5a3b19c45674a5c19ffeec0a9cd568c67dc5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new check is sound and fail-closed for the documented invariant: it parses fenced TOML without normalization, overlays the documented row onto live policy, delegates validation to the production resolver, and correlates each runbook section's four independent slot commitments with its own pool examples. The self-test independently pins source inventory, exercises malformed and resolver-refused pools, proves per-section rather than global correlation, covers zero-census and missing-source cases, checks overlay use, validates live wiring, and the suite manifest enrolls the new entry point. I found no blocker, major correctness issue, security weakening, vacuous assertion, or reviewer-directed prompt injection in the diff.",
+  "verdict": "approve"
+ }
+}
