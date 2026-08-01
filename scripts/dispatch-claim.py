@@ -13679,7 +13679,19 @@ def _self_test():
         "registry_policy_resolve_enable",
         Path(__file__).resolve().parents[1] / "scripts" / "policy-resolve.py")
     _ENABLED_REPO = "jeswr/agent-account-registry"
-    _DEFERRED_REPO = "sparq-org/sparq"
+    # [#1451] sparq is now ENROLLED, so there is no longer a live enabled-but-un-enrolled repo to
+    # point this control at — and #1540 showed that KEEPING one staged purely to feed a test
+    # couples every policy change to an unrelated repo's onboarding (a workflow-ingestion outage
+    # there blocked this enable). The axis is therefore SPLIT into the two distinct properties it
+    # was conflating:
+    #   * "an empty allowlist enumerates NOTHING"  -> a property of enumerate_review_items, proven
+    #     below against a synthetic repo with an explicit frozenset(). Code, not policy.
+    #   * "the enable did not widen too far"       -> a property of the SHIPPED POLICY, pinned by
+    #     the EXACT-population guards in mint-provenance.py and auto-mint-provenance.py, which
+    #     name every enrolled repo and red on a third.
+    # That is strictly stronger than the old single assertion: naming the exact set catches ANY
+    # widening, whereas checking one nominated repo only caught a widening that reached THAT repo.
+    _DEFERRED_REPO = "example/not-enrolled"
 
     # ---- [#1451] THE SHIPPED MANIFEST MUST EQUAL THE SHIPPED ENABLED SET ----------------------
     # REGRESSION 2026-08-01, a FULL dispatch outage: PR #1535 enabled `jeswr/solid-sdk` in
@@ -13713,13 +13725,16 @@ def _self_test():
 
 
     _shipped_authors = _enable_policy.review_enrolment_authors(_ENABLED_REPO, _repos_doc)
-    _deferred_authors = _enable_policy.review_enrolment_authors(_DEFERRED_REPO, _repos_doc)
+    _deferred_authors = frozenset()
     assert _shipped_authors, (
         "policy/repos.toml must ENABLE review_enrolment_authors for "
         f"{_ENABLED_REPO} — that is what this change is")
-    assert _deferred_authors == frozenset(), (
-        f"{_DEFERRED_REPO} is deliberately DEFERRED to a follow-up; enabling it here would widen "
-        f"the blast radius past one repo. Found: {sorted(_deferred_authors)}")
+    # ...and the SHIPPED policy must enrol sparq too — this is what #1451 is. Sourced from the
+    # real TOML, so emptying it reds here rather than silently un-serving every sparq PR.
+    _SPARQ_REPO = "sparq-org/sparq"
+    assert _enable_policy.review_enrolment_authors(_SPARQ_REPO, _repos_doc), (
+        f"policy/repos.toml must ENABLE review_enrolment_authors for {_SPARQ_REPO} — without it "
+        "the review lane skips every jeswr-authored sparq PR and they strand in review:changes")
 
     def _enable_states(target_repo, authors, *, login, ref="fix/869-question-park-marker",
                        record=None):
@@ -13744,7 +13759,13 @@ def _self_test():
     #     not orchestrator-attested.
     assert _enable_states(_DEFERRED_REPO, _deferred_authors,
                           login=sorted(_shipped_authors)[0]) == [], (
-        "sparq is NOT enrolled by this change — an identical PR there must still be skipped")
+        "an EMPTY allowlist must enumerate nothing — otherwise leg (1) could pass by admitting "
+        "every PR regardless of enrolment, and enrolment would gate nothing at all")
+    # ...and the SHIPPED sparq allowlist DOES enumerate, which is the throughput this change buys.
+    assert _enable_states(_SPARQ_REPO,
+                          _enable_policy.review_enrolment_authors(_SPARQ_REPO, _repos_doc),
+                          login="jeswr") == ["needs-review"], (
+        "a jeswr-authored sparq PR must now be enumerable — that is the point of #1451")
     assert _enable_states(_ENABLED_REPO, _shipped_authors, login="drive-by-contributor") == [], \
         "an author the shipped allowlist does not name is still skipped"
     assert _enable_states(_ENABLED_REPO, _shipped_authors, login=sorted(_shipped_authors)[0],
