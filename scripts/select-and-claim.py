@@ -433,6 +433,12 @@ FABLE_WINDOW = "fable_7d_oi"  # prefix of the fable sub-quota util/reset keys in
 # [#720] The keys account-usage.py's claude-opus-5 OBSERVATION writes into a usage entry. The window
 # NAME is the arming signal: it is present iff that probe actually saw a rate-limit window the
 # whole-account 5h/7d pair does not cover, so observation and enforcement are the same fact.
+#
+# The window key is ALSO the one token of an account record's persisted `limits:` line this module
+# reads back (`_parse_account`), under the SAME name because it is the same fact: a bucket this
+# account has been proven to have. That read-back is what makes the discovery durable rather than
+# decorative — without it, a probe that cannot answer this tick forgets the bucket and the
+# whole-account 5h/7d pair admits an opus5 worker onto a premium bucket nobody measured.
 OPUS5_PREMIUM_WINDOW_KEY = "opus5_premium_window"
 OPUS5_PREMIUM_UTIL_KEY = "opus5_premium_util"
 
@@ -507,12 +513,15 @@ def _opus5_eligible(u, margin):
     (`_assemble_opus5`) and declares what it saw, and this reads the declaration. Three states,
     deliberately NOT fable's two:
 
-      * NO window declared -> True. The probe saw no rate-limit window beyond the whole-account
-        pair (or could not observe at all), so the 5h/7d gate above is the whole story and
-        admission is EXACTLY what it is today. This is the no-regression arm, and it is why the
-        gate could land before the answer was known: absence of evidence must not park the fleet's
-        only anthropic tier, which is a machine-recoverable capacity condition escalating onto a
-        human's desk (#703).
+      * NO window declared -> True. NOTHING — this tick's headers, nor the account record's
+        persisted `opus5_premium_window` from an earlier tick — has ever shown a rate-limit window
+        beyond the whole-account pair, so the 5h/7d gate above is the whole story and admission is
+        EXACTLY what it is today. This is the no-regression arm, and it is why the gate could land
+        before the answer was known: absence of evidence must not park the fleet's only anthropic
+        tier, which is a machine-recoverable capacity condition escalating onto a human's desk
+        (#703). Note the arm is keyed on "never observed", NOT on "not observed this tick": a probe
+        that fails on an account with a KNOWN bucket declares that bucket with no utilization and
+        lands on the unreadable arm below.
       * a window IS declared and READABLE -> require >= margin headroom IN THAT WINDOW.
       * a window IS declared and UNREADABLE -> False. An unknown premium bucket is precisely the
         case where whole-account headroom is misleading, so refuse rather than fall back to it.
@@ -1276,6 +1285,29 @@ def _run(args):
     return result
 
 
+# [#720] A persisted window NAME is a rate-limit header window (`7d_oi`), so it is a short
+# `[A-Za-z0-9_.-]` token. A value outside that shape is corruption, not a window, and is read as if
+# the token were absent — the same state a tamperer reaches by deleting the whole line, so nothing
+# is gained by treating it more strictly.
+PREMIUM_WINDOW_TOKEN_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+
+
+def _persisted_premium_window(limits_value):
+    """The `opus5_premium_window=<name>` token of an account record's `limits:` line, or None.
+
+    WHO WRITES THIS (AGENTS.md item 5): account-usage.py's `persist_limits`, from the rate-limit
+    headers claude-opus-5 really returned — and, like every account front-matter field, a
+    maintainer editing the issue. The read is safe in the ONE direction that matters: the only
+    decision this value can reach is `_opus5_eligible`'s REFUSAL arm, so a forged or corrupt token
+    can withhold capacity (loudly, as measured exhaustion) but can never grant it.
+    """
+    for token in (limits_value or "").split():
+        key, sep, value = token.partition("=")
+        if sep and key == OPUS5_PREMIUM_WINDOW_KEY:
+            return value if PREMIUM_WINDOW_TOKEN_RE.fullmatch(value) else None
+    return None
+
+
 def _parse_account(body):
     d = {"models": [], "max_concurrent_workers": 4}
     for line in (body or "").splitlines():
@@ -1289,6 +1321,15 @@ def _parse_account(body):
             d[k] = int(v) if v.isdigit() else 1
         elif k in ("secret_ref", "provider", "harness", "credential_format"):
             d[k] = v
+        elif k == "limits":
+            # [#720] The one token of the tier-limit line the allocator reads back: the premium
+            # window this account has been PROVEN to have. account-usage.py's probe consumes it so
+            # that a tick which cannot read the bucket says "exists, unreadable" (refuse) instead
+            # of "no bucket seen" (admit on whole-account headroom). Absent token -> absent key, so
+            # an account no probe has ever seen a bucket on behaves exactly as before #720.
+            window = _persisted_premium_window(v)
+            if window:
+                d[OPUS5_PREMIUM_WINDOW_KEY] = window
     return d
 
 
@@ -3670,6 +3711,30 @@ def _self_test():
             _entry[OPUS5_PREMIUM_UTIL_KEY] = _bad
         check(f"[#720] REFUSED: opus5 bucket declared but unreadable ({_label})",
               usage_eligible(_entry, model="opus5"), False)
+    # (3b) WHERE THE DECLARATION CAN COME FROM ACROSS TICKS: `opus5_premium_window` is also the one
+    #      token of an account record's persisted `limits:` line this parser reads back, and
+    #      account-usage.py's probe hands it to the next observation. Without this read-back the
+    #      persisted discovery is decorative — the tick after a transport blip forgets the bucket
+    #      and the (2) rows above admit on whole-account headroom alone. MUTANT: delete the
+    #      `limits` branch of `_parse_account`, or its non-empty guard.
+    _acct_limits = ("provider: anthropic\nharness: claude\nmodels: [opus5]\n"
+                    "credential_format: claude-oauth-token\nsecret_ref: ACCT01_TOKEN\n"
+                    "limits: 5h_limit=1000 opus5_premium_window=7d_oi opus5_premium_limit=42\n")
+    check("[#720] the PROVEN premium window is read back out of the account's limits line",
+          (_parse_account(_acct_limits).get(OPUS5_PREMIUM_WINDOW_KEY),
+           validate_account_record("acct01", _acct_limits).get(OPUS5_PREMIUM_WINDOW_KEY)),
+          ("7d_oi", "7d_oi"))
+    #      ...and an account no probe ever saw a bucket on declares NOTHING, so the permissive arm
+    #      is preserved exactly. A malformed token is corruption, not a window: read as absent (the
+    #      same state deleting the line reaches), and it can only ever withhold capacity anyway.
+    for _label, _line in (("no limits line at all", ""),
+                          ("limits line without the token", "limits: 5h_limit=1000\n"),
+                          ("empty value", "limits: opus5_premium_window=\n"),
+                          ("corrupt value", "limits: opus5_premium_window=7d/oi\n"),
+                          ("wrong key", "limits: opus5_premium_windows=7d_oi\n")):
+        check(f"[#720] no proven window is invented from {_label}",
+              OPUS5_PREMIUM_WINDOW_KEY in _parse_account(
+                  "provider: anthropic\nmodels: [opus5]\n" + _line), False)
     # (4) The bucket is MODEL-SPECIFIC (the issue #450 lesson, re-asked for opus5): an exhausted
     #     opus5 bucket must not erase the same account's slots for any other alias.
     check("[#720] a cliffed opus5 bucket leaves haiku/sonnet/sol routing on that account untouched",

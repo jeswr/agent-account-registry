@@ -208,6 +208,10 @@ def _probe_fable(token):
 OPUS5_PROVIDER_MODEL = "claude-opus-5"  # parity with orchestration/routing.toml [models.opus5]
 BASE_WINDOWS = frozenset({"5h", "7d"})
 _UTILIZATION_SUFFIX = "-utilization"
+# The arming key, spelled ONCE here and consumed by LIMIT_KEYS (persistence), `_assemble_opus5`
+# (observation) and select-and-claim (`OPUS5_PREMIUM_WINDOW_KEY`, admission). The self-test pins
+# this against the allocator's own constant, so the three consumers cannot drift apart.
+OPUS5_PREMIUM_WINDOW_KEY = "opus5_premium_window"
 
 
 def _premium_window(hdr):
@@ -235,42 +239,76 @@ def _premium_window(hdr):
     return max(windows, key=lambda pair: float(pair[1].strip()))
 
 
-def _assemble_opus5(hdr):
-    """[#720] The claude-opus-5 OBSERVATION RECORD for one account, from a parsed header map. Pure —
-    unit-tested by --self-test. Always a dict, so the snapshot always says what was seen:
+def _known_window(window):
+    """A previously-PROVEN premium-window name (from the account record's persisted `limits:` line),
+    normalized, or None when there is no usable name. Pure — unit-tested by --self-test."""
+    return window.strip() if isinstance(window, str) and window.strip() else None
+
+
+def _assemble_opus5(hdr, known_window=None):
+    """[#720] The claude-opus-5 OBSERVATION RECORD for one account, from a parsed header map and
+    whatever the ACCOUNT RECORD already proved. Pure — unit-tested by --self-test. Always a dict, so
+    the snapshot always says what was seen:
 
         opus5_probe    "observed" | "no-headers" | "error"  — did the probe get an answer at all
         opus5_headers  the FULL parsed rate-limit header map (only when the probe answered)
-        opus5_premium_window / _util / _reset / _limit  — ONLY when a non-base window appeared
+        opus5_premium_window / _util / _reset / _limit  — the non-base window in force
 
     The window key is the ARMING SIGNAL that select-and-claim._opus5_eligible reads: absent means
-    "no distinct bucket was seen", present means "gate on this window, and refuse if it is
-    unreadable". A probe that could not answer at all records `error` and declares NO window — it
-    must not fail closed, because opus5 is the fleet's only anthropic tier and a probe blip would
-    then park every single-rung chain onto a human's desk, which is the outcome #703 names."""
+    "no distinct bucket has EVER been seen for this account", present means "gate on this window,
+    and refuse if it is unreadable".
+
+    `known_window` is that account's `opus5_premium_window` token, persisted by `persist_limits`
+    into the account issue and read back by select-and-claim._parse_account. It is what makes the
+    discovery BINDING rather than decorative, and it splits the two states a single tick cannot
+    tell apart:
+
+      * the probe produced NO readable rate-limit state (transport `error`, or a completed request
+        carrying no rate-limit headers at all) and this account has a KNOWN bucket -> re-declare
+        that window with NO utilization, i.e. "this bucket exists and I could not read it", which
+        admission refuses. Forgetting it here is the fail-OPEN path: healthy whole-account 5h/7d
+        would then admit a worker onto a premium bucket that may be exhausted, exactly the mid-run
+        failure #720 exists to prevent.
+      * the probe DID publish rate-limit state -> that response is authoritative, memory included.
+        A bucket it no longer declares is not re-asserted, so if the provider stops publishing one
+        the account recovers on its own tick (and `persist_limits` rewrites the line without it)
+        rather than parking forever on a stale token.
+
+    With NO known window a probe that could not answer still declares nothing and stays permissive:
+    opus5 is the fleet's only anthropic tier and a blip on an account never seen to have a bucket
+    must not park every single-rung chain onto a human's desk, which is the outcome #703 names."""
+    known = _known_window(known_window)
     if hdr is None:
-        return {"opus5_probe": "error"}
-    entry = {"opus5_probe": "observed" if hdr else "no-headers", "opus5_headers": dict(hdr)}
-    selected = _premium_window(hdr)
-    if selected is not None:
-        window, util = selected
-        entry["opus5_premium_window"] = window
-        entry["opus5_premium_util"] = util
-        for field, suffix in (("opus5_premium_reset", "-reset"),
-                              ("opus5_premium_limit", "-limit")):
-            value = hdr.get(window + suffix)
-            if value is not None:
-                entry[field] = value
+        entry, answered = {"opus5_probe": "error"}, False
+    else:
+        entry = {"opus5_probe": "observed" if hdr else "no-headers", "opus5_headers": dict(hdr)}
+        answered = bool(hdr)
+        selected = _premium_window(hdr)
+        if selected is not None:
+            window, util = selected
+            entry[OPUS5_PREMIUM_WINDOW_KEY] = window
+            entry["opus5_premium_util"] = util
+            for field, suffix in (("opus5_premium_reset", "-reset"),
+                                  ("opus5_premium_limit", "-limit")):
+                value = hdr.get(window + suffix)
+                if value is not None:
+                    entry[field] = value
+            return entry
+    if not answered and known:
+        # Declared with NO utilization: known bucket, unreadable state -> admission refuses.
+        entry[OPUS5_PREMIUM_WINDOW_KEY] = known
     return entry
 
 
-def _probe_opus5(token):
-    """[#720] Observe claude-opus-5's rate-limit headers with the SAME request shape the worker uses.
+def _probe_opus5(token, known_window=None):
+    """[#720] Observe claude-opus-5's rate-limit headers with the SAME request shape the worker
+    uses, against what this account's record already proved (`known_window`; see `_assemble_opus5`).
 
     `claude_code=True` is not decoration: every opus5 worker runs through the Claude Code CLI, and
     the fable measurement showed the premium sub-quota headers surface only on that subscription-
     OAuth path. Probing any other shape would answer a question about a request nobody makes."""
-    return _assemble_opus5(_probe_headers(token, OPUS5_PROVIDER_MODEL, claude_code=True))
+    return _assemble_opus5(_probe_headers(token, OPUS5_PROVIDER_MODEL, claude_code=True),
+                           known_window)
 
 
 def _load_account_catalog(script_dir):
@@ -389,7 +427,8 @@ def _probe_account(account, secrets, probe=None, fable_probe=None, opus5_probe=N
     or unknown provider (e.g. `openia`) previously TRANSMITTED that account's token to a provider
     the catalog never named — and admitted the account on the response. Unknown providers now
     never reach a probe; the omitted entry surfaces as UNAVAILABLE in usage-alert (loud), like
-    every other fail-closed omit. `probe`/`fable_probe` are injectable for the self-test ONLY."""
+    every other fail-closed omit. `probe`/`fable_probe`/`opus5_probe` are injectable for the
+    self-test ONLY; `opus5_probe` takes (token, known premium window) — see `_assemble_opus5`."""
     if str(account.get("provider") or "").strip().lower() != "anthropic":
         return None
     ref = account.get("secret_ref")
@@ -420,11 +459,16 @@ def _probe_account(account, secrets, probe=None, fable_probe=None, opus5_probe=N
             probed.update(fable)
     # [#720] opus5 is the sole anthropic tier, so every opus5-capable account is OBSERVED: record
     # whatever rate-limit headers claude-opus-5 actually returns. The observation carries its own
-    # verdict (`opus5_probe`) and arms select-and-claim's premium gate only when it saw a window the
-    # whole-account pair does not cover — so this answers the question with data instead of argument
-    # and enforces the answer in the same tick.
+    # verdict (`opus5_probe`) and arms select-and-claim's premium gate only when a window the
+    # whole-account pair does not cover has been seen — so this answers the question with data
+    # instead of argument and enforces the answer in the same tick.
+    #
+    # The account's OWN record is an input, not just an output: `opus5_premium_window` persisted by
+    # a previous tick is what lets a probe that cannot read the bucket say "exists, unreadable"
+    # (refused) instead of "no bucket seen" (admitted on whole-account headroom alone).
     if "opus5" in account.get("models", []):
-        probed.update((opus5_probe or _probe_opus5)(token))
+        probed.update((opus5_probe or _probe_opus5)(
+            token, account.get(OPUS5_PREMIUM_WINDOW_KEY)))
     return probed
 
 
@@ -495,10 +539,15 @@ def _usable_secret_refs(secrets):
 # DURABLE per-account record this repo keeps of what a probe saw, and the whole point of #720 is
 # that "does claude-opus-5 have its own bucket, and what is it called" must be answered by data
 # that survives the tick. A per-account front-matter line does; a snapshot in $RUNNER_TEMP does not.
-# select-and-claim._parse_account ignores unknown keys and dashboard-gen._front_matter keeps only
-# the `<window>_limit` names it knows, so both extra tokens are inert for every existing consumer.
+#
+# And it is READ BACK, not just written: select-and-claim._parse_account parses this one token into
+# the account record, `_probe_account` hands it to the next probe, and `_assemble_opus5` re-declares
+# it when that probe cannot read the bucket. A write-only token would be decorative — the tick after
+# a transport blip would forget the bucket and admit on whole-account headroom alone. The remaining
+# tokens stay inert for every other consumer (dashboard-gen._front_matter keeps only the
+# `<window>_limit` names it knows, and _parse_account reads no other token of this line).
 LIMIT_KEYS = ("5h_limit", "7d_limit", "fable_7d_oi_limit",
-              "opus5_premium_window", "opus5_premium_limit")
+              OPUS5_PREMIUM_WINDOW_KEY, "opus5_premium_limit")
 
 # The two diagnostics this lane emits, as named constants. They are the strings the self-test's
 # loudness rows assert against, and a message and its assertion that are two separate literals
@@ -637,9 +686,10 @@ def persist_limits(usage_path, run=None):
     PROPAGATED as a non-zero return (the step is continue-on-error, so this surfaces the failure as a
     red annotation instead of a false 'refreshed'), and each per-issue write goes through _persist_one
     so a concurrent metadata edit is never silently overwritten (a clobber inside the write window is
-    detected via the body-edit count and surfaced as failure, not confirmed as success). select-and-claim's _parse_account
-    ignores unknown keys, so the extra line is inert for the allocator. Privacy: prints carry no
-    handles or counts (locked decision 22b). `run` is injectable for the self-test ONLY."""
+    detected via the body-edit count and surfaced as failure, not confirmed as success). The
+    allocator reads exactly one token of this line back (`opus5_premium_window`, see LIMIT_KEYS) and
+    ignores the rest. Privacy: prints carry no handles or counts (locked decision 22b). `run` is
+    injectable for the self-test ONLY."""
     run = run or subprocess.run
     registry_repo = os.environ["REGISTRY_REPO"]
     try:
@@ -1077,12 +1127,52 @@ def _self_test(escaped=None):
     chk("[#720] healthy whole-account + healthy opus5 bucket is ADMITTED",
         opus5_alloc.usage_eligible({**opus5_base, **obs_healthy}, model="opus5"), True)
     #   NO REGRESSION: an account the probe observed with no distinct bucket — and one it could not
-    #   observe at all — must be admitted exactly as before #720.
-    chk("[#720] no distinct bucket observed -> admitted exactly as today",
+    #   observe at all, having never been seen to HAVE a bucket — must be admitted exactly as
+    #   before #720.
+    chk("[#720] no distinct bucket ever observed -> admitted exactly as today",
         (opus5_alloc.usage_eligible({**opus5_base, **obs_base}, model="opus5"),
          opus5_alloc.usage_eligible({**opus5_base, **_assemble_opus5(None)}, model="opus5"),
+         opus5_alloc.usage_eligible({**opus5_base, **_assemble_opus5(None, "  ")}, model="opus5"),
+         opus5_alloc.usage_eligible({**opus5_base, **_assemble_opus5(None, 7)}, model="opus5"),
          opus5_alloc.usage_eligible(dict(opus5_base), model="opus5")),
-        (True, True, True))
+        (True, True, True, True, True))
+    #   ("  " and 7 are the ill-shaped known-window values: a blank or non-string token is not a
+    #   proven bucket, and reading it as one would park an account on corruption.)
+    #   ... but a bucket this account has ALREADY been proven to have does NOT evaporate when the
+    #   next probe cannot read it. Forgetting it is the fail-OPEN path: healthy whole-account 5h/7d
+    #   would admit a worker onto a premium bucket that may be exhausted — the mid-run failure #720
+    #   exists to prevent. MUTANT: drop the `known` re-declaration in `_assemble_opus5` => both
+    #   verdict rows flip to True while every row above stays green.
+    obs_error_known = _assemble_opus5(None, "7d_oi")
+    obs_nohdr_known = _assemble_opus5({}, "7d_oi")
+    chk("[#720] a PROVEN bucket survives a transport error and a headerless answer",
+        (obs_error_known.get("opus5_probe"), obs_error_known.get(OPUS5_PREMIUM_WINDOW_KEY),
+         "opus5_premium_util" in obs_error_known,
+         obs_nohdr_known.get("opus5_probe"), obs_nohdr_known.get(OPUS5_PREMIUM_WINDOW_KEY)),
+        ("error", "7d_oi", False, "no-headers", "7d_oi"))
+    chk("[#720] ... and the allocator REFUSES it: the bucket exists and its state is unreadable",
+        (opus5_alloc.usage_eligible({**opus5_base, **obs_error_known}, model="opus5"),
+         opus5_alloc.usage_eligible({**opus5_base, **obs_nohdr_known}, model="opus5")),
+        (False, False))
+    #   RECOVERY (and the reason the retention is keyed on "the probe could not answer", not on
+    #   "this tick saw no bucket"): a response that DID publish rate-limit state is authoritative,
+    #   so a window it no longer declares is not re-asserted and the account is not parked forever
+    #   on a stale token. MUTANT: retain `known` unconditionally => this row flips to (True, False).
+    obs_gone = _assemble_opus5(base_only, "7d_oi")
+    chk("[#720] a header-bearing answer that declares NO bucket clears the memory (recovery)",
+        (OPUS5_PREMIUM_WINDOW_KEY in obs_gone,
+         opus5_alloc.usage_eligible({**opus5_base, **obs_gone}, model="opus5")),
+        (False, True))
+    #   ... and a LIVE current reading of the same window always beats the remembered name.
+    chk("[#720] a readable current bucket is used verbatim, never masked by the known name",
+        _assemble_opus5(_parse_rate_headers(
+            "anthropic-ratelimit-unified-30d_px-utilization: 0.05\r\n"), "7d_oi"
+        ).get(OPUS5_PREMIUM_WINDOW_KEY), "30d_px")
+    #   The three consumers of the arming key spell it ONCE: persistence (LIMIT_KEYS), observation
+    #   (_assemble_opus5) and admission (the allocator's own constant). MUTANT: rename either side.
+    chk("[#720] the arming key is the SAME name here, in LIMIT_KEYS and in the allocator",
+        (OPUS5_PREMIUM_WINDOW_KEY in LIMIT_KEYS,
+         opus5_alloc.OPUS5_PREMIUM_WINDOW_KEY), (True, OPUS5_PREMIUM_WINDOW_KEY))
     #   The alias the probe addresses must be the alias the routing table dispatches, or the
     #   observation answers a question about a model nobody runs.
     import tomllib as _tomllib
@@ -1099,11 +1189,20 @@ def _self_test(escaped=None):
     globals()["_probe_headers"] = lambda token, model, claude_code=False: (
         _opus5_calls.append((token, model, claude_code)) or {})
     try:
-        _probe_opus5("tok-720")
+        _unknown_probe = _probe_opus5("tok-720")
+        _known_probe = _probe_opus5("tok-720", "9q_zz")
     finally:
         globals()["_probe_headers"] = _saved_probe_headers
     chk("[#720] the opus5 probe uses the model AND the Claude-Code request shape",
-        _opus5_calls, [("tok-720", OPUS5_PROVIDER_MODEL, True)])
+        _opus5_calls, [("tok-720", OPUS5_PROVIDER_MODEL, True)] * 2)
+    #   ... and it THREADS the account's proven window into the record. MUTANT: drop the argument
+    #   from `_probe_opus5`'s `_assemble_opus5` call => the headerless answer above forgets the
+    #   bucket and the allocator admits on whole-account headroom. `9q_zz` appears nowhere else.
+    chk("[#720] _probe_opus5 threads the account's PROVEN window into the record",
+        (OPUS5_PREMIUM_WINDOW_KEY in _unknown_probe,
+         _known_probe.get(OPUS5_PREMIUM_WINDOW_KEY),
+         opus5_alloc.usage_eligible({**opus5_base, **_known_probe}, model="opus5")),
+        (False, "9q_zz", False))
     #   And that shape really does carry BOTH halves of the premium path (UA + system prompt).
     _opus5_argv, _ = _probe_curl_command("tok", OPUS5_PROVIDER_MODEL, claude_code=True)
     chk("[#720] the opus5 probe body carries the Claude-Code UA and system prompt",
@@ -1116,6 +1215,42 @@ def _self_test(escaped=None):
     chk("[#720] the observation is persisted into the account catalog's limits line",
         _limits_line({**opus5_base, "5h_limit": "10", **obs_bucket}),
         "limits: 5h_limit=10 opus5_premium_window=7d_oi opus5_premium_limit=424242")
+    #   THE CROSS-TICK LOOP, END TO END THROUGH THE PRODUCTION PATH — the property the persisted
+    #   token exists for, and the one a write-only token cannot have. Tick 1's observation is
+    #   written into a real account body by the real `_limits_line`/`_upsert_limits_line` pair; that
+    #   body is parsed by the REAL allocator (`validate_account_record`, the same reader dispatch
+    #   and worker adoption use); tick 2's probe FAILS (`_assemble_opus5(None, known)`, the
+    #   production assembly with a simulated transport failure); and the resulting production usage
+    #   entry is put to the BINDING gate. No step is re-implemented here.
+    #   MUTANT: any one of `_parse_account`'s limits branch, `_probe_account`'s known-window
+    #   argument, or `_assemble_opus5`'s re-declaration => the verdict flips to True.
+    _tick_body = ("provider: anthropic\nharness: claude\nmodels: [opus5]\n"
+                  "credential_format: claude-oauth-token\nsecret_ref: ACCT01_TOKEN\n"
+                  "max_concurrent_workers: 2\n")
+
+    def _next_tick(tick1_entry):
+        """(catalog window after persistence, tick-2 usage entry) for one probe-failure tick."""
+        # `or "limits:"` keeps a LIMIT_KEYS mutant landing as a red row rather than a TypeError
+        # that aborts the suite mid-run (AGENTS.md item 4, crash-after-partial-run).
+        body, _changed = _upsert_limits_line(_tick_body, _limits_line(tick1_entry) or "limits:")
+        account = opus5_alloc.validate_account_record("acct01", body)
+        entry = _probe_account(
+            account, {"ACCT01_TOKEN": "tok"}, probe=lambda token: dict(opus5_base),
+            opus5_probe=lambda token, known: _assemble_opus5(None, known))
+        return account.get(OPUS5_PREMIUM_WINDOW_KEY), entry
+
+    _known_catalog, _tick2 = _next_tick({**opus5_base, "5h_limit": "10", **obs_bucket})
+    chk("[#720] CROSS-TICK: a persisted bucket + a FAILED next probe is REFUSED, never forgotten",
+        (_known_catalog, _tick2.get("opus5_probe"), _tick2.get(OPUS5_PREMIUM_WINDOW_KEY),
+         opus5_alloc.usage_eligible(_tick2, model="opus5")),
+        ("7d_oi", "error", "7d_oi", False))
+    #   ... and the PAIR that proves it is the persisted bucket doing the work and not the failed
+    #   probe: the identical flow for an account NO probe has ever seen a bucket on still admits.
+    _no_catalog, _tick2_plain = _next_tick({**opus5_base, "5h_limit": "10", **obs_base})
+    chk("[#720] CROSS-TICK: with no bucket ever persisted, the same failed probe still ADMITS",
+        (_no_catalog, _tick2_plain.get(OPUS5_PREMIUM_WINDOW_KEY) is None,
+         opus5_alloc.usage_eligible(_tick2_plain, model="opus5")),
+        (None, True, True))
     # [ISSUE #196] the SAME strict validator now guards the BASE 5h/7d windows (previously only the
     # Fable sub-quota): a malformed base window / empty status OMITS the account (fail-closed) rather
     # than being emitted to fail open as eligible capacity downstream. `good_base` is the parsed
@@ -1315,22 +1450,46 @@ def _self_test(escaped=None):
     # declaration is merged onto the base entry; a haiku-only account does NOT (the base probe is
     # the only call). MUTANT: delete the `if "opus5" in ...` block => the first row loses its
     # second call AND its window key; MUTANT: drop the models guard => the second row gains one.
-    _opus5_obs = {"opus5_probe": "observed", "opus5_premium_window": "9q_zz",
+    #
+    # The probe is called with (token, KNOWN WINDOW), and the known window comes from the account
+    # RECORD — so the record's persisted discovery reaches the next observation. MUTANT: pass only
+    # the token, or read the window from anywhere but the account => `opus5_known` reds. The two
+    # rows below pass different persisted values so a hard-coded constant cannot satisfy both.
+    _opus5_obs = {"opus5_probe": "observed", OPUS5_PREMIUM_WINDOW_KEY: "9q_zz",
                   "opus5_premium_util": "0.99"}
+    opus5_known = []
     _opus5_entry = _probe_account(
         {"handle": "acct01", "provider": "anthropic", "secret_ref": "ACCT01_TOKEN",
-         "models": ["opus5"]}, stub_secrets, probe=_rec_probe, fable_probe=_rec_probe,
-        opus5_probe=lambda token: probe_calls.append(token) or dict(_opus5_obs))
-    chk("[#720] an opus5 account is probed twice and carries its observation",
-        (probe_calls, _opus5_entry.get("opus5_premium_window"), _opus5_entry.get("status")),
-        (["tok", "tok"], "9q_zz", "allowed"))
+         "models": ["opus5"], OPUS5_PREMIUM_WINDOW_KEY: "4k_qq"}, stub_secrets,
+        probe=_rec_probe, fable_probe=_rec_probe,
+        opus5_probe=lambda token, known: (probe_calls.append(token),
+                                          opus5_known.append(known))[0] or dict(_opus5_obs))
+    chk("[#720] an opus5 account is probed twice, with its RECORD's known window, and carries "
+        "the observation",
+        (probe_calls, opus5_known, _opus5_entry.get(OPUS5_PREMIUM_WINDOW_KEY),
+         _opus5_entry.get("status")),
+        (["tok", "tok"], ["4k_qq"], "9q_zz", "allowed"))
     probe_calls.clear()
+    opus5_known.clear()
+    _opus5_fresh = _probe_account(
+        {"handle": "acct01", "provider": "anthropic", "secret_ref": "ACCT01_TOKEN",
+         "models": ["opus5"]}, stub_secrets, probe=_rec_probe, fable_probe=_rec_probe,
+        opus5_probe=lambda token, known: (probe_calls.append(token),
+                                          opus5_known.append(known))[0] or dict(_opus5_obs))
+    chk("[#720] an account whose record proves no bucket passes NO known window",
+        (probe_calls, opus5_known, _opus5_fresh.get(OPUS5_PREMIUM_WINDOW_KEY)),
+        (["tok", "tok"], [None], "9q_zz"))
+    probe_calls.clear()
+    opus5_known.clear()
     _haiku_entry = _probe_account(
         {"handle": "acct01", "provider": "anthropic", "secret_ref": "ACCT01_TOKEN",
-         "models": ["haiku"]}, stub_secrets, probe=_rec_probe, fable_probe=_rec_probe,
-        opus5_probe=lambda token: probe_calls.append(token) or dict(_opus5_obs))
+         "models": ["haiku"], OPUS5_PREMIUM_WINDOW_KEY: "4k_qq"}, stub_secrets,
+        probe=_rec_probe, fable_probe=_rec_probe,
+        opus5_probe=lambda token, known: (probe_calls.append(token),
+                                          opus5_known.append(known))[0] or dict(_opus5_obs))
     chk("[#720] a non-opus5 account is NOT opus5-probed and declares no window",
-        (probe_calls, "opus5_premium_window" in _haiku_entry), (["tok"], False))
+        (probe_calls, opus5_known, OPUS5_PREMIUM_WINDOW_KEY in _haiku_entry),
+        (["tok"], [], False))
     probe_calls.clear()
     chk("non-worker secret_ref still never dereferenced/probed",
         (_probe_account({"handle": "acct01", "provider": "anthropic",
