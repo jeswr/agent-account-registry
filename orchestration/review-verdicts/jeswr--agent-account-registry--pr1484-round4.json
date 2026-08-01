@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1484,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4b8623c45cb65d87e0a6aee003b006cd82e4a428",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`repair_lane_owned` still returns true for a `dirty` same-repository pull without validating `pull.head.sha`. Both `stale_worker_pr_reason` and `age_park_cause_recovered` therefore treat that pull as repair-lane-owned, but `enumerate_review_items` rejects a missing, non-string, short, or otherwise malformed SHA at its unconditional `SAFE_SHA.fullmatch(sha)` gate before reaching `needs-rebase`. This can suppress a visible age park or spend the one-shot re-admission grant while dispatch emits nothing indefinitely. The new `_rl_pull` fixture always supplies `_rl_sha`; the stale-status test supplies another valid 40-hex SHA and exercises snapshot mismatch, not malformed live-head rejection. Thus the prior-round hole remains untested and unfixed.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Make the shared ownership predicate require the same well-formed live head SHA required by dispatch, failing closed when it is absent or malformed. Add paired park-entry and park-exit tests for missing, non-string, short, and non-hex `head.sha`, and pass those identical pull shapes through the real enumerator to prove it emits no item while groom keeps the visible park. Retain a valid 40-hex same-repository positive control proving both exemption and re-admission still deliver `needs-rebase`.",
+    "severity": "major",
+    "title": "Repair ownership still omits dispatch's terminal head-SHA gate"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 leaves the round-3 delivery gap materially unchanged. The shared `repair_lane_owned` predicate still proves only the repair merge state and exact same-repository head, while the real dispatch enumerator also unconditionally requires a well-formed 40-hex live `head.sha` before it can emit `needs-rebase`. Consequently, a valid-provenance dirty PR with a missing or malformed SHA can still avoid a new age park or consume its bounded standing-park re-admission grant, yet dispatch will emit no repair item. The expanded delivery matrix continues to construct every repair-lane pull with `_rl_sha`, and its stale-snapshot case tests a valid but mismatched SHA rather than the terminal malformed-shape gate. Because the same major finding remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
