@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5532,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a2ffeeb986758333a239db0a42d6b5e191d13b6b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The old text ('the consequences of triple terms for canonicalization are unsettled upstream (see w3c/rdf-star-wg#114)') was a hedged claim carrying a re-check pointer. The new text \u2014 'no W3C RDF-1.2 dataset-canonicalization specification exists' \u2014 is a stronger, absolute, undated claim about the outside world, and the diff simultaneously deletes the only reference a reader or a future agent could follow to confirm it. Two consequences: (a) if the W3C RDF 1.2 WG has (or later has) an editor's draft / Working Draft / chartered deliverable on canonicalization, 'no specification exists' reads as false while 'unsettled upstream' would still have been true, and nothing in the doc tells the reader where to look; (b) the citation was not removed for gate reasons \u2014 scripts/banned-terminology.json:200 explicitly allow-lists 'rdf-star-wg' as a legitimate proper-noun/URL citation, and skills/terminology/SKILL.md:106 names it a real citable body, warning that 'silent flattening of a precise prior-art reference is as much a documentation defect' as the reverse. The same wording lands in Cargo.toml, README.md, lib.rs and SKILL.md, so the observation applies to all five surfaces.",
+    "file": "crates/sparq-canon/src/rdf12.rs",
+    "fix_hint": "Either keep the tracking link alongside the new phrasing (e.g. '... no W3C RDF-1.2 dataset-canonicalization specification exists; the underlying question is tracked at w3c/rdf-star-wg#114'), or make the claim checkable and bounded: '... no W3C RDF-1.2 dataset-canonicalization Recommendation or Working Draft as of 2026-08'. Restore the '[w3c/rdf-star-wg#114]: https://github.com/w3c/rdf-star-wg/issues/114' reference definition in crates/sparq-canon/src/rdf12.rs if the link is reinstated.",
+    "severity": "minor",
+    "title": "Cited hedge replaced by an undated, uncited absolute claim about external W3C state"
+   },
+   {
+    "body": "After this change the shipped surfaces say 'no W3C RDF-1.2 dataset-canonicalization specification exists', while research/rdf-canon-rdf12-triple-terms-upstream.md (lines 16, 27, 42, 188) and bead sq-hslb still frame the same fact as 'currently undefined / unsettled upstream (w3c/rdf-star-wg#114)'. That is defensible \u2014 research/ records are dated historical artefacts and are deliberately not kept in lockstep \u2014 but a reader moving from the README to the design record now meets two different characterisations of the same upstream state with no bridge between them.",
+    "file": "crates/sparq-canon/README.md",
+    "fix_hint": "No change required if the divergence is intentional. If a single voice is wanted, reuse one phrasing in both places, or add one clause to the README/SKILL note pointing at research/rdf-canon-rdf12-triple-terms-upstream.md as the record of the upstream questions this profile raised.",
+    "severity": "nit",
+    "title": "Shipped docs and the in-repo research record now describe upstream status differently"
+   }
+  ],
+  "progress": null,
+  "summary": "Docs-only change across 5 surfaces (sparq-canon Cargo.toml feature comment, crate README, lib.rs crate doc, rdf12.rs module + fn docs, skills/rdf-canon/SKILL.md). It replaces the hedged, cited phrasing 'RDF-1.2 canonicalization is unsettled upstream (w3c/rdf-star-wg#114)' with the absolute 'no W3C RDF-1.2 dataset-canonicalization specification exists', and drops the link. Correctness checks performed: (1) no code, test, or feature-gating change \u2014 behaviour is untouched, so no test is required and no test is rendered vacuous; (2) the load-bearing honesty labels all survive verbatim on every surface \u2014 NOT W3C RDFC-1.0, OFF by default, byte-identical with the feature OFF, standard paths still fail closed with CanonError::TripleTerm, W3C suite still passes \u2014 so the maintainer constraint from sq-hslb ('CLEARLY LABEL as non-standard, OPT-IN') is preserved; (3) the rustdoc reference-link removal is complete and self-consistent: rdf12.rs deletes both the sole usage and the '[w3c/rdf-star-wg#114]: ...' definition, and grep over crates/, skills/, site/, docs/ finds no surviving usage, so there is no dangling intra-doc/markdown link that could red the rustdoc --all-features half of the clippy gate; the still-used [RDFC-1.0] definition is retained; (4) all five occurrences of the old phrasing in shipped docs are updated together \u2014 no shipped surface is left with the old wording (remaining 'unsettled' hits in the tree are unrelated: OWL2-QL CQ, MPC estate recon, sparql_entail, reason-ql cq); (5) no security surface, no ZK/MPC privacy or soundness claim, no hard-coded performance number, no terminology-gate regression (rdf-star-wg is an allowPattern, not a ban, scripts/banned-terminology.json:200 \u2014 so the link was not required to be removed for the gate). Remaining points are minor doc-honesty observations, not blockers: the new claim is an undated, uncited assertion about external W3C state and is strictly stronger than the hedge it replaces, and it drops \u2026 [truncated 151 chars]",
+  "verdict": "approve"
+ }
+}
