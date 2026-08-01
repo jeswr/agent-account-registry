@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1519,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "691e69e1f45dcde4b07e7ecc18700210e699933f",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_workflow_job_key` bounds the job with `(?=^  \\S|\\Z)`. YAML comments do not participate in indentation or close a mapping, but a line such as `  # keepalive controls` satisfies that lookahead. If that comment appears after the existing `runs-on: ubuntu-latest` and before `    if: false`, the captured block still yields the expected `runs-on` and returns `None` for `if`, so the production row passes even though the whole job is disabled. The synthetic fixture only has a four-space comment and therefore does not exercise this boundary case.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Make the job boundary ignore comment-only lines (and refuse ambiguous/duplicate matching job definitions), then add an independent synthetic case with a two-space comment between `runs-on` and `if: false`; assert that the gate is still read. Keep the positive control before the comment so this exact truncation mutant is proven red.",
+    "severity": "major",
+    "title": "A job-indented comment hides subsequent job gates"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe prior round's `if : false` spelling defect is corrected and directly exercised. However, the replacement job-block extractor still does not follow YAML semantics: its end lookahead treats any two-space nonblank line, including a comment, as the next job. A two-space comment inserted after `runs-on` and before a job-level `if` makes both live assertions remain green (`runs-on` is seen, `if` appears absent) while GitHub still applies the gate. The marquee job-gate check therefore remains bypassable and non-vacuous only for a subset of valid formatting. This is a new major finding despite resolution of the prior one, so progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
