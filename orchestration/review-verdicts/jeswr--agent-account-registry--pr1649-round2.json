@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1649,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ecd1390774adb9b51b71e8970e94c41d76284f05",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-1 coverage gap is closed. The added end-to-end masking scenarios independently drive a token-shaped, multiline, over-limit arbitrary exception through each of the four widened production handlers (stale-PR detection, issue status repair, stale-PR hand-off, and age un-park), and compare each emitted ALERT against a fixed literal independent of the masking regex, length bound, and injected message construction. A call-site regression to `str(exc)` at any one handler therefore fails its own row while the shared helper remains unchanged. The broader boundary handlers remain loud, preserve per-object continuation, and retain phase-level systemic-failure precedence and lease release. No correctness, soundness, test-validity, or security issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
