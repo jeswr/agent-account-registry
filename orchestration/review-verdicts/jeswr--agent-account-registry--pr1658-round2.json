@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1658,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "868da1acae62028bbad6b615bce336e68b7ccf1f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 closes the prior major finding. The seam assertion now resolves the token-producing step and independently pins the exact SHA-referenced `actions/create-github-app-token` action, both App-secret inputs, `owner: sparq-org`, `repositories: sparq`, and `permission-actions: write`, while retaining exact checks for the consumer gate and `GH_TOKEN` wiring. The same-ID non-mint and changed owner/permission fixtures demonstrate non-crashing falsifiability, and the new step-key extractor is directly exercised for nesting, absence, first-key handling, and duplicate refusal. I found no remaining blocker, major, or other diff-scoped correctness/security issue.",
+  "verdict": "approve"
+ }
+}
