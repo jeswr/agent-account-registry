@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "51bde6688e140866",
-   "claim_id": "83029495c83c4fcc960d0733f0d155da",
-   "holder": "jeswr/agent-account-registry#1602@30720328561.1",
-   "package": "review-loop",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785621636,
-   "expires_at": 1785625338
-  },
-  {
-   "account": "51bde6688e140866",
    "claim_id": "ae7a3d40d0384421955566e43e0476ce",
    "holder": "fix:jeswr/agent-account-registry#1639@30721096315.1",
    "package": "worker",
