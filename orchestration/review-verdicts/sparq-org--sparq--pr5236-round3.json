@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5236,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "71eced6c620bd93f3315a3a51a3c9bf572ec06a7",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_pr_reachable` only matches `uses:` when `./.github/workflows/...` immediately follows optional whitespace. Valid YAML such as `uses: './.github/workflows/release.yml'` or `uses: \"./.github/workflows/release.yml\"` is therefore absent from `graph`. If a PR-triggered workflow adds such a quoted call (directly or through an intermediate), `test_no_release_only_workflow_is_reachable_from_a_pr_trigger` remains green while edits to the allowlisted callee can affect a PR check, contradicting the claimed fail-closed inertness proof.",
+    "file": "scripts/tests/test_ci_select.py",
+    "fix_hint": "Accept matching single or double quotes around local workflow references (and require a matching/valid closing quote or otherwise parse the scalar conservatively), then extend the transitive regression fixture with at least one quoted `uses` edge and assert the release workflow remains reachable. Treat any ambiguous local workflow reference conservatively rather than silently dropping it.",
+    "severity": "major",
+    "title": "Reachability scan misses quoted reusable-workflow calls"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The direct-trigger audit and current repository fixture pass, but the transitive caller proof is not fail-closed for valid GitHub Actions syntax. A quoted local reusable-workflow `uses` value is accepted by Actions yet omitted from the constructed graph, so a future PR-triggered caller could reach an allowlisted release workflow without making this guard fail. Because round 2 had no findings and this is a new major soundness gap, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
