@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5261,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0544e06e00fb1225b1c7e700fab5269f20a39d70",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 10.4 hard-codes individual run durations, a selected-leg count, and a projected '+4\u201310 m' median-wall effect; section 10.5 adds more fixed timing values. These are dated profile observations/projections embedded as durable evidence. The repository's reviewer contract explicitly disallows hard-coded performance numbers and says session/work-box/EC2 timings are non-canonical. The same projected range is also repeated in the companion changed research record.",
+    "file": "research/change-based-test-selection.md",
+    "fix_hint": "Remove the literal durations, leg-count range, and projected minute range from the prose/table. Link to the profile or generated benchmark artifact and describe the conclusion qualitatively (for example, that forcing the full matrix restores the materially slower full-matrix shape). Make the corresponding removal in research/ci-mergequeue-speedup-2026-07.md.",
+    "severity": "major",
+    "title": "New hard-coded performance numbers violate the repository evidence policy"
+   }
+  ],
+  "progress": null,
+  "summary": "The batch-stacking argument is internally coherent and explicitly records its remote ALLGREEN premise, but the change cannot be approved because it adds concrete, non-canonical timing figures and a projected performance range to a research record. Repository review policy expressly forbids hard-coded performance numbers and requires work-box/dated profile timings not to be presented as canonical evidence. Replace the figures with links to the generated/profile evidence and a qualitative cost statement, or use the repository's approved generated benchmark-data mechanism.",
+  "verdict": "request_changes"
+ }
+}
