@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1545,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b9a1d5e4f2c752e0872f1d812b216f49eddbc514",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The read/write posture split is coherent and fail-closed at the relevant boundaries: locally introduced records retain a closed vocabulary, stored records tolerate only bounded token-shaped unknown names, all known-field validation remains active, raw account handles are rejected even inside structured unknown values, and invalid origin declarations fail as ValueError. The append seam validates the new record under write posture while preserving later-release fields through the read-modify-write path. Tests exercise the rolling-upgrade regression, both posture directions, origin omission/typos, malformed field names and exception classes, literal cap boundaries, preservation across append, downstream park readers, and warning behavior; the assertions are outcome-bearing rather than merely checking presence. The documentation accurately records the one-time rollout constraint and does not introduce a trust-plane weakening. No reviewer-directed instruction or other prompt-injection content was detected in the diff.",
+  "verdict": "approve"
+ }
+}
