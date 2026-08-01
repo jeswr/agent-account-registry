@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1643,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d2cd7aa75e087e91b45dc0e69fe9112928b21513",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The writer leaves `last_ok` untouched on every absent/unparseable response while incrementing `fail_streak`, but the consumer rule says any record whose `last_ok` is older than the TTL reads as never-observed and admits. Therefore a bucket that was once well formed and then remains malformed will refuse only from streak N until `last_ok` expires; after one weekly window plus slack it becomes row 4 and admits forever even though this tick still has a shape failure and probes continue succeeding at the transport layer. This defeats the stated consecutive-drift gate precisely for long-lived provider shape drift and contradicts the claim that only a sustained probe outage decays toward admission.",
+    "file": "research/720-opus5-premium-quota-gating.md",
+    "fix_hint": "Track freshness of the observation/outcome separately from `last_ok` (for example, a last-probed or last-shape-failure timestamp), and define expiry so only genuinely unobserved/unprobed state decays to row 4. Continuous successfully received malformed responses must remain row 3 after the threshold. Add a named transition test where malformed responses continue beyond the TTL and a mutant that incorrectly reclassifies that state as never-observed/admitted.",
+    "severity": "major",
+    "title": "The TTL eventually converts continuous observed drift back into permanent admission"
+   }
+  ],
+  "progress": "improving",
+  "summary": "The prior round's missing durable state machine and incomplete stale-comment inventory are now addressed, but the proposed freshness rule makes the new drift refusal self-disabling. Because this design record is intended to govern the later admission gate, that internal state-machine contradiction remains a major completeness defect.",
+  "verdict": "request_changes"
+ }
+}
