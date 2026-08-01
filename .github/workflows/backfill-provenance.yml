@@ -28,7 +28,11 @@ on:
           Target owner/repository (must be ENABLED in policy/repos.toml). Leave EMPTY to sweep
           every enabled target, which is what the schedule does.
         required: false
-        default: sparq-org/sparq
+        # [#1544] NO default. A `default:` is materialised for workflow_dispatch, so any value here
+        # makes "leave EMPTY to sweep every enabled target" unreachable from the UI/API — the manual
+        # path would silently disagree with its own description AND with the schedule. Scheduled
+        # runs are unaffected either way (a schedule supplies no `inputs` context at all), so this
+        # only fixes the manual half.
         type: string
       apply:
         description: Write records + convert to draft (false = dry run)
