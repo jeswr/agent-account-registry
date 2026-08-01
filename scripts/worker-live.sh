@@ -3643,6 +3643,84 @@ _purge_before_target_code() {
   fi
 }
 
+# PURE (self-tested via _seal_before_target_code's rows): locate the UNIQUE step whose `- name:`
+# line is exactly NAME, prove from inside its body that it really hands SEALED_PATH to the artifact
+# service, and print `line <n>` where <n> is the line of the validated
+# `uses: actions/upload-artifact@<40-hex>` invocation — the executable line whose POSITION is the
+# thing worth ordering. Anything short of that prints a named refusal instead:
+#   no-upload-step            no step carries the name
+#   ambiguous-upload-step     more than one does, so the name identifies nothing
+#   upload-step-not-an-upload the step runs no SHA-pinned actions/upload-artifact
+#   upload-step-path-mismatch it uploads something other than the lane's sealed directory
+#   upload-step-disabled      its condition is a constant false
+# A step spans its `- name:` line to the next `- name:` or to the JOB boundary (a two-space-indented
+# key), the same span every other extractor here uses — without the job boundary the last step of a
+# job would absorb the next job's lines and could be certified by a neighbour's `uses:`.
+_upload_step_line() {
+  local file=$1 name=$2 sealed_path=$3
+  [[ -f "$file" ]] || { printf 'worker-live: workflow file missing: %s\n' "$file" >&2; return 1; }
+  python3 - "$file" "$name" "$sealed_path" <<'PY'
+import re, sys
+
+path, name, sealed = sys.argv[1], sys.argv[2], sys.argv[3]
+name_line = "      - name: " + name
+STEP = re.compile(r"^\s*-\s+name:")
+JOB = re.compile(r"^  [A-Za-z0-9_-]+:\s*$")
+
+with open(path, encoding="utf-8") as fh:
+    lines = fh.read().splitlines()
+
+steps, cur = [], None
+for i, ln in enumerate(lines):
+    if STEP.match(ln):
+        cur = [] if ln == name_line else None
+        if cur is not None:
+            steps.append(cur)
+        continue
+    if JOB.match(ln):
+        cur = None
+        continue
+    if cur is not None:
+        cur.append((i + 1, ln))
+
+
+def refuse(verdict):
+    print(verdict)
+    raise SystemExit(0)
+
+
+if not steps:
+    refuse("no-upload-step")
+if len(steps) > 1:
+    refuse("ambiguous-upload-step")
+
+body = steps[0]
+# Exact-match, not containment (AGENTS.md item 6): `@v4`, `@main` or a different action must all
+# read as "this step is not the pinned upload", and only a trailing `# vX` comment is tolerated.
+# The leading-indent anchor is the same defence `_purge_before_target_code` documents — a
+# COMMENTED-OUT `uses:`/`path:` still contains the text, and a containment match would certify a
+# step that runs nothing.
+uses = [n for n, ln in body
+        if re.fullmatch(r" {8}uses: actions/upload-artifact@[0-9a-f]{40}(\s+#.*)?", ln)]
+if not uses:
+    refuse("upload-step-not-an-upload")
+if not any(ln == "          path: " + sealed for _, ln in body):
+    refuse("upload-step-path-mismatch")
+for _, ln in body:
+    cond = re.fullmatch(r" {8}if:\s*(.*)", ln)
+    if cond and re.search(r"(?<![\w.])false(?![\w.])", cond.group(1)):
+        refuse("upload-step-disabled")
+# DECLARED EQUIVALENT (AGENTS.md item 4): the line printed is the `uses:` invocation rather than the
+# step's `- name:` line, and no well-formed workflow can separate the two across a target-code
+# anchor — a step's `uses:` sits within a few lines of its own name and nothing else may come
+# between them. It is written this way because the invocation is the executable thing being ordered,
+# and because `uses:` is never ABOVE its own name line the verdict can only ever be more
+# conservative, never less. What the earlier revision actually lacked was a name BOUND to an upload
+# at all; that is what everything above this line now establishes.
+print("line %d" % uses[0])
+PY
+}
+
 # PURE (self-tested): verdict on whether a live lane SEALS the model's work into its inert,
 # digest/sha-bound artifact — and hands that artifact to the artifact service — BEFORE it runs any
 # target-controlled code. `ordered` is the only passing value; every other outcome, including a lane
@@ -3662,24 +3740,46 @@ _purge_before_target_code() {
 # the gate can overwrite. A late upload fails CLOSED rather than silently — the pre-gate digest/sha
 # refuses the rewritten artifact — but nothing measured the claim.
 #
-# Usage: _seal_before_target_code <workflow-file> <seal-subcommand> <upload-step-name>
+# [PR #1639 review r1] THE UPLOAD IS PROVEN, NOT NAMED. An earlier revision took the upload's
+# position from the first exact `- name:` match and never opened the step, so the whole upload arm
+# rested on a display string that binds nothing: delete the step's `uses:`, swap it for another
+# action, unpin it, point `path:` somewhere other than the sealed directory, or add `if: false`, and
+# the lane hands the artifact service NOTHING while the verdict still read `ordered`. Worse, an
+# inert step keeping the expected name could sit early and mask a real, renamed upload placed after
+# the gate. So the upload step is located by name, required to be UNIQUE, and then validated from
+# the inside — a SHA-pinned `actions/upload-artifact` invocation, the lane's exact sealed path, and
+# no disabling condition — and the line that gets ORDERED is that validated `uses:` invocation, not
+# the name line. Every failure is its own named verdict (`upload-step-not-an-upload`,
+# `upload-step-path-mismatch`, `upload-step-disabled`, `ambiguous-upload-step`), never `ordered`.
+#
+# Usage: _seal_before_target_code <workflow-file> <seal-subcommand> <upload-step-name> <sealed-path>
 # Matched on exact `run:` / `- name:` lines for the reason _purge_before_target_code is: these
 # subcommand names also appear in the comments above their own steps, and a containment match would
 # measure the comment's position rather than the step's.
 _seal_before_target_code() {
-  local file=$1 seal_cmd=$2 upload_name=$3
+  local file=$1 seal_cmd=$2 upload_name=$3 sealed_path=$4
   [[ -f "$file" ]] || { printf 'worker-live: workflow file missing: %s\n' "$file" >&2; return 1; }
   [[ "$seal_cmd" =~ ^[a-z][a-z-]*$ ]] ||
     { printf 'worker-live: unsafe seal subcommand: %s\n' "$seal_cmd" >&2; return 1; }
   [[ -n "$upload_name" ]] || { printf 'worker-live: no upload step name given\n' >&2; return 1; }
+  [[ -n "$sealed_path" ]] ||
+    { printf 'worker-live: no sealed artifact path given\n' >&2; return 1; }
   local seal_ln upload_ln tool_ln gate_ln
   seal_ln=$(_first_match_line \
     "^        run: bash \.\./registry/scripts/worker-live\.sh $seal_cmd\$" < "$file")
-  upload_ln=$(_first_match_line "^      - name: $upload_name\$" < "$file")
   tool_ln=$(_first_match_line '^      - name: Ensure a Rust toolchain for the crate-scoped gate$' < "$file")
   gate_ln=$(_first_match_line '^        run: bash \.\./registry/scripts/worker-live\.sh gate$' < "$file")
   [[ -n "$seal_ln" ]] || { printf 'no-seal-step\n'; return 0; }
-  [[ -n "$upload_ln" ]] || { printf 'no-upload-step\n'; return 0; }
+  local upload_verdict
+  upload_verdict=$(_upload_step_line "$file" "$upload_name" "$sealed_path") || return 1
+  case "$upload_verdict" in
+    line\ *) upload_ln=${upload_verdict#line } ;;
+    no-upload-step|ambiguous-upload-step|upload-step-not-an-upload|\
+    upload-step-path-mismatch|upload-step-disabled) printf '%s\n' "$upload_verdict"; return 0 ;;
+    # Fail CLOSED on anything unrecognised: an extractor that stopped producing a verdict must not
+    # be able to reach the `ordered` print below.
+    *) printf 'worker-live: unrecognised upload verdict: %s\n' "$upload_verdict" >&2; return 1 ;;
+  esac
   [[ -n "$tool_ln" && -n "$gate_ln" ]] || { printf 'no-target-code-step\n'; return 0; }
   # Ordered against BOTH target-controlled steps rather than against the gate alone: the rustup
   # provisioning honours the TARGET's own rust-toolchain.toml, so it is target-controlled code too
@@ -5126,10 +5226,12 @@ WFFIX
   local rf_seal_run='        run: bash ../registry/scripts/worker-live.sh stage-fix'
   local wk_upload='Upload the pre-gate publish bundle (inert data only)'
   local rf_upload='Upload the pre-gate fix bundle (inert data only)'
+  local wk_sealed='${{ runner.temp }}/registry-worker/publish-bundle'
+  local rf_sealed='${{ runner.temp }}/registry-worker/fix-bundle'
   chk "#248 (LIVE worker.yml): the publish bundle is SEALED and UPLOADED before any target code" \
-    "$(_seal_before_target_code "$wf" bundle "$wk_upload")" "ordered"
+    "$(_seal_before_target_code "$wf" bundle "$wk_upload" "$wk_sealed")" "ordered"
   chk "#248 (LIVE review-fix.yml): ...and the fix lane seals+uploads before its own toolchain+gate" \
-    "$(_seal_before_target_code "$rf_wf" stage-fix "$rf_upload")" "ordered"
+    "$(_seal_before_target_code "$rf_wf" stage-fix "$rf_upload" "$rf_sealed")" "ordered"
   # NON-VACUITY, per lane and per ordered step. (1) The seal MOVED below the gate — the exact shape
   # this issue exists to prevent, where the routing still looks right and every downstream check
   # verifies happily. (2) The seal DELETED, which must read as a defect and not as an ordering that
@@ -5139,41 +5241,60 @@ WFFIX
   grep -Fv "$wk_seal_run" "$wf" > "$wf_seal_gone"
   { cat "$wf_seal_gone"; printf '%s\n' "$wk_seal_run"; } > "$wf_seal_late"
   chk "#248: a worker-lane seal moved AFTER the gate is REPORTED (non-vacuous)" \
-    "$(_seal_before_target_code "$wf_seal_late" bundle "$wk_upload")" "seal-after-target-code"
+    "$(_seal_before_target_code "$wf_seal_late" bundle "$wk_upload" "$wk_sealed")" \
+    "seal-after-target-code"
   chk "#248: a DELETED worker-lane seal is REPORTED, never read as ordered (fail closed)" \
-    "$(_seal_before_target_code "$wf_seal_gone" bundle "$wk_upload")" "no-seal-step"
+    "$(_seal_before_target_code "$wf_seal_gone" bundle "$wk_upload" "$wk_sealed")" "no-seal-step"
   # The two lanes seal through DIFFERENT subcommands and DIFFERENT step names, so the fix lane gets
   # its own pair rather than inheriting the worker lane's evidence.
   local rf_seal_gone="$tmp/review-fix-seal-gone.yml" rf_seal_late="$tmp/review-fix-seal-late.yml"
   grep -Fv "$rf_seal_run" "$rf_wf" > "$rf_seal_gone"
   { cat "$rf_seal_gone"; printf '%s\n' "$rf_seal_run"; } > "$rf_seal_late"
   chk "#248: a fix-lane seal moved AFTER the gate is REPORTED too (non-vacuous per lane)" \
-    "$(_seal_before_target_code "$rf_seal_late" stage-fix "$rf_upload")" "seal-after-target-code"
+    "$(_seal_before_target_code "$rf_seal_late" stage-fix "$rf_upload" "$rf_sealed")" \
+    "seal-after-target-code"
   chk "#248: a DELETED fix-lane seal is REPORTED (fail closed)" \
-    "$(_seal_before_target_code "$rf_seal_gone" stage-fix "$rf_upload")" "no-seal-step"
+    "$(_seal_before_target_code "$rf_seal_gone" stage-fix "$rf_upload" "$rf_sealed")" "no-seal-step"
   # (3) The UPLOAD is ordered INDEPENDENTLY of the seal: a seal that stays pre-gate while its
   # artifact copy slips below the gate leaves the sealed directory writable by target code for the
   # whole gate. Both mutants keep the seal early, so only the upload arm can fire.
+  # [PR #1639 review r1] The WHOLE step moves, not its display name. Relocating the name line alone
+  # would leave a bodiless step that the extractor now (correctly) refuses as
+  # `upload-step-not-an-upload` — a DIFFERENT verdict from the ordering defect these two fixtures
+  # exist to exhibit, so the row would have gone green for the wrong reason.
+  _seal_split_step() {
+    local src=$1 want_name=$2 out=$3
+    : > "$out.step"
+    awk -v want="      - name: $want_name" -v step="$out.step" '
+      /^[[:space:]]*-[[:space:]]+name:/ { instep = ($0 == want) }
+      /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { instep = 0 }
+      { if (instep) print >> step; else print }
+    ' "$src" > "$out"
+  }
   local wf_up_gone="$tmp/worker-upload-gone.yml" wf_up_late="$tmp/worker-upload-late.yml"
-  grep -Fv "      - name: $wk_upload" "$wf" > "$wf_up_gone"
-  { cat "$wf_up_gone"; printf '      - name: %s\n' "$wk_upload"; } > "$wf_up_late"
+  _seal_split_step "$wf" "$wk_upload" "$wf_up_gone"
+  { cat "$wf_up_gone"; cat "$wf_up_gone.step"; } > "$wf_up_late"
   chk "#248: an upload moved AFTER the gate is REPORTED, with the seal still early (non-vacuous)" \
-    "$(_seal_before_target_code "$wf_up_late" bundle "$wk_upload")" "upload-after-target-code"
+    "$(_seal_before_target_code "$wf_up_late" bundle "$wk_upload" "$wk_sealed")" \
+    "upload-after-target-code"
   chk "#248: a DELETED upload is REPORTED (the artifact copy is what outlives the gate)" \
-    "$(_seal_before_target_code "$wf_up_gone" bundle "$wk_upload")" "no-upload-step"
+    "$(_seal_before_target_code "$wf_up_gone" bundle "$wk_upload" "$wk_sealed")" "no-upload-step"
   # (4) ...and the verdict is not a blanket 'ordered' for any file it is handed: a lane that seals
   # but runs NO target-controlled code has nothing to be early to, and that is a named outcome.
   chk "#248: ...and a lane whose target-controlled step is missing is named, not waved through" \
-    "$(_seal_before_target_code "$wf_purge_nogate" bundle "$wk_upload")" "no-target-code-step"
+    "$(_seal_before_target_code "$wf_purge_nogate" bundle "$wk_upload" "$wk_sealed")" \
+    "no-target-code-step"
   chk "#248: _seal_before_target_code fails CLOSED on an unreadable workflow" \
-    "$(_seal_before_target_code "$tmp/no-such-workflow.yml" bundle "$wk_upload" 2>/dev/null
-       printf '%s' "$?")" "1"
-  # The two arguments are spliced into the scan patterns, so a metachar subcommand ('.*' would make
-  # the seal match the FIRST worker-live.sh step in the file, which is always early) or an empty
-  # upload name must REFUSE rather than report a comfortable 'ordered'.
-  chk "#248: ...and on a metachar seal subcommand / an empty upload step name (never a free pass)" \
-    "$(_seal_before_target_code "$wf" '.*' "$wk_upload" 2>/dev/null; printf '%s' "$?"):$(
-       _seal_before_target_code "$wf" bundle '' 2>/dev/null; printf '%s' "$?")" "1:1"
+    "$(_seal_before_target_code "$tmp/no-such-workflow.yml" bundle "$wk_upload" "$wk_sealed" \
+         2>/dev/null; printf '%s' "$?")" "1"
+  # The arguments are spliced into the scan patterns / exact-match targets, so a metachar subcommand
+  # ('.*' would make the seal match the FIRST worker-live.sh step in the file, which is always
+  # early), an empty upload name, or an empty sealed path must REFUSE rather than report a
+  # comfortable 'ordered'.
+  chk "#248: ...and on a metachar subcommand / an empty upload name / an empty sealed path" \
+    "$(_seal_before_target_code "$wf" '.*' "$wk_upload" "$wk_sealed" 2>/dev/null; printf '%s' "$?"):$(
+       _seal_before_target_code "$wf" bundle '' "$wk_sealed" 2>/dev/null; printf '%s' "$?"):$(
+       _seal_before_target_code "$wf" bundle "$wk_upload" '' 2>/dev/null; printf '%s' "$?")" "1:1:1"
   # BOTH CONJUNCTS OF BOTH COMPARISONS, one fixture each. The live-file mutants above append the
   # moved step at the END, which puts it after the toolchain AND after the gate — so each
   # comparison's two conjuncts are false together there, and dropping either one alone would
@@ -5181,6 +5302,35 @@ WFFIX
   # carrying just the four anchor lines lets a step sit BETWEEN them, which is also the realistic
   # regression: a seal moved below the rustup provisioning that honours the TARGET's own
   # rust-toolchain.toml is already past target-controlled code even though the gate has not run.
+  #
+  # [PR #1639 review r1] The upload anchor emits a REAL step body — condition, SHA-pinned action,
+  # sealed path — because the ordered line is now taken from the validated `uses:` invocation. Each
+  # `upload-*` variant breaks exactly ONE of those parts, so every clause of the validation has its
+  # own killing fixture; the sha is a value that appears nowhere else in this harness (AGENTS.md
+  # item 4's value-identical survivor).
+  local seal_sha='1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d'
+  _seal_upload_step() {
+    local variant=$1
+    printf '      - name: %s\n' "$wk_upload"
+    case "$variant" in
+      off) printf '%s\n' '        if: ${{ false }}' ;;
+      *)   printf '%s\n' '        if: ${{ !inputs.dry_run }}' ;;
+    esac
+    case "$variant" in
+      nouses)    : ;;
+      unpinned)  printf '%s\n' '        uses: actions/upload-artifact@v4' ;;
+      other)     printf '        uses: actions/cache@%s # v4\n' "$seal_sha" ;;
+      commented) printf '        # uses: actions/upload-artifact@%s # v4.6.2\n' "$seal_sha" ;;
+      *)         printf '        uses: actions/upload-artifact@%s # v4.6.2\n' "$seal_sha" ;;
+    esac
+    printf '%s\n' '        with:' '          name: publish-bundle'
+    case "$variant" in
+      nopath)      : ;;
+      badpath)     printf '%s\n' '          path: ${{ runner.temp }}/registry-worker/scratch' ;;
+      pathcomment) printf '          # path: %s\n' "$wk_sealed" ;;
+      *)           printf '          path: %s\n' "$wk_sealed" ;;
+    esac
+  }
   _seal_fixture() {
     local out=$1 anchor
     shift
@@ -5188,7 +5338,15 @@ WFFIX
     for anchor in "$@"; do
       case "$anchor" in
         seal)   printf '%s\n' '        run: bash ../registry/scripts/worker-live.sh bundle' >> "$out" ;;
-        upload) printf '      - name: %s\n' "$wk_upload" >> "$out" ;;
+        upload)          _seal_upload_step ok       >> "$out" ;;
+        upload-off)      _seal_upload_step off      >> "$out" ;;
+        upload-nouses)   _seal_upload_step nouses   >> "$out" ;;
+        upload-unpinned) _seal_upload_step unpinned >> "$out" ;;
+        upload-other)    _seal_upload_step other    >> "$out" ;;
+        upload-nopath)   _seal_upload_step nopath   >> "$out" ;;
+        upload-badpath)  _seal_upload_step badpath  >> "$out" ;;
+        upload-commented)   _seal_upload_step commented   >> "$out" ;;
+        upload-pathcomment) _seal_upload_step pathcomment >> "$out" ;;
         tool)   printf '%s\n' '      - name: Ensure a Rust toolchain for the crate-scoped gate' >> "$out" ;;
         gate)   printf '%s\n' '        run: bash ../registry/scripts/worker-live.sh gate' >> "$out" ;;
       esac
@@ -5200,19 +5358,61 @@ WFFIX
   local seal_fx="$tmp/seal-anchors.yml"
   _seal_fixture "$seal_fx" upload seal tool gate
   chk "#248 fixture control: the four-anchor lane in the SHIPPED order reads 'ordered'" \
-    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload")" "ordered"
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload" "$wk_sealed")" "ordered"
   _seal_fixture "$seal_fx" upload tool seal gate
   chk "#248: a seal after the RUSTUP step but before the gate is REPORTED (toolchain conjunct)" \
-    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload")" "seal-after-target-code"
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload" "$wk_sealed")" "seal-after-target-code"
   _seal_fixture "$seal_fx" upload gate seal tool
   chk "#248: a seal after the GATE but before the rustup step is REPORTED (gate conjunct)" \
-    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload")" "seal-after-target-code"
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload" "$wk_sealed")" "seal-after-target-code"
   _seal_fixture "$seal_fx" seal tool upload gate
   chk "#248: an upload after the RUSTUP step but before the gate is REPORTED (toolchain conjunct)" \
-    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload")" "upload-after-target-code"
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload" "$wk_sealed")" "upload-after-target-code"
   _seal_fixture "$seal_fx" seal gate upload tool
   chk "#248: an upload after the GATE but before the rustup step is REPORTED (gate conjunct)" \
-    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload")" "upload-after-target-code"
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload" "$wk_sealed")" "upload-after-target-code"
+  # [PR #1639 review r1] THE UPLOAD STEP'S BODY, one named fixture per way it can carry the right
+  # display name while handing the artifact service nothing. Every one of these sits EARLY (the
+  # shipped position), so the ordering arms cannot fire and only the validation can produce the
+  # verdict — which is what makes each row a kill for its own clause rather than for the ordering.
+  _seal_fixture "$seal_fx" upload-nouses seal tool gate
+  chk "#248 r1: an early INERT step wearing the upload's name is REPORTED, never taken as the copy" \
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload" "$wk_sealed")" \
+    "upload-step-not-an-upload"
+  _seal_fixture "$seal_fx" upload-unpinned seal tool gate
+  chk "#248 r1: an UNPINNED actions/upload-artifact@v4 is REPORTED (a movable tag is not evidence)" \
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload" "$wk_sealed")" \
+    "upload-step-not-an-upload"
+  _seal_fixture "$seal_fx" upload-other seal tool gate
+  chk "#248 r1: the step swapped to a DIFFERENT pinned action is REPORTED" \
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload" "$wk_sealed")" \
+    "upload-step-not-an-upload"
+  _seal_fixture "$seal_fx" upload-nopath seal tool gate
+  chk "#248 r1: an upload with its path REMOVED is REPORTED" \
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload" "$wk_sealed")" \
+    "upload-step-path-mismatch"
+  _seal_fixture "$seal_fx" upload-badpath seal tool gate
+  chk "#248 r1: an upload of some OTHER directory is REPORTED (the sealed tree is the claim)" \
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload" "$wk_sealed")" \
+    "upload-step-path-mismatch"
+  # Exact-match at the seam, not containment: a COMMENTED-OUT invocation or path still carries the
+  # text, and this module already documents that hazard for the seal/gate anchors. These two rows
+  # are what keep the anchored form from being relaxed to a substring search.
+  _seal_fixture "$seal_fx" upload-commented seal tool gate
+  chk "#248 r1: an upload surviving only as a COMMENT is REPORTED (anchored, not contained)" \
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload" "$wk_sealed")" \
+    "upload-step-not-an-upload"
+  _seal_fixture "$seal_fx" upload-pathcomment seal tool gate
+  chk "#248 r1: a sealed path surviving only as a COMMENT is REPORTED (anchored, not contained)" \
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload" "$wk_sealed")" \
+    "upload-step-path-mismatch"
+  _seal_fixture "$seal_fx" upload-off seal tool gate
+  chk "#248 r1: an upload DISABLED by 'if: false' is REPORTED (the #941 step-level shape)" \
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload" "$wk_sealed")" "upload-step-disabled"
+  _seal_fixture "$seal_fx" upload seal tool gate upload
+  chk "#248 r1: two steps sharing the upload's name are REPORTED, not resolved to the early one" \
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload" "$wk_sealed")" \
+    "ambiguous-upload-step"
 
   local verify_ln mint_ln
   verify_ln=$(_first_match_line 'worker-live\.sh verify-bundle' < "$wf")
