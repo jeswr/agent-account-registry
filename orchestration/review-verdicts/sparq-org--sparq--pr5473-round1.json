@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5473,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f7d35614c09bdc81daf1f844a706f2414d9cf667",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is a narrowly scoped research verification record, not an implementation or soundness certification. Its claims are consistently qualified as source/diff-derived and unmeasured, it explicitly preserves the sq-qhy4 external-review caveat, and it records the missing live failure-path test, Brillig message-path uncertainty, and absent measurement as blockers before the upstream draft is advanced. The summary added to the optimization program matches the detailed record, including the limited patch-application check and the fact that snapshot files, PR discussion, and runtime behavior were not reviewed. No security issue, vacuous claim of test coverage, or unqualified soundness/performance assertion is introduced.",
+  "verdict": "approve"
+ }
+}
