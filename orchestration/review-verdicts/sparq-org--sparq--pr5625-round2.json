@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5625,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "747828e8811b47a126aec020a28073534432f849",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains a documentation-only correction of stale holder-binding deferral language and introduces no correctness, soundness, security, or test-validity defect. The new README synopsis and sig.rs comments accurately distinguish the challenge-bound holder PoP from the issuer-attested per-credential binding, retain the research-grade/not-externally-audited sq-qhy4 caveat, describe the default bearer-compatible and require_binding fail-closed policies consistently with the verifier path, and accurately identify the landed hidden-key holder_pok path. The focused A-presents-B rejection coverage remains a real-path test of the load-bearing B1 invariant. No instruction-like prompt injection appears in the diff.",
+  "verdict": "approve"
+ }
+}
