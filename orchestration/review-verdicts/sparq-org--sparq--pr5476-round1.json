@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5476,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a75242d73acb80a2ae921e716d06fb0073989914",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change consistently adds the mdBook Markdown sources to both hard documentation gates: markdownlint receives `book/**/*.md` through its authoritative JSONC glob list, and the offline lychee invocation receives the same quoted glob explicitly. The surrounding comments accurately describe the resulting scope and correctly note that mdBook include directives are not Markdown links. No correctness, security, or test-validity defect is evident in the diff. Local execution of the pinned markdownlint command was unavailable because `npx` is not installed in this checkout environment, but the configuration syntax and workflow wiring follow the existing mechanisms.",
+  "verdict": "approve"
+ }
+}
