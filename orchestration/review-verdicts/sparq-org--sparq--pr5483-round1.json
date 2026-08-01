@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5483,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a7e308b5d1e2445698f558a5d262125c90fccbcf",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The added child-process harness correctly forces the non-Node initialization branch, records the module-relative WASM fetch, serves the real built artifact with the expected MIME type, and verifies the instantiated engine by executing a query. The retry case creates a genuine first-fetch rejection and confirms that a second init() re-enters the loader for the same asset. Fresh child processes avoid memoized module/initialization state leaking between scenarios, and the mode guard keeps the helper inert during node --test discovery. No correctness, soundness, test-validity, or security defect is evident in the diff. The test assumes the repository's documented build-before-test workflow has produced js/dist and js/wasm artifacts.",
+  "verdict": "approve"
+ }
+}
