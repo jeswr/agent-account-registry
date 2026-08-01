@@ -1018,11 +1018,20 @@ def _live_issue_labels(repo, issue):
         raise WorkerIssueError(
             f"GitHub API returned no readable label set for {repo}#{issue} — the status write "
             f"cannot be confirmed")
-    return {
-        label.get("name")
-        for label in item["labels"]
-        if isinstance(label, dict) and isinstance(label.get("name"), str)
-    }
+    names = set()
+    for label in item["labels"]:
+        # An entry we cannot READ is not evidence that a label is ABSENT — and absence is exactly
+        # what `_assert_status_landed` reads this set for (`drop & live` must come back empty).
+        # Discarding a malformed entry would let `{"labels": [null, ...]}` certify that every
+        # dropped label is gone, the one conclusion an unreadable response cannot support, and a
+        # removal-only transition would pass its confirmation on that. Refuse the whole read, the
+        # same direction `_paginated` takes on a malformed entry.
+        if not isinstance(label, dict) or not isinstance(label.get("name"), str):
+            raise WorkerIssueError(
+                f"GitHub API returned a malformed label entry ({label!r}) for {repo}#{issue} — "
+                f"the status write cannot be confirmed")
+        names.add(label["name"])
+    return names
 
 
 def claim_receipt(repo, issue, model, run_url, run_key, bot_login):
@@ -2075,6 +2084,36 @@ def _self_test():
         finally:
             globals()["_gh_json"] = fake_gh_json
         assert not landed, "unconfirmable status write reported as success"
+
+        # (x-x-b) round-2 finding: the same refusal for a malformed ENTRY inside an otherwise
+        # well-formed labels list. This is the case that reads as PROOF rather than as a crash —
+        # a filtered-out `null` is indistinguishable from "the dropped label is gone", so the
+        # removal-only `complete` flip (add == set(), drop == {status:in-progress, ...}) would
+        # confirm itself against a response nothing can be concluded from. Discarding the entry
+        # instead of raising makes `set_status` return cleanly here, so this assertion is what
+        # kills that variant.
+        live.clear()
+        live.add("status:in-progress")
+
+        def malformed_entry_gh_json(args, *, input_doc=None):
+            if input_doc is not None and "labels" in input_doc:
+                return fake_gh_json(args, input_doc=input_doc)
+            return {"labels": [None, {"name": "role:impl"}]}
+
+        globals()["_gh_json"] = malformed_entry_gh_json
+        landed = True
+        try:
+            set_status("o/r", 9, "complete")
+        except WorkerIssueError as exc:
+            landed = False
+            assert "malformed label entry" in str(exc), exc
+            assert "cannot be confirmed" in str(exc), exc
+        except Exception as exc:        # a raw crash is malformedness, not a diagnosable refusal
+            raise AssertionError(
+                f"malformed label entry crashed instead of refusing: {exc!r}") from exc
+        finally:
+            globals()["_gh_json"] = fake_gh_json
+        assert not landed, "status write confirmed against an unreadable label entry"
     finally:
         globals().update(saved)
 
