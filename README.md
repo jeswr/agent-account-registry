@@ -29,6 +29,19 @@ in that manifest in the same PR. Retiring a script or manifest entry requires tw
 filename to `scripts/selftest-retirements.txt` on the base branch, then remove the script and its
 manifest entry in a later PR. The gate refuses an unapproved same-PR retirement.
 
+**This README is itself under test.** `scripts/readme-runbook-check.py` validates the
+[enrolment runbook](#adding-an-account--step-by-step-runbook-an-agent-can-follow-this-verbatim)
+against the live rules, so "an agent can follow this verbatim" stays true as accounts are retired
+and handle shapes change. It parses each fenced `toml` block with `tomllib` **unchanged** and hands
+the result to `policy-resolve.resolve()` — it never re-derives the resolver's rules over split text,
+because a second implementation of a rule is a false green wherever the two disagree (#660 shipped
+that defect twice). The correlation is scoped to **one `##` section**: the handle *that* runbook's
+steps enrol must appear in *that* runbook's `account_pool` example, so two runbooks with swapped
+handles cannot vouch for each other. Each of the four places a step commits to a slot — the claim
+ref, `--account-handle`, the issue title, and the record's `secret_ref:` — is pinned separately, so
+a source that stops matching **fails** rather than narrowing the check. If you edit the runbook, run
+`python3 scripts/readme-runbook-check.py`; the gate runs it as part of the suite.
+
 ## One issue per account
 
 Each model account is a GitHub **issue** in this repo. The issue **body** is structured YAML
