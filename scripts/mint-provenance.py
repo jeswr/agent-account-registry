@@ -1828,9 +1828,20 @@ def _self_test():                                                       # noqa: 
     policy_doc = tomllib.loads(
         (SCRIPTS_DIR.parent / "policy" / "repos.toml").read_text(encoding="utf-8"))
     policy_resolve = _load_policy_resolve()
+    # [OPUS-5] ENABLED ROWS ONLY. `review_enrolment_authors` resolves through `_policy_row`, which
+    # is fail-closed and RAISES `PolicyError: target repo ... is disabled`. Iterating every row
+    # therefore crashed this self-test — and so the whole `gate` — the moment a legitimately
+    # DISABLED target joined the policy (live: `jeswr/solid-sdk`, onboarded 2026-07-31 with
+    # enabled=false until its routing pointer lands on its default branch). A disabled repo cannot
+    # be enrolled BY CONSTRUCTION, so it contributes nothing to the enrolled set; skipping it is
+    # the honest reading of the question this guard asks, not a workaround for the exception.
+    # The assertion below is deliberately UNCHANGED — this fixes which rows are readable, never
+    # what the guard demands of them.
+    _enabled_rows = [name for name, row in (policy_doc.get("repos") or {}).items()
+                     if isinstance(row, dict) and row.get("enabled")]
     enrolled_live = sorted(
         (name, sorted(policy_resolve.review_enrolment_authors(name, policy_doc)))
-        for name in (policy_doc.get("repos") or {}))
+        for name in _enabled_rows)
     check("the shipped policy enrols EXACTLY the registry, and only `jeswr` (one-repo rollout; "
           "sparq is a deliberate follow-up)",
           [row for row in enrolled_live if row[1]],
@@ -1843,7 +1854,20 @@ def _self_test():                                                       # noqa: 
 
 
     probe_doc = copy.deepcopy(policy_doc)
-    probe_repo = sorted(probe_doc["repos"])[0]
+    # ...and the probe must pick an ENABLED row that does NOT already carry the key. Round-1
+    # review: picking `sorted(_enabled_rows)[0]` selects the registry, which ALREADY resolves to
+    # ["jeswr"], so setting it to ["jeswr"] is a value-identical no-op and the check below proves
+    # nothing about the reader. A real transition needs a row whose CURRENT value is empty.
+    # (A disabled row cannot serve either: it RAISES instead of reporting empty, testing the
+    # exception rather than the reader.)
+    _probe_candidates = [name for name in sorted(_enabled_rows)
+                         if not policy_resolve.review_enrolment_authors(name, policy_doc)]
+    assert _probe_candidates, (
+        "the positive-transition probe needs an ENABLED policy row with NO review_enrolment_authors; "
+        "every enabled row already carries one, so this probe can no longer prove a transition")
+    probe_repo = _probe_candidates[0]
+    check("...the probe row genuinely starts EMPTY, so the check below is a real transition",
+          sorted(policy_resolve.review_enrolment_authors(probe_repo, policy_doc)), [])
     probe_doc["repos"][probe_repo]["review_enrolment_authors"] = ["jeswr"]
     check("...and the same reader WOULD surface one",
           sorted(policy_resolve.review_enrolment_authors(probe_repo, probe_doc)), ["jeswr"])

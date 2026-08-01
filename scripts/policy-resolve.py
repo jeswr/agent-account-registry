@@ -914,6 +914,51 @@ agent = "docs-agent"
             lambda: resolve("unknown/repo", "impl", policy, routing))
     rejects("disabled repo fails closed", "is disabled",
             lambda: resolve("example/disabled", "impl", policy, routing))
+    # [OPUS-5] EVERY STAGED (enabled=false) ROW MUST SURVIVE ITS OWN ENABLE.
+    #
+    # `_policy_row` rejects a disabled target BEFORE validating its remaining fields, so a staged row
+    # can carry an invalid `gate_profile`, an unknown key or a malformed type and stay silently green
+    # for as long as it is disabled — then fail closed the moment someone performs the "one-line
+    # enable" its comment promises. Round-1 review on #1479 caught exactly that: the staged
+    # jeswr/solid-sdk row shipped `gate_profile = "node-workspace"`, which is not in GATE_PROFILES
+    # and has no worker branch, and nothing could see it.
+    #
+    # This validates EVERY disabled row as if it were enabled, on a COPY, so the promise is proven at
+    # gate time rather than discovered at activation time. It is deliberately a loop over all staged
+    # rows, not a fixture naming solid-sdk: the next staged target inherits the guarantee for free.
+    # ⚠️ THE SHIPPED FILE, NOT THE FIXTURE. `policy` here is the self-test's own fixture doc, which
+    # contains `example/disabled` and knows nothing about the real staged targets — a first cut of
+    # this guard looped over it, reported ok on ['example/disabled'], and SURVIVED restoring the
+    # invalid `node-workspace` profile it exists to catch. A guard that cannot see the artifact it
+    # guards is worse than none: it reads green forever. Load policy/repos.toml.
+    import copy as _copy
+    import tomllib as _tomllib
+    _shipped = _tomllib.loads(
+        (Path(__file__).resolve().parents[1] / "policy" / "repos.toml").read_text(encoding="utf-8"))
+    _staged = [name for name, row in (_shipped.get("repos") or {}).items()
+               if isinstance(row, dict) and not row.get("enabled")]
+    assert _staged, ("this guard must have at least one staged row to validate; if the policy ever "
+                     "has none, DELETE the guard rather than let it pass vacuously")
+    # ⚠️ `_validated` is appended to ONLY after `_policy_row` RETURNS, and the check below compares
+    # it against the independently-derived `_staged`. Round-2 review caught the first cut ending in
+    # `check(..., sorted(_staged), sorted(_staged))` — a value compared with ITSELF, which stays
+    # green (and preserves the check count) if this whole loop is deleted. A guard whose own removal
+    # is invisible protects nothing; the expected value must be PRODUCED BY THE WORK.
+    _validated = []
+    for _name in sorted(_staged):
+        _probe = _copy.deepcopy(_shipped)
+        _probe["repos"][_name]["enabled"] = True
+        try:
+            _policy_row(_name, _probe)
+        except Exception as _exc:        # noqa: BLE001 — the message IS the assertion
+            raise AssertionError(
+                f"staged row {_name!r} does NOT survive `enabled = true`: {_exc}. A staged target "
+                "whose only documented activation step is flipping `enabled` must validate under "
+                "that flip, or the promise is false and the enable fails closed.") from _exc
+        _validated.append(_name)
+    check("every staged (disabled) row survives its own one-line enable",
+          _validated, sorted(_staged))
+
     rejects("unknown role fails closed", "unknown role",
             lambda: resolve("sparq-org/sparq", "destroy", policy, routing))
     rejects("multiple roles fail closed", "ambiguous role labels",
