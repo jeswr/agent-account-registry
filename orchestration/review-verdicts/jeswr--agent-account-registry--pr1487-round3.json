@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1487,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6f8ca59756e3b10f5c67a5efcd9f12b1535040f4",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 fail-closed defect is corrected: `_live_issue_labels` now rejects every malformed nested label entry rather than converting unreadable data into evidence of absence. The added removal-only `complete` test exercises the exact previously surviving path, requires a diagnosable refusal, and would fail if the malformed entry were filtered out. The surrounding delete-before-add ordering, atomic add call, live postcondition, and whole-table ordering/state assertions remain sound and non-vacuous. No blocker, major, or other diff-scoped issue remains.",
+  "verdict": "approve"
+ }
+}
