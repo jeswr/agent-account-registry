@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5570,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "be7115011135784a612b7436c49b9510181bb581",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The added line (research/docs-site-single-sourcing-anti-drift.md:14) reads \"The guide's Pages mount discussed in \u00a78 remains open\". In this file \u00a78 is '## 8. What this PR changes' (line 214), which covers the README/introduction.md {{#include}} anchoring and the mdbook-rewrite-links.py uppercase-pattern gap. \u00a78 mentions the guide mount only in passing as a 404 risk (line 227); it nowhere discusses the mount's status. The discussion of the mount being open/blocked is \u00a77, '## 7. Rustdoc as the generated bulk, and the one open decision' (line 177), whose line 192 reads '**The one genuinely blocked item is the Pages mount**' and is followed by the (a)/(b)/(c) option list including the guide-at-root versus /guide/ choice the banner refers to.\n\nThis is self-contradictory within the same block quote: the pre-existing banner text four lines above already uses '\u00a78' correctly for its true referent ('The one code change shipped alongside it is named in \u00a78'). A reader following the new pointer lands on the code-change section, finds no mount-status discussion, and cannot confirm the claim \u2014 which defeats the purpose of a status banner whose whole job is to be checkable. Carried over unfixed from round 3 (and mis-labelled the same way in the round-2 review text, so the error was likely inherited from the review prose rather than the record).",
+    "file": "research/docs-site-single-sourcing-anti-drift.md",
+    "fix_hint": "Change '\u00a78' to '\u00a77' in the added line: \"The guide's Pages mount discussed in \u00a77 remains open: `docs.yml` still has no deploy job, and `pages.yml` still records the guide-at-root versus `/guide/` decision as open.\"",
+    "severity": "minor",
+    "title": "Banner cites the Pages mount as discussed in \u00a78, but the open-mount discussion is \u00a77"
+   },
+   {
+    "body": "The added text (research/dashboard-retirement-assessment.md:13) says 'see the linked runbook's Provenance section', but \u2014 unlike research/docs-site-single-sourcing-anti-drift.md, whose pre-existing banner does carry an explicit markdown link to ../docs/pages-cutover-runbook.md \u2014 this record never hyperlinks the runbook. It appears only as inline code spans further down (line 69, '(this is the broader Pages-cutover work in `docs/pages-cutover-runbook.md`)' and line 82), both below the banner, so 'the linked runbook' is a forward reference to something named but not linked. The path is discoverable, so this is cosmetic only. Unchanged since round 3.",
+    "file": "research/dashboard-retirement-assessment.md",
+    "fix_hint": "Make the reference explicit in the banner, e.g. \"see the Provenance section of [`docs/pages-cutover-runbook.md`](../docs/pages-cutover-runbook.md)\", mirroring the wording already used in the anti-drift record's banner.",
+    "severity": "nit",
+    "title": "'the linked runbook' has no link in this record's banner"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Docs-only PR adding a 'Post-record status' banner to two research records. Round 4 head is byte-identical to what round 3 reviewed for these two files: no new commit addresses the round-3 findings, and no new defect appears. Hence 'stagnant' \u2014 the same one minor and one nit remain at the same severities.\n\nEvery factual claim in both banners re-verified against this checkout:\n- 'sq-iigf Pages source-mode cutover complete on the repo side: the producer workflow exists' \u2014 true; .github/workflows/pages.yml is the sole Actions Pages producer (deploy via actions/deploy-pages), and docs/pages-cutover-runbook.md:7-12 states the same in the same hedged terms.\n- 'Pages service setting reported as flipped but not verified here; see the linked runbook's Provenance section' \u2014 matches the runbook's 'Provenance of the claims below' section (docs/pages-cutover-runbook.md:18ff), which explicitly separates the artifact class from the settings class and says the source mode is relayed from an undated pages.yml comment ('PAGES SOURCE (DONE ...)'), not probed. The hedge is honest and correctly attributed.\n- 'bench.yml still publishes the standalone dashboard to benchmark-data' \u2014 true: bench.yml:630 benchmark-data-dir-path: dev/bench; bench.yml:725 'Seed Pages dashboard onto benchmark-data (if absent)'.\n- 'pages.yml overlays that tree into the site export' \u2014 true: pages.yml:266 'Overlay benchmark dashboard(s) (dev/bench*) from benchmark-data'.\n- 'docs.yml still has no deploy job' \u2014 true: docs.yml:22 says the deploy job arrives only when the cutover bead lands; :112 uploads the guide as 'CI artifact only \u2014 NOT a Pages deploy'; no configure-pages/upload-pages-artifact/deploy-pages in that lane.\n- 'pages.yml still records the guide-at-root versus /guide/ decision as open' \u2014 true: pages.yml 'OPEN PRODUCT DECISION (sq-svtt ...)' header.\n- sq-hsyg gap closure \u2014 true: site/src/components/benchmarks/{trend-charts,scaling-charts,line-chart}.tsx exist, and site/scripts/sync-\u2026 [truncated 346 chars]",
+  "verdict": "approve"
+ }
+}
