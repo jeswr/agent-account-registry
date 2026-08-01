@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5542,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2da7d869d734e7e02b31ac40d1a91fc1ca2acf23",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "commit_plan independently commits selected.per_pattern and envelope.participating_sources, but never verifies that the envelope participation set equals the distinct sources assigned by the selection. A caller can remove a selected source from the envelope (or add an unrelated one) and still obtain Ok(PlanCommitment) containing contradictory selection and participation components. This undermines the advertised fail-closed construction and is especially material because the envelope is the declared leakage/accounting artifact.",
+    "file": "crates/sparq-fedplan-mpc/src/binding.rs",
+    "fix_hint": "Derive the distinct selected source-id set from the committed patterns and require exact equality with the canonicalized envelope.participating_sources, returning DescriptorMismatch at PlanBinding on either omission or addition. Add real-pipeline mutation tests for both a dropped and an extra participant.",
+    "severity": "major",
+    "title": "Participation set is not cross-checked against selected source assignments"
+   },
+   {
+    "body": "commit_operators checks the disclose/hide flag and hidden operator class, but it canonicalizes declared.disclosed_operands without requiring that the list be empty when declared.disclosed is false. It therefore constructs a CommittedOperator with disclosed=false and non-empty disclosed_operands, despite the public field contract saying hidden operators have an empty list and the module claiming routing/envelope disagreement is refused. This creates a non-canonical contradictory representation and can invalidate the leakage statement that operands are disclosed only for Disclosed routes.",
+    "file": "crates/sparq-fedplan-mpc/src/binding.rs",
+    "fix_hint": "Reject any hidden operator whose envelope has non-empty disclosed_operands with DescriptorMismatch at PlanBinding. Add a test that mutates a real assembled envelope by adding an operand to a hidden operator and asserts commit_plan fails.",
+    "severity": "major",
+    "title": "Hidden operators can carry disclosed operands"
+   }
+  ],
+  "progress": null,
+  "summary": "The documentation is appropriately cautious about the audit-gated soundness boundary, and the tests exercise real Phase-2/3/4 construction. However, commit_plan does not fully validate that its three input artifacts describe one consistent plan. It accepts a participation set that disagrees with the selected per-pattern sources, and accepts disclosed operands on a hidden operator. Both cases contradict the stated fail-closed canonicalisation contract and can encode an internally inconsistent plan rather than rejecting it.",
+  "verdict": "request_changes"
+ }
+}
