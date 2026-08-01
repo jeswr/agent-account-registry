@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1592,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1417b3236f2991192947707910ca2b481e83071a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Carried forward unchanged from round 1, and re-confirmed: nothing in the self-test suite compares the documented enum against scripts/policy-resolve.py:55, which is exactly why the comment could fall behind when \"registry-selftest\" was added to GATE_PROFILES and put into shipped use by the registry's own row (policy/repos.toml:197). The same drift can recur in either direction the next time a profile is added or retired, and a future reader trusting this block could believe a valid profile is unsupported - or, worse, that a retired one is still valid.\n\nThis remains a genuine nit and is explicitly NOT a condition of approval: the comment is prose, the validator at policy-resolve.py:255-256 is the real and unchanged authority, and requiring a new test harness as the price of a one-line docs correction would be scope creep on an otherwise clean fix. It is recorded again only because the diff is unchanged from round 1 and suppressing it would misrepresent the round as having moved.",
+    "file": "policy/repos.toml",
+    "fix_hint": "Optional and reasonably deferred to a separate change: add a non-vacuous assertion to policy-resolve.py --self-test that parses the `#   gate_profile           = ...` line out of policy/repos.toml, extracts the double-quoted tokens, and asserts set equality with GATE_PROFILES (set equality, not a subset check - a subset check passes vacuously if the comment lists nothing). Pair it with a negative case proving the comparison flips red when the two differ, in the style of the existing staged-row guard at policy-resolve.py:1012-1054. If the comment format is judged too brittle to parse, the honest option is to leave it as-is rather than ship a check that silently no-ops once the regex stops matching.",
+    "severity": "nit",
+    "title": "Still no guard preventing this comment from drifting out of sync with GATE_PROFILES again"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 re-review. The branch diff (git diff master...HEAD) is byte-for-byte the same single-line change reviewed in round 1: the field-reference comment block in policy/repos.toml now documents gate_profile as \"none\" | \"lint-only\" | \"crate-scoped\" | \"workspace\" | \"registry-selftest\". Nothing was added, removed or amended since round 1, so the findings are materially identical at identical severity -> \"stagnant\" (not \"improving\": no prior finding was addressed; not \"regressing\": no new or higher-severity finding).\n\nRe-verified independently rather than inherited from round 1:\n\n1. Exact authority match. scripts/policy-resolve.py:55 defines GATE_PROFILES = {\"none\", \"lint-only\", \"crate-scoped\", \"workspace\", \"registry-selftest\"}; _policy_row (policy-resolve.py:255-256) raises \"unknown gate_profile\" for anything outside it. The updated comment is now set-equal to the validator - no member documented that the validator would reject, none omitted.\n\n2. No phantom profile. Every one of the five documented values has a live branch in worker-live.sh run_gate (none:789, lint-only:792, crate-scoped:798, workspace:867, registry-selftest:874), with `*) die \"unsupported gate profile\"` as the fail-closed default. registry-selftest is demonstrably non-vacuous: no runnable suite dies (2072), an unvalidated touched control file dies (2073-2074), an empty changed-path list dies (1960), an unavailable dependency is ENV-BLOCKED rather than a pass (1954).\n\n3. Already shipped, not newly enabled. policy/repos.toml:197 has carried gate_profile = \"registry-selftest\" already; the comment was simply stale. Documentation catches up to reality - nothing is enabled, widened or introduced.\n\n4. Completeness. The enum is enumerated repo-wide in exactly two places (this comment and GATE_PROFILES). Greps over *.md and the whole tree surface no third stale listing, and no script parses this comment block, so the format change cannot break a consumer.\n\nTrust-plane lens: zero behavio\u2026 [truncated 362 chars]",
+  "verdict": "approve"
+ }
+}
