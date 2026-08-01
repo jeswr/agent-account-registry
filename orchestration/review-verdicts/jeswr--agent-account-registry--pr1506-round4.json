@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1506,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "77310aedf7259f28533df55d616432be32bbfda8",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The validator still gates the prohibited-key lookup on `isinstance(flow, dict)`: `if isinstance(flow, dict) and \"leases\" in flow`. Consequently, a parseable top-level object such as `{\"schema\":\"registry-observability/v1\",\"flow\":[{\"leases\":[{\"label\":\"ab12cd340a5f9e71\"}]}]}` returns no violations even though the public bytes contain the refused per-account array. The added `alien` self-test instead makes the entire document a list, which is caught by `if not isinstance(document, dict)` and does not exercise the round-3 finding. This also contradicts the updated README claim that the guard refuses the hiding shape.",
+    "file": "scripts/ledger-invariant.py",
+    "fix_hint": "When `flow` is present, fail closed unless its value is an object; keep an absent `flow` accepted only if that is the intended schema. Add a literal fixture whose top-level document is an object and whose `flow` value is a non-object containing a nested `leases` array. Assert a specifically classified `validate()` refusal and add that case to the real CLI table with expected exit code 1, so both the nested-shape guard and its delivery path are tested.",
+    "severity": "major",
+    "title": "Non-object flow still bypasses the public-byte lease-row invariant"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 bypass remains. `_snapshot_violations` now refuses a non-object top-level document, but it still accepts an object whose present `flow` member is a list, string, null, or other non-object. The new alien-shape test exercises a top-level list rather than the reported nested `flow` seam, so it is green without closing the bypass. Because the same major finding remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
