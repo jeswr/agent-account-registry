@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5625,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "747828e8811b47a126aec020a28073534432f849",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The documentation-only change accurately retires stale holder-binding deferral notes. The stated B1 behavior matches the real bind_holder_pop path, which verifies the challenge-bound PoP and then calls bind_holder_binding to enforce the issuer-attested digest and policy; the focused A-presents-B and bearer-required tests exercise those rejection paths. The B2 description matches bind_holder_pok's reconstruction of issuer-attested public inputs and policy enforcement, and the wording retains explicit research-grade/no-external-audit caveats consistent with the holder-PoP design record and sq-qhy4. No correctness, soundness, test-validity, security, or prompt-injection issue was found.",
+  "verdict": "approve"
+ }
+}
