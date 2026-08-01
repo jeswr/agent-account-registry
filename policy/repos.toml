@@ -99,6 +99,10 @@ max_concurrent = 40
 worker_timeout_minutes = 90
 gate_profile = "crate-scoped"
 arm_auto_merge = true         # arming now actually happens — ONLY in the review-fix approve path
+# [#1451] The review lane may act on PRs by these authors in THIS repo. sparq carries
+# arm_auto_merge = true and max_concurrent = 40, so this widens the ARM boundary, not just
+# review — see the PR body. The enabled-but-un-enrolled CONTROL moves to jeswr/solid-sdk.
+review_enrolment_authors = ["jeswr"]
 require_usage = true          # hold (fail-closed) if the usage probe is unavailable
 usage_safety_margin = 0.15    # admit only accounts with >=15% headroom in BOTH windows
 max_attempts = 3              # per-issue worker attempts (also bounds the deferred-retry loop)

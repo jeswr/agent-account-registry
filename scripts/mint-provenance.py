@@ -1842,15 +1842,24 @@ def _self_test():                                                       # noqa: 
     enrolled_live = sorted(
         (name, sorted(policy_resolve.review_enrolment_authors(name, policy_doc)))
         for name in _enabled_rows)
-    check("the shipped policy enrols EXACTLY the registry, and only `jeswr` (one-repo rollout; "
-          "sparq is a deliberate follow-up)",
+    # [#1451] REPOINTED, not relaxed — exactly as the paragraph above prescribes. sparq's
+    # follow-up has now landed, so the pinned population GROWS to name both enrolled repos. It
+    # still reds on the two changes that matter: a THIRD repo enrolled alongside a minting change
+    # (jeswr/solid-sdk is enabled and deliberately un-enrolled, so that widening is observable),
+    # or either list emptied, which would silently make every mint refusal permanent again.
+    check("the shipped policy enrols EXACTLY the registry and sparq, and only `jeswr` "
+          "(jeswr/solid-sdk is enabled and deliberately NOT enrolled — it is the control)",
           [row for row in enrolled_live if row[1]],
-          [("jeswr/agent-account-registry", ["jeswr"])])
+          [("jeswr/agent-account-registry", ["jeswr"]), ("sparq-org/sparq", ["jeswr"])])
     # NON-VACUOUS in the other direction too: the same reader, over the same LIVE rows, surfaces an
     # EMPTY list for a repo that is not enrolled — so the assertion above is a fact about the
     # shipped policy rather than about a reader that returns whatever it is given.
+    # [#1451] The un-enrolled EXAMPLE moves with the rollout: sparq is now enrolled, so asking
+    # about it would assert ["jeswr"] == [] and red. jeswr/solid-sdk is the live enabled-but-
+    # un-enrolled row, which is the whole reason a THIRD policy row was added before this enable —
+    # without it this direction of the guard would have no subject and had to be deleted.
     check("...and the reader still reports an un-enrolled repo as empty",
-          sorted(policy_resolve.review_enrolment_authors("sparq-org/sparq", policy_doc)), [])
+          sorted(policy_resolve.review_enrolment_authors("jeswr/solid-sdk", policy_doc)), [])
 
 
     probe_doc = copy.deepcopy(policy_doc)

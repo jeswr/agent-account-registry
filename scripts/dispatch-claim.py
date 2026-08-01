@@ -13679,7 +13679,11 @@ def _self_test():
         "registry_policy_resolve_enable",
         Path(__file__).resolve().parents[1] / "scripts" / "policy-resolve.py")
     _ENABLED_REPO = "jeswr/agent-account-registry"
-    _DEFERRED_REPO = "sparq-org/sparq"
+    # [#1451] sparq is now ENROLLED, so the un-enrolled control moves to the third policy row.
+    # This assertion is the CONTROL half of the enable proof ("widening it to every repo reds
+    # the control"), so it must always name a repo that is enabled but deliberately NOT
+    # enrolled — otherwise the proof degrades to a tautology over an empty axis.
+    _DEFERRED_REPO = "jeswr/solid-sdk"
     _shipped_authors = _enable_policy.review_enrolment_authors(_ENABLED_REPO, _repos_doc)
     _deferred_authors = _enable_policy.review_enrolment_authors(_DEFERRED_REPO, _repos_doc)
     assert _shipped_authors, (
