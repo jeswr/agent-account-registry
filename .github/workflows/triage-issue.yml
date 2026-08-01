@@ -4,9 +4,12 @@
 # with an EXACT-MATCH trust for jeswr (the maintainer) and for the registry orchestrator App bot; a
 # third-party author is quarantined (trust:untrusted) and its content is NEVER inspected. A trusted
 # author's issue is statically triaged (role/priority/status) by scripts/triage.py — no model call.
-# CLEARING that quarantine is authorized by the EVENT ACTOR's own write+ permission, never by the
-# event's TYPE: `triage` permission can move labels but is not trusted here, so a triage-role actor
-# stripping `trust:untrusted` gets it restored. The quarantine step carries the whole argument.
+# CLEARING that quarantine is authorized by the EVENT ACTOR's own write+ permission or by a write+
+# 👍 REACTION on the issue, never by the event's TYPE: `triage` permission can move labels but is
+# not trusted here, so a triage-role actor stripping `trust:untrusted` — or leaving a 👍 — gets it
+# restored. The actor rule alone is not durable (it can only hold on the event that carries the
+# label move, so the next edit re-quarantines); the reaction is ISSUE state and survives (#1009).
+# The trust step and the quarantine step carry the whole argument between them.
 #
 # Minimal by design (do not over-build): reuses the sparq template and the registry's own
 # scripts/triage.py. actionlint-clean; least privilege (issues:write, contents:read only).
@@ -103,13 +106,37 @@ jobs:
             actor_trusted=$(trust_of "$ACTOR")
           fi
           echo "trusted=$author_trusted" >> "$GITHUB_OUTPUT"
+          # MAINTAINER APPROVAL, read from the issue's 👍 REACTIONS (#1009). The actor rule below is
+          # real but NOT DURABLE: it can only be true on the event that carries the label move, so
+          # the third party's next `edited` re-derives the decision from the AUTHOR's trust and
+          # re-quarantines an issue the maintainer had deliberately released. A reaction is ISSUE
+          # state, not event state, so it is re-read and re-honoured on every event.
+          # ANYONE CAN REACT ON A PUBLIC REPO. An unfiltered reaction read is the sparq #4743 shape,
+          # so triage.py hands back CANDIDATE logins only and each one goes through `trust_of` — the
+          # SAME exact-match/write+ probe the author and the actor get, with no second spelling of
+          # the trust rule in this step (#958). A `read`/`triage`-role or drive-by 👍 counts for
+          # nothing. The read is an idempotent GET, so it takes gh_retry's bounded backoff.
+          # THE FALLBACK DIRECTION IS DELIBERATE and is the one place a fallback belongs in this
+          # step: an unreadable reaction list yields NO candidates, hence NOT approved, which can
+          # only ever ADD quarantine. (The decision call below still has none — see there.)
+          approved=0
+          reactors=$(python3 scripts/gh_retry.py read api "repos/$REPO/issues/$NUM/reactions" --paginate \
+            | python3 scripts/triage.py --approval-reactors) || reactors=""
+          while IFS= read -r reactor; do
+            [ -n "$reactor" ] || continue
+            if [ "$(trust_of "$reactor")" = "1" ]; then
+              approved=1
+              break
+            fi
+          done <<< "$reactors"
+          echo "maintainer_approved=$approved" >> "$GITHUB_OUTPUT"
           # ONE definition of the quarantine rule, and it lives in Python where the self-test can
-          # EXECUTE it over the whole (event x author-trust x actor-trust) matrix — a second copy
-          # spelled as a workflow `if:` expression would be a mutually-masking duplicate (AGENTS.md
-          # pre-flight 4) that no test could kill. No `|| <fallback>` here for the same reason: if
-          # the decision cannot be computed the step goes RED and the job stops, which is the only
-          # honest outcome — a fallback would be that second definition.
-          quarantine=$(python3 scripts/triage.py --quarantine-decision --action "$ACTION" --author-trusted "$author_trusted" --actor-trusted "$actor_trusted")
+          # EXECUTE it over the whole (event x author-trust x actor-trust x approval) matrix — a
+          # second copy spelled as a workflow `if:` expression would be a mutually-masking duplicate
+          # (AGENTS.md pre-flight 4) that no test could kill. No `|| <fallback>` here for the same
+          # reason: if the decision cannot be computed the step goes RED and the job stops, which is
+          # the only honest outcome — a fallback would be that second definition.
+          quarantine=$(python3 scripts/triage.py --quarantine-decision --action "$ACTION" --author-trusted "$author_trusted" --actor-trusted "$actor_trusted" --maintainer-approved "$approved")
           echo "quarantine=$quarantine" >> "$GITHUB_OUTPUT"
 
       # PR #595 finding 5: the QUARANTINE labels are a TRUST BOUNDARY, so their write is fail-loud.
@@ -131,8 +158,10 @@ jobs:
       # With the exemption, such an actor could strip `trust:untrusted` and nothing would put it
       # back, clearing the hard gate that ready-issues.py / curate-frontier.py / dispatch-claim.py
       # read, on an issue whose AUTHOR is still untrusted. So the decision is now taken from the
-      # ACTOR's own permission: `steps.trust.quarantine` is 0 only when the author is trusted, or
-      # when a WRITE+ actor asserted the label set on a label event (the deliberate un-quarantine).
+      # ACTOR's own permission: `steps.trust.quarantine` is 0 only when the author is trusted, when
+      # a WRITE+ login has 👍-approved the issue (#1009 — standing evidence that survives the next
+      # content event, which the actor rule cannot), or when a WRITE+ actor asserted the label set
+      # on a label event (the deliberate un-quarantine).
       # Every other event — including an `unlabeled` by a triage-role or drive-by actor — RESTORES
       # `trust:untrusted` and `status:untriaged` via the idempotent `--add-label` write below.
       # The rule itself is a single Python function so it is executable and testable; see
