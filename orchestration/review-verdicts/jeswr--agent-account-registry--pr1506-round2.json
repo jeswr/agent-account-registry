@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1506,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "77310aedf7259f28533df55d616432be32bbfda8",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nBoth round-1 soundness gaps are closed. The ledger content check now reads the attested `HEAD:data/observability.json` blob from the same enumerated tree, independently checks divergent worktree bytes consumed by local tooling, and fails closed on read/decode/parse errors. Duplicate object members are rejected at every nesting level before last-key-wins lookup can hide `flow.leases`. The added tests exercise deleted, overwritten, untracked, and divergent worktree states; top-level and nested duplicate members; malformed bytes; and the actual CLI exit path. The dashboard-side refusal remains presence-keyed while preserving the earlier privacy-label classification, with non-vacuous assertions distinguishing the two errors. I found no remaining blocker or major issue in the diff.",
+  "verdict": "approve"
+ }
+}
