@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5558,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a174c341e0e3be868bd8fdea4cddba3334c401df",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 confirms the prior approval. The added tests exercise the real RDF 1.2 canonicalization entry points and make byte-exact, non-vacuous assertions for VT and all U+000E\u2013U+001F escapes, including LF/FF boundary behavior. Named-node and blank-node graph labels are tested through Quad-based canonicalization with the document trailing newline, and the round-trip assertion correctly preserves a fourth graph term while omitting DefaultGraph. No correctness, soundness, security, or test-validity issue was found.",
+  "verdict": "approve"
+ }
+}
