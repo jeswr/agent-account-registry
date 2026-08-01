@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1491,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a9f39ab3cce98a6bd7e3a72d76f140f08615523c",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new `record-marker` call occurs before `_run_gh(..., check=False)` and is not undone when that call returns nonzero. That failure branch releases the reviewer lease, records `dispatch-launch-failed`, and launches nothing, yet the `strandedrecover` marker remains. Repeating this transient/API-side failure to the limit makes the next tick call `needs-user` with evidence that N recovery dispatches recorded no review round. Those were failed launch attempts, not dispatched recovery reviews, so machine/control-plane failure can still drive the question-class terminal. The comment explicitly accepts this over-count, but that contradicts the counter's stated exact-dispatch semantics and the terminal's evidence. The added tests cover marker-write failure and successful launch, but contain no stranded recovery row where `workflow run` returns nonzero, so this boundary is unprotected.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Make the durable charge contingent on a confirmed workflow launch while preserving crash safety, for example with a reservation/commit protocol whose uncommitted records are not charged (and whose ambiguous launch result fails closed without fabricating a dispatch). Add a test where the stranded marker write succeeds but `gh workflow run` returns nonzero; assert that the lease is released, nothing is launched, and the charged recovery count cannot advance toward `needs-user`.",
+    "severity": "major",
+    "title": "Failed workflow launches still consume the human-owned recovery budget"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-1 allocator-ordering defect is corrected: no-slot, lease-error, unsafe-claim, and marker-write-failure paths no longer charge a recovery attempt. However, the marker is still persisted before `gh workflow run` is known to have succeeded. A nonzero launch result releases the lease and records `dispatch-launch-failed`, but leaves the durable recovery marker behind; three launch failures can therefore produce the human-owned terminal claiming three recovery dispatches recorded no round even though no workflow was launched. This is a new major finding, so progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
