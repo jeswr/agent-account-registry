@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5247,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "204289241272198a1a230477fecd4c8370c90589",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "test_deploy_tree_is_not_read_by_any_rust_ci_workflow scans a manually maintained rust_ci filename list and skips missing entries. A new or renamed Rust workflow can read deploy/ without being scanned, while the test remains green and deploy/** stays in _ORCHESTRATION_SAFE. The new crate/build-input scan resolves that half of the round-1 finding, but the workflow half still does not re-derive the claimed 'any Rust-CI workflow' non-interference property.",
+    "file": "scripts/tests/test_ci_select_wiring.py",
+    "fix_hint": "Derive the audited workflow set fail-closed from all .github/workflows/*.yml files, excluding only an explicit and narrowly justified set of known non-Rust/deploy/docs workflows, and add a witness showing that an otherwise unlisted Rust workflow containing a deploy/ reference is detected. Alternatively, remove deploy/ from _ORCHESTRATION_SAFE. Do not silently continue past missing expected workflow files.",
+    "severity": "major",
+    "title": "Rust-CI workflow audit remains fail-open"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 fixes the crate/build-input half of the prior finding and adds a useful mutation witness, but the workflow half remains a hard-coded allowlist. The test still claims to cover every Rust-CI workflow while silently ignoring any newly added or renamed workflow. Such a workflow can consume deploy/**, land without invalidating this audit, and later deploy-only changes will still classify orchestration-only and skip the Rust matrix. Because the allowlist is justified as a fail-closed non-interference proof, this remaining same-severity gap blocks approval.",
+  "verdict": "request_changes"
+ }
+}
