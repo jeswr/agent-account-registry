@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5499,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3cd6297ec1f3247378799f46bc38cf2f25872155",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The lowercase root-level Markdown fix is correct and scoped: `_ROOT_MD` now admits either-case alphabetic filenames while preserving the existing exclusions for `./` and `../` book-internal links, absolute/schemed targets, and non-Markdown files. The README workaround is safely reverted to a repository-relative link that the preprocessor now rewrites under the guide mount. The self-test exercises the reported lowercase regression, reference links, fragments, allow-listed directories, exclusions, code masking, idempotence, and recursive chapter walking, and it passes at the PR head. Adding it to the always-run docs-quality quick gate closes the silent-regression gap. No security, correctness, test-validity, or instruction-injection issue was found.",
+  "verdict": "approve"
+ }
+}
