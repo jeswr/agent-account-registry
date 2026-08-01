@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1545,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b9a1d5e4f2c752e0872f1d812b216f49eddbc514",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The read/write posture split remains correct, complete, and fail-closed. Write-side construction and the append seam reject undeclared fields, while stored records tolerate only bounded token-shaped unknown names; every known-field grammar remains active, raw account handles are rejected even inside structured unknown values, invalid origins fail as ValueError, and non-string keys cannot escape the callers' ValueError handling. The read-modify-write path preserves later-release fields without allowing the current release to introduce them. The tests exercise both posture directions, origin omission and typos, malformed names and exception classes, literal cap boundaries, append refusal and preservation, downstream park readers, warning behavior, and previously uncovered document-shape guards with outcome-bearing assertions. The documentation accurately states the rollout constraint and trust posture. No reviewer-directed instruction or other prompt-injection content was detected in the diff.",
+  "verdict": "approve"
+ }
+}
