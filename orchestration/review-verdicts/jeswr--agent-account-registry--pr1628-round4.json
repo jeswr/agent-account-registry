@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1628,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "bad7f0cdd0e3617b96b5ba521d26970641213153",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-four diff remains sound and complete. Non-exact-match reactors are intersected with the repository-owned collaborator roster before the bounded probe set is formed, while the configured maintainer and App identities are emitted only when they actually reacted and remain cap-exempt. Every resulting candidate still passes through the existing exact-match/write+ trust probe; unreadable reaction data yields no approval, and roster failures narrow approval to the exact-match identities. The quarantine decision fails closed for malformed or absent approval flags and preserves the existing author- and actor-trust paths. The tests cover the Python logic, exact workflow argv wiring, paginated and malformed payloads, cap and crowd-out kill controls, roster outages, unauthorized reactions, and execution of the real workflow step. I found no diff-supported correctness, soundness, test-validity, or security issue.",
+  "verdict": "approve"
+ }
+}
