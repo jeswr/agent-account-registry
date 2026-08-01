@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1529,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3ce4091f657fa30d30bcd6ff9b699efa47d39244",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe orphan lane remains correct, fail-closed, and non-vacuously tested. The workflow reduces the unfiltered REST issue scan to non-PR issues carrying neither a status nor priority label, bounds and shape-checks that scan independently, and feeds only the reduced pages into the existing capped snapshot. The apply path re-reads all mutable eligibility inputs, re-runs the trust and hold gates, treats adoption as a guarded write, and parks on status:untriaged without creating a second readiness transition. The harness independently exercises malformed orphan payloads, the orphan request ceiling, multi-page advancement and termination, reduction output, the real apply entrypoint, degraded known-label handling, and the two-tick recovery. I found no blocker, major, or lower-severity diff-scoped issue. With zero findings in both rounds 2 and 3, progress is stagnant under the required rubric.",
+  "verdict": "approve"
+ }
+}
