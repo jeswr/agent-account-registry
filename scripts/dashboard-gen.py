@@ -1004,6 +1004,34 @@ def _workflow_step_env(text, step_id):
     return mapping
 
 
+def _yaml_own_key(lines, indent, key, where):
+    """The raw one-line scalar value of the OWN `<key>:` at exactly `indent` in `lines`, else None.
+
+    YAML permits separation whitespace before a mapping colon, so `if : false` defines the very
+    same key as `if: false` (#935 review round 2: a raw `re.fullmatch(r"    if:.*", line)` scan
+    recognised only the second spelling, leaving a gate written the first way invisible to the
+    assertion built on it). The key name is therefore taken from the text BEFORE the first colon
+    and stripped, then compared for EQUALITY — containment would read a commented-out `# if:` as
+    the key it names (pre-flight item 6), which is also why no comment-skipping guard is wanted
+    here: the `#` stays in the compared name, so exact match already rejects it, and skipping the
+    line first would only make that mutant unkillable. Bounded to one indent level so a key nested
+    inside a deeper mapping cannot answer a question about the block that encloses it, and two
+    matches at that indent is a refusal rather than a first-wins guess."""
+    values = []
+    for line in lines:
+        if not line.strip():
+            continue
+        if (len(line) - len(line.lstrip())) != indent:
+            continue
+        name, separator, value = line.strip().partition(":")
+        if separator and name.strip() == key:
+            values.append(value.strip())
+    if len(values) > 1:
+        raise DashboardError(
+            f"{where} has {len(values)} top-level `{key}:` keys, expected at most 1")
+    return values[0] if values else None
+
+
 def _workflow_step_key(text, step_id, key):
     """The raw one-line scalar value of the step's OWN top-level `<key>:`, or None if absent.
 
@@ -1013,22 +1041,23 @@ def _workflow_step_key(text, step_id, key):
     step itself, and two of them at that indent is a refusal rather than a first-wins guess."""
     lines = _workflow_step(text, step_id).split("\n")
     indent = len(lines[0]) - len(lines[0].lstrip()) + 2
-    values = []
-    for index, line in enumerate(lines):
-        if not line.strip():
-            continue
-        # The `- ` of the sequence entry holds the first key at the same column as the rest.
-        here = (" " * indent + line.lstrip()[2:]
-                if index == 0 and line.lstrip().startswith("- ") else line)
-        if (len(here) - len(here.lstrip())) != indent:
-            continue
-        name, separator, value = here.strip().partition(":")
-        if separator and name.strip() == key:
-            values.append(value.strip())
-    if len(values) > 1:
-        raise DashboardError(
-            f"step `id: {step_id}` has {len(values)} top-level `{key}:` keys, expected at most 1")
-    return values[0] if values else None
+    # The `- ` of the sequence entry holds the first key at the same column as the rest.
+    if lines[0].lstrip().startswith("- "):
+        lines = [" " * indent + lines[0].lstrip()[2:]] + lines[1:]
+    return _yaml_own_key(lines, indent, key, f"step `id: {step_id}`")
+
+
+def _workflow_job_key(text, job, key):
+    """The raw one-line scalar value of the job's OWN top-level `<key>:`, or None if absent.
+
+    #935 review round 2: an `if:` on the JOB skips every step it contains, so a gate one level
+    ABOVE the step the keepalive harness pins would disable both legs with every step-level row
+    still green. The step extractor cannot see the level above it, and a missing job is a refusal
+    — a job whose name no longer resolves must not read as "that job carries no gate"."""
+    match = re.search(r"(?ms)^  " + re.escape(job) + r"[ \t]*:[ \t]*\n(.*?)(?=^  \S|\Z)", text)
+    if match is None:
+        raise DashboardError(f"workflow defines no job `{job}:` — refusing")
+    return _yaml_own_key(match.group(1).split("\n"), 4, key, f"job `{job}`")
 
 
 def _js_function_body(text, name):
@@ -4153,15 +4182,54 @@ esac
           (None, "own-gate", "synthetic", True))
     # The gate is only worth asserting if a gate is what production has: an `if:` on the enclosing
     # JOB would skip both legs of the mesh with the row above still green, so the job that carries
-    # them must have none. Read from the raw workflow text at job-key indentation, because the step
-    # extractor cannot see the level above it.
-    keepalive_job = re.search(r"(?ms)^  cron-keepalive:\n(.*?)(?=^  \S|\Z)", dashboard_workflow)
+    # them must have none. Read at job-key indentation, because the step extractor cannot see the
+    # level above it. `runs-on:` is the positive control that pins the None: a reader that found
+    # nothing in this job at all (wrong name, wrong indent, block missed) also answers None to the
+    # gate question, and would report an ungated job however the job were actually written.
+    def _job_key(text, job, key):
+        """`_workflow_job_key`, with a refusal returned as TEXT rather than raised into `check`.
+
+        A refusal must RED its row, not abort the suite half-way: every row below an unhandled
+        refusal never runs, so the mutant records as a kill on a SHORTER run (pre-flight item 4,
+        crash-after-partial-run). Measured: an extractor mutated to match the key by containment
+        refuses here — "2 top-level `if:` keys" — instead of answering the wrong value, and that
+        must still leave a comparable suite. The refusal path itself stays pinned by the explicit
+        `_raises_dashboard` element of the synthetic row below."""
+        try:
+            return _workflow_job_key(text, job, key)
+        except DashboardError as exc:
+            return f"refused: {exc}"
+
     check("[#935] ...and the job carrying BOTH keepalive legs is itself ungated — an `if:` one "
           "level up skips the mesh entirely and no executed row can see it",
-          (bool(keepalive_job),
-           [line.strip() for line in (keepalive_job.group(1) if keepalive_job else "").split("\n")
-            if re.fullmatch(r"    if:.*", line)]),
-          (True, []))
+          (_job_key(dashboard_workflow, "cron-keepalive", "if"),
+           _job_key(dashboard_workflow, "cron-keepalive", "runs-on")),
+          (None, "ubuntu-latest"))
+    # Round-2 finding: the raw-line scan this replaced spelled the gate `    if:` and so read a
+    # perfectly valid `if : false` as no gate at all. Driven directly, since production carries
+    # neither spelling and the live row above can therefore never distinguish the two. The `# if:`
+    # line is load-bearing: it is what an extractor matching the key by CONTAINMENT rather than
+    # equality reads as a second gate (pre-flight item 6), so it must stay in this fixture.
+    synthetic_job = ("jobs:\n"
+                     "  cron-keepalive:\n"
+                     "    # if: a comment is not a mapping key\n"
+                     "    runs-on: ubuntu-latest\n"
+                     "    steps:\n"
+                     "      - if: nested-must-not-count\n"
+                     "        run: 'true'\n"
+                     "  other-job:\n"
+                     "    if: not-this-job\n")
+    check("[#935] the job-key extractor reads that job's OWN keys in BOTH YAML spellings of a "
+          "mapping key — `if : false` gates the job exactly as `if: false` does — while a step's "
+          "or a sibling job's gate is not this job's, and an unresolvable job is a refusal",
+          (_job_key(synthetic_job, "cron-keepalive", "if"),
+           _job_key(synthetic_job.replace("    runs-on:", "    if : false\n    runs-on:"),
+                    "cron-keepalive", "if"),
+           _job_key(synthetic_job.replace("    runs-on:", "    if: false\n    runs-on:"),
+                    "cron-keepalive", "if"),
+           _job_key(synthetic_job, "other-job", "if"),
+           _raises_dashboard(lambda: _workflow_job_key(synthetic_job, "renamed-job", "if"))),
+          (None, "false", "false", "not-this-job", True))
 
     # --- #612 review round 2, finding 5 (MINOR): the successful CLI -> builder handoff. Deleting
     # `probe_status=probe_status` from main()'s build_dashboard call left every direct-builder test
