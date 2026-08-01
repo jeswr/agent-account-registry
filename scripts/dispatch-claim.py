@@ -13680,6 +13680,38 @@ def _self_test():
         Path(__file__).resolve().parents[1] / "scripts" / "policy-resolve.py")
     _ENABLED_REPO = "jeswr/agent-account-registry"
     _DEFERRED_REPO = "sparq-org/sparq"
+
+    # ---- [#1451] THE SHIPPED MANIFEST MUST EQUAL THE SHIPPED ENABLED SET ----------------------
+    # REGRESSION 2026-08-01, a FULL dispatch outage: PR #1535 enabled `jeswr/solid-sdk` in
+    # policy/repos.toml but left `DISPATCH_TARGET_REPOS` in .github/workflows/dispatch.yml naming
+    # only two repos. `run_claim` compares them as SETS and raises "PLAN target manifest does not
+    # exactly match enabled registry policy", so CLAIM failed CLOSED on every executed tick and
+    # ZERO workers launched until the YAML caught up.
+    #
+    # The enabled set is therefore DUPLICATED across a .toml and a .yml, and nothing compared the
+    # two SHIPPED copies — the production check only ever saw a plan built from the manifest, so
+    # the divergence was undetectable until it reached a live tick. This asserts the real files.
+    _wf_text = (Path(__file__).resolve().parents[1]
+                / ".github" / "workflows" / "dispatch.yml").read_text(encoding="utf-8")
+    _wf_match = re.search(r"^  DISPATCH_TARGET_REPOS: '(.+)'$", _wf_text, re.M)
+    assert _wf_match, (
+        "could not find DISPATCH_TARGET_REPOS in dispatch.yml — if it was renamed or reformatted, "
+        "REPOINT this guard; deleting it restores a silent full-outage mode")
+    _manifest_repos = set(json.loads(_wf_match.group(1)))
+    _policy_enabled = _enabled_repositories(_repos_doc, _enable_policy)
+    assert _manifest_repos == _policy_enabled, (
+        "dispatch.yml's DISPATCH_TARGET_REPOS does NOT equal the enabled rows in "
+        f"policy/repos.toml. manifest={sorted(_manifest_repos)} "
+        f"enabled={sorted(_policy_enabled)}. run_claim compares these as SETS and fails CLAIM "
+        "CLOSED on a mismatch, so this is a FULL dispatch outage (zero workers), not a degraded "
+        "sweep. Enabling a repo in policy REQUIRES adding it to the workflow manifest.")
+    # NON-VACUOUS: the same comparison must REJECT a manifest that drops an enabled repo, so this
+    # asserts a fact about the two SHIPPED files rather than about a comparison that always agrees.
+    assert (_manifest_repos - {sorted(_policy_enabled)[0]}) != _policy_enabled, (
+        "the manifest/policy comparison accepted a manifest with an enabled repo REMOVED — it "
+        "cannot detect the divergence it exists to catch")
+
+
     _shipped_authors = _enable_policy.review_enrolment_authors(_ENABLED_REPO, _repos_doc)
     _deferred_authors = _enable_policy.review_enrolment_authors(_DEFERRED_REPO, _repos_doc)
     assert _shipped_authors, (
