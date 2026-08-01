@@ -4978,7 +4978,7 @@ def _current_issue_matches(repo, item, trusted_bots, allow_actions_bot_issues=Fa
 
 
 def _target_tokens_map():
-    """[OPUS-4.8] defects #1,#5: the PER-OWNER target App-token map. dispatch.yml mints one App
+    """defects #1,#5: the PER-OWNER target App-token map. dispatch.yml mints one App
     token per DISTINCT manifest owner and passes {owner: token} as JSON in TARGET_GH_TOKENS. The
     single-target legacy env TARGET_GH_TOKEN is still honoured as a fallback (mapped to the first
     manifest owner via TARGET_GH_TOKEN_OWNER), so a single-target deployment is unchanged. This is
@@ -8392,7 +8392,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 # generic defer line here.
                 defer_reasons["live-busy-crate"] += 1
                 continue
-            # [OPUS-4.8] Per-item resilience: a single item's trust/route/policy resolution failure
+            # Per-item resilience: a single item's trust/route/policy resolution failure
             # must SKIP that item, not abort the whole dispatch (which would strand the other ready
             # issues and mark the run failed). Global setup errors above still abort as before.
             try:

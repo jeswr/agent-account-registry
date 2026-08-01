@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [OPUS-4.8] Registry self-management: the readiness engine for jeswr/agent-account-registry.
+# Registry self-management: the readiness engine for jeswr/agent-account-registry.
 # A copy of the sparq target's scripts/ready-issues.py — the dispatch PLAN clones this repo and
 # runs `scripts/ready-issues.py --self-test` + imports compute_ready(), exactly as it does for
 # sparq. Kept behaviourally identical so the shared dispatcher treats both targets the same.

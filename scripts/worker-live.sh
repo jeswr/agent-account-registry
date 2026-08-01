@@ -479,7 +479,7 @@ _run_headless_harness() {
   harness_wall_seconds=$(( $(date +%s) - harness_started_at ))
   _extract_usage_telemetry "$model_log" "$harness" "$worker_root" "$harness_wall_seconds" || true
   if [[ "$rc" -ne 0 ]]; then
-    # [OPUS-4.8] canary diagnostic: emit ONLY a sanitized error CLASS (never the raw
+    # canary diagnostic: emit ONLY a sanitized error CLASS (never the raw
     # model output/credential) so failures are debuggable without leaking secrets.
     # HOST-OBSERVABLE SIGNALS ONLY (review defect #4): classify from the nonzero CLI exit code
     # plus the CLI's OWN error text — its stderr stream and, from stdout, ONLY lines carrying the
@@ -623,7 +623,7 @@ run_model() {
   # anything it can observe); the host creates the worker branch AFTER the run and asserts HEAD
   # never moved. `git switch -c` carries the model's uncommitted edits onto the new branch.
   _run_headless_harness "$prompt" allow
-  # [OPUS-4.8] Lift any model-declared follow-ups OUT of the target tree BEFORE the change-detection +
+  # Lift any model-declared follow-ups OUT of the target tree BEFORE the change-detection +
   # commit, so they become issues (worker.yml) but are NEVER committed. Doing it before the
   # "no repository changes" check means a follow-ups-only run correctly registers as no real work.
   if [[ -f "${TARGET_DIR:-.}/.worker-followups.jsonl" ]]; then
@@ -798,7 +798,7 @@ run_gate() {
     crate-scoped)
       [[ -f Cargo.toml ]] || die 'crate-scoped gate requires Cargo.toml'
       if [[ -z "$packages" ]]; then
-        # [OPUS-4.8] No area:<crate> label. Legitimate for a docs/non-crate change (e.g. a
+        # No area:<crate> label. Legitimate for a docs/non-crate change (e.g. a
         # role:docs task edits AGENTS.md only) — there is no crate to build, and the PR's CI
         # docs-quality gate is the real backstop. But it is a REAL error if the diff actually
         # touches crate source with no crate label, so fail closed in that case.
@@ -872,7 +872,7 @@ run_gate() {
       printf 'worker-live: workspace gate passed\n'
       ;;
     registry-selftest)
-      # [OPUS-4.8] python/actions gate for a self-managed target (the registry itself): the
+      # python/actions gate for a self-managed target (the registry itself): the
       # crate-scoped cargo gate does not fit a python repo. Fail-closed, and NON-VACUOUS — a run
       # that touched a script but found no runnable suite is an error, not a silent pass.
       registry_selftest_gate
@@ -2360,7 +2360,7 @@ with open(issue_file, encoding="utf-8") as handle:
 raw = " ".join(str(issue.get("title", "")).split())
 if not raw:
     raise SystemExit("worker-live: issue title is empty")
-# [OPUS-4.8] Build a Conventional-Commits PR title. `.github/workflows/pr-title.yml` validates it,
+# Build a Conventional-Commits PR title. `.github/workflows/pr-title.yml` validates it,
 # and because main uses squash-merge the PR TITLE becomes the release-plz-parsed commit subject. A
 # migrated issue title is "sq-<id>: <desc>", whose "sq-<id>" reads as an invalid type → the check
 # fails on EVERY worker PR. Derive an allowed type from role/kind, scope from area:<crate>, and keep

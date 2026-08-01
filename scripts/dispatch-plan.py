@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [OPUS-4.8] Registry self-management: the pure dispatch PLANNER for jeswr/agent-account-registry.
+# Registry self-management: the pure dispatch PLANNER for jeswr/agent-account-registry.
 # A copy of the sparq target's scripts/dispatch-plan.py. The shared dispatch.yml PLAN job clones
 # this repo (as a target), runs `scripts/dispatch-plan.py --self-test`, and imports compute_ready
 # / plan_dispatch / packages_of / labels_of / _routing_doc — exactly as it does for sparq.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [OPUS-4.8] Maintainer alerting — the opposite posture from the dispatcher (which FAILS CLOSED and
+# Maintainer alerting — the opposite posture from the dispatcher (which FAILS CLOSED and
 # silently skips a capped account): this FAILS LOUD so the maintainer learns when worker throughput is
 # degraded and can act (reset a subscription usage window, rotate an expired setup-token, top up codex).
 #

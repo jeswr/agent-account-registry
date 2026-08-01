@@ -373,7 +373,7 @@ WORKER_HEAD_RE = re.compile(r"sparq-agent/issue-([1-9][0-9]*)-[A-Za-z0-9._-]+")
 # groom's parked-PR marker ("Human attention required"). Either stands the loop down.
 HUMAN_OWNED_LABELS = ("review:needs-user", "needs:user")
 SECURITY_KEYWORDS = ("zk", "mpc", "crypto", "auth", "e2ee")
-# [OPUS-4.8] B3 / defect #2,#4: the trust-surface FILE paths. A worker PR whose diff touches ANY
+# B3 / defect #2,#4: the trust-surface FILE paths. A worker PR whose diff touches ANY
 # of these gate-weakening / orchestration-control files must NOT auto-arm regardless of its issue
 # labels — the cross-provider review still runs (automated), but the final arm click is a HUMAN's.
 # This is the ACTIVE, WIRED FILE-level control (previously the policy-row `security_paths` was
@@ -1261,7 +1261,7 @@ def _norm_path(path):
 
 
 def trust_surface_paths_touched(diff_files, surface_paths=DEFAULT_TRUST_SURFACE_PATHS):
-    """[OPUS-4.8] B3 / defects #2,#4: the ACTIVE FILE-level trust-surface control. Returns the
+    """B3 / defects #2,#4: the ACTIVE FILE-level trust-surface control. Returns the
     sorted subset of `diff_files` that touch a gate-weakening / orchestration-control path, so the
     ARM path can withhold auto-arm and route to a HUMAN. A path in `surface_paths` ending in `/`
     matches that directory subtree; a bare path matches itself or any descendant. Hostile-tolerant:
@@ -1818,7 +1818,7 @@ def _park_policy():
 
 
 def _pr_changed_files(repo, pr_number):
-    """[OPUS-4.8] B3: the LIVE changed-file paths of a PR (paginated). Used by ready_and_arm's
+    """B3: the LIVE changed-file paths of a PR (paginated). Used by ready_and_arm's
     trust-surface re-derivation so the arm gate keys on the actual diff (renamed paths included),
     not a planning-time snapshot. Malformed entries are dropped (fail closed toward human arm)."""
     pages = _gh_json([
@@ -5476,7 +5476,7 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     PR stays visible to the sweep for a bounded re-review instead of stalling non-draft/unarmed
     forever; if even the undo fails, this escalates to review:needs-user (never silent).
 
-    [OPUS-4.8] B3, REVISED per Decision 7 (maintainer 2026-07-18): the trust-surface set is
+    B3, REVISED per Decision 7 (maintainer 2026-07-18): the trust-surface set is
     still re-derived on LIVE changed files (renamed-path safe), but a hit no longer withholds
     the arm — approve IS the arm decision on every surface. The hits feed the POST-arm audit
     trail (_apply_trust_surface_audit: trust-surface label + one idempotent marker comment),
@@ -6025,7 +6025,7 @@ def review_outcome(args):
               "reviewed-sha stays unbound; the sweep re-reviews the current head")
         return
     post_findings(args.repo, args.pr, args.verdict_file, args.round)
-    # [OPUS-4.8] B3 / defects #2,#4: the ACTIVE FILE-level trust-surface control. Derive it from
+    # B3 / defects #2,#4: the ACTIVE FILE-level trust-surface control. Derive it from
     # the PR's own diff file set (the same list the reviewer just used). ANY gate-weakening /
     # orchestration-control path forces the security posture — the review stays automated, but an
     # approved PR that touches one is HUMAN-armed (needs-user), never auto-armed. The surface list
@@ -7038,7 +7038,7 @@ def _self_test():
     check("security label substring", security_flagged({"area:sparq-zk"}), True)
     check("security trust prefix", security_flagged({"trust:untrusted"}), True)
     check("security plain labels", security_flagged({"area:sparq-core", "role:impl"}), False)
-    # [OPUS-4.8] defect #3: per-target keyword injection flags the registry's trust areas that the
+    # defect #3: per-target keyword injection flags the registry's trust areas that the
     # builtin keyword set missed (area:worker/dispatch/set-up-account/review-loop/groom).
     check("defect#3 registry area unflagged by builtin",
           security_flagged({"area:worker", "role:impl", "status:ready"}), False)
@@ -7049,7 +7049,7 @@ def _self_test():
           security_flagged({"area:usage", "role:impl"},
                            extra_keywords=("worker", "dispatch")), False)
 
-    # [OPUS-4.8] B3 / defects #2,#4: the WIRED trust-surface FILE control (both directions +
+    # B3 / defects #2,#4: the WIRED trust-surface FILE control (both directions +
     # renamed-path + directory-subtree). A benign diff is NOT flagged; ANY gate-weakening path is.
     check("trust-surface benign diff",
           trust_surface_paths_touched(["README.md", "data/leases.json"]), [])
@@ -13217,7 +13217,7 @@ def main():
     arm.add_argument("--reviewer-provider", required=True)
     arm.add_argument("--arm", choices=("true", "false"), required=True)
     arm.add_argument("--issue", type=int)
-    # [OPUS-4.8] B3: the live trust-surface arm gate's path list (repeatable; from policy
+    # B3: the live trust-surface arm gate's path list (repeatable; from policy
     # security_paths). [issue #166] Unioned onto the mandatory DEFAULT_TRUST_SURFACE_PATHS floor
     # (resolve_trust_surface_paths) — it extends the defaults; empty -> defaults alone (fail closed).
     arm.add_argument("--surface-path", action="append", default=[],
@@ -13245,7 +13245,7 @@ def main():
     rout.add_argument("--round", required=True, type=int)
     rout.add_argument("--max-rounds", required=True, type=int)
     rout.add_argument("--security", action="store_true")
-    # [OPUS-4.8] B3 / defects #2,#4: the WIRED trust-surface FILE list from the target policy
+    # B3 / defects #2,#4: the WIRED trust-surface FILE list from the target policy
     # row's `security_paths` (repeatable). Any PR-diff path under one of these forces the human
     # arm even for a benign-labelled PR. [issue #166] Unioned onto the mandatory
     # DEFAULT_TRUST_SURFACE_PATHS floor (it extends the defaults); empty -> the defaults alone.
