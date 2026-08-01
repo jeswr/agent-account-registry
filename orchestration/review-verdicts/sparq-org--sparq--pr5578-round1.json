@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5578,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "23fcbeb97a9479faeb49447fb3fc891708e7a433",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly closes the stale WAC authorization-view window for statically targeted group-document writes. The referenced-document set is derived from the same fragment-stripping rule used by materialization, includes absent-but-referenced documents, is invalidated in lock-step with reindexing, and is consulted across the complete resolved target set before deciding whether to rematerialize. The end-to-end revoke and grant tests exercise the real enforced update and read paths without an explicit rebuild; the revoke case directly covers the fail-open-critical invariant, while the denied-write test confirms authorization is unchanged. The implementation remains conservative for dynamic/wildcard writes and does not introduce an authorization bypass or evident feature-state/build issue.",
+  "verdict": "approve"
+ }
+}
