@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1500,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f1b361cd0efeb88cfb5c233403a833862b50aaa3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`NON_VERDICT_CONCLUSIONS = {\"cancelled\"}` makes `newest_concluded_run` skip every cancelled run solely from its conclusion. The motivating non-verdict is narrower: a concurrency-cancelled run with `jobs.total_count == 0` before job creation. A cancelled run that has one or more jobs proves the workflow was ingested and its job graph was created, so it is a valid healthy ingestion verdict. With an older `action_required`/zero-job run followed by a cancelled run that created jobs, this code selects the stale rejection and continues to upsert/hold M4 even though ingestion recovered. The tests only construct cancelled rows without job evidence and therefore cannot distinguish the intended zero-job case from this overbroad rule.",
+    "file": "scripts/ci-latency-alert.py",
+    "fix_hint": "Classify cancellation using job evidence rather than conclusion alone: only treat a cancelled run as non-verdict when its job read establishes zero jobs (and fail closed when that read is unavailable); treat a cancelled run with jobs as affirmative ingestion evidence. Add detector-level tests for an older zero-job `action_required` followed by (1) cancelled/zero jobs, (2) cancelled/nonzero jobs, and (3) cancelled/unreadable jobs, asserting the correct finding and recovery census in each case.",
+    "severity": "major",
+    "title": "All cancelled runs are discarded without checking whether jobs were created"
+   }
+  ],
+  "progress": null,
+  "summary": "The self-observation path is carefully bound to repository, workflow, event, and newest run, and its tests exercise both the pure and live wiring. However, the cancelled-run change broadens a measured zero-job concurrency case into a rule for every cancelled run. A cancelled run can have created/executed jobs, which is affirmative evidence that workflow ingestion succeeded. Unconditionally stepping over it can retain an older rejection and keep/reopen the alert after recovery. Because the marquee classification is not sound for the full conclusion class it handles, changes are required.",
+  "verdict": "request_changes"
+ }
+}
