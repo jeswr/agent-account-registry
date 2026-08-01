@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5308,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c0ac360a03e956e74dd9f157afe5476f5307b8b4",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 5.2 says `subjects` is updated for the written document and `deps` is recomputed for the written document only, while section 5.3 computes `affected` from the pre-existing `rdeps(D)`. If P already reaches subject `<o#pol>` but Q previously contains no triple for it, Q is absent from P's old closure. A PUT to Q that introduces `<o#pol> acp:allow acl:Read` changes `subjects[<o#pol>]`, but recomputing only Q cannot discover that P must now depend on Q, and old `rdeps(Q)` omits P. The scoped path therefore retains a stale P slice. The analogous WAC case occurs when Q first adds facts for an Authorization subject declared elsewhere.",
+    "file": "research/solid-scoped-materializer-design.md",
+    "fix_hint": "Define update ordering that handles occurrence-set additions and deletions before `affected` is chosen: invalidate and recompute every closure whose reachable subject frontier intersects a changed subject, or conservatively fall back to full materialization whenever any subject occurrence set changes. Add named ACP and WAC regressions where P already references or declares a subject, Q initially does not mention it, and a PUT to Q introduces allow or agent facts; require scoped/full auth-view equality and demonstrate that recomputing only the written document's dependencies makes the test fail.",
+    "severity": "major",
+    "title": "Subject-occurrence changes still do not invalidate existing dependency closures"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 leaves the prior major incremental-invalidation defect materially unchanged. The design updates `subjects` for the written document, recomputes only that document's `deps`, and derives `affected` from the existing reverse dependencies. A write can add the first occurrence in Q of a subject already reachable from P; the old dependency graph cannot identify P, so P's retained slice can become stale even though full materialization changes it. Progress is stagnant because the same major finding remains.",
+  "verdict": "request_changes"
+ }
+}
