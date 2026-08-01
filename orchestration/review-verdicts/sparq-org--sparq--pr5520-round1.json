@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5520,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "057799aa9ba4ffacc6b379ff03a20f352e2e6e1e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "is_status_evaluator_artifact() excludes every check run named `ci-summary status`, without verifying that it belongs to the trusted ci-summary-status workflow or SELF_RUN_ID. A same-repository PR controls its workflow job names and can give a failing or pending job this exact name. run_gate() will then remove that real leg from the sibling set, so the currently required `ci-summary / gate` can report success despite the hidden failure. The new unit test explicitly validates name-only exclusion but never tests provenance, making this a merge-authorization bypass rather than merely an observational-stage concern.",
+    "file": "scripts/ci_summary_gate.py",
+    "fix_hint": "Identify evaluator artifacts using trusted run provenance (for example, resolve the check to its workflow run and require the exact default-branch workflow identity/event in addition to the job name), or exclude only the anchored evaluator run IDs known to the invocation. Add an adversarial test where a pull-request workflow creates a same-named failing job and prove it still gates, while genuine evaluator runs are excluded.",
+    "severity": "blocker",
+    "title": "Name-only artifact exclusion lets PR-controlled jobs bypass the required gate"
+   },
+   {
+    "body": "The workflow omits `workflow_run.workflows` and acknowledges that whether this subscribes to all workflows is unverified. GitHub's workflow_run configuration uses `workflows` to specify the upstream workflow(s); shipping an event-driven transport with no established upstream means the workflow may be invalid or never fire. This defeats stage 1 itself: there will be no status or parity evidence to observe, and the repository test only searches YAML text rather than validating the workflow against GitHub's schema/runtime semantics.",
+    "file": ".github/workflows/ci-summary-status.yml",
+    "fix_hint": "Use a GitHub-supported trigger configuration with explicitly established semantics and add schema validation. If enumerating workflows is unacceptable, redesign the event source before merging rather than shipping a known silent-failure assumption; document and test how newly added workflows are included.",
+    "severity": "major",
+    "title": "workflow_run trigger has no upstream workflow selector"
+   }
+  ],
+  "progress": null,
+  "summary": "The slotless evaluator is not safe or complete as implemented. Its artifact exclusion trusts only a caller-controlled check-run name, allowing a PR workflow to hide a failing job from both the existing required gate and the proposed status. In addition, the new workflow intentionally omits the workflow_run workflows selector even though that selector identifies the upstream workflows; the submitted configuration therefore lacks a valid, demonstrated event source and may never publish the observational status. The tests encode both assumptions rather than exercising GitHub provenance/configuration semantics.",
+  "verdict": "request_changes"
+ }
+}
