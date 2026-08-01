@@ -125,6 +125,14 @@ before it fires, so a single spiky tick never alarms. Document shape:
        "review_lane_runs_1h": 3,                         //   0 success + a review:changes backlog;
        "worker_attempts_1h": 4,                          //   idle = backlog but 0 concluded runs;
        "worker_success_rate_1h": 0.75,                   //   drafts are NOT part of the backlog
+       "worker_no_change_1h": 3,                         // #987: the NO-CHANGE gate. A no_change
+       "worker_no_change_rate_1h": 0.75,                 //   run SUCCEEDS as a run, so the success
+       "worker_no_change_by_reason_1h": {                //   rate above cannot see it. All four are
+         "unspecified": 0, "underspecified": 1,          //   null (never 0) when the model-health
+         "blocked_on_decision": 0, "too_large": 0,       //   ledger gave no attributable signal.
+         "already_done": 2, "other": 0},                 //   Reasons: no_change_routing.py's CLOSED
+       "worker_no_change_repeat_issues_1h": [            //   vocabulary, every one always present.
+         {"issue": 3241, "count": 2}],                   //   Repeats = issues looping on no-diff.
        "pr_open_rate": 5.0, "pr_close_rate": 0.0, "net_pr_flow": 5.0  // net>0 => backlog GROWING
      }
    }}
@@ -137,11 +145,19 @@ driven cross-repo from here, not from a sparq-hosted workflow), filtered to the 
 run-name and windowed by run COMPLETION time; in-progress runs count as neither an attempt nor a
 success. Absent that signal the health is `unknown` (fail-open — never a false `ok`).
 
+The `worker_no_change_*` block (registry #987 / #466 AC3) is censused from
+`data/model-health.json` on this same branch, read through model-health's own validator. A health
+record carries no target repo, so a row is charged to a target through the ONLY link there is: its
+`run_id` is `<workflow run id>.<attempt>`, matched against the run ids of the worker runs already
+attributed to that target above. That keeps the census and its denominator over one population, so
+the rate can never exceed 1; a row whose run id is empty or belongs to another target is charged to
+NOBODY. An unreadable health ledger publishes `null` across the four fields — never a reassuring 0.
+
 The current snapshot is also CAS-written to `data/metrics.json` on the `ledger` branch (same
 per-target shape plus a top-level `alerts: [...]`). The sole Pages owner, `dashboard.yml`, copies it
 to `site/metrics.json` in its generated artifact for the dashboard panel to consume. Alert rows:
 `{target, classification, fire, summary, metrics}` where `classification ∈ {backlog-growing,
-review-lane-stalled, ready-starved, worker-failing}`. Alerts are deduped to ONE rolling
+review-lane-stalled, ready-starved, worker-failing, worker-no-change}`. Alerts are deduped to ONE rolling
 `throughput-alert`-labelled issue per `(target, classification)`, and auto-close only with
 hysteresis (the condition must be clear for `recover_snapshots` consecutive ticks) so a
 boundary-flapping metric never churns the same issue open/closed — never spammed. A target SKIPPED

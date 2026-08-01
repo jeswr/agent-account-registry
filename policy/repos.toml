@@ -68,15 +68,20 @@
 # each snapshot to a bounded ring on the `ledger` branch (LEDGER_REF, data/metrics-history.json),
 # and upserts ONE deduped `throughput-alert` issue per (target, classification) when a SUSTAINED
 # backlog-growth-vs-drain condition holds. Classifications: backlog-growing | review-lane-stalled |
-# ready-starved | worker-failing. All fields optional; each must be the type shown:
+# ready-starved | worker-failing | worker-no-change. All fields optional; each must be the type
+# shown:
 #   [repos."owner/name".throughput]
 #   target_ready            = int in [1,100] (default 12) # curate-frontier ready-depth target
 #   open_pr_alert_threshold = positive int (default 20)   # backlog-growing needs prs_open above this
 #   ready_alert_threshold   = positive int (default 40)   # ready-starved needs issues_ready above this
 #   sustain_snapshots       = positive int (default 2)    # K: recent snapshots that must AGREE for
-#                                                         #   ANY of the four rules (all are sustained)
+#                                                         #   ANY of the five rules (all are sustained)
 #   worker_success_floor    = float in [0,1] (default 0.5)# worker-failing below this with attempts
-#   worker_min_samples      = positive int (default 3)    # worker-failing needs >= this many attempts
+#   worker_no_change_ceiling = float in [0,1] (default 0.5) # worker-no-change ABOVE this share of the
+#                                                         #   hour's worker runs leaving the tree
+#                                                         #   unchanged (registry #987 / #466 AC3)
+#   worker_min_samples      = positive int (default 3)    # worker-failing AND worker-no-change need
+#                                                         #   >= this many attempts
 #                                                         #   (a single failed run is noise, not a fail)
 #   recover_snapshots       = positive int (default 2)    # hysteresis: auto-close only after the
 #                                                         #   condition is clear this many ticks

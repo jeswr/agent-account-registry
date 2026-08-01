@@ -47,6 +47,13 @@
 #         "review_lane_runs_1h": int | null,   # review-fix runs CONCLUDED this hour (null=no signal)
 #         "worker_attempts_1h": int,           # worker runs concluded this hour (0 => rate null)
 #         "worker_success_rate_1h": float | null,
+#         # [#987] the NO-CHANGE gate, per target: how much of the fleet's work produced nothing.
+#         # All four are null when the model-health ledger yielded no attributable signal — never 0.
+#         "worker_no_change_1h": int | null,        # no_change health rows from THIS hour's runs
+#         "worker_no_change_rate_1h": float | null, # /worker_attempts_1h (0 attempts => null)
+#         "worker_no_change_by_reason_1h": {"<why_no_diff>": int, ...} | null,  # CLOSED vocabulary,
+#                                                   # every reason always present (zero rows included)
+#         "worker_no_change_repeat_issues_1h": [{"issue": int, "count": int}, ...] | null,
 #         # derived:
 #         "pr_open_rate": float,      # PRs opened / hr (from prs_opened_1h, or the ring delta)
 #         "pr_close_rate": float,     # PRs closed+merged / hr
@@ -76,6 +83,18 @@ if _gh_retry_spec is None or _gh_retry_spec.loader is None:
 gh_retry = importlib.util.module_from_spec(_gh_retry_spec)
 _gh_retry_spec.loader.exec_module(gh_retry)
 
+# [#987] The `why_no_diff` vocabulary is DECLARED ONCE, in no_change_routing.py (registry #701), and
+# IMPORTED here — never restated. The no-change census below emits one key per reason, so a copy of
+# the tuple would silently publish a stale breakdown the moment a reason is appended (#958 shape).
+_nc_spec = importlib.util.spec_from_file_location(
+    "registry_no_change_routing_for_metrics",
+    os.path.join(os.path.dirname(__file__), "no_change_routing.py"))
+if _nc_spec is None or _nc_spec.loader is None:
+    raise RuntimeError("cannot load the shared no_change routing vocabulary")
+no_change_routing = importlib.util.module_from_spec(_nc_spec)
+_nc_spec.loader.exec_module(no_change_routing)
+NO_CHANGE_REASONS = no_change_routing.NO_CHANGE_REASONS
+
 # Keep in sync with select-and-claim.py / groom.py / model-health.py LEDGER_REF (issue #28 data
 # plane). Every write pins this ref; readers fail LOUD if the branch is missing.
 LEDGER_REF = os.environ.get("REGISTRY_LEDGER_REF", "ledger")
@@ -103,6 +122,7 @@ BACKLOG_GROWING = "backlog-growing"
 REVIEW_LANE_STALLED = "review-lane-stalled"
 READY_STARVED = "ready-starved"
 WORKER_FAILING = "worker-failing"
+WORKER_NO_CHANGE = "worker-no-change"
 
 # --- per-target default thresholds; overridable in policy/repos.toml [repos.*].throughput ---
 DEFAULT_THRESHOLDS = {
@@ -111,8 +131,16 @@ DEFAULT_THRESHOLDS = {
     "sustain_snapshots": 2,          # K: how many recent snapshots must agree (SUSTAINED, not spiky)
     "worker_success_floor": 0.5,     # worker-failing when success rate below this with >0 attempts
     "worker_min_samples": 3,         # worker-failing needs at least this many attempts (anti-noise)
+    # [#987] worker-no-change fires when MORE than this share of the hour's concluded worker runs
+    # left the tree untouched. 0.5 sits well under the ~75% #466 measured and well over the rate a
+    # healthy fleet shows, and it shares worker_min_samples so one honest empty-handed run is noise.
+    "worker_no_change_ceiling": 0.5,
     "recover_snapshots": 2,          # hysteresis: condition must be clear this many ticks to recover
 }
+# The thresholds that are RATIOS in [0, 1] rather than positive counts — validated as floats in
+# _thresholds_of. Named as a set so adding a ratio threshold cannot fall through to the
+# positive-integer arm (which would reject every legal value it can take).
+RATIO_THRESHOLD_KEYS = frozenset({"worker_success_floor", "worker_no_change_ceiling"})
 CURATOR_THROUGHPUT_KEYS = {"target_ready"}
 
 # readiness engines per target (declared in policy; falls back by repo below)
@@ -134,6 +162,60 @@ class MetricsConflict(MetricsError):
 # =============================================================================================
 # PURE metric computation (unit-tested; no I/O)
 # =============================================================================================
+def no_change_census(records, run_ids):
+    """PURE per-target census of the NO-CHANGE gate (#987 / #466 AC3), from validated model-health
+    rows. Returns the three `worker_no_change_*` count inputs compute_target_metrics consumes.
+
+    `records` are model-health rows already validated + pruned by model-health's own reader, so a
+    `no_change` row's `issue` is a bounded int and its `why_no_diff` (when present) is inside the
+    CLOSED `NO_CHANGE_REASONS` vocabulary. Nothing else from a row is republished: the snapshot is
+    served on a PUBLIC page, and these two are the only no-change fields whose grammar is closed.
+
+    ATTRIBUTION. A health record carries no target repo, so it is charged to a target through the
+    ONLY thing that links it to one: `run_id` is `<workflow run id>.<attempt>` (worker.yml's health
+    step), and `run_ids` is the set of worker-run ids ALREADY attributed to this target by run-name
+    and windowed by conclusion time. Using that same set — rather than a second timestamp filter —
+    is what keeps `no_change <= worker_attempts_1h` true by construction, so the published rate can
+    never exceed 1. An UNATTRIBUTABLE row (empty/absent run_id, or one whose run is not this
+    target's) is charged to NOBODY: guessing a target here would invent wasted runs for a repo that
+    never had them.
+
+    The reason breakdown always carries EVERY reason in the vocabulary, including the zeroes — a
+    census that omits its empty rows reads as "not measured" exactly when an operator needs "0"
+    (AGENTS pre-flight item 8). Repeat offenders are the issues with >= 2 no-change rows in the
+    window, newest-loudest first; the list is UNCAPPED on purpose (it is already bounded by the
+    ledger's own retention ceiling, and a silent top-N would hide the worst loopers)."""
+    counted = 0
+    by_reason = {reason: 0 for reason in NO_CHANGE_REASONS}
+    per_issue = {}
+    wanted = {rid for rid in (run_ids or ()) if isinstance(rid, str) and rid}
+    for record in records or ():
+        if not isinstance(record, dict) or record.get("exit_class") != "no_change":
+            continue
+        run_id = record.get("run_id")
+        if not isinstance(run_id, str) or run_id.split(".", 1)[0] not in wanted:
+            continue
+        counted += 1
+        # The absent -> `unspecified` fold is no_change_routing's, called on the single row so the
+        # breakdown can never drift from the routing decision the same field drives (#701).
+        for reason in no_change_routing.declared_reasons([record]):
+            # Indexed, never `.get`-folded: declared_reasons only ever returns a member of
+            # NO_CHANGE_REASONS, which is the same tuple that seeded this dict, so the key set of
+            # this PUBLICLY-served document is closed by construction. A producer that broke that
+            # contract must raise here rather than quietly mint a new key on a served page.
+            by_reason[reason] += 1
+        issue = record.get("issue")
+        if isinstance(issue, int) and not isinstance(issue, bool):
+            per_issue[issue] = per_issue.get(issue, 0) + 1
+    repeats = sorted(((issue, n) for issue, n in per_issue.items() if n > 1),
+                     key=lambda pair: (-pair[1], pair[0]))
+    return {
+        "worker_no_change_1h": counted,
+        "worker_no_change_by_reason_1h": by_reason,
+        "worker_no_change_repeat_issues_1h": [{"issue": issue, "count": n} for issue, n in repeats],
+    }
+
+
 def compute_target_metrics(counts):
     """Build one target's metric dict from raw collector COUNTS.
 
@@ -144,12 +226,16 @@ def compute_target_metrics(counts):
       review_lane_success_1h  (int: # of SUCCEEDED review-fix runs in the last hour),
       review_lane_runs_1h      (int: # of review-fix runs attempted in the last hour),
       worker_success_1h, worker_attempts_1h  (ints: worker run outcomes in the last hour)
+      worker_no_change_1h, worker_no_change_by_reason_1h, worker_no_change_repeat_issues_1h
+                               (the no_change_census() block; ABSENT when the model-health ledger
+                                gave no attributable signal — which publishes null, never 0)
 
     The instantaneous per-hour rates come straight from authoritative REST list windows; the REAL
     rate-OVER-TIME signal is the SUSTAINED (K-snapshot) condition that evaluate_alerts() reads off
     the ledger ring — so a single spiky hour never alarms. Derived:
     pr_open_rate, pr_close_rate (merged+closed), net_pr_flow, review_lane_health,
-    worker_success_rate_1h. Pure — no network, no clock beyond what the caller stamps."""
+    worker_success_rate_1h, worker_no_change_rate_1h. Pure — no network, no clock beyond what the
+    caller stamps."""
     g = lambda k: int(counts.get(k, 0) or 0)  # noqa: E731 — terse local getter
     prs_opened_1h = g("prs_opened_1h")
     # close-rate counts BOTH merges and plain closes (either drains the open-PR backlog).
@@ -189,6 +275,15 @@ def compute_target_metrics(counts):
     worker_success_rate = (round(g("worker_success_1h") / worker_attempts, 4)
                            if worker_attempts > 0 else None)
 
+    # [#987] The no-change gate. `worker_no_change_1h` ABSENT means the model-health ledger yielded
+    # nothing attributable this tick, which publishes null across all four fields — an unreadable
+    # ledger must never render as a healthy 0% wasted-run rate. Present-with-0 attempts also leaves
+    # the RATE null: 0/0 is not 0.0, and a 0.0 there would read as "the fleet wasted nothing".
+    has_no_change = "worker_no_change_1h" in counts
+    worker_no_change = g("worker_no_change_1h") if has_no_change else None
+    worker_no_change_rate = (round(worker_no_change / worker_attempts, 4)
+                             if has_no_change and worker_attempts > 0 else None)
+
     return {
         "issues_open": g("issues_open"),
         "issues_ready": g("issues_ready"),
@@ -209,6 +304,12 @@ def compute_target_metrics(counts):
         "review_lane_runs_1h": concluded if "review_lane_runs_1h" in counts else None,
         "worker_attempts_1h": worker_attempts,
         "worker_success_rate_1h": worker_success_rate,
+        "worker_no_change_1h": worker_no_change,
+        "worker_no_change_rate_1h": worker_no_change_rate,
+        "worker_no_change_by_reason_1h": (counts.get("worker_no_change_by_reason_1h")
+                                          if has_no_change else None),
+        "worker_no_change_repeat_issues_1h": (counts.get("worker_no_change_repeat_issues_1h")
+                                              if has_no_change else None),
         "pr_open_rate": round(pr_open_rate, 4),
         "pr_close_rate": round(pr_close_rate, 4),
         "net_pr_flow": net_pr_flow,
@@ -259,6 +360,18 @@ def _worker_failing_pred(th):
         return (isinstance(wsr, (int, float))
                 and r.get("worker_attempts_1h", 0) >= th["worker_min_samples"]
                 and wsr < th["worker_success_floor"])
+    return pred
+
+
+def _worker_no_change_pred(th):
+    def pred(r):
+        rate = r.get("worker_no_change_rate_1h")
+        # Same min-sample floor as worker-failing: with the ledger's per-run granularity a single
+        # honest "nothing to do here" run is 100% and must not page. `None` (no ledger signal, or
+        # no attempts) is NOT a firing condition — absent evidence never alarms.
+        return (isinstance(rate, (int, float)) and not isinstance(rate, bool)
+                and r.get("worker_attempts_1h", 0) >= th["worker_min_samples"]
+                and rate > th["worker_no_change_ceiling"])
     return pred
 
 
@@ -317,6 +430,27 @@ def evaluate_alerts(current, history, thresholds_by_target):
                                  f"({m.get('worker_attempts_1h', 0)} attempts this hour)",
                                  {"worker_success_rate_1h": wsr,
                                   "worker_attempts_1h": m.get("worker_attempts_1h", 0)}))
+
+        # 5) worker-no-change [#987]: the fleet is burning worker slots and account leases to
+        #    produce no diff at all. Distinct from worker-failing — these runs SUCCEED as runs, so
+        #    the success rate can read healthy while ~75% of the work lands nothing (#466). The
+        #    breakdown rides along on the alert body: `already_done` means the issues are finished
+        #    and want closing, `underspecified`/`blocked_on_decision` mean they want a human.
+        if _sustained(history, target, k, _worker_no_change_pred(th)):
+            ncr = m.get("worker_no_change_rate_1h")
+            alerts.append(_alert(target, WORKER_NO_CHANGE,
+                                 f"no-change rate {ncr:.0%} > "
+                                 f"{th['worker_no_change_ceiling']:.0%} ceiling over {k} snapshots "
+                                 f"({m.get('worker_no_change_1h')} of "
+                                 f"{m.get('worker_attempts_1h', 0)} worker runs this hour left the "
+                                 f"tree unchanged)",
+                                 {"worker_no_change_rate_1h": ncr,
+                                  "worker_no_change_1h": m.get("worker_no_change_1h"),
+                                  "worker_attempts_1h": m.get("worker_attempts_1h", 0),
+                                  "worker_no_change_by_reason_1h":
+                                      m.get("worker_no_change_by_reason_1h"),
+                                  "worker_no_change_repeat_issues_1h":
+                                      m.get("worker_no_change_repeat_issues_1h")}))
     return alerts
 
 
@@ -369,7 +503,7 @@ def _thresholds_of(repo, row):
             if not isinstance(val, int) or isinstance(val, bool) or not 1 <= val <= 100:
                 raise MetricsError(f"{key} for {repo!r} must be an integer in [1, 100]")
             continue
-        if key == "worker_success_floor":
+        if key in RATIO_THRESHOLD_KEYS:
             if not isinstance(val, (int, float)) or isinstance(val, bool) or not (0.0 <= val <= 1.0):
                 raise MetricsError(f"{key} for {repo!r} must be a float in [0, 1]")
         elif not isinstance(val, int) or isinstance(val, bool) or val <= 0:
@@ -636,14 +770,18 @@ def _ready_issues_module():
     return mod
 
 
-def collect_counts(repo, kind, token, now, orchestration=None):
+def collect_counts(repo, kind, token, now, orchestration=None, health_records=None):
     """Live raw counts from REST lists, lag-tolerant 24h search, and the readiness engine.
 
     `orchestration`, when given, is (orchestration_repo, orchestration_token): the repo that HOSTS
     this target's review-fix / worker workflows. sparq's review orchestration is driven cross-repo
     from the REGISTRY's own review-fix.yml/worker.yml, NOT from a sparq-hosted workflow — so the
     lane/worker health for a target must be read off the ORCHESTRATION repo's runs, filtered to
-    that target, not off `repo`'s actions. When absent, lane/worker health is left unknown/null."""
+    that target, not off `repo`'s actions. When absent, lane/worker health is left unknown/null.
+
+    `health_records`, when given, is the validated model-health window read ONCE per tick by the
+    caller (it is a fleet-wide ledger, not a per-target read). None — an unreadable ledger, or a
+    run that never read it — leaves every no-change field null rather than 0 (#987)."""
     h1, h24 = _iso_ago(3600, now), _iso_ago(86400, now)
     current, open_issues = _current_state(repo, token)
     c = {
@@ -666,10 +804,15 @@ def collect_counts(repo, kind, token, now, orchestration=None):
             c["review_lane_runs_1h"] = total
             c["review_lane_success_1h"] = ok
         # worker success this hour (best-effort; absent => worker_success_rate_1h stays null)
-        wattempts, wok = _worker_runs(orch_repo, repo, orch_token, now)
+        wattempts, wok, wrun_ids = _worker_runs(orch_repo, repo, orch_token, now)
         if wattempts is not None:
             c["worker_attempts_1h"] = wattempts
             c["worker_success_1h"] = wok
+            # [#987] The no-change census over THIS target's worker runs. Gated on the runs signal
+            # too: without the run-id set there is no way to tell which ledger rows are this
+            # target's, and a census computed over the wrong population is worse than none.
+            if health_records is not None:
+                c.update(no_change_census(health_records, wrun_ids))
     return c
 
 
@@ -703,8 +846,14 @@ def _run_in_window(run, since_iso):
 
 def _orchestration_lane_runs(orch_repo, target, lane_names, token, now, window_s=3600,
                              fetch_lookback_s=6 * 3600):
-    """(concluded, succeeded) run counts for `target`'s runs of `lane_names` on the ORCHESTRATION
-    repo that CONCLUDED within the trailing window, or (None, None) if the runs API is unavailable.
+    """(concluded, succeeded, run_ids) for `target`'s runs of `lane_names` on the ORCHESTRATION
+    repo that CONCLUDED within the trailing window, or (None, None, set()) if the runs API is
+    unavailable.
+
+    `run_ids` is the id of every run counted into `concluded`, as strings — the ONLY key that links
+    a model-health ledger row (which carries no repo) back to the target it acted on (#987). It is
+    derived HERE, from the same filtered walk that produced the counts, so the census can never be
+    computed over a different population than the denominator it divides by.
 
     Only runs whose conclusion is set (completed) count toward `concluded`; an in-progress run is
     neither an attempt nor a success — treating it as attempted-but-failed reads the lane as
@@ -722,8 +871,8 @@ def _orchestration_lane_runs(orch_repo, target, lane_names, token, now, window_s
     fetch_since = _iso_ago(max(window_s, fetch_lookback_s), now)
     runs = _paginate_runs(orch_repo, fetch_since, token, now)
     if runs is None:
-        return (None, None)
-    concluded, succeeded = 0, 0
+        return (None, None, set())
+    concluded, succeeded, run_ids = 0, 0, set()
     for r in runs:
         if not isinstance(r, dict) or not _run_matches(r, lane_names, target):
             continue
@@ -735,7 +884,10 @@ def _orchestration_lane_runs(orch_repo, target, lane_names, token, now, window_s
         concluded += 1
         if conclusion == "success":
             succeeded += 1
-    return (concluded, succeeded)
+        run_id = r.get("id")
+        if isinstance(run_id, int) and not isinstance(run_id, bool):
+            run_ids.add(str(run_id))
+    return (concluded, succeeded, run_ids)
 
 
 def _paginate_runs(repo, since_iso, token, now, page_cap=10):
@@ -764,7 +916,11 @@ def _paginate_runs(repo, since_iso, token, now, page_cap=10):
 
 
 def _review_lane_runs(orch_repo, target, token, now):
-    return _orchestration_lane_runs(orch_repo, target, REVIEW_LANE_WORKFLOWS, token, now)
+    # The review lane has no ledger census to join, so its run ids are dropped here rather than
+    # threaded through a caller that would never read them.
+    concluded, succeeded, _run_ids = _orchestration_lane_runs(
+        orch_repo, target, REVIEW_LANE_WORKFLOWS, token, now)
+    return (concluded, succeeded)
 
 
 def _worker_runs(orch_repo, target, token, now):
@@ -888,6 +1044,51 @@ class GitHubAPI:
 
 def ledger_read_path(registry_repo):
     return f"/repos/{registry_repo}/contents/{LEDGER_PATH}?ref={LEDGER_REF}"
+
+
+def _model_health_module():
+    """Load scripts/model-health.py (hyphenated name => importlib, the _ready_issues_module pattern,
+    cached). LAZY on purpose: metrics.py is also read as TEXT by metrics-alert.py's sparse-checkout
+    self-test, and the collector job that actually calls this takes the FULL checkout."""
+    cached = getattr(_model_health_module, "_mod", None)
+    if cached is not None:
+        return cached
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location("registry_model_health_for_metrics",
+                                                  os.path.join(here, "model-health.py"))
+    if spec is None or spec.loader is None:
+        raise MetricsError("cannot load scripts/model-health.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _model_health_module._mod = mod
+    return mod
+
+
+def read_health_window(api, registry_repo, now):
+    """The validated, pruned model-health window — the raw no-change signal (#987) — or None.
+
+    Read through model-health's OWN reader/validator, never a private parse, so a poisoned row is
+    refused here exactly as it is everywhere else. Returns None (never []) on any failure: None
+    means NO EVIDENCE and publishes null across the no-change fields, while [] would publish a
+    confident `0 wasted runs` off an unreadable ledger. Never raises — this is telemetry riding
+    alongside the throughput collection, and a health-ledger blip must not take the whole snapshot
+    (and with it every other alert) down."""
+    def unreadable(exc):
+        print(f"::warning::metrics: the model-health ledger is unreadable ({exc}) — the no-change "
+              "telemetry is published as null this tick, NOT as zero")
+        return None
+
+    try:
+        health = _model_health_module()
+    except (MetricsError, OSError, ImportError, SyntaxError) as exc:
+        return unreadable(exc)
+    # HealthError is model-health's own RuntimeError; MetricsError is what THIS module's api client
+    # raises on a transport/HTTP failure (read_ledger's `api` is ours, so both classes reach here).
+    try:
+        records, _sha = health.read_ledger(api, registry_repo)
+        return health.prune(records, now)
+    except (health.HealthError, MetricsError, ValueError, OSError) as exc:
+        return unreadable(exc)
 
 
 def read_history(api, registry_repo):
@@ -1114,7 +1315,8 @@ def upsert_alert(action, repo, token, maintainer):
     return False
 
 
-ALERT_CLASSES = (BACKLOG_GROWING, REVIEW_LANE_STALLED, READY_STARVED, WORKER_FAILING)
+ALERT_CLASSES = (BACKLOG_GROWING, REVIEW_LANE_STALLED, READY_STARVED, WORKER_FAILING,
+                 WORKER_NO_CHANGE)
 
 # The per-class predicate factory used both to FIRE (sustained over K) and to RECOVER (clear over
 # recover_snapshots). Keeping one source of truth means the recovery test can never drift from the
@@ -1124,6 +1326,7 @@ _CLASS_PRED = {
     REVIEW_LANE_STALLED: _review_stalled_pred,
     READY_STARVED: _ready_starved_pred,
     WORKER_FAILING: _worker_failing_pred,
+    WORKER_NO_CHANGE: _worker_no_change_pred,
 }
 
 
@@ -1177,13 +1380,15 @@ def _token_for(repo, token_map, default_token):
     return (token_map or {}).get(owner) or default_token
 
 
-def build_snapshot(targets, token_map, default_token, now, orchestration=None):
+def build_snapshot(targets, token_map, default_token, now, orchestration=None,
+                   health_records=None):
     """Collect live counts for every target and assemble the snapshot (no ledger write here). Each
     target is read with its owner's token so a cross-owner search is never attempted on the wrong
     token; a target whose token is missing is SKIPPED loudly (never silently zero) — a skipped
     target has NO row, which the recovery reconciler uses to avoid closing its alerts on no
     evidence. `orchestration` = (orch_repo, orch_token): the repo hosting the review-fix/worker
-    workflows, read for per-target lane/worker health."""
+    workflows, read for per-target lane/worker health. `health_records` = the fleet-wide validated
+    model-health window, read ONCE by the caller and censused per target (#987)."""
     generated_at = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     out = {"generated_at": generated_at, "_ts": int(now), "schema_version": 1, "targets": {}}
     for repo, kind, _thr in targets:
@@ -1191,7 +1396,8 @@ def build_snapshot(targets, token_map, default_token, now, orchestration=None):
         if not tok:
             print(f"::warning::metrics: no token for {repo} — skipping (not counted as zero)")
             continue
-        counts = collect_counts(repo, kind, tok, now, orchestration=orchestration)
+        counts = collect_counts(repo, kind, tok, now, orchestration=orchestration,
+                                health_records=health_records)
         out["targets"][repo] = compute_target_metrics(counts)
     return out
 
@@ -1205,9 +1411,12 @@ def run(policy_path, token_map, registry_token, registry_repo, maintainer, do_al
     targets = load_targets(policy_path)
     thresholds_by_target = {repo: thr for repo, _kind, thr in targets}
     orchestration = (registry_repo, registry_token)
-    snapshot = build_snapshot(targets, token_map, registry_token, now, orchestration=orchestration)
-
     api = GitHubAPI(registry_token)
+    # ONE fleet-wide read of the model-health window per tick, censused per target below (#987).
+    health_records = read_health_window(api, registry_repo, now)
+    snapshot = build_snapshot(targets, token_map, registry_token, now, orchestration=orchestration,
+                              health_records=health_records)
+
     read_history(api, registry_repo)  # fail LOUD before we compute if the ledger branch is missing
     append_snapshot(api, registry_repo, snapshot)
     history, _sha = read_history(api, registry_repo)  # re-read the pruned ring (includes current)
@@ -1359,6 +1568,8 @@ def _self_test():
     _test_rate_derivation(chk)
     _test_alert_rules(chk)
     _test_alert_mutation_nonvacuous(chk)
+    _test_no_change_census(chk)
+    _test_no_change_wiring(chk)
     _test_list_api_contract(chk)
     _test_event_list_contract(chk)
     _test_collection_contract(chk)
@@ -1416,6 +1627,256 @@ def _test_metric_computation(chk):
                   if k not in ("worker_attempts_1h", "worker_success_1h")}
     chk("worker rate null when no runs",
         compute_target_metrics(no_workers)["worker_success_rate_1h"], None)
+
+
+# [#987] Health rows are built through model-health's OWN writer, never hand-shaped: the census
+# reads field names (`exit_class`/`run_id`/`issue`/`why_no_diff`) that make_record decides, and a
+# hand-written fixture would stay green through a rename on the writer side. make_record also
+# fail-closed VALIDATES what it returns, so every fixture below is a row the live reader accepts.
+def _health_row(run_id, issue=None, why=None, exit_class="no_change"):
+    return _model_health_module().make_record(
+        "anthropic", "a1b2c3d4e5f60718", "opus5", exit_class, run_id, 1_700_000_000,
+        issue=issue, why_no_diff=why)
+
+
+def _test_no_change_census(chk):
+    """[#987 / #466 AC3] Per-issue telemetry for the no-change gate.
+
+    #466 measured ~75% of worker runs producing no diff at all, and none of it was visible: a
+    no_change is a run that SUCCEEDS as a run, so `worker_success_rate_1h` reads healthy straight
+    through it. These assertions pin (a) which ledger rows are charged to a target, (b) that a
+    breakdown separating `already_done` (close the issue) from `underspecified` (get a human) is
+    published, (c) that no-signal publishes NULL rather than a reassuring zero, and (d) that moving
+    the ceiling flips the alert.
+    """
+    import contextlib
+    import io
+    global _model_health_module
+
+    # Six worker runs for THIS target. 111/112/113 are three attempts at ONE issue — the exact
+    # #701 looper shape — 114/116 are one repeat pair, 115 succeeded with a real diff.
+    attributed = {"111", "112", "113", "114", "115", "116"}
+    records = [
+        _health_row("111.1", issue=3241, why="underspecified"),
+        _health_row("112.1", issue=3241),                        # no declaration => unspecified
+        _health_row("113.2", issue=3241, why="already_done"),    # ATTEMPT suffix must not defeat it
+        _health_row("114.1", issue=2575, why="already_done"),
+        _health_row("116.1", issue=2575, why="other"),
+        _health_row("115.1", exit_class="success"),              # a real diff — never a no-change
+        _health_row("999.1", issue=42, why="too_large"),         # ANOTHER target's worker run
+        _health_row("", issue=43, why="too_large"),              # unattributable: no run id at all
+    ]
+    census = no_change_census(records, attributed)
+    chk("census counts only the no_change rows of THIS target's worker runs",
+        census["worker_no_change_1h"], 5)
+    # The breakdown is written out LITERALLY rather than derived from NO_CHANGE_REASONS: comparing
+    # the emitted keys against the constant the emitter reads is a tautology that cannot fail
+    # (AGENTS pre-flight 2b). Appending a reason to the vocabulary must land here too — this dict IS
+    # the published public schema.
+    chk("census breaks the reasons out, with a ZERO row for every unused reason",
+        census["worker_no_change_by_reason_1h"],
+        {"unspecified": 1, "underspecified": 1, "blocked_on_decision": 0, "too_large": 0,
+         "already_done": 2, "other": 1})
+    chk("...so `already_done` (close the issue) is separable from `underspecified` (needs a human)",
+        (census["worker_no_change_by_reason_1h"]["already_done"],
+         census["worker_no_change_by_reason_1h"]["underspecified"]), (2, 1))
+    chk("census names the repeat offenders, loudest first",
+        census["worker_no_change_repeat_issues_1h"],
+        [{"issue": 3241, "count": 3}, {"issue": 2575, "count": 2}])
+    # DIRECTION 2 of the attribution guard: drop the run-id filter and the other target's row plus
+    # the unattributable one are charged here — 5 becomes 7 and issue 42 appears from nowhere.
+    wide = no_change_census(records, attributed | {"999", ""})
+    chk("an unattributable row is charged to NOBODY (it is not simply the other-target filter)",
+        (wide["worker_no_change_1h"],
+         wide["worker_no_change_by_reason_1h"]["too_large"]), (6, 1))
+    # A tie on count is broken by issue number ASCENDING (a stable, reviewable order).
+    tie = no_change_census([_health_row("111.1", issue=9), _health_row("112.1", issue=9),
+                            _health_row("113.1", issue=4), _health_row("114.1", issue=4),
+                            _health_row("115.1", issue=8)], attributed)
+    chk("repeat offenders tie-break on issue number, and a ONE-row issue is not a repeat",
+        tie["worker_no_change_repeat_issues_1h"],
+        [{"issue": 4, "count": 2}, {"issue": 9, "count": 2}])
+    chk("an EMPTY window still censuses — a zero row, never a missing one",
+        no_change_census([], attributed),
+        {"worker_no_change_1h": 0,
+         "worker_no_change_by_reason_1h": {"unspecified": 0, "underspecified": 0,
+                                           "blocked_on_decision": 0, "too_large": 0,
+                                           "already_done": 0, "other": 0},
+         "worker_no_change_repeat_issues_1h": []})
+
+    # ---- the RATE, and the null-vs-zero boundary the acceptance criteria name explicitly.
+    m = compute_target_metrics({**SPARQ_LIVE, "worker_attempts_1h": 6, "worker_success_1h": 6,
+                                **census})
+    chk("no-change rate is the census over the SAME hour's concluded worker runs",
+        m["worker_no_change_rate_1h"], round(5 / 6, 4))
+    chk("...and the raw count rides along for the alert body", m["worker_no_change_1h"], 5)
+    chk("the reason breakdown reaches the published snapshot row",
+        m["worker_no_change_by_reason_1h"]["already_done"], 2)
+    # Sliced, not indexed: a mutant that empties this list must RED this row, not raise an
+    # IndexError that aborts the suite and hides every check below it (AGENTS pre-flight 4).
+    chk("the repeat-offender list reaches the published snapshot row",
+        m["worker_no_change_repeat_issues_1h"][:1], [{"issue": 3241, "count": 3}])
+    zero_attempts = compute_target_metrics({**SPARQ_LIVE, "worker_attempts_1h": 0,
+                                            "worker_success_1h": 0,
+                                            **no_change_census([], attributed)})
+    chk("ZERO attempts leaves the rate NULL, not 0.0 (0/0 is not 'nothing was wasted')",
+        zero_attempts["worker_no_change_rate_1h"], None)
+    chk("...while the COUNT is a real 0 — the census ran and found nothing",
+        zero_attempts["worker_no_change_1h"], 0)
+    real_zero = compute_target_metrics({**SPARQ_LIVE, "worker_attempts_1h": 4,
+                                        "worker_success_1h": 4,
+                                        **no_change_census([], attributed)})
+    chk("4 attempts and no no-change rows IS 0.0 — distinguishable from 'not measured'",
+        real_zero["worker_no_change_rate_1h"], 0.0)
+    absent = compute_target_metrics(SPARQ_LIVE)   # no census at all: an unreadable health ledger
+    chk("NO ledger signal publishes null across all four fields, never a healthy-looking zero",
+        [absent[k] for k in ("worker_no_change_1h", "worker_no_change_rate_1h",
+                             "worker_no_change_by_reason_1h",
+                             "worker_no_change_repeat_issues_1h")],
+        [None, None, None, None])
+
+    # ---- the ALERT. The tripping fixture is the #466 shape: 3 of 4 runs wasted.
+    firing = compute_target_metrics({**REGISTRY_LIVE, "worker_attempts_1h": 4,
+                                     "worker_success_1h": 4,
+                                     "worker_no_change_1h": 3,
+                                     "worker_no_change_by_reason_1h": {"already_done": 3},
+                                     "worker_no_change_repeat_issues_1h": []})
+    chk("the tripping fixture's rate is the 0.75 #466 measured",
+        firing["worker_no_change_rate_1h"], 0.75)
+    chk("...and its SUCCESS rate reads a perfect 1.0 — which is why worker-failing cannot see it",
+        firing["worker_success_rate_1h"], 1.0)
+    hist = [_snap(1000, {"o/r": firing}), _snap(2000, {"o/r": firing})]
+
+    def fired(thresholds, history=None):
+        history = history or hist
+        return {a["classification"]
+                for a in evaluate_alerts(history[-1], history, {"o/r": thresholds})}
+
+    # THRESHOLD MUTATION (the acceptance criterion): the literal ceilings below are written out, not
+    # read from DEFAULT_THRESHOLDS, so a mutant that moves the shipped default cannot move the
+    # expected value with it (AGENTS pre-flight 2c).
+    chk("worker-no-change FIRES at a 0.5 ceiling", WORKER_NO_CHANGE in fired(
+        {**DEFAULT_THRESHOLDS, "worker_no_change_ceiling": 0.5}), True)
+    chk("...and a 0.9 ceiling silences exactly that alert (the threshold is load-bearing)",
+        WORKER_NO_CHANGE in fired({**DEFAULT_THRESHOLDS, "worker_no_change_ceiling": 0.9}), False)
+    chk("a rate EXACTLY at the ceiling does not fire (strictly above, like every other rule)",
+        WORKER_NO_CHANGE in fired({**DEFAULT_THRESHOLDS, "worker_no_change_ceiling": 0.75}), False)
+    chk("the shipped default ceiling fires on the #466 shape",
+        WORKER_NO_CHANGE in fired(DEFAULT_THRESHOLDS), True)
+    # the min-sample floor, mutated the same way: 4 attempts is above 3 and below 5.
+    chk("min_samples 5 silences it — one or two empty-handed runs are not a failing gate",
+        WORKER_NO_CHANGE in fired({**DEFAULT_THRESHOLDS, "worker_min_samples": 5}), False)
+    chk("worker-FAILING does NOT fire on this shape (the classes are genuinely distinct)",
+        WORKER_FAILING in fired(DEFAULT_THRESHOLDS), False)
+    # SUSTAINED, like every other rule: one tick never alarms.
+    chk("a single snapshot never alarms (K=2 sustain)",
+        WORKER_NO_CHANGE in fired(DEFAULT_THRESHOLDS, [_snap(2000, {"o/r": firing})]), False)
+    # absent evidence never alarms, in either of its two shapes.
+    null_rate = compute_target_metrics({**REGISTRY_LIVE, "worker_attempts_1h": 4,
+                                        "worker_success_1h": 0})
+    null_hist = [_snap(1000, {"o/r": null_rate}), _snap(2000, {"o/r": null_rate})]
+    chk("a NULL no-change rate never alarms (no ledger signal is not a wasted-run rate of 100%)",
+        WORKER_NO_CHANGE in fired(DEFAULT_THRESHOLDS, null_hist), False)
+    chk("...though that same fixture DOES trip worker-failing, so the history itself is live",
+        WORKER_FAILING in fired(DEFAULT_THRESHOLDS, null_hist), True)
+    # the class is registered for RECOVERY as well as firing — an alert with no auto-close is a
+    # conveyor onto the maintainer's desk (#703).
+    healthy = compute_target_metrics({**REGISTRY_LIVE, "worker_attempts_1h": 4,
+                                      "worker_success_1h": 4,
+                                      **no_change_census([], attributed)})
+    rec = compute_recoveries([_snap(1000, {"o/r": healthy}), _snap(2000, {"o/r": healthy})],
+                             ["o/r"], {"o/r": DEFAULT_THRESHOLDS})
+    chk("worker-no-change auto-closes once the rate clears", ("o/r", WORKER_NO_CHANGE) in rec, True)
+    chk("...and does NOT auto-close while it is still tripping",
+        ("o/r", WORKER_NO_CHANGE) in compute_recoveries(
+            hist, ["o/r"], {"o/r": DEFAULT_THRESHOLDS}), False)
+
+    # ---- the READ: an unreadable health ledger yields None (=> null fields), never [] (=> 0).
+    class _Boom:
+        def request(self, *args, **kwargs):
+            raise MetricsError("HTTP 503")
+
+    log = io.StringIO()
+    with contextlib.redirect_stdout(log):
+        window = read_health_window(_Boom(), "o/r", 1_700_000_000)
+    chk("an unreadable model-health ledger reads None, never an empty (confidently zero) window",
+        window, None)
+    chk("...and says so loudly", "::warning::" in log.getvalue() and "no-change" in log.getvalue(),
+        True)
+
+    class _NoFile:
+        """The ledger BRANCH resolves but carries no health file yet (the first-record path)."""
+
+        def request(self, method, path, body=None, allow_404=False, retry_conflict=False):
+            return {"object": {"sha": "f" * 40}} if "/git/ref/" in path else None
+
+    log_empty = io.StringIO()
+    with contextlib.redirect_stdout(log_empty):
+        empty = read_health_window(_NoFile(), "o/r", 1_700_000_000)
+    chk("a ledger branch with no health file yet is an EMPTY window, not a failure", empty, [],
+        diag=log_empty.getvalue())
+    chk("...and that is silent — it is not a degraded read", log_empty.getvalue(), "")
+
+    class _MissingBranch:
+        def request(self, method, path, body=None, allow_404=False, retry_conflict=False):
+            return None      # neither the file NOR the ledger branch resolves
+
+    log_branch = io.StringIO()
+    with contextlib.redirect_stdout(log_branch):
+        gone = read_health_window(_MissingBranch(), "o/r", 1_700_000_000)
+    chk("a MISSING ledger branch is None (no evidence), never an empty window", gone, None,
+        diag=log_branch.getvalue())
+
+    real_loader = _model_health_module
+    try:
+        def _no_module():
+            raise MetricsError("scripts/model-health.py is not in this checkout")
+
+        _model_health_module = _no_module
+        log_load = io.StringIO()
+        with contextlib.redirect_stdout(log_load):
+            unloadable = read_health_window(_NoFile(), "o/r", 1_700_000_000)
+        chk("a checkout without model-health.py degrades to None, it does not crash the snapshot",
+            unloadable, None, diag=log_load.getvalue())
+    finally:
+        _model_health_module = real_loader
+
+
+def _test_no_change_wiring(chk):
+    """[#987] THE CALL SITES. `_test_no_change_census` is entirely pure, and `build_snapshot`'s loop
+    body plus `run()` are the two lines it can never reach — measured at 0 executions before this
+    test existed. A mutant that drops `health_records=` at either production hand-off leaves every
+    pure assertion green while the published snapshot goes permanently null (#937's Z6 shape: one
+    argument, one call site, a whole suite blind to it)."""
+    global collect_counts, build_snapshot, read_health_window, read_history, append_snapshot
+    global load_targets
+    real = (collect_counts, build_snapshot, read_health_window, read_history, append_snapshot,
+            load_targets)
+    window_sentinel = [_health_row("111.1", issue=3241, why="already_done")]
+    seen = {}
+    try:
+        collect_counts = lambda *a, **kw: seen.update(to_collect=kw.get("health_records")) or {}
+        build_snapshot([("o/r", READY_FROM_AGENT, DEFAULT_THRESHOLDS)], {}, "tok", 0,
+                       health_records=window_sentinel)
+        chk("build_snapshot hands the health window to EVERY target's collector",
+            seen.get("to_collect"), window_sentinel)
+        collect_counts, build_snapshot = real[0], real[1]
+
+        load_targets = lambda _path: [("o/r", READY_FROM_AGENT, DEFAULT_THRESHOLDS)]
+        read_health_window = lambda api, repo, at: (
+            seen.update(read_args=(repo, at)) or window_sentinel)
+        build_snapshot = lambda *a, **kw: (
+            seen.update(to_snapshot=kw.get("health_records")) or {"_ts": 0, "targets": {}})
+        read_history = lambda *a, **kw: ([], None)
+        append_snapshot = lambda *a, **kw: None
+        run("policy/repos.toml", {}, "tok", "o/r", "jeswr", False, False, 1_700_000_000)
+        chk("run() reads the health window ONCE, for the registry, at the snapshot's own stamp",
+            seen.get("read_args"), ("o/r", 1_700_000_000))
+        chk("...and hands exactly that window to build_snapshot",
+            seen.get("to_snapshot"), window_sentinel)
+    finally:
+        (collect_counts, build_snapshot, read_health_window, read_history,
+         append_snapshot, load_targets) = real
 
 
 def _test_rate_derivation(chk):
@@ -1588,33 +2049,43 @@ def _test_collection_contract(chk):
     # DIFFERENT target must be attributed away from sparq.
     runs_by_target = {
         "sparq-org/sparq": [
-            {"path": ".github/workflows/review-fix.yml",
+            {"id": 7001, "path": ".github/workflows/review-fix.yml",
              "display_title": f"review-fix fix sparq-org/sparq#3400 claim={'d' * 32}",
              "name": "review-fix",
              "status": "completed", "conclusion": "failure",
              "updated_at": _iso_ago(600, now), "created_at": _iso_ago(1200, now)},
-            {"path": ".github/workflows/worker.yml",
+            {"id": 8001, "path": ".github/workflows/worker.yml",
              "display_title": "worker sparq-org/sparq claim=aaa", "name": "worker",
              "status": "completed", "conclusion": "success",
              "updated_at": _iso_ago(300, now), "created_at": _iso_ago(900, now)},
-            {"path": ".github/workflows/worker.yml",
+            {"id": 8002, "path": ".github/workflows/worker.yml",
              "display_title": "worker sparq-org/sparq claim=bbb", "name": "worker",
              "status": "completed", "conclusion": "failure",
              "updated_at": _iso_ago(200, now), "created_at": _iso_ago(800, now)},
-            {"path": ".github/workflows/worker.yml",
+            {"id": 8003, "path": ".github/workflows/worker.yml",
              "display_title": "worker sparq-org/sparq claim=ccc", "name": "worker",
              "status": "in_progress", "conclusion": None,
              "updated_at": _iso_ago(60, now), "created_at": _iso_ago(120, now)},
-            {"path": ".github/workflows/worker.yml",   # a DIFFERENT target — must not count for sparq
+            # a DIFFERENT target — must not count for sparq
+            {"id": 8004, "path": ".github/workflows/worker.yml",
              "display_title": "worker other/repo claim=zzz", "name": "worker",
              "status": "completed", "conclusion": "failure",
              "updated_at": _iso_ago(100, now), "created_at": _iso_ago(150, now)},
-            {"path": ".github/workflows/ci.yml",        # unrelated workflow — ignored
+            {"id": 9001, "path": ".github/workflows/ci.yml",        # unrelated workflow — ignored
              "display_title": "ci sparq-org/sparq", "name": "ci",
              "status": "completed", "conclusion": "failure",
              "updated_at": _iso_ago(50, now), "created_at": _iso_ago(90, now)},
         ],
     }
+    # [#987] The fleet-wide health window this tick. Only 8002 is a CONCLUDED sparq worker run, so
+    # only its row may be censused here: 8003's run is still in progress (not an attempt yet) and
+    # 8004 belongs to another target — either one leaking in would publish a wasted-run rate that
+    # sparq did not earn.
+    health_window = [
+        _health_row("8002.1", issue=3241, why="underspecified"),
+        _health_row("8003.1", issue=999, why="already_done"),
+        _health_row("8004.1", issue=555, why="too_large"),
+    ]
 
     def fake_paginate(repo, since_iso, token, now_, page_cap=10):
         return list(runs_by_target.get("sparq-org/sparq", []))
@@ -1626,7 +2097,8 @@ def _test_collection_contract(chk):
         _ready_count = lambda *args: 86   # drainable candidates, NOT the 4-wide frontier
         _paginate_runs = fake_paginate
         counts = collect_counts("sparq-org/sparq", READY_STATUS_ENGINE, "tok", now,
-                                orchestration=("jeswr/agent-account-registry", "regtok"))
+                                orchestration=("jeswr/agent-account-registry", "regtok"),
+                                health_records=health_window)
         # readiness is the DRAINABLE count (blocker #1) — not the concurrency width.
         chk("collect: issues_ready is the 86 drainable count", counts["issues_ready"], 86)
         chk("collect: authoritative LIST counts all five live state/label metrics",
@@ -1649,7 +2121,16 @@ def _test_collection_contract(chk):
         chk("collect: worker_attempts_1h = 2 concluded sparq runs (in_progress/other excluded)",
             counts.get("worker_attempts_1h"), 2)
         chk("collect: worker_success_1h = 1", counts.get("worker_success_1h"), 1)
+        # [#987] the no-change census, joined to those SAME two concluded sparq worker runs.
+        chk("collect: worker_no_change_1h = 1 (8003 in-progress + 8004 other-target excluded)",
+            counts.get("worker_no_change_1h"), 1)
+        chk("collect: ...and the excluded rows' reasons never reach the breakdown",
+            counts.get("worker_no_change_by_reason_1h"),
+            {"unspecified": 0, "underspecified": 1, "blocked_on_decision": 0, "too_large": 0,
+             "already_done": 0, "other": 0})
         m = compute_target_metrics(counts)
+        chk("collect->metrics: no-change rate 1/2 over the same denominator as the success rate",
+            m["worker_no_change_rate_1h"], 0.5)
         # the derived metrics + alerts that ACTUALLY result from the sparq shape:
         chk("collect->metrics: review lane STALLED (real, off orchestration)",
             m["review_lane_health"], "stalled")
@@ -1669,9 +2150,24 @@ def _test_collection_contract(chk):
         # a sparq target with NO orchestration signal at all reads unknown (never falsely ok/stalled).
         _paginate_runs = lambda *a, **k: None
         counts_no_orch = collect_counts("sparq-org/sparq", READY_STATUS_ENGINE, "tok", now,
-                                        orchestration=("jeswr/agent-account-registry", "regtok"))
+                                        orchestration=("jeswr/agent-account-registry", "regtok"),
+                                        health_records=health_window)
         chk("collect: no orchestration runs => review_lane_health unknown",
             compute_target_metrics(counts_no_orch)["review_lane_health"], "unknown")
+        # ...and with no run-id set there is nothing to attribute the ledger rows to, so the census
+        # is SKIPPED rather than computed over a population it cannot partition — the whole health
+        # window is in hand here, so a census that ran anyway would report 3 wasted sparq runs.
+        chk("collect: no orchestration runs => the no-change census is absent, not zero",
+            [k for k in counts_no_orch if k.startswith("worker_no_change")], [])
+        # The OTHER no-signal direction: the runs are readable but the health ledger was not, so
+        # there is nothing to census. The keys must be absent (=> null) rather than a confident 0.
+        _paginate_runs = fake_paginate
+        counts_no_health = collect_counts("sparq-org/sparq", READY_STATUS_ENGINE, "tok", now,
+                                          orchestration=("jeswr/agent-account-registry", "regtok"),
+                                          health_records=None)
+        chk("collect: an unreadable health ledger leaves the census ABSENT (not a zero census)",
+            ([k for k in counts_no_health if k.startswith("worker_no_change")],
+             counts_no_health.get("worker_attempts_1h")), ([], 2))
     finally:
         _search_count, _ready_count, _paginate_runs, _list_open_rows, _list_event_rows = (
             real_sc, real_rc, real_pr, real_lr, real_er)
@@ -1713,11 +2209,32 @@ def _test_run_windowing(chk):
         _paginate_runs = lambda *a, **k: []
         chk("no runs at all => (0 concluded, 0 succeeded) — idle, not stalled",
             _orchestration_lane_runs("o/r", "sparq-org/sparq", REVIEW_LANE_WORKFLOWS, "t", now),
-            (0, 0))
+            (0, 0, set()))
         _paginate_runs = lambda *a, **k: None
         chk("runs API unavailable => (None, None) — health stays unknown",
             _orchestration_lane_runs("o/r", "sparq-org/sparq", REVIEW_LANE_WORKFLOWS, "t", now),
-            (None, None))
+            (None, None, set()))
+        # [#987] the run-id set is derived from the SAME filtered walk as the counts: only runs
+        # attributed to the target, in the window, and CONCLUDED contribute an id. An id that
+        # slipped in from an in-progress or other-target run would charge that run's ledger rows to
+        # the wrong denominator.
+        _paginate_runs = lambda *a, **k: [
+            {"id": 111, "path": ".github/workflows/worker.yml", "name": "worker",
+             "display_title": "worker sparq-org/sparq claim=aaa", "status": "completed",
+             "conclusion": "success", "updated_at": _iso_ago(300, now)},
+            {"id": 222, "path": ".github/workflows/worker.yml", "name": "worker",
+             "display_title": "worker sparq-org/sparq claim=bbb", "status": "in_progress",
+             "conclusion": None, "updated_at": _iso_ago(60, now)},
+            {"id": 333, "path": ".github/workflows/worker.yml", "name": "worker",
+             "display_title": "worker other/repo claim=ccc", "status": "completed",
+             "conclusion": "failure", "updated_at": _iso_ago(120, now)},
+            {"id": 444, "path": ".github/workflows/worker.yml", "name": "worker",
+             "display_title": "worker sparq-org/sparq claim=ddd", "status": "completed",
+             "conclusion": "failure", "updated_at": _iso_ago(9000, now)},
+        ]
+        chk("run ids cover exactly the CONCLUDED, in-window, this-target runs",
+            _orchestration_lane_runs("o/r", "sparq-org/sparq", WORKER_WORKFLOWS, "t", now),
+            (1, 1, {"111"}))
     finally:
         _paginate_runs = real_pr
 
@@ -2508,6 +3025,27 @@ def _test_policy_and_readiness(chk):
         zero_error = str(exc)
     chk("sustain_snapshots=0 rejected loudly (anti-spike cannot be disabled)",
         "sustain_snapshots" in zero_error and "positive integer" in zero_error, True)
+
+    # [#987] worker_no_change_ceiling is a RATIO, so it must take the float arm — the positive-
+    # integer arm would reject every legal value it can hold (0.6) and accept an illegal one (7).
+    def _threshold_outcome(line):
+        doc = f'[repos."o/r"]\nenabled = true\n[repos."o/r".throughput]\n{line}\n'
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+            fh.write(doc)
+            where = fh.name
+        try:
+            return load_targets(where)[0][2]["worker_no_change_ceiling"]
+        except MetricsError as exc:
+            return str(exc)
+
+    chk("a fractional worker_no_change_ceiling is ACCEPTED (it is validated as a ratio)",
+        _threshold_outcome("worker_no_change_ceiling = 0.6"), 0.6)
+    chk("...and one outside [0, 1] is refused",
+        "must be a float in [0, 1]" in str(_threshold_outcome("worker_no_change_ceiling = 7")),
+        True)
+    chk("...and a non-numeric one is refused too",
+        "must be a float in [0, 1]" in str(
+            _threshold_outcome('worker_no_change_ceiling = "half"')), True)
 
     # The live registry policy nests security_paths under readiness (arm-side audit input);
     # metrics must ACCEPT it (regression: run 29838473663 rejected the live policy) while
