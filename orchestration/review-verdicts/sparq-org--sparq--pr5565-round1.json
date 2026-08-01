@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 5565,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "849c5ceb1c2e320662d7e05d66d7ab7415f4aac2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [
+   {
+    "body": "The changed README says scripts/mdbook-rewrite-links.py rewrites links to github.com/sparq-org/sparq/blob/main. At this PR head, that script still defines GITHUB_BLOB_BASE as https://github.com/jeswr/sparq/blob/main/, and book/book.toml still points its repository and edit URLs at jeswr/sparq. Consequently the built book continues publishing stale owner links and the new README statement is false.",
+    "file": "README.md",
+    "fix_hint": "Update scripts/mdbook-rewrite-links.py and book/book.toml to sparq-org/sparq in this migration, and add/extend a test that verifies generated mdBook links use the new owner.",
+    "severity": "major",
+    "title": "README claims the mdBook preprocessor emits the new owner, but it still emits the old URL"
+   },
+   {
+    "body": "This diff changes the asserted first-party supplier URL to https://github.com/sparq-org/sparq, but scripts/sbom-normalize.jq still hard-codes https://github.com/jeswr/sparq in both its implementation and explanatory comment. Generated release SBOMs therefore contradict the changed compliance control/evidence and retain the stale coordinate.",
+    "file": "compliance/sbom/controls/sbom.md",
+    "fix_hint": "Change the normalizer's first-party supplier URL to https://github.com/sparq-org/sparq and update its regression fixtures/tests so generated SBOM output is checked for the new URL.",
+    "severity": "major",
+    "title": "SBOM documentation was migrated but the SBOM generator still emits the old repository URL"
+   },
+   {
+    "body": "The new term uses all-markdown and explicitly declines to scan scripts/workflows/source/manifests, but many live stale coordinates remain outside Markdown: clone URLs in hwrun and benchmark scripts, package metadata in js/package.json and crates/sparq-py/pyproject.toml, OCI labels in Dockerfile, the SBOM normalizer, book configuration, and other generated/published metadata. These are precisely the coordinates most likely to keep emitting or consuming the old owner, so the migration is incomplete and the ratchet will report clean despite them.",
+    "file": "scripts/banned-terminology.json",
+    "fix_hint": "Complete the operational-coordinate migration and add a dedicated authored-source/config surface (with narrow explicit exemptions for @jeswr/sparq, ghcr.io/jeswr, Homebrew, fixtures, and intentional historical mentions) so future stale repository coordinates fail CI outside Markdown too.",
+    "severity": "major",
+    "title": "The new stale-owner ratchet excludes operational source and package metadata"
+   }
+  ],
+  "progress": null,
+  "summary": "The owner migration is internally inconsistent. The edited documentation now claims generated and published metadata use sparq-org/sparq, but the unchanged generators/configuration still emit jeswr/sparq. The new terminology ratchet intentionally scans Markdown only, so it cannot prevent these operational stale coordinates. The diff also contains agent-role imperative text, so injection_detected is true under the supplied review rule, although it appears to be repository prompt data rather than an attempt that affected this verdict.",
+  "verdict": "request_changes"
+ }
+}
