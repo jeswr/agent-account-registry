@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5487,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "28960e0b424433b801e20ed66d2c194eba61721d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`stream_admission` unconditionally degrades every over-cap SELECT-JSON request to the buffered serializer, while `ServerConfig::default()` leaves `max_results` and the query memory ceilings disabled. A client can therefore submit a SELECT with a very large result and, once generation pressure reaches the cap, force the server to materialize the complete serialized response in memory instead of using bounded-channel streaming. The comment that the buffered path is `always memory-bounded` is not supported by any configured bound or by the added tests, which use a finite fixed result. This exchanges bounded snapshot retention for an unbounded memory-DoS path under load.",
+    "file": "crates/sparq-server/src/http.rs",
+    "fix_hint": "Make degradation conditional on a real response/result bound, or use a bounded spill-to-disk/body mechanism. If buffering cannot be proven affordable, fail with an explicit load-shed response rather than materializing an unbounded result. Add a test that exercises the over-cap path with the relevant bound exceeded and verifies bounded/refusal behavior, and revise the public docs to describe the actual guarantee.",
+    "severity": "major",
+    "title": "Admission fallback can turn streamed queries into unbounded buffered allocations"
+   }
+  ],
+  "progress": null,
+  "summary": "The pin-deadline mechanics are fail-closed and the tests include useful anti-vacuity controls, but the admission fallback introduces a resource-safety regression: under generation pressure, an otherwise streaming SELECT is forced through the fully buffered serializer even though the default configuration has no result or response-size ceiling. Consequently, hostile large-result queries can cause unbounded response materialization precisely when the server is already under pressure. The new documentation also incorrectly states that this fallback is always memory-bounded. Admission needs a bounded fallback or an honest refusal when buffering cannot be proven affordable.",
+  "verdict": "request_changes"
+ }
+}
