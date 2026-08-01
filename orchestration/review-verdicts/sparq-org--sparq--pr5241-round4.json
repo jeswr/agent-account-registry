@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5241,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f2fd6b110f0f4ba37609dc27c33439990b9c04a1",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`artifact_covers_crate()` still returns true for any token-delimited crate name anywhere in a matched file. Consequently a comment or another surface's blurb in `surfaces.ts`, an unrelated book-page cross-reference, or a crate mention in `SUMMARY.md` alone suppresses the crate's follow-on even though no crate-specific site entry or complete guide chapter exists. The new tests do not cover these cases: they test a valid README include and a file containing no crate mention, leaving the prior false-suppression paths intact.",
+    "file": "scripts/flow-on.py",
+    "fix_hint": "Parse or structurally validate the relevant artifact. For the site rule, require a Surface entry whose crate-specific README/href identifies the evaluated crate. For the guide rule, require both a SUMMARY chapter link and its corresponding guide page, with that page's include target identifying the crate README or SKILL. Add negative tests for comment/blurb-only mentions, unrelated cross-references, and SUMMARY-only crate mentions.",
+    "severity": "major",
+    "title": "Bare crate-name mentions still suppress follow-ons without proving artifact coverage"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 leaves the round-3 major finding materially unchanged. Suppression is still based on any token-delimited crate-name occurrence anywhere in a matched shared artifact. The added positive guide test proves only that an include works, while the negative test proves only that a file with no crate mention does not suppress; neither distinguishes a real site Surface record or complete mdBook chapter from a comment, blurb, cross-reference, or SUMMARY-only mention. Those weak mentions can therefore still suppress the only follow-on for unfinished work. Progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
