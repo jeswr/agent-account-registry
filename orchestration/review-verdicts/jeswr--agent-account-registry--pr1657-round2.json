@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 1657,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e6bf3158b2bae7ee7bee822ddf95a43c313667da",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Carried over from round 1 and not addressed (the file is byte-identical). With --coverdir, write_results uses _fullmodname(filename) (trace.py:262, joined at :271), which strips the longest matching sys.path prefix and replaces os.sep with '.'. For this repo's flat scripts/*.py that yields the bare name \u2014 trace sets sys.path[0] = os.path.dirname(progname) (trace.py:717) and _fullmodname prefers the longest prefix (trace.py:133-140), so even with REPO_ROOT also on sys.path the result is still 'foo' \u2014 hence the instruction is correct AS USED HERE. It stops being correct for a module reached inside a package: pkg/foo.py is written as <dir>/pkg.foo.cover, and an agent following the rule literally would look for foo.cover, find nothing, and \u2014 exactly against the intent of this paragraph \u2014 may conclude 'no uncovered lines'. (Note the stdlib's own -C help text at trace.py:632-634 documents this wrongly as <dir>/<package>/<module>.cover, so an author cross-checking against --help is misled twice.)",
+    "file": "AGENTS.md",
+    "fix_hint": "Optionally note that with -C the filename is the module's full DOTTED name (<dir>/<pkg>.<module>.cover), and that a missing cover file must be treated as an instrument failure, never as zero uncovered lines.",
+    "severity": "nit",
+    "title": "Unaddressed from round 1: with -C <dir> the cover filename is the DOTTED full module name, so '<dir>/<module>.cover' holds only for top-level modules"
+   },
+   {
+    "body": "New this round; verified against trace.py, not asserted from memory. The added step says to append a never-called function and 'confirm its executable line appears as >>>>>>'. For a function like `def _never(): \\\"\\\"\\\"doc\\\"\\\"\\\"; x = 2; return x`, the three line classes behave differently in write_results_file (trace.py:310-324): the `def _never():` line IS executed at module-definition time under trace, so it lands in lines_hit and prints a COUNT, not '>>>>>>'; the docstring line is excluded from lnotab by _find_strings (trace.py:350-371, 384) and prints as blank padding; only the BODY statement lines (x = 2 / return x) are in lnotab-but-unhit and carry '>>>>>>'. So an author who validates by checking 'its executable line' and picks the def line \u2014 the one line that names the function, and the natural thing to grep for \u2014 sees a hit count and would wrongly conclude the instrument is broken (or, worse, 'fix' the command until the def line is marked). This is a small imprecision, but the very sentence it attaches to cites #756, whose failure was exactly mis-attributing coverage inside a never-called function ('counted docstring lines as covered, scored a never-called function at 6.2 %'), so the precision is cheap and on-topic. Not blocking: it fails toward distrusting a working instrument, not toward trusting a broken one.",
+    "file": "AGENTS.md",
+    "fix_hint": "Say 'its BODY line' rather than 'its executable line' \u2014 e.g. 'confirm the function's body line (not its `def` line, which executes at import) appears as >>>>>>'. Optionally add that docstring lines are never marked, since _find_strings excludes them from the executable-line table.",
+    "severity": "nit",
+    "title": "Instrument-validation step: the appended function's `def` line IS executed, so 'confirm its executable line appears as >>>>>>' can read as a false negative"
+   },
+   {
+    "body": "Carried over from round 1 and not addressed. This diff establishes that a count-only report cannot show never-executed lines, yet several existing comments still record measurements taken that way: scripts/dashboard-gen.py:2944 ('Measured with `python3 -m trace --count` before this change: BOTH refusal lines...'), scripts/triage.py:1921 ('measured with `python3 -m trace --count'), and the aside at scripts/triage.py:2742. Those files are outside this diff so this cannot be a blocker (and is filed against AGENTS.md only because the schema requires an in-diff path), and the claims may still be true \u2014 a NONZERO count is evidence even without --missing, and the neighbouring citations at scripts/triage.py:2031, scripts/model-health.py:4335 and scripts/pat-validity.py:2036 already use `--count --missing` correctly. But the bare-`--count` ones read as endorsements of the instrument this rule now calls unable-to-fail: the #958 duplication shape applied to prose. Same for the canonical copy in sparq-org/sparq's AGENTS.md, which this file's own preamble (AGENTS.md:24-30) requires be mirrored in the same wave and which I cannot see from this checkout.",
+    "file": "AGENTS.md",
+    "fix_hint": "Either re-measure those call sites with `--count --missing` and update the comment wording, or state in the PR body that the sparq-org/sparq canonical copy is mirrored in this wave (or why not), per the preamble at AGENTS.md:24-30.",
+    "severity": "nit",
+    "title": "Unaddressed from round 1: in-repo comments still cite bare `trace --count` as a coverage measurement this rule now declares vacuous"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Docs-only change to AGENTS.md pre-flight item 1. The diff is IDENTICAL to round 1 (branch carries one commit, e6bf3158b; AGENTS.md untouched since), so nothing was pushed in response to round 1 and both of its nits still stand.\n\nTrust-plane lens: no script, workflow, policy or orchestration file is touched. I confirmed AGENTS.md is only ever CITED in prose comments (dispatch-secrets-guard.py, retriage.py, ci-latency-alert.py, readme-runbook-check.py, ...) and never parsed by any checker, so no self-test, route, label set, arm-side classifier or gate can be affected and no default-allow path is opened. The change strictly STRENGTHENS a previously vacuous instrument.\n\nI re-derived every technical claim from /usr/lib/python3.11/trace.py rather than trusting round 1:\n(a) '--count alone never writes >>>>>>' is exact: lnotab is {} unless show_missing (266-269) and '>>>>>> ' is emitted solely for `lineno in lnotab` (317-320); -m/--missing wires straight into that parameter (635-637, 737). A count-only report physically cannot contain the marker, so grepping it returns a vacuous zero.\n(b) '-C also writes a cover file for every module touched, including stdlib' is exact: is_ignored_filename only skips '<...>' pseudo-files (180-184) and --ignore-dir defaults to [] (651), so the never-glob warning is load-bearing.\n(c) The stale-cover-file warning is exact: write_results runs after the traced program's try/except SystemExit (728-737), so a self-test that sys.exit()s during path discovery still leaves a cover file measuring almost nothing.\n(d) The command ordering parses correctly (progname + REMAINDER, 657-660), and '<dir>/<module>.cover' is right for this repo's flat scripts/ because _fullmodname takes the LONGEST matching sys.path prefix (125-147) with sys.path[0] = dirname(progname) (717).\n\nThree nits below, none blocking. Progress is 'stagnant': the artifact is unchanged and round 1's two nits persist at the same severity. My third nit is new but is a\u2026 [truncated 106 chars]",
+  "verdict": "approve"
+ }
+}
