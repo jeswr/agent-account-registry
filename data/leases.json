@@ -59,6 +59,16 @@
    "model": "sol",
    "issued_at": 1785578399,
    "expires_at": 1785582599
+  },
+  {
+   "account": "dc2d751954080e13",
+   "claim_id": "6a7b63ccfac34a4bb9b5e58e6a888eb4",
+   "holder": "review:sparq-org/sparq#5542@dispatch-30694680414.1",
+   "package": "sparq-fedplan-mpc,sparq-mpc",
+   "role": "review",
+   "model": "sol",
+   "issued_at": 1785578407,
+   "expires_at": 1785582607
   }
  ]
 }
