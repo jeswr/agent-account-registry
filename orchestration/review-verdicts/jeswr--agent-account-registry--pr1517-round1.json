@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1517,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c7aaba8124fb50696d4394a3d0fa4e26f0f9d94d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nApproved. The new sibling dependency is pinned at both the workflow sparse-checkout seam and SELF_TEST_LIVE_INPUTS. All `gh api` GETs are routed through the shared bounded retry layer without widening it to mutations, and exhausted reads remain fail-closed. The diagnosis change is narrowly scoped to the repository metadata read, whose failure cannot itself establish a protected-setting defect; environment-read failures and evaluated settings defects retain the full remediation. The self-test is non-vacuous: it counts actual subprocess attempts, proves a retry recovery reaches the verified path, checks failure transport/status without exposing stderr, exercises malformed successful metadata, and includes inverse/scoping cases that preserve real findings. No reviewer-directed instruction was detected in the diff.",
+  "verdict": "approve"
+ }
+}
