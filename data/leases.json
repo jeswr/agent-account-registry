@@ -59,6 +59,16 @@
    "model": "opus5",
    "issued_at": 1785552444,
    "expires_at": 1785558744
+  },
+  {
+   "account": "dc2d751954080e13",
+   "claim_id": "dc1a9e5877e54306abf2823d60e2cd68",
+   "holder": "review:sparq-org/sparq#5513@dispatch-30680554867.1",
+   "package": "sparq-canon",
+   "role": "review",
+   "model": "sol",
+   "issued_at": 1785552453,
+   "expires_at": 1785556653
   }
  ]
 }
