@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1605,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1f1eba49241738fd1d3187e2253d4911d9549b96",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_policy_derived_output_keys()` collects every `Assign` with `ast.walk()` and only ever adds names to `tainted`; it does not respect statement order, control flow, or assignments that kill prior taint. For example, a resolver containing `repos = load(open(\"policy/repos.toml\", \"rb\"))` followed by `repos = [\"some-owner/some-name\"]` and `print(\"repos=\" + json.dumps(repos))` is reported as policy-derived. The same false positive occurs when the policy assignment is under `if False:` before a live hardcoded assignment. Thus a valid workflow mutation can publish a copied enabled set while the shipped assertion and current decoy mutant remain green. This is the prior policy-sourcing finding narrowed to the new analyzer, not a completed proof of executable dataflow.",
+    "file": "scripts/backfill-provenance.py",
+    "fix_hint": "Make the analysis order- and control-flow-aware enough to prove the value reaching the `repos=` print is derived on live paths, including killing taint on hardcoded reassignment and rejecting unreachable seeds. At minimum, add non-crashing overwrite-after-policy and dead-branch-policy mutants whose named `resolve_policy_derived_outputs` finding becomes empty while the full self-test row count is preserved.",
+    "severity": "major",
+    "title": "Policy taint survives overwrites and unreachable assignments"
+   }
+  ],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe prior resolver job/step conditionality finding is fixed: both seams are now reported by presence and exact value, with deleted and inert mutants. The policy-source check is materially stronger than the prior cross-step substring, but it still accepts a hardcoded resolver when a policy-derived assignment is overwritten or lies in unreachable code. Because the marquee one-source-of-truth assertion can still stay green after the live output is severed from policy, one major finding remains.",
+  "verdict": "request_changes"
+ }
+}
