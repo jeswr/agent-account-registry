@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1618,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0114c5d843aae3f6f47a4b693385ff35aa83f891",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new sentence in `starvation_provenance_escalation_body` \u2014 \"The scheduled provenance sweep records it within one cadence.\" \u2014 is unconditional, but `backfill-provenance.yml`'s own header documents that a PR it cannot resolve (log unreadable / no anchored source / sources disagree / partial evidence / binding mismatch / author mismatch) is reported and left fail-closed invisible. Run-log retention and GitHub's scheduled-workflow behaviour are further reasons a sweep may not clear a given holder. An operator reading this receipt may wait out a cadence for a record that will never land, which is the same \"hold whose exit nobody can find\" failure mode (#703) the receipt exists to prevent \u2014 just relocated from \"no remedy named\" to \"remedy named that may not fire\". The census one-liner at :2747 carries the same unconditional phrasing (\"records these within one cadence\").",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Soften to something like \"The scheduled provenance sweep attempts this every cadence; it leaves the PR recordless with a named reason when the run log cannot bind an implementer identity.\" Same qualifier in `format_unprovenanced_narrowed_census`.",
+    "severity": "minor",
+    "title": "Receipt promises unconditional auto-recovery, but backfill can legitimately fail to resolve a PR"
+   },
+   {
+    "body": "The census string is pinned exactly (two tripwires), but the receipt's new claim is only reachable through the substring asserts at :23383-23392, none of which mention the scheduled sweep. Per this file's own doctrine at :23390 (\"Unasserted, this qualifier could be reverted green\"), the sentence that tells an operator recovery is automatic can be deleted without reding any self-test \u2014 the same gap that let the now-corrected \"nothing triggers it\" wording persist after #1544 landed.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Add one assert next to the existing receipt asserts, e.g. `assert \"scheduled provenance sweep\" in receipt, receipt`, matching the phrasing chosen for the first issue.",
+    "severity": "minor",
+    "title": "New scheduled-sweep sentence in the escalation receipt is unasserted and could be reverted green"
+   }
+  ],
+  "progress": null,
+  "summary": "Message/comment-only change to scripts/dispatch-claim.py: the unprovenanced-narrowed census line, the starvation_provenance_escalation docstring, and the operator receipt in starvation_provenance_escalation_body are updated to stop asserting that backfill-provenance is workflow_dispatch-only with no automatic recovery. VERIFIED against the checkout at PR head: .github/workflows/backfill-provenance.yml now carries `schedule: cron '23 */4 * * *'` (added under #1544), the targets job resolves EVERY enabled policy row when no target_repo is supplied (which is what a schedule supplies), and APPLY is `${{ inputs.apply || github.event_name == 'schedule' }}`, so a scheduled run really does write records across all enabled targets on a four-hour cadence. The new prose therefore matches reality and the old prose no longer did.\n\nNo behaviour change: no control flow, routing precedence, reservation/lease logic, gate, permission, or classifier is touched. Nothing is weakened \u2014 the escalation still fires, still does not free the partition, still names the manual backfill and the area-label partial recovery, and the fail-closed reservation is untouched.\n\nTest validity: the two exact-string tripwires at scripts/dispatch-claim.py:19111 and :19284 are updated in lockstep with the emitter at :2747 and I diffed them character-for-character \u2014 they still pin the whole stdout of that leg, so dropping or conditioning the census emission still reds them. Non-vacuous. The receipt self-test at :23382 asserts substrings that all survive the rewording (`backfill-provenance`, `apply=true`, the `declares no area:* label` qualifier, the labelling clause), so it stays green legitimately rather than by accident. No stale copy of the old wording remains anywhere in the tree (grepped).\n\nTwo minor accuracy/coverage notes below; neither blocks. No token/PII surface, no workflow expansion of untrusted text, nothing to arm.",
+  "verdict": "approve"
+ }
+}
