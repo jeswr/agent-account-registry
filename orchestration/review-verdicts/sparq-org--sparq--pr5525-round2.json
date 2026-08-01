@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5525,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "520f4edff7595c8c84133a6a51a6c3a78680bef9",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "run_query_pinned executes a query after prepare_with_dataset(sparql, dataset), so default-graph-uri and named-graph-uri affect the real active dataset. The slow-query recorder later calls log.record(pin.snapshot(), &q, elapsed), and SlowQueryLog::record calls explain_plan(graph, sparql), which reparses only the original query text and has no DatasetOverride input. For a protocol request with dataset parameters, the retained plan therefore describes the snapshot/query-declared dataset rather than the dataset actually executed. This makes the operational record materially misleading and violates the feature's stated purpose of showing what the planner did.",
+    "file": "crates/sparq-server/src/http.rs",
+    "fix_hint": "Replay the same prepared query/dataset semantics used by run_query_pinned: either add an explain-plan entry point that accepts the prepared query or protocol DatasetOverride, or serialize/apply the override before planning. Add a real HTTP integration test using default-graph-uri or named-graph-uri whose plan/estimate differs without the override, and assert the retained plan matches the executed dataset.",
+    "severity": "major",
+    "title": "Recorded plan drops protocol dataset overrides"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The slow-query replay does not preserve SPARQL Protocol dataset overrides. The real request is prepared with default-graph-uri/named-graph-uri, but the recorded plan reparses only the original query text against the snapshot. Consequently the admin endpoint can report a plan for a different active dataset than the query actually used, contradicting the documented promise that it shows what the planner decided. This is a newly identified major correctness issue relative to round 1, so progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
