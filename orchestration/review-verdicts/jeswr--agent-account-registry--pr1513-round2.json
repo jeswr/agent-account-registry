@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1513,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "bd32323280a37b62224c78c22ac15d18ab497231",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe diff remains documentation-only and accurately describes the current bidirectional retriage behavior. Retriage considers only status:untriaged or status:ready after first excluding gates, holds, deferred/parked/claim-owned states, and epics; an issue with neither status is therefore not-retriageable. A role-less ready issue can enter the repair/re-park path, while an ambiguous-role ready issue satisfies exclusion_reason because it has a role and, when the classifier still reports ready, is intentionally left ready-consistent; routing_refusal separately rejects it rather than guessing or collapsing a role. The workflow and self-test comments correctly explain why a failed quarantine write cannot be recovered by retriage. No executable behavior, trust check, workflow permission, or test assertion changes, and no reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
