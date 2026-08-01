@@ -2031,6 +2031,14 @@ jobs:
     environment: dispatch-secrets
     permissions:
       contents: write   # registry provenance file via github.token — never in the worker job
+      # [issue #296] The TERMINAL registry-write / provenance-read failures raised by
+      # worker-pr.py page a maintainer by upserting an `ops-alert` issue in THIS registry under
+      # `github.token` — the `_alert_route()` fallback destination, and the one that applies
+      # whenever the optional private ALERT_REPO route is unconfigured. Without this scope the
+      # route resolves but every delivery call is refused, so the page is still lost. Granted for
+      # the same reason `contents: write` is safe here: this job runs NO target code. Matches
+      # review-fix.yml's `outcome` job, which carries it for the same upsert.
+      issues: write
     steps:
       - name: Checkout registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -2074,6 +2082,20 @@ jobs:
           # provider server-side (provenance_record: must be anthropic|openai).
           IMPL_PROVIDER: ${{ needs.claim.outputs.provider }}
           IMPL_ALIAS: ${{ needs.claim.outputs.model }}
+          # [issue #296] Ops-alert routing for the TERMINAL failures this step can raise — a
+          # provenance read that exhausts its retry budget, and a registry record write that
+          # never lands. worker-pr.py's `_alert_route()` reads exactly these four names; with
+          # none of them set it returned (None, None) and `_ops_alert` silently no-opped, so the
+          # job failed loudly in the run log but no maintainer was ever paged. Matches the
+          # verdict-record step in review-fix.yml.
+          REGISTRY_REPO: ${{ github.repository }}
+          REGISTRY_ALERT_TOKEN: ${{ github.token }}
+          # Privacy routing (locked decision 22c + the #436 confirmation rule): a maintainer-set
+          # ALERT_REPO sends the account-referencing alert to a PRIVATE repo, honoured only when
+          # ALERT_TOKEN is set too AND the destination is confirmed private; unset (the default)
+          # falls back to this public registry + the workflow token above.
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
         run: |
           python3 registry/scripts/worker-pr.py reconcile-provenance \
             --registry-repo "$GITHUB_REPOSITORY" \
