@@ -3643,6 +3643,56 @@ _purge_before_target_code() {
   fi
 }
 
+# PURE (self-tested): verdict on whether a live lane SEALS the model's work into its inert,
+# digest/sha-bound artifact — and hands that artifact to the artifact service — BEFORE it runs any
+# target-controlled code. `ordered` is the only passing value; every other outcome, including a lane
+# with no seal step at all, is a named refusal, so a deleted step reads as a defect rather than as
+# an ordering that holds trivially because there is nothing to order.
+#
+# [issue #248] WHY THIS IS A SEPARATE INVARIANT FROM EVERY #575/#91 BINDING CHECK. Those prove
+# "what the publisher pushed is what the pre-gate step recorded". Not one of them can see WHEN the
+# recording happened: move the seal step BELOW the gate and the digest (worker lane) or the commit
+# id (fix lane) faithfully binds a tree the target's own build scripts had already rewritten, and
+# `_bundle_verify_verdict` / `_verify_staged_fix` both still print `ok`. The whole of #248 reopens
+# with no Python change at all, purely at the YAML seam — which is exactly where the vacuity lives
+# (AGENTS.md item 6). The ordering is therefore asserted on the LIVE files, per lane.
+#
+# The UPLOAD is ordered for the same reason the workflows already claim it in prose: it is the
+# moment the artifact service takes its own copy, and after it the sealed directory is just a file
+# the gate can overwrite. A late upload fails CLOSED rather than silently — the pre-gate digest/sha
+# refuses the rewritten artifact — but nothing measured the claim.
+#
+# Usage: _seal_before_target_code <workflow-file> <seal-subcommand> <upload-step-name>
+# Matched on exact `run:` / `- name:` lines for the reason _purge_before_target_code is: these
+# subcommand names also appear in the comments above their own steps, and a containment match would
+# measure the comment's position rather than the step's.
+_seal_before_target_code() {
+  local file=$1 seal_cmd=$2 upload_name=$3
+  [[ -f "$file" ]] || { printf 'worker-live: workflow file missing: %s\n' "$file" >&2; return 1; }
+  [[ "$seal_cmd" =~ ^[a-z][a-z-]*$ ]] ||
+    { printf 'worker-live: unsafe seal subcommand: %s\n' "$seal_cmd" >&2; return 1; }
+  [[ -n "$upload_name" ]] || { printf 'worker-live: no upload step name given\n' >&2; return 1; }
+  local seal_ln upload_ln tool_ln gate_ln
+  seal_ln=$(_first_match_line \
+    "^        run: bash \.\./registry/scripts/worker-live\.sh $seal_cmd\$" < "$file")
+  upload_ln=$(_first_match_line "^      - name: $upload_name\$" < "$file")
+  tool_ln=$(_first_match_line '^      - name: Ensure a Rust toolchain for the crate-scoped gate$' < "$file")
+  gate_ln=$(_first_match_line '^        run: bash \.\./registry/scripts/worker-live\.sh gate$' < "$file")
+  [[ -n "$seal_ln" ]] || { printf 'no-seal-step\n'; return 0; }
+  [[ -n "$upload_ln" ]] || { printf 'no-upload-step\n'; return 0; }
+  [[ -n "$tool_ln" && -n "$gate_ln" ]] || { printf 'no-target-code-step\n'; return 0; }
+  # Ordered against BOTH target-controlled steps rather than against the gate alone: the rustup
+  # provisioning honours the TARGET's own rust-toolchain.toml, so it is target-controlled code too
+  # — the same pair _purge_before_target_code orders against. Each conjunct is killed by its own
+  # fixture in the self-test (a seal placed between the two would otherwise leave one of them
+  # permanently redundant, i.e. individually unkillable — AGENTS.md item 4).
+  [[ "$seal_ln" -lt "$tool_ln" && "$seal_ln" -lt "$gate_ln" ]] ||
+    { printf 'seal-after-target-code\n'; return 0; }
+  [[ "$upload_ln" -lt "$tool_ln" && "$upload_ln" -lt "$gate_ln" ]] ||
+    { printf 'upload-after-target-code\n'; return 0; }
+  printf 'ordered\n'
+}
+
 # PURE (self-tested): print the step id of every token mint in the GATE-RUNNING job that does NOT
 # disable the action's token-revocation post phase. Expected output is EMPTY.
 #
@@ -5065,6 +5115,104 @@ WFFIX
     "$(_purge_before_target_code "$wf_purge_nogate")" "no-target-code-step"
   chk "#232 r2: _purge_before_target_code fails CLOSED on an unreadable workflow" \
     "$(_purge_before_target_code "$tmp/no-such-workflow.yml" 2>/dev/null; printf '%s' "$?")" "1"
+
+  # --- [issue #248] WHEN the model's work is sealed, asserted on both LIVE lanes. Every #575/#91
+  # binding check proves the publisher pushed what the pre-gate step RECORDED; not one of them can
+  # see a seal step that MOVED BELOW the gate, at which point the recording faithfully binds a tree
+  # the target's own build scripts had already rewritten and `_bundle_verify_verdict` /
+  # `_verify_staged_fix` both still print `ok`. These rows are that missing half — the ordering the
+  # rest of the containment is silently conditional on. ---
+  local wk_seal_run='        run: bash ../registry/scripts/worker-live.sh bundle'
+  local rf_seal_run='        run: bash ../registry/scripts/worker-live.sh stage-fix'
+  local wk_upload='Upload the pre-gate publish bundle (inert data only)'
+  local rf_upload='Upload the pre-gate fix bundle (inert data only)'
+  chk "#248 (LIVE worker.yml): the publish bundle is SEALED and UPLOADED before any target code" \
+    "$(_seal_before_target_code "$wf" bundle "$wk_upload")" "ordered"
+  chk "#248 (LIVE review-fix.yml): ...and the fix lane seals+uploads before its own toolchain+gate" \
+    "$(_seal_before_target_code "$rf_wf" stage-fix "$rf_upload")" "ordered"
+  # NON-VACUITY, per lane and per ordered step. (1) The seal MOVED below the gate — the exact shape
+  # this issue exists to prevent, where the routing still looks right and every downstream check
+  # verifies happily. (2) The seal DELETED, which must read as a defect and not as an ordering that
+  # holds trivially because there is nothing left to order (that verdict is also what proves the
+  # LIVE rows above matched a real step rather than nothing).
+  local wf_seal_gone="$tmp/worker-seal-gone.yml" wf_seal_late="$tmp/worker-seal-late.yml"
+  grep -Fv "$wk_seal_run" "$wf" > "$wf_seal_gone"
+  { cat "$wf_seal_gone"; printf '%s\n' "$wk_seal_run"; } > "$wf_seal_late"
+  chk "#248: a worker-lane seal moved AFTER the gate is REPORTED (non-vacuous)" \
+    "$(_seal_before_target_code "$wf_seal_late" bundle "$wk_upload")" "seal-after-target-code"
+  chk "#248: a DELETED worker-lane seal is REPORTED, never read as ordered (fail closed)" \
+    "$(_seal_before_target_code "$wf_seal_gone" bundle "$wk_upload")" "no-seal-step"
+  # The two lanes seal through DIFFERENT subcommands and DIFFERENT step names, so the fix lane gets
+  # its own pair rather than inheriting the worker lane's evidence.
+  local rf_seal_gone="$tmp/review-fix-seal-gone.yml" rf_seal_late="$tmp/review-fix-seal-late.yml"
+  grep -Fv "$rf_seal_run" "$rf_wf" > "$rf_seal_gone"
+  { cat "$rf_seal_gone"; printf '%s\n' "$rf_seal_run"; } > "$rf_seal_late"
+  chk "#248: a fix-lane seal moved AFTER the gate is REPORTED too (non-vacuous per lane)" \
+    "$(_seal_before_target_code "$rf_seal_late" stage-fix "$rf_upload")" "seal-after-target-code"
+  chk "#248: a DELETED fix-lane seal is REPORTED (fail closed)" \
+    "$(_seal_before_target_code "$rf_seal_gone" stage-fix "$rf_upload")" "no-seal-step"
+  # (3) The UPLOAD is ordered INDEPENDENTLY of the seal: a seal that stays pre-gate while its
+  # artifact copy slips below the gate leaves the sealed directory writable by target code for the
+  # whole gate. Both mutants keep the seal early, so only the upload arm can fire.
+  local wf_up_gone="$tmp/worker-upload-gone.yml" wf_up_late="$tmp/worker-upload-late.yml"
+  grep -Fv "      - name: $wk_upload" "$wf" > "$wf_up_gone"
+  { cat "$wf_up_gone"; printf '      - name: %s\n' "$wk_upload"; } > "$wf_up_late"
+  chk "#248: an upload moved AFTER the gate is REPORTED, with the seal still early (non-vacuous)" \
+    "$(_seal_before_target_code "$wf_up_late" bundle "$wk_upload")" "upload-after-target-code"
+  chk "#248: a DELETED upload is REPORTED (the artifact copy is what outlives the gate)" \
+    "$(_seal_before_target_code "$wf_up_gone" bundle "$wk_upload")" "no-upload-step"
+  # (4) ...and the verdict is not a blanket 'ordered' for any file it is handed: a lane that seals
+  # but runs NO target-controlled code has nothing to be early to, and that is a named outcome.
+  chk "#248: ...and a lane whose target-controlled step is missing is named, not waved through" \
+    "$(_seal_before_target_code "$wf_purge_nogate" bundle "$wk_upload")" "no-target-code-step"
+  chk "#248: _seal_before_target_code fails CLOSED on an unreadable workflow" \
+    "$(_seal_before_target_code "$tmp/no-such-workflow.yml" bundle "$wk_upload" 2>/dev/null
+       printf '%s' "$?")" "1"
+  # The two arguments are spliced into the scan patterns, so a metachar subcommand ('.*' would make
+  # the seal match the FIRST worker-live.sh step in the file, which is always early) or an empty
+  # upload name must REFUSE rather than report a comfortable 'ordered'.
+  chk "#248: ...and on a metachar seal subcommand / an empty upload step name (never a free pass)" \
+    "$(_seal_before_target_code "$wf" '.*' "$wk_upload" 2>/dev/null; printf '%s' "$?"):$(
+       _seal_before_target_code "$wf" bundle '' 2>/dev/null; printf '%s' "$?")" "1:1"
+  # BOTH CONJUNCTS OF BOTH COMPARISONS, one fixture each. The live-file mutants above append the
+  # moved step at the END, which puts it after the toolchain AND after the gate — so each
+  # comparison's two conjuncts are false together there, and dropping either one alone would
+  # survive every row above it (the mutually-masking shape, AGENTS.md item 4). A synthetic lane
+  # carrying just the four anchor lines lets a step sit BETWEEN them, which is also the realistic
+  # regression: a seal moved below the rustup provisioning that honours the TARGET's own
+  # rust-toolchain.toml is already past target-controlled code even though the gate has not run.
+  _seal_fixture() {
+    local out=$1 anchor
+    shift
+    : > "$out"
+    for anchor in "$@"; do
+      case "$anchor" in
+        seal)   printf '%s\n' '        run: bash ../registry/scripts/worker-live.sh bundle' >> "$out" ;;
+        upload) printf '      - name: %s\n' "$wk_upload" >> "$out" ;;
+        tool)   printf '%s\n' '      - name: Ensure a Rust toolchain for the crate-scoped gate' >> "$out" ;;
+        gate)   printf '%s\n' '        run: bash ../registry/scripts/worker-live.sh gate' >> "$out" ;;
+      esac
+      # An unrecognised anchor deliberately emits nothing: the missing line reads back as one of
+      # the `no-*-step` refusals, so a typo here surfaces as a red row rather than as a fixture
+      # that quietly asserted a different arrangement than the one its row names.
+    done
+  }
+  local seal_fx="$tmp/seal-anchors.yml"
+  _seal_fixture "$seal_fx" upload seal tool gate
+  chk "#248 fixture control: the four-anchor lane in the SHIPPED order reads 'ordered'" \
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload")" "ordered"
+  _seal_fixture "$seal_fx" upload tool seal gate
+  chk "#248: a seal after the RUSTUP step but before the gate is REPORTED (toolchain conjunct)" \
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload")" "seal-after-target-code"
+  _seal_fixture "$seal_fx" upload gate seal tool
+  chk "#248: a seal after the GATE but before the rustup step is REPORTED (gate conjunct)" \
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload")" "seal-after-target-code"
+  _seal_fixture "$seal_fx" seal tool upload gate
+  chk "#248: an upload after the RUSTUP step but before the gate is REPORTED (toolchain conjunct)" \
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload")" "upload-after-target-code"
+  _seal_fixture "$seal_fx" seal gate upload tool
+  chk "#248: an upload after the GATE but before the rustup step is REPORTED (gate conjunct)" \
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload")" "upload-after-target-code"
 
   local verify_ln mint_ln
   verify_ln=$(_first_match_line 'worker-live\.sh verify-bundle' < "$wf")
