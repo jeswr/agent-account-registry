@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1491,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "60ed963d67d17e44c79ea57a6ed3ccf4f690c859",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The recovery is launched before `record-marker`, and a `DispatchError` from that write only increments in-memory telemetry. If the launched reviewer dies before writing its round marker, the next tick sees neither a round nor a recovery-attempt marker. Repeating the same real failure sequence keeps both durable counters flat, so `STRANDED_RECOVERY_LIMIT` is never reached. The added marker-write-failure test confirms that such a launch is uncharged, but it runs only one tick and therefore does not prove convergence. The comment that this residual costs at most one attempt is not enforced: every attempt can be lost in the same launch/write window.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Add durable pre-launch reservation/commit accounting, or another durable fail-closed reconciliation mechanism that can bound confirmed launches whose post-launch marker cannot be written without treating an unconfirmed launch as completed work. Add a multi-tick test in which every launch succeeds, every reviewer dies before recording its round, and every post-launch attempt-marker write fails; assert that dispatches nevertheless converge to a safe bounded state without fabricated human-terminal evidence.",
+    "severity": "major",
+    "title": "Repeated post-launch marker failures still bypass the recovery bound"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-3 major remains unresolved. The new durable counter converges only when `record-marker` succeeds after a confirmed launch. If that write repeatedly fails, each successfully launched recovery remains uncharged; if each reviewer then dies before `review-outcome` records the round, both the round count and recovery-attempt count remain flat and every later tick may dispatch again forever. The new failure row explicitly asserts this uncharged state but does not establish the claimed bound or any durable reconciliation path. Because the same major finding remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
