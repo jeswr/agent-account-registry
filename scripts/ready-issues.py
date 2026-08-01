@@ -488,6 +488,16 @@ def frontier_census(cands, held, ready, limit=CENSUS_TOP_CONTENDED):
       * `free_areas` — demanded-by-a-candidate and NOT reserved. The 9th area in `8 reserved / 1
         free` is the whole finding, so the denominator is the areas candidates actually want, not
         every area label that exists.
+      * `cross-cutting-blocked` — deferred CROSS-CUTTING candidates (`{GLOBAL}` packages, i.e. no
+        `area:` label) that collide with NO reserved key yet cannot run, because the third conflict
+        rule refuses to co-run cross-cutting work with ANY reservation. `blocked-by-reserved` is
+        structurally blind to these: `{GLOBAL}` intersects an area-specific held set emptily, so
+        pre-#1478-review such a tick read `frontier=0 ... blocked-by-reserved: none` — occupancy
+        stopped the frontier while the census denied any reservation was costing demand. Counted
+        HERE and not there, EXCLUSIVELY (`elif`): a candidate already attributed to a colliding key
+        is never re-counted, so the two fields never double-count one deferral. A candidate stopped
+        only by a key the frontier's OWN head took is in neither — `held` is in-flight occupancy,
+        and that tick is the engine working as designed.
       * `blocked-by-reserved` — for each RESERVED key, how many deferred candidates collide with
         it, ranked by count then key and capped at `limit`. A reserved key that blocks nothing is
         not named (it is costing nothing); the count above still counts it.
@@ -496,17 +506,23 @@ def frontier_census(cands, held, ready, limit=CENSUS_TOP_CONTENDED):
     demanded = set().union(set(), *(pkgs for _p, _n, _it, pkgs in cands))
     selected = {it.get("number") for it in ready}
     blocked = {}
+    cross_cutting = 0
     for _p, number, _it, pkgs in cands:
         if number in selected:
             continue
-        for pkg in pkgs & held:
-            blocked[pkg] = blocked.get(pkg, 0) + 1
+        collisions = pkgs & held
+        if collisions:
+            for pkg in collisions:
+                blocked[pkg] = blocked.get(pkg, 0) + 1
+        elif GLOBAL in pkgs and held:        # refused by ANY reservation, collides with no key
+            cross_cutting += 1
     ranked = sorted(blocked.items(), key=lambda kv: (-kv[1], kv[0]))
     shown = ", ".join(f"{pkg}={n}" for pkg, n in ranked[:limit]) or "none"
     more = f" (+{len(ranked) - limit} more)" if len(ranked) > limit else ""
     line = (f"{CENSUS_PREFIX} candidates={len(cands)} frontier={len(ready)} "
             f"conflict-deferred={len(cands) - len(ready)} "
             f"reserved_areas={len(held)} free_areas={len(demanded - held)} "
+            f"cross-cutting-blocked={cross_cutting} "
             f"blocked-by-reserved: {shown}{more}")
     if GLOBAL in held:
         # `blocked-by-reserved` cannot see this one: a cross-cutting occupant collides with no
@@ -756,7 +772,7 @@ def _self_test():
     check("[#1478] a tick that deferred NOTHING still prints its census (zero included)",
           [line for line in quiet if line.startswith(CENSUS_PREFIX)],
           [f"{CENSUS_PREFIX} candidates=1 frontier=1 conflict-deferred=0 reserved_areas=0 "
-           "free_areas=1 blocked-by-reserved: none"])
+           "free_areas=1 cross-cutting-blocked=0 blocked-by-reserved: none"])
     # exclusion_reason is the single predicate ready_candidates and retriage's re-park both use.
     check("exclusion_reason: complete label set is enumerable",
           exclusion_reason({"status:ready", "priority:P1", "role:impl", "area:usage"}), None)
@@ -1002,7 +1018,8 @@ def _self_test():
           ([it["number"] for it in _wide_ready], _wide_lines),
           ([914],
            [f"{CENSUS_PREFIX} candidates=5 frontier=1 conflict-deferred=4 reserved_areas=3 "
-            "free_areas=1 blocked-by-reserved: dispatch=2, review-loop=1, worker=1"]))
+            "free_areas=1 cross-cutting-blocked=0 "
+            "blocked-by-reserved: dispatch=2, review-loop=1, worker=1"]))
     # RESERVED means HELD BY IN-FLIGHT WORK, not "taken by the time the loop ended". Two candidates
     # on one area with NO occupancy at all is a healthy tick: one is offered, one waits for it, and
     # the census must say `reserved_areas=0`. Reading the post-selection `taken` (or seeding the
@@ -1014,7 +1031,7 @@ def _self_test():
     check("[#1478] a key the frontier's OWN head took is not a reserved area (no false alarm)",
           _healthy,
           [f"{CENSUS_PREFIX} candidates=2 frontier=1 conflict-deferred=1 reserved_areas=0 "
-           "free_areas=1 blocked-by-reserved: none"])
+           "free_areas=1 cross-cutting-blocked=0 blocked-by-reserved: none"])
     # The GLOBAL occupant collides with no `area:` key — it stops the loop. Unnamed, this tick
     # reads as a wide-open board (free areas, nothing contended) while NOTHING can run.
     _global_lines = []
@@ -1024,14 +1041,58 @@ def _self_test():
           "where nothing can co-run",
           _global_lines,
           [f"{CENSUS_PREFIX} candidates=1 frontier=0 conflict-deferred=1 reserved_areas=1 "
-           f"free_areas=1 blocked-by-reserved: none — {GLOBAL} is held: NO other work can "
-           "co-run this tick"])
+           "free_areas=1 cross-cutting-blocked=0 blocked-by-reserved: none "
+           f"— {GLOBAL} is held: NO other work can co-run this tick"])
+    # ...and the INVERSE of that occupant, which is the third conflict rule and the branch whose
+    # census evidence was missing: the CANDIDATE is cross-cutting and an AREA is reserved. `{GLOBAL}`
+    # intersects an area-specific held set emptily, so `blocked-by-reserved` is structurally blind
+    # to it — this tick used to read `frontier=0 reserved_areas=1 ... blocked-by-reserved: none`,
+    # denying that any reservation was costing demand while a reservation was stopping the frontier
+    # dead. `cross-cutting-blocked` is the only field that can carry it.
+    _xcut_lines = []
+    _xcut_ready = compute_ready([pr(960, ["area:worker"]),
+                                 iss(961, R + ["priority:P1"])], log=_xcut_lines.append)
+    check("[#1478] a cross-cutting candidate refused by an AREA reservation is attributed, so a "
+          "held-and-stopped tick cannot report that nothing is blocked",
+          ([it["number"] for it in _xcut_ready], _xcut_lines),
+          ([],
+           [f"{CENSUS_PREFIX} candidates=1 frontier=0 conflict-deferred=1 reserved_areas=1 "
+            "free_areas=1 cross-cutting-blocked=1 blocked-by-reserved: none"]))
+    # The OTHER direction, twice over — the field must stay 0 when no RESERVATION is the cause:
+    #   (i) dropping the `held` conjunct would report the healthy tick below (a cross-cutting
+    #       candidate waiting on the frontier's OWN P1 head, zero in-flight work) as reservation-
+    #       blocked — the false alarm that makes the real one above unreadable.
+    _xcut_head = []
+    compute_ready([iss(970, R + ["priority:P1", "area:usage"]),
+                   iss(971, R + ["priority:P2"])], log=_xcut_head.append)
+    check("[#1478] a cross-cutting candidate waiting on the frontier's OWN head is NOT counted as "
+          "reservation-blocked (reserved means in-flight)",
+          _xcut_head,
+          [f"{CENSUS_PREFIX} candidates=2 frontier=1 conflict-deferred=1 reserved_areas=0 "
+           "free_areas=2 cross-cutting-blocked=0 blocked-by-reserved: none"])
+    #   (ii) relaxing the `elif` to `if` would count a cross-cutting candidate that ALREADY named
+    #        its colliding key in `blocked-by-reserved` a second time, so one deferral would show up
+    #        in two fields and the census would over-report its own population.
+    _xcut_both = []
+    compute_ready([iss(980, ["status:in-progress", "role:impl"]),
+                   iss(981, R + ["priority:P1"])], log=_xcut_both.append)
+    check("[#1478] a deferral attributed to a colliding key is NOT also counted as cross-cutting "
+          "(the two fields never double-count one candidate)",
+          _xcut_both,
+          [f"{CENSUS_PREFIX} candidates=1 frontier=0 conflict-deferred=1 reserved_areas=1 "
+           f"free_areas=0 cross-cutting-blocked=0 blocked-by-reserved: {GLOBAL}=1 "
+           f"— {GLOBAL} is held: NO other work can co-run this tick"])
     # The census for board F, asserted whole (it was split out of `emitted` above). `held` there is
-    # the in-progress issue #10's `set-up-account`, which blocks no candidate: a reserved area that
-    # costs nothing is counted, not named.
-    check("[#1478] the census counts a reserved-but-uncontended area without naming it", census,
+    # the in-progress issue #10's `set-up-account`, which no candidate NAMES: a reserved area that
+    # contends with no `area:` label is counted, not named. It is not costing nothing, though —
+    # board F's #11 is the cross-cutting P4, and `set-up-account` being in flight is on its own
+    # sufficient to refuse it. That `cross-cutting-blocked=1` is the headline fixture carrying the
+    # very case the field exists for; it read 0-shaped (`blocked-by-reserved: none`, no field at
+    # all) before, which is how the branch stayed invisible in the engine's own reference board.
+    check("[#1478] the census counts a reserved area that names no candidate, and still attributes "
+          "the cross-cutting demand that area refuses", census,
           [f"{CENSUS_PREFIX} candidates=5 frontier=3 conflict-deferred=2 reserved_areas=1 "
-           "free_areas=4 blocked-by-reserved: none"])
+           "free_areas=4 cross-cutting-blocked=1 blocked-by-reserved: none"])
     # Ranking (count desc, then key) and the cap. Ten reserved areas each blocking one candidate:
     # a dropped bound prints all ten, an ascending sort or a missing `+N more` changes this text.
     _many = [pr(940 + i, [f"area:a{i}"]) for i in range(10)]
@@ -1041,8 +1102,8 @@ def _self_test():
     check("[#1478] the named areas are ranked and BOUNDED, and the overflow is declared",
           _many_lines,
           [f"{CENSUS_PREFIX} candidates=10 frontier=0 conflict-deferred=10 reserved_areas=10 "
-           "free_areas=0 blocked-by-reserved: a0=1, a1=1, a2=1, a3=1, a4=1, a5=1, a6=1, a7=1 "
-           "(+2 more)"])
+           "free_areas=0 cross-cutting-blocked=0 "
+           "blocked-by-reserved: a0=1, a1=1, a2=1, a3=1, a4=1, a5=1, a6=1, a7=1 (+2 more)"])
     # `frontier_census` is PURE and the numbers are DERIVED, not passed through: hand it a
     # candidate set and a held set directly, with no engine in the loop.
     _c = [(1, 11, {"number": 11}, {"worker"}), (1, 12, {"number": 12}, {"docs", "worker"}),
@@ -1050,11 +1111,11 @@ def _self_test():
     check("[#1478] frontier_census is pure and derives every number from its inputs",
           frontier_census(_c, {"worker", "groom"}, [{"number": 13}]),
           [f"{CENSUS_PREFIX} candidates=3 frontier=1 conflict-deferred=2 reserved_areas=2 "
-           "free_areas=2 blocked-by-reserved: worker=2"])
+           "free_areas=2 cross-cutting-blocked=0 blocked-by-reserved: worker=2"])
     # An EMPTY board still reports, and reports zeroes — not a crash, not silence.
     check("[#1478] an empty board reports zeroes rather than nothing", frontier_census([], (), []),
           [f"{CENSUS_PREFIX} candidates=0 frontier=0 conflict-deferred=0 reserved_areas=0 "
-           "free_areas=0 blocked-by-reserved: none"])
+           "free_areas=0 cross-cutting-blocked=0 blocked-by-reserved: none"])
     # ADD-ONLY RESERVATIONS + CONFLICT-FREEDOM, BY EXECUTION over every subset of a PR-bearing
     # board. These are the two universals this change actually has, and both pin the SIGN of it:
     #
