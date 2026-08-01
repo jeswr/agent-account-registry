@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1433,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "16566da4893fe1c148fb93b8c8bee661fdf8590f",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In delegation leg (d), `drop_again` does not count calls and the patched sleep is not inspected. A mutant can call `http_transient.is_transient_network(exc)` merely for effect, ignore its false result for `RemoteDisconnected`, and retain a private `isinstance(exc, RemoteDisconnected)` retry decision. It will make three attempts and eventually raise the expected `FetchError`; `inverted[\"n\"] >= 1` also passes. The converse NotADirectoryError leg does not close this hole because such a mutant can delegate promotion while retaining a private RemoteDisconnected allow-list. Thus the test does not establish the stated false-result control flow and the prior finding remains at the same severity.",
+    "file": "scripts/plan-snapshot.py",
+    "fix_hint": "Count `drop_again` calls and capture sleeps, then assert exactly one attempt and no sleep when the shared predicate returns false. Also capture the predicate argument and assert it is the exact raised exception instance. Keep the converse true-result retry assertion, and verify a mutant that calls the predicate but ignores false for RemoteDisconnected fails with the pristine total self-test count.",
+    "severity": "major",
+    "title": "False classifier result is called but not proven to control retries"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe added inversion test now establishes that `make_fetch` calls the shared predicate, and the true-result leg establishes that an ordinarily fatal OSError can be promoted to the bounded retry path. However, the false-result leg still proves only eventual `FetchError`, not immediate failure. Because its `urlopen` stub always raises and neither attempts nor sleeps are asserted, production may call the shared predicate, ignore its false answer for `RemoteDisconnected`, retry three times under a caller-private rule, and still satisfy every assertion in that leg. The prior round's central requirement\u2014that the call site follows the shared taxonomy in both directions\u2014therefore remains major and unresolved.",
+  "verdict": "request_changes"
+ }
+}
