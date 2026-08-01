@@ -102,7 +102,12 @@ collector-side, and write no per-account rows anywhere:
   `scripts/ledger-invariant.py` refuses the file on the `ledger` ref itself (so the refusal covers
   every consumer of the branch, not only the builds that read the snapshot — the disclosure is the
   array EXISTING on a public branch). That second guard also refuses a non-object snapshot, which
-  would otherwise be a place to hide the same array.
+  would otherwise be a place to hide the same array. Because the disclosure is the published BYTES,
+  it reads both the blob committed at `HEAD` — the object its tree allowlist attested, so deleting
+  or overwriting the worktree copy hides nothing — and the worktree copy consumers go on to read,
+  and it refuses a snapshot that repeats a JSON member name at any level (last-key-wins parsing
+  would otherwise let a trailing empty `flow` hide an earlier `flow.leases` that is still there in
+  the bytes).
 - **The decision-22 label check is unconditional over whatever rows ARE present, and runs FIRST**
   — so a raw (non-salted) handle in a lease row is reported as the privacy incident it is rather
   than as a deprecated shape. That remains true whether or not this build would ever have
