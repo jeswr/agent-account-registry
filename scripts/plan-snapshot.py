@@ -2034,9 +2034,55 @@ def _self_test():
             else:
                 raise AssertionError("a NON-transient OSError must not be retried")
         assert fatal["n"] == 1, fatal
-        # ...and the decision above is the SHARED one, not a local opinion that could drift.
-        assert http_transient.is_transient_network(RemoteDisconnected("x")) is True
-        assert http_transient.is_transient_network(NotADirectoryError(20, "x")) is not True
+        # (d) DELEGATION, proven by INVERTING the shared classifier — round-2 review's finding.
+        #     Asserting what `is_transient_network` returns for these types proves nothing about
+        #     whether make_fetch ASKS it: swapping the production call for a local
+        #     `isinstance(exc, RemoteDisconnected)` keeps (a), (b) and (c) green and silently
+        #     restores the caller-private taxonomy this change exists to delete. So instead, make
+        #     the shared predicate LIE and require the production path to follow it.
+        inverted = {"n": 0}
+
+        def say_not_transient(exc, _c=inverted):
+            _c["n"] += 1
+            return False
+
+        def drop_again(request, timeout=None):
+            raise RemoteDisconnected("Remote end closed connection without response")
+
+        with patch.object(http_transient, "is_transient_network", say_not_transient), \
+                patch.object(module, "urlopen", drop_again), patch.object(time, "sleep"):
+            try:
+                make_fetch("t")("https://api.github.com/x")
+            except FetchError:
+                pass
+            else:
+                raise AssertionError("delegation: a RemoteDisconnected must be FATAL once the "
+                                     "shared taxonomy calls it non-transient")
+        assert inverted["n"] >= 1, (
+            "make_fetch never CALLED http_transient.is_transient_network — the retry decision is "
+            "a caller-private opinion, which is exactly the half-consolidation this change removes")
+
+        #     ...and the converse: the shared predicate calling an ordinarily-fatal OSError
+        #     transient must make the production path RETRY it. Together these pin the direction of
+        #     the dependency, not merely its agreement.
+        seen = {"n": 0}
+
+        def say_transient(exc):
+            return True
+
+        def enotdir_again(request, timeout=None):
+            seen["n"] += 1
+            raise NotADirectoryError(20, "Not a directory")
+
+        with patch.object(http_transient, "is_transient_network", say_transient), \
+                patch.object(module, "urlopen", enotdir_again), patch.object(time, "sleep"):
+            try:
+                make_fetch("t")("https://api.github.com/x")
+            except FetchError:
+                pass
+        assert seen["n"] == 3, (
+            "delegation: the shared taxonomy calling this OSError transient must make make_fetch "
+            f"retry the full schedule, got {seen['n']} attempt(s)")
 
     def budget_403_is_never_downgraded_to_a_per_item_skip():
         """THE COMPOSITION TRAP. `_fetch_check_runs` converts every FetchError into a per-PR
