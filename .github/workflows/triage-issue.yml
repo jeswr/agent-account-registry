@@ -145,19 +145,13 @@ jobs:
         if: steps.trust.outputs.quarantine == '1'
         run: |
           set -euo pipefail
-          # [#999] THE LABEL WRITE IS IDEMPOTENT; THE COURTESY COMMENT WAS NOT. `--add-label` of a
+          # THE LABEL WRITE IS IDEMPOTENT; THE COURTESY COMMENT WAS NOT (#999). `--add-label` of a
           # label already present is a no-op, but `gh issue comment` appends unconditionally: every
           # `edited` event on an ALREADY-quarantined third-party issue posted another identical
-          # notice, so an author editing their own body three times collected three copies. The
-          # de-duplication reads the PRE-mutation label set through the same bounded-retry reader
-          # the post-read below already uses, and only the NOTICE is conditional on it.
-          # THE FALLBACK DIRECTION IS DELIBERATE, and it is the whole fail-closed argument: this
-          # read is courtesy plumbing, so it must never be able to withhold or delay the quarantine
-          # write. A read that fails yields an EMPTY pre-state, which degrades to the historical
-          # behaviour (post the notice, possibly a duplicate) — never to a skipped label write.
-          # The write itself, its no-`|| true` posture and its post-read verification are untouched.
-          pre=$(python3 scripts/gh_retry.py read issue view "$NUM" -R "$REPO" --json labels \
-            --jq '[.labels[].name]|join(",")') || pre=""
+          # notice, so an author editing their own body three times collected three copies.
+          # The label write, its fail-loud posture (no swallowed failure) and its post-read
+          # verification come FIRST and are untouched: nothing about the courtesy notice may delay
+          # or withhold the quarantine.
           gh issue edit "$NUM" -R "$REPO" --add-label trust:untrusted --add-label status:untriaged
           post=$(python3 scripts/gh_retry.py read issue view "$NUM" -R "$REPO" --json labels \
             --jq '[.labels[].name]|join(",")')
@@ -167,14 +161,27 @@ jobs:
               *) echo "::error title=quarantine #$NUM::$required did NOT land (labels now: $post) — refusing to report success on an un-quarantined third-party issue"; exit 1 ;;
             esac
           done
-          case ",$pre," in
-            *",trust:untrusted,"*)
-              echo "::notice title=quarantine #$NUM::already quarantined before this event — the labels are re-asserted above, the courtesy notice is NOT re-posted" ;;
-            *)
-              gh issue comment "$NUM" -R "$REPO" \
-                --body "> 🤖 SPARQ agent — this issue is from a non-collaborator, so it is **quarantined** (\`trust:untrusted\`) and its content is not acted on. A maintainer can approve it by adding a 👍 reaction." \
-                || echo "::warning title=quarantine #$NUM::the quarantine notice comment failed to post; the quarantine LABELS are verified in place, so the issue is not acted on" ;;
-          esac
+          # [PR #1565 r1] THE DE-DUPLICATION READS THE NOTICE, NEVER THE LABEL. #999's first cut
+          # skipped the notice when `trust:untrusted` was already present pre-write — but the label
+          # is not evidence that a comment exists, and it is the only state remembered, so a single
+          # miss became PERMANENT silence: this job's own `cancel-in-progress` group can kill a run
+          # between the verified label write above and the post below, and the post is best-effort
+          # anyway. Either one left the label set and no notice, and every later event then skipped.
+          # So the question asked is the one that matters — does an AUTHENTIC notice comment exist?
+          # `quarantine_notice_posted()` answers it author-filtered and line-anchored; the marker
+          # and the body live only in that module, so there is no second copy here to drift (#958).
+          # THE FALLBACK DIRECTION IS DELIBERATE: this read is courtesy plumbing, so a failure
+          # yields an empty verdict, which degrades to POSTING (at worst a duplicate) — never to a
+          # withheld label write and never to a suppressed notice.
+          notified=$(python3 scripts/gh_retry.py read issue view "$NUM" -R "$REPO" --json comments \
+            | python3 scripts/triage.py --quarantine-notice-posted) || notified=""
+          if [ "$notified" = "1" ]; then
+            echo "::notice title=quarantine #$NUM::the quarantine notice is already posted on this issue — the labels are re-asserted above, the notice is NOT re-posted"
+          else
+            notice=$(python3 scripts/triage.py --quarantine-notice-body)
+            gh issue comment "$NUM" -R "$REPO" --body "$notice" \
+              || echo "::warning title=quarantine #$NUM::the quarantine notice comment failed to post; the quarantine LABELS are verified in place, so the issue is not acted on — a later event on this issue will retry the notice"
+          fi
 
       # `--apply` owns the whole read -> plan -> mutate sequence FAIL-CLOSED (registry #582).
       # It replaces the previous per-label `gh issue edit ... || true` loops, which applied the
