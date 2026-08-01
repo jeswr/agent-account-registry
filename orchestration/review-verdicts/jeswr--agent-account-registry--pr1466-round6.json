@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1466,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0080d5600a186a08a5ce19c4352d692bc36657a0",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The record still requires the groom lane to resolve a stale differing-value maximum-generation tie by applying the deterministic tie-break, while the exhaustive delete rule permits a maximum-generation deletion only for the deleter's own record when a smaller sibling is present. A later groom owns neither dead writer's operation record. No promotion, delegated-delete authority, authentication rule, or other fenced transition is defined, so the required sweep remains forbidden by the protocol and the disarm latch may remain UNKNOWN indefinitely.",
+    "file": "research/389-reviewed-sha-bind-store.md",
+    "fix_hint": "Define a concrete fenced transition the groom is authorized to perform, including authentication, concurrency semantics, and non-vacuous interleaving tests. For example, specify deterministic promotion of the selected value at a fresh generation, or narrowly authorize groom deletion of the selected loser while preserving the never-delete-winner invariant.",
+    "severity": "major",
+    "title": "The stale-tie groom still cannot delete a dead writer's loser"
+   },
+   {
+    "body": "Step 0 still says that finding a record carrying `(N, op)` means the operation landed and immediately returns it. It does not fetch or compare the record body with the expected operation body under the declared volatile-field equivalence rule. Thus corruption, an operation-digest collision, or divergent bytes at the same path are silently accepted on retry instead of producing conflict or UNKNOWN. The later test requirement for varying bodies exercises store create-or-keep behavior, but does not close this early-return bypass.",
+    "file": "research/389-reviewed-sha-bind-store.md",
+    "fix_hint": "Require step 0 rediscovery to read and validate the existing record using the declared equivalence rule before returning. Divergence must fail closed. Add a restart/lost-response test with a matching `(N, op)` filename but non-equivalent bytes and assert conflict or UNKNOWN rather than success.",
+    "severity": "major",
+    "title": "Step 0 still accepts a matching path without validating its body"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 6 leaves both round-5 soundness gaps materially unchanged. The stale differing-value tie is still assigned to a groom that is not authorized by the stated delete invariant to remove either dead writer's maximum-generation loser; no promotion, delegated ownership, or other fenced groom transition is defined, so UNKNOWN may remain permanent. Step 0 still treats an `(N, op)` filename match as proof that the operation landed and returns without validating the immutable record body under the declared volatile-field equivalence rule. Both defects remain load-bearing, so changes are still required.",
+  "verdict": "request_changes"
+ }
+}
