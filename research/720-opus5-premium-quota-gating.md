@@ -234,8 +234,13 @@ state should be a second front-matter line through the same seam, not a new stor
 
 **Fields**, per account, keyed by model alias:
 
-- `last_ok` — RFC3339 UTC of the most recent probe that returned a *well-formed* window.
-- `fail_streak` — probes since `last_ok` that reached the provider and did not return one.
+- `last_probed` — RFC3339 UTC of the most recent probe that *reached the provider*, whatever shape
+  came back. This is the freshness key, and the TTL below reads this field and no other.
+- `fail_streak` — consecutive probes that reached the provider since the last well-formed window
+  and did not return one.
+- `last_ok` — RFC3339 UTC of the most recent *well-formed* window. **Diagnostic only:** it answers
+  "when did this account last work" for a human reading the issue body, and no admission rule keys
+  on it. Making it load-bearing is the specific mistake the freshness rule below rules out.
 
 Absence of the line is itself meaningful and is the safe default: `persist_limits` already skips
 accounts missing from the snapshot and writes nothing when `_limits_line` returns `None`, so a
@@ -245,9 +250,9 @@ never-probed account carries no state, which is row 4.
 
 | probe outcome | seam that already distinguishes it | transition |
 |---|---|---|
-| well-formed window | `_assemble_fable`-shaped classifier returns an entry | `last_ok = now`, `fail_streak = 0` |
-| response received, window absent or unparseable | classifier returns `None` after headers were parsed | `fail_streak += 1`, `last_ok` untouched |
-| transport failure / no token / account not probed | `_probe_headers` returns `None` (line 80); `_probe_anthropic` (line 112) already splits this from shape failure | **no write at all** |
+| well-formed window | `_assemble_fable`-shaped classifier returns an entry | `last_probed = last_ok = now`, `fail_streak = 0` |
+| response received, window absent or unparseable | classifier returns `None` after headers were parsed | `last_probed = now`, `fail_streak += 1`, `last_ok` untouched |
+| transport failure / no token / account not probed | `_probe_headers` returns `None` (line 80); `_probe_anthropic` (line 112) already splits this from shape failure | **no write at all** — neither timestamp moves |
 
 The third row is load-bearing. A transport failure is evidence about the prober, not about the
 account; counting it would let one broken runner, an expired credential set, or a workflow outage
@@ -270,11 +275,38 @@ moment the merge is expressed as "read k, write k+1" outside the retry loop. Mak
 `(old_line, outcome) -> new_line` function and unit-test it; that is the seam every transition row
 in §8 exercises.
 
-**Freshness decays toward admitting, not toward refusing.** A record whose `last_ok` is older than
-a TTL (one full weekly window plus slack is the natural choice, since that is the bucket's own
-period) reads as row 4 — never-observed — not as dead. An expiry that decays toward refuse turns
-any sustained probe outage into a fleet-wide latch with no recovery path, which is the #639 shape
-`select-and-claim.py:519–535` already rejected.
+**Freshness decays toward admitting, not toward refusing — but only genuine unobservedness may
+decay.** A record whose `last_probed` is older than a TTL (one full weekly window plus slack is the
+natural choice, since that is the bucket's own period) reads as row 4 — never-observed — not as
+dead. An expiry that decays toward refuse turns any sustained probe outage into a fleet-wide latch
+with no recovery path, which is the #639 shape `select-and-claim.py:519–535` already rejected.
+
+**The TTL must key on `last_probed`, never on `last_ok`, and this is the sharpest edge in §4.1.**
+The two look interchangeable and are not, because the drift transition deliberately leaves
+`last_ok` untouched while still writing every tick. Key the TTL on `last_ok` and an account that
+was once well formed and then drifts permanently refuses from streak N only until `last_ok` ages
+out — one weekly window plus slack — at which point it reads as never-observed and **admits
+forever**, while probes keep landing and every one of them keeps failing shape. That is precisely
+the sustained provider-side drift #720 exists to catch, readmitted on a timer nobody set and
+disguised as recovery. It would also falsify the paragraph immediately above, which is only
+defensible if a probe *outage* is the sole thing that decays toward admission. `last_probed`
+separates the two decays cleanly:
+
+| what stopped | what stops advancing | state after the TTL |
+|---|---|---|
+| the prober — transport, credentials, workflow outage | `last_probed`, because the third writer row writes nothing at all | row 4, **admit** loudly; the #639 escape hatch, intact |
+| the provider's header shape | nothing — `last_probed` advances on every tick, the drift row still writes | still row 3, **refuse**; the streak has no expiry because nothing about it is stale |
+
+So the rule to implement is: *the streak expires only when observation itself stops.* Continuously
+received malformed responses are observation, not silence, and must hold row 3 indefinitely.
+
+The honest cost of that split, since it is the reason someone would reach for `last_ok` in the
+first place: with no time-based escape from row 3, a bug in *our own* classifier is
+indistinguishable from provider drift and latches the alias closed N ticks after it ships. That is
+accepted deliberately — recovery is to fix the classifier or drop the alias from Stage B's mapping,
+both code changes a human makes with the alert row in hand — but it is exactly why row 3's
+"loudly" has to be a real usage-alert row and why N has to stay small. A TTL is not a substitute
+for either, and using one as a silent self-repair is how the gate becomes vacuous.
 
 **Resolving rows 3 and 4 against Stage B's counter.** As first written, §4's table refused
 immediately on drift while Stage B item 3 refused only after N consecutive failures. They cannot
@@ -402,7 +434,8 @@ Only if Stage A shows a distinct bucket:
 4. Extend the front-matter writer for the state line: `LIMIT_KEYS`/`_limits_line`
    (`account-usage.py:403,415`) gains a sibling, routed through the same `_persist_one` edit-count
    guard, and `persist_limits` (line 536) gains an injectable clock — it has no `now` today, and
-   `last_ok` is untestable without one. The self-test already injects `run=`, so the idiom exists.
+   `last_probed`/`last_ok` are untestable without one — and the TTL rows in §8 need a clock they
+   can advance past a week. The self-test already injects `run=`, so the idiom exists.
 
 ### On #720's "same change" requirement
 
@@ -441,13 +474,14 @@ that make it non-vacuous — each row names the mutant that must fail:
 
 | transition / rule | seam | mutant it must catch |
 |---|---|---|
-| well-formed window ⇒ `last_ok = now`, `fail_streak = 0` | state writer in `persist_limits` | delete the reset — `fail_streak` becomes monotonic and every account eventually refuses |
-| response with absent/unparseable window ⇒ `fail_streak += 1`, `last_ok` untouched | same | also advance `last_ok`, which makes the TTL never expire |
-| transport failure / unprobed ⇒ **no write** | the `hdr is None` vs shape-invalid split (`account-usage.py:112`) | count transport failures too — one broken runner kills the fleet in N ticks |
+| well-formed window ⇒ `last_probed = last_ok = now`, `fail_streak = 0` | state writer in `persist_limits` | delete the reset — `fail_streak` becomes monotonic and every account eventually refuses |
+| response with absent/unparseable window ⇒ `last_probed = now`, `fail_streak += 1`, `last_ok` untouched | same | leave `last_probed` untouched on drift — the record then ages out of the streak gate while drift continues (the readmit-forever row below) |
+| transport failure / unprobed ⇒ **no write**, neither timestamp advances | the `hdr is None` vs shape-invalid split (`account-usage.py:112`) | count transport failures too — one broken runner kills the fleet in N ticks; or advance `last_probed` anyway, which pins a dead prober's records fresh forever |
 | `fail_streak < N` + absent window ⇒ **admit** | the pure state reader beside `_fable_eligible` | flip to refuse — this is §4's fleet-stop mutant and needs a *named* test asserting admission |
 | `fail_streak ≥ N` + absent window ⇒ **refuse** | same | never refuse — the gate is vacuous and #720 is unfixed |
 | `fail_streak ≥ N` **but this tick's window is well-formed** ⇒ headroom decides, record ignored | same (consumer rule 1) | let the record refuse alone — an issue-body edit becomes a capacity kill switch |
-| `last_ok` older than TTL ⇒ reads as never-observed (**admit**) | same | treat stale as dead — a probe outage latches the fleet with no recovery |
+| `last_probed` older than TTL (prober stopped) ⇒ reads as never-observed (**admit**) | same | treat stale as dead — a probe outage latches the fleet with no recovery |
+| **malformed responses continuing past the TTL** (probes still landing, `last_probed` fresh, `fail_streak ≥ N`) ⇒ still row 3, **refuse** | same | key freshness on `last_ok` instead of `last_probed` — the record ages into never-observed one weekly window after drift begins and admits forever while every probe still fails shape. This needs a *named* test that advances a clock well past the TTL under continuous shape failure and asserts refusal; without it the gate silently self-repairs into vacuity |
 | malformed/garbage state line ⇒ never-observed + `::warning::`, account **stays in the catalog** | consumer rules 2–3 | raise or refuse — corrupt state removes capacity instead of degrading |
 
 Loudness rows assert over emitted workflow commands via `workflow_commands`
