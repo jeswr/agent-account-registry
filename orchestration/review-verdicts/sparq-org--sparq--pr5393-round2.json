@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5393,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "78331a83dcd487b131d480b0e441ba232cd1f73c",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains documentation-only and is accurate. `apply_migration` is implemented as three passes (issue upsert, body-marker stamping, then label reconciliation); blocker and parent relationships are written only as body markers; `fetch_native_blockers` is read-only; and `verify_migration` explicitly refuses to use native count summaries as proof that a specific marker landed. The dispatch statement also matches `open_blocker_count`, which holds an issue when either the native count or an open marker blocker is nonzero. No correctness, soundness, test-validity, or security defect is introduced.",
+  "verdict": "approve"
+ }
+}
