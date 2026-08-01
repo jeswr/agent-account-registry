@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5481,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "28a8a59a9c5c69e065c273ef421cf81599f8d56d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains correct and complete. All subject-position blank-node inspection is routed through exhaustive helpers, preserving current oxrdf 0.3 behavior while creating the intended compile-time tripwire if NamedOrBlankNode gains another variant. The depth calculation is unchanged for both representable subject kinds, and the tests cover both helper arms plus the real canonicalization path for a blank node in an embedded triple subject. No correctness, soundness, security, or test-validity defect is apparent. Relative to round 1, there are still no findings, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
