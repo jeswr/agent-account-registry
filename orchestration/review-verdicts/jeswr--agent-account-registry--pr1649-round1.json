@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1649,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d45b9db10ff100abad99d99c3550c4d0cba77968",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new masking scenario injects `_raise_leaky` only into the stale-PR detection GET. The diff adds or rewires `_deferral_detail(exc)` at four distinct production handlers: age unpark, stale-PR detection, issue status repair, and stale-PR hand-off. Replacing the helper with `str(exc)` at either repair handler or the age-unpark handler leaves the new masking row green; their ValueError boundary/continuation rows use a short, non-secret message and therefore do not detect the leak. A call-site wiring error on any of those paths would expose arbitrary exception text even though the shared helper itself remains correct.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Drive a token-shaped, multiline, over-limit arbitrary exception through every widened handler and assert the emitted ALERT/deferral is masked, single-line, and bounded for each call site. At minimum, add independent end-to-end assertions for issue status repair, stale-PR hand-off, and age unpark, with inputs that do not derive their expected values from `_TOKEN_SHAPE` or `GH_DETAIL_LIMIT`.",
+    "severity": "major",
+    "title": "Masking test covers only one widened handler"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe widened per-object handlers consistently route arbitrary exception text through the shared masking helper, and the new scenarios exercise boundary catching, continuation, reclaim, and phase-exit precedence. However, the security assertion is wired through only one of the four production call sites changed to use `_deferral_detail`. The suite therefore does not establish that arbitrary exception text is masked on the issue-repair, stale-PR hand-off, or age-unpark paths. Because those paths now accept arbitrary exception strings and emit them to operator logs, this missing call-site coverage leaves the principal security property incomplete.",
+  "verdict": "request_changes"
+ }
+}
