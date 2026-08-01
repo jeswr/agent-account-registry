@@ -1117,6 +1117,42 @@ def _admitted_review_prs(
     return admitted
 
 
+def repair_lane_owned(pull: dict[str, Any], merge_state: str, target_repo: str) -> bool:
+    """Will dispatch's repair lane actually ENUMERATE this pull in this merge state?
+
+    The ONE admission proof both #171 carve-outs are gated on — the new park in
+    ``stale_worker_pr_reason`` and the re-admission of a standing park in
+    ``age_park_cause_recovered`` — so "the repair lane owns this PR" cannot mean two things on
+    the two sides of the same park. Two conjuncts, both load-bearing:
+
+    - the live merge state is in REPAIR_LANE_MERGE_STATES (see that constant for why the set is
+      exactly ``{dirty}``: it IS the needs-rebase admission, read off the same detail response),
+      AND
+    - the head repository is PRESENT and is EXACTLY ``target_repo``.
+
+    The head-repository conjunct is not defence in depth, it is the other half of the admission
+    (round-2 review of PR #1484). ``enumerate_review_items`` rejects ``head_repo != repo``
+    UNCONDITIONALLY and hoisted ABOVE every waivable gate — it is the one attacker-facing
+    predicate in that enumerator, and nothing below it is reachable without it. So a conflicting,
+    valid-provenance, worker-shaped PR whose head repo is FOREIGN, or whose head repo is GONE (a
+    deleted fork reads ``"repo": null``), is enumerated by NOBODY. Exempting it from the age park
+    on the merge state alone would trade a visible escalation for a silent terminal stall —
+    strictly worse than the deadlock #171 reports, and the same delivery-not-plausibility bar the
+    round-1 review set for admitting a merge state to the set at all.
+
+    Every missing, malformed or mismatched shape answers False, including an empty/non-string
+    ``target_repo``: an admission we cannot PROVE is not an admission, and the fail-closed
+    direction here is KEEPING the escalation."""
+    if merge_state not in REPAIR_LANE_MERGE_STATES:
+        return False
+    if not isinstance(target_repo, str) or not target_repo:
+        return False
+    head = pull.get("head")
+    head_repo = head.get("repo") if isinstance(head, dict) else None
+    full_name = head_repo.get("full_name") if isinstance(head_repo, dict) else None
+    return isinstance(full_name, str) and full_name == target_repo
+
+
 def stale_worker_pr_reason(
     pull: dict[str, Any],
     bot_login: str,
@@ -1124,6 +1160,7 @@ def stale_worker_pr_reason(
     now: int,
     *,
     has_valid_provenance: bool,
+    target_repo: str,
 ) -> str | None:
     """Return why an old worker PR needs HUMAN attention, or None when it should remain untouched.
 
@@ -1133,13 +1170,15 @@ def stale_worker_pr_reason(
     provenance record (missing, unreadable, or schema-invalid — worker_pr_provenance_enumerable),
     which no automated loop will ever pick up (genuine orphan). A worker PR with a VALID
     provenance record is review-loop-owned and is NEVER escalated here for a state that loop
-    provably owns: a DRAFT never (see the draft branch below), and a NON-DRAFT never in a
-    REPAIR_LANE_MERGE_STATES state — i.e. `dirty`, which IS dispatch-claim's needs-rebase
-    admission predicate read off the same detail response (issue #171). Every other bad merge
+    provably owns: a DRAFT never (see the draft branch below), and a NON-DRAFT never when
+    `repair_lane_owned` PROVES dispatch will enumerate it — a REPAIR_LANE_MERGE_STATES state
+    (i.e. `dirty`, which IS dispatch-claim's needs-rebase admission predicate read off the same
+    detail response) on a head hosted in `target_repo` itself (issue #171). Every other bad merge
     state keeps its park precisely because the state alone does not prove an item will be
-    enumerated; see REPAIR_LANE_MERGE_STATES for the per-state argument. Together: nothing is
-    ever silently stranded, and no PR the repair lane is provably about to fix is parked out of
-    that lane."""
+    enumerated; see REPAIR_LANE_MERGE_STATES for the per-state argument, and `repair_lane_owned`
+    for why a foreign or missing head repository keeps its park too. Together: nothing is ever
+    silently stranded, and no PR the repair lane is provably about to fix is parked out of that
+    lane."""
     updated = _epoch(pull.get("updated_at"), "pull request")
     if now - updated < threshold_seconds:
         return None
@@ -1189,7 +1228,7 @@ def stale_worker_pr_reason(
         merge_state = "unknown"
     if not isinstance(merge_state, str):
         raise GroomError("pull request merge state is malformed")
-    if has_valid_provenance and merge_state in REPAIR_LANE_MERGE_STATES:
+    if has_valid_provenance and repair_lane_owned(pull, merge_state, target_repo):
         # [issue #171] The draft carve-out above was HALF the ownership rule. Conflict repair is
         # dispatched for READY worker PRs too — the branch that emits needs-rebase never reads the
         # draft bit — so a valid-provenance NON-DRAFT whose base is CONFLICTING (which is what
@@ -1197,7 +1236,9 @@ def stale_worker_pr_reason(
         # awaiting review, and parking it excludes it from the lane that would otherwise fix it.
         # See REPAIR_LANE_MERGE_STATES for why this set is exactly {dirty} and why every other
         # bad merge state — including `unstable`/`blocked`, whose ci-fix admission needs a
-        # head-bound CONCLUDED failing repair gate this function cannot see — keeps its park.
+        # head-bound CONCLUDED failing repair gate this function cannot see — keeps its park; and
+        # `repair_lane_owned` for the head-repository half of the same admission, which the
+        # enumerator applies above every waivable gate and which a merge state alone cannot prove.
         return None
     return BAD_MERGE_STATES.get(merge_state)
 
@@ -2259,6 +2300,8 @@ def age_park_cause_recovered(
     cause: str,
     pull: dict[str, Any],
     live_provenance: Callable[[], tuple[str, dict[str, Any] | None]],
+    *,
+    target_repo: str,
 ) -> tuple[bool, str]:
     """Has THIS park's OWN cause provably recovered? Returns (recovered, why).
 
@@ -2269,20 +2312,23 @@ def age_park_cause_recovered(
       ref. That is exactly the predicate _live_provenance_record already computes to CANCEL a
       park, reused to CLEAR one, so "the review loop will drive this PR" cannot mean two things.
     - ``merge-*``      — the live ``mergeable_state`` is no longer one of BAD_MERGE_STATES, OR
-      (issue #171) that live state is one of REPAIR_LANE_MERGE_STATES — i.e. `dirty`, which IS
-      the needs-rebase admission predicate — and an ADMISSIBLE record exists on the live ledger
-      ref. The second disjunct is the park-side carve-out on the EXIT: a merge-dirty park on a
+      (issue #171) `repair_lane_owned` proves dispatch will enumerate this pull as it now stands
+      — a REPAIR_LANE_MERGE_STATES state (i.e. `dirty`, the needs-rebase admission) on a head
+      hosted in ``target_repo`` — and an ADMISSIBLE record exists on the live ledger ref. The
+      second disjunct is the park-side carve-out on the EXIT: a merge-dirty park on a
       review-loop-owned PR is waiting for a recovery that only the rebase lane can perform, and
-      the park itself is what excludes the PR from that lane. Both conjuncts are REQUIRED — a
-      state whose repair is merely plausible (`unstable`, `blocked`) does not spend the bounded
-      re-admission grant, because re-admitting into an enumeration that emits nothing would
-      convert a visible park into a silent stall (round-1 review of PR #1484). Without this
-      disjunct, `stale_worker_pr_reason`'s carve-out would only stop NEW parks while every
-      park already standing kept its deadlock forever — the exact terminal state issue #171
-      reports. Proof is the SAME live-ledger admission `orphan-draft` uses, so "the review loop
-      will drive this PR" means one thing on both branches; the grant is consumed exactly once by
-      the caller, and the carve-out guarantees the sweep will not re-park the same PR for the same
-      cause, so this cannot flap.
+      the park itself is what excludes the PR from that lane. Every conjunct is REQUIRED — a
+      state whose repair is merely plausible (`unstable`, `blocked`), or a conflicting head the
+      enumerator's unconditional fork gate rejects (foreign or deleted head repository), does not
+      spend the bounded re-admission grant, because re-admitting into an enumeration that emits
+      nothing would convert a visible park into a silent stall (rounds 1 and 2 of PR #1484's
+      review). Without this disjunct, `stale_worker_pr_reason`'s carve-out would only stop NEW
+      parks while every park already standing kept its deadlock forever — the exact terminal
+      state issue #171 reports. The exit's admission is LITERALLY the park's own
+      (`repair_lane_owned`, one function), and its provenance proof is the SAME live-ledger
+      admission `orphan-draft` uses, so "the review loop will drive this PR" means one thing on
+      both branches; the grant is consumed exactly once by the caller, and the carve-out
+      guarantees the sweep will not re-park the same PR for the same cause, so this cannot flap.
 
     Every ambiguity fails toward STAYING PARKED: an unreadable/conflicting provenance read, a
     malformed merge state, and an unrecognised cause token all return False. An unrecognised
@@ -2310,6 +2356,14 @@ def age_park_cause_recovered(
             # bad, and still repair-lane-owned, is worth a live read.
             if merge_state not in REPAIR_LANE_MERGE_STATES:
                 return False, f"the merge state is still {merge_state}"
+            if not repair_lane_owned(pull, merge_state, target_repo):
+                # [round-2 review of PR #1484] The repair-lane STATE without the repair-lane HEAD.
+                # dispatch's enumerator rejects a head repo that is not the target repo above every
+                # waivable gate, so spending the bounded re-admission grant here would un-park a PR
+                # into a lane that emits nothing for it — a silent stall replacing a visible park.
+                return False, (
+                    f"the merge state is still {merge_state} and its head repository is not "
+                    f"{target_repo!r}, so dispatch's repair lane never enumerates it")
             state, _record = live_provenance()
             if state == "admits":
                 return True, (
@@ -2655,6 +2709,7 @@ def _execute_age_unpark_actions(
                     owed["cause"], pull,
                     lambda: _live_provenance_record(
                         registry_api, registry_repo, repo, number),
+                    target_repo=repo,
                 )
                 if not recovered:
                     print(f"age park stands {repo}#{number} (cause={owed['cause']} "
@@ -3520,6 +3575,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                     now,
                     has_valid_provenance=worker_pr_provenance_enumerable(
                         repo, number, ledger_root=ledger_root),
+                    target_repo=repo,
                 )
             except GroomError as exc:
                 print(f"ALERT PR {repo}#{number}: {exc} — stale PR detection deferred")
@@ -3925,6 +3981,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 now,
                 has_valid_provenance=worker_pr_provenance_enumerable(
                     action.repo, action.number, ledger_root=ledger_root),
+                target_repo=action.repo,
             )
             if reason is None:
                 print(f"SKIP PR {action.repo}#{action.number}: no longer stale/failing")
@@ -4646,9 +4703,13 @@ def _self_test() -> int:
         _bot_login(_StubAPI({"/user": {"login": "legacy[bot]"}})),
         "legacy[bot]",
     )
+    # [round-2 review of PR #1484] The head REPOSITORY is part of the fixture now, because it is
+    # part of the repair-lane admission: dispatch's enumerator rejects `head_repo != repo` above
+    # every waivable gate, so a carve-out that never reads it exempts a PR nothing enumerates.
+    STALE_PR_REPO = "owner/repo"
     old_pr = {
         "updated_at": datetime.fromtimestamp(now - 601, timezone.utc).isoformat(),
-        "head": {"ref": "sparq-agent/issue-7-99-1"},
+        "head": {"ref": "sparq-agent/issue-7-99-1", "repo": {"full_name": STALE_PR_REPO}},
         "user": {"login": "app[bot]"},
         "body": WORKER_PR_MARKER + "\n\nFixes #7",
         "draft": False,
@@ -4657,7 +4718,8 @@ def _self_test() -> int:
     check(
         "stale blocked worker PR",
         stale_worker_pr_reason(
-            old_pr, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=True
+            old_pr, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=True,
+            target_repo=STALE_PR_REPO,
         ),
         BAD_MERGE_STATES["blocked"],
     )
@@ -4670,6 +4732,7 @@ def _self_test() -> int:
             limits.threshold_seconds,
             now,
             has_valid_provenance=True,
+            target_repo=STALE_PR_REPO,
         ),
         None,
     )
@@ -4681,6 +4744,7 @@ def _self_test() -> int:
             600,
             now,
             has_valid_provenance=True,
+            target_repo=STALE_PR_REPO,
         ),
         None,
     )
@@ -5312,7 +5376,8 @@ def _self_test() -> int:
     check(
         "stale DRAFT worker PR with VALID provenance is NOT age-parked (review-loop-owned)",
         stale_worker_pr_reason(
-            stale_draft_pr, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=True
+            stale_draft_pr, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=True,
+            target_repo=STALE_PR_REPO,
         ),
         None,
     )
@@ -5324,6 +5389,7 @@ def _self_test() -> int:
             limits.threshold_seconds,
             now,
             has_valid_provenance=True,
+            target_repo=STALE_PR_REPO,
         ),
         None,
     )
@@ -5335,7 +5401,8 @@ def _self_test() -> int:
     check(
         "stale DRAFT worker PR WITHOUT valid provenance still parks (orphan hand-off)",
         stale_worker_pr_reason(
-            stale_draft_pr, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=False
+            stale_draft_pr, "app[bot]", limits.threshold_seconds, now,
+            has_valid_provenance=False, target_repo=STALE_PR_REPO,
         ),
         ORPHAN_DRAFT_REASON,
     )
@@ -5347,6 +5414,7 @@ def _self_test() -> int:
             limits.threshold_seconds,
             now,
             has_valid_provenance=False,
+            target_repo=STALE_PR_REPO,
         ),
         ORPHAN_DRAFT_REASON,
     )
@@ -5366,10 +5434,26 @@ def _self_test() -> int:
     # escalation for a PR the enumerator may emit NOTHING for — a silent stall, strictly worse
     # than the deadlock. States are written as LITERALS below, never derived from the constant
     # under test: a comprehension over REPAIR_LANE_MERGE_STATES stays green when the set widens.
-    def _park_reason(state, *, valid=True, draft=False):
+    # Sentinels for the two head-REPOSITORY shapes a fixture has to be able to express, since
+    # `None` is itself one of them (GitHub renders a deleted fork's head as `"repo": null`).
+    _KEEP_HEAD_REPO = object()            # leave old_pr's own same-repo head untouched
+    _NO_HEAD_REPO_KEY = object()          # the `repo` key is absent from the head object entirely
+
+    def _park_reason(state, *, valid=True, draft=False, head_repo=_KEEP_HEAD_REPO):
+        """The age-park reason for a stale worker PR. `head_repo` is spliced in RAW, exactly as
+        the REST detail response carries it, so a fixture can pin a foreign head, a deleted fork
+        (`None`) or an absent key without the harness normalising any of them away."""
+        pull = {**old_pr, "draft": draft, "mergeable_state": state}
+        if head_repo is not _KEEP_HEAD_REPO:
+            head = {**pull["head"]}
+            if head_repo is _NO_HEAD_REPO_KEY:
+                head.pop("repo", None)
+            else:
+                head["repo"] = head_repo
+            pull["head"] = head
         return stale_worker_pr_reason(
-            {**old_pr, "draft": draft, "mergeable_state": state},
-            "app[bot]", limits.threshold_seconds, now, has_valid_provenance=valid)
+            pull, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=valid,
+            target_repo=STALE_PR_REPO)
 
     check(
         "[#171] a stale valid-provenance NON-DRAFT is NOT parked when its base CONFLICTS — that "
@@ -5397,6 +5481,59 @@ def _self_test() -> int:
         "(fail-closed)",
         _park_reason("dirty", valid=False),
         BAD_MERGE_STATES["dirty"],
+    )
+    # [round-2 review of PR #1484] ...and it is gated on the HEAD REPOSITORY too, because that is
+    # the OTHER half of the same admission. enumerate_review_items rejects `head_repo != repo`
+    # UNCONDITIONALLY and hoisted above every waivable gate, so a conflicting worker PR whose head
+    # repo is foreign, deleted or unstated is enumerated by nobody: exempting it on the merge state
+    # alone replaces a visible escalation with a silent terminal stall. Delete the head-repo
+    # conjunct from `repair_lane_owned` and all four rows below go None.
+    check(
+        "[#1484 r2] the conflicting carve-out requires a PRESENT, SAME-repository head: a FOREIGN "
+        "head repo, a case-shifted near-miss, a PREFIX near-miss (`<target>-fork`, which a "
+        "containment test would wave through), a null full_name, a DELETED fork (`repo: null`) "
+        "and an ABSENT `repo` key all keep the age park — dispatch's fork gate compares with "
+        "`!=`, so it refuses every one of them",
+        [_park_reason("dirty", head_repo=head) for head in (
+            {"full_name": "attacker/repo"},
+            {"full_name": "Owner/Repo"},
+            {"full_name": STALE_PR_REPO + "-fork"},
+            {"full_name": None},
+            None,
+            _NO_HEAD_REPO_KEY,
+        )],
+        [BAD_MERGE_STATES["dirty"]] * 6,
+    )
+    check(
+        "[#1484 r2] ...and the SAME-repository head is what makes the exemption: re-stating it "
+        "explicitly proves the four rows above differ from the exempt row ONLY in the head repo",
+        _park_reason("dirty", head_repo={"full_name": STALE_PR_REPO}),
+        None,
+    )
+    check(
+        "[#1484 r2] `repair_lane_owned` cannot prove an admission against a target repo it was "
+        "not given: an empty or non-string target fails CLOSED — including against an equally "
+        "empty head repo, where a bare `==` would MATCH and exempt the PR — and a non-repair "
+        "state is refused before the head is consulted at all",
+        (repair_lane_owned(old_pr, "dirty", ""),
+         repair_lane_owned(old_pr, "dirty", None),
+         repair_lane_owned({"head": {"repo": {"full_name": ""}}}, "dirty", ""),
+         repair_lane_owned(old_pr, "dirty", STALE_PR_REPO),
+         repair_lane_owned(old_pr, "behind", STALE_PR_REPO)),
+        (False, False, False, True, False),
+    )
+    check(
+        "[#1484 r2] a MALFORMED head — no `head` key, a non-object head, a non-object `repo` — "
+        "answers False rather than RAISING: `stale_worker_pr_reason`'s caller catches only "
+        "GroomError, so an AttributeError here would abort the whole sweep before dead-lease "
+        "reclaim (the #644/#647 head-of-line shape) instead of parking one PR",
+        [repair_lane_owned(pull, "dirty", STALE_PR_REPO) for pull in (
+            {"mergeable_state": "dirty"},
+            {"head": None},
+            {"head": "sparq-agent/issue-7-99-1"},
+            {"head": {"repo": "owner/repo"}},
+        )],
+        [False, False, False, False],
     )
     # MUTATION guard for (b): master's merge branch — `return BAD_MERGE_STATES.get(state)` with no
     # provenance conjunct — parks the valid-provenance non-draft this fix now preserves. The
@@ -5433,12 +5570,20 @@ def _self_test() -> int:
                            "impl_provider": "anthropic", "impl_alias": "fable",
                            "impl_account_h": "ab" * 8, "issue": 7, "recorded_at_run": "1.1"}}
 
-    def _rl_pull(labels=()):
+    def _rl_pull(labels=(), head_repo=_KEEP_HEAD_REPO):
         # The SAME shape (b) parks: a stale NON-DRAFT worker PR, App-bot-authored, worker branch.
+        # `head_repo` is spliced in RAW and is the SAME override `_park_reason` takes, so the two
+        # sides of each correspondence below are driven by one description of one PR.
+        head = {"ref": "sparq-agent/issue-7-99-1", "sha": _rl_sha,
+                "repo": {"full_name": _rl_repo}}
+        if head_repo is not _KEEP_HEAD_REPO:
+            if head_repo is _NO_HEAD_REPO_KEY:
+                head.pop("repo")
+            else:
+                head["repo"] = head_repo
         return {"number": 77, "state": "open", "draft": False,
                 "body": WORKER_PR_MARKER + "\n\nFixes #7",
-                "head": {"ref": "sparq-agent/issue-7-99-1", "sha": _rl_sha,
-                         "repo": {"full_name": _rl_repo}},
+                "head": head,
                 "user": {"login": "app[bot]", "type": "Bot"},
                 "labels": [{"name": name} for name in labels]}
 
@@ -5448,14 +5593,15 @@ def _self_test() -> int:
             "mergeable": False if merge_state == "dirty" else True,
             "draft": False, "auto_merge": None, "check_runs": list(check_runs)})}
 
-    def _rl_states(status, *, labels=(), issue_labels=("area:crate-a", "role:impl")):
+    def _rl_states(status, *, labels=(), issue_labels=("area:crate-a", "role:impl"),
+                   head_repo=_KEEP_HEAD_REPO):
         """The item states dispatch would actually enumerate; its exclusion log discarded."""
         buffer, saved = io.StringIO(), sys.stdout
         sys.stdout = buffer
         try:
             return [item["state"] for item in _rl.enumerate_review_items(
-                _rl_repo, [_rl_pull(labels)], _rl_provenance, [], {7: list(issue_labels)}, now,
-                bot_login="app[bot]", pr_status=status)]
+                _rl_repo, [_rl_pull(labels, head_repo)], _rl_provenance, [],
+                {7: list(issue_labels)}, now, bot_login="app[bot]", pr_status=status)]
         finally:
             sys.stdout = saved
 
@@ -5472,6 +5618,33 @@ def _self_test() -> int:
         "in one assertion: neither the carve-out nor the delivery can be removed alone",
         (_rl_states(_rl_status("dirty")), _park_reason("dirty")),
         (["needs-rebase"], None),
+    )
+    check(
+        "[#1484 r2] the two halves of that correspondence really do describe ONE repository — "
+        "were the groom fixture's target repo not the one the enumerator is run against, every "
+        "paired row below would be comparing two unrelated PRs",
+        STALE_PR_REPO == _rl_repo,
+        True,
+    )
+    _rl_bad_head = []
+    for _label, _head in (("foreign", {"full_name": "attacker/repo"}),
+                          ("case-near-miss", {"full_name": "Owner/Repo"}),
+                          ("prefix-near-miss", {"full_name": _rl_repo + "-fork"}),
+                          ("deleted", None),
+                          ("absent", _NO_HEAD_REPO_KEY)):
+        _rl_bad_head.append((_label,
+                             _rl_states(_rl_status("dirty"), head_repo=_head),
+                             _park_reason("dirty", head_repo=_head)))
+    check(
+        "[#1484 r2] DELIVERY, the NEGATIVE direction — the identical conflicting posture with a "
+        "FOREIGN, case- or prefix-near-miss, DELETED or ABSENT head repository enumerates NOTHING "
+        "(the fork gate is unconditional and sits above every waivable gate), so groom must keep "
+        "parking it. Drop the head-repo conjunct from `repair_lane_owned`, or relax its exact "
+        "match, and every reason here becomes None while the enumeration stays empty: exactly the "
+        "silent terminal stall the carve-out must not create",
+        _rl_bad_head,
+        [(name, [], BAD_MERGE_STATES["dirty"]) for name in
+         ("foreign", "case-near-miss", "prefix-near-miss", "deleted", "absent")],
     )
     _rl_no_item = []
     for _state in ("behind", "blocked", "unknown", "unstable"):
@@ -5716,7 +5889,8 @@ def _self_test() -> int:
         "draft and repair-lane branches changed)",
         _reverted_stale_worker_pr_reason(_behind_pr, "app[bot]", limits.threshold_seconds, now)
         == stale_worker_pr_reason(
-            _behind_pr, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=True
+            _behind_pr, "app[bot]", limits.threshold_seconds, now, has_valid_provenance=True,
+            target_repo=STALE_PR_REPO,
         ),
         True,
     )
@@ -8182,7 +8356,12 @@ def _self_test() -> int:
                 "labels": [{"name": name} for name in labels],
                 "updated_at": datetime.fromtimestamp(
                     int(time.time()) if fresh else 1_000, timezone.utc).isoformat(),
-                "head": {"sha": f"{number:040x}", "ref": f"sparq-agent/issue-9{number}-fix"},
+                # The head REPOSITORY is the target repo, as a same-repo worker branch always is.
+                # It is load-bearing from round 2 of PR #1484 on: the repair-lane re-admission
+                # requires the head repo dispatch's enumerator requires, so a fixture that omitted
+                # it would exercise the head-repo refusal instead of the branch it means to test.
+                "head": {"sha": f"{number:040x}", "ref": f"sparq-agent/issue-9{number}-fix",
+                         "repo": {"full_name": "owner/repo"}},
                 "user": {"login": "app[bot]"},
                 "body": f"{WORKER_PR_MARKER}\n\nautomated work",
                 "mergeable_state": merge_state,
@@ -9121,21 +9300,24 @@ def _self_test() -> int:
         check(
             "an UNRECOGNISED cause token is NEVER re-admitted (no predicate ⇒ no proof ⇒ parked)",
             age_park_cause_recovered("teleported", {"mergeable_state": "clean"},
-                                     lambda: ("admits", {}))[0],
+                                     lambda: ("admits", {}), target_repo="owner/repo")[0],
             False,
         )
         check(
             "an INDETERMINATE live provenance read keeps the orphan-draft park (never re-admit on "
             "an unusable read)",
-            (age_park_cause_recovered("orphan-draft", {}, lambda: ("indeterminate", None))[0],
-             age_park_cause_recovered("orphan-draft", {}, lambda: ("denies", None))[0],
-             age_park_cause_recovered("orphan-draft", {}, lambda: ("admits", {}))[0]),
+            (age_park_cause_recovered("orphan-draft", {}, lambda: ("indeterminate", None),
+                                      target_repo="owner/repo")[0],
+             age_park_cause_recovered("orphan-draft", {}, lambda: ("denies", None),
+                                      target_repo="owner/repo")[0],
+             age_park_cause_recovered("orphan-draft", {}, lambda: ("admits", {}),
+                                      target_repo="owner/repo")[0]),
             (False, False, True),
         )
         check(
             "a MALFORMED live merge state keeps the park (fail-closed, never a re-admission)",
             age_park_cause_recovered("merge-blocked", {"mergeable_state": 7},
-                                     lambda: ("denies", None))[0],
+                                     lambda: ("denies", None), target_repo="owner/repo")[0],
             False,
         )
         # [issue #171] The park-side carve-out stated on the EXIT. Without this branch the fix
@@ -9147,9 +9329,21 @@ def _self_test() -> int:
         # re-admission grant on a PR the sweep re-parks next tick, and a state re-admitted here
         # that the enumerator emits nothing for would trade a visible park for a silent stall
         # (round-1 review of PR #1484). States below are LITERALS, never derived from the constant.
-        def _recovered(cause, state, provenance):
+        _EXIT_REPO = "owner/repo"
+
+        def _recovered(cause, state, provenance, head_repo=_KEEP_HEAD_REPO):
+            """Did this standing park's cause recover? `head_repo` is spliced in RAW (same
+            override `_park_reason` takes) so the exit can be driven with the foreign/deleted/
+            absent head shapes dispatch's fork gate refuses."""
+            head = {"repo": {"full_name": _EXIT_REPO}}
+            if head_repo is not _KEEP_HEAD_REPO:
+                if head_repo is _NO_HEAD_REPO_KEY:
+                    head.pop("repo")
+                else:
+                    head["repo"] = head_repo
             return age_park_cause_recovered(
-                cause, {"mergeable_state": state}, lambda: (provenance, None))[0]
+                cause, {"mergeable_state": state, "head": head},
+                lambda: (provenance, None), target_repo=_EXIT_REPO)[0]
 
         check(
             "[#171] a STILL-DIRTY park re-admits ONLY on a proven live-ledger admission — a "
@@ -9177,13 +9371,66 @@ def _self_test() -> int:
              _recovered("merge-dirty", "behind", "admits")),
             (True, False),
         )
+        # [round-2 review of PR #1484] The EXIT mirrors the park's FULL admission, head repository
+        # included — it calls the same `repair_lane_owned`. Re-admitting a conflicting PR whose
+        # head repo the enumerator's unconditional fork gate refuses would spend the bounded,
+        # once-only re-admission grant to put the PR back into a lane that emits nothing for it:
+        # the park would vanish and no repair would follow. Best provenance in the world does not
+        # buy it; drop the head-repo conjunct and all four rows below flip to True.
+        _exit_bad_heads = []
+        for _head in ({"full_name": "attacker/repo"}, {"full_name": "Owner/Repo"},
+                      {"full_name": _EXIT_REPO + "-fork"}, None, _NO_HEAD_REPO_KEY):
+            _exit_bad_heads.append(_recovered("merge-dirty", "dirty", "admits", _head))
+        check(
+            "[#1484 r2] a STILL-DIRTY park whose head repository is FOREIGN, a case- or "
+            "prefix-near-miss, DELETED or ABSENT is NEVER re-admitted, however admissible its "
+            "provenance — the grant is not spent on an enumeration that would emit nothing",
+            _exit_bad_heads,
+            [False, False, False, False, False],
+        )
+        check(
+            "[#1484 r2] ...while the SAME park with a PRESENT, same-repository head DOES re-admit "
+            "— so the four rows above differ from this one ONLY in the head repository",
+            _recovered("merge-dirty", "dirty", "admits", {"full_name": _EXIT_REPO}),
+            True,
+        )
+        check(
+            "[#1484 r2] a state NO lane repairs is refused on the merge state ALONE, in exactly "
+            "those words, without the head repository being consulted at all — pinned by EXACT "
+            "match because the head-repo refusal's wording CONTAINS this one, so a substring "
+            "test cannot tell the two branches apart (AGENTS.md pre-flight 6)",
+            age_park_cause_recovered(
+                "merge-behind",
+                {"mergeable_state": "behind", "head": {"repo": {"full_name": "attacker/repo"}}},
+                lambda: ("admits", {}), target_repo=_EXIT_REPO),
+            (False, "the merge state is still behind"),
+        )
+        _refused_head_reads = []
+        check(
+            "[#1484 r2] and the head-repo refusal costs NO live provenance read (it is proven "
+            "from the detail response already in hand) and NAMES the target repo it refused "
+            "against, so an operator can see why the park stands",
+            age_park_cause_recovered(
+                "merge-dirty",
+                {"mergeable_state": "dirty", "head": {"repo": {"full_name": "attacker/repo"}}},
+                lambda: (_refused_head_reads.append(1), ("admits", {}))[1],
+                target_repo=_EXIT_REPO),
+            (False, "the merge state is still dirty and its head repository is not "
+                    f"{_EXIT_REPO!r}, so dispatch's repair lane never enumerates it"),
+        )
+        check(
+            "[#1484 r2] ...and that refusal really did skip the live read",
+            _refused_head_reads,
+            [],
+        )
         _provenance_reads = []
         check(
             "[#171] a RECOVERED merge state still exits without any live read (the cheap "
             "predicate runs first — no new API call on the ordinary recovery path)",
             (age_park_cause_recovered(
                 "merge-dirty", {"mergeable_state": "clean"},
-                lambda: (_provenance_reads.append(1), ("denies", None))[1])[0],
+                lambda: (_provenance_reads.append(1), ("denies", None))[1],
+                target_repo=_EXIT_REPO)[0],
              _provenance_reads),
             (True, []),
         )
