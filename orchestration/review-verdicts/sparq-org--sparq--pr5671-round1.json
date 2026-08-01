@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 5671,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "70040f7af0ccd9d15c8abb9eb6662bf317fa8d99",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new wording \"W3C has published no RDF-1.2 dataset canonicalization specification\" is an unqualified negative existence claim about upstream state, carried in four places, with the supporting citation removed. Two consequences: (1) a reader can no longer follow a pointer to check it, and (2) it silently goes stale the moment W3C publishes anything in this space -- including a mere Working Draft, which is still a W3C *publication*, so the sentence could become literally false while the substantive point (no normative RDF-1.2 canonicalization exists) stays true. The same file already models the better pattern about 90 lines lower: \"Status checked 2026-08-01 (issue #3455): W3C rdf12-n-quads is a **Working Draft** (23 July 2026) and has never been published past Working Draft\" -- dated, precise about publication maturity, and tied to a tracking issue. The old phrasing (\"unsettled upstream\") was weaker but robust to a WD landing; the new one is sharper but brittle. Nothing here is wrong today on the evidence available in-repo, so this is not blocking.",
+    "file": "crates/sparq-canon/src/rdf12.rs",
+    "fix_hint": "Prefer maturity-precise, dated wording in the canonical spot (rdf12.rs module docs), e.g. \"W3C has published no RDF-1.2 dataset canonicalization *Recommendation* (status checked 2026-08-01)\", and let the shorter surfaces (Cargo.toml / README / SKILL.md / lib.rs) point at it. If the citation was dropped because it was judged a misattribution rather than merely redundant, say so in the PR body so the next reader does not re-add it.",
+    "severity": "minor",
+    "title": "Undated, uncited absolute upstream-status claim replaces a cited hedge"
+   },
+   {
+    "body": "Lines 5-8 of the module docs now read \"... canonicalization specification, so the profile here is sparq's own opt-in / extension. The standard / [`crate::canonicalize`] / ...\", with `//! extension. The standard` as a short orphan line in an otherwise ~78-column block. rustfmt does not reflow doc comments, so no gate catches it; purely cosmetic.",
+    "file": "crates/sparq-canon/src/rdf12.rs",
+    "fix_hint": "Reflow the paragraph to the surrounding column width so \"The standard\" joins the following line.",
+    "severity": "nit",
+    "title": "Ragged doc-comment wrap leaves an orphan \"The standard\" line"
+   },
+   {
+    "body": "research/rdf-canon-rdf12-triple-terms-upstream.md (lines 15-16) still describes triple-term canonicalization as \"currently **undefined** upstream ([w3c/rdf-star-wg#114])\", and its item-3 draft as \"not yet a stable normative reference\". That file is outside this diff (hence filed against the rdf12.rs docs it mirrors). It is a dated 2026-07-17 design record, so leaving it untouched is defensible; flagging only so the inconsistency is a deliberate choice rather than an oversight.",
+    "file": "crates/sparq-canon/src/rdf12.rs",
+    "fix_hint": "Either leave the research record as an explicitly point-in-time artifact (it already carries a Date: header) or add a one-line dated status update to it referencing the wording change made here.",
+    "severity": "nit",
+    "title": "research/ record still carries the old \"undefined upstream (#114)\" framing"
+   }
+  ],
+  "progress": null,
+  "summary": "Doc-only change across crates/sparq-canon (Cargo.toml feature comment, README, lib.rs and rdf12.rs module docs) and skills/rdf-canon/SKILL.md. It replaces the hedged phrase \"their canonicalization is unsettled upstream (w3c/rdf-star-wg#114)\" with the flat statement \"W3C has published no RDF-1.2 dataset canonicalization specification\" and drops the issue citation. No Rust code, no test, no public API, no feature wiring changes: `rdf12-triple-terms = [\"dep:sha2\"]` is untouched, so there is no correctness, soundness, or security surface and no vacuous-test risk. Verified locally: (a) the removed reference-style link definition `[w3c/rdf-star-wg#114]:` in rdf12.rs had exactly one use, which the same hunk removes, so no dangling markdown reference / rustdoc broken-link warning is introduced (`[RDFC-1.0]` remains defined and used); (b) `scripts/check-terminology.py` on all five changed files is clean (the removed spellings were allow-listed proper nouns, the added prose contains no banned term); (c) `scripts/check-readme-template.py` reports 0 deviations across 68 READMEs; (d) the fail-closed behaviour statements the docs make (feature OFF => byte-identical, `CanonError::TripleTerm` on triple terms) are unchanged and still match the code. All four doc surfaces plus the Cargo.toml comment were updated together, so doc-sync is respected. The new claim is consistent with what the repo itself records (RDFC-1.0 is RDF-1.1-only; rdf12-n-quads is still a Working Draft per the dated status note further down rdf12.rs), and it is a narrower, more checkable statement than \"unsettled upstream\". Remaining remarks are non-blocking: the new claim is an undated, uncited absolute negative where the same file elsewhere dates its upstream-status assertions, one comment line wraps raggedly, and research/rdf-canon-rdf12-triple-terms-upstream.md still carries the old \"undefined upstream (#114)\" framing (that file is outside this diff).",
+  "verdict": "approve"
+ }
+}
