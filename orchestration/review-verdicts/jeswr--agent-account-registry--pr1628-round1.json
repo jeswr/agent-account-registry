@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1628,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "24e2ef58d496d594bfa6b3dc448f26fcf21c5200",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_approval_reactors_cli()` sorts all unique reactor logins and truncates that untrusted list to the first 50 before the workflow performs any `trust_of` checks. Anyone can react on this public repository, so an attacker can add 50 lexicographically earlier reactor accounts and ensure that a maintainer or write-role reactor sorts after the cap. The workflow then reports `maintainer_approved=0`; on the next content event it restores quarantine even though a valid maintainer approval exists. This is a deterministic public-input denial of the headline durable-approval behavior, and the existing cap test only verifies truncation, not whether a trusted reactor beyond the cap is still honored.",
+    "file": "scripts/triage.py",
+    "fix_hint": "Bound adversary-controlled permission work without discarding authoritative evidence based solely on attacker-controlled sort order. At minimum, recognize/probe the exact trusted maintainer and App identities before applying the general candidate cap; design a bounded strategy for write-role approvals that cannot be crowded out, or explicitly narrow the supported approvers. Add an executed test with more than 50 untrusted reactors and a valid trusted reactor beyond the current sorted prefix, asserting that the approval remains effective.",
+    "severity": "major",
+    "title": "Public reactors can crowd every trusted approval out of the probe cap"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe reaction approval path is generally fail-closed and well exercised, but its public-input probe cap can be exhausted before any trusted reactor is considered. That lets arbitrary users suppress a real maintainer approval and defeats the durability this PR is intended to provide.",
+  "verdict": "request_changes"
+ }
+}
