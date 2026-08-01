@@ -330,6 +330,28 @@ INGESTION_REJECTED_CONCLUSION = "action_required"
 # `skipped` is deliberately NOT here: a run whose jobs were all skipped by their own `if:` had
 # its file ingested and its job graph evaluated, which is exactly what this mode measures.
 NON_VERDICT_CONCLUSIONS = frozenset({"cancelled"})
+# ...AND THE STEP-OVER IS NOT THE WHOLE READ. What makes a cancelled run say nothing is its
+# ZERO JOB COUNT, not the word `cancelled`: a concurrency group that killed the run AFTER job
+# creation leaves `jobs.total_count > 0`, which is the exact NEGATION of this mode's
+# fingerprint — GitHub parsed that file and built its job graph, so ingestion was WORKING at
+# that run's timestamp. Stepping over it unconditionally is fail-closed but it is not free: an
+# older `action_required`/zero-job run stays the newest verdict, and the alert keeps
+# re-publishing a rejection that has already been fixed for as long as cancelled runs keep
+# landing on top. That is the same recovery lag #1457 exists to remove, arriving by a
+# different door.
+#
+# So the step-over above picks the VERDICT, and each cancelled run sitting NEWER than a
+# rejection is then resolved by its OWN job count (`cancelled_runs_above` feeds the same
+# `job_counts` map the rejection is confirmed from): >0 clears the lane, 0 or UNREADABLE leaves
+# the rejection standing, because the expensive direction here is a MUTE. Cancelled runs OLDER
+# than the verdict are never read — a run the rejection superseded cannot witness a recovery
+# from it.
+#
+# How many of them are resolved, newest first. The reads are only ever spent on a lane that
+# ALREADY looks rejected, so a healthy repo still pays nothing; the cap bounds a lane whose
+# concurrency group is killing every run. Truncation is ANNOUNCED, and dropping candidates can
+# only hold an alert open — unread evidence never clears one.
+CANCELLED_EVIDENCE_LIMIT = 10
 # SELF-OBSERVATION — M4 COULD NOT SEE ITS OWN LANE (#1457). This watchdog is hosted in
 # groom.yml, and groom.yml is one of the lanes it inspects. Its own run cannot have concluded
 # while it is doing the reading, so on its own lane the newest-verdict read always returns the
@@ -374,12 +396,18 @@ SELF_EXECUTING_STATE = "self-executing"
 # population — most of this repo's workflows, on every healthy tick. A workflow that DOES
 # carry a cron but whose runs were never listed (it is disabled) is INSIDE the population and
 # UNREAD, which is not the same as healthy. See M4_INDETERMINATE_STATES.
+#
+# `ingesting-cancelled-with-jobs` is kept SEPARATE from `ingesting` rather than folded into it:
+# it is the one exit reached over the top of a rejection still recorded in the lane's newest
+# verdict, so an operator reading the census needs to see that the all-clear rests on a
+# cancelled run's job count and not on a clean verdict.
 M4_CENSUS_STATES = (
     "not-scheduled",
     "not-sampled",
     "no-concluded-run",
     SELF_EXECUTING_STATE,
     "ingesting",
+    "ingesting-cancelled-with-jobs",
     "approval-gated-with-jobs",
     "rejected-zero-jobs",
     "rejected-jobs-unreadable",
@@ -653,12 +681,25 @@ def find_cron_deficits(lanes: list[dict], now: dt.datetime,
     return findings, census
 
 
+def created_jobs(count) -> bool:
+    """True only when `count` is a MEASURED positive job count — the evidence that GitHub built
+    a job graph for a run, and therefore ingested its file.
+
+    The bool is excluded explicitly: `isinstance(True, int)` is True in Python and `True > 0`.
+    This predicate only ever guards a MUTE, so a malformed payload arriving through
+    `--state-file` (where JSON `true` survives the round trip that `fetch_job_count` would have
+    refused) must not be able to clear a live alert.
+    """
+    return isinstance(count, int) and not isinstance(count, bool) and count > 0
+
+
 def find_ingestion_rejections(lanes: list[dict], job_counts: dict,
                               self_lane: dict | None = None) -> tuple[list[dict], dict]:
-    """M4. `lanes` carry {runs_sampled, newest_concluded, newest_schedule_run_id};
-    `job_counts` maps the run id of an apparently-rejected run (as a STRING — JSON object keys
-    are strings, and a dict keyed by int here would silently miss every entry that came back
-    through --state-file) to its `jobs.total_count`, or to None when that read failed.
+    """M4. `lanes` carry {runs_sampled, newest_concluded, newest_schedule_run_id,
+    cancelled_above}; `job_counts` maps the run id of an apparently-rejected run — and of each
+    cancelled run sitting above it — (as a STRING — JSON object keys are strings, and a dict
+    keyed by int here would silently miss every entry that came back through --state-file) to
+    its `jobs.total_count`, or to None when that read failed.
 
     The lane's NEWEST VERDICT — its newest concluded scheduled run, stepping over the
     conclusions that state nothing (NON_VERDICT_CONCLUSIONS) — is the signal for every lane
@@ -666,7 +707,9 @@ def find_ingestion_rejections(lanes: list[dict], job_counts: dict,
     every subsequent run of it is refused the same way, so the newest verdict states the
     CURRENT condition and the alert self-clears one cycle after a fix lands. An `in_progress`
     newest run is skipped rather than treated as evidence either way — a run with no conclusion
-    has not said anything yet.
+    has not said anything yet, and a cancelled run stepped over on the way to that verdict is
+    resolved by its OWN job count rather than discarded — see the note above
+    NON_VERDICT_CONCLUSIONS.
 
     `self_lane` is {workflow, run_id} for the run EXECUTING this watchdog, or None. On THAT
     lane the newest-verdict read is structurally one cron period stale (#1457), and this
@@ -704,6 +747,16 @@ def find_ingestion_rejections(lanes: list[dict], job_counts: dict,
             continue
         if newest.get("conclusion") != INGESTION_REJECTED_CONCLUSION:
             bump("ingesting")
+            continue
+        # RECOVERY ABOVE A STEPPED-OVER CANCELLATION. The cancelled runs newer than this
+        # rejection are not verdicts, but a MEASURED positive job count on any one of them is
+        # direct evidence that GitHub built a job graph for this file AFTER the rejection —
+        # the negation of the fingerprint, stated by a newer run. A zero says nothing (the
+        # kill landed before job creation) and an unreadable count says less; both leave the
+        # rejection standing, so this branch can only ever clear on evidence that was read.
+        if any(created_jobs(job_counts.get(str(rid)))
+               for rid in lane.get("cancelled_above") or []):
+            bump("ingesting-cancelled-with-jobs")
             continue
         jobs = job_counts.get(str(newest.get("id")))
         if isinstance(jobs, int) and jobs > 0:
@@ -938,6 +991,33 @@ def newest_concluded_run(runs):
             "created_at": newest.get("created_at")}
 
 
+def cancelled_runs_above(runs, after):
+    """M4. -> the STRINGIFIED ids of the runs in `runs` whose conclusion states nothing about
+    ingestion (NON_VERDICT_CONCLUSIONS) and which were created strictly AFTER `after` — an ISO
+    timestamp, or None for no lower bound — NEWEST FIRST. Pure, so both the cutoff and the
+    ordering are testable without the network.
+
+    These are exactly the runs `newest_concluded_run` stepped over, handed back as CANDIDATE
+    evidence rather than discarded: cancellation alone does not say whether GitHub ingested the
+    file, and a cancelled run carrying jobs proves it did. Newest first because the caller
+    reads only the first CANCELLED_EVIDENCE_LIMIT of them, and the freshest evidence about a
+    lane is the most likely to be the one that clears it.
+
+    The `after` cutoff is LOAD-BEARING and strict: a cancelled run older than (or concurrent
+    with) the rejection witnessed a state that rejection then superseded, so crediting it would
+    close an alert on stale evidence. Runs with no `created_at` (unorderable) or no `id`
+    (unreadable) are dropped rather than guessed at.
+    """
+    cutoff = _ts(after) if after else None
+    candidates = [r for r in runs
+                  if r.get("status") == "completed"
+                  and r.get("conclusion") in NON_VERDICT_CONCLUSIONS
+                  and r.get("created_at") and r.get("id") is not None
+                  and (cutoff is None or _ts(r["created_at"]) > cutoff)]
+    return [str(r["id"]) for r in sorted(candidates,
+                                         key=lambda r: _ts(r["created_at"]), reverse=True)]
+
+
 def newest_schedule_run_id(runs):
     """M4 self-observation (#1457). -> the id (STRINGIFIED, to match `GITHUB_RUN_ID`) of the
     newest run in `runs` by creation time, CONCLUDED OR NOT, or None.
@@ -1036,7 +1116,10 @@ def fetch_lanes(repo, root, window_hours, now):
                 "runs_sampled": False, "newest_concluded": None,
                 # M4 self-observation: the newest sampled scheduled run of this lane,
                 # concluded or not, which is what `GITHUB_RUN_ID` is matched against (#1457).
-                "newest_schedule_run_id": None}
+                "newest_schedule_run_id": None,
+                # M4: the cancelled runs stepped over ABOVE the newest verdict, whose job
+                # counts decide whether ingestion recovered after a rejection.
+                "cancelled_above": []}
         if in_scope and lane["state"] == "active":
             payload = _api(repo, f"actions/workflows/{path.name}/runs"
                                  f"?event=schedule&per_page=100")
@@ -1046,6 +1129,15 @@ def fetch_lanes(repo, root, window_hours, now):
             lane["runs_sampled"] = True
             lane["newest_concluded"] = newest_concluded_run(runs)
             lane["newest_schedule_run_id"] = newest_schedule_run_id(runs)
+            above = cancelled_runs_above(
+                runs, (lane["newest_concluded"] or {}).get("created_at"))
+            if len(above) > CANCELLED_EVIDENCE_LIMIT:
+                # SAID OUT LOUD, never silently truncated: the dropped candidates are the
+                # OLDEST of them, and every one left unread can only hold an alert open.
+                print(f"::warning::ci-latency: M4 is resolving only the newest "
+                      f"{CANCELLED_EVIDENCE_LIMIT} of {len(above)} cancelled runs above "
+                      f"{rel}'s newest verdict; the rest stay unread")
+            lane["cancelled_above"] = above[:CANCELLED_EVIDENCE_LIMIT]
             times = [_ts(r["created_at"]) for r in runs if r.get("created_at")]
             # COVERAGE GUARD: the sample is the newest 100 runs. If the OLDEST sampled run
             # is NEWER than the window start the count is TRUNCATED and would manufacture a
@@ -1205,7 +1297,7 @@ def capped_expectation(window_hours=CRON_WINDOW_HOURS):
 def _lane(workflow="a.yml", crons=("*/10 * * * *",), cron_only=False, in_scope=True,
           state="active", fires=0, now=None, spacing_min=20, created_hours_ago=None,
           runs_sampled=True, newest_conclusion="success", run_id="1",
-          newest_run_id=None):
+          newest_run_id=None, cancelled_above=()):
     """`created_hours_ago` gives the lane a birth date, for the NEW-LANE WINDOW. `None`
     means an established lane (no `created_at`), which must behave exactly as before.
 
@@ -1216,12 +1308,17 @@ def _lane(workflow="a.yml", crons=("*/10 * * * *",), cron_only=False, in_scope=T
     `newest_run_id` is the lane's newest sampled scheduled run, concluded or not — what the
     self-observation seam matches `GITHUB_RUN_ID` against (#1457). It defaults to None so no
     pre-existing fixture can be self-credited by accident.
+
+    `cancelled_above` is the ids of the cancelled runs sitting above the newest verdict, whose
+    job counts can show ingestion recovered. It defaults to EMPTY for the same reason: no
+    pre-existing fixture may be cleared by a candidate it never declared.
     """
     now = now or dt.datetime(2026, 7, 28, 12, 0, tzinfo=dt.timezone.utc)
     first = now - dt.timedelta(minutes=CRON_GRACE_MINUTES + 1)
     lane = {"workflow": workflow, "crons": list(crons), "cron_only": cron_only,
             "in_scope": in_scope, "state": state,
             "runs_sampled": runs_sampled, "newest_schedule_run_id": newest_run_id,
+            "cancelled_above": [str(r) for r in cancelled_above],
             "newest_concluded": ({"id": run_id, "conclusion": newest_conclusion,
                                   "created_at": "2026-07-28T11:50:00Z"}
                                  if newest_conclusion else None),
@@ -1677,7 +1774,8 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
                   "M4-workflow-ingestion-rejected"))
     chk("M4's census names every exit, in order, so the all-clear prints a row per state",
         M4_CENSUS_STATES == ("not-scheduled", "not-sampled", "no-concluded-run",
-                             "self-executing", "ingesting", "approval-gated-with-jobs",
+                             "self-executing", "ingesting", "ingesting-cancelled-with-jobs",
+                             "approval-gated-with-jobs",
                              "rejected-zero-jobs", "rejected-jobs-unreadable"))
     chk("the states that hold a recovery are exactly the two M4 never read the lane in",
         M4_INDETERMINATE_STATES == ("not-sampled", "no-concluded-run"))
@@ -1741,6 +1839,46 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
          or {}).get("id") == "46")
     chk("the non-verdict set is exactly `cancelled`, written as a literal",
         NON_VERDICT_CONCLUSIONS == {"cancelled"})
+
+    # ...and the step-over is not the end of the read: the cancelled rows it stepped over are
+    # kept as CANDIDATE evidence, to be resolved by their own job counts rather than discarded
+    # on their conclusion alone. Every id below is hand-chosen and appears nowhere else here.
+    chk("the cancelled rows ABOVE the verdict are carried, NEWEST FIRST, with ids stringified "
+        "— the cap reads the freshest evidence, and the map that resolves them is string-keyed",
+        cancelled_runs_above(_cancelled_over
+                             + [_sched_run(47, "cancelled", "2026-07-28T11:35:00Z")],
+                             "2026-07-28T11:00:00Z") == ["47", "44"])
+    chk("a cancelled run OLDER than the verdict — or concurrent with it — is NOT evidence "
+        "about it: the rejection superseded whatever that run witnessed",
+        cancelled_runs_above([_sched_run(48, "cancelled", "2026-07-28T10:30:00Z"),
+                              _sched_run(49, "cancelled", "2026-07-28T11:00:00Z")],
+                             "2026-07-28T11:00:00Z") == [])
+    chk("only CANCELLED, CONCLUDED rows are candidates — a success above the verdict is "
+        "already the verdict, and an unconcluded run has said nothing",
+        cancelled_runs_above([_sched_run(50, "success", "2026-07-28T11:30:00Z"),
+                              _sched_run(51, "cancelled", "2026-07-28T11:40:00Z",
+                                         status="in_progress"),
+                              _sched_run(52, "cancelled", "2026-07-28T11:45:00Z")],
+                             "2026-07-28T11:00:00Z") == ["52"])
+    chk("a candidate with no created_at (unorderable) or no id (unreadable) is dropped, not "
+        "guessed at — and with NO cutoff every cancelled row is still a candidate",
+        cancelled_runs_above([{"status": "completed", "conclusion": "cancelled"},
+                              {"status": "completed", "conclusion": "cancelled",
+                               "created_at": "2026-07-28T11:30:00Z"},
+                              _sched_run(53, "cancelled", "2026-07-28T09:00:00Z")],
+                             None) == ["53"])
+    chk("the evidence cap is a positive count — a zero would make the recovery read "
+        "permanently inert while every row above stayed green",
+        isinstance(CANCELLED_EVIDENCE_LIMIT, int) and CANCELLED_EVIDENCE_LIMIT > 0)
+    # `created_jobs` is the whole mute predicate, and it guards a MUTE, so both of its refusals
+    # are asserted here rather than inferred from the detector rows below.
+    chk("a positive count is job evidence; zero, None and a missing read are NOT",
+        created_jobs(1) and created_jobs(9)
+        and not created_jobs(0) and not created_jobs(None) and not created_jobs(-1))
+    chk("a BOOLEAN is refused — `True` IS an int in Python and `True > 0`, so a malformed "
+        "state-file count would otherwise clear a live alert",
+        not created_jobs(True) and not created_jobs(False))
+    chk("a stringified count is refused rather than coerced", not created_jobs("4"))
 
     # --- SELF-OBSERVATION: identifying the run doing the evaluating (#1457) -------------
     # Pure over the environment mapping, so every refusal is a row here rather than a claim.
@@ -1820,6 +1958,55 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
                   "run_id": "80"}, {})
     chk("M4 treats a MISSING job-count entry as unreadable, never as zero and never as OK",
         len(_f) == 1 and _c == {**_M4_CLEAN, "rejected-jobs-unreadable": 1})
+    # A CANCELLED RUN ABOVE THE REJECTION IS RESOLVED BY ITS JOBS, not by its conclusion.
+    # ONE fixture, FOUR job-count worlds: the lane, the rejection (81, zero jobs) and the
+    # candidate id (82) are byte-identical in all four, so nothing here can pass because the
+    # fixture was unable to fire — only the candidate's own count moves the outcome.
+    _CANCEL_LANE = {"workflow": "recovered.yml", "newest_conclusion": "action_required",
+                    "run_id": "81", "cancelled_above": ["82"]}
+    _f, _c = _m4(_CANCEL_LANE, {"81": 0, "82": 0})
+    chk("a cancelled run above the rejection that created NO job is still not a verdict — the "
+        "rejection stands and M4 alarms",
+        len(_f) == 1 and _f[0]["run_id"] == "81"
+        and _c == {**_M4_CLEAN, "rejected-zero-jobs": 1})
+    _f, _c = _m4(_CANCEL_LANE, {"81": 0, "82": 5})
+    chk("a cancelled run above the rejection that DID create jobs proves GitHub ingested the "
+        "file after it — the lane is placed as recovered and nothing is alarmed on",
+        _f == [] and _c == {**_M4_CLEAN, "ingesting-cancelled-with-jobs": 1})
+    _f, _c = _m4(_CANCEL_LANE, {"81": 0, "82": None})
+    chk("an UNREADABLE count on that cancelled run clears nothing — the mute direction is the "
+        "expensive one, so it fails closed to the rejection",
+        len(_f) == 1 and _c == {**_M4_CLEAN, "rejected-zero-jobs": 1})
+    _f, _c = _m4(_CANCEL_LANE, {"81": 0})
+    chk("a MISSING count on that cancelled run clears nothing either — a read that never "
+        "happened is not evidence of a job", len(_f) == 1
+        and _c == {**_M4_CLEAN, "rejected-zero-jobs": 1})
+    _f, _c = _m4(_CANCEL_LANE, {"81": 0, "82": True})
+    chk("a BOOLEAN count on that cancelled run clears nothing — `True > 0` would otherwise "
+        "close a live alert on a malformed payload", len(_f) == 1
+        and _c == {**_M4_CLEAN, "rejected-zero-jobs": 1})
+    # ANTI-VACUITY for the binding: the clearing count must belong to a run the LANE declared
+    # as sitting above its own rejection. Scanning the job-count map instead would let any
+    # other lane's healthy run clear this one.
+    _f, _c = _m4({**_CANCEL_LANE, "cancelled_above": ()}, {"81": 0, "82": 5})
+    chk("a lane that declares NO cancelled run above its verdict is read on its own evidence "
+        "— a stray count in the map clears nothing",
+        len(_f) == 1 and _c == {**_M4_CLEAN, "rejected-zero-jobs": 1})
+    _f, _c = _m4({**_CANCEL_LANE, "cancelled_above": ["82", "83"]},
+                 {"81": 0, "82": 0, "83": 6})
+    chk("ANY resolved candidate with jobs clears the lane, not just the newest — the scan "
+        "does not stop at the first zero",
+        _f == [] and _c == {**_M4_CLEAN, "ingesting-cancelled-with-jobs": 1})
+    _f, _c = _m4({**_CANCEL_LANE, "cancelled_above": ["82", "83"]},
+                 {"81": 0, "82": 0, "83": 0})
+    chk("...and a lane whose candidates ALL read zero keeps its rejection",
+        len(_f) == 1 and _c == {**_M4_CLEAN, "rejected-zero-jobs": 1})
+    # The recovery must actually CLOSE the alert, which is a property of the transport reading
+    # this census — not of the detector. A new census state absent from the indeterminate set
+    # is the difference between "recovered" and "held forever".
+    chk("the recovery state does NOT block the transport's close — the all-clear lands",
+        decide([], 7, recovery_blockers(
+            MODE_INGESTION, {**_M4_CLEAN, "ingesting-cancelled-with-jobs": 1})) == "close")
     # THE HEALTHY POPULATION, stated so "no findings" cannot be reached by a detector that
     # stopped looking: the census must place the lane in `ingesting`.
     _f, _c = _m4({"workflow": "live.yml"}, {})
@@ -2284,6 +2471,75 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
             main(["--repo", "o/r", "--dry-run"])
         chk("a HEALTHY repo pays NOTHING for M4 — no job-count request is made at all",
             _asked_healthy and not [p for p in _asked_healthy if "/jobs?" in p])
+
+        # THE CANCELLED-RECOVERY WIRING, on the LIVE route. The clearing branch reads
+        # `lane["cancelled_above"]` and a job count for a run NOTHING else ever asks about;
+        # both links are assembled here and nowhere else, so without these rows the branch is
+        # reachable only from a hand-built fixture — a green suite over dead production code.
+        def _cancelled_api(jobs_by_run, asked, extra=0):
+            def _stub(repo, path):
+                asked.append(path)
+                if path.startswith("actions/workflows?"):
+                    return {"workflows": [{"path": GROOM_WORKFLOW, "state": "active",
+                                           "created_at": "2026-07-01T00:00:00Z"}]}
+                if path.startswith(f"actions/workflows/{_GROOM_FILE}/runs"):
+                    # The measured shape this fix exists for: the newest VERDICT is a
+                    # rejection, and a cancelled run — no verdict at all — sits above it.
+                    runs = [{"id": 77, "status": "completed",
+                             "conclusion": "action_required",
+                             "created_at": "2026-07-28T11:50:00Z", "event": "schedule"},
+                            {"id": 91, "status": "completed", "conclusion": "cancelled",
+                             "created_at": "2026-07-28T11:52:00Z", "event": "schedule"}]
+                    runs += [{"id": 900 + i, "status": "completed",
+                              "conclusion": "cancelled",
+                              "created_at": f"2026-07-28T11:53:{i:02d}Z",
+                              "event": "schedule"} for i in range(extra)]
+                    return {"workflow_runs": runs}
+                if "/jobs?" in path:
+                    return {"total_count": jobs_by_run.get(path.split("/")[2], 0)}
+                return {"workflow_runs": []}
+            return _stub
+
+        _asked_recovered = []
+        globals()["_api"] = _cancelled_api({"91": 3}, _asked_recovered)
+        _rec_out = io.StringIO()
+        with contextlib.redirect_stdout(_rec_out):
+            main(["--repo", "o/r", "--dry-run"])
+        chk("the LIVE path resolves the cancelled run above the rejection by READING its jobs",
+            "actions/runs/91/jobs?per_page=1" in _asked_recovered)
+        chk("...and that read clears the lane: ingestion recovered above a stale rejection, so "
+            "the tick alarms on nothing",
+            "ingesting-cancelled-with-jobs: 1" in _rec_out.getvalue()
+            and "jobs.total_count" not in _rec_out.getvalue())
+        # ANTI-VACUITY: the IDENTICAL live tick where that same cancelled run created no job
+        # still alarms — the rows above measure the job evidence, not a fixture gone quiet.
+        _asked_zero = []
+        globals()["_api"] = _cancelled_api({}, _asked_zero)
+        _zero_out = io.StringIO()
+        with contextlib.redirect_stdout(_zero_out):
+            main(["--repo", "o/r", "--dry-run"])
+        chk("the same tick with a ZERO-job cancelled run still alarms on the rejection "
+            "underneath it", "rejected-zero-jobs: 1" in _zero_out.getvalue()
+            and "jobs.total_count = 0" in _zero_out.getvalue())
+        # THE CAP, and its announcement. Silently truncating would read as "every candidate
+        # was resolved" when the older ones were never asked about.
+        # The candidate count is a LITERAL 13 (+ run 91 = 14), not a number derived from the
+        # cap: an input scaled off the constant the code reads would stay green whatever that
+        # constant said.
+        _asked_capped = []
+        globals()["_api"] = _cancelled_api({}, _asked_capped, extra=13)
+        _cap_out = io.StringIO()
+        with contextlib.redirect_stdout(_cap_out):
+            _capped = {lane["workflow"]: lane for lane
+                       in fetch_lanes("o/r", Path(__file__).resolve().parents[1],
+                                      CRON_WINDOW_HOURS, NOW)}
+        chk("fetch_lanes carries the cancelled runs above the verdict, capped and NEWEST "
+            "FIRST — the oldest are dropped, never substituted for the fresh ones",
+            _capped.get(GROOM_WORKFLOW, {}).get("cancelled_above")
+            == [str(912 - i) for i in range(CANCELLED_EVIDENCE_LIMIT)])
+        chk("...and the truncation is ANNOUNCED, with both counts, rather than passing as a "
+            "complete read",
+            f"newest {CANCELLED_EVIDENCE_LIMIT} of 14 cancelled runs" in _cap_out.getvalue())
     finally:
         globals()["_api"] = _real_lanes_api
 
@@ -2528,6 +2784,11 @@ def run(args):
             if (newest.get("conclusion") == INGESTION_REJECTED_CONCLUSION
                     and newest.get("id")):
                 job_counts[str(newest["id"])] = fetch_job_count(repo, newest["id"])
+                # ...and the cancelled runs above it, which are the only thing that can show
+                # ingestion recovered while the newest VERDICT still records the rejection.
+                # Reached only from inside this branch, so the healthy repo still pays zero.
+                for rid in lane.get("cancelled_above") or []:
+                    job_counts[str(rid)] = fetch_job_count(repo, rid)
 
     # EMPTY SCAN SET IS FAIL-LOUD. A detector watching nothing is not a healthy repo; it is
     # a broken detector, and the two must never look alike. 100% question: if no workflow
