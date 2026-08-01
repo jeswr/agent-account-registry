@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5505,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ee7cda742ed41a28bdbc160fef6255b0dfcc5c88",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new tests establish equality for fixtures, constants, package pins, artifact location, and proof flavour, but they never import or execute proveFilterGe. They therefore cannot detect GUI-specific breakage in dynamic imports, circuit loading, Barretenberg construction, Noir input wiring, witness execution, generateProof/verifyProof calls, public-input handling, or the panel's refusal branch. The file explicitly admits that the GUI wiring is not gated, yet the PR marks the panel working and states that it genuinely proves, verifies, excludes the witness from public inputs, and refuses the opposite claim. Reusing the site's artifact and selected configuration does not prove that this separate implementation and UI path works.",
+    "file": "gui/app/src/lib/zk-prover-parity.test.ts",
+    "fix_hint": "Add a browser integration test that drives the GUI tool's real prove path with the shipped ACIR and pinned dependencies: generate and verify an honest proof, assert the witness is absent from public inputs, and exercise the opposite verdict through the narrowly classified refusal branch. If that lane cannot be added in this PR, keep the tool non-working/stubbed and avoid live proof/refusal claims until the actual GUI path is gated.",
+    "severity": "major",
+    "title": "Parity checks still do not exercise the GUI's load-bearing proof path"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 fixes the field-wrap defect by rejecting aggregate sums at or above the modulus, with direct boundary coverage, and narrows refusal classification to the circuit's specific verdict assertion while testing ambiguous and unrelated errors. The remaining load-bearing gap is the actual GUI proving path: the new parity tests compare selected constants and configuration with the site's prover, but do not execute the GUI's own loader, Noir witness generation, UltraHonk prove/verify calls, or panel wiring. The diff itself acknowledges that this wiring remains review-only while promoting the tool as working and making concrete proof/refusal claims. Because an implementation/API/wiring defect unique to zk-prover.ts or zk-tool.tsx can still pass every added test, the central feature is not yet adequately verified.",
+  "verdict": "request_changes"
+ }
+}
