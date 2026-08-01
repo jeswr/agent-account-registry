@@ -149,11 +149,21 @@ def render_body(repo, counts, reasons, run_url, maintainer):
         "automatic re-admission can clear them. They are declining **correctly** — this is not a "
         "bug report against the park policy.",
         "",
-        "⚠️ **This is a SUBSET.** `dispatch-claim` also treats a park as terminal when a proven "
-        "human applied it, or the automatic cap is spent — both need per-PR timeline/receipt "
-        "reads and are NOT covered here. Measured 2026-08-01: dispatch-claim saw 6 terminal on "
-        "the registry where this label-only census sees 2. Do not read a closed alert as "
-        "\"no parked PR needs a human\" (registry #1573).",
+        "⚠️ **This is a SUBSET — measured 13 of 24.** `dispatch-claim`'s own park census names "
+        "24 human-terminal PRs across both targets where this census finds 13. Three known "
+        "reasons, from reading its code rather than guessing:",
+        "",
+        "1. it censuses only BOT-AUTHORED parked PRs and classifies by the ADMISSION REFUSAL "
+        "code, not by labels;",
+        "2. a park is a PAIR — `review:needs-user` on the PR AND `needs:user` on the SOURCE "
+        "ISSUE — and this census reads PR labels ONLY, so a PR held via its source issue is "
+        "invisible here;",
+        "3. `proven-human park` and `spent automatic cap` are terminal for dispatch-claim and "
+        "need per-PR timeline/receipt reads.",
+        "",
+        "⚠️ **Do not read a closed alert as \"no parked PR needs a human\".** The complete list "
+        "is emitted by dispatch-claim every executed tick; giving THAT census a durable output "
+        "is the right fix, not widening this one (registry #1573).",
         "",
         f"- PRs: {listed}",
         f"- live holds: {holds}",
@@ -396,6 +406,12 @@ def _self_test():
                              ["r"], "", "jeswr"))
     chk("the alert body carries the stable dedupe marker", ALERT_MARKER in body)
     chk("the alert body states a human gesture is required", "human re-admission gesture" in body)
+    # The subset caveat must name the MEASURED shortfall and the ACTUAL reasons. An alert that
+    # under-reports while implying completeness is worse than one that reports nothing: a reader
+    # who trusts a closed alert stops looking. Pinned on the numbers so a future widening that
+    # changes coverage must update the claim with it.
+    chk("the caveat states the measured coverage, not a vague 'subset'", "13 of 24" in body)
+    chk("...and names the source-issue half of the park pair as a cause", "SOURCE" in body)
 
     print(("park-stock-alert self-test: FAIL " + ", ".join(failures)) if failures
           else "park-stock-alert self-test: PASS")
