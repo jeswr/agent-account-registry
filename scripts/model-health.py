@@ -281,6 +281,9 @@ RESET_HINT_MAX_LEN = 256
 MAX_USAGE_TOKENS = 1_000_000_000
 MAX_WALL_SECONDS = 7 * 24 * 3600
 MAX_ISSUE_NUMBER = 2_147_483_647
+# [#738] Counts of HOST-PARSED harness protocol events in one run (assistant turns; repo-inspecting
+# tool calls). Both are bounded the same way and by the same reasoning as the ceilings above.
+MAX_EVENT_COUNT = 1_000_000
 
 # --- thresholds (WHY each is what it is). Tuned to page on a real stall, stay quiet on churn.
 # PROVIDER-OUTAGE: >=3 launch failures within 30 min from >= max(2, ceil(enabled-fleet/2)) distinct
@@ -425,13 +428,13 @@ def _decision_class(exit_class):
 
 def make_record(provider, account_h, model_alias, exit_class, run_id, now, reset_hint=None,
                 input_tokens=None, output_tokens=None, wall_seconds=None, issue=None,
-                why_no_diff=None):
+                why_no_diff=None, num_turns=None, probe_tool_calls=None):
     """Build one health record. `account_h` MUST already be the salted hash (a raw handle here is a
     privacy bug — the caller salts). reset_hint (a provider reset time string) is kept ONLY for the
     limit + transient (rate-limit) classes, where it is actionable (maintainer alert body / the
     reactive-backoff duration for probe-exempt providers). A no_change record carries its target
-    issue plus optional numeric input/output/wall telemetry; these are evidence fields only, never
-    transcript content.
+    issue plus optional numeric input/output/wall/turn/probe telemetry; these are evidence fields
+    only, never transcript content.
 
     The FULLY-ASSEMBLED record is fail-closed validated before it is returned (issue #202): the
     account must be a salted hash (never a raw acctNN handle), the provider must be catalog-known,
@@ -458,6 +461,12 @@ def make_record(provider, account_h, model_alias, exit_class, run_id, now, reset
         # (the wire index is an envelope detail); the validator below admits nothing else, so this
         # is a closed enum in the public ledger, not free text.
         "why_no_diff": why_no_diff,
+        # [#738] Effort evidence, counted by the HOST from harness protocol events (never model
+        # text): assistant turns, and the tool calls that actually inspected the repository.
+        # `probe_tool_calls == 0` on a no_change is the difference between "investigated, then
+        # declined" and "declined without looking" — the question the reason enum cannot answer.
+        "num_turns": num_turns,
+        "probe_tool_calls": probe_tool_calls,
     }
     for field, value in no_change_fields.items():
         if value is not None:
@@ -727,7 +736,8 @@ def _validate_record(r):
     blob into the PUBLIC ledger."""
     if not isinstance(r, dict):
         raise ValueError("model-health ledger contains a non-object entry")
-    no_change_fields = {"input_tokens", "output_tokens", "wall_seconds", "issue", "why_no_diff"}
+    no_change_fields = {"input_tokens", "output_tokens", "wall_seconds", "issue", "why_no_diff",
+                        "num_turns", "probe_tool_calls"}
     extra = set(r) - ({"ts", "provider", "account", "model_alias", "exit_class", "run_id",
                        "reset_hint"} | no_change_fields)
     if extra:
@@ -764,6 +774,12 @@ def _validate_record(r):
             raise ValueError(f"model-health no_change {field} is malformed")
     if "wall_seconds" in r and not _is_bounded_int(r["wall_seconds"], 0, MAX_WALL_SECONDS):
         raise ValueError("model-health no_change wall_seconds is malformed")
+    # [#738] Host-counted effort evidence. Type-strict and bounded like the rest: these are counts
+    # of parsed protocol events, so a float, a bool, a negative or an arbitrary-precision integer
+    # is a forgery or a producer bug, never a legitimate measurement.
+    for field in ("num_turns", "probe_tool_calls"):
+        if field in r and not _is_bounded_int(r[field], 0, MAX_EVENT_COUNT):
+            raise ValueError(f"model-health no_change {field} is malformed")
     # [#701] why_no_diff is a CLOSED ENUM, not a bounded string: the value originates in a
     # model-authored file, so admitting "any safe token" here would put attacker-chosen text into
     # the PUBLIC ledger and into the escalation comment that republishes it. Membership is the
@@ -2612,6 +2628,12 @@ _NO_CHANGE_ENVELOPE_FIELDS = {
     # has seen model-controlled text), so the reason travels as a number and is decoded to a name
     # against the closed vocabulary below — a forged index is REFUSED, never folded to a default.
     "why": "why_no_diff",
+    # [#738] Host-counted effort evidence: assistant turns, and the repo-INSPECTING tool calls
+    # (Read/Bash/Glob/Grep) the run made. `probe:0` is a meaningful value, not a missing one — it
+    # says the model produced no diff without opening anything — so the producer emits it whenever
+    # telemetry parsed and omits it only when telemetry is absent.
+    "turns": "num_turns",
+    "probe": "probe_tool_calls",
 }
 
 
@@ -2688,7 +2710,7 @@ def _cmd_record(args):
     # directly. getattr's default keeps it None until the envelope merge below fills it in.
     no_change = {field: getattr(args, field, None)
                  for field in ("input_tokens", "output_tokens", "wall_seconds", "issue",
-                               "why_no_diff")}
+                               "why_no_diff", "num_turns", "probe_tool_calls")}
     reset_hint = args.reset_hint
     if folded_class == CLASS_NO_CHANGE and reset_hint:
         try:
@@ -2959,6 +2981,51 @@ def _self_test():
         "why_no_diff" in _parse_no_change_envelope("no-change-v1 issue:500"), False)
     chk("the ledger vocabulary IS the routing module's (one declaration, not two)",
         NO_CHANGE_REASONS is no_change_routing.NO_CHANGE_REASONS, True)
+
+    # ---- [#738 M1] num_turns / probe_tool_calls: the host-counted effort evidence that separates
+    # "investigated, then declined" from "declined without opening a file". The reason enum alone
+    # cannot tell those apart, and before this the codex tier reported NEITHER.
+    _effort = make_record("openai", hash_a, "codex", CLASS_NO_CHANGE, "1", now,
+                          issue=500, num_turns=4, probe_tool_calls=17)
+    chk("no_change carries host-counted turn + probe evidence",
+        (_effort["num_turns"], _effort["probe_tool_calls"]), (4, 17))
+    # NON-VACUITY: `probe:0` is the WHOLE point of the field — a producer or a record builder that
+    # treats 0 as "missing" (e.g. `if value:` instead of `if value is not None:`) erases exactly the
+    # runs worth finding, and turns this red.
+    _idle = make_record("openai", hash_a, "codex", CLASS_NO_CHANGE, "1", now,
+                        issue=500, probe_tool_calls=0)
+    chk("a ZERO probe count is STORED, not dropped as falsy", _idle.get("probe_tool_calls"), 0)
+    chk("a run with no effort telemetry omits both fields entirely",
+        {"num_turns", "probe_tool_calls"} & set(make_record(
+            "openai", hash_a, "codex", CLASS_NO_CHANGE, "1", now, issue=500)), set())
+    # NON-VACUITY: deleting the bounds loop in _validate_record turns each of these green.
+    for _field in ("num_turns", "probe_tool_calls"):
+        for _bad in (MAX_EVENT_COUNT + 1, -1, True, 1.5, "4", None):
+            chk(f"{_field}={_bad!r} is REFUSED at construction",
+                _raises(lambda f=_field, b=_bad: make_record(
+                    "openai", hash_a, "codex", CLASS_NO_CHANGE, "1", now,
+                    issue=500, **{f: b})), _bad is not None)
+    chk("hand-forged effort evidence is rejected by the READ validator too", _raises(
+        lambda: _validate_record({
+            "ts": now, "provider": "openai", "account": hash_a, "model_alias": "codex",
+            "exit_class": CLASS_NO_CHANGE, "run_id": "1", "issue": 500,
+            "probe_tool_calls": 1e9})), True)
+    chk("effort evidence on a NON-no_change class is refused (it is no-change evidence)",
+        _raises(lambda: make_record("openai", hash_a, "codex", "auth", "1", now,
+                                    num_turns=4)), True)
+    # The ENVELOPE is the only path in: ASCII-decimal keys, decoded to typed record fields.
+    chk("the envelope decodes turn + probe counts",
+        {key: value for key, value in
+         _parse_no_change_envelope("no-change-v1 issue:500,turns:4,probe:17").items()
+         if key != "issue"},
+        {"num_turns": 4, "probe_tool_calls": 17})
+    chk("the envelope preserves a ZERO probe count (absent != zero)",
+        _parse_no_change_envelope("no-change-v1 issue:500,probe:0")["probe_tool_calls"], 0)
+    chk("an envelope with no effort fields omits them",
+        {"num_turns", "probe_tool_calls"} & set(
+            _parse_no_change_envelope("no-change-v1 issue:500")), set())
+    chk("a non-numeric probe value cannot smuggle text through the envelope",
+        _raises(lambda: _parse_no_change_envelope("no-change-v1 issue:500,probe:seventeen")), True)
 
     chk("no_change rejects non-numeric usage at construction (#500 tripwire)",
         _raises(lambda: make_record("openai", hash_a, "codex", CLASS_NO_CHANGE, "1", now,
@@ -4808,6 +4875,16 @@ def _test_record_provider_guard(chk):
             _cmd_record(_rec("openai", "no_change",
                              f"no-change-v1 issue:500,why:{len(NO_CHANGE_REASONS)}")), 1)
         chk("a forged reason index writes NO record", _CountingAPI.put_count, 6)
+        # [#738] the host-counted effort evidence rides that SAME sanitized handoff. `probe:0` must
+        # reach the ledger — it is the signal that the model declared defeat without looking.
+        chk("record expands host-counted turn + probe evidence",
+            _cmd_record(_rec("openai", "no_change",
+                             "no-change-v1 issue:500,turns:4,probe:0")), 0)
+        chk("effort-evidence handoff writes one record", _CountingAPI.put_count, 7)
+        chk("record REFUSES an out-of-bounds probe count",
+            _cmd_record(_rec("openai", "no_change",
+                             f"no-change-v1 issue:500,probe:{MAX_EVENT_COUNT + 1}")), 1)
+        chk("an out-of-bounds probe count writes NO record", _CountingAPI.put_count, 7)
     finally:
         GitHubAPI = real_api
         for k, v in saved.items():
