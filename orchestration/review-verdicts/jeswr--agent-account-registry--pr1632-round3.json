@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1632,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ae397b4909e06273bd1107c4225d51f5756f7808",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Step C prescribes `python3 scripts/ledger-invariant.py` against a fresh checkout of the rewritten branch. The shipped program requires a positional `root` unless `--self-test` is used, so that exact invocation exits in argparse before validating anything. In addition, the ledger branch is deliberately data-only and its allowlist excludes `scripts/`; if the operator enters the fresh ledger checkout, the named script is absent. This is not merely cosmetic: the document calls \u00a75 executable today, and this is its pre-resume tree-shape check.",
+    "file": "research/536-ledger-history-rewrite.md",
+    "fix_hint": "Give an exact command that runs the validator from a trusted checkout of the code branch while passing the separate rewritten-ledger checkout as its positional root, for example `python3 <registry-checkout>/scripts/ledger-invariant.py <rewritten-ledger-checkout>`. State which reviewed code SHA supplies the validator and keep both paths distinct so the operator cannot accidentally execute code from the rewritten data branch or validate the wrong repository.",
+    "severity": "major",
+    "title": "The prescribed ledger-invariant post-check cannot run as written"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 finding is resolved: step C now explicitly forbids the mutating `--claim` and bare `groom.py` paths and replaces them with SHA-pinned, read-only checks. However, the first replacement post-check is not executable as written. `ledger-invariant.py` requires a checkout-root positional argument, and the rewritten data-only checkout cannot itself contain `scripts/ledger-invariant.py`. Because this command is the runbook's tree-shape gate before writers resume, the maintenance procedure remains incomplete. Under the required progress scale this is regressing: the prior finding was fixed, but a new major finding remains.",
+  "verdict": "request_changes"
+ }
+}
