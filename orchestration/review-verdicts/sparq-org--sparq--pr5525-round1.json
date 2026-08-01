@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5525,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "801643de598b616b6592a1a730005bffc9126feb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The opt-in slow-query log is correctly feature- and runtime-gated, records the already-measured request duration without re-executing the query, re-plans against the pinned snapshot, bounds retained data, and protects raw query text with the write/admin authorization gate. The HTTP integration tests exercise the real /sparql recording path, threshold behavior, disarmed route, and authorization boundary; unit tests cover ring policy and measurement handoff. Public configuration, CLI/env controls, feature-matrix coverage, and operator documentation are updated consistently. No correctness, soundness, test-validity, or security defect requiring changes was found.",
+  "verdict": "approve"
+ }
+}
