@@ -1,16 +1,6 @@
 {
  "leases": [
   {
-   "account": "58b7c92faa5b5ca5",
-   "claim_id": "30d8197729ac406f8023b260995044d8",
-   "holder": "fix:sparq-org/sparq#5419@30671378857.1",
-   "package": "sparq-mpc",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785538496,
-   "expires_at": 1785544796
-  },
-  {
    "account": "9e13ea21abf27e68",
    "claim_id": "933bfe967d0d4c11bc5bd968ba8073a9",
    "holder": "fix:sparq-org/sparq#5355@30674392400.1",
@@ -39,16 +29,6 @@
    "model": "opus5",
    "issued_at": 1785544026,
    "expires_at": 1785550326
-  },
-  {
-   "account": "9e13ea21abf27e68",
-   "claim_id": "fa23564247ec4cc5ad0738870feaabad",
-   "holder": "sparq-org/sparq#3369@30675548508.1",
-   "package": "sparq-canon",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785544023,
-   "expires_at": 1785550323
   },
   {
    "account": "dc2d751954080e13",
