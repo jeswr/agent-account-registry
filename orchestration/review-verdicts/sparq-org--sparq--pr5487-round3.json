@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5487,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8228ff868daa91cdcd7a6b042f02c4dd6606d1c0",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`collect_json_chunks_capped` receives an owned `String`, so `query_json_stream_with_budget` has already serialized and allocated the entire chunk before `chunk.len()` is checked. Chunking around 64 KiB does not bound a single row fragment: one dictionary-resident literal can itself be arbitrarily large. Thus one row containing, for example, a gigabyte literal still creates a gigabyte temporary allocation even though the sink then returns `Break`. This contradicts the comments that the allocation is refused before it is made and that peak memory is safely bounded by 8 MiB plus an innocuous in-flight chunk. The added test uses four separate 3 MiB literals; it proves the accumulated Vec cap but cannot detect the single-chunk hole.",
+    "file": "crates/sparq-server/src/http.rs",
+    "fix_hint": "Enforce a byte limit inside serialization before constructing an oversized row/literal chunk (for example, use a byte-budgeted writer/sink that checks incremental writes), or establish and enforce a hard maximum serialized chunk size before allocating it. Add a regression test with one stored literal substantially larger than the degraded budget and instrumentation or an internal serializer test proving serialization aborts before allocating/copying the whole lexical form. Revise the hard-bound documentation to match the actual peak-memory guarantee.",
+    "severity": "major",
+    "title": "The degraded byte cap is applied after each engine chunk has already been allocated"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 prevents the accumulated Vec of response chunks from exceeding 8 MiB and adds the previously missing low-row/high-byte regression shape, so the implementation is more targeted. However, it still does not enforce the claimed hard allocation bound: the engine must fully allocate each String chunk before the capped sink sees it, and a single stored literal can make one chunk arbitrarily large. The new test deliberately uses four 3 MiB literals, so each individual chunk stays modest and only exercises the accumulated-body cap. The same resource-safety finding therefore remains major and progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
