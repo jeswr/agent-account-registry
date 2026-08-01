@@ -21,16 +21,6 @@
    "expires_at": 1785599784
   },
   {
-   "account": "dc2d751954080e13",
-   "claim_id": "b5b547205bcd49e689e16578ee5ab56b",
-   "holder": "review:sparq-org/sparq#5484@30703388473.1",
-   "package": "sparq-trust",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785593741,
-   "expires_at": 1785597941
-  },
-  {
    "account": "51bde6688e140866",
    "claim_id": "2b32dd4f46cd45e1a6cba6d929b40a42",
    "holder": "fix:sparq-org/sparq#5505@30703400888.1",
