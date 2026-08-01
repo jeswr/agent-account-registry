@@ -2080,18 +2080,48 @@ registry_selftest_gate() {
 # (GPT-5.6 sol/codex); terra is a DIFFERENT, sonnet-class GPT model that older comments
 # misnamed "GPT-5.6 sol". terra + sonnet are docs-only, but they stay in this provenance map:
 # it labels WHOEVER authored a commit (docs lanes included) — it is not a review/fix chain.
-coauthor_for() {
+#
+# [issue #97] THE NATURAL-LANGUAGE NAME MUST CARRY THE VARIANT. "GPT-5.6" on its own identifies
+# nothing: the codex catalog holds more than one GPT-5.6 (`gpt-5.6-sol`, `gpt-5.6-luna`), they sit
+# at different tiers, and a human reading a commit trailer or a PR description has no other way to
+# tell which one ran. So this table is the ONE place a routed alias becomes prose, and every
+# versioned entry names the variant: "GPT-5.6 Sol", "GPT-5.6 Luna". terra is deliberately NOT
+# versioned — its routing `provider_model` is EMPTY (the codex CLI default tracks the account) and
+# it is sonnet-class, so writing "GPT-5.6 Terra" would re-assert exactly the mislabelling the
+# paragraph above records. Kept honest by a self-test rather than by this comment: the suite
+# cross-checks these names against orchestration/routing.toml, where any alias whose
+# `provider_model` reads `gpt-<ver>-<variant>` MUST render as "GPT-<ver> <Variant>".
+model_display_name() {
   case "$1" in
-    opus5) printf '%s' 'Claude Opus 5 <noreply@anthropic.com>' ;;
-    fable) printf '%s' 'Claude Fable 5 <noreply@anthropic.com>' ;;
-    opus) printf '%s' 'Claude Opus 4.8 (1M context) <noreply@anthropic.com>' ;;
-    sonnet) printf '%s' 'Claude Sonnet 4.6 <noreply@anthropic.com>' ;;
-    haiku) printf '%s' 'Claude Haiku 4.5 <noreply@anthropic.com>' ;;
-    sol) printf '%s' 'GPT-5.6 Sol <noreply@openai.com>' ;;
-    luna) printf '%s' 'GPT Luna <noreply@openai.com>' ;;
-    terra) printf '%s' 'GPT Terra <noreply@openai.com>' ;;
+    opus5) printf '%s' 'Claude Opus 5' ;;
+    fable) printf '%s' 'Claude Fable 5' ;;
+    opus) printf '%s' 'Claude Opus 4.8 (1M context)' ;;
+    sonnet) printf '%s' 'Claude Sonnet 4.6' ;;
+    haiku) printf '%s' 'Claude Haiku 4.5' ;;
+    sol) printf '%s' 'GPT-5.6 Sol' ;;
+    luna) printf '%s' 'GPT-5.6 Luna' ;;
+    terra) printf '%s' 'GPT Terra' ;;
+    *) die 'unknown model alias for natural-language naming' ;;
+  esac
+}
+
+# The provenance mailbox is the PROVIDER's, so it is keyed separately from the display name above:
+# an alias added to one table with no entry in the other DIES rather than acquiring a default.
+_model_provenance_email() {
+  case "$1" in
+    opus5|fable|opus|sonnet|haiku) printf '%s' 'noreply@anthropic.com' ;;
+    sol|luna|terra) printf '%s' 'noreply@openai.com' ;;
     *) die 'unknown model alias for commit provenance' ;;
   esac
+}
+
+coauthor_for() {
+  local _name _email
+  # Assigned on their own lines: `local x=$(…)` would swallow the inner `die`'s exit status and
+  # mint a half-empty trailer for an unknown alias.
+  _name=$(model_display_name "$1") || die 'unknown model alias for commit provenance'
+  _email=$(_model_provenance_email "$1") || die 'unknown model alias for commit provenance'
+  printf '%s <%s>' "$_name" "$_email"
 }
 
 # Authenticated push, extracted so BOTH token-bearing callers share one askpass implementation
@@ -2354,7 +2384,7 @@ from pathlib import Path
 import sys
 
 (issue_file, title_file, body_file, issue_number, agent, model_alias, provider_model, gate,
- arm_requested, impl_provider) = sys.argv[1:]
+ arm_requested, impl_provider, model_display) = sys.argv[1:]
 with open(issue_file, encoding="utf-8") as handle:
     issue = json.load(handle)
 raw = " ".join(str(issue.get("title", "")).split())
@@ -2391,12 +2421,18 @@ budget = 100 - len(head) - 2 - len(suffix)          # keep the header a sane len
 if len(desc) > budget:
     desc = desc[:max(1, budget)].rstrip()
 title = f"{head}: {desc}{suffix}"
+# [issue #97] Name the model the way a human reads it, AND identify WHICH variant it was. The old
+# form printed the bare alias and provider id, so a reader had to know the catalog to learn that
+# `luna` is a GPT-5.6; the display name (worker-live.sh model_display_name) says "GPT-5.6 Luna"
+# outright. terra routes with an EMPTY provider_model on purpose (the codex CLI default), so the
+# provider-id clause is omitted rather than rendered as an empty pair of backticks.
+provider_clause = f", provider model `{provider_model}`" if provider_model else ""
 body = f"""> 🤖 SPARQ agent
 
 ## What / why
 
 Automated implementation of the trusted task in #{issue_number}, routed to `{agent}` on
-`{model_alias}` (`{provider_model}`).
+**{model_display}** (alias `{model_alias}`{provider_clause}).
 
 Fixes #{issue_number}
 
@@ -2476,9 +2512,14 @@ bundle_work() {
   git reset --quiet
   [[ -z "$(git diff --cached --name-only)" ]] || die 'bundle phase failed to restore the pre-gate index'
 
+  # [issue #97] Resolved here, on the routed alias, so an alias with no natural-language name fails
+  # the SEAL — the PR description never ships an unidentifiable model.
+  local model_display
+  model_display=$(model_display_name "$model_alias") ||
+    die 'no natural-language name for the routed model alias'
   _write_pr_title_body "$issue_file" "$bundle_dir/pr-title.txt" "$bundle_dir/pr-body.md" \
     "$issue_number" "$agent" "$model_alias" "$provider_model" "$gate" "$arm_requested" \
-    "$impl_provider"
+    "$impl_provider" "$model_display"
 
   # Model-declared follow-ups are UNTRUSTED model output. They cross inside the SAME digest-bound
   # bundle so the publisher can only create the lines that existed before the gate ran.
@@ -2601,9 +2642,14 @@ publish_pr() {
   [[ -z "$(git status --porcelain=v1 -- .beads 2>/dev/null)" ]] || die 'refusing to publish .beads changes'
   git diff --cached --check
   [[ -n "$(git diff --cached --name-only)" ]] || die 'reconstructed patch staged no changes'
+  # Resolved into a variable FIRST: inside `-m "… $(coauthor_for …)"` the helper's `die` exits only
+  # the substitution subshell, so an unnamed alias would commit the trailer as "Co-Authored-By: "
+  # and the provenance of the commit would be silently lost instead of the publish failing.
+  local coauthor
+  coauthor=$(coauthor_for "$model_alias") || die 'no commit provenance for the routed model alias'
   git -c core.hooksPath=/dev/null commit --no-verify \
     -m "feat: resolve target issue #$issue_number [$model_alias]" \
-    -m "Co-Authored-By: $(coauthor_for "$model_alias")"
+    -m "Co-Authored-By: $coauthor"
 
   local pr_url pr_number head_sha title
   head_sha=$(git rev-parse HEAD)
@@ -3175,7 +3221,12 @@ stage_fix() {
   local reset_mode=--mixed
   [[ -z "$(git diff --cached --name-only)" ]] || reset_mode=--soft
 
-  _git_commit_fix "$message" "Co-Authored-By: $(coauthor_for "$model_alias")" "$beads_ref"
+  # Same reason as publish_pr's: resolve BEFORE the argument list, so an unnamed alias fails the
+  # seal instead of committing an empty trailer from a subshell that died unnoticed.
+  local fix_coauthor
+  fix_coauthor=$(coauthor_for "$model_alias") ||
+    die 'no commit provenance for the routed fixer model alias'
+  _git_commit_fix "$message" "Co-Authored-By: $fix_coauthor" "$beads_ref"
   local staged_sha
   staged_sha=$(git rev-parse HEAD)
   [[ "$staged_sha" =~ ^[0-9a-f]{40}$ ]] || die 'staged fix commit sha is unsafe'
@@ -7045,6 +7096,37 @@ print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcaplive/
   ) > /dev/null 2>&1 || sf_drift_rc=$?
   chk "(#91 r2) ...and it DIES on a token in scope, and on a head that drifted (fail closed, both)" \
     "$sf_tok_rc:$sf_drift_rc" "1:1"
+  # [issue #97] An alias with no provenance name must fail the SEAL. `coauthor_for`'s `die` runs in
+  # a command-substitution subshell, so without the resolve-into-a-variable form the fix would be
+  # committed with a bare "Co-Authored-By: " and the model that wrote it would be unrecorded.
+  # MEASURED: the first draft of this row pointed WORKER_ROOT at a directory that did not exist,
+  # stage_fix refused on THAT instead, and a mutant deleting the guard survived it. Hence the
+  # positive control immediately below — same fixture, catalogued alias, must seal.
+  local sf_noname_root="$sf/stagefix-noname-root" sf_noname_rc=0
+  mkdir -p "$sf_noname_root"
+  (
+    GITHUB_OUTPUT="$tmp/stagefix-noname.out" TARGET_DIR="$sf_work" \
+    WORKER_ROOT="$sf_noname_root" \
+    TARGET_BOT_LOGIN="$sf_bot" TARGET_BOT_ID=305236749 \
+    WORKER_PR_NUMBER=7 WORKER_PR_HEAD_BRANCH="$sf_branch" WORKER_PR_HEAD_SHA="$sf_head" \
+    WORKER_FIX_ROUND=2 WORKER_FIX_KIND=verdict WORKER_MODEL_ALIAS=not-a-catalogued-model \
+    stage_fix
+  ) > /dev/null 2>&1 || sf_noname_rc=$?
+  chk "#97 stage_fix: an alias with no provenance name DIES, sealing no fix commit at all" \
+    "$sf_noname_rc:$(git -C "$sf_work" rev-parse HEAD):$([[ -e "$sf_noname_root/fix-bundle/fix.bundle" ]] && printf sealed || printf nothing-sealed)" \
+    "1:$sf_head:nothing-sealed"
+  local sf_ctl_rc=0
+  (
+    GITHUB_OUTPUT="$tmp/stagefix-ctl.out" TARGET_DIR="$sf_work" \
+    WORKER_ROOT="$sf_noname_root" \
+    TARGET_BOT_LOGIN="$sf_bot" TARGET_BOT_ID=305236749 \
+    WORKER_PR_NUMBER=7 WORKER_PR_HEAD_BRANCH="$sf_branch" WORKER_PR_HEAD_SHA="$sf_head" \
+    WORKER_FIX_ROUND=2 WORKER_FIX_KIND=verdict WORKER_MODEL_ALIAS=opus5 \
+    stage_fix
+  ) > /dev/null 2>&1 || sf_ctl_rc=$?
+  chk "#97 stage_fix: ...and the IDENTICAL fixture with a catalogued alias DOES seal (non-vacuous)" \
+    "$sf_ctl_rc:$([[ -e "$sf_noname_root/fix-bundle/fix.bundle" ]] && printf sealed || printf nothing-sealed)" \
+    "0:sealed"
 
   # Each publisher arm gets its own clone of the ORIGIN, detached at the dispatched head — the
   # publisher's real position. `git clone` takes refs/heads only, so the staged commit (whose only
@@ -7295,6 +7377,89 @@ print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcaplive/
     "$(grep -lc 'ROTATED-SENTINEL' "$wbroot/.credential-durable" 2>/dev/null | wc -l | tr -d ' ')" "1"
 
   # ================================================================================================
+  # ISSUE #97 — natural-language model identity. Every human-readable surface the worker emits must
+  # say WHICH model ran; for the codex catalog a bare "GPT-5.6" identifies nothing, because more
+  # than one GPT-5.6 is routable. Expected values below are LITERALS, never re-derived from the
+  # table under test.
+  # ================================================================================================
+  chk "#97 name: sol renders with its variant" "$(model_display_name sol)" "GPT-5.6 Sol"
+  chk "#97 name: luna renders with its variant too (it is ALSO a GPT-5.6)" \
+    "$(model_display_name luna)" "GPT-5.6 Luna"
+  # terra's routing provider_model is EMPTY and it is sonnet-class — versioning it here would
+  # re-assert the exact mislabelling routing.toml/policy record as a past defect.
+  chk "#97 name: terra is NOT versioned (empty provider_model, sonnet-class)" \
+    "$(model_display_name terra)" "GPT Terra"
+  chk "#97 name: the anthropic tier renders its own product name" \
+    "$(model_display_name opus5)" "Claude Opus 5"
+  chk "#97 name: an unknown alias DIES — it never acquires a default name" \
+    "$( (model_display_name definitely-not-a-model) >/dev/null 2>&1 && printf named || printf died)" \
+    "died"
+  chk "#97 name: an unknown alias emits NOTHING on stdout (no half-name to embed)" \
+    "$( (model_display_name definitely-not-a-model) 2>/dev/null; printf '|')" "|"
+  chk "#97 trailer: the provenance trailer is the display name + the PROVIDER's mailbox" \
+    "$(coauthor_for luna)" "GPT-5.6 Luna <noreply@openai.com>"
+  chk "#97 trailer: and the anthropic side keeps its own mailbox" \
+    "$(coauthor_for opus5)" "Claude Opus 5 <noreply@anthropic.com>"
+  chk "#97 trailer: an unknown alias yields NO trailer, not an empty one" \
+    "$( (coauthor_for definitely-not-a-model) 2>/dev/null; printf '|')" "|"
+  chk "#97 trailer: and it fails closed (non-zero), so the caller's || die fires" \
+    "$( (coauthor_for definitely-not-a-model) >/dev/null 2>&1 && printf ok || printf died)" "died"
+  # TABLE PARITY. `coauthor_for` consults two independent tables, and each refuses an unknown alias
+  # on its own — so a mutant that defaults ONE of them survives every row above, MASKED by the
+  # other. That masking is only safe while the two enumerate the SAME aliases; an alias present in
+  # one and absent from the other would render half a trailer from whichever lookup still answers.
+  # Row one is a literal pin (it also proves the extractor below is not matching nothing, and it
+  # forces whoever adds a model to touch this suite); row two makes the parity itself load-bearing.
+  local _m97_names _m97_mails
+  _m97_aliases_of() {
+    declare -f "$1" \
+      | grep -oE '^[[:space:]]+[a-z0-9]+([[:space:]]*\|[[:space:]]*[a-z0-9]+)*\)$' \
+      | tr -d ' )' | tr '|' '\n' | sort | paste -sd, -
+  }
+  _m97_names=$(_m97_aliases_of model_display_name)
+  _m97_mails=$(_m97_aliases_of _model_provenance_email)
+  chk "#97 tables: the display-name table enumerates exactly the catalogued aliases" \
+    "$_m97_names" "fable,haiku,luna,opus,opus5,sol,sonnet,terra"
+  chk "#97 tables: the provenance-mailbox table enumerates the IDENTICAL set (no half-trailers)" \
+    "$_m97_mails" "$_m97_names"
+  # THE ANTI-DRIFT ROW. Expectation is derived from orchestration/routing.toml — the catalog the
+  # dispatcher actually routes from — and compared against this script's independent table. A new
+  # `gpt-<ver>-<variant>` tier added to the catalog with no display-name entry makes
+  # model_display_name die, which empties its half of the pair and reds this row.
+  local _m97_catalog _m97_alias_line _m97_want _m97_got=''
+  _m97_catalog=$(python3 - "$SCRIPT_DIR/../orchestration/routing.toml" <<'PY'
+import re
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    models = tomllib.load(handle).get("models") or {}
+aliases, want = [], []
+for alias, spec in sorted(models.items()):
+    matched = re.fullmatch(r"gpt-([0-9]+(?:\.[0-9]+)*)-([a-z]+)",
+                           str((spec or {}).get("provider_model") or ""))
+    if matched:
+        aliases.append(alias)
+        want.append("%s=GPT-%s %s" % (alias, matched.group(1), matched.group(2).capitalize()))
+print(" ".join(aliases))
+print("|".join(want))
+PY
+) || true    # a broken/unreadable catalog must RED the rows below, not abort the suite
+  _m97_alias_line=$(printf '%s\n' "$_m97_catalog" | sed -n 1p)
+  _m97_want=$(printf '%s\n' "$_m97_catalog" | sed -n 2p)
+  local -a _m97_aliases=()
+  read -ra _m97_aliases <<<"$_m97_alias_line"
+  local _m97_alias
+  for _m97_alias in "${_m97_aliases[@]}"; do
+    _m97_got+="${_m97_got:+|}$_m97_alias=$(model_display_name "$_m97_alias" 2>/dev/null || true)"
+  done
+  chk "#97 catalog: the cross-check is NON-VACUOUS (routing.toml really does list gpt-<ver>-<x>)" \
+    "$([[ "${#_m97_aliases[@]}" -ge 2 ]] && printf enough || printf "too-few:${#_m97_aliases[@]}")" \
+    "enough"
+  chk "#97 catalog: every routed gpt-<ver>-<variant> alias renders as 'GPT-<ver> <Variant>'" \
+    "$_m97_got" "$_m97_want"
+
+  # ================================================================================================
   # ISSUE #575 — the publish bundle: hostile gate code must not be able to reach the token-bearing
   # publisher. Real git fixtures end to end: seal PRE-GATE on the "worker", verify on the
   # "publisher", reconstruct with `git apply` and hooks neutralised. Every refusal arm is exercised
@@ -7358,6 +7523,47 @@ print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcaplive/
     "added.txt,tracked.txt"
   chk "#575 bundle: it REFUSES to run with a token in scope (token-free by construction)" \
     "$( ( _bundle_env; export GH_TOKEN=ghs_fake; bundle_work ) >/dev/null 2>&1 && printf ran || printf refused)" \
+    "refused"
+
+  # ---- [issue #97] the PR DESCRIPTION names the model. Asserted on the sealed pr-body.md rather
+  # than by calling the writer directly, so the rows also pin that the display name is threaded from
+  # the routed alias, through bundle_work, into the body the publisher actually posts. The
+  # opus5 seal above supplies the anthropic side; a second seal supplies the codex side, which is
+  # the one the issue is about — it must distinguish luna from the other GPT-5.6. ----
+  chk "#97 PR body: the anthropic seal names the model in prose, alias beside it" \
+    "$(grep -cFx '**Claude Opus 5** (alias `opus5`, provider model `claude-opus-5`).' \
+        "$bdir/pr-body.md" || true)" "1"
+  local lroot="$tmp/bundle-root-luna" lout="$tmp/bundle-luna.out" luna_rc
+  mkdir -p "$lroot"
+  if ( _bundle_env; export WORKER_ROOT="$lroot" WORKER_MODEL_ALIAS=luna \
+         WORKER_PROVIDER_MODEL=gpt-5.6-luna WORKER_PROVIDER=openai GITHUB_OUTPUT="$lout"
+       bundle_work ) > "$tmp/bundle-luna.log" 2>&1; then luna_rc=0; else luna_rc=$?; fi
+  chk "#97 bundle: the codex-routed seal SUCCEEDS (the body rows below ran against a real seal)" \
+    "$luna_rc" "0"
+  chk "#97 PR body: it says WHICH GPT-5.6 ran, with the alias + provider id beside it" \
+    "$(grep -cFx '**GPT-5.6 Luna** (alias `luna`, provider model `gpt-5.6-luna`).' \
+        "$lroot/publish-bundle/pr-body.md" || true)" "1"
+  # The regression this exists for: a body that reverts to a bare "GPT-5.6", or to the alias alone.
+  # Case-sensitive on purpose — the lowercase `gpt-5.6-luna` provider id must not satisfy it.
+  chk "#97 PR body: EVERY GPT-5.6 mention is qualified by its variant (no bare 'GPT-5.6')" \
+    "$(grep -o 'GPT-5\.6[^`*)]*' "$lroot/publish-bundle/pr-body.md" | sort -u | paste -sd'|' -)" \
+    "GPT-5.6 Luna"
+  # terra routes with an EMPTY provider_model; the clause must be OMITTED, never rendered as an
+  # empty pair of backticks, and the name must still identify the model.
+  local troot="$tmp/bundle-root-terra" terra_rc
+  mkdir -p "$troot"
+  if ( _bundle_env; export WORKER_ROOT="$troot" WORKER_MODEL_ALIAS=terra \
+         WORKER_PROVIDER_MODEL='' WORKER_PROVIDER=openai GITHUB_OUTPUT="$tmp/bundle-terra.out"
+       bundle_work ) > "$tmp/bundle-terra.log" 2>&1; then terra_rc=0; else terra_rc=$?; fi
+  chk "#97 bundle: the empty-provider_model seal SUCCEEDS" "$terra_rc" "0"
+  chk "#97 PR body: an empty provider_model drops the clause instead of printing empty backticks" \
+    "$(grep -cFx '**GPT Terra** (alias `terra`).' "$troot/publish-bundle/pr-body.md" || true)" "1"
+  # And an alias with no name at all must fail the SEAL — never ship an unidentifiable model.
+  chk "#97 bundle: an alias with NO natural-language name REFUSES to seal (fail closed)" \
+    "$( ( _bundle_env; export WORKER_ROOT="$tmp/bundle-root-unknown" \
+            WORKER_MODEL_ALIAS=not-a-catalogued-model WORKER_PROVIDER_MODEL=x \
+            GITHUB_OUTPUT="$tmp/bundle-unknown.out"
+          bundle_work ) >/dev/null 2>&1 && printf sealed || printf refused)" \
     "refused"
 
   # ---- verification arms. `ok` only for the untouched bundle; every drift DEFERS. ----
@@ -7503,6 +7709,40 @@ HOOK
     "$([[ "$pub2_rc" -ne 0 ]] && printf refused || printf published)" "refused"
   chk "#575 publish: and it left the publisher checkout untouched (no commit, no branch)" \
     "$(git -C "$wpub2" rev-parse HEAD)" "$wbase"
+  # [issue #97] A bundle whose recorded alias has NO provenance name must stop the publisher before
+  # the commit. bundle_work already refuses to seal one, so this is defence in depth — but without
+  # the resolve-into-a-variable form `coauthor_for`'s `die` would only exit the substitution
+  # subshell and the PR would be published carrying an empty "Co-Authored-By: " trailer. The
+  # fixture is RE-DIGESTED so the only thing that can fire is the naming refusal, not the digest.
+  local wpub3="$tmp/bundle-pub3" pub3_rc badalias_dir="$tmp/bundle-badalias"
+  cp -r "$bdir" "$badalias_dir"
+  python3 - "$badalias_dir/meta.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    meta = json.load(handle)
+meta["model_alias"] = "not-a-catalogued-model"
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(meta, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+  git clone -q "$wsrc" "$wpub3" && git -C "$wpub3" remote remove origin
+  git -C "$wpub3" checkout -q "$wbase"
+  if ( export TARGET_DIR="$wpub3" TARGET_REPO="$wrepo" WORKER_ROOT="$pubroot" \
+              WORKER_BUNDLE_DIR="$badalias_dir" \
+              WORKER_BUNDLE_DIGEST="$(_bundle_digest "$badalias_dir")" \
+              WORKER_BUNDLE_BASE_SHA="$wbase" WORKER_BUNDLE_BRANCH="$wbranch" \
+              ISSUE_NUMBER=575 TARGET_DEFAULT_BRANCH=main \
+              TARGET_BOT_LOGIN='sparq-agent[bot]' TARGET_BOT_ID=12345 \
+              GH_TOKEN=ghs_fake_publisher GITHUB_OUTPUT="$tmp/pub3.out" \
+              GIT_CONFIG_NOSYSTEM=1 HOME="$tmp/no-home" PATH="$pubbin:$PATH"
+       publish_pr ) > "$tmp/pub3.log" 2>&1; then pub3_rc=0; else pub3_rc=$?; fi
+  chk "#97 publish: an alias with no provenance name is REFUSED before any commit is made" \
+    "$([[ "$pub3_rc" -ne 0 ]] && printf refused || printf published):$(git -C "$wpub3" rev-parse HEAD)" \
+    "refused:$wbase"
+  chk "#97 publish: the refusal is the NAMING one, not the digest (the re-digest verified)" \
+    "$(grep -c 'no commit provenance for the routed model alias' "$tmp/pub3.log" || true)" "1"
 
   # ================================================================================================
   # SELF-TEST SANDBOX — no enrolled self-test may reach the real `gh`.
