@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5603,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bfe1d163b78db72221de7b33ea93c534d78efedd",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete as an analysis-only change. The six-condition BAF statement excludes the identified variable-predicate and recursive compound-term counterexamples, and its finite active-domain/ground-head argument supports the stated termination and PTIME data-complexity bounds. The document consistently distinguishes termination from OSB cost, scopes arbitrary-rule nontermination to in-process callers today, marks ACP/ODRL as unaudited, labels the argument informal rather than machine-checked, and states that enforcement is not shipped. Its proposed rejection cases are non-vacuous checker targets, and the companion design accurately carries these caveats. No correctness, soundness, test-validity, security, or instruction-injection issue is present. With no findings in either round 2 or round 3, progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
