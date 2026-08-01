@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5487,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "477c7a2f3771e04f2e0e1326250cbfe0f4a097c2",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`buffered_response_bound` treats any of `max_query_rows`, `max_results`, or `max_query_bytes` as proof that buffering is affordable. The first two bound row count only, so one result row containing a client-controlled or preloaded enormous literal can serialize to an arbitrarily large body. The documented `max_query_bytes` estimate prices id tuples and query-computed terms, but excludes bytes of terms already stored in the graph dictionary; a SELECT returning a huge stored literal has a small id-level working set and a huge JSON representation. Thus an attacker can combine over-cap generation pressure with a low-cardinality, high-byte result and force full response materialization. The added ceiling-exceeded test uses 20,000 ordinary rows and only proves row-cap refusal, not the claimed response-size bound.",
+    "file": "crates/sparq-server/src/http.rs",
+    "fix_hint": "Only enable buffered degradation when a limit directly and cooperatively bounds serialized response bytes, or buffer through a byte-capped/spill mechanism that refuses before exceeding its allocation budget. Do not treat row-count limits as response-byte bounds. Add a regression test with very few rows containing a very large pre-existing graph literal, under over-cap pressure, and verify bounded refusal/spill rather than whole-body materialization; cover whichever configured ceiling is claimed to make buffering safe. Update the CLI/SKILL wording accordingly.",
+    "severity": "major",
+    "title": "Configured query ceilings still do not bound the buffered response allocation"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 correctly makes admission inert when no ceiling is configured and adds useful anti-vacuity/refusal tests, but the original resource-safety issue remains for two of the three ceilings treated as sufficient. `max_results` and `max_query_rows` cap only row cardinality, not serialized byte size; even `max_query_bytes` accounts id-level rows and query-computed terms while explicitly excluding pre-existing graph dictionary term bytes. A bounded number of rows can therefore contain arbitrarily large stored literal lexicals, and the admission fallback will still materialize the entire JSON response. Since the same major finding remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
