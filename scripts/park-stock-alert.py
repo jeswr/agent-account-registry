@@ -134,7 +134,11 @@ def decide(reasons, has_open_alert):
 
 
 def render_body(repo, counts, reasons, run_url, maintainer):
-    listed = ", ".join(f"#{n}" for n in counts["terminal"]) or "(none)"
+    # `terminal` rows are already `owner/repo#N` (main() qualifies them per target). GitHub
+    # linkifies THAT form; prefixing another "#" yields `#owner/repo#N`, which resolves to
+    # nothing — 13 dead links in the first live alert. Bare ints keep their "#".
+    listed = ", ".join(str(n) if isinstance(n, str) and "#" in n else f"#{n}"
+                       for n in counts["terminal"]) or "(none)"
     holds = ", ".join(f"`{k}`={v}" for k, v in counts["holds"].items()) or "(none)"
     return "\n".join([
         ALERT_MARKER,
@@ -380,6 +384,16 @@ def _self_test():
     body = render_body("o/r", {"terminal": ["o/r#590", "o/r#601"], "parked": 5, "considered": 40,
                                "holds": {HUMAN: 2}}, ["r"], "http://run", "jeswr")
     chk("the alert body NAMES the PRs", "#590" in body and "#601" in body)
+    # ...and renders a CROSS-REPO ref GitHub can actually resolve. `owner/repo#N` linkifies;
+    # `#owner/repo#N` does not — the first live alert shipped 13 dead links exactly that way.
+    chk("a qualified ref renders as owner/repo#N, never #owner/repo#N",
+        "#o/r#590" in body, False)
+    chk("...and the qualified ref IS present in linkable form", "o/r#590" in body)
+    # A BARE int must still get its "#": the two forms are rendered by one expression, so a fix
+    # for one that breaks the other is the shape this pins.
+    chk("a bare number still renders as #N",
+        "#42" in render_body("o/r", {"terminal": [42], "parked": 1, "considered": 1, "holds": {}},
+                             ["r"], "", "jeswr"))
     chk("the alert body carries the stable dedupe marker", ALERT_MARKER in body)
     chk("the alert body states a human gesture is required", "human re-admission gesture" in body)
 
