@@ -30,11 +30,11 @@ holder now escalates with its own named recovery)". In the tree:
 
 - What PR #1415 (`30c5bd5c8`, "resolve target issue #677") actually added is the **narrowing** of
   `source-unlisted`, under the banner `[registry #677 point 1]` — `unlisted_source_narrowing`
-  (`scripts/dispatch-claim.py:1798`) plus the sixth cause `CAUSE_SOURCE_UNLISTED_NARROWED` (`:547-566`).
+  (`scripts/dispatch-claim.py:1815`) plus the sixth cause `CAUSE_SOURCE_UNLISTED_NARROWED` (`:547-566`).
 - The **escalation** half is registry #772's, not #677's (`starvation_provenance_escalation`,
-  `scripts/dispatch-claim.py:2757`), and it does **not** cover every unknown-crate holder: it fires
+  `scripts/dispatch-claim.py:2774`), and it does **not** cover every unknown-crate holder: it fires
   on `missing-provenance` **only** and deliberately declines `source-no-areas`, because that holder
-  has no provenance recovery to name (`:2782-2784`). So one unknown-crate class — a PR whose source
+  has no provenance recovery to name (`:2799-2801`). So one unknown-crate class — a PR whose source
   issue is known and carries no `area:*` — today neither narrows nor escalates. It is counted, and
   that is all.
 
@@ -53,14 +53,14 @@ A design that does not name which one it means is unimplementable, so this recor
 
 | | **Reading A** — N *global holders* may co-run | **Reading B** — a live `__global__` reservation stops excluding, up to N in flight |
 |---|---|---|
-| what changes | `packages_conflict(__global__, __global__)` stops being `True` for the first N | `package_conflicts_with_areas` stops being `True` against a global occupant for the first N |
+| what changes | universal-vs-universal stops excluding for the first N — in **both** implementations of §4's predicate: `packages_conflict`'s "`None` intersects everything" arm (ledger legs) *and* `partition_defer_attribution`'s `__global__ in busy` / `package == __global__` branches (open-PR legs) | a live global reservation stops excluding **narrow** rows too — the same two implementations, and on the open-PR side that is specifically the `__global__ in busy` branch that today defers every row unconditionally |
 | who gets to run | only *other* `__global__` rows | every deferred row, global or narrow |
 | pairs whose footprints overlap | universal ∩ universal — **certain**, every pair, every crate | unknown ∩ known — unbounded, unmeasured |
 | what it buys on the measured board | ~nothing (§3) | one extra in-flight row per starved tick (§3) |
 
 **Bounded N already exists in this fleet, and it is not the partition.** `max_concurrent` is a
 per-repo policy cap — 40 on sparq, 3 on the registry (`policy/repos.toml:98`, `:143`) — narrowed
-live by account headroom (`allocator.dynamic_concurrency`, `scripts/dispatch-claim.py:8679-8681`).
+live by account headroom (`allocator.dynamic_concurrency`, `scripts/dispatch-claim.py:8696-8698`).
 That is a **capacity** governor: it answers *how much work can the account pool sustain*, and being
 wrong costs rate limits. The partition is a **correctness** governor: it answers *which pairs of
 rows may touch the tree at once*, and being wrong costs a corrupted crate. Point 1 proposes to
@@ -71,7 +71,7 @@ and a single integer cannot serve both.
 
 **The load-bearing empirical finding: on the measured board `__global__` is held by open PRs'
 *reservations*, not by *runnable queue entries*.** `busy_packages_of_pulls`
-(`scripts/dispatch-claim.py:1852`) derives occupancy from every open same-repo `sparq-agent/*` PR;
+(`scripts/dispatch-claim.py:1869`) derives occupancy from every open same-repo `sparq-agent/*` PR;
 that reservation stands for the PR's whole life, not for a worker's runtime. A slot is a
 **dispatch-time admission** primitive. Under Reading A it would schedule holders that are not
 waiting to be admitted — they are already open, mostly inert, and hold their crates regardless.
@@ -80,12 +80,12 @@ Measured, all of it already in the tree:
 
 | measurement | value | where |
 |---|---|---|
-| executed sparq ticks 2026-07-27..28 carrying a `__global__` reservation | **14 of 101** | `scripts/dispatch-claim.py:18376-18380` |
+| executed sparq ticks 2026-07-27..28 carrying a `__global__` reservation | **14 of 101** | `scripts/dispatch-claim.py:18393-18397` |
 | — of which `source-unlisted` | **7**, and **6 of those 7 were the same PR** (sparq#3620) on six consecutive ticks | same |
-| that whole class after PR #1415 | **narrowed away** — it no longer holds `__global__` | `:1798`, `:547-566` |
-| registry ticks 2026-07-27 planning 0 items behind an unprovenanced holder | **5 of 84**, three PRs, still recordless 16h/8h/4h later | `:2766-2769` |
-| widest co-occurring starved `__global__` board ever measured | **4 holders** (2026-07-27 20:12:40Z–20:47:36Z), all provably **inert** | `:2574-2577` |
-| observed outage from that window | **~55 min** | `:2544-2545` |
+| that whole class after PR #1415 | **narrowed away** — it no longer holds `__global__` | `:1815`, `:547-566` |
+| registry ticks 2026-07-27 planning 0 items behind an unprovenanced holder | **5 of 84**, three PRs, still recordless 16h/8h/4h later | `:2783-2786` |
+| widest co-occurring starved `__global__` board ever measured | **4 holders** (2026-07-27 20:12:40Z–20:47:36Z), all provably **inert** | `:2591-2594` |
+| observed outage from that window | **~55 min** | `:2561-2562` |
 
 Read against the two readings:
 
@@ -93,7 +93,7 @@ Read against the two readings:
   of 2 has nothing to put in the second slot. The one window where holders genuinely co-occurred
   (4 of them) is the window where every holder was a provably-inert draft: the thing that frees
   that partition is **parking** them, which the sweep already does and which actually releases the
-  crates (`starvation_park_targets`, `:2580`; the inertness clause at `:2596-2602` exists precisely
+  crates (`starvation_park_targets`, `:2597`; the inertness clause at `:2613-2619` exists precisely
   because parking an *active* holder writes a label and frees nothing).
 - **Reading B buys at most one extra in-flight row per starved tick**, on a residual of ≤7/101
   sparq ticks (~7%) and 5/84 registry ticks (~6%), and only while the deferred backlog is non-empty.
@@ -110,11 +110,32 @@ labelling all are.
 **The invariant today, stated exactly.** Any two concurrently dispatched rows have **provably
 disjoint area sets**. A partition key names a set; two keys exclude iff their sets intersect;
 `__global__` is the universal set and anything unreadable reduces to it
-(`scripts/lease_schema.py:86-102`, `:105-117`). One predicate decides this at all four enforcement
-sites — the PLAN assemble filter (`filter_busy_area_items`, `scripts/dispatch-claim.py:2385`), the
-CLAIM live re-check (`revalidate_items_against_live_pulls`, `:2866`), the cross-lane ledger view
-(`sibling_lease_conflict`, `:994`), and the allocator (`partition_available`,
-`scripts/select-and-claim.py:747-772`).
+(`scripts/lease_schema.py:86-102`, `:105-124`).
+
+**One semantics, TWO implementations — and an overrule has to move both.** The four enforcement
+sites do *not* all call one function, and a design that assumes they do would ship a widening at
+half the board. The actual topology:
+
+| leg | site | how it decides | operand |
+|---|---|---|---|
+| ledger | `sibling_lease_conflict` (`scripts/dispatch-claim.py:1092`) | calls `lease_schema.packages_conflict` | two partition KEYS |
+| ledger | `partition_available` (`scripts/select-and-claim.py:774`) | calls `lease_schema.packages_conflict` | two partition KEYS |
+| open-PR (PLAN) | `filter_busy_area_items` (`scripts/dispatch-claim.py:2451`) | calls `partition_defer_attribution` | key vs. the busy UNION |
+| open-PR (CLAIM) | `revalidate_items_against_live_pulls` (`scripts/dispatch-claim.py:2935`) | calls `partition_defer_attribution` | key vs. the busy UNION |
+
+`partition_defer_attribution` (`scripts/dispatch-claim.py:2130`) is an **independent** decision —
+three branches over the expanded union of atoms the open PRs hold: `__global__ in busy` (`:2185`),
+`package == __global__` (`:2188`), and `package_areas(package) & busy` (`:2225-2231`). It reaches
+`packages_conflict` at no point, and it does not call `lease_schema.package_conflicts_with_areas`
+either — that helper is the busy-union form of the predicate but has **no production caller** in
+the tree, only its own self-test (`scripts/lease_schema.py:127-141`). What the two share is
+`package_areas`, i.e. the *set* semantics and the fail-closed universal reading — not the
+exclusion decision built on top of it.
+
+They are equivalent **today by test, not by construction**: the two open-PR legs are pinned to
+decide identically on every board tried (`scripts/dispatch-claim.py:19835-19858`) and the union arm
+is pinned to intersect rather than membership-test (`:19860-19891`). That pinning is what §9.3
+turns into a requirement.
 
 N > 1 does not weaken that invariant. It **deletes** it for the admitted pairs — and under Reading
 A it deletes it for the pairs where overlap is not a risk but a certainty, since both operands are
@@ -131,14 +152,14 @@ the universal set.
    green `gate` that "would each have reddened `gate` for every subsequent PR, because master moved
    under them after their gate ran"; `pr-gate.yml` fires only on `pull_request` events and this repo
    has **no merge queue**, so nothing re-derives the green (`scripts/worker-pr.py:4908-4919`). The
-   detector is `gate_freshness` (`scripts/dispatch-claim.py:4512`) and the consequence is a bounded
+   detector is `gate_freshness` (`scripts/dispatch-claim.py:4529`) and the consequence is a bounded
    deferral. It fails closed, and it is evidence *for* this record's direction: even with the
    partition serializing, "CI is green" was already not a statement about the tree that would
    merge. N > 1 multiplies the population that rests on it.
 3. **The class neither rung reaches**: two edits to the *same crate*, textually disjoint, each
    individually correct, each green on a post-merge base, **jointly wrong**. This file names it as
    the corrupting direction in its own words — "two workers on one crate can produce a semantic
-   conflict that compiles and passes" (`scripts/dispatch-claim.py:2771-2775`, restated at
+   conflict that compiles and passes" (`scripts/dispatch-claim.py:2788-2792`, restated at
    `research/1012-parked-non-draft-queue-membership.md` §2) — and it is exactly why
    `busy_packages_of_pulls` fails closed on an unknown footprint.
 
@@ -164,7 +185,7 @@ slots on either side of itself.
 |---|---|---|---|
 | `declared-areas` (`:520`) | **KNOWN, and it is everything** | overlap is **certain**: two universal sets intersect on every crate. Unsound by proof. | none — nothing to narrow |
 | `missing-provenance` (`:521`) | UNKNOWN | overlap probability is unmeasured and unmeasurable from inside the dispatcher. Unsound by ignorance. | shipped (sparq#4821) where the PR's own labels bound it |
-| `source-unlisted` (`:522`) | UNKNOWN | same | shipped (#1415, `:1798`) |
+| `source-unlisted` (`:522`) | UNKNOWN | same | shipped (#1415, `:1815`) |
 | `source-no-areas` (`:523`) | UNKNOWN | same | **deliberately not** — see below |
 
 This is the inversion #1011 identified, carried to its conclusion: the only cause where the
@@ -176,12 +197,12 @@ Two live sub-cases worth naming so a later author does not rediscover them as bu
 
 - A PR wearing the literal `area:__global__` label is a **declared** universal footprint and is
   routed to `source-unlisted`, not to the narrowed cause, precisely so the closed-enum census still
-  accepts it (`scripts/dispatch-claim.py:18429-18447`). Co-admitting that row is a declared
+  accepts it (`scripts/dispatch-claim.py:18446-18464`). Co-admitting that row is a declared
   collision, not an inferred one.
 - `source-no-areas` is not narrowed **on purpose**: the source issue is known and already reserves
   `__global__` on the PLAN side, so narrowing only the PR half would desynchronise the two
   occupancy legs — the linkage-parity failure the two legs share one function to avoid
-  (`:18412-18419`, `:1803-1809`). Its lever is upstream (§6), not in the partition.
+  (`:18429-18436`, `:1820-1826`). Its lever is upstream (§6), not in the partition.
 
 ## 6. What does buy throughput here, with a soundness proof attached
 
@@ -203,9 +224,9 @@ What remains, with honest ceilings:
   that genuinely span several surfaces". So this lever is real, sound, and **partial**; it is not a
   substitute for the partition and it must not be sold as one.
 - **`missing-provenance` → backfill.** Already counted, capped and named, with the recovery
-  workflow spelled in the escalation body (`scripts/dispatch-claim.py:2757`, `:2820`).
+  workflow spelled in the escalation body (`scripts/dispatch-claim.py:2774`, `:2837`).
 - **Inert holders → park them.** The only remedy that actually releases crates, and it releases
-  them *legitimately* (`:2580`, `:2596-2602`).
+  them *legitimately* (`:2597`, `:2613-2619`).
 - **`declared-areas` → nothing.** A genuinely repo-wide change serializing is the partition working
   as designed.
 
@@ -227,8 +248,9 @@ What remains, with honest ceilings:
 
 Confirm **one**:
 
-- [ ] **(A) Confirm the recommendation.** `__global__` stays exclusive; `packages_conflict` keeps
-      the universal-set semantics unchanged. #1011 closes on this record. The throughput work
+- [ ] **(A) Confirm the recommendation.** `__global__` stays exclusive; both implementations of
+      §4's predicate — `packages_conflict` and `partition_defer_attribution` — keep the
+      universal-set semantics unchanged. #1011 closes on this record. The throughput work
       continues as §6 — narrowing where evidence proves a footprint, upstream area labelling for
       `source-no-areas`, and the existing sweeps — each a separate issue.
 - [ ] **(B) Overrule — build bounded N anyway.** Then §9 binds it, starting with naming Reading A
@@ -246,10 +268,23 @@ Non-negotiable, because each is a place this change can fail open:
 2. **Supply the detector for §4.3, or prove the class empty — measured, not assumed.** "CI is
    green" is disqualified by registry #940's own measurement. If the answer is "review catches it",
    say which reviewer reads *both* diffs, and note that today neither does.
-3. **One predicate, all four sites.** `lease_schema.packages_conflict` is THE predicate. A slot
-   admitted at PLAN and not at `partition_available` plans work the allocator then refuses —
-   `package-single-flight` every tick, forever, which is the failure that predicate was unified to
-   prevent (`scripts/select-and-claim.py:756-760`).
+3. **All four sites, and BOTH implementations, in one change.** There is no single predicate to
+   edit (§4). The slot count has to land in `lease_schema.packages_conflict` — which decides
+   `sibling_lease_conflict` and `partition_available` — **and**, independently, in
+   `partition_defer_attribution`, which decides `filter_busy_area_items` and
+   `revalidate_items_against_live_pulls` and shares no exclusion code with it. Reading A moves that
+   function's two `__global__` branches (`scripts/dispatch-claim.py:2185`, `:2188`); Reading B moves
+   those *and* the set-intersection arm (`:2225-2231`). Land one and not the other and the scheduler
+   contradicts itself in whichever direction was widened: a slot admitted at PLAN and refused at
+   `partition_available` plans work the allocator then declines — `package-single-flight` every
+   tick, forever (`scripts/select-and-claim.py:756-763`) — and a slot admitted on the ledger and
+   refused at PLAN buys nothing while looking implemented. So the tests are end-to-end over the
+   PAIR, not per function: PLAN and CLAIM deciding identically on the same board (extend
+   `scripts/dispatch-claim.py:19835-19858`), the ledger legs agreeing with them on that same board,
+   and a mutant that changes **one** implementation going RED. Cheaper order of operations: first
+   make the open-PR legs consume a genuinely canonical predicate — `package_conflicts_with_areas`
+   is already the busy-union form and today has no caller — as a separate behaviour-preserving
+   refactor that can be reviewed on its own, and only then add slots to the one predicate.
 4. **Say where the slot count lives, and how a PR-derived reservation consumes one.** The ledger is
    the only serialized state in this system (CAS over `data/leases.json`), so N is countable inside
    a lease transaction. But §3's population is **open-PR occupancy, which is not in the ledger** — a
