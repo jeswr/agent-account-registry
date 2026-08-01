@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3916,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a94ea4c3933c76aa18abbced2738e78bf3610b95",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "assemble_competitors() checks only isinstance(entry.get(\"id\"), str), so {\"competitors\":[{\"id\":\"\"}]} is accepted by --check and merged into the assembled registry. An empty ID is not a usable stable identifier for the downstream ID-based gather path, making the entry effectively unaddressable and defeating the same no-anonymous-record safety property now enforced for benchmark fragments. The existing test covers a missing ID but not an empty one.",
+    "file": "scripts/bench_registry.py",
+    "fix_hint": "Require competitor IDs to be non-empty after applying the project's intended whitespace policy (at minimum, reject id == \"\"; preferably reject whitespace-only IDs too), and add focused regression cases for empty and whitespace-only string IDs in scripts/tests/test_bench_registry.py.",
+    "severity": "major",
+    "title": "Competitor fragments accept empty IDs"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-1 per-entry benchmark-ID defect is fixed and directly regression-tested, and the focused 31-test assembler suite passes. However, the parallel competitor-fragment validator still accepts an empty competitor ID. That violates the fragment registry's load-bearing identifiable-entry invariant and permits a competitor that normal ID-based gather selection cannot meaningfully address. Because this is a newly identified correctness gap, progress is regressing under the required comparison scale.",
+  "verdict": "request_changes"
+ }
+}
