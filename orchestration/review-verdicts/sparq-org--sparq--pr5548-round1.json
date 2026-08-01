@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5548,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8528e4c39a0c8586022acd959f56a3c984ddedc7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 2.2(C), 5.2, and P3 assume that adding an `inDoc` guard to the current `grantsAgent` / `acl:mode` rules makes a named Authorization document-local. It does not: the loader emits `auth solidx:inDoc doc` once for every document containing any triple with that subject. If the owning ACL supplies `a acl:Authorization`/`acl:accessTo` and a foreign ACL supplies `acl:agent`/`acl:mode`, the merged fact set gives the subject `inDoc` facts for both documents. An existential `?auth solidx:inDoc ?doc` guard remains satisfied and the foreign properties still combine with the local applicability fact. Because later phases explicitly drop shared-subject edges after P3, the resulting dependency closure can omit a real input and retain a stale or incorrect grant.",
+    "file": "research/solid-pod-scoped-materializer-design.md",
+    "fix_hint": "Specify a provenance-preserving rule shape that binds each contributing input triple to the same control document that establishes applicability. For example, retain/document per-triple graph provenance and join `agent`/`mode` against that provenance, or derive document-qualified intermediate facts (including document identity) and only then emit grants. Add the stated split-node regression with a same-subject foreign ACL and demonstrate that the foreign `agent` and `mode` cannot contribute. If per-triple provenance is not introduced, keep the shared-subject dependency edges in P4 instead of claiming case (C) is eliminated.",
+    "severity": "major",
+    "title": "Proposed `inDoc` guard does not eliminate split-authorization inputs"
+   }
+  ],
+  "progress": null,
+  "summary": "The record identifies important cross-document dependencies, but its phased design relies on a WAC hardening step that is not sufficient as specified. An authorization subject can have `solidx:inDoc` facts for multiple ACLs; adding an existential `inDoc` guard to `grantsAgent`/mode rules does not tie the contributing predicate to the ACL that established `appliesTo`. Consequently case (C) is not eliminated, yet P4 and later closure logic assume that it is. The design must specify provenance-preserving derivation or retain shared-subject dependencies.",
+  "verdict": "request_changes"
+ }
+}
