@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1584,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c8360b6f9f0b219f6479c608bb97d378cf20fa32",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`no_change_census` strips the attempt suffix (`run_id.split(\".\", 1)[0]`) and counts every matching health record, while `_orchestration_lane_runs` counts the workflow-run object once and returns only its base `id`. The model-health ledger deliberately retains separately executed outcomes such as `123.1` and `123.2` for a full rerun under the same GitHub run id. Both records therefore enter `worker_no_change_1h`, but the Actions list contributes only one `worker_attempts_1h`. This violates the documented `no_change <= attempts` invariant, permits a published rate above 1, and can falsely sustain `worker-no-change`. The test only proves that one suffixed record matches; it does not cover two attempts of one run id.",
+    "file": "scripts/metrics.py",
+    "fix_hint": "Define numerator and denominator over the same attempt-level population. Carry an exact attempt identity through collection and match the full ledger `run_id`, or enumerate/count concluded attempts if historical attempts are intended to count. Account for recorder-only reruns that preserve the producing attempt. Add a non-vacuous test with at least two retained attempt records sharing one base run id and assert both the intended count and that the rate cannot exceed 1.",
+    "severity": "major",
+    "title": "Rerun attempts can make the no-change numerator exceed its denominator"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new census is not bounded to the population used as its denominator. A rerun keeps the same GitHub workflow-run id while producing a distinct model-health record keyed by the attempt suffix, so multiple retained no-change outcomes can be joined to one run counted once. This can publish rates above 1 and generate false alerts. The added tests exercise an attempt suffix but omit the multiple-attempt case that breaks the stated invariant.",
+  "verdict": "request_changes"
+ }
+}
