@@ -1530,10 +1530,23 @@ def _self_test():
           seam["no_draft_convert_default"], False)
     # The wrong-input seam: binding NO_DRAFT_CONVERT to `inputs.apply` lints clean and silently
     # inverts an apply run. Assert the exact expression, not the mere presence of the name.
-    check("each workflow env name is bound to ITS OWN dispatch input (wrong-input seam)",
+    # [#1544] TARGET_REPO now comes from the MATRIX (the schedule sweeps every enabled target and
+    # a scheduled run has no `inputs.*`), and APPLY must additionally be true on a schedule.
+    check("each workflow env name is bound to ITS OWN source (wrong-input seam)",
           seam["step_env_bindings"],
-          {"TARGET_REPO": "${{ inputs.target_repo }}", "APPLY": "${{ inputs.apply }}",
+          {"TARGET_REPO": "${{ matrix.repo }}",
+           "APPLY": "${{ inputs.apply || github.event_name == 'schedule' }}",
            "NO_DRAFT_CONVERT": "${{ inputs.no_draft_convert }}"})
+    # ...and the SCHEDULED sweep must APPLY. Binding APPLY to `inputs.apply` alone lints clean,
+    # keeps every check above green, and makes the cron a PERMANENT DRY RUN — it would run forever,
+    # report success, and record nothing, which is indistinguishable from a drained population.
+    # That is the exact "built, wired, never fired" shape this estate keeps paying for, so it is
+    # asserted on the SHIPPED expression rather than trusted.
+    _apply_expr = seam["step_env_bindings"]["APPLY"]
+    check("a SCHEDULED run applies (the cron is not a permanent dry run)",
+          "github.event_name == 'schedule'" in _apply_expr, True)
+    check("...while a manual run still defaults to a DRY RUN (inputs.apply is still consulted)",
+          "inputs.apply" in _apply_expr, True)
     check("two-page slurped listing flattens (sol r5)",
           flatten_pull_pages([[{"number": 1}], [{"number": 2}, {"number": 3}]]),
           [{"number": 1}, {"number": 2}, {"number": 3}])
