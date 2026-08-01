@@ -126,11 +126,27 @@ So the five single-rung routes (§3) do degrade gracefully today: defer → aler
 auto-readmit. #720's blast-radius argument is directionally right about *which* routes are
 exposed, but wrong about *where they land*.
 
-**One stale comment does say otherwise**, and it is worth correcting because it is the kind of
-thing a future change reasons from: `orchestration/routing.toml:276`, in the `role = "ci"` block,
-claims `escalate = true` "flips a starved item to needs:user". It has not done that since #116.
-The `role = "impl"` block at lines 239–246 in the *same file* describes the post-#116 behaviour
-correctly. Two comments in one file disagreeing about the terminal class is a live hazard.
+**Two stale comments say otherwise, not one.** An exact search for `needs:user` in
+`orchestration/routing.toml` returns four sites; they split two and two:
+
+| line | text | verdict |
+|---|---|---|
+| 141–142 | security-label override header: "on chain-exhaustion, **ESCALATES** to a human (`needs:user`) rather than degrading" | **stale** — that route (183–191) lands in `status:parked` |
+| 276 | `role = "ci"`: `escalate = true` "flips a starved item to `needs:user`" | **stale** — same reason |
+| 14 | an approved trust-surface PR "is routed to a HUMAN arm (`needs:user`), never auto-armed" | correct — the review-lane **arm gate**, a different mechanism |
+| 278 | the security override "still WINS (opus + human arm)" | correct — arm gate again |
+
+Only the first two describe the *starvation* terminal, and both are wrong post-#116. The
+`role = "impl"` block at 239–246 in the same file describes the post-#116 behaviour correctly and
+in detail. So the file contains three descriptions of one terminal class, two of which contradict
+the code — and the stale one at 141–142 sits in the header of the very route §3 lists as the most
+exposed. That is a live hazard, not a typo: a future change reasons from whichever comment it
+reads first.
+
+The same override header carries an adjacent staleness worth fixing in one pass: lines 139–140
+describe "opus-4.8 as tail fallback … so an opus5 capacity outage degrades to the previous
+soundness tier", while the route's `model_chain` at line 188 is `["opus5"]` alone. The fallback
+that comment promises is the one §3 records as absent.
 
 ---
 
@@ -186,10 +202,118 @@ through for exactly this shape, and it is the right one here.
 |---|---|---|
 | observed, headroom ≥ margin | admit | normal |
 | observed, exhausted | **refuse** | the case #720 exists to catch |
-| observed, unparseable (shape drift) | **refuse** | provider changed under us; `_assemble_fable`'s posture |
+| observed, unparseable (shape drift) | **refuse after N consecutive, admit loudly before** | provider changed under us — but see §4.1 |
 | never observed on this account | **admit, loudly** | absence of evidence; refusing self-latches the sole tier |
 
-Collapsing rows 3 and 4 — which the current `fable_ok` idiom does — is the outage.
+The current `fable_ok` idiom collapses rows 3 and 4 into a single immediate **refuse**, and on a
+sole tier that is the outage. Note that rows 3 and 4 still *admit alike* for the first N−1 ticks;
+what separates them is destiny, not this tick's decision, and §4.1 is what makes that destiny
+representable at all.
+
+### 4.1 The state that makes rows 3 and 4 distinguishable, and where it has to live
+
+The table above is not implementable against the Stage A data as first drafted, and that gap is
+exactly at the gate's fail direction, so it is spelled out here rather than left to Stage B.
+
+**The problem.** Stage A's output is a per-tick header set inside the ephemeral usage snapshot that
+`account-usage.py main()` writes and `select-and-claim` reads once. On a tick where the expected
+opus5 window is absent, that snapshot alone cannot tell row 3 from row 4: a newly enrolled account
+that has never been probed and an account that exposed the window last week and has now drifted
+produce byte-identical snapshot entries (no window). It also cannot count "N consecutive" anything
+— it has no yesterday. Left unspecified, an implementer picks a reading, and both readings are bad:
+refuse-on-absent reproduces §4's fleet self-latch, admit-on-absent means row 3 never fires and the
+gate is vacuous.
+
+**The store already exists.** This repo has one durable per-account record and one guarded writer
+for it: the account catalog issue body, written by `persist_limits` (`account-usage.py:536`) via
+`_persist_one` (line 484) — a read-merge-write whose version stamp is the issue's body-edit count,
+which fails loudly rather than clobbering a concurrent edit — and validated before every write by
+`select-and-claim.account_record_schema_errors` (line 1313). The `limits:` line (`LIMIT_KEYS`,
+line 403; `_limits_line`, line 415) is an existing instance of exactly this shape. Premium-bucket
+state should be a second front-matter line through the same seam, not a new store.
+
+**Fields**, per account, keyed by model alias:
+
+- `last_ok` — RFC3339 UTC of the most recent probe that returned a *well-formed* window.
+- `fail_streak` — probes since `last_ok` that reached the provider and did not return one.
+
+Absence of the line is itself meaningful and is the safe default: `persist_limits` already skips
+accounts missing from the snapshot and writes nothing when `_limits_line` returns `None`, so a
+never-probed account carries no state, which is row 4.
+
+**Writer transitions** — at most one per account per tick, and the three-way split matters:
+
+| probe outcome | seam that already distinguishes it | transition |
+|---|---|---|
+| well-formed window | `_assemble_fable`-shaped classifier returns an entry | `last_ok = now`, `fail_streak = 0` |
+| response received, window absent or unparseable | classifier returns `None` after headers were parsed | `fail_streak += 1`, `last_ok` untouched |
+| transport failure / no token / account not probed | `_probe_headers` returns `None` (line 80); `_probe_anthropic` (line 112) already splits this from shape failure | **no write at all** |
+
+The third row is load-bearing. A transport failure is evidence about the prober, not about the
+account; counting it would let one broken runner, an expired credential set, or a workflow outage
+drive every account to the refusing state in N ticks — §4's outage reached by a slower path. The
+existing `_probe_anthropic` already makes precisely this distinction (`hdr is None` = transport,
+`_valid_base_usage` false = shape); the counter must key off the same split, not off "entry is
+falsy".
+
+**Reset** is one rule: any well-formed window zeroes `fail_streak`. There is no other reset path,
+and in particular a human edit of the issue body is not one we design for.
+
+One writer hazard, because it is easy to get wrong at this exact seam: `_limits_line` is a pure
+function of the snapshot alone, but a *streak* line is not — it depends on the record's prior
+value. The increment therefore has to be computed inside `_persist_one`'s read-merge, from the body
+that read returns, not precomputed once from the snapshot. `_persist_one` retries up to
+`PERSIST_ATTEMPTS` (line 444) when a foreign edit lands after ours, and a precomputed
+`fail_streak = k + 1` would be re-applied on each retry against a body that already carries it —
+silently correct by idempotence in that particular case, but the same shape double-counts the
+moment the merge is expressed as "read k, write k+1" outside the retry loop. Make the merge a pure
+`(old_line, outcome) -> new_line` function and unit-test it; that is the seam every transition row
+in §8 exercises.
+
+**Freshness decays toward admitting, not toward refusing.** A record whose `last_ok` is older than
+a TTL (one full weekly window plus slack is the natural choice, since that is the bucket's own
+period) reads as row 4 — never-observed — not as dead. An expiry that decays toward refuse turns
+any sustained probe outage into a fleet-wide latch with no recovery path, which is the #639 shape
+`select-and-claim.py:519–535` already rejected.
+
+**Resolving rows 3 and 4 against Stage B's counter.** As first written, §4's table refused
+immediately on drift while Stage B item 3 refused only after N consecutive failures. They cannot
+both hold; the counter wins, and the table above is corrected to match. Reason: fable's
+refuse-on-first-drift was safe because fable was one rung of a multi-rung chain, so a drift cost an
+account a rung. A provider-side header rename hits *every* account on the *same* tick, and on the
+sole tier that is a synchronous fleet stop. N converts that into N ticks of loud warnings. The cost
+of those N ticks is bounded and is not new: it is exactly today's behaviour (option A). The
+counter-argument is real and should bound N — a *single*-account drift is not fleet-wide, and there
+each tick below N burns a lease — so N should be small (2–3 ticks), and row 3's "loudly" has to be
+an actual usage-alert row, not a log line nobody reads.
+
+**Consumer rules.** The state line is parsed by a pure, unit-tested function next to
+`_fable_eligible`, and:
+
+1. **The record supplies "how long", never "whether".** A refusal fires only when *this tick's*
+   snapshot also lacks a well-formed window. The durable record can only escalate an
+   already-live absence past the streak threshold; it can never refuse on its own.
+2. **Malformed state reads as row 4** (admit loudly, `::warning::`) — not as dead. This is
+   fail-closed in the direction that matters, and the bound is worth stating explicitly: the
+   exhaustion signal comes from the live snapshot, so a corrupt record can at worst downgrade a
+   would-be drift refusal to the row the policy already chose to admit. It can never admit past an
+   observed-exhausted bucket.
+3. **A corrupt state line must not drop the account from the catalog.** `_account_schema_errors`
+   (`select-and-claim.py:1266`) validates a required-field allow-list and does not reject unknown
+   keys, so an additive line is safe here today — but that also means the consumer is the *only*
+   validator, and rule 2 is therefore not optional.
+
+**Trust caveat, not audited.** This state lives in a public issue body that an out-of-band editor
+can change, so it is operator-influenceable input to an admission gate. Rule 1 is what keeps that
+from being a capacity kill switch — without it, editing one line would refuse an account
+indefinitely. Rule 2 is what keeps it from being a bypass. Neither has been reviewed by anyone but
+this record; treat the pairing as **needing review before Stage B arms**, not as established.
+
+**If no durable state is wanted**, the alternative is honest and available: drop rows 3 and 4 to a
+single "no well-formed window this tick ⇒ admit loudly" row, gate only on observed-and-exhausted,
+and accept that shape drift fails open until someone reads the warnings. That is strictly weaker
+than the table above and strictly safer than getting the state machine wrong; it is a legitimate
+Stage B scope cut, not a failure.
 
 ---
 
@@ -269,10 +393,16 @@ Only if Stage A shows a distinct bucket:
    prerequisite, not an optimisation.
 2. Add `opus5` with its observed window — **in the same change** as the producer emitting that
    window's fields, which is what #720 step 2 is really asking for and is achievable.
-3. Implement §4's three-way fail direction. The never-observed row must admit; make it loud
-   (a `::warning::` and a usage-alert row), and consider bounding it the way `unproven`
-   reachability is bounded — after N consecutive probe failures on an account, that account's
-   opus5 state becomes *observed-dead* and refuses.
+3. Implement §4's fail direction **together with §4.1's durable per-account state** — they are one
+   change, not two. The never-observed row must admit, loudly (a `::warning::` and a usage-alert
+   row); the drifted row refuses only after N consecutive shape failures, counted and reset by
+   §4.1's writer transitions and read under §4.1's three consumer rules. Shipping the gate without
+   the state is what §4.1 rules out: the snapshot alone cannot tell the two rows apart, so the gate
+   silently becomes either the fleet self-latch or a vacuous check.
+4. Extend the front-matter writer for the state line: `LIMIT_KEYS`/`_limits_line`
+   (`account-usage.py:403,415`) gains a sibling, routed through the same `_persist_one` edit-count
+   guard, and `persist_limits` (line 536) gains an injectable clock — it has no `now` today, and
+   `last_ok` is untestable without one. The self-test already injects `run=`, so the idiom exists.
 
 ### On #720's "same change" requirement
 
@@ -286,8 +416,13 @@ consumer reads.
 
 ### On step 4
 
-No change needed — §2.5. The follow-up is to fix the stale `routing.toml:276` comment so the next
-reader does not re-derive a conclusion the code stopped supporting in #116.
+No change needed — §2.5. The follow-up is to fix **both** stale comment sites in one pass —
+`routing.toml:141–142` (the security-label override header, the most exposed route) and
+`routing.toml:276` (`role = "ci"`) — so the next reader does not re-derive a conclusion the code
+stopped supporting in #116. Fixing only one leaves the file still self-contradicting. The two
+`needs:user` mentions at lines 14 and 278 describe the review-lane arm gate and must be left
+alone. While in that comment block, correct the "opus-4.8 as tail fallback" claim at lines 139–140
+against the actual `model_chain = ["opus5"]` at line 188.
 
 ---
 
@@ -300,6 +435,25 @@ reader does not re-derive a conclusion the code stopped supporting in #116.
 | healthy whole-account headroom + exhausted opus5 bucket ⇒ **refused** | `usage_eligible`, `select-and-claim.py:551` | delete the premium arm |
 | no opus5 bucket data at all ⇒ **behaves as today** | same, never-observed row of §4 | flip never-observed to refuse (this is the outage test — it must be a *named* test asserting admission) |
 | a cliff produces a **capacity park, never `needs:user`** | `escalate_persist_decision` + the `_park_source_issue` write at `dispatch-claim.py:8729` | swap `MACHINE_PARK_LABEL` (`park_policy.py:112`) for `HUMAN_PARK_LABEL` (line 119) |
+
+§4.1 adds a state machine, and every transition in it needs its own red. These are the obligations
+that make it non-vacuous — each row names the mutant that must fail:
+
+| transition / rule | seam | mutant it must catch |
+|---|---|---|
+| well-formed window ⇒ `last_ok = now`, `fail_streak = 0` | state writer in `persist_limits` | delete the reset — `fail_streak` becomes monotonic and every account eventually refuses |
+| response with absent/unparseable window ⇒ `fail_streak += 1`, `last_ok` untouched | same | also advance `last_ok`, which makes the TTL never expire |
+| transport failure / unprobed ⇒ **no write** | the `hdr is None` vs shape-invalid split (`account-usage.py:112`) | count transport failures too — one broken runner kills the fleet in N ticks |
+| `fail_streak < N` + absent window ⇒ **admit** | the pure state reader beside `_fable_eligible` | flip to refuse — this is §4's fleet-stop mutant and needs a *named* test asserting admission |
+| `fail_streak ≥ N` + absent window ⇒ **refuse** | same | never refuse — the gate is vacuous and #720 is unfixed |
+| `fail_streak ≥ N` **but this tick's window is well-formed** ⇒ headroom decides, record ignored | same (consumer rule 1) | let the record refuse alone — an issue-body edit becomes a capacity kill switch |
+| `last_ok` older than TTL ⇒ reads as never-observed (**admit**) | same | treat stale as dead — a probe outage latches the fleet with no recovery |
+| malformed/garbage state line ⇒ never-observed + `::warning::`, account **stays in the catalog** | consumer rules 2–3 | raise or refuse — corrupt state removes capacity instead of degrading |
+
+Loudness rows assert over emitted workflow commands via `workflow_commands`
+(`account-usage.py:741`), against named message constants in the discipline already set at lines
+405–413 — a message and its assertion written as two separate literals drift apart in the
+permissive direction exactly once and then stay there.
 
 On the YAML seam: this repo already has the right idiom and it is not substring counting.
 `account-usage.py`'s self-test extracts step bodies **by `id:`** via
@@ -319,19 +473,24 @@ and an extraction-based assertion, per Stage A item 4.
   that its failure mode is bounded by the #116 park ladder, and that the proposed replacement has a
   worse unbounded failure mode if adopted without observation first. The trust properties of the
   admission path as a whole have not been audited here.
+- It does not claim §4.1's state machine is sound. It is specified so that the fail direction is
+  decidable rather than left to an implementer, and its trust caveat (durable state living in an
+  operator-editable public issue body) is named but unreviewed. It needs review before Stage B arms.
 - No performance or cost numbers are asserted; §5 row 4 is a measurement to take, not one taken.
 
 ## References
 
 - `scripts/select-and-claim.py` — 427–436 (`PREMIUM_MODELS`), 488–497 (`_fable_eligible`),
-  499–553 (`usage_eligible`), 519–535 (the `unproven` self-latch argument), 604, 627–653, 683
+  499–553 (`usage_eligible`), 519–535 (the `unproven` self-latch argument), 604, 627–653, 683,
+  1266–1324 (`_account_schema_errors` / `account_record_schema_errors`), 1375, 1459
 - `scripts/account-usage.py` — 18–27 (`7d_oi` empirical note), 49–57, 80–96, 99–110, 112–125,
-  159–178, 180–189, 301–341, 403, 1597–1625
+  159–178, 180–189, 301–341, 403–421 (`LIMIT_KEYS`, the named diagnostics, `_limits_line`),
+  455–482 (`_issue_view`), 484–534 (`_persist_one`), 536–604 (`persist_limits`), 741, 1597–1625
 - `scripts/dispatch-claim.py` — 7807–7830, 8008–8055, 8690–8790
 - `scripts/deprecated_models.py` — `DEPRECATED_ALIASES`, `assert_no_deprecated`
 - `scripts/park_policy.py` — 1–60, `MACHINE_PARK_LABEL`, `capacity_park_readmitted`
-- `orchestration/routing.toml` — 132–134, 183–191, 239–251, 260–263, 276, 282–285, 291–295,
-  300–303, 310–320
+- `orchestration/routing.toml` — 14, 132–134, 139–144, 183–191, 239–251, 260–263, 276, 278,
+  282–285, 291–295, 300–303, 310–320
 - `.github/workflows/dispatch.yml` — 1765, 1889–1926, 2187
 - Prior records: registry #116 (starvation ladder), #639 (exemption ≠ reachability), #703
   (park classes), #715 / sparq#4211 (the deprecation)
