@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1657,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e6bf3158b2bae7ee7bee822ddf95a43c313667da",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new text says to read `<dir>/<module>.cover`. When --coverdir is given, trace uses `_fullmodname(filename)` (trace.py:262, joined at trace.py:271), which strips the longest matching sys.path prefix and replaces separators with dots. For the flat `scripts/*.py` modules in this repo that yields the bare name (trace sets `sys.path[0] = os.path.dirname(progname)` at trace.py:717), so the instruction is correct as used here. It stops being correct for a module reached as part of a package: `pkg/foo.py` is written as `<dir>/pkg.foo.cover`, and an agent following the rule literally would look for `foo.cover`, find nothing, and \u2014 exactly against the intent of this paragraph \u2014 may conclude 'no uncovered lines'.",
+    "file": "AGENTS.md",
+    "fix_hint": "Optionally note that with -C the filename is the module's full dotted name (`<dir>/<pkg>.<module>.cover`), and that a missing cover file must be treated as an instrument failure, never as zero uncovered lines.",
+    "severity": "nit",
+    "title": "With -C <dir>, the cover filename is the DOTTED full module name, so '<dir>/<module>.cover' holds only for top-level modules"
+   },
+   {
+    "body": "The diff establishes that a count-only report cannot show never-executed lines. Two existing comments still record measurements made that way \u2014 `scripts/dashboard-gen.py:2944` ('Measured with `python3 -m trace --count` before this change: BOTH refusal lines...') and the aside at `scripts/triage.py:2742`. Those files are outside this diff so this cannot be a blocker, and the claims may still be true (a nonzero count is evidence even without --missing), but they read as endorsements of the instrument this rule now calls unable-to-fail \u2014 the #958 duplication shape applied to prose. Same for the neighbouring canonical copy in sparq-org/sparq's AGENTS.md, which this file's own preamble requires be mirrored in the same wave and which I cannot see from this checkout.",
+    "file": "AGENTS.md",
+    "fix_hint": "Either re-measure those two call sites with `--count --missing` and update the comment wording, or state in the PR body that the sparq-org/sparq canonical copy is mirrored in this wave (or why not), per the preamble at AGENTS.md:24-30.",
+    "severity": "nit",
+    "title": "In-repo comments still cite bare `trace --count` as a coverage measurement the new rule declares vacuous"
+   }
+  ],
+  "progress": null,
+  "summary": "Docs-only change to AGENTS.md item 1 (line-coverage pre-flight). No script, workflow, policy or orchestration file is touched, so no trust check, self-test, route, label set or arm-side classifier is weakened, and no default-allow path is opened. I verified every technical claim against the stdlib source at /usr/lib/python3.11/trace.py rather than from memory: (a) '--count alone never writes a >>>>>> marker' is exactly right \u2014 write_results() only computes lnotab via _find_executable_linenos() when show_missing is true (trace.py:266-269) and write_results_file() emits '>>>>>> ' solely for 'lineno in lnotab' (trace.py:317-320), so a count-only report physically cannot contain the marker and grepping it returns a vacuous zero; the CLI wires -m/--missing straight into that parameter (trace.py:635-637, 737). (b) '-C <dir> also writes a cover file for every module touched, including stdlib modules' is right \u2014 --ignore-dir defaults to [] (trace.py:651) and is the only ignore source (trace.py:699), so stdlib .cover files land in the same coverdir; the 'never glob and take the first result' warning is therefore load-bearing, not decorative. (c) The stale-cover-file warning is right \u2014 write_results() runs after the traced program's try/except in main() (trace.py:734-737), so a self-test that dies during REPO_ROOT/__file__ path discovery still leaves a cover file measuring nothing. (d) The added instrument-validation step (append a never-called function, rerun the exact command, confirm >>>>>> on its executable line) is a real falsifiable check and is the correct fix for the failure mode the paragraph already cites (#756/#956 instruments that could not emit a negative). The change makes previously vacuous guidance non-vacuous and adds no new claim I could not confirm. Two non-blocking nits below; neither affects correctness of the rule as written.",
+  "verdict": "approve"
+ }
+}
