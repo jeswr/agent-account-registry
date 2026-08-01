@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1522,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "aac1edb105087f0efac3c44df9eaf8b3df1ffa74",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 placement gap is closed. The scanner now recognizes `skip-token-revoke: true` only as a direct child of the mint step's own `with:` mapping, resets that state at step and job boundaries, and preserves exact gate-job selection. The added non-crashing fixtures independently exercise false, absent, sibling-`env:` relocation, deeper block-scalar text, exact job matching, and the existence/scope controls. The live review-fix assertion covers both run-job mints, while clean jobs remain deliberately excluded. I found no remaining correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
