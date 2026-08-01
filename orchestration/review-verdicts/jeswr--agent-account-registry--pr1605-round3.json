@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1605,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "63830c1faa927b79ff9fb3850a08eff71c4887b1",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_taint_block()` unions the taint states of an unknown `if`, then `_record_printed_keys()` credits a print after the join when any branch taints the name. A resolver can therefore load policy into `enabled`, assign `repos = enabled` on one runtime branch, assign `repos = [\"some-owner/some-name\"]` on the other, and print after the join; the report still returns `[\"repos\"]`. Applied to the live resolver, changing the scheduled `else` arm to a copied list while leaving the manual arm policy-derived preserves the marquee check even though every scheduled recovery run now sweeps the copied set. The added positive branch test expressly locks in this existential behavior but does not prove that the hardcoded branch is policy-validated; the analyzer does not analyze that validation. Thus the round-2 dataflow finding remains at the same severity.",
+    "file": "scripts/backfill-provenance.py",
+    "fix_hint": "Prove the output reaching `print` is policy-authorized on every executable path, distinguishing direct value derivation from a manual input that is actually guarded by membership in the policy-derived enabled set. At minimum add a named non-crashing mutant of the shipped resolver that hardcodes the scheduled `else` arm while retaining a policy-derived manual arm; it must make `resolve_policy_derived_outputs` empty without changing the self-test row count. Do not use a plain union join as proof of the output key as a whole.",
+    "severity": "major",
+    "title": "Union joins bless a hardcoded scheduled-path output"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe ordered strong-update analysis fixes the two concrete round-2 examples (overwrite after a policy read and an unreachable literal-false seed), but the policy-source proof remains path-insensitive at runtime branches. Because joins use union, one policy-derived branch blesses a hardcoded value published on the other branch. In this workflow the scheduled path is the marquee recovery path, so it can still be severed from policy while the shipped assertion and all new mutants stay green. The prior major finding therefore remains materially unresolved.",
+  "verdict": "request_changes"
+ }
+}
