@@ -31,16 +31,6 @@
    "expires_at": 1785565273
   },
   {
-   "account": "51bde6688e140866",
-   "claim_id": "d0693b6fc35d4366a928aca30acf9345",
-   "holder": "jeswr/agent-account-registry#670@30684282388.1",
-   "package": "docs",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785559032,
-   "expires_at": 1785561732
-  },
-  {
    "account": "9e13ea21abf27e68",
    "claim_id": "94bb1a5eb5cb44d0baec4a849f2dc95b",
    "holder": "jeswr/agent-account-registry#1180@30684581960.1",
