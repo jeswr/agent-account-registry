@@ -2,6 +2,7 @@
 """Build the privacy-preserving static account-fleet dashboard payload."""
 
 import argparse
+import contextlib
 import copy
 import datetime as dt
 import hashlib
@@ -1612,6 +1613,21 @@ def _obs_lease_aggregate(value):
     return {"mean": round(mean, 2), "max": round(maximum, 2)}
 
 
+def _obs_drop_queue(detail):
+    """[#982] Announce a dropped observability queue input instead of swallowing it.
+
+    `_obs_trigger_rows` already sets this precedent on the same collector document. It matters
+    more here: a dropped queue row leaves `flow.queue` EMPTY, and an empty queue panel is exactly
+    what an IDLE queue renders as. So a producer/consumer shape mismatch — a collector handing
+    over the natural `queue_stats()` shape, whose classes are Python INTEGERS — published a green
+    build, a green self-test and a panel reading `no backlog`, with the loss visible nowhere.
+
+    Only the SHAPE is named: a type name, a field name, and for a class string the `_obs_text`
+    sanitized form. No collector value reaches the build log raw, so a malformed snapshot cannot
+    inject lines into the log it is being diagnosed in."""
+    print(f"dashboard-gen: dropped observability queue input ({detail})")
+
+
 def _obs_flow(flow):
     """Queue depth/age per class, fleet-wide lease utilization, review rounds, park rates,
     arm→merge latency, target-CI congestion. A lease row whose label is not the canonical 16-hex
@@ -1623,13 +1639,31 @@ def _obs_flow(flow):
     if not isinstance(flow, dict):
         return None
     queue = []
-    for item in flow.get("queue") if isinstance(flow.get("queue"), list) else []:
+    # [#982] Drop-the-row tolerance is unchanged — a malformed queue row never fails the build —
+    # but every drop is now ANNOUNCED, one reason at a time, so a shape mismatch is legible
+    # instead of arriving as an empty panel. The container check is part of it: `queue_stats()`
+    # keyed by the integer classes is a dict, which loses every row before the loop even starts.
+    raw_queue = flow.get("queue")
+    if "queue" in flow and not isinstance(raw_queue, list):
+        _obs_drop_queue(
+            f"`flow.queue` (type {type(raw_queue).__name__}) is not a list of rows")
+    for item in raw_queue if isinstance(raw_queue, list) else []:
         if not isinstance(item, dict):
+            _obs_drop_queue(f"the row (type {type(item).__name__}) is not an object")
             continue
         queue_class = item.get("class")
+        if not isinstance(queue_class, str):
+            _obs_drop_queue(f"row `class` (type {type(queue_class).__name__}) is not a class "
+                            "STRING such as '1'/'2a'/'4'")
+            continue
+        if OBS_QUEUE_CLASS_RE.fullmatch(queue_class) is None:
+            _obs_drop_queue(
+                f"row `class` {_obs_text(queue_class, 16)!r} is not one of the queue classes")
+            continue
         depth = _obs_count(item.get("depth"))
-        if (not isinstance(queue_class, str)
-                or OBS_QUEUE_CLASS_RE.fullmatch(queue_class) is None or depth is None):
+        if depth is None:
+            _obs_drop_queue(f"row `depth` (type {type(item.get('depth')).__name__}) is not a "
+                            "non-negative integer")
             continue
         queue.append({"class": queue_class, "depth": depth,
                       "oldest_age_minutes": _obs_minutes(item.get("oldest_age_minutes"))})
@@ -4513,6 +4547,91 @@ const degraded = (node) =>
           obs_normalized(obs_fixture), obs_expected)
     check("absent observability snapshot stays hidden (None)",
           _normalize_observability(None), None)
+    # ---- [#982] A DROPPED QUEUE ROW MUST BE ANNOUNCED. `flow.queue: []` renders identically to
+    # an idle queue, so the pre-#982 silent `continue` turned a producer/consumer shape mismatch
+    # into a green build, a green self-test and a panel reading `no backlog` — the loss visible
+    # nowhere. The tolerance is deliberately unchanged (drop the row, never fail the build); only
+    # the silence is fixed, and the rows below pin BOTH halves of that.
+    # The expected strings are literals on purpose: reading them back off the module under test
+    # would be the tautology AGENTS.md pre-flight 2(b) names — it cannot fail.
+    _QUEUE_DROP = "dashboard-gen: dropped observability queue input ({})"
+
+    def obs_queue(rows):
+        """(published `flow.queue`, the queue-drop warnings this build printed)."""
+        fixture = copy.deepcopy(obs_fixture)
+        fixture["flow"]["queue"] = rows
+        stream = io.StringIO()
+        try:                       # same crash-after-partial-run guard as ObsRefusal above
+            with contextlib.redirect_stdout(stream):
+                document = _normalize_observability(fixture)
+        except DashboardError as error:
+            document = ObsRefusal(refused=str(error))
+        return (document["flow"]["queue"],
+                [line for line in stream.getvalue().splitlines()
+                 if line.startswith("dashboard-gen: dropped observability queue")])
+
+    # THE REGRESSION, in the exact shape #636 found: `queue_stats()`'s classes are Python ints.
+    # Every row is dropped and the panel reads `no backlog`; pre-#982 nothing said so.
+    check("[#982] INTEGER queue classes publish an empty queue — and now name themselves once per "
+          "dropped row instead of rendering as `no backlog` on a green build",
+          obs_queue([{"class": 1, "depth": 4}, {"class": 2, "depth": 0}]),
+          ([], [_QUEUE_DROP.format(
+              "row `class` (type int) is not a class STRING such as '1'/'2a'/'4'")] * 2))
+    # ...and the whole snapshot still normalizes: this is a drop diagnostic, NOT a new fatality.
+    # Turning the drop into a raise (or into a `flow: None`) turns this row red.
+    dropped_all = copy.deepcopy(obs_fixture)
+    dropped_all["flow"]["queue"] = [{"class": 1, "depth": 4}]
+    with contextlib.redirect_stdout(io.StringIO()):
+        tolerated = obs_normalized(dropped_all)["flow"]
+    check("[#982] a queue nothing in it parses is still TOLERATED — the rest of the flow panel is "
+          "published unchanged and the build stays green",
+          (tolerated["queue"], tolerated["parks_1h"], tolerated["lease_utilization_1h"]),
+          ([], {"needs_user": 2, "needs_orchestrator": 1}, {"mean": 0.6, "max": 0.8}))
+    # The accept path must stay SILENT, or the warning marks nothing: an unconditional print, or
+    # one hoisted above the guards, publishes the same rows and turns this row red.
+    check("[#982] a queue whose rows all parse prints NOTHING (the warning marks a real drop, so "
+          "it can never fire on the accept path)",
+          obs_queue([{"class": "2a", "depth": 1}, {"class": "4", "depth": 9}]),
+          ([{"class": "2a", "depth": 1, "oldest_age_minutes": None},
+            {"class": "4", "depth": 9, "oldest_age_minutes": None}], []))
+    # One warning per drop REASON, each naming the field that failed — a single shared message
+    # would leave a `depth` mismatch reading as a `class` mismatch. The non-object row is the
+    # branch a `--self-test` line-coverage run showed had never executed at all (pre-flight 1).
+    for case, rows, detail in (
+        ("a whole non-list queue container (`queue_stats()` handed over verbatim)",
+         {1: {"depth": 4}, 2: {"depth": 0}},
+         "`flow.queue` (type dict) is not a list of rows"),
+        ("an explicit null queue", None, "`flow.queue` (type NoneType) is not a list of rows"),
+        ("a non-object row", [["2a", 4]], "the row (type list) is not an object"),
+        # The three ABSENT-field cases are here because their siblings above do not cover them:
+        # a guard made inert for exactly the null/missing input (`item is None or …`) survived a
+        # suite that only ever sent a WRONGLY-TYPED value. That is pre-flight item 3's #938 shape,
+        # and null is the likeliest thing a JSON producer actually emits.
+        ("a null row", [None], "the row (type NoneType) is not an object"),
+        ("a missing class", [{"depth": 4}],
+         "row `class` (type NoneType) is not a class STRING such as '1'/'2a'/'4'"),
+        ("an unknown class string", [{"class": "9z", "depth": 1}],
+         "row `class` '9z' is not one of the queue classes"),
+        ("a non-integer depth", [{"class": "2a", "depth": "4"}],
+         "row `depth` (type str) is not a non-negative integer"),
+        ("a negative depth", [{"class": "2a", "depth": -1}],
+         "row `depth` (type int) is not a non-negative integer"),
+        ("a missing depth", [{"class": "2a"}],
+         "row `depth` (type NoneType) is not a non-negative integer"),
+    ):
+        check(f"[#982] {case} is dropped LOUDLY, by the field that failed",
+              obs_queue(rows), ([], [_QUEUE_DROP.format(detail)]))
+    # ...and the ONE collector value any of these messages quotes is sanitized and BOUNDED on the
+    # way out. Echo `queue_class` raw instead of `_obs_text(queue_class, 16)` and a hostile or
+    # merely enormous class writes itself into the build log that is diagnosing it.
+    for case, queue_class, quoted in (
+        ("non-printable", "2a\ndashboard-gen: dropped observability queue input (forged)", "''"),
+        ("4000 characters long", "9" * 4000, "'9999999999999999'"),
+    ):
+        check(f"[#982] a {case} class is not echoed into the build log that diagnoses it",
+              obs_queue([{"class": queue_class, "depth": 1}]),
+              ([], [_QUEUE_DROP.format(
+                  f"row `class` {quoted} is not one of the queue classes")]))
     overflow = copy.deepcopy(obs_fixture)
     overflow["flow"]["review_rounds"]["mean"] = 1e309       # JSON 1e309 decodes to +Infinity
     overflow["thresholds"]["workflow_failure_rate"] = 1e309
