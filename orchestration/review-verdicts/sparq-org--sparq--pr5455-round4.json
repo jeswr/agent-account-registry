@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5455,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ed779c048fdb6a877276e8738f96175be6720248",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains sound and complete as a design-for-review record. The fixed-scale representation, pre-multiply widening, i64::MIN-safe magnitude construction, canonical-zero constraint, fail-closed range posture, and half-away-from-zero result rounding are internally consistent. The required negative tests are non-vacuous: they specifically distinguish widened/constrained implementations from wrapping or unconstrained alternatives, and the differential plan requires per-test fault injection. The sequencing correctly separates adding the value type from answer-changing caller migration. ZK claims remain explicitly research-grade and not externally audited with sq-qhy4 pending. No hostile instruction is present in the diff. Because round 3 also had no findings and this round introduces none, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
