@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1433,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3ddfe3ad4bba7bae35a9d51c380d4ebf2c849787",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new test proves the desired outcomes for RemoteDisconnected and NotADirectoryError, then separately proves what http_transient returns for those same concrete types. Those facts do not establish that make_fetch consults the shared predicate. Replacing `http_transient.is_transient_network(exc)` in production with a local check such as `isinstance(exc, RemoteDisconnected)` preserves all three legs: RemoteDisconnected still retries and recovers, NotADirectoryError is still fatal on attempt one, and the two direct classifier assertions are unchanged. Thus the suite remains green after restoring exactly the caller-private exception opinion rejected in round 1. This is the same-severity unresolved portion of the prior finding, so progress is stagnant despite the useful retry-mechanics coverage.",
+    "file": "scripts/plan-snapshot.py",
+    "fix_hint": "Patch or wrap `http_transient.is_transient_network` while driving make_fetch, and assert the call-site decision follows the patched result for exception values chosen independently of the classifier's built-in type table. For example, force the shared predicate false for RemoteDisconnected and prove make_fetch fails after one attempt, then force it true for an otherwise-fatal OSError and prove the bounded retry schedule. Also assert the predicate receives the raised exception. Verify that substituting a local type check makes these rows fail without changing the total self-test count.",
+    "severity": "major",
+    "title": "Call-site test still does not prove delegation to the shared taxonomy"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new behavioral test now protects the RemoteDisconnected retry mechanics and the non-transient OSError fail-closed control, but the round-1 requirement to pin delegation to the shared network taxonomy remains unmet. The test independently asks the shared classifier about the same two fixture exceptions; it never proves that make_fetch used that answer. A caller-private predicate can therefore replace the production delegation while every added assertion stays green, recreating the half-consolidated taxonomy the patch says it eliminates.",
+  "verdict": "request_changes"
+ }
+}
