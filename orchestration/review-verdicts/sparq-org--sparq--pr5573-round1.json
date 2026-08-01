@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5573,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "78cc92b28b17f8095a61652fbff1525a7deff2b6",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`LABEL_WRITE_PATTERNS` recognizes a `/labels` API call only when it contains an explicit `-X/--method POST|PUT|PATCH|DELETE`. GitHub CLI's `gh api` automatically switches from GET to POST when fields are supplied, so a label write such as `gh api repos/$R/issues/$N/labels -f 'labels[]=needs:user'` is mutating but is not classified as a label-writing step. A foreign PAT in that step therefore escapes R1 entirely, contradicting the advertised invariant that every label-writing step carries bot identity. The positive fixtures cover `gh pr edit`, script indirection, and output laundering, but not either explicit-method or implicit-method REST writes.",
+    "file": "scripts/check-label-write-token.py",
+    "fix_hint": "Detect mutating `gh api` label endpoints when request fields/input imply the CLI's default POST (including `-f`, `-F`, `--raw-field`, `--field`, and `--input` as applicable), while continuing to exclude genuine GET requests. Add positive self-test fixtures for both explicit-method and implicit-default-POST `/labels` writes, plus a negative GET fixture, so this branch cannot pass vacuously.",
+    "severity": "major",
+    "title": "Default-POST `gh api` label writes bypass the identity guard"
+   }
+  ],
+  "progress": null,
+  "summary": "The guard and its supplied self-test pass, but the label-write classifier does not cover a standard mutating `gh api` form. Because the workflow claims to enforce bot identity on every label-writing step, this false negative leaves the central security invariant bypassable and is not exercised by the fixtures.",
+  "verdict": "request_changes"
+ }
+}
