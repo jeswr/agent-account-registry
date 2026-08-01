@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1522,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "aac1edb105087f0efac3c44df9eaf8b3df1ffa74",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe gate-running `run` job's two token mints now explicitly disable the action's post-job revoker, while the clean publish/outcome jobs retain normal revocation. The scanner selects the job by exact key, resets at job and step boundaries, and accepts the setting only as a direct child of the mint step's `with:` mapping. Its live assertion and independent false, absent, misplaced, depth, exact-job, existence, and scope controls make the check non-vacuous. I found no remaining correctness, soundness, test-validity, or security issue. With round 3 also reporting no findings, progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
