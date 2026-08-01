@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5447,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "87d540ef02be7b015f1a24545fb1a32951f9b4db",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The widened candidate fetch is correctly implemented with exhaustive REST pagination, explicit pull-request exclusion, fail-closed snapshot sizing, and filtering for the absence of any area label. Apply behavior remains safe because park removal is derived per issue and is coupled to adding at least one validated area label. The added tests exercise the real fetch and main/apply paths, cover never-parked reach, truncation, settled-issue and PR exclusion, the ceiling, per-issue unpark behavior, and the empty-write guard. No correctness, soundness, security, or vacuity issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
