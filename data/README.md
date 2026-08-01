@@ -153,8 +153,11 @@ attributed to that target above. A row whose run id is empty or belongs to anoth
 to NOBODY. The count is ONE VOTE PER RUN: the ledger retains every separately executed attempt of a
 full re-run (`123.1` and `123.2` are two real outcomes there), while the Actions list contributes
 one run object per run id, so the attempts fold — numerator and denominator stay over one
-population and the rate can never exceed 1. A folded run reports its LATEST attempt's reason and
-issue. An unreadable health ledger publishes `null` across the four fields — never a reassuring 0.
+population and the rate can never exceed 1. The fold spans EVERY exit class, so a run is counted as
+no-change only when its LATEST executed attempt was one: a re-run that finally succeeded is not
+wasted work, while a re-run that finally produced no diff is — and the counted run reports THAT
+attempt's reason and issue. An unreadable health ledger publishes `null` across the four fields —
+never a reassuring 0.
 
 The current snapshot is also CAS-written to `data/metrics.json` on the `ledger` branch (same
 per-target shape plus a top-level `alerts: [...]`). The sole Pages owner, `dashboard.yml`, copies it

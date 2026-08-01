@@ -191,6 +191,18 @@ def no_change_census(records, run_ids):
     attempt cannot rank; they are never summed across attempts, which would re-inflate the
     repeat-offender list with a loop no issue actually took.
 
+    THE FOLD SPANS EVERY EXIT CLASS, and the `no_change` test is applied to its WINNER — not the
+    other way round (review round 2 of PR #1584). worker.yml's health job records exactly ONE row
+    per executed attempt, carrying THAT attempt's class, so `117.1 = no_change` then `117.2 =
+    success` is one run whose final outcome produced a diff. Filtering to `no_change` BEFORE the
+    fold discards attempt 2 and lets the superseded attempt 1 keep voting — the run is still
+    published as wasted, and that phantom can hold `worker-no-change` firing over a re-run that
+    actually fixed it. Selecting first and testing after also makes the reverse case honest:
+    `success` then `no_change` counts, because the run's last word was no diff. A row with no
+    usable exit class joins no fold at all rather than superseding a real outcome (the reader
+    already refuses any class outside model-health's DECISION_CLASSES, so this only guards a
+    hand-shaped row from silently CANCELLING a no-change vote).
+
     The reason breakdown always carries EVERY reason in the vocabulary, including the zeroes — a
     census that omits its empty rows reads as "not measured" exactly when an operator needs "0"
     (AGENTS pre-flight item 8). Repeat offenders are the issues with >= 2 no-change RUNS in the
@@ -201,7 +213,10 @@ def no_change_census(records, run_ids):
     wanted = {rid for rid in (run_ids or ()) if isinstance(rid, str) and rid}
     latest = {}   # base run id -> (attempt ordering key, that attempt's record)
     for position, record in enumerate(records or ()):
-        if not isinstance(record, dict) or record.get("exit_class") != "no_change":
+        if not isinstance(record, dict):
+            continue
+        exit_class = record.get("exit_class")
+        if not isinstance(exit_class, str) or not exit_class:
             continue
         run_id = record.get("run_id")
         if not isinstance(run_id, str):
@@ -215,7 +230,11 @@ def no_change_census(records, run_ids):
         key = (int(attempt) if attempt.isdigit() else -1, position)
         if base not in latest or key > latest[base][0]:
             latest[base] = (key, record)
-    for _key, record in latest.values():
+    # The no-change test lands on the fold's WINNER: only a run whose LATEST executed attempt was a
+    # no_change is a run that left the tree unchanged.
+    wasted = [record for _key, record in latest.values()
+              if record.get("exit_class") == "no_change"]
+    for record in wasted:
         # The absent -> `unspecified` fold is no_change_routing's, called on the single row so the
         # breakdown can never drift from the routing decision the same field drives (#701).
         for reason in no_change_routing.declared_reasons([record]):
@@ -230,7 +249,7 @@ def no_change_census(records, run_ids):
     repeats = sorted(((issue, n) for issue, n in per_issue.items() if n > 1),
                      key=lambda pair: (-pair[1], pair[0]))
     return {
-        "worker_no_change_1h": len(latest),
+        "worker_no_change_1h": len(wasted),
         "worker_no_change_by_reason_1h": by_reason,
         "worker_no_change_repeat_issues_1h": [{"issue": issue, "count": n} for issue, n in repeats],
     }
@@ -1737,6 +1756,37 @@ def _test_no_change_census(chk):
         no_change_census([_health_row("117.2", issue=808, why="already_done"),
                           _health_row("117.1", issue=808, why="underspecified")],
                          {"117"})["worker_no_change_by_reason_1h"]["already_done"], 1)
+    # THE TRANSITION, BOTH DIRECTIONS (review round 2 of #1584). A re-run's attempts do not all
+    # share one exit class, and the fold must span EVERY class so the LATEST outcome — not the
+    # latest no_change — decides. Filtering to `no_change` before the fold keeps a superseded
+    # attempt 1 voting while the success that fixed it is dropped: the run reads as wasted forever
+    # and can hold `worker-no-change` firing on its own. Both fixtures put the LOW attempt LAST in
+    # ledger order, so neither can pass by reading the ledger's final row.
+    fixed = no_change_census([_health_row("118.2", exit_class="success"),
+                              _health_row("118.1", issue=808, why="underspecified")], {"118"})
+    chk("a SUCCESSFUL re-run supersedes the earlier no-change attempt — that run is not wasted",
+        fixed["worker_no_change_1h"], 0)
+    chk("...so it casts no reason vote and names no repeat offender either",
+        (fixed["worker_no_change_by_reason_1h"]["underspecified"],
+         fixed["worker_no_change_repeat_issues_1h"]), (0, []))
+    # DIRECTION 2: the reverse transition must still COUNT, so the fix is not just "drop any run
+    # that ever succeeded" — a re-run that ends with no diff is exactly the waste this measures.
+    regressed = no_change_census([_health_row("119.2", issue=808, why="already_done"),
+                                  _health_row("119.1", exit_class="success")], {"119"})
+    chk("...but a run whose LAST attempt produced no diff still counts, earlier success or not",
+        (regressed["worker_no_change_1h"],
+         regressed["worker_no_change_by_reason_1h"]["already_done"]), (1, 1))
+    # Hand-shaped for the same reason as the non-string run_id above: a row with NO usable exit
+    # class is outside make_record's grammar (and the reader refuses one), so only a raw dict can
+    # reach the entry guards. Now that the fold spans every class, an unusable row that skipped
+    # them would win run 120 on its higher attempt and CANCEL a real no-change vote — the silent
+    # direction, where the gate under-counts waste. Neither guard has any other fixture.
+    chk("a row with no usable exit class (or no dict at all) supersedes NOTHING",
+        no_change_census(["not a record at all",
+                          {"run_id": "120.2", "issue": 808},
+                          {"exit_class": "", "run_id": "120.3", "issue": 808},
+                          _health_row("120.1", issue=808, why="other")],
+                         {"120"})["worker_no_change_1h"], 1)
     rerun_rate = compute_target_metrics({**SPARQ_LIVE, "worker_attempts_1h": 1,
                                          "worker_success_1h": 1, **rerun})
     chk("...so the rate holds the documented no_change <= attempts invariant: 1.0, never 2.0",
