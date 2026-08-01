@@ -405,6 +405,12 @@ def _self_test():  # noqa: C901 — a flat sequence of assertions
             ("a non-boolean value", SPARQ_SHAPED.replace(
                 SECURITY_ROLE_DIRECTED[0],
                 'agent = "sparq-reviewer"\nagent_from_role = "true"\nescalate = true', 1)),
+            # An explicit `false` resolves IDENTICALLY to the undeclared table on both sides, so no
+            # agreement row can ever see it: only a both-sides REFUSAL makes the typo visible.
+            ("an explicit FALSE (an inert declaration no agreement row could catch)",
+             SPARQ_SHAPED.replace(
+                 SECURITY_ROLE_DIRECTED[0],
+                 'agent = "sparq-reviewer"\nagent_from_role = false\nescalate = true', 1)),
             ("a ROLE route", SPARQ_SHAPED.replace(
                 'role = "impl"\nmodel_chain = ["opus5", "sol"]\nagent = "sparq-rust-impl"',
                 'role = "impl"\nmodel_chain = ["opus5", "sol"]\nagent = "sparq-rust-impl"\n'

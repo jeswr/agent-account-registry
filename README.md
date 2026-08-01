@@ -357,8 +357,10 @@ a rolling `data/cache-affinity.json`), never in the public repos.
   `match_labels` keyword union the arm-side classifier reads are returned exactly as declared, so
   the soundness tier, `escalate_starved` and the human-arm on trust-surface PRs are unchanged. It
   is opt-in **data** implemented by *both* resolvers (a redirect only one side implements is a
-  permanent `route-policy-failed` defer), anything but the boolean `true` fails closed, and it is
-  rejected outright on a role route or in `[defaults]` where it would be inert. Backing it up,
+  permanent `route-policy-failed` defer), anything but the boolean `true` fails closed — including
+  an explicit `agent_from_role = false`, which resolves identically to the absent key and so is the
+  one inert declaration no cross-resolver row could ever surface; **omit** the key to opt out — and
+  it is rejected outright on a role route or in `[defaults]` where it would be inert. Backing it up,
   `worker.yml` passes `policy-resolve.py --require-fix-capable`: that lane always mutates the
   checkout, so a persona the target does not declare `fix_capable = true` fails the resolve job
   closed instead of burning a worker slot on a model told not to edit.

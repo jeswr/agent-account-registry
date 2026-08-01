@@ -114,8 +114,15 @@ def validate_agent_from_role(doc):
                 f"{where} may not set {AGENT_FROM_ROLE_KEY}: it directs a SECURITY override's "
                 "persona at the issue's own role route, so it is meaningful only on a "
                 "match_labels route")
-        if not isinstance(table.get(AGENT_FROM_ROLE_KEY, False), bool):
-            raise ValueError(f"{where} {AGENT_FROM_ROLE_KEY} must be boolean")
+        # PRESENT means OPT-IN, so the only accepted value is the boolean `true`. An explicit
+        # `false` is value-identical to omitting the key — the same inert declaration refused above
+        # on a role row / in [defaults] — and being value-identical, no agreement row could catch
+        # it. Omit the key to get the undeclared behaviour.
+        if AGENT_FROM_ROLE_KEY in table and table[AGENT_FROM_ROLE_KEY] is not True:
+            raise ValueError(
+                f"{where} {AGENT_FROM_ROLE_KEY} must be the boolean true when declared: it is an "
+                "explicit opt-in, so any other value (including false) is an inert declaration — "
+                "omit the key instead")
 
 
 def resolve(labels, doc):
@@ -257,6 +264,10 @@ def _self_test():
     # plans a route CLAIM rejects on every tick.
     for _where, _mutate in (
             ("a non-boolean value", lambda d: d["route"][0].update({AGENT_FROM_ROLE_KEY: "true"})),
+            # an explicit `false` is the one bad value that RESOLVES identically to the absent key,
+            # so only refusing it — on both sides — can surface the typo at all.
+            ("an explicit FALSE (an inert declaration)",
+             lambda d: d["route"][0].update({AGENT_FROM_ROLE_KEY: False})),
             ("a ROLE route", lambda d: d["route"][2].update({AGENT_FROM_ROLE_KEY: True})),
             ("[defaults]", lambda d: d["defaults"].update({AGENT_FROM_ROLE_KEY: True}))):
         _bad = copy.deepcopy(doc)

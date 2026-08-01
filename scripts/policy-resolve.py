@@ -404,10 +404,18 @@ def _agent_from_role_flag(route, where, allowed):
         raise PolicyError(
             f"{where} may not set {AGENT_FROM_ROLE_KEY}: it directs a SECURITY override's persona "
             "at the issue's own role route, so it is meaningful only on a match_labels route")
-    flag = route.get(AGENT_FROM_ROLE_KEY, False)
-    if not isinstance(flag, bool):
-        raise PolicyError(f"{where} {AGENT_FROM_ROLE_KEY} must be boolean")
-    return flag
+    if AGENT_FROM_ROLE_KEY not in route:
+        return False
+    # PRESENT means OPT-IN: the ONLY accepted value is the boolean `true`. An explicit `false` is
+    # value-identical to omitting the key, i.e. exactly the inert declaration this refuses on a role
+    # row or in [defaults] — a maintainer (or a generator) could believe it was pinning the
+    # pre-#1397 persona when it pins nothing. Omit the key to get that behaviour.
+    if route[AGENT_FROM_ROLE_KEY] is not True:
+        raise PolicyError(
+            f"{where} {AGENT_FROM_ROLE_KEY} must be the boolean true when declared: it is an "
+            "explicit opt-in, so any other value (including false) is an inert declaration — "
+            "omit the key instead")
+    return True
 
 
 def _reject_docs_only(chain, where):
@@ -1287,11 +1295,14 @@ notes = "declared, but says nothing about fixing"
               (["worker", "zk"], ["worker", "zk"]))
     # FAIL CLOSED ON A MALFORMED OR MISPLACED DECLARATION. Anything but the boolean `true` is a
     # routing-document defect: silently ignoring it would resolve a persona PLAN did not plan.
-    for bad_value in ("true", 1, [], None):
+    # `False` is in this list on purpose — it is the one bad value that is VALUE-IDENTICAL to the
+    # absent key, so accepting it would be the inert declaration the misplacement guards below
+    # already refuse, and no resolver-agreement row could ever see it.
+    for bad_value in ("true", 1, [], None, False):
         bad_routing = copy.deepcopy(routing)
         bad_routing["route"][1][AGENT_FROM_ROLE_KEY] = bad_value
-        rejects(f"a non-boolean agent_from_role ({bad_value!r}) refuses to resolve",
-                f"{AGENT_FROM_ROLE_KEY} must be boolean",
+        rejects(f"a non-`true` agent_from_role ({bad_value!r}) refuses to resolve",
+                f"{AGENT_FROM_ROLE_KEY} must be the boolean true when declared",
                 lambda doc=bad_routing: resolve("sparq-org/sparq", ["role:impl"], policy, doc))
     # ...and it is meaningful ONLY on a security override. On a role row or in [defaults] there is
     # nothing to direct, so accepting it there would be an inert declaration a maintainer could
