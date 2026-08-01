@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5545,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bbeb3328181cb2edfc0aa970570fcf28b802c567",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The provenance section says the live site and Pages API were not probed and correctly notes that the file tree cannot reveal what Pages is serving. The following section nevertheless states that the site serves at the custom domain, that Pages has `build_type: workflow`, that the owner flip is resolved, and that `pages.yml` is the live publisher. `site/public/CNAME` and a deploy workflow establish intended artifact configuration, not the repository's current Pages settings or successful live cutover. Because this document warns operators against a recovery action based on those assertions, the unsupported status claims are correctness-critical.",
+    "file": "docs/pages-cutover-runbook.md",
+    "fix_hint": "Either query `gh api repos/sparq-org/sparq/pages` (and, if needed, probe the deployed URLs), date and record those results in the provenance, or rewrite the statements as conditional/intended topology: the workflow is configured to publish the custom domain, and operators must confirm `build_type: workflow` plus the live URL before acting. Do not claim `sq-vbq9` is resolved or `pages.yml` is the live publisher solely from repository contents.",
+    "severity": "major",
+    "title": "Unverified live Pages settings are stated as facts"
+   }
+  ],
+  "progress": null,
+  "summary": "The rewrite usefully removes a dangerously stale rollback procedure and its workflow-topology descriptions agree with the checked-in producer. However, it explicitly says the verification did not probe GitHub Pages settings and then presents several live/settings claims as established facts. That contradiction is material in an operational cutover record: repository workflows cannot establish the configured Pages source, successful completion of the owner flip, or the currently served hostname. The document should either verify those claims through the Pages API and record that evidence, or phrase them as intended/configured topology and require an API check before relying on them.",
+  "verdict": "request_changes"
+ }
+}
