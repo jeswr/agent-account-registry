@@ -51,11 +51,6 @@ env:
   # canary runs reaching the model stage confirm it is); CLAIM mints a PER-OWNER token map so the
   # registry-owner disarm/needs-user/deferred-label mutations use the jeswr-scoped token, not the
   # sparq-org one (defects #1,#5 — the single-token mint 404-looped every registry mutation).
-  # ⚠️ THIS LIST MUST EXACTLY EQUAL the ENABLED rows in policy/repos.toml. dispatch-claim
-  # compares them as SETS and raises "PLAN target manifest does not exactly match enabled
-  # registry policy", failing CLAIM closed — i.e. enabling a repo in policy WITHOUT adding it
-  # here is a full dispatch outage, not a degraded sweep. (Regression 2026-08-01: #1535 enabled
-  # jeswr/solid-sdk and CLAIM failed every executed tick until this line caught up.)
   DISPATCH_TARGET_REPOS: '["sparq-org/sparq", "jeswr/agent-account-registry", "jeswr/solid-sdk"]'
 
 jobs:
