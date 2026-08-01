@@ -12183,12 +12183,24 @@ def _self_test():
     _labels285 = ["role:impl", "area:review-loop"]      # the motivating trust-surface issue
     _route285 = _pol285.resolve(_reg285, _labels285, _policy_doc285, _routing285)["agent"]
     _impl285 = _pol285.resolve(_reg285, ["role:impl"], _policy_doc285, _routing285)["agent"]
-    assert _pol285.agent_fix_capable(_routing285, _impl285) and not _pol285.agent_fix_capable(
-            _routing285, _route285), (
-        "fixture: this repo's security override must still route a trust-surface issue to a "
-        "persona its routing declares NOT fix-capable, while the role:impl fallback IS declared "
-        "fix-capable — otherwise the live rows below cover neither direction",
-        _route285, _impl285)
+    # [#1397] THE LIVE REFUSE DIRECTION MOVED, AND SAYING SO IS THE POINT OF THIS FIXTURE. It used
+    # to be this very row: the security override named the verdict-only reviewer, so the persona a
+    # trust-surface issue's ROUTE produced was the one the fix leg had to refuse. That was the
+    # DEFECT one layer up — `worker.yml` resolves its persona from the same route and handed the
+    # same "never a fix" brief to an IMPLEMENTATION run — so the override now declares
+    # `agent_from_role = true` and a trust-surface impl issue routes to the DECLARED implementer.
+    # Row 1 below therefore drives the live ADOPT direction. The live verdict-only persona is now
+    # the one `role = "review"` selects (driven by the review-mode rows below), and the ROUTE-side
+    # refusal is driven SYNTHETICALLY — `auditor-persona`, over the values a route may produce
+    # rather than over a checked-in name, which is what [#285] review r2 established anyway.
+    _review285 = _pol285.resolve(_reg285, ["role:review"], _policy_doc285, _routing285)["agent"]
+    assert (_pol285.agent_fix_capable(_routing285, _impl285) and _route285 == _impl285
+            and not _pol285.agent_fix_capable(_routing285, _review285)), (
+        "fixture: this repo's trust-surface IMPLEMENTATION route must resolve the SAME declared "
+        "fix-capable implementer as the `--role impl` fallback (#1397), while the review role "
+        "still resolves a persona its routing declares NOT fix-capable — otherwise the live rows "
+        "below cover neither direction",
+        _route285, _impl285, _review285)
 
     # THE DECLARATION MUST STAY HONEST, and this is the only place prose is read — as a check ON
     # THE DECLARATION, never as the authorisation itself (production reads the declaration, not
@@ -12290,18 +12302,23 @@ def _self_test():
                         routing={}),
         )
 
-    # THE LIVE RED CASE: the trust-surface route's verdict-only persona is REFUSED for fix mode and
-    # the lane runs the declared-capable implementer instead. The chain is untouched — the refusal
-    # is about the PROMPT, not the model.
+    # THE LIVE ROW: a trust-surface fix lane publishes a DECLARED fix-capable persona and its
+    # route-authorised chain. [#1397] Since the security override became role-directed, this row
+    # reaches that persona by ADOPTING the route (the route now names the implementer) rather than
+    # by refusing it — the refusal path is driven by the synthetic rows and the review-mode rows
+    # below. Either way the invariant asserted is the same one: the persona `worker-live.sh fix`
+    # receives is declared able to mutate a checkout. The chain is untouched by any of it — this is
+    # about the PROMPT, not the model.
     _rf285 = _workflow_route_constraint(
         "fix", FIX_CHAIN["anthropic"], resolver=_pol285, target_repo=_reg285,
         issue_labels=_labels285, policy_agent=_impl285, policy_doc=_policy_doc285,
         routing=_routing285)
     assert _rf285[0] == list(FIX_CHAIN["anthropic"]) and _rf285[1] == "", (
         "the trust-surface fix lane must still resolve its route-authorised chain", _rf285)
-    assert _rf285[2] == _impl285, (
-        "review-fix.yml handed the fix leg the VERDICT-ONLY reviewer persona: `worker-live.sh "
-        "fix` would run a brief that forbids editing the PR at all", _rf285[2], _route285)
+    assert _rf285[2] == _impl285 and _pol285.agent_fix_capable(_routing285, _rf285[2]), (
+        "review-fix.yml handed the fix leg a persona this repo does not declare fix-capable: "
+        "`worker-live.sh fix` would run a brief that forbids editing the PR at all",
+        _rf285[2], _route285, _review285)
     # ...and the full row set. Adoption tracks the DECLARATION and nothing else: a differently
     # named verdict-only persona is refused exactly like the reviewer, an undeclared one is
     # refused, and a fallback persona a capability-enabled target has not DECLARED fix-capable —
@@ -12320,8 +12337,12 @@ def _self_test():
                                       route_agent="registry-impl",
                                       routing=_routing285)[2] == "role-resolved-agent", (
         "review mode must keep the --role review persona")
+    # [#1397] Driven with the persona `role = "review"` actually resolves — the live verdict-only
+    # one, asserted NOT fix-capable by the fixture above. Driving it with the trust-surface ROUTE
+    # persona would now be vacuous: that persona is the declared implementer, which the fix-mode
+    # check would never have refused anyway.
     assert _persona285(mode="review", wanted=REVIEW_CHAIN["anthropic"], routing=_routing285,
-                       policy_agent=_route285) == _route285, (
+                       policy_agent=_review285) == _review285, (
         "the REVIEW lane's own verdict-only persona must not be refused by the fix-mode "
         "capability check — that would take the cross-provider review lane down entirely")
     # FAIL CLOSED, not fall back. A route that names no usable agent empties the fix chain and

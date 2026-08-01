@@ -192,10 +192,21 @@ jobs:
           TARGET_REPO: ${{ inputs.target_repo }}
         run: |
           set -euo pipefail
+          # [#1397] `--require-fix-capable`: THIS LANE ALWAYS MUTATES THE CHECKOUT. The persona
+          # resolved here becomes `WORKER_AGENT` and then
+          # `worker-live.sh --append-system-prompt-file .claude/agents/$WORKER_AGENT.md`, so a
+          # persona the target's routing declares NOT `fix_capable` is a system prompt instructing
+          # the model not to write code — it burns a worker slot, an account lease and an attempt
+          # and reports "model produced no repository changes" with nothing naming the cause. Fail
+          # the resolve job CLOSED instead, on the SAME declaration and the same helper the review
+          # lane's fix leg uses (policy-resolve.agent_fix_refused / review-fix.yml), so "may this
+          # persona mutate a checkout" has one meaning. A target with no `[agents]` table at all
+          # keeps its pre-declaration behaviour and nothing here fires.
           args=(
             --target-repo "$TARGET_REPO"
             --policy-file registry/policy/repos.toml
             --target-root target-routing
+            --require-fix-capable
           )
           while IFS= read -r label; do
             args+=(--label "$label")

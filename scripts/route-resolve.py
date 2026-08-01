@@ -12,6 +12,7 @@ if any listed keyword is a SUBSTRING of any issue label (so `worker` matches `ar
 `dispatch` matches `area:dispatch`, etc.). An `impl` issue that also touches `area:worker` therefore
 routes to Opus (soundness), not Fable, regardless of where the security block sits in the file.
 """
+import copy
 import importlib.util
 from pathlib import Path
 import sys
@@ -83,6 +84,47 @@ class UnknownRoleError(RoleResolutionError):
     """
 
 
+# [#1397] The ROLE-DIRECTED PERSONA flag, mirrored from the CLAIM-side resolver
+# (policy-resolve.AGENT_FROM_ROLE_KEY — read its comment for the why). A `match_labels` override
+# that declares `agent_from_role = true` supplies the model_chain + escalate, while the PERSONA
+# comes from the issue's own `role = "<role>"` row: the security keywords on this repo
+# (worker/dispatch/review-loop/...) match the surfaces most in need of IMPLEMENTATION, and the
+# override named the VERDICT-ONLY reviewer, so every implementation run on a trust-surface issue was
+# handed a brief that forbids editing. The keyword list, the chain and `escalate` are untouched, so
+# the arm-side security classifier and the escalation posture are exactly as before.
+AGENT_FROM_ROLE_KEY = "agent_from_role"
+
+
+def validate_agent_from_role(doc):
+    """FAIL CLOSED on a malformed / misplaced `agent_from_role`, exactly as CLAIM does.
+
+    Validated over EVERY route (and `[defaults]`), not only the matched one, so PLAN and CLAIM
+    refuse the SAME tables: a declaration CLAIM raises on and PLAN silently ignores is a route PLAN
+    plans and CLAIM rejects — a permanent per-item `route-policy-failed` defer, not a lost setting.
+    """
+    tables = [("routing defaults", doc.get("defaults", {}), False)]
+    for index, route in enumerate(doc.get("route", [])):
+        if isinstance(route, dict):
+            tables.append((f"routing route #{index + 1}", route, "match_labels" in route))
+    for where, table, allowed in tables:
+        if not isinstance(table, dict):
+            continue
+        if AGENT_FROM_ROLE_KEY in table and not allowed:
+            raise ValueError(
+                f"{where} may not set {AGENT_FROM_ROLE_KEY}: it directs a SECURITY override's "
+                "persona at the issue's own role route, so it is meaningful only on a "
+                "match_labels route")
+        # PRESENT means OPT-IN, so the only accepted value is the boolean `true`. An explicit
+        # `false` is value-identical to omitting the key — the same inert declaration refused above
+        # on a role row / in [defaults] — and being value-identical, no agreement row could catch
+        # it. Omit the key to get the undeclared behaviour.
+        if AGENT_FROM_ROLE_KEY in table and table[AGENT_FROM_ROLE_KEY] is not True:
+            raise ValueError(
+                f"{where} {AGENT_FROM_ROLE_KEY} must be the boolean true when declared: it is an "
+                "explicit opt-in, so any other value (including false) is an inert declaration — "
+                "omit the key instead")
+
+
 def resolve(labels, doc):
     """Return (model_chain, agent, escalate). `labels`: iterable of the issue's labels.
 
@@ -102,6 +144,7 @@ def resolve(labels, doc):
     # than resolving to a chain CLAIM would reject. ChainPreferenceError is a ValueError, the same
     # fail-closed class dispatch-plan already handles.
     preferences = _PREF.parse_preferences(doc, set(doc.get("models", {})))
+    validate_agent_from_role(doc)   # [#1397] refuse the same tables CLAIM refuses
     labels = set(labels)
     routes = doc.get("route", [])
     # The explicit role routes declared in routing.toml (role blocks, never security blocks); the
@@ -129,7 +172,14 @@ def resolve(labels, doc):
     for r in routes:
         kws = r.get("match_labels")
         if kws and any(k in lb for lb in labels for k in kws):
-            return r["model_chain"], r["agent"], bool(r.get("escalate"))
+            agent = r["agent"]
+            # [#1397] The persona — and ONLY the persona — may be directed at the issue's own role
+            # row. `role` is a declared role route by construction (the unknown-role guard above),
+            # and a ROLELESS issue has no row to direct from, so it keeps the override's own agent.
+            if r.get(AGENT_FROM_ROLE_KEY) is True and role is not None:
+                agent = next(rr["agent"] for rr in routes
+                             if "match_labels" not in rr and rr.get("role") == role)
+            return r["model_chain"], agent, bool(r.get("escalate"))
     # Phase 2 — explicit role route (only role blocks, never a security block).
     if role is not None:
         for r in routes:
@@ -171,12 +221,60 @@ def _self_test():
 
     # impl + a trust surface (area:worker) -> security rule wins over role -> Opus-5-led
     # (opus tail fallback, 2026-07-24), escalate.
+    #
+    # [#1397] ...and since the override DECLARES `agent_from_role = true`, the PERSONA comes from
+    # the `role = "impl"` row: the chain and escalate are the security override's (unchanged), the
+    # brief is the IMPLEMENTER's. Before that declaration this row read `registry-reviewer` — a
+    # verdict-only brief ("never a fix", Read/Glob/Grep, byte-identical tree) handed to an
+    # IMPLEMENTATION run, which is the whole defect.
     mc, ag, esc = resolve(["role:impl", "area:worker"], doc)
-    chk("impl+worker -> opus5-led/escalate", (mc, ag, esc),
-        (["opus5"], "registry-reviewer", True))
+    chk("impl+worker -> opus5-led/escalate, IMPLEMENTER persona", (mc, ag, esc),
+        (["opus5"], "registry-impl", True))
     # dispatch is a trust surface too.
     mc, ag, esc = resolve(["role:impl", "area:dispatch"], doc)
     chk("impl+dispatch -> opus5/escalate", (mc, esc), (["opus5"], True))
+    # [#1397] BOTH DIRECTIONS at the seam, on the LIVE table: an implementation lane on a trust
+    # surface gets a persona whose real brief authorises editing, a review lane still gets the
+    # verdict-only reviewer. The briefs are read, not assumed — this is the file worker-live.sh
+    # loads with --append-system-prompt-file.
+    _briefs = Path(__file__).resolve().parents[1] / ".claude" / "agents"
+    _MUTATES = "edits the current checkout only"
+    for _labels, _want_agent, _want_mutates in (
+            (["role:impl", "area:review-loop"], "registry-impl", True),
+            (["role:impl", "area:groom"], "registry-impl", True),
+            (["role:docs", "area:worker"], "registry-docs", True),
+            (["role:review", "area:review-loop"], "registry-reviewer", False),
+            (["area:review-loop"], "registry-reviewer", False)):   # ROLELESS: no row to direct from
+        _agent = resolve(_labels, doc)[1]
+        _text = (_briefs / f"{_agent}.md").read_text(encoding="utf-8").lower()
+        chk(f"[#1397] {_labels} -> a persona whose REAL brief matches the lane",
+            (_agent, _MUTATES in _text), (_want_agent, _want_mutates))
+    # NON-VACUOUS: strip the declaration and the implementation lane resolves the verdict-only
+    # reviewer again, so the rows above pin the declaration and not merely the table's shape.
+    _stripped = copy.deepcopy(doc)
+    for _row in _stripped["route"]:
+        _row.pop(AGENT_FROM_ROLE_KEY, None)
+    chk("[#1397] RED: without the declaration an IMPLEMENTATION lane is handed the verdict-only "
+        "persona again", resolve(["role:impl", "area:review-loop"], _stripped)[1],
+        "registry-reviewer")
+    chk("[#1397] ...and the declaration changes ONLY the persona (chain + escalate identical)",
+        resolve(["role:impl", "area:review-loop"], _stripped)[0::2],
+        resolve(["role:impl", "area:review-loop"], doc)[0::2])
+    # A malformed / misplaced declaration must REFUSE here exactly as it does at CLAIM, or PLAN
+    # plans a route CLAIM rejects on every tick.
+    for _where, _mutate in (
+            ("a non-boolean value", lambda d: d["route"][0].update({AGENT_FROM_ROLE_KEY: "true"})),
+            # an explicit `false` is the one bad value that RESOLVES identically to the absent key,
+            # so only refusing it — on both sides — can surface the typo at all.
+            ("an explicit FALSE (an inert declaration)",
+             lambda d: d["route"][0].update({AGENT_FROM_ROLE_KEY: False})),
+            ("a ROLE route", lambda d: d["route"][2].update({AGENT_FROM_ROLE_KEY: True})),
+            ("[defaults]", lambda d: d["defaults"].update({AGENT_FROM_ROLE_KEY: True}))):
+        _bad = copy.deepcopy(doc)
+        _mutate(_bad)
+        raises(f"[#1397] agent_from_role on {_where} refuses to resolve (PLAN must refuse the "
+               "tables CLAIM refuses)", ValueError,
+               lambda d=_bad: resolve(["role:impl", "area:usage"], d))
     # [OPUS-5] a NON-trust area (usage) -> plain impl -> OPUS5-ONLY + escalate (maintainer decision
     # 2026-07-26 on the registry #738 measurement: "Remove sol from impl fallback"; sol converted
     # 18% vs opus5 86% in-cell, n=74). The FULL tuple is asserted, not just the head, so demoting

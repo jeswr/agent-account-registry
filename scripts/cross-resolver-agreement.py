@@ -95,6 +95,13 @@ AGREEMENT_MATRIX = (
     # -- security surfaces: never re-ordered, on either side.
     ("area:gui + a security surface (ZK wins)", ("area:gui", "area:sparq-zk", "role:impl")),
     ("a security surface alone", ("area:sparq-zk", "role:impl")),
+    # -- [#1397] the security override's PERSONA branch. Under `agent_from_role` the agent is taken
+    # from the issue's own role row, so each role must be decided identically by both resolvers,
+    # and a ROLELESS security issue (no row to direct from) must keep the override's own persona.
+    ("a security surface + role:docs (a DIFFERENT role row supplies the persona)",
+     ("area:sparq-zk", "role:docs")),
+    ("a security surface + role:research", ("area:sparq-zk", "role:research")),
+    ("a security surface with NO role (the persona cannot be role-directed)", ("area:sparq-zk",)),
     # -- the exclusions. site* is NOT gui; `guide`/`guidance` must not substring-match.
     ("area:site + role:impl", ("area:site", "role:impl")),
     ("area:site-specs + role:impl", ("area:site-specs", "role:impl")),
@@ -250,6 +257,13 @@ inject_roles = ["impl"]
 SECURITY_CROSS_PROVIDER = 'model_chain = ["opus5"]\nagent = "sparq-reviewer"'
 SECURITY_CROSS_PROVIDER_FIXED = 'model_chain = ["opus5", "sol"]\nagent = "sparq-reviewer"'
 
+# [#1397] `agent_from_role`: the security override supplies the chain + escalate, the issue's own
+# role row supplies the PERSONA. It is a two-resolver rule like every other rule in this file — a
+# redirect CLAIM implements and PLAN does not is a permanent per-item `route-policy-failed` defer
+# for every trust-surface issue, which on the registry itself is most of the backlog.
+SECURITY_ROLE_DIRECTED = ('agent = "sparq-reviewer"\nescalate = true',
+                          'agent = "sparq-reviewer"\nagent_from_role = true\nescalate = true')
+
 
 def _self_test():  # noqa: C901 — a flat sequence of assertions
     ok = True
@@ -359,6 +373,53 @@ def _self_test():  # noqa: C901 — a flat sequence of assertions
             chain(single_inject, _near), ["opus5"])
     chk("a security surface under area:gui is still returned unmodified",
         chain(single_inject, ("area:gui", "area:sparq-zk", "role:impl")), ["opus5"])
+    # (3d) [#1397] THE ROLE-DIRECTED SECURITY PERSONA. Same shape as (3b)/(3c): assert the rule
+    # MOVES something, that both resolvers move it identically, and that a malformed declaration is
+    # refused by both — a one-sided redirect would be invisible to every per-resolver assertion.
+    assert SECURITY_ROLE_DIRECTED[0] in SPARQ_SHAPED, \
+        "the agent_from_role fixture is stale — it no longer edits the security route"
+    directed = tomllib.loads(SPARQ_SHAPED.replace(*SECURITY_ROLE_DIRECTED, 1))
+
+    def persona(doc, labels):
+        return _claim(labels, doc)[1][1]
+
+    chk("the declaration MOVES the trust-surface implementation persona off the verdict-only "
+        "reviewer (so the agreement rows below are not vacuous)",
+        (persona(undeclared, ("area:sparq-zk", "role:impl")),
+         persona(directed, ("area:sparq-zk", "role:impl"))),
+        ("sparq-reviewer", "sparq-rust-impl"))
+    chk("...and PLAN moves it to exactly the same persona",
+        _plan(_ROUTE.resolve, ("area:sparq-zk", "role:impl"), directed)[1][1], "sparq-rust-impl")
+    chk("...while the CHAIN and ESCALATE stay the security override's on both sides (the "
+        "soundness posture is not what moved)",
+        (_claim(("area:sparq-zk", "role:impl"), directed)[1][0::2],
+         _plan(_ROUTE.resolve, ("area:sparq-zk", "role:impl"), directed)[1][0::2]),
+        ((["opus5"], True), (["opus5"], True)))
+    chk("...a ROLELESS security issue keeps the override's own persona on both sides",
+        (persona(directed, ("area:sparq-zk",)),
+         _plan(_ROUTE.resolve, ("area:sparq-zk",), directed)[1][1]),
+        ("sparq-reviewer", "sparq-reviewer"))
+    chk("PLAN and CLAIM agree on EVERY matrix row for the role-directed-persona table",
+        compare(directed), [])
+    for _label, _bad_toml in (
+            ("a non-boolean value", SPARQ_SHAPED.replace(
+                SECURITY_ROLE_DIRECTED[0],
+                'agent = "sparq-reviewer"\nagent_from_role = "true"\nescalate = true', 1)),
+            # An explicit `false` resolves IDENTICALLY to the undeclared table on both sides, so no
+            # agreement row can ever see it: only a both-sides REFUSAL makes the typo visible.
+            ("an explicit FALSE (an inert declaration no agreement row could catch)",
+             SPARQ_SHAPED.replace(
+                 SECURITY_ROLE_DIRECTED[0],
+                 'agent = "sparq-reviewer"\nagent_from_role = false\nescalate = true', 1)),
+            ("a ROLE route", SPARQ_SHAPED.replace(
+                'role = "impl"\nmodel_chain = ["opus5", "sol"]\nagent = "sparq-rust-impl"',
+                'role = "impl"\nmodel_chain = ["opus5", "sol"]\nagent = "sparq-rust-impl"\n'
+                "agent_from_role = true", 1))):
+        _bad_doc = tomllib.loads(_bad_toml)
+        chk(f"agent_from_role on {_label} is REFUSED by BOTH resolvers (a rule only one side "
+            "refuses is a table PLAN plans and CLAIM rejects, every tick, forever)",
+            (_plan(_ROUTE.resolve, ("area:sparq-zk", "role:impl"), _bad_doc)[0],
+             _claim(("area:sparq-zk", "role:impl"), _bad_doc)[0]), ("refused", "refused"))
     # A declaration that tried to inject into an authorship-pinned escalating role is REFUSED, and
     # refused IDENTICALLY by both resolvers — so the prohibition cannot become a one-sided rule.
     banned = tomllib.loads(_single + GUI_DECLARATION_INJECT.replace(
