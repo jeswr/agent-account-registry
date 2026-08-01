@@ -34,7 +34,7 @@
 #   account_pool           = [string, ...]
 #   max_concurrent         = positive integer
 #   worker_timeout_minutes = positive integer
-#   gate_profile           = "none" | "lint-only" | "crate-scoped" | "workspace"
+#   gate_profile           = "none" | "lint-only" | "crate-scoped" | "workspace" | "registry-selftest"
 #   arm_auto_merge         = bool
 #   max_attempts           = positive integer
 #   trust                  = "collaborators"
