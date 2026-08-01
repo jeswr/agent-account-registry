@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5419,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0f641c618bad91f11377b8fedea7e1549dc72255",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new residual accurately admits that a party which knows r and supplies a different [r] to m=d*r than to u=r*s can flip an unequal-key verdict without either MAC check failing. The code prevents this only because one centralized, honest-dealer simulation passes the same in-memory AuthenticatedShare to both calls. That does not establish malicious security for a distributed protocol: operand consistency across gates is not cryptographically bound, and TrustedDealerSim explicitly gives the dealer knowledge of r. Despite this admitted wrong-answer execution, the public API remains named malicious_secure_equal*, the module claims AXIS-1 Malicious / malicious-with-abort, and auth_equal_verdicts promises \"Aborts, never a wrong answer.\" Caveating the missing obligation does not make those stronger claims true.",
+    "file": "crates/sparq-mpc/src/auth_equal.rs",
+    "fix_hint": "Until multiplication-gate verification or commitments bind both operands and the same mask across both gates, contain this as an experimental trusted-dealer/tamper-evident simulation: remove AXIS-1 Malicious and \"never a wrong answer\" claims, rename the malicious_secure_equal* exports, and apply the narrowed tier consistently in lib.rs, the capability matrix, design record, and skills/mpc/SKILL.md. Alternatively implement the binding and add an adversarial test that independently substitutes the mask at the two gate invocations and proves abort.",
+    "severity": "major",
+    "title": "Public malicious-with-abort contract still excludes the admitted gate-equivocation attack"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 documents the prior gate-equivocation attack much more explicitly, but does not fix or contain the public security tier. The implementation still relies on an honest in-process dealer and reuse of one Rust AuthenticatedShare object to ensure that the verdict gate and witness gate receive the same mask. That is an implementation invariant of the simulator, not a protocol binding against an actively deviating distributed party. The module nevertheless exports malicious_secure_equal*, labels the construction AXIS-1 Malicious / malicious-with-abort, and promises \"Aborts, never a wrong answer.\" Its own residual states that a party which knows r and presents different authenticated r values to the two gates can flip the verdict. Since TrustedDealerSim has the dealer know r and no gate verification binds the operands across invocations, the advertised malicious tier remains unsupported. This is materially the same major finding as round 4, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
