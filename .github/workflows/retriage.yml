@@ -60,7 +60,7 @@ jobs:
       # the loop. Every READ goes through the shared bounded-retry layer; MUTATIONS stay
       # single-attempt + fail-loud inside the applier (gh_retry's hard scope rule).
       # scripts/retriage.py --self-test statically asserts all of this against this file.
-      - name: Sweep the untriaged and status:ready boards (at most 80 issues)
+      - name: Sweep the untriaged, status:ready and orphan boards (at most 80 issues)
         # `id:` so retriage.py's self-test can EXTRACT and EXECUTE this exact step body against a
         # stubbed `gh_retry`/applier (#605 review round 2): the pagination ceiling, the
         # completeness proof, the page-shape guard and the truncation break are SHELL guards, and
@@ -120,6 +120,42 @@ jobs:
               fi
               page=$((page + 1))
             done
+          done
+          # registry #1180: THE ORPHAN BOARD — the one query that depends on NO prior successful
+          # write. Both lanes above are keyed on a `status:*` label, so a triage batch that DIED at
+          # the mutation (GitHub fails the WHOLE `gh issue edit` on one unknown `--add-label`, so
+          # the priority and the status attestation are lost together) leaves an issue neither lane
+          # can ever list — the backstop was blind to exactly the population the failure creates.
+          # Measured: 40 open issues with no priority and no status, undispatchable and in no
+          # census. There is no `-label:` filter on the REST issues endpoint, so the orphan set is
+          # computed the drift-free way: page the OPEN issues and reduce each page to the residue
+          # locally. That costs at most the same $max_pages requests as one lane, and the predicate
+          # names no label, so it cannot rot when the taxonomy changes.
+          page=1
+          while : ; do
+            scan="$tmp/scan-$page.json"     # NOT page-* — only the REDUCED page feeds the snapshot
+            gh_read api "repos/$REPO/issues?state=open&per_page=100&page=$page" > "$scan"
+            if ! jq -e 'type == "array"' "$scan" > /dev/null; then
+              echo "::error::the orphan board page $page is not a JSON array — refusing to sweep a board this run could not read (fail closed)"
+              exit 1
+            fi
+            got=$(jq 'length' "$scan")
+            # `/issues` returns PULL REQUESTS too, and a PR carries neither label — dropping them
+            # here is what keeps the sweep from writing `status:untriaged` onto one. (`snapshot()`
+            # drops them a second time; the reduction must not depend on that.)
+            jq '[ .[]
+                  | select(has("pull_request") | not)
+                  | select( [ (.labels // [])[].name ]
+                            | (any(startswith("status:")) or any(startswith("priority:")))
+                            | not ) ]' "$scan" > "$tmp/page-orphan-$page.json"
+            if [ "$got" -lt 100 ]; then
+              break
+            fi
+            if [ "$page" -ge "$max_pages" ]; then
+              echo "::error::the open-issue scan is larger than ${max_pages} pages (>= $((max_pages * 100)) issues) — refusing to sweep a board this run could not read completely (fail closed)"
+              exit 1
+            fi
+            page=$((page + 1))
           done
           # Each page file is already a JSON array, so slurping them yields the list-of-pages shape
           # `--snapshot` validates. Glob order is irrelevant: it flattens and re-orders by number.
