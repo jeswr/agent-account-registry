@@ -2146,9 +2146,30 @@ if not label:
     # asserting the stub's strictness instead of the workflow's. So this page is DISCRIMINATING —
     # one true orphan and three documents the workflow's own jq reduction has to drop — and short,
     # so the page accounting the #605 rows check stays readable.
+    #
+    # [#1180 review round 1] The orphan scan's shape guard, its short-page break, its page
+    # increment and its max-pages refusal are a SECOND, INDEPENDENT copy of the lane loop's, and
+    # item 4 of AGENTS.md's pre-flight is explicit that duplicated guards are individually
+    # unkillable while only one copy ever executes. STUB_PAYLOAD / STUB_FULL_PAGES cannot reach
+    # this copy: STUB_PAYLOAD is answered above for EVERY request, so the first labeled lane dies
+    # first and the scan never runs, and STUB_FULL_PAGES is read only on the labeled branch below.
+    # So the unfiltered lane gets its OWN knobs, and the rows that use them leave the labeled lanes
+    # completely healthy — the mutant has to be caught here or not at all.
+    if os.environ.get("STUB_ORPHAN_PAYLOAD", "array") == "object":
+        print(json.dumps({"message": "Not Found"}))
+        sys.exit(0)
     def doc(number, labels, **extra):
         return dict({"number": number, "user": {"login": "owner"}, "body": "", "labels": labels,
                      "updated_at": "2026-07-01T00:00:00Z"}, **extra)
+    if page <= int(os.environ.get("STUB_ORPHAN_FULL_PAGES", "0")):
+        # A FULL (100-document) unfiltered page whose RESIDUE is 60 — the reduction has real work
+        # to do on it, and `got` is still read from the unreduced page, which is what the short-page
+        # break has to be measured against. Numbers are page-derived and share no prefix with the
+        # short page or either lane, so a page the loop re-fetched instead of advancing is visible.
+        print(json.dumps([doc(3000000 + page * 1000 + index,
+                              [] if index < 60 else [{"name": "priority:P2"}])
+                          for index in range(100)]))
+        sys.exit(0)
     print(json.dumps([doc(2000001, []),                                    # the orphan
                       doc(2000002, [{"name": "priority:P2"}]),             # has a priority
                       doc(2000003, [{"name": "status:ready"}]),            # has a status
@@ -2177,9 +2198,15 @@ if str(nth) in {token for token in os.environ.get("STUB_FAIL_APPLIES", "").split
     sys.exit(1)
 '''
 
-    def run_sweep_step(full_pages=2, payload="array", run_number=3, fail_applies=""):
+    def run_sweep_step(full_pages=2, payload="array", run_number=3, fail_applies="",
+                       orphan_payload="array", orphan_full_pages=0):
         """Execute the REAL sweep step body. Returns (exit code, log text, page-file names,
-        window line count, applier invocation count, API targets the step actually requested)."""
+        window line count, applier invocation count, API targets the step actually requested,
+        and the reduced ORPHAN pages in page order).
+
+        `orphan_payload`/`orphan_full_pages` steer the LANE-LESS request only, so a row can put
+        the orphan scan under a malformed page or past the request ceiling while both labeled
+        lanes still complete normally (#1180 review round 1)."""
         with tempfile.TemporaryDirectory() as directory:
             root = os.path.join(directory, "repo")
             os.makedirs(os.path.join(root, "scripts"))
@@ -2194,6 +2221,8 @@ if str(nth) in {token for token in os.environ.get("STUB_FAIL_APPLIES", "").split
                                MAINTAINER_LOGIN="owner", APP_BOT_LOGIN="app[bot]",
                                GITHUB_RUN_NUMBER=str(run_number),
                                STUB_FULL_PAGES=str(full_pages), STUB_PAYLOAD=payload,
+                               STUB_ORPHAN_PAYLOAD=orphan_payload,
+                               STUB_ORPHAN_FULL_PAGES=str(orphan_full_pages),
                                STUB_APPLY_LOG=log, STUB_TARGET_LOG=targets_path,
                                STUB_FAIL_APPLIES=fail_applies,
                                STUB_REAL_RETRIAGE=os.path.abspath(__file__))
@@ -2216,13 +2245,27 @@ if str(nth) in {token for token in os.environ.get("STUB_FAIL_APPLIES", "").split
             if os.path.isfile(targets_path):
                 with open(targets_path, encoding="utf-8") as handle:
                     targets = [line.strip() for line in handle if line.strip()]
-            # registry #1180: what the ORPHAN reduction actually kept, so the jq predicate is
-            # asserted by its OUTPUT rather than by its text.
-            orphan_path = os.path.join(sweep_temp, "page-orphan-1.json")
-            orphans = None
-            if os.path.isfile(orphan_path):
-                with open(orphan_path, encoding="utf-8") as handle:
-                    orphans = [item["number"] for item in json.load(handle)]
+            # registry #1180: what the ORPHAN reduction actually kept, EVERY page of it in page
+            # order, so the jq predicate is asserted by its OUTPUT rather than by its text and a
+            # scan that stopped early or re-reduced one page is visible as a shape change.
+            # A mutated guard can leave a reduced page EMPTY or non-array (the step's own jq
+            # refused it). That is reported as `None` for the page rather than raised: a traceback
+            # here would abort the suite and record every row below it as a phantom kill —
+            # AGENTS.md pre-flight item 4, "crash-after-partial-run" (measured: mutating the orphan
+            # shape guard to `if false` did exactly this, 0 of 212 checks reached).
+            orphans = []
+            for name in sorted((name for name in pages if name.startswith("page-orphan-")),
+                               key=lambda name: int(name.split("-")[2].split(".")[0])):
+                with open(os.path.join(sweep_temp, name), encoding="utf-8") as handle:
+                    try:
+                        page = json.load(handle)
+                    except ValueError:
+                        page = None
+                    orphans.append([item["number"] for item in page]
+                                   if isinstance(page, list) and all(isinstance(item, dict)
+                                                                     and "number" in item
+                                                                     for item in page)
+                                   else None)
             return (completed.returncode, completed.stdout + completed.stderr, pages, window,
                     applies, targets, orphans)
 
@@ -2248,7 +2291,7 @@ if str(nth) in {token for token in os.environ.get("STUB_FAIL_APPLIES", "").split
     # inverted or removed altogether (all four would).
     checks.append(("[#1180] the lane-less scan is REDUCED to the orphan residue — an issue with a "
                    "priority, an issue with a status and a pull request are all dropped",
-                   orphans == [2000001]))
+                   orphans == [[2000001]]))
     # [registry #487 / #1180] BOARD MEMBERSHIP — the honest scope of the opt-in, asserted by
     # EXECUTION. The rows above prove the widening WORKS on a document handed to plan(); this one
     # proves WHICH documents production can ever hand it. The board is exactly three queries: the
@@ -2278,6 +2321,51 @@ if str(nth) in {token for token in os.environ.get("STUB_FAIL_APPLIES", "").split
     code, log, _pages, _window, applies, _targets, _orphans = run_sweep_step(payload="object")
     checks.append(("[#605 r2 f2] a non-array page payload fails the step CLOSED, never sweeps",
                    (code != 0, "not a JSON array" in log, applies) == (True, True, 0)))
+
+    # -------------------------------------------------------------------------------------------
+    # [registry #1180, review ROUND 1] THE ORPHAN SCAN'S OWN PAGINATION GUARDS, INDEPENDENTLY
+    # EXECUTED. The three rows above steer EVERY request, so the first labeled lane dies first and
+    # the lane-less loop never runs — its shape guard, its ceiling and its short-page break are a
+    # duplicated copy borrowing the first copy's coverage, which AGENTS.md pre-flight item 4 names
+    # as the shape that makes each copy individually unkillable. Every row below therefore leaves
+    # BOTH labeled lanes healthy (asserted: all 6 labeled requests are served) and mutates only the
+    # unfiltered lane, so the only thing that can turn the step red is the orphan copy itself.
+    # -------------------------------------------------------------------------------------------
+    code, log, _pages, _window, applies, targets, _orphans = run_sweep_step(orphan_payload="object")
+    labeled = [target for target in targets if "/issues?" in target and "labels=" in target]
+    checks.append(("[#1180 r1] a non-array ORPHAN page fails the step CLOSED with both labeled "
+                   "lanes served — the orphan `jq -e` type guard is what refuses",
+                   (code != 0, "the orphan board page 1 is not a JSON array" in log,
+                    applies, len(labeled)) == (True, True, 0, 6)))
+    # The orphan REQUEST ceiling: 25 full unfiltered pages against the same max_pages=20, with the
+    # labeled lanes short-paging normally at 3 requests each. Dies on deleting the orphan ceiling's
+    # own `exit 1`, on `if false`, and on a raised/dropped max_pages — each of those runs the scan
+    # to the short page and exits 0 with 80 applies. `page-orphan-*` counted EXACTLY, not `>=`, so
+    # an off-by-one in the refusal's own `-ge` is a different number here, not the same pass.
+    code, log, pages, _window, applies, targets, _orphans = run_sweep_step(orphan_full_pages=25)
+    labeled = [target for target in targets if "/issues?" in target and "labels=" in target]
+    scanned = [target for target in targets if "/issues?" in target and "labels=" not in target]
+    checks.append(("[#1180 r1] an ORPHAN scan past the REQUEST ceiling fails the step CLOSED at "
+                   "page 20, having made exactly 20 unfiltered REQUESTS, with both labeled lanes "
+                   "served",
+                   (code != 0, "the open-issue scan is larger than 20 pages" in log,
+                    len(scanned), len([name for name in pages
+                                       if name.startswith("page-orphan-")]),
+                    applies, len(labeled)) == (True, True, 20, 20, 0, 6)))
+    # A MULTI-PAGE orphan scan that terminates on a short page: two full pages (100 documents each,
+    # residue 60) then the discriminating short page (residue 1). Dies on a premature break (`got`
+    # read from the REDUCED page instead of the raw one, or `-lt 100` loosened — 60 < 100, so the
+    # scan would stop after page 1 and the board total would be 474, not 535), on the reduction
+    # reading a fixed `scan-1.json` (page 2's residue would repeat page 1's numbers), and on every
+    # page being written to one `page-orphan.json` (the page list collapses to a single entry).
+    code, log, _pages, _window, applies, _targets, orphans = run_sweep_step(orphan_full_pages=2)
+    checks.append(("[#1180 r1] a multi-page ORPHAN scan pages to its short terminal page and EVERY "
+                   "reduced page reaches the snapshot (535 = 2x(200+7) + 60 + 60 + 1)",
+                   (code, applies,
+                    [None if page is None else len(page) for page in orphans],
+                    [None if not page else page[0] for page in orphans],
+                    "535 board issue(s)" in log)
+                   == (0, 80, [60, 60, 1], [3001000, 3002000, 2000001], True)))
 
     # [registry #510] PER-ISSUE ERROR ISOLATION, EXECUTED. A GENUINE write failure — the class that
     # is still an error, as opposed to a dropped unknown label — must be RECORDED per issue, must
