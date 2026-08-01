@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1599,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4ebe5090c4e27cdced791a12583c09e84fda0a0c",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "_name_bindings walks every assignment in every scope, and _module_launcher_aliases resolves them as one file-global, monotonic fixpoint. Consequently an unrelated local assignment such as `def helper(): runner = subprocess.run` can cause a module-level `def f(run=runner)` to be reported even when the module-level `runner` is a safe helper. Likewise, a launcher assignment after a default taints the earlier default although Python evaluates that default before the later assignment. The transitive_backwards known-positive enshrines this error: at module execution its `def go(..., runner=_ALIAS)` raises NameError, so it never captures a launcher. This is the scope/order defect called out in round 1, now converted into intentional over-collection rather than resolved.",
+    "file": "scripts/launcher-default-sweep.py",
+    "fix_hint": "Resolve each default against bindings visible in its actual lexical scope at the point the default is evaluated. Respect statement order and shadowing/rebinding, while retaining AnnAssign and transitive Name support. Replace the reverse-order positive with executable fixtures, and add independent negatives proving that later assignments, function-local assignments, and same-named bindings in unrelated scopes do not create findings.",
+    "severity": "major",
+    "title": "Alias resolution still ignores scope and binding order"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round adds independent positives for annotated and transitive aliases, but the prior major is not fully resolved. The resolver deliberately discards Python scope and execution-order semantics: assignments anywhere in the AST permanently taint an identifier everywhere, including assignments after a default or inside an unrelated function. That makes the enrolled standing gate reject safe defaults based on bindings that cannot supply their values. The reverse-order fixture pins this unsound behavior using a function definition that would itself fail with NameError when executed, so it does not validate the claimed import-time capture hazard. A trust-plane gate must be conservative without manufacturing evidence; this remains a major correctness defect.",
+  "verdict": "request_changes"
+ }
+}
