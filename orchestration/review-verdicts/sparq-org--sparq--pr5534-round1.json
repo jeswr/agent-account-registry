@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5534,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "08c06916d2e8c6e6b5176c25fe363724866db4c4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change replaces the lossy run-level-success bound with a job-level classification that requires positive full-matrix shard coverage, rejects genuine failures and unverified shards, and clearly reports stale/cold-start fallback behavior. The tests exercise the load-bearing positive and negative cases through both the pure classifier and the real command-construction path, including cancelled aggregate runs with successful shards, failure/cancellation rejection, newest valid-bound selection, horizon fallback, and report-only mode. No correctness, soundness, security, or vacuous-test defect is apparent in the diff.",
+  "verdict": "approve"
+ }
+}
