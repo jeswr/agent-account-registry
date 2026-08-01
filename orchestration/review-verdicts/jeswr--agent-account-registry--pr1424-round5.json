@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1424,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "695c77bcb7e56c15c2b08215a325a27dabcffd9c",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`route_token = os.environ.get(\"ALERT_TOKEN\") or registry_token` still treats `REGISTRY_ALERT_TOKEN` as the private destination credential. With `ALERT_REPO=private/alerts`, no `ALERT_TOKEN`, and a registry token that can read the destination, `_repo_confirmed_private` probes with the registry token and `_alert_route` returns `(\"private/alerts\", registry_token)`. This violates the documented two-token boundary and can silently lose the best-effort alert when the registry-scoped token cannot write to that private repository. The uninjected default-route test codifies the defect by expecting `(\"private/alerts\", \"t0\")` while `ALERT_TOKEN` is unset.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Use only `ALERT_TOKEN` as the candidate private-route token. If it is absent, return `(registry_repo, registry_token)` without issuing a visibility probe. Add a distinct-token test with `ALERT_REPO` and `REGISTRY_ALERT_TOKEN` set but `ALERT_TOKEN` absent that asserts registry fallback and zero probe calls; make the uninjected live-probe test set an explicit `ALERT_TOKEN` and assert that token is used for both the probe and the private return.",
+    "severity": "major",
+    "title": "Missing ALERT_TOKEN still selects the private route with the registry token"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-4 credential-boundary defect remains in `scripts/worker-pr.py`. Although the new fallback assertions correctly require the registry token after a rejected probe, `_alert_route` still defines the candidate private-route token as `ALERT_TOKEN or REGISTRY_ALERT_TOKEN`. Thus, when `ALERT_TOKEN` is absent but the registry token can read the configured private destination, the live probe can approve that destination and the registry-scoped token is returned for a cross-repository private write. The default-route self-test explicitly expects this unsafe result. This is materially the same major finding as round 4, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
