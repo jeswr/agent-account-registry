@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1479,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c6257321dc07ff0937e2e7db4429de2ea65793a3",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-2 test-validity defect is corrected. `_validated` is now populated only after each staged row successfully passes `_policy_row` under an enabled copy, and the final check compares that work-produced list against the independently derived staged-row list. Deleting or conditionally bypassing the validation loop therefore leaves `_validated` empty and makes the named check fail without changing the check count. The shipped solid-sdk row uses the supported `lint-only` profile, remains fail-closed while disabled, and its remaining fields are exercised through the same production validator that activation uses. The mint-provenance self-test now restricts enrolment reads to enabled rows while retaining independent empty-to-enrolled transition checks. I found no correctness, soundness, security, or non-vacuity blocker in the diff.",
+  "verdict": "approve"
+ }
+}
