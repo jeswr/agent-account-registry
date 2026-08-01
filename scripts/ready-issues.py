@@ -219,6 +219,13 @@ def _defer_log(message):
     print(message, file=sys.stderr)
 
 
+# The two line families this engine emits through `log`, both greppable by prefix: one PER-ISSUE
+# attribution for a label-gate refusal, and one PER-RUN census of the conflict stage.
+DEFER_PREFIX = "readiness defer #"
+CENSUS_PREFIX = "readiness census:"
+CENSUS_TOP_CONTENDED = 8   # reserved areas named in the census line, ranked by blocked demand
+
+
 def exclusion_reason(labels, open_blockers=0):
     """The ONE label-side ENUMERABILITY predicate, as a REASON: None when the engine can enumerate
     an OPEN issue carrying these labels, else a short attributable string naming the FIRST failing
@@ -249,6 +256,9 @@ def exclusion_reason(labels, open_blockers=0):
     Package SERIALIZATION drops (compute_ready's one-per-package concurrency width) are
     deliberately NOT reported here: they are transient by design — the issue is still on the
     frontier next tick — and the assembler already names them (`assembler defer #N: crate ...`).
+    Not reported here is not the same as unreported (#1478): `frontier_census` counts them in
+    AGGREGATE, per reserved area, on every run, because at the measured population they are almost
+    the entire candidate set and their silence hid a width-exhausted frontier.
     """
     labels = set(labels)
     if "status:ready" not in labels:          # positive attestation required
@@ -350,7 +360,7 @@ def ready_candidates(issues, log=None):
         reason = (exclusion_reason(L, it.get("open_blockers", 0)) or routing_refusal(L))
         if reason is not None:
             if "status:ready" in L:
-                log(f"readiness defer #{it.get('number', 0)}: {reason}")
+                log(f"{DEFER_PREFIX}{it.get('number', 0)}: {reason}")
             continue
         cands.append((valid_priority(L), it.get("number", 0), it, packages_of(L)))
     cands.sort(key=lambda c: (c[0], c[1]))   # priority then number (deterministic)
@@ -440,6 +450,72 @@ def unit_reservations(issues, source_links=None):
     return out
 
 
+def frontier_census(cands, held, ready, limit=CENSUS_TOP_CONTENDED):
+    """The ONE-LINE, per-run WIDTH census of the CONFLICT stage. Pure — returns the lines to print,
+    so the check is testable rather than a side effect nobody exercises (`native_channel_alarm`'s
+    idiom). `held` is occupancy BEFORE selection; `cands` is `ready_candidates`' output.
+
+    Issue #1478: `ready_candidates` logs its own label-gate refusals faithfully (the #586 idiom),
+    but `compute_ready`'s three conflict rules dropped candidates with a bare `continue` — and that
+    is where almost the entire population dies. MEASURED on the live registry 2026-07-31: 413
+    candidates entered the conflict filter, ONE survived, and 412 printed NOTHING. The observable
+    signal was an empty frontier plus 25 unrelated label-gate defer lines, so a frontier that was
+    WIDTH-EXHAUSTED (45 in-flight PRs holding 8 of the 9 demanded areas; the single dispatchable
+    item was the lowest-priority P4 on the one free area while 30+ P1s waited) was indistinguishable
+    from a backlog that had simply run dry. A tick spent clearing `needs:user` holds on six P1s
+    delivered exactly zero, because every one of them was in a reserved area, and nothing in the
+    engine's output said so before or after.
+
+    AGGREGATE, deliberately, and this is the one judgement call in the fix. The issue also proposed
+    a defer line per conflict-dropped candidate; at the measured population that is 412 lines per
+    tick naming a condition that is transient by design (the issue is still on the frontier next
+    tick, and `exclusion_reason`'s docstring records why serialization drops are not label-gate
+    refusals). `413 -> 1, 8 areas held` is the sentence that makes width exhaustion visible, and the
+    per-area demand breakdown attributes every one of the 412 to the area that is holding it.
+
+    ALWAYS printed, ZERO INCLUDED — the standing rule for every cap in this fleet: a limit must name
+    itself on every tick, including a tick on which it refused nothing, so a quiet tick is
+    distinguishable from an uninstrumented one.
+
+    Counts, precisely:
+      * `candidates` / `frontier` — the drainable set and the concurrency width it collapsed to.
+        Every candidate that is not on the frontier was dropped by a conflict rule (the label gate
+        ran upstream, in `ready_candidates`), so `conflict-deferred` is exact, not a residual.
+      * `reserved_areas` — keys held by IN-FLIGHT work (open PRs, in-progress issues, and any
+        `in_progress_packages` seed) BEFORE selection. Keys that the frontier's own earlier heads
+        take are NOT counted: those are the engine working as designed, and folding them in would
+        report a healthy tick as a held one.
+      * `free_areas` — demanded-by-a-candidate and NOT reserved. The 9th area in `8 reserved / 1
+        free` is the whole finding, so the denominator is the areas candidates actually want, not
+        every area label that exists.
+      * `blocked-by-reserved` — for each RESERVED key, how many deferred candidates collide with
+        it, ranked by count then key and capped at `limit`. A reserved key that blocks nothing is
+        not named (it is costing nothing); the count above still counts it.
+    """
+    held = set(held)
+    demanded = set().union(set(), *(pkgs for _p, _n, _it, pkgs in cands))
+    selected = {it.get("number") for it in ready}
+    blocked = {}
+    for _p, number, _it, pkgs in cands:
+        if number in selected:
+            continue
+        for pkg in pkgs & held:
+            blocked[pkg] = blocked.get(pkg, 0) + 1
+    ranked = sorted(blocked.items(), key=lambda kv: (-kv[1], kv[0]))
+    shown = ", ".join(f"{pkg}={n}" for pkg, n in ranked[:limit]) or "none"
+    more = f" (+{len(ranked) - limit} more)" if len(ranked) > limit else ""
+    line = (f"{CENSUS_PREFIX} candidates={len(cands)} frontier={len(ready)} "
+            f"conflict-deferred={len(cands) - len(ready)} "
+            f"reserved_areas={len(held)} free_areas={len(demanded - held)} "
+            f"blocked-by-reserved: {shown}{more}")
+    if GLOBAL in held:
+        # `blocked-by-reserved` cannot see this one: a cross-cutting occupant collides with no
+        # `area:` key, it simply stops the loop. Unnamed, the census would read as a wide-open
+        # board (free areas, nothing contended) on the tick where NOTHING can run.
+        line += f" — {GLOBAL} is held: NO other work can co-run this tick"
+    return [line]
+
+
 def compute_ready(issues, in_progress_packages=None, log=None, source_links=None):
     """Conflict-free, priority-ordered, FAIL-CLOSED ready frontier (one-per-package concurrency
     width). This is NOT the count of drainable work — see ready_candidates() for that.
@@ -447,10 +523,19 @@ def compute_ready(issues, in_progress_packages=None, log=None, source_links=None
     [OPUS-5 #768] `issues` may carry PULL-REQUEST rows (any row with a `pull_request` key). They
     are pure OCCUPANCY: they reserve, and they are never selected. `source_links`, when supplied,
     additionally folds a PR and the issues it closes into one unit reserving the union ONCE.
+
+    [#1478] Emits ONE `readiness census:` line through the same `log` sink, every run, after the
+    per-issue `readiness defer #N:` lines the label gate emitted — the conflict stage below used to
+    discard most of the population with a bare `continue` and no signal at all. See
+    `frontier_census`.
     """
+    log = _defer_log if log is None else log
     taken = set(in_progress_packages or ())
     for areas, _artifact in unit_reservations(issues, source_links):
         taken |= areas
+    # Snapshot BEFORE the selection loop mutates `taken`: the census must report what IN-FLIGHT
+    # work holds, not what the frontier's own heads went on to take.
+    held = frozenset(taken)
     cands = ready_candidates(issues, log=log)
     ready = []
     for _p, _n, it, pkgs in cands:
@@ -462,6 +547,8 @@ def compute_ready(issues, in_progress_packages=None, log=None, source_links=None
             continue
         taken |= pkgs
         ready.append(it)
+    for line in frontier_census(cands, held, ready):
+        log(line)
     return ready
 
 
@@ -613,8 +700,15 @@ def _self_test():
     check("packages none->global", packages_of({"role:impl"}), {GLOBAL})
     # ---- #586: every dropped `status:ready` candidate is ATTRIBUTABLE (the silent `continue` is
     # what let a label-regressed issue leave the frontier forever with zero signal) ----
-    lines = []
-    compute_ready(F, log=lines.append)
+    emitted = []
+    compute_ready(F, log=emitted.append)
+    # [#1478] `log` now carries TWO line families. Split by prefix rather than relaxing any
+    # assertion below: the per-issue set is still asserted EXACTLY, and the census lines it
+    # separates out are asserted just as exactly, further down.
+    lines = [line for line in emitted if line.startswith(DEFER_PREFIX)]
+    census = [line for line in emitted if line.startswith(CENSUS_PREFIX)]
+    check("[#1478] the log carries the 9 defer lines AND exactly ONE census line, nothing else",
+          (len(lines), len(census), len(emitted)), (9, 1, 10))
     check("every dropped status:ready candidate emits one attributable defer line",
           sorted(int(re.search(r"#(\d+)", line).group(1)) for line in lines),
           [4, 5, 7, 9, 10, 13, 14, 15, 40])
@@ -654,7 +748,15 @@ def _self_test():
           (False, False, False))
     quiet = []
     compute_ready([iss(20, R + ["priority:P1", "area:usage"])], log=quiet.append)
-    check("an enumerable board emits NO defer line", quiet, [])
+    check("an enumerable board emits NO defer line",
+          [line for line in quiet if line.startswith(DEFER_PREFIX)], [])
+    # ...and the census is NOT suppressed on that tick — ZERO INCLUDED, so a tick that refused
+    # nothing is distinguishable from a tick nobody instrumented. `if conflict_deferred:` is the
+    # mutant this kills.
+    check("[#1478] a tick that deferred NOTHING still prints its census (zero included)",
+          [line for line in quiet if line.startswith(CENSUS_PREFIX)],
+          [f"{CENSUS_PREFIX} candidates=1 frontier=1 conflict-deferred=0 reserved_areas=0 "
+           "free_areas=1 blocked-by-reserved: none"])
     # exclusion_reason is the single predicate ready_candidates and retriage's re-park both use.
     check("exclusion_reason: complete label set is enumerable",
           exclusion_reason({"status:ready", "priority:P1", "role:impl", "area:usage"}), None)
@@ -791,7 +893,7 @@ def _self_test():
     _pr_lines = []
     compute_ready([pr(740, ["status:ready", "area:worker"])], log=_pr_lines.append)
     check("[#768] a PR row emits NO readiness-defer line (it is not a rejected candidate)",
-          _pr_lines, [])
+          [line for line in _pr_lines if line.startswith(DEFER_PREFIX)], [])
     # UNIT RESERVATIONS. `source_links=None` must be byte-identical to the legacy per-row loop —
     # this is what lets dispatch.yml keep calling compute_ready(rows) unchanged.
     _board = [pr(750, ["area:worker"]), iss(751, ["status:in-progress", "role:impl", "area:docs"]),
@@ -878,6 +980,81 @@ def _self_test():
              if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef))]
     check("[#768] no top-level def is defined twice (a shadowed copy is unmutatable dead code)",
           sorted(name for name in set(_tops) if _tops.count(name) > 1), [])
+    # ------------------------------------------------------------------------------------------
+    # [#1478] THE WIDTH CENSUS. The conflict stage used to discard its population with a bare
+    # `continue`: 413 candidates in, 1 out, 412 silent. Every check below asserts the census TEXT,
+    # never merely that some line was emitted — an engine that printed `readiness census: ok` would
+    # satisfy "a line exists" and report nothing at all.
+    # ------------------------------------------------------------------------------------------
+    # THE LIVE SHAPE, in miniature: in-flight PRs hold 3 of the 4 areas candidates want, so the ONE
+    # dispatchable row is the lowest-priority item on the only free area while four P1s wait. This
+    # is the tick the issue describes; pre-fix its entire output was `[914]` and nothing else.
+    _wide = [pr(900, ["area:dispatch"]), pr(901, ["area:worker"]), pr(902, ["area:review-loop"]),
+             iss(910, R + ["priority:P1", "area:dispatch"]),
+             iss(911, R + ["priority:P1", "area:dispatch"]),
+             iss(912, R + ["priority:P1", "area:worker"]),
+             iss(913, R + ["priority:P1", "area:review-loop"]),
+             iss(914, R + ["priority:P4", "area:usage"])]
+    _wide_lines = []
+    _wide_ready = compute_ready(_wide, log=_wide_lines.append)
+    check("[#1478] a width-exhausted frontier NAMES itself: candidates, width, held vs free areas, "
+          "and the demand each reserved area is holding",
+          ([it["number"] for it in _wide_ready], _wide_lines),
+          ([914],
+           [f"{CENSUS_PREFIX} candidates=5 frontier=1 conflict-deferred=4 reserved_areas=3 "
+            "free_areas=1 blocked-by-reserved: dispatch=2, review-loop=1, worker=1"]))
+    # RESERVED means HELD BY IN-FLIGHT WORK, not "taken by the time the loop ended". Two candidates
+    # on one area with NO occupancy at all is a healthy tick: one is offered, one waits for it, and
+    # the census must say `reserved_areas=0`. Reading the post-selection `taken` (or seeding the
+    # census from `ready`'s own packages) reports that tick as area-starved — the false alarm that
+    # would make the real one, above, unreadable.
+    _healthy = []
+    compute_ready([iss(920, R + ["priority:P1", "area:usage"]),
+                   iss(921, R + ["priority:P2", "area:usage"])], log=_healthy.append)
+    check("[#1478] a key the frontier's OWN head took is not a reserved area (no false alarm)",
+          _healthy,
+          [f"{CENSUS_PREFIX} candidates=2 frontier=1 conflict-deferred=1 reserved_areas=0 "
+           "free_areas=1 blocked-by-reserved: none"])
+    # The GLOBAL occupant collides with no `area:` key — it stops the loop. Unnamed, this tick
+    # reads as a wide-open board (free areas, nothing contended) while NOTHING can run.
+    _global_lines = []
+    compute_ready([iss(930, ["status:in-progress", "role:impl"]),
+                   iss(931, R + ["priority:P1", "area:worker"])], log=_global_lines.append)
+    check("[#1478] a held GLOBAL partition is named — the census never reads as open on a tick "
+          "where nothing can co-run",
+          _global_lines,
+          [f"{CENSUS_PREFIX} candidates=1 frontier=0 conflict-deferred=1 reserved_areas=1 "
+           f"free_areas=1 blocked-by-reserved: none — {GLOBAL} is held: NO other work can "
+           "co-run this tick"])
+    # The census for board F, asserted whole (it was split out of `emitted` above). `held` there is
+    # the in-progress issue #10's `set-up-account`, which blocks no candidate: a reserved area that
+    # costs nothing is counted, not named.
+    check("[#1478] the census counts a reserved-but-uncontended area without naming it", census,
+          [f"{CENSUS_PREFIX} candidates=5 frontier=3 conflict-deferred=2 reserved_areas=1 "
+           "free_areas=4 blocked-by-reserved: none"])
+    # Ranking (count desc, then key) and the cap. Ten reserved areas each blocking one candidate:
+    # a dropped bound prints all ten, an ascending sort or a missing `+N more` changes this text.
+    _many = [pr(940 + i, [f"area:a{i}"]) for i in range(10)]
+    _many += [iss(950 + i, R + ["priority:P1", f"area:a{i}"]) for i in range(10)]
+    _many_lines = []
+    compute_ready(_many, log=_many_lines.append)
+    check("[#1478] the named areas are ranked and BOUNDED, and the overflow is declared",
+          _many_lines,
+          [f"{CENSUS_PREFIX} candidates=10 frontier=0 conflict-deferred=10 reserved_areas=10 "
+           "free_areas=0 blocked-by-reserved: a0=1, a1=1, a2=1, a3=1, a4=1, a5=1, a6=1, a7=1 "
+           "(+2 more)"])
+    # `frontier_census` is PURE and the numbers are DERIVED, not passed through: hand it a
+    # candidate set and a held set directly, with no engine in the loop.
+    _c = [(1, 11, {"number": 11}, {"worker"}), (1, 12, {"number": 12}, {"docs", "worker"}),
+          (2, 13, {"number": 13}, {"usage"})]
+    check("[#1478] frontier_census is pure and derives every number from its inputs",
+          frontier_census(_c, {"worker", "groom"}, [{"number": 13}]),
+          [f"{CENSUS_PREFIX} candidates=3 frontier=1 conflict-deferred=2 reserved_areas=2 "
+           "free_areas=2 blocked-by-reserved: worker=2"])
+    # An EMPTY board still reports, and reports zeroes — not a crash, not silence.
+    check("[#1478] an empty board reports zeroes rather than nothing", frontier_census([], (), []),
+          [f"{CENSUS_PREFIX} candidates=0 frontier=0 conflict-deferred=0 reserved_areas=0 "
+           "free_areas=0 blocked-by-reserved: none"])
     # ADD-ONLY RESERVATIONS + CONFLICT-FREEDOM, BY EXECUTION over every subset of a PR-bearing
     # board. These are the two universals this change actually has, and both pin the SIGN of it:
     #
