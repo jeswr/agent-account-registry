@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5576,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e070ff3fa310801be78c14827d267541c57eece5",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The skill still says each generated element costs C(n,t) local PRF calls. The real party-local path evaluates C(n-1,t) PRFs per party, and this in-process implementation evaluates n*C(n-1,t) PRFs to produce all n shares. C(n,t) is the setup seed count and the cost of the separate central oracle pass, not the online share-generation cost. The same inaccurate claim remains in PrssRandomness's rustdoc in crates/sparq-mpc/src/prss.rs.",
+    "file": "skills/mpc/SKILL.md",
+    "fix_hint": "State C(n-1,t) PRF evaluations per party, or n*C(n-1,t) for the in-process generation of all shares. Reserve C(n,t) for setup seed count and the simulation-only central-value oracle, and make the same correction in PrssRandomness's rustdoc.",
+    "severity": "minor",
+    "title": "PRSS evaluation cost remains misstated"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-3 correctness and security assessment remains intact: the party-local generation path, access instrumentation, mutation guard, fail-closed deployment status, and simulated-setup/semi-honest/externally-unaudited caveats are coherent. However, the sole prior minor documentation defect remains materially unchanged. The skill still describes C(n,t) local PRF calls per generated element, while the implementation evaluates C(n-1,t) PRFs per party and n*C(n-1,t) across the in-process production of all n shares. The matching PrssRandomness rustdoc makes the same inaccurate cost claim. This is a documentation-only issue and does not undermine the implemented protocol or tests, so approval remains appropriate, but progress is stagnant rather than improving.",
+  "verdict": "approve"
+ }
+}
