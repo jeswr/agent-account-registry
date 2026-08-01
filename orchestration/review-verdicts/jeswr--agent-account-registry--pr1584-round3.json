@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1584,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "af022db52f535b8a5aafb451a98dee9157c13e9f",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 major finding is resolved. `no_change_census` now selects the latest attributable attempt across all usable exit classes before deciding whether the run's final outcome is `no_change`. The added opposed-order transition checks cover both `no_change -> success` (excluded) and `success -> no_change` (included), so the previous filter-before-fold defect is no longer present. The surrounding attribution, null-on-unreadable behavior, ratio threshold validation, sustained firing/recovery registration, and production call-site wiring remain fail-closed and are covered by non-vacuous assertions. I found no blocker, major, or lower-severity defect in the diff.",
+  "verdict": "approve"
+ }
+}
