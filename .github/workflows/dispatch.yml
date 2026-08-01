@@ -51,7 +51,7 @@ env:
   # canary runs reaching the model stage confirm it is); CLAIM mints a PER-OWNER token map so the
   # registry-owner disarm/needs-user/deferred-label mutations use the jeswr-scoped token, not the
   # sparq-org one (defects #1,#5 — the single-token mint 404-looped every registry mutation).
-  DISPATCH_TARGET_REPOS: '["sparq-org/sparq", "jeswr/agent-account-registry", "jeswr/solid-sdk"]'
+  DISPATCH_TARGET_REPOS: '["sparq-org/sparq", "jeswr/agent-account-registry"]'
 
 jobs:
   # MINIMUM INTERVAL BETWEEN EXECUTED TICKS (issue #819). PR #787 cut the snapshot step 6.4x and
