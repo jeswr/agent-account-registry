@@ -748,11 +748,26 @@ def quarantine_notice_body():
     Line 1 is the invisible provenance marker `quarantine_notice_posted()` matches on; line 2 is
     the SPARQ agent self-identification blockquote (AGENTS.md). The marker is an HTML comment, so
     it renders as nothing at all on the issue.
+
+    IT MUST NAME THE APPROVAL AFFORDANCE THAT EXISTS (#1000). The inherited sparq-template wording
+    told the maintainer to "approve it by adding a 👍 reaction" — nothing in this repository reads
+    issue reactions, so a legitimate third-party issue could sit quarantined for ever while its
+    maintainer waited on a gesture with no consumer. The ONE mechanism that clears the gate is a
+    WRITE+ actor removing `trust:untrusted`: `quarantine_required()` re-applies the quarantine for
+    every other event, and `ready-issues.py` / `curate-frontier.py` / `retriage.py` /
+    `dispatch-claim.py` / `triage()` all read that label as the hard gate. The caveat is stated
+    because it is load-bearing, not decoration: `triage` permission can move labels but is NOT
+    write+ here, so a triage-role actor's removal is restored within one event (#607, PR #998 r1).
+
+    Re-wording this body is safe for the de-duplication — `quarantine_notice_posted()` matches on
+    LINE 1 only, so notices already on the board keep matching and are not re-posted. That is the
+    opposite of re-pointing `QUARANTINE_NOTICE_MARKER`, which would re-post on every issue.
     """
     return (f"{QUARANTINE_NOTICE_MARKER}\n"
             "> 🤖 SPARQ agent — this issue is from a non-collaborator, so it is **quarantined** "
             "(`trust:untrusted`) and its content is not acted on. A maintainer can approve it by "
-            "adding a 👍 reaction.")
+            "removing the `trust:untrusted` label; a removal by anyone without write access is "
+            "restored automatically.")
 
 
 def quarantine_notice_posted(comments):
@@ -2819,6 +2834,18 @@ print(os.environ["STUB_LABELS"])
          _notice_text.split("\n")[0], _notice_text.split("\n")[1].startswith("> 🤖 SPARQ agent"),
          "trust:untrusted" in _notice_text),
         (True, QUARANTINE_NOTICE_MARKER, True, True))
+    # [#1000] THE NOTICE MUST ADVERTISE ONLY AN AFFORDANCE THAT EXISTS. Both directions, because
+    # neither alone is enough: the ACCEPT row alone stays green if the 👍 sentence is re-added
+    # alongside the real one, and the REJECT row alone stays green if the whole affordance sentence
+    # is deleted and the reader is told nothing at all. The expected literals are written HERE, not
+    # read back off the module (AGENTS.md pre-flight 2b), and `👍`/`reaction` appear nowhere else
+    # in this body so neither row can be satisfied by an unrelated word (pre-flight 4).
+    chk("[#1000] the notice NAMES the approval path that exists — removing the `trust:untrusted` "
+        "label — and does not merely mention the label in passing",
+        bool(re.search(r"remov\w*\s+the\s+`trust:untrusted`\s+label", _notice_text)), True)
+    chk("[#1000] the notice advertises NO reaction-based approval: nothing in this repository "
+        "reads issue reactions, so a 👍 instruction strands a legitimate third-party issue",
+        ("👍" in _notice_text, "reaction" in _notice_text.lower()), (False, False))
     # WHO CAN WRITE THE THING THIS READS (AGENTS.md pre-flight 5)? On a PUBLIC repo anyone can post
     # a comment, so a byte-identical forgery must NOT count as evidence — otherwise a drive-by
     # commenter silences the quarantine notice on their own issue.
