@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1482,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "aca47614aa1f8556e4368ae580be2379fc3857bc",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 remains sound. The added end-to-end coverage invokes main() for all five verdicts on both alert routes, checks the exact sole GITHUB_OUTPUT record including its terminating newline, and on the same invocation verifies that stdout contains only the expected coarse class and excludes verdict, detail, expiry, and days-left data. The temporary output file is pre-created, so deleting the write produces an assertion failure rather than a harness crash; exact split-line and newline assertions also catch duplication, widening, and unterminated output. I found no diff-scoped correctness, soundness, test-validity, or security issue. With no prior-round findings and no new findings, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
