@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5577,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a2950756116ce90a875fccde10f734626a49a21d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change consistently separates certification scope from the existing rule-applicability scope across the ontology, runtime query construction, fixtures, public vocabulary constant, specifications, and usage skill. The parsed-ontology tests are substantive: they verify that extension declarations do not collide with core declarations and that both validity properties have a single owl:unionOf domain containing Certification and StatusAttestation. The expression fixtures and query assertion exercise the renamed property on the real admission path. No correctness, soundness, security, or vacuous-test issue is evident in the supplied diff.",
+  "verdict": "approve"
+ }
+}
