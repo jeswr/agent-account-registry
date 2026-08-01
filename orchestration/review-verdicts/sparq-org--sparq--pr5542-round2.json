@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5542,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "36ffd3acb6b382793b9d0f053d36532146d76f01",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior major findings. commit_plan now requires exact equality between the distinct selected source assignments and the canonicalized envelope participation set, with real-pipeline mutation tests for both omitted and extra participants. commit_operators now rejects non-empty disclosed_operands on hidden operators, also covered by a real-pipeline mutation test. The implementation remains fail-closed, opt-in, and explicit that canonicalization/revalidation provides no cryptographic soundness; the proof binding remains deferred with the pending audit gates named. No new correctness, soundness, test-validity, or security issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
