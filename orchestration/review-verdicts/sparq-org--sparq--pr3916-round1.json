@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3916,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b691f7eeace4306415a64966b841e66f4707951c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "assemble_registry() checks only that the fragment contains at least one regex-matched id. A fragment such as `[[benchmark]]\\nid=\"ok\"\\n[[benchmark]]\\nname=\"missing\"` is accepted, even though the new contract says every entry requires an id. This creates an assembled TOML registry containing an unidentifiable benchmark and can make downstream ID-based gates silently ignore that record. The existing no-id test uses a fragment with only one entry, so it does not exercise this case.",
+    "file": "scripts/bench_registry.py",
+    "fix_hint": "Parse each fragment with tomllib (or otherwise split and validate every [[benchmark]] block), require exactly one non-empty string id per benchmark table, and add a regression test with two entries where only one has an id. Keep duplicate detection over the resulting per-entry IDs. Also make --check reject parse failures directly if parsing is introduced there.",
+    "severity": "major",
+    "title": "ID validation is fragment-wide instead of per benchmark entry"
+   }
+  ],
+  "progress": null,
+  "summary": "The fragment architecture and consumer wiring are coherent, but the benchmark assembler does not enforce its stated per-entry ID invariant. A fragment containing multiple [[benchmark]] tables passes as long as any one table has an id, leaving anonymous benchmark records in the assembled registry. The focused tests cover only the single-entry/no-id case and therefore do not catch this.",
+  "verdict": "request_changes"
+ }
+}
