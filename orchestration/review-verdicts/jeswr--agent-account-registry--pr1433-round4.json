@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1433,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b17c20aaf20ddf2d0562c90af935fe9c742267cd",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`say_not_transient` increments a counter but discards `exc`, and `drop_again` constructs and raises the exception inline without retaining it. The assertions therefore establish that the shared predicate is called and that its Boolean result controls retrying, but not that it is called with the exact exception caught from `urlopen`. A mutant such as `http_transient.is_transient_network(type(exc)())` preserves the tested RemoteDisconnected and NotADirectoryError classifications, follows both inverted Boolean stubs, and passes the attempt/sleep assertions, yet it no longer delegates classification of the actual failure object. That distinction becomes observable as soon as shared policy uses instance state such as an errno, reason, or wrapped cause. The prior round explicitly required capturing the predicate argument and checking object identity; that portion remains absent.",
+    "file": "scripts/plan-snapshot.py",
+    "fix_hint": "Create and retain the exact `RemoteDisconnected` instance raised by `drop_again`; have the patched predicate append its argument to a list; then assert one classifier call and `classified[0] is raised_exception`, alongside the existing one-attempt/no-sleep assertions. Apply the same identity check to the converse promotion leg (or use a shared recording predicate parameterized by its return value) so both directions prove that the caught object itself crosses the delegation boundary. Verify a reconstructed-exception mutant fails with the pristine self-test check count.",
+    "severity": "major",
+    "title": "Delegation test still does not prove the raised exception is classified"
+   }
+  ],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 materially improves the prior test: the false-result leg now proves immediate failure with exactly one attempt and no sleep, so the previously demonstrated private-allow-list mutant is killed. The production change also routes raw OSError-family failures through the shared taxonomy while preserving the existing URLError, TimeoutError, and JSON-decode retry behavior. One narrower but still major delegation gap remains from the prior requested fix: the test counts classifier calls but never records or identity-checks its argument. Consequently, a call site that asks the shared classifier about a reconstructed or substitute exception can satisfy every new assertion while failing to delegate classification of the exception actually raised by urlopen. Because this is a trust-plane self-test whose stated purpose is to prove the dependency at the production call site, approval remains fail-closed until that argument flow is pinned.",
+  "verdict": "request_changes"
+ }
+}
