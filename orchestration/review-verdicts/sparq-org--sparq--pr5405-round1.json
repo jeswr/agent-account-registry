@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5405,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b9b248b68ca59c02b4e3a67bc1485b41613054cb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "M4_WINDOW_HOURS is documented and justified as a fixed 24-hour window, and the new design explicitly says sub-day change-point/fidelity measurements are not validated. However, run() calls find_cadence_fidelity_gaps(lanes, now, args.window_hours), while fetch_lanes() also computes its shared truncated flag from args.window_hours. Thus --window-hours 6 makes M4 classify six-hour delivery using the 24-hour-derived 0.40 floor and admission assumptions; it can also mark samples truncated according to M1's window rather than M4's. This violates the detector's load-bearing measurement basis and can manufacture a chronic declaration finding from the exact sub-day burstiness the prose says must remain undetected. The added unit tests call the classifier with its 24-hour default, so they do not cover the production mismatch.",
+    "file": "scripts/ci_execution_latency_alarm.py",
+    "fix_hint": "Keep M4 on M4_WINDOW_HOURS in run(), independent of the M1 --window-hours value. Make fetch_lanes retain enough schedule history for both windows and compute truncation/coverage separately per detector (or store the oldest-sample coverage and let each classifier evaluate it). Add a call-path test using a non-24 --window-hours value that proves M1 uses the override while M4 still uses its validated 24-hour window.",
+    "severity": "major",
+    "title": "M4's fixed 24-hour validity assumption is overridden by the M1 CLI window"
+   }
+  ],
+  "progress": null,
+  "summary": "The M4 classifier and its focused tests are internally coherent for the documented 24-hour observation window, but the production call path does not preserve that invariant. The existing --window-hours argument is passed into both M4 and the fetch-layer truncation calculation, allowing M4 to operate on an unvalidated sub-day window even though the new design text explicitly rejects sub-day fidelity statistics. This can produce false chronic findings or silently skip M4 depending on the requested M1 window. The tests do not exercise this real call-path mismatch.",
+  "verdict": "request_changes"
+ }
+}
