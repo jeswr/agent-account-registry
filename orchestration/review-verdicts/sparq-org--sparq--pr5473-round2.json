@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5473,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f7d35614c09bdc81daf1f844a706f2414d9cf667",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and narrowly scoped as a research verification record rather than an implementation or soundness certification. The added program summary and detailed record consistently qualify all conclusions as source/diff-derived and unmeasured, preserve the sq-qhy4 external-review caveat, and explicitly keep the missing live failure-path test, uncertain Brillig message path, author review, and measurement work as blockers before advancing the upstream draft. The claims align internally: only call.rs patch applicability was checked, snapshot/review/runtime evidence was not reviewed, the predication and one-limb equivalence arguments state their source basis, and no canonical performance number or unqualified security/soundness claim is introduced. No actionable correctness, security, completeness, or test-validity issue is present in this documentation-only change.",
+  "verdict": "approve"
+ }
+}
