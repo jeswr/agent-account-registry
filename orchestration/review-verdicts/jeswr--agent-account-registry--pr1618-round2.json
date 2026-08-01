@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 1618,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0114c5d843aae3f6f47a4b693385ff35aa83f891",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Still present verbatim at :2850 \u2014 \"The scheduled provenance sweep records it within one cadence.\" \u2014 and at :2751 in the census (\"records these within one cadence\"). Both are unconditional, but backfill-provenance.yml's own header (:8-10) documents that a PR it cannot resolve (log unreadable / no anchored source / sources disagree / partial evidence / binding mismatch / author mismatch) is reported with a reason and left FAIL-CLOSED INVISIBLE. Run-log retention and GitHub's disabling of scheduled workflows on inactive repos are further reasons a given holder may never be cleared by a sweep.\n\nThe wording change also demotes the manual backfill from '**Recovery:**' to '**Recover sooner:**', reframing the one deterministic operator action as a mere optimisation. For the never-resolvable class the manual backfill fails identically, so an operator who trusts this receipt may wait out cadences for a record that will never land \u2014 the same 'hold whose exit nobody can find' failure mode (#703) this receipt exists to prevent, relocated from 'no remedy named' to 'remedy named that may not fire'. It stays MINOR only because the third path (area:* labelling, :2855-2858) is still named and still works unconditionally.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Qualify both sites, e.g. \"The scheduled provenance sweep attempts this every cadence; it leaves the PR recordless with a named reason when the run log cannot bind an implementer identity.\" Consider keeping the manual path labelled '**Recovery:**' rather than '**Recover sooner:**' so the deterministic action is not framed as optional.",
+    "severity": "minor",
+    "title": "CARRIED OVER from round 1 (unaddressed): receipt promises unconditional auto-recovery that backfill can legitimately never deliver"
+   },
+   {
+    "body": "The census wording is pinned exactly by two tripwires (:19111 and :19284), but the receipt's new claim is only reachable through the substring asserts at :23383-23392 \u2014 'o/r#51', 'backfill-provenance', 'apply=true', '12 ready row(s)', 'declares no `area:*` label of its own', 'labelling the PR with the `area:*` sections it actually touches'. NONE of them mentions the scheduled sweep, so the sentence at :2850 can be deleted or re-inverted without reding any self-test.\n\nThis file's own doctrine three lines above, at :23390 \u2014 \"Unasserted, this qualifier could be reverted green\" \u2014 is exactly the rule being skipped here, and it is the same gap that let the now-corrected 'nothing triggers it' wording survive after #1544 landed. Not a vacuous test (the surrounding asserts do flip red on wrong answers), just an uncovered new claim.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Add one assert beside the existing receipt asserts at :23392, e.g. `assert \"scheduled provenance sweep\" in receipt, receipt`, matching whatever phrasing is chosen for the first issue.",
+    "severity": "minor",
+    "title": "CARRIED OVER from round 1 (unaddressed): the new scheduled-sweep sentence in the receipt is unasserted and could be reverted green"
+   },
+   {
+    "body": "'**Recover sooner:**' (:2851) and '**Faster partial recovery (sparq#4821):**' (:2855) now both present themselves as the speed-up, which blurs which one an operator should reach for first (the label path is the one that actually unstarves the lane on the next tick; the backfill is the one that restores review visibility). Separately, the reflow leaves `f\"\\`apply=true\\`. It \"` as a two-word continuation fragment on :2852 \u2014 concatenation is correct and the emitted string is fine, it just reads oddly in source. Also a mild internal tension at :2849-2850: 'the hold does not expire' immediately followed by 'the scheduled provenance sweep records it within one cadence'.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Re-wrap :2851-2853 onto natural line boundaries, and consider distinguishing the two headings by WHAT each restores (lane throughput vs. review visibility) rather than both by speed.",
+    "severity": "nit",
+    "title": "Receipt now has two competing 'faster' headings, and the reflowed f-string leaves a two-word fragment"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2. The diff is materially IDENTICAL to round 1: the same three prose sites in scripts/dispatch-claim.py (the unprovenanced-narrowed census one-liner at :2747, the starvation_provenance_escalation docstring at :2786-2788, and the operator receipt at :2839-2852) plus the two exact-string tripwires. Neither of round 1's two minor findings was addressed, and nothing new was introduced -> stagnant.\n\nRE-VERIFIED INDEPENDENTLY against the checkout at PR head. .github/workflows/backfill-provenance.yml really does carry `schedule: cron '23 */4 * * *'` (:22-23, added under #1544); the `targets` job resolves EVERY enabled policy row when `target_repo` is empty, which is exactly what a schedule supplies (:80-94); and APPLY is `${{ inputs.apply || github.event_name == 'schedule' }}` (:169), so a scheduled run genuinely writes records across all enabled targets on a four-hour cadence. The new prose matches reality; the old prose ('workflow_dispatch-only and nothing triggers it') did not. Grepped the whole tree: no stale copy of the retracted claim survives (the remaining `dispatch-only` hits are auto-mint-provenance/mint-provenance and research docs, a different workflow).\n\nNO BEHAVIOUR CHANGE. No control flow, routing precedence, cause classification, pacing cap, lease/reservation logic, gate, permission block or classifier is touched. starvation_provenance_escalation still fires, still frees nothing, and the fail-closed `__global__` reservation is untouched. Nothing to arm; no token/PII surface; no workflow expansion of untrusted text.\n\nTEST VALIDITY: non-vacuous. Both exact-string tripwires (:19111-19117 and :19284-19289) were diffed character-for-character against the emitter at :2747-2752 and match; they still pin the WHOLE stdout of that leg, so wrapping the census emission in `if holders:` or dropping it still reds them. The receipt self-test at :23382-23392 asserts substrings that all survive the rewording ('backfill-provenance', 'apply=true',\u2026 [truncated 257 chars]",
+  "verdict": "approve"
+ }
+}
