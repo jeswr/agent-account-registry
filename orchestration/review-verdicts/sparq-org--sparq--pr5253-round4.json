@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5253,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6aff29ca3aafbe39929b5f583f34f8ed54729ed3",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 finds no correctness, soundness, test-validity, or security defect. The workflow explicitly checks out the immutable PR head SHA with full history, fails closed if either the base ref or checked-out HEAD violates its assumptions, records the exact base SHA graded, and runs the real C1 guard only after a clean merge. The tests pin the load-bearing checkout, HEAD verification, base merge, clean-merge gate, published SHA, merge-group backstop, permissions, and required-check behavior. This is materially unchanged from the already-clean round 3 result, and no reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
