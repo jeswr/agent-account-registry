@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5236,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "71eced6c620bd93f3315a3a51a3c9bf572ec06a7",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_pr_reachable` still uses `r\"uses:\\s*\\./\\.github/workflows/([A-Za-z0-9._-]+)\"`, which requires `./.github/workflows/...` immediately after optional whitespace. GitHub Actions accepts quoted YAML scalars such as `uses: './.github/workflows/release.yml'` and `uses: \"./.github/workflows/release.yml\"`; those edges remain absent from `graph`. A PR-triggered workflow can therefore reach an allowlisted release workflow through a quoted call while `test_no_release_only_workflow_is_reachable_from_a_pr_trigger` stays green, contradicting the asserted fail-closed inertness proof. The added transitive fixture uses unquoted `uses:` on both hops and does not cover the prior-round counterexample.",
+    "file": "scripts/tests/test_ci_select.py",
+    "fix_hint": "Recognize both unquoted and correctly closed single- or double-quoted local workflow references, or parse the YAML scalar conservatively. Add regression cases with quoted edges (including a transitive quoted hop) and assert the release workflow is reachable. Ambiguous local `uses:` syntax should fail closed instead of being silently ignored.",
+    "severity": "major",
+    "title": "Reachability scan still misses quoted reusable-workflow calls"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is stagnant: the round 3 major finding remains unchanged. The reusable-workflow edge regex still recognizes only unquoted local `uses:` values, so valid single- or double-quoted calls are omitted from the reachability graph. The claimed fail-closed proof therefore remains incomplete, and the new regression fixture still exercises only unquoted edges.",
+  "verdict": "request_changes"
+ }
+}
