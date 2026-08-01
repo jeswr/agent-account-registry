@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1500,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "118defb2caa2e57844802d540fa7a3cf61a42302",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "find_ingestion_rejections() uses created_jobs() for cancelled runs, but the newest action_required run is still cleared by `isinstance(jobs, int) and jobs > 0`. In Python, True satisfies that expression. The state-file route preserves JSON booleans, so `{\"job_counts\": {\"<rejected-id>\": true}}` places the lane in `approval-gated-with-jobs` and emits no finding even though no measured positive job count exists. This contradicts created_jobs()'s fail-closed contract and the change's stated rule that malformed state-file evidence must not mute a live alert. Existing new tests assert boolean refusal only for a cancelled_above candidate, leaving the primary mute branch untested.",
+    "file": "scripts/ci-latency-alert.py",
+    "fix_hint": "Use created_jobs(jobs) for the primary positive-job decision as well. Also use a non-boolean integer check when distinguishing zero from unreadable evidence and when serializing the finding. Add a detector test with an action_required newest verdict and its own job count set to True; it must remain alarmed and classify the count as unreadable rather than approval-gated or measured zero. Add an end-to-end state-file row for the same case so the JSON seam cannot regress.",
+    "severity": "major",
+    "title": "Boolean job count still clears the primary rejection path"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The cancelled-run and self-observation additions are otherwise carefully bound and well exercised, but the change leaves a fail-open inconsistency in the same M4 evidence path it is hardening. The new created_jobs() predicate correctly rejects booleans because JSON true is an int in Python, yet the primary action_required verdict branch still uses isinstance(jobs, int) and jobs > 0. A state-file value of true therefore classifies a rejected lane as approval-gated-with-jobs and suppresses its finding. The added boolean tests cover only cancelled_above evidence, so they do not catch this sibling mute path. Because round 2 had no findings and this round identifies a new major issue, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
