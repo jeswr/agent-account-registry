@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5247,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2194f7bff3b9cc1bfdcb8ae181e07d26f070c850",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The derived workflow scan checks only literal deploy/ tokens in workflow YAML, while _rust_build_inputs checks only Rust files and Cargo manifests/lockfile. A selection-gated Rust workflow can run a repository helper (for example `scripts/prepare-fixture.sh`) whose body reads deploy/; the workflow contains no deploy/ token and the helper is outside _rust_build_inputs, so every new test remains green even though deploy-only changes can alter the Rust lane that selection now skips. This invalidates the claimed non-interference proof despite fixing the prior filename allowlist.",
+    "file": "scripts/tests/test_ci_select_wiring.py",
+    "fix_hint": "Audit transitive workflow inputs, or conservatively scan repository-side executable/config inputs reachable from selection-gated Rust workflows for deploy/ references. At minimum add a mutation witness consisting of a workflow that invokes a helper and a helper body that reads deploy/, and require the audit to reject it. If a sound bounded dependency model is not feasible, remove deploy/ from _ORCHESTRATION_SAFE.",
+    "severity": "major",
+    "title": "Deploy dependency audit misses workflow helper indirection"
+   },
+   {
+    "body": "test_deploy_lane_workflows_run_no_cargo treats absence of the literal lowercase substring `cargo` as proof that the two allowlisted workflow definitions are Rust-inert. A workflow can invoke Rust work through a local action, reusable workflow, make/task target, wrapper script, or differently spelled command without containing that token. Such a change to deploy-lint.yml or deploy-terraform-lint.yml would itself classify orchestration-only and skip the Rust matrix, contrary to the allowlist's stated property.",
+    "file": "scripts/tests/test_ci_select_wiring.py",
+    "fix_hint": "Replace the substring assertion with a fail-closed structural policy for these allowlisted workflow files and their invoked local actions/helpers, with mutation witnesses for indirect Rust execution. Otherwise stop allowlisting the workflow definitions even if deploy/ itself remains allowlisted.",
+    "severity": "major",
+    "title": "Lowercase cargo substring is not a fail-closed Rust-inertness proof"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 fixes the prior hard-coded workflow-list defect by deriving the workflow corpus and rejecting stale exemptions. However, the non-interference proof remains fail-open across indirection: it scans only literal deploy/ references in workflow YAML and Rust source/manifests, so a Rust workflow can invoke a helper that reads deploy/ without either scan observing the dependency. The newly allowlisted deploy workflow definitions also rely on a raw lowercase `cargo` substring check, which does not prove those workflows are Rust-inert. These are new major soundness gaps in the expanded proof, so progress is regressing under the required rubric.",
+  "verdict": "request_changes"
+ }
+}
