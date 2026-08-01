@@ -3618,11 +3618,18 @@ _purge_before_target_code() {
 # Job boundary is a two-space-indented key (same convention as `_tokens_after_gate`), so the
 # clean jobs' own legitimate, revoking mints are deliberately not counted. The job name is matched
 # EXACTLY (compared as a string, never as a regex), so `run` cannot also match `run-something`.
+#
+# [PR #1522 round 2] `skip-token-revoke` only reaches the action as an INPUT, i.e. as a child of
+# that step's OWN `with:` mapping. The same line under the step's `env:` (or any other sibling
+# mapping) is an environment variable the action never reads, so the post-job revoker is still
+# registered — while a scan that matched the key anywhere inside the step would call that mint
+# protected. So the key is counted ONLY at with-child indentation while inside the `with:` block:
+# step-level keys sit at eight spaces and close the mapping, their children at ten.
 _worker_mints_missing_revoke_skip() {
   awk -v job="${2:-worker}" '
     /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
       if (injob && mint && !skip) print id
-      mint=0; skip=0; id="(unnamed)"
+      mint=0; skip=0; inwith=0; id="(unnamed)"
       key=$0; sub(/^  /,"",key); sub(/:[[:space:]]*$/,"",key)
       injob = (key == job)
       next
@@ -3630,11 +3637,13 @@ _worker_mints_missing_revoke_skip() {
     !injob { next }
     /^      -[[:space:]]/ {
       if (mint && !skip) print id
-      mint=0; skip=0; id="(unnamed)"
+      mint=0; skip=0; inwith=0; id="(unnamed)"
     }
+    /^        [A-Za-z0-9_.-]+:/ { inwith=0 }
+    /^        with:[[:space:]]*$/ { inwith=1 }
     /^[[:space:]]*id:[[:space:]]/ { ln=$0; sub(/^[[:space:]]*id:[[:space:]]*/,"",ln); id=ln }
     /^[[:space:]]*uses:[[:space:]]*actions\/create-github-app-token@/ { mint=1 }
-    /^[[:space:]]*skip-token-revoke:[[:space:]]*true[[:space:]]*$/ { skip=1 }
+    inwith && /^          skip-token-revoke:[[:space:]]*true[[:space:]]*$/ { skip=1 }
     END { if (injob && mint && !skip) print id }
   ' "$1"
 }
@@ -5677,6 +5686,58 @@ YAML
     "$(_worker_mints_missing_revoke_skip "$rf_revoke_absent" run | grep -Ec 'app-token-(publish|outcome|arm)' || true)" "0"
   chk "#1285: ...and those clean-job mints really exist to be skipped (control)" \
     "$(grep -Ec '^        id: app-token-(publish|outcome|arm)$' "$rf_wf" || true)" "3"
+  # PLACEMENT, not mere presence. `skip-token-revoke` disables the revoker only as an ACTION INPUT
+  # — a child of that step's own `with:`. Under the step's `env:` it is an environment variable the
+  # action never reads: the credential-bearing post phase is still registered, and the LIVE zero
+  # above would stay green while the hole is open. Neither the false nor the absent mutant can
+  # catch that (both only vary the key AT the correct place), so the third regression direction is
+  # the same key, same step, WRONG mapping — every mint must still be reported.
+  # The key is re-attached as a sibling `env:` mapping DIRECTLY AFTER the action's `with:` block —
+  # the ordering a real edit produces, and the one that exercises both halves of the placement
+  # guard: the `with:` opener AND the step-level key that must CLOSE it (leave the mapping open and
+  # this misplaced child reads as an input again).
+  local rf_revoke_misplaced="$tmp/review-fix-revoke-misplaced.yml"
+  awk '
+    function flush() { if (pending) { print "        env:"; print "          skip-token-revoke: true"; pending=0 } }
+    /^[[:space:]]*uses:[[:space:]]*actions\/create-github-app-token@/ { mint=1 }
+    inwith && $0 !~ /^          / && $0 !~ /^[[:space:]]*$/ { pending=1; inwith=0; mint=0 }
+    mint && /^        with:[[:space:]]*$/ { inwith=1 }
+    { flush(); print }
+    END { if (inwith) pending=1; flush() }
+  ' "$rf_revoke_absent" > "$rf_revoke_misplaced"
+  chk "#1285: skip-token-revoke under the step env: mapping (not its with:) is STILL REPORTED" \
+    "$(_worker_mints_missing_revoke_skip "$rf_revoke_misplaced" run | wc -l | tr -d ' ')" "2"
+  # ...over a fixture that really did RELOCATE the key rather than lose it — otherwise the line
+  # above merely re-asserts the absent mutant it was built from. Each mint in the file carries the
+  # key exactly once, as a child of an `env:` mapping (structurally valid YAML, just the wrong
+  # mapping), and the base fixture it was grown from carries none at all.
+  chk "#1285: ...and that fixture relocated the key, one per mint, each under an env: mapping" \
+    "$(grep -A1 '^        env:$' "$rf_revoke_misplaced" | grep -c '^          skip-token-revoke: true$' || true):$(grep -c '^          skip-token-revoke: true$' "$rf_revoke_absent" || true):$(grep -c 'uses:[[:space:]]*actions/create-github-app-token@' "$rf_wf" || true)" \
+    "6:0:6"
+  # ...and DEPTH is part of placement too: an input is a DIRECT child of `with:`, so the same text
+  # nested deeper — inside a block scalar the action passes through as a value — is not an input
+  # either. Asserted next to the accepting shape so the depth anchor is shown to reject only the
+  # text that is not an input, rather than rejecting everything (which would make the LIVE zeros
+  # unreachable rather than true).
+  local rf_revoke_depth="$tmp/revoke-depth-fixture.yml"
+  cat > "$rf_revoke_depth" <<'WFDEPTH'
+jobs:
+  run:
+    steps:
+      - name: a mint whose with: mapping merely CONTAINS the text, nested in a block scalar
+        id: app-token-textonly
+        uses: actions/create-github-app-token@v3
+        with:
+          private-key: |
+            skip-token-revoke: true
+      - name: a mint that really passes the input
+        id: app-token-proper
+        uses: actions/create-github-app-token@v3
+        with:
+          skip-token-revoke: true
+WFDEPTH
+  chk "#1285: only a DIRECT with:-child counts — deeper block-scalar text is still REPORTED" \
+    "$(_worker_mints_missing_revoke_skip "$rf_revoke_depth" run | tr '\n' ',')" "app-token-textonly,"
   # The job name is compared as a STRING, not a regex: an unrelated job whose name merely contains
   # the gate job's name must not be scanned, and a job that does not exist must read empty rather
   # than falling through to "scan everything".
