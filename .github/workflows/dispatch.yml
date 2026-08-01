@@ -1566,17 +1566,12 @@ jobs:
           # (executed_body_inputs_declared_verdict), so the next step that loads a script goes red in
           # pr-gate instead of halting dispatch. It is read by the EXECUTED BODY, never by the guard
           # module itself.
-          # scripts/gh_retry.py is loaded at MODULE IMPORT (issue #1025): every `gh api` GET the
-          # guard makes now runs through the shared bounded-retry layer, so one blipped read costs
-          # a jittered retry instead of the whole dispatch tick — measured at ~14 % of ticks lost,
-          # each one printing a maintainer remediation for three settings that were CORRECT.
           # KEEP THIS LIST IN SYNC — SELF_TEST_LIVE_INPUTS in scripts/dispatch-secrets-guard.py is
           # asserted against this very block every tick, so a new live-file dependency that is not
           # added here goes RED instead of silently degrading a check to vacuous.
           sparse-checkout: |
             scripts/dispatch-secrets-guard.py
             scripts/gh_403.py
-            scripts/gh_retry.py
             scripts/worker-live.sh
             scripts/worker-pr.py
             scripts/grant-account.py
