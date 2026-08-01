@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5537,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "993aace13b01fcd9caba775697c98181627be569",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior major findings. The ontology now types the three vendored dimension subjects only as sec-prop:SecurityProperty, matching the vendored YAML-LD, and explicitly avoids the unsupported owl:ObjectProperty assertion. The focused test parses the actual Turtle and verifies each public constant's subject/type triple, so it exercises the real artifact rather than a mock. The new public constants and ALL_SECPROP_IRIS membership are now documented in both the sparq-trust README and skills/access-control/SKILL.md. No correctness, soundness, security, or test-validity issue remains in the supplied diff.",
+  "verdict": "approve"
+ }
+}
