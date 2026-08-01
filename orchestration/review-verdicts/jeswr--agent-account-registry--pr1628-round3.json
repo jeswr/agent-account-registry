@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1628,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "bad7f0cdd0e3617b96b5ba521d26970641213153",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-three change resolves the prior major finding. Non-exact-match reactors are now intersected with the repository-owned collaborator roster before the 50-candidate cap, so public sock-puppet reactions cannot displace an ordinary write/maintain/admin collaborator's approval. The exact-match maintainer and App identities remain cap-exempt, roster failures narrow approval to those identities, and every emitted candidate still passes through the existing write+ trust probe. The added unit, YAML-seam, and executed workflow tests exercise the prior crowd-out corpus, a kill control, roster pagination/failure modes, exact-match hoisting, and unauthorized reactions; I found no diff-supported correctness, soundness, test-validity, or security defect.",
+  "verdict": "approve"
+ }
+}
