@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5241,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f2fd6b110f0f4ba37609dc27c33439990b9c04a1",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`artifact_covers_crate()` returns true for any token-delimited crate name anywhere in a matched file. This is weaker than the stated invariant that a site Surface record or an mdBook chapter covers that crate. For example, changing `surfaces.ts` to add a comment/TODO or another surface's blurb mentioning the new crate suppresses `new-crate-site-advert`; changing a book page that merely cross-references the crate suppresses `new-crate-guide-docs`. The guide case can also be suppressed by a changed SUMMARY mention alone even if no valid crate chapter exists. These cases still silently drop the only follow-on for unfinished work.",
+    "file": "scripts/flow-on.py",
+    "fix_hint": "Validate the artifact's relevant structure rather than searching for a bare token: require a site Surface entry whose crate-specific README/href identifies the evaluated crate, and require both a SUMMARY chapter entry and a corresponding changed/existing guide page whose include target identifies that crate. Add negative tests for a crate name appearing only in a comment/blurb/cross-reference and for a SUMMARY-only mention, while retaining the two-crate one-covered/one-uncovered test.",
+    "severity": "major",
+    "title": "Textual crate mentions are not proof that a shared artifact covers the crate"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 narrows suppression from PR-global path matching to per-crate textual attribution and adds the requested two-crate regression shape, but it still does not establish that the changed artifact actually supplies the required crate-specific site entry or guide chapter. Any token-delimited mention of the crate anywhere in a matched shared file suppresses the follow-on, so comments, blurbs, cross-references, or a SUMMARY link without a valid chapter can still silently lose the work. The prior major finding therefore remains materially unresolved; progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
