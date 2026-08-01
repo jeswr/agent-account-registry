@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5570,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "be7115011135784a612b7436c49b9510181bb581",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The added line reads 'The guide's Pages mount discussed in \u00a78 remains open'. In this file \u00a78 is '## 8. What this PR changes' (line 214), which covers the README/introduction.md {{#include}} anchoring and the mdbook-rewrite-links.py uppercase-pattern gap - it does not mention the Pages mount at all. The mount discussion is in \u00a77 ('Rustdoc as the generated bulk, and the one open decision'), heading at line 177, with '**The one genuinely blocked item is the Pages mount**' at line 192 and the (a)/(b) option list following it.\n\nThis is self-contradictory within the same block quote: the pre-existing banner text two lines above already uses '\u00a78' correctly for its true referent ('The one code change shipped alongside it is named in \u00a78'). A reader who follows the new pointer lands on the code-change section, finds no mount discussion, and cannot confirm the status claim - which defeats the purpose of a status banner whose whole job is to be checkable. Note the round-2 findings also mis-labelled this as 'Section 8', so the error was likely inherited from the review text rather than the record.",
+    "file": "research/docs-site-single-sourcing-anti-drift.md",
+    "fix_hint": "Change '\u00a78' to '\u00a77' in the added line: 'The guide's Pages mount discussed in \u00a77 remains open: `docs.yml` still has no deploy job, and `pages.yml` still records the guide-at-root versus `/guide/` decision as open.'",
+    "severity": "minor",
+    "title": "New banner cites the Pages mount as being discussed in \u00a78, but it is \u00a77"
+   },
+   {
+    "body": "The added text says 'see the linked runbook's Provenance section', but unlike research/docs-site-single-sourcing-anti-drift.md - whose banner does carry an explicit markdown link to ../docs/pages-cutover-runbook.md - this record never hyperlinks the runbook. It appears only as inline code spans further down (line 69, '(this is the broader Pages-cutover work in `docs/pages-cutover-runbook.md`)' and line 82), both of which are below the banner, so 'the linked runbook' is a forward reference to something that is named but not linked. The path is discoverable, so this is cosmetic only.",
+    "file": "research/dashboard-retirement-assessment.md",
+    "fix_hint": "Make the reference explicit in the banner, e.g. \"see the Provenance section of [`docs/pages-cutover-runbook.md`](../docs/pages-cutover-runbook.md)\", mirroring the wording already used in the anti-drift record.",
+    "severity": "nit",
+    "title": "'the linked runbook' has no link in this record's banner"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Docs-only PR adding a 'Post-record status' banner to two research records. Round 3 rewrites the banner prose, and all three round-2 findings are genuinely fixed, verified against this head.\n\n(1) The round-2 MAJOR on research/dashboard-retirement-assessment.md is resolved. The banner no longer calls the retirement criteria 'historical'; it now states plainly that 'the retirement cutover remains open: bench.yml still publishes the standalone dashboard to benchmark-data, and pages.yml overlays that tree into the site export.' That matches the tree: .github/workflows/bench.yml:630 still sets benchmark-data-dir-path: dev/bench and :725 is still the 'Seed Pages dashboard onto benchmark-data' step, while .github/workflows/pages.yml:266 is still 'Overlay benchmark dashboard(s) (dev/bench*) from benchmark-data'. The record's DO-NOT-RETIRE verdict and the lines 79-81 'actual retirement step' bullet are no longer contradicted.\n\n(2) The round-2 MAJOR on research/docs-site-single-sourcing-anti-drift.md is resolved. The banner now says the guide's Pages mount 'remains open: docs.yml still has no deploy job, and pages.yml still records the guide-at-root versus /guide/ decision as open.' Verified: docs.yml carries the 'WHY IT DOES NOT DEPLOY TO PAGES' block, :112 uploads the guide as 'CI artifact only - NOT a Pages deploy', and no configure-pages/upload-pages-artifact/deploy-pages step exists in that lane; pages.yml:43-44 still leaves the root question undecided.\n\n(3) The round-2 MINOR is resolved. Both banners now carry the runbook's own hedge verbatim in substance - 'complete on the repo side: the producer workflow exists. The Pages service setting is reported as flipped but is not verified here' - matching docs/pages-cutover-runbook.md:9-12 and its Provenance section at :18.\n\nThe sq-hsyg closure claim is also true: site/src/components/benchmarks/{trend-charts,scaling-charts,line-chart}.tsx exist and site/scripts/sync-benchmarks.mjs:93 emits a 20-commit his\u2026 [truncated 222 chars]",
+  "verdict": "approve"
+ }
+}
