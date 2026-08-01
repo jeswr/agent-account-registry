@@ -2747,8 +2747,9 @@ def format_unprovenanced_narrowed_census(repo, occupancy):
     return (f"unprovenanced-narrowed census {repo}: {len(holders)} open worker PR(s) have NO "
             f"registry provenance record but declare their own `area:*` labels, so they reserve "
             f"those areas instead of `{GLOBAL_PACKAGE}` — {detail}. Their records are still "
-            f"missing and `enumerate_review_items` still cannot see them; recovery is the "
-            f"`backfill-provenance` workflow with apply=true.")
+            f"missing and `enumerate_review_items` still cannot see them. The scheduled "
+            f"`backfill-provenance` sweep records these within one cadence; to recover sooner, "
+            f"run the workflow with apply=true.")
 
 
 # [registry #772] How many unprovenanced `__global__` holders ONE tick may escalate, per target
@@ -2782,8 +2783,9 @@ def starvation_provenance_escalation(planned_items, deferred, occupancy, log=pri
     no registry provenance record simply stayed at zero, invisibly, with no terminal state and no
     named recovery. MEASURED on jeswr/agent-account-registry: 5 of 84 successful dispatch ticks on
     2026-07-27 planned 0 items with every ready row deferred behind such a holder, and the three
-    PRs responsible (sparq-org/sparq #4360, #4509, #4528) were still recordless 16h/8h/4h later —
-    because `backfill-provenance.yml` is `workflow_dispatch`-only and nothing triggers it.
+    PRs responsible (sparq-org/sparq #4360, #4509, #4528) were still recordless 16h/8h/4h later.
+    At the time, `backfill-provenance.yml` was `workflow_dispatch`-only; it now runs a scheduled
+    sweep over every enabled target once per four-hour cadence.
 
     THIS FUNCTION FREES NOTHING. It does not touch the area set, the busy union, or the
     reservation: an unprovenanced PR's crates are genuinely unknowable and under-serialising them
@@ -2836,7 +2838,7 @@ def starvation_provenance_escalation(planned_items, deferred, occupancy, log=pri
 
 def starvation_provenance_escalation_body(repo, pr_number, deferred):
     """The operator-facing receipt for ONE escalated unprovenanced holder. Names the PR, the cost,
-    the cause and the ONE recovery that clears it — a hold whose exit nobody can find is the
+    the cause and the recovery paths that clear it — a hold whose exit nobody can find is the
     failure mode this replaces (registry #703)."""
     return (
         f"`{repo}#{pr_number}` reserves the serializing `{GLOBAL_PACKAGE}` partition because it "
@@ -2844,8 +2846,10 @@ def starvation_provenance_escalation_body(repo, pr_number, deferred):
         f"so the crates it touches are unknowable and the reservation fails closed. {deferred} "
         f"ready row(s) were deferred behind it this tick and the issue lane planned nothing.\n\n"
         f"It is NOT a candidate for the starvation park sweep (that only helps an un-parked, "
-        f"provably-inert draft), so no automatic remedy applies and the hold does not expire.\n\n"
-        f"**Recovery:** run the `backfill-provenance` workflow for `{repo}` with `apply=true`. It "
+        f"provably-inert draft), so that park remedy does not apply and the hold does not "
+        f"expire. The scheduled provenance sweep records it within one cadence.\n\n"
+        f"**Recover sooner:** run the `backfill-provenance` workflow for `{repo}` with "
+        f"`apply=true`. It "
         f"reconstructs the implementer identity from the worker run log and writes the record to "
         f"the `ledger` branch; the reservation then resolves to the PR's real `area:*` set.\n\n"
         f"**Faster partial recovery (sparq#4821):** labelling the PR with the `area:*` sections it "
@@ -19108,8 +19112,9 @@ agent = "impl"
         "unprovenanced-narrowed census example/repo: 0 open worker PR(s) have NO registry "
         "provenance record but declare their own `area:*` labels, so they reserve those areas "
         "instead of `__global__` — none. Their records are still missing and "
-        "`enumerate_review_items` still cannot see them; recovery is the `backfill-provenance` "
-        "workflow with apply=true.")
+        "`enumerate_review_items` still cannot see them. The scheduled `backfill-provenance` "
+        "sweep records these within one cadence; to recover sooner, run the workflow with "
+        "apply=true.")
     assert assembler_kept == [], assembler_kept
     assert assembler_output.getvalue().splitlines() == [expected_assembler_log,
                                                         expected_reservation_log,
@@ -19279,8 +19284,9 @@ agent = "impl"
         "unprovenanced-narrowed census example/repo: 0 open worker PR(s) have NO registry "
         "provenance record but declare their own `area:*` labels, so they reserve those areas "
         "instead of `__global__` — none. Their records are still missing and "
-        "`enumerate_review_items` still cannot see them; recovery is the `backfill-provenance` "
-        "workflow with apply=true.",
+        "`enumerate_review_items` still cannot see them. The scheduled `backfill-provenance` "
+        "sweep records these within one cadence; to recover sooner, run the workflow with "
+        "apply=true.",
     ]
     stall_census = {}
     for stall_order in (stall_pulls, list(reversed(stall_pulls))):
