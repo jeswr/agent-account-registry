@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5505,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "93559448516bb5f6f831787cbee7aa220674f71b",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the sole round-2 finding. gui/e2e-playwright/specs/zk-tool.spec.ts now drives the GUI's actual exported-browser path through lazy package loading, ACIR fetch, prover warm-up, live-store witness selection, Noir witness execution, UltraHonk generation and verification, rendered public inputs, and the narrowly classified opposite-verdict refusal. Its assertions are non-vacuous: it requires a verified proof, exactly five populated public inputs with expected op/bound values, absence of the witness value, a specific declined uncommitted row, and refusal without the generic error branch or a stale proof card. The workflow gives this real single-threaded run sufficient job time, while the UI and README consistently retain the research-track/not-externally-audited sq-qhy4 caveat. No hostile reviewer-directed instruction was found in the diff.",
+  "verdict": "approve"
+ }
+}
