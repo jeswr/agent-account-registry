@@ -2046,11 +2046,21 @@ def _self_test():
             _c["n"] += 1
             return False
 
+        # round-3 review: count the attempts and capture the sleeps. `drop_again` raises on
+        # EVERY call, so `FetchError` alone is what BOTH designs produce -- the retrying one
+        # simply arrives there three attempts and two sleeps later. Only these two counters
+        # distinguish "followed the predicate immediately" from "exhausted the ladder anyway",
+        # and following it immediately is the whole point: a fatal error re-tried is a tick's
+        # budget spent to reach the same failure.
+        dropped = {"n": 0}
+
         def drop_again(request, timeout=None):
+            dropped["n"] += 1
             raise RemoteDisconnected("Remote end closed connection without response")
 
         with patch.object(http_transient, "is_transient_network", say_not_transient), \
-                patch.object(module, "urlopen", drop_again), patch.object(time, "sleep"):
+                patch.object(module, "urlopen", drop_again), \
+                patch.object(time, "sleep") as slept_d:
             try:
                 make_fetch("t")("https://api.github.com/x")
             except FetchError:
@@ -2058,6 +2068,12 @@ def _self_test():
             else:
                 raise AssertionError("delegation: a RemoteDisconnected must be FATAL once the "
                                      "shared taxonomy calls it non-transient")
+        assert dropped["n"] == 1, (
+            "a predicate verdict of NOT-transient must fail on the FIRST attempt: "
+            f"made {dropped['n']} attempts, so the ladder ran regardless of the verdict")
+        assert slept_d.call_args_list == [], (
+            "a predicate verdict of NOT-transient must not sleep before failing",
+            slept_d.call_args_list)
         assert inverted["n"] >= 1, (
             "make_fetch never CALLED http_transient.is_transient_network — the retry decision is "
             "a caller-private opinion, which is exactly the half-consolidation this change removes")
