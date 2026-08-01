@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1491,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "60ed963d67d17e44c79ea57a6ed3ccf4f690c859",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The recovery launch is committed before `record-marker`, and a `DispatchError` from that write only increments in-memory telemetry and continues. If the launched reviewer dies before `review-outcome` records its round and the marker write also fails, the next tick sees neither a round nor an attempt. Repeating that real failure mode dispatches forever without reaching `STRANDED_RECOVERY_LIMIT`. The comment's claim that the residual costs at most one attempt is unsupported: persistent target-write failure, or repeated process death in the launch/write window, can lose every charge. The added marker-write-failure row proves the launch remains uncharged but does not run subsequent ticks or prove convergence, so the marquee round-independent bound is incomplete.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Use a durable reservation/commit state that is written before launch but is not charged as a confirmed dispatch until launch succeeds; reconcile stale or ambiguous reservations fail-closed without fabricating human-terminal evidence. Alternatively provide another durable, bounded reconciliation path for confirmed launches whose post-launch marker cannot be recorded. Add a multi-tick test where each launch succeeds, no round marker lands, and each attempt-marker write fails; assert the system converges without falsely counting failed launches.",
+    "severity": "major",
+    "title": "Post-launch marker failures bypass the recovery bound indefinitely"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The prior round's false-charge defect is fixed: a nonzero `workflow run` result now releases the lease and cannot advance the stranded-recovery counter, and the new failed-launch test exercises that boundary non-vacuously. However, moving the only durable charge after launch leaves the opposite crash/write-failure window unbounded. A recovery can be successfully dispatched, fail before writing its round marker, and then also fail to write `strandedrecover`; repeating that sequence leaves both counters flat forever. The code calls this at most one lost attempt, but neither control flow nor a durable reservation enforces that claim. Because this is a new major completeness defect while the prior major is resolved, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
