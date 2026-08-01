@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1479,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f7a3b24587a1d6c60315005402a0ed65bcc60e99",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "After the validation loop, `check(\"every staged...\", sorted(_staged), sorted(_staged))` compares a value with itself. Deleting the entire `for _name in sorted(_staged)` block therefore leaves this check green and preserves the pristine check count, even though no staged row is validated. The shipped solid-sdk row catches mutations that make that row invalid, but the suite does not catch deletion or conditional bypass of the newly added validation control itself. This is the value-identical/vacuous assertion shape the repository pre-flight explicitly requires authors to reject.",
+    "file": "scripts/policy-resolve.py",
+    "fix_hint": "Accumulate a success value only after each `_policy_row(_name, _probe)` call returns, then compare that independently produced result with the staged-row expectation. Add a non-crashing deletion/conditional-inert mutation proving the pristine and mutant runs execute the same total check count and that bypassing validation produces a line-anchored failure. Do not compare `_staged` directly with itself.",
+    "severity": "major",
+    "title": "The staged-row guard ends in a tautological check"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Both round-1 defects are substantively corrected: the staged row now uses a supported profile and the enrolment probe starts from an independently asserted empty value. The new staged-row validation does exercise the shipped policy under enabled=true, but its only named check is value-identical and remains green if the validation loop is deleted. That leaves the newly advertised invariant without a non-vacuous deletion guard, so one major test-validity issue remains.",
+  "verdict": "request_changes"
+ }
+}
