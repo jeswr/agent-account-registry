@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1522,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b56ad1c1bba02a6cefd0ddcf53bbdd26bae71d85",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly extends the post-gate credential boundary to both token mints in review-fix.yml's gate-running run job while leaving token revocation enabled in isolated jobs that do not execute target code. The scanner now selects the requested job by exact parsed key, retains the worker default for the existing lane, and reports mints that either omit skip-token-revoke or set it false. The added checks are non-vacuous in both failure directions, verify the expected mint population, demonstrate clean-job exclusion, and cover exact job-name matching plus an absent job. I found no correctness, soundness, security, or test-validity issue in the diff.",
+  "verdict": "approve"
+ }
+}
