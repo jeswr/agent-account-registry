@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5667,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "892a4ad2ed76d28df7ebd8685386907a8553d00f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 3.1/4 require a regression guard for the property relied on by the capacity-assert elision in patched `BoundedVec::push`, and the amendment repeatedly says section 5 now specifies that test. But L1 tests only a plain `[Field; 4]` dynamic write. Section 5.6 explicitly says the actual BoundedVec form L2 makes both in-range and out-of-range mutations reject because dependent witnesses are stranded, and it leaves the necessary reshaping unresolved. L1 can provide evidence for the generic ACIR memory-bound premise, but it cannot go red if a later change to `BoundedVec::push` removes or misplaces the relevant write or otherwise violates the claimed domination argument. Thus the real-path invariant remains without the promised non-vacuous test specification.",
+    "file": "research/noir-bounded-vec-capacity-assert-5027.md",
+    "fix_hint": "Either narrow all new claims to say section 5 specifies only a compiler-mechanism prerequisite/control, leaving the BoundedVec push regression guard unspecified, or provide a concrete L2/harness construction whose in-range forged witness verifies and whose out-of-range witness reaches the actual patched `push` write and rejects. Keep the three-way honest/in-range/out-of-range matrix for that real-path fixture. Update the companion-program wording consistently.",
+    "severity": "major",
+    "title": "The specified fixture does not exercise the patched BoundedVec push path"
+   },
+   {
+    "body": "The table says the needed test is specified command-by-command in the companion record, but the only fully shaped fixture is the plain-array L1 mechanism test; the BoundedVec form needed to exercise the elided assertion remains unresolved and is described as producing no verdict in its current form.",
+    "file": "research/noir-optimization-program.md",
+    "fix_hint": "Describe section 5 as a specification of the ACIR memory-bound mechanism test and positive-control pattern, not the completed BoundedVec push regression test, unless a non-vacuous L2 design is added.",
+    "severity": "minor",
+    "title": "Companion record overstates completion of the test specification"
+   }
+  ],
+  "progress": null,
+  "summary": "The amendment is careful about non-vacuity and explicitly avoids claiming an executed result, but it does not actually specify the missing regression test for the patched BoundedVec::push path. Its executable design is L1, a plain-array compiler-mechanism fixture; the document itself concedes that the real BoundedVec form (L2) strands dependent witnesses and yields no verdict unless it is reshaped, without specifying such a reshaping. Therefore the new claims that section 5 specifies the section 3.1 test and closes issue #5062 overstate what has been provided.",
+  "verdict": "request_changes"
+ }
+}
