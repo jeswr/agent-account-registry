@@ -33,6 +33,7 @@ migrate-secrets.sh
 mint-provenance.py
 model-health.py
 no_change_routing.py
+park-stock-alert.py
 park_policy.py
 pat-validity.py
 plan-alert.py
