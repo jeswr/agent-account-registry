@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5558,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a174c341e0e3be868bd8fdea4cddba3334c401df",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change adds focused, byte-exact coverage for the previously untested RDF 1.2 canonical N-Quads cases: VT and U+000E-U+001F escaping, plus named-node and blank-node graph labels. The helper exercises the real Quad-based canonicalization entry point, the expected documents include the trailing newline, and the round-trip test now preserves and checks the fourth graph term while correctly omitting DefaultGraph. The assertions are non-vacuous and cover both graph-label variants. No correctness, soundness, security, or prompt-injection issue was found. The targeted test could not be executed in this environment because cargo is unavailable, but the API usage matches the repository's canonicalize_rdf12 signature.",
+  "verdict": "approve"
+ }
+}
