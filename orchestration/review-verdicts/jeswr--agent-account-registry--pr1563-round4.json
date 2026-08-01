@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1563,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "aa7b1c50ef7e967541ee70f82e00ff7a3ab356d8",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change is correct and complete within the diff scope. It adds an always-emitted, bounded conflict-stage census without changing frontier selection or weakening a trust check. The census snapshots in-flight reservations before selection, distinguishes reserved-key collisions from cross-cutting refusal without double-counting, names GLOBAL occupancy, reports zero/empty boards, and deterministically caps ranked detail. Exact full-line self-tests cover the live width-exhaustion shape, healthy frontier-only serialization, both GLOBAL directions, no-double-count behavior, ranking/cap overflow, direct pure-function derivation, and the integration log split while retaining exact defer assertions. I found no blocker, major correctness, soundness, security, or test-validity issue, and no instruction-like injection in the diff.",
+  "verdict": "approve"
+ }
+}
