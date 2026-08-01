@@ -86,6 +86,11 @@ DISPATCH_REQUIRED_LANES = ("worker", "review", "fix", "disarm")
 # Issue #841: the snapshot itself is readable on the PUBLIC `ledger` branch, so this contract no
 # longer REQUIRES the per-account rows either — `flow.lease_utilization_1h` may be sent already
 # aggregated, and a collector that does so writes no per-account row array to a public branch.
+# Issue #891: and now it REFUSES them. Not requiring the rows left the legacy path accepted, so a
+# collector authored against the older prose still parked the array on the public branch with every
+# check green; `scripts/ledger-invariant.py` refuses it at the ledger ref and `_obs_flow` refuses it
+# here. The decision-22 label check below is unchanged and still runs FIRST, so a raw handle is
+# still reported as the privacy incident it is rather than as a deprecated shape.
 OBS_SCHEMA = "registry-observability/v1"
 # Issue #375: the salted label is the CANONICAL account fingerprint — sha256(handle:salt)[:16],
 # locked decision 22a, the one shape model-health.account_hash / worker-pr.account_hash produce and
@@ -1595,8 +1600,8 @@ def _obs_exit_rows(items):
 
 
 def _obs_lease_aggregate(value):
-    """A lease-utilization aggregate the COLLECTOR computed, i.e. the row-free form of the input
-    (issue #841). Same published shape as the rows-derived one: ``{"mean", "max"}``.
+    """A lease-utilization aggregate the COLLECTOR computed — since issue #841 the row-free form of
+    this input, and since issue #891 the ONLY one: ``{"mean", "max"}``.
 
     Fail-closed to None — the panel stat hides — rather than to a plausible-looking number: both
     fields must be real fractions and ``max >= mean``, which no aggregate over real samples can
@@ -1617,9 +1622,9 @@ def _obs_flow(flow):
     arm→merge latency, target-CI congestion. A lease row whose label is not the canonical 16-hex
     salted account fingerprint (issue #375) is a raw account identity reaching the collector
     output — or a second identity format nothing else here speaks — a decision-22 privacy
-    incident, fatal — and since issue #374 the rows themselves are aggregated away rather than
-    republished (issue #841: and since the rows sit on a PUBLIC branch, they need not be sent at
-    all)."""
+    incident, fatal. Since issue #374 the rows themselves were aggregated away rather than
+    republished; since issue #891 sending them at all is fatal too (they sit on a PUBLIC branch),
+    and the fleet-wide utilization comes only from the collector's own `lease_utilization_1h`."""
     if not isinstance(flow, dict):
         return None
     queue = []
@@ -1647,18 +1652,24 @@ def _obs_flow(flow):
     # collector's snapshot lives at data/observability.json on the `ledger` branch of this PUBLIC
     # repo, so a consumer contract that says "keep sending one row per account and we will drop
     # them" still parks a per-account row array — fleet size, stable salted labels — one branch
-    # over from the page #374 cleaned. So the aggregate is now accepted DIRECTLY as
-    # `flow.lease_utilization_1h`, and a collector can satisfy this panel while writing no rows to
-    # the public branch at all. Two properties this must NOT trade away, both self-tested:
-    #   * rows-first precedence, keyed on the PRESENCE of the legacy `leases` key rather than on
-    #     whether a row happened to parse. A collector mid-migration that sends both keeps exactly
-    #     today's published value — including the null it publishes when the rows it sent carry no
-    #     usable `utilization_1h` — so the new key can never override a legacy result. Only the
-    #     genuinely row-free form (no `leases` key at all) consults the collector's aggregate.
-    #   * the decision-22 label check is unconditional over the rows that ARE present. Supplying
-    #     the aggregate is not a way to smuggle an unvalidated row past it, and a collector that
-    #     regresses to writing rows is still caught the moment a raw handle appears in one.
-    lease_utilizations = []
+    # over from the page #374 cleaned. #841 therefore accepted the collector's own aggregate
+    # DIRECTLY as `flow.lease_utilization_1h` so a collector need write no rows anywhere.
+    #
+    # Issue #891: not REQUIRING the rows is not the same as refusing them, and #841 deliberately
+    # kept the legacy path so a mid-migration collector stayed byte-identical — which left the only
+    # outcome that matters unchanged: a collector authored against the older prose re-parks the row
+    # array on a public branch and every check stays green. So the legacy path is gone. Two
+    # properties of its removal, both self-tested:
+    #   * it is a REFUSAL, never a silent drop, and it keys on the PRESENCE of the `leases` key
+    #     rather than on whether a row parsed. Ignoring the rows instead would let the collector's
+    #     aggregate silently override the measurements a rows-sending collector actually reported —
+    #     exactly the silent override #841's rows-first precedence existed to prevent. The refusal
+    #     names the fix so the collector author is not left guessing.
+    #   * the decision-22 label check still runs FIRST and is still unconditional over the rows
+    #     that ARE present. A raw handle in the collector's output is a privacy incident whether or
+    #     not this build would have published the row, and it must be reported as that rather than
+    #     as a deprecated shape — which is also what keeps OBS_SALTED_LABEL_RE (issue #375's
+    #     canonical 16-hex fingerprint) load-bearing now that no row is ever consumed.
     for item in flow.get("leases") if isinstance(flow.get("leases"), list) else []:
         if not isinstance(item, dict):
             continue
@@ -1666,16 +1677,11 @@ def _obs_flow(flow):
         if not isinstance(label, str) or OBS_SALTED_LABEL_RE.fullmatch(label) is None:
             raise DashboardError(
                 "observability lease row does not carry a salted account label (decision 22)")
-        utilization = _obs_fraction(item.get("utilization_1h"))
-        if utilization is not None:
-            lease_utilizations.append(utilization)
     if "leases" in flow:
-        lease_utilization = {
-            "mean": round(sum(lease_utilizations) / len(lease_utilizations), 2),
-            "max": round(max(lease_utilizations), 2),
-        } if lease_utilizations else None
-    else:
-        lease_utilization = _obs_lease_aggregate(flow.get("lease_utilization_1h"))
+        raise DashboardError(
+            "observability snapshot carries per-account flow.leases rows on the public ledger "
+            "branch; send the pre-aggregated flow.lease_utilization_1h instead (issue #891)")
+    lease_utilization = _obs_lease_aggregate(flow.get("lease_utilization_1h"))
 
     rounds = flow.get("review_rounds")
     review_rounds = None
@@ -4435,11 +4441,9 @@ const degraded = (node) =>
         "flow": {"queue": [{"class": "2a", "depth": 1, "oldest_age_minutes": 12.34},
                            {"class": "4", "depth": 9, "oldest_age_minutes": 3},
                            {"class": "9z", "depth": 1}],
-                 "leases": [{"label": "ab12cd340a5f9e71", "provider": "anthropic",
-                             "utilization_1h": 0.8},
-                            {"label": "ef56ab78b3c2d104", "provider": "anthropic",
-                             "utilization_1h": 0.4},
-                            {"label": "cd90ef1276a8b535", "provider": "openai"}],
+                 # [#891] the row-free contract: the collector's own aggregate and NO per-account
+                 # rows. A `leases` key here would now be a refusal, not a golden document.
+                 "lease_utilization_1h": {"mean": 0.6, "max": 0.8},
                  "review_rounds": {"mean": 1.44444, "max": 3, "budget_exhausted_1h": 0},
                  "parks_1h": {"needs_user": 2, "needs_orchestrator": 1},
                  "arm_to_merge_minutes_24h": {"p50": 18, "p90": 55.5, "samples": 9},
@@ -4470,9 +4474,8 @@ const degraded = (node) =>
                                   {"model": "fable", "exit_class": "success", "count": 3}],
         "flow": {"queue": [{"class": "2a", "depth": 1, "oldest_age_minutes": 12.3},
                            {"class": "4", "depth": 9, "oldest_age_minutes": 3.0}],
-                 # [#374] three validated lease rows in, ZERO published: only the mean/max of the
-                 # utilizations that parsed (0.8, 0.4 -> 0.6/0.8). The unparseable third row proves
-                 # the aggregate is taken over reporting rows, and the count itself never appears.
+                 # [#374/#891] the published flow carries fleet-wide summary statistics only —
+                 # nothing that reads out the fleet's size or names an account.
                  "lease_utilization_1h": {"mean": 0.6, "max": 0.8},
                  "review_rounds": {"mean": 1.44, "max": 3, "budget_exhausted_1h": 0},
                  "parks_1h": {"needs_user": 2, "needs_orchestrator": 1},
@@ -4530,102 +4533,91 @@ const degraded = (node) =>
             schema_rejected = False
         check(f"alien observability document rejected loudly ({type(bad_document).__name__})",
               schema_rejected, True)
-    raw_label = copy.deepcopy(obs_fixture)
-    raw_label["flow"]["leases"][0]["label"] = handle   # a raw account handle, not the salted form
-    try:
-        _normalize_observability(raw_label)
-    except DashboardError:
-        label_rejected = True
-    else:
-        label_rejected = False
-    check("raw (non-salted) lease label is a fatal privacy violation (decision 22)",
-          label_rejected, True)
-    # [#374] ...and the salted labels are not published either. Two fleets whose lease rows differ
-    # only in COUNT must normalize identically; pre-#374 the row array itself was the disclosure.
-    def obs_leases(rows):
+    # ---- [#891] per-account lease ROWS are REFUSED — here, and at the ledger ref itself by
+    # scripts/ledger-invariant.py. #374 stopped this build PUBLISHING the rows and #841 stopped it
+    # REQUIRING them; neither stopped a collector PARKING the array at data/observability.json on
+    # the PUBLIC `ledger` branch, and the array existing there — fleet size, stable salted labels —
+    # is the disclosure whether or not any build reads it. Dropping the legacy aggregation path is
+    # only fail-closed as a REFUSAL: silently ignoring the rows would let the collector's aggregate
+    # override the measurements a rows-sending collector actually reported, which is the silent
+    # override #841's rows-first precedence existed to prevent.
+    #
+    # Every row below asserts WHICH refusal fired, never merely THAT one did. Both refusals raise
+    # DashboardError, so a boolean "it raised" would let the row refusal stand in for the
+    # decision-22 label check and turn every #375 row underneath it vacuous.
+    def obs_rows_refusal(rows):
+        """`flow.leases = rows` classified by the refusal it earns, from the message text."""
         fixture = copy.deepcopy(obs_fixture)
         fixture["flow"]["leases"] = rows
-        return obs_normalized(fixture)["flow"]
+        try:
+            _normalize_observability(fixture)
+        except DashboardError as error:
+            message = str(error)
+            if "salted account label" in message:
+                return "privacy"
+            return "deprecated" if "flow.leases" in message else f"unclassified: {message}"
+        return "published"
 
-    one_lease = obs_leases([{"label": "ab12cd340a5f9e71", "provider": "anthropic",
-                             "utilization_1h": 0.5}])
-    four_leases = obs_leases([{"label": f"ab12cd340a5f9e7{index}", "provider": "anthropic",
-                               "utilization_1h": 0.5} for index in range(4)])
-    check("[#374] lease rows of different fleet sizes normalize to the same published flow",
-          (one_lease, one_lease == four_leases,
-           "ab12cd340a5f9e71" in json.dumps(one_lease)),
-          (four_leases, True, False))
-    check("[#374] no reported lease utilization publishes nothing rather than a zero",
-          obs_leases([])["lease_utilization_1h"], None)
+    salted = "ab12cd340a5f9e71"
+    for case, rows in (
+        ("a canonically-labelled row array", [{"label": salted, "provider": "anthropic",
+                                               "utilization_1h": 0.5}]),
+        ("a four-row array (the fleet size IS the disclosure)",
+         [{"label": f"ab12cd340a5f9e7{index}", "provider": "anthropic", "utilization_1h": 0.5}
+          for index in range(4)]),
+        ("an EMPTY row array", []),
+        ("a null `leases` key", None),
+        ("a non-list `leases` key", {salted: 0.5}),
+        ("rows reporting no usable utilization", [{"label": salted, "provider": "anthropic"}]),
+    ):
+        # Presence-keyed and unconditional: re-key the refusal on a row having parsed — or drop it
+        # for the collector's aggregate — and the last four of these publish instead of refusing.
+        check(f"[#891] {case} is refused, never published and never silently dropped",
+              obs_rows_refusal(rows), "deprecated")
+    check("raw (non-salted) lease label is a fatal privacy violation (decision 22), reported as "
+          "that rather than as the deprecated row shape",
+          obs_rows_refusal([{"label": handle, "provider": "anthropic", "utilization_1h": 0.5}]),
+          "privacy")
     # ---- [#375] the salted label IS the canonical account fingerprint, sha256(handle:salt)[:16]
     # (locked decision 22a). Pre-#375 this seam validated an 8-hex shape that NOTHING in this repo
     # produces, so a collector handing over the same fingerprint model-health / worker-pr / the
     # lease ledger all carry would have failed the build, while a truncated half of one was waved
     # through as "salted". The accept row derives its label from the canonical implementation
     # rather than from a literal, so a shortening on EITHER side of the wire turns it red.
+    #
+    # [#891] No row is ever consumed now, so the ACCEPTED shape is the one whose row earns the
+    # deprecation refusal rather than the privacy one — which is what keeps OBS_SALTED_LABEL_RE
+    # load-bearing after the legacy path is gone. Narrowing the pattern (back to `{8}`) flips the
+    # canonical row to "privacy"; widening it to `{8,16}` — the tempting "accept both" — flips the
+    # three rejection rows it newly admits to "deprecated" (measured: only the 17-hex overrun still
+    # fails that pattern, so the other three carry the mutant). Both directions are red.
     canonical_label = _model_health_module().account_hash("acct-obs-375", "fixture-salt")
-    canonical_flow = obs_leases([{"label": canonical_label, "provider": "anthropic",
-                                  "utilization_1h": 0.5}])
-    check("[#375] the CANONICAL salted fingerprint (model-health.account_hash) is the accepted "
-          "lease label, and its row is really consumed rather than merely tolerated",
-          (len(canonical_label), canonical_flow["lease_utilization_1h"]),
-          (16, {"mean": 0.5, "max": 0.5}))
-    # ...and the pre-#375 8-hex format is now fatal rather than a second accepted identity shape.
-    # Widening the pattern back to `{8}` kills the row above; widening it to `{8,16}`/`{8,}` — the
-    # tempting "accept both" — is what these rows exist to kill, so they assert REJECTION.
+    check("[#375] the CANONICAL salted fingerprint (model-health.account_hash) is still the one "
+          "accepted lease label, not a decision-22 violation",
+          (len(canonical_label), obs_rows_refusal([{"label": canonical_label,
+                                                    "provider": "anthropic",
+                                                    "utilization_1h": 0.5}])),
+          (16, "deprecated"))
     for case, bad_label in (("the pre-#375 8-hex format", "ab12cd34"),
                             ("the canonical fingerprint truncated to 8 hex", canonical_label[:8]),
                             ("a 15-hex near-miss", canonical_label[:15]),
                             ("a 17-hex overrun", canonical_label + "0")):
-        mis_shaped = copy.deepcopy(obs_fixture)
-        mis_shaped["flow"]["leases"][0]["label"] = bad_label
         check(f"[#375] {case} is a fatal decision-22 violation, never a second accepted format",
-              _raises_dashboard(lambda: _normalize_observability(mis_shaped)), True)
-    # ---- [#841] the ROW-FREE collector contract. #374 stopped this build PUBLISHING the rows; it
-    # did not stop them EXISTING at data/observability.json on the public `ledger` branch. So the
-    # aggregate is accepted directly and a collector need write no per-account rows anywhere.
-    def obs_flow_without_rows(aggregate):
+              obs_rows_refusal([{"label": bad_label, "provider": "anthropic",
+                                 "utilization_1h": 0.5}]), "privacy")
+    # ---- [#841] the ROW-FREE collector contract, which since #891 is the ONLY one: the collector
+    # computes `flow.lease_utilization_1h` itself and writes no per-account rows anywhere.
+    def obs_flow_aggregate(aggregate):
         fixture = copy.deepcopy(obs_fixture)
-        fixture["flow"].pop("leases", None)          # the collector sends NO per-account rows
         fixture["flow"]["lease_utilization_1h"] = aggregate
         return obs_normalized(fixture)["flow"]["lease_utilization_1h"]
 
-    check("[#841] a collector that sends NO lease rows still publishes the aggregate it computed",
-          obs_flow_without_rows({"mean": 0.31, "max": 0.77}), {"mean": 0.31, "max": 0.77})
-    # Precedence is ROWS-FIRST and total, so a collector mid-migration that sends both publishes
-    # exactly its pre-#841 value — the new key can never silently override real measurements.
-    # Flipping the precedence turns this into {0.99, 0.99}.
-    both = copy.deepcopy(obs_fixture)
-    both["flow"]["lease_utilization_1h"] = {"mean": 0.99, "max": 0.99}
-    check("[#841] lease ROWS outrank a collector-supplied aggregate (no silent override)",
-          obs_normalized(both)["flow"]["lease_utilization_1h"],
-          {"mean": 0.6, "max": 0.8})
-    # ...and precedence keys on the legacy KEY, not on a row happening to parse. Rows that are
-    # present but report no usable utilization published null pre-#841 and must still publish null:
-    # make the fallback conditional on `lease_utilizations` instead and these become {0.99, 0.99},
-    # i.e. the new key overriding a legacy source that was sent.
-    for case, rows in (
-        ("no utilization field", [{"label": "ab12cd340a5f9e71", "provider": "anthropic"}]),
-        ("malformed utilization", [{"label": "ab12cd340a5f9e71", "provider": "anthropic",
-                                    "utilization_1h": "busy"}]),
-        ("zero rows", []),
-    ):
-        unparseable = copy.deepcopy(both)
-        unparseable["flow"]["leases"] = rows
-        check(f"[#841] legacy rows with {case} keep their pre-#841 null, aggregate or not",
-              obs_normalized(unparseable)["flow"]["lease_utilization_1h"], None)
-    # ...and sending the aggregate is NOT a way around the decision-22 check on the rows that ARE
-    # present. Make the label check conditional on the rows being used and this normalizes happily.
-    both_raw = copy.deepcopy(both)
-    both_raw["flow"]["leases"][0]["label"] = handle    # a raw account handle alongside a valid mean
-    try:
-        _normalize_observability(both_raw)
-    except DashboardError:
-        aggregate_is_no_bypass = True
-    else:
-        aggregate_is_no_bypass = False
-    check("[#841] a raw lease label stays fatal even when an aggregate is also supplied",
-          aggregate_is_no_bypass, True)
+    check("[#841] a collector that sends NO lease rows publishes the aggregate it computed",
+          obs_flow_aggregate({"mean": 0.31, "max": 0.77}), {"mean": 0.31, "max": 0.77})
+    no_aggregate = copy.deepcopy(obs_fixture)
+    no_aggregate["flow"].pop("lease_utilization_1h")
+    check("[#841] a flow with neither rows nor an aggregate publishes nothing, never a zero",
+          obs_normalized(no_aggregate)["flow"]["lease_utilization_1h"], None)
     for case, aggregate in (
         ("incoherent (max < mean)", {"mean": 0.8, "max": 0.4}),
         ("out-of-range fraction", {"mean": 0.2, "max": 1.4}),
@@ -4634,7 +4626,7 @@ const degraded = (node) =>
         ("non-object", [0.2, 0.4]),
     ):
         check(f"[#841] {case} collector aggregate is dropped, never published",
-              obs_flow_without_rows(aggregate), None)
+              obs_flow_aggregate(aggregate), None)
     try:
         with_observability = build_dashboard(
             issues, leases, usage, history, None, now, "fixture-salt", observability=obs_fixture)

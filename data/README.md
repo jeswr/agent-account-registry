@@ -20,6 +20,8 @@ separate branch:
   `scripts/ledger-invariant.py`: mode `100644` blobs may be only `README.md`, flat
   `data/*.json`, or flat `orchestration/{provenance,review-verdicts}/*.json`; only the parent
   directories may be mode `040000` trees. Every other path, mode, or Git object type is refused.
+  The same validator carries the one content invariant the tree shape cannot express — a
+  `flow.leases[]` per-account row array in `data/observability.json` (issue #891, below).
   This is load-bearing, not cosmetic (review rounds 1–2): a
   `workflow_dispatch` at `ref: ledger` executes the **ledger's** copy of a workflow file, so
   the non-execution property requires no workflow file at that ref (a dispatch against it
@@ -74,30 +76,37 @@ order only because the collector has not landed: there is no producer to break, 
 must be built against is now the canonical one. An 8-hex label is now FATAL, not a second accepted
 format.
 
-**`flow.leases` rows are DEPRECATED — send `flow.lease_utilization_1h` instead (issues #374,
-#841).** Issue #374 stopped the per-account rows being PUBLISHED: a `{label, provider,
+**`flow.leases` rows are REFUSED — send `flow.lease_utilization_1h` instead (issues #374, #841,
+#891).** Issue #374 stopped the per-account rows being PUBLISHED: a `{label, provider,
 utilization_1h}` array is a direct read of the fleet's size and its salted labels are stable
 across builds, which is exactly what the dashboard's own `accounts` array was removed for. But
 #374 only fixed the Pages surface — this snapshot itself is a file on the **public** `ledger`
 branch, so a contract that says "keep sending the rows and we will drop them" still parks that
-same array one branch over from the page it cleaned (issue #841).
+same array one branch over from the page it cleaned (issue #841). #841 stopped REQUIRING the rows;
+issue #891 stopped ACCEPTING them, because until something refused them a collector authored
+against the older prose would re-park the array with every check green.
 
-So the aggregate is now the contract. Send `flow.lease_utilization_1h = {"mean", "max"}`,
-computed collector-side, and write no per-account rows anywhere:
+So the aggregate is the contract. Send `flow.lease_utilization_1h = {"mean", "max"}`, computed
+collector-side, and write no per-account rows anywhere:
 
-- **Preferred (row-free).** `flow.lease_utilization_1h` is published as-is once both fields are
-  real fractions and `max >= mean`. An incoherent or half-supplied aggregate is DROPPED (the stat
-  hides) rather than published as a plausible number — it carries no identity, so it takes the
-  malformed-row tolerance, not the fatal path.
-- **Legacy (rows).** `flow.leases[]` is still accepted and still aggregated to the same
-  `{mean, max}`. Precedence is ROWS-FIRST and total, and it keys on the PRESENCE of the `leases`
-  key rather than on whether a row parsed: send that key at all and the rows decide the published
-  value, down to the `null` you get when none of them reports a usable `utilization_1h`. The
-  aggregate is consulted only by the genuinely row-free form. So a collector mid-migration that
-  sends both publishes exactly its pre-#841 value and nothing changes silently underneath it.
-- **The decision-22 label check is unconditional over whatever rows ARE present** — supplying the
-  aggregate is not a way past it. A raw (non-salted) handle in a lease row is a privacy incident
-  whether or not this build would have published that row, and it still fails the build LOUD.
+- **The only accepted form (row-free).** `flow.lease_utilization_1h` is published as-is once both
+  fields are real fractions and `max >= mean`. An incoherent or half-supplied aggregate is DROPPED
+  (the stat hides) rather than published as a plausible number — it carries no identity, so it
+  takes the malformed-row tolerance, not the fatal path. Neither key at all publishes `null`,
+  never a zero.
+- **A `flow.leases` key is FATAL**, and it is a refusal rather than a silent drop: ignoring the
+  rows instead would let the aggregate silently override measurements a rows-sending collector
+  really reported. It keys on the PRESENCE of the key, not on whether a row parsed — an empty,
+  `null` or mis-typed `leases` is refused exactly like a populated one. Two guards, both
+  self-tested: `dashboard-gen._normalize_observability` refuses the document, and
+  `scripts/ledger-invariant.py` refuses the file on the `ledger` ref itself (so the refusal covers
+  every consumer of the branch, not only the builds that read the snapshot — the disclosure is the
+  array EXISTING on a public branch). That second guard also refuses a non-object snapshot, which
+  would otherwise be a place to hide the same array.
+- **The decision-22 label check is unconditional over whatever rows ARE present, and runs FIRST**
+  — so a raw (non-salted) handle in a lease row is reported as the privacy incident it is rather
+  than as a deprecated shape. That remains true whether or not this build would ever have
+  published the row.
 
 Note this closes only the dashboard's half of #841: `data/leases.json` on the same branch is one
 row per live lease and is producer-side (`select-and-claim.py`), still tracked there.
