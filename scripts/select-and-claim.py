@@ -753,11 +753,14 @@ def partition_available(leases, holder_prefix, package):
     reduce to — intersects everything and therefore still serializes in both directions, exactly
     as the old `package == "__global__" -> not scoped` special case did.
 
-    THE SAME PREDICATE AS PLAN. `dispatch-claim.filter_busy_area_items` /
-    `revalidate_items_against_live_pulls` / `sibling_lease_conflict` all decide with
-    `lease_schema.packages_conflict` too. Widening one side and not the other produces a scheduler
-    that plans work the allocator then refuses (`package-single-flight` every tick, forever), which
-    is worse than either width — so there is one predicate and every site imports it.
+    THE SAME SEMANTICS AS PLAN, through TWO implementations. `dispatch-claim.sibling_lease_conflict`
+    imports `lease_schema.packages_conflict` exactly as this does; the open-PR legs
+    (`filter_busy_area_items` / `revalidate_items_against_live_pulls`) decide against the busy UNION
+    of atoms via `partition_defer_attribution`, which shares `package_areas` but NOT that function.
+    Widening one side and not the other produces a scheduler that plans work the allocator then
+    refuses (`package-single-flight` every tick, forever), which is worse than either width — so a
+    change to the exclusion RULE lands in both (`research/1011-global-partition-bounded-concurrency.md`
+    §9.3), and the two stay equivalent by test, not by construction.
 
     A lease whose `package` is missing or unreadable reads as the UNIVERSAL set and therefore
     CONFLICTS. That is a tightening over the old `lease.get("package") in {package, "__global__"}`

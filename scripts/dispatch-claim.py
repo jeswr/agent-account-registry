@@ -583,11 +583,28 @@ def plan_package(areas):
 
 
 def packages_conflict(left, right):
-    """THE exclusion predicate over two partition keys — DELEGATED to lease_schema, for the same
-    reason `plan_package` is: PLAN's assemble filter, CLAIM's live re-check, the cross-lane ledger
-    view and the allocator's own `partition_available` must all decide with ONE function. A key
-    names a SET of areas, so two rows exclude iff their sets INTERSECT; `__global__` is the
-    universal set and still serializes in both directions."""
+    """THE exclusion predicate over two partition KEYS — DELEGATED to lease_schema, for the same
+    reason `plan_package` is: the cross-lane ledger view (`sibling_lease_conflict`) and the
+    allocator's own `partition_available` must decide with ONE function. A key names a SET of
+    areas, so two rows exclude iff their sets INTERSECT; `__global__` is the universal set and
+    still serializes in both directions.
+
+    SCOPE — this is not the only implementation of that semantics, and a widening applied here
+    reaches only the two LEDGER legs. PLAN's assemble filter and CLAIM's live re-check decide
+    against the busy UNION of atoms via `partition_defer_attribution`, which shares `package_areas`
+    (the set semantics, the fail-closed universal reading) but NOT this function. The two are
+    equivalent by TEST, not by construction — the self-test pins PLAN and CLAIM deciding
+    identically and pins the union arm to intersect rather than membership-test. Change one and the
+    scheduler contradicts itself; see `research/1011-global-partition-bounded-concurrency.md` §4/§9.3.
+
+    WHETHER `__global__` SHOULD SERIALIZE AT ALL — bounded N-slot concurrency instead of exclusion
+    — is a DECIDED question, not an open one: see registry #677 point 1 / #1011, recorded in
+    `research/1011-global-partition-bounded-concurrency.md`. N slots either schedule a population
+    that is not runnable (the measured holders are inert OPEN PRs, not queued rows) or delete the
+    disjointness invariant for the admitted pairs, and the class that admits — same crate,
+    textually disjoint, jointly wrong — is one no gate grades and no reviewer reads. The lever is
+    NARROWING a cause on evidence that proves the footprint, which keeps BOTH implementations of
+    the exclusion intact rather than suspending either."""
     return _lease_schema.packages_conflict(left, right)
 
 
