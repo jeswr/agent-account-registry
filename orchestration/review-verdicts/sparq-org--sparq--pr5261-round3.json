@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5261,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e48006b760273de8e6ed3436f36c2b88bcbc9789",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The round-2 policy blocker is only partially resolved. Immediately before the newly added DONE note, the changed companion record still states fixed timings for conformance ratchets, container-scan, and CodeQL (44\u201376 s, 3.6 m, and 3.8 m). Because this PR updates and ratifies that conclusion, leaving those figures in its durable prose preserves the same prohibited hard-coded performance evidence at the same severity.",
+    "file": "research/ci-mergequeue-speedup-2026-07.md",
+    "fix_hint": "Remove the three literal timings from the companion record and keep the conclusion qualitative (for example: short parallel legs that are never the pole; parallel non-critical-path scan; security gate with negligible profile benefit). Point readers to the cited profile tables or run logs for measurements.",
+    "severity": "major",
+    "title": "Companion record still embeds hard-coded performance timings"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 is stagnant. The new Appendix A text has removed the previously embedded durations and projected minute range, but the companion changed research record still retains fixed per-leg performance timings (44\u201376 s, 3.6 m, and 3.8 m) in the durable lever-4 conclusion immediately above the newly added completion note. This is the same major repository-policy violation identified in round 2: hard-coded performance numbers are forbidden, and dated work-box/CI timings must remain in linked generated/profile evidence rather than durable prose. The soundness memo otherwise presents its ALLGREEN premise, induction, and residual remote-setting risk clearly, but approval remains blocked until the remaining literal timings are removed.",
+  "verdict": "request_changes"
+ }
+}
