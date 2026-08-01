@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5518,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "774bdb84215f59e16c31938cc615107e19d4a6b3",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The text says that nothing else in the tree pulls a Radix primitive and then says this is established by comparing the barrel closure with all installed @radix-ui lockfile entries. Equality proves that every installed Radix package belongs to the barrel closure, but it cannot prove that another package does not also depend on one of those same packages. This does not affect the closure sizes or used-versus-unused artifact-byte calculation.",
+    "file": "research/nextjs-optimize-package-imports-radix-upstream.md",
+    "fix_hint": "Either remove the claim that nothing else pulls a Radix primitive, or extend the reproduction to scan dependency edges from all lockfile package entries and report any non-barrel reverse dependents. The existing exact-set assertion can remain as evidence that the barrel accounts for every installed @radix-ui package.",
+    "severity": "minor",
+    "title": "Closure equality does not establish exclusive dependency provenance"
+   }
+  ],
+  "progress": "improving",
+  "summary": "The round-1 major finding is resolved. The revised script now derives the barrel and used-primitive transitive closures from lockfile dependency metadata, verifies the barrel closure equals the installed @radix-ui package set, verifies the used closure is a subset, obtains artifact sizes at lockfile-pinned versions with response validation, checks the byte partition, and prints every reported table value, percentage, and largest-unused list. The evidence is appropriately scoped as unminified artifact bytes rather than emitted bundle bytes. One minor wording overreach remains: closure equality does not prove that no other dependency also references one of the same Radix packages, but that statement is not needed for the measured comparison and does not undermine the conclusion.",
+  "verdict": "approve"
+ }
+}
