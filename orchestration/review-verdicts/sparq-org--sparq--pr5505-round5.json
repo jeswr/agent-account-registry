@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5505,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "465b637ef0c57a4e89795651ce9b5cda3a9ee6f1",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The blurb still says the FILTER is proved over a live-store integer `without disclosing it`, while operand_enc is public and deterministically identifies one of only four shipped values (24, 25, 30, 42). A verifier can enumerate OPERAND_ENC and recover the selected witness. Related panel/E2E wording equates absence of the literal field value with hiding, but the E2E assertion only proves that 30 is not itself a public field; it does not test or negate dictionary disclosure through operand_enc. This is materially the same major finding as round 4.",
+    "file": "gui/app/src/components/workbench/zk-tool.meta.ts",
+    "fix_hint": "Replace the blurb and related panel/README/E2E claims with a precise statement: the raw digits are private circuit inputs, but the deterministic public operand_enc may reveal low-entropy values by enumeration. Adjust the E2E description so it asserts only that digits are not direct public inputs. If actual value hiding is required, use a hiding commitment with verifier-bound randomness and test the resulting disclosure model.",
+    "severity": "major",
+    "title": "Deterministic operand_enc still makes the hidden-value claim false"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant: the round-4 disclosure-model defect remains at major severity. The wording was narrowed in ProofSummary to say the raw store value is not literally among the public inputs, but the tool-level blurb, comments, and E2E narrative still claim the value is hidden from or not disclosed to the verifier. operand_enc remains a deterministic public input selected from the four-entry shipped OPERAND_ENC table, so a verifier can enumerate that table and identify the witness. The browser test still checks only that the integer field 30 is absent; it does not address dictionary recovery through operand_enc. The research-track/external-audit caveat does not make this specific nondisclosure claim true.",
+  "verdict": "request_changes"
+ }
+}
