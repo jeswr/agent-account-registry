@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1565,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "247f80d4d920501cf31253489f7ae1980b1c9e2b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The workflow has `concurrency.cancel-in-progress: true` for each issue. This step reads an absent pre-state, writes `trust:untrusted`, verifies it, and only then posts the notice. If a newer `edited`/`labeled` event cancels the run after the label write but before `gh issue comment` completes, the replacement run reads `trust:untrusted` and skips the comment. All subsequent events do the same, so the issue may never receive even one quarantine notice. The same permanent suppression follows from a first comment attempt that fails, because the label remains the only remembered state. Thus presence of the security label is being used as evidence of a separate side effect that it does not prove. The new self-tests run each shell invocation to completion and cannot detect the cancellation window.",
+    "file": ".github/workflows/triage-issue.yml",
+    "fix_hint": "De-duplicate against evidence that the notice itself exists (for example, an exact bot-authored marker/comment check with quoted/untrusted content excluded), while retaining the fail-open direction for this courtesy read so label application cannot be delayed. Add an executable case representing interruption after the verified label write and prove a later event still posts exactly one notice. Alternatively introduce a sound atomic/serialized protocol whose committed marker cannot precede the notice.",
+    "severity": "major",
+    "title": "Cancellation can permanently suppress a notice that was never posted"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe sequential paths are well exercised and preserve the quarantine label write, but the label is not a sound de-duplication marker for the courtesy comment under this workflow's actual cancellation semantics. A run can persist `trust:untrusted` and then be cancelled before commenting; every later run will treat that label as proof that the notice was already posted. The added tests execute the shell only to completion and therefore miss this production seam.",
+  "verdict": "request_changes"
+ }
+}
