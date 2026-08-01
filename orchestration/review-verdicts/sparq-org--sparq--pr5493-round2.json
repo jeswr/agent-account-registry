@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5493,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b1fa9187329cf4749431acc90e23033ceb59b76b",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major audit-dossier inconsistency is resolved: section 7 now marks the v0.3.0 pin bump complete, names both the workflow and harness pins, and explicitly qualifies the evidence on a green CI run. The workflow, harness default/example, AGENTS.md, and dossier are mutually consistent. The historical v0.2.0 references in section 1.3 are clearly past-tense provenance rather than stale current-state claims. No correctness, soundness, test-validity, or security issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
