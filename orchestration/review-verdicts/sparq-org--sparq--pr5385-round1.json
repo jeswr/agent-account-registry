@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 5385,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "16f94d370e861069132c6ec8bdf72148ccec81a7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [
+   {
+    "body": "The new command uses `gh api repos/sparq-org/sparq/actions/workflows/codeql.yml`, but this repository and the surrounding documents identify the project as `jeswr/sparq`. The same bad owner/repo appears in `compliance/cis/evidence.md`. As written, the claimed authoritative re-verification is not reproducible against the project under review and will normally return a lookup error rather than `disabled_manually`.",
+    "file": "compliance/iso27001/evidence.md",
+    "fix_hint": "Change both new workflow-state commands to `repos/jeswr/sparq/actions/workflows/codeql.yml` (or derive the current repository dynamically), then ensure the documented expected output was obtained from that target.",
+    "severity": "major",
+    "title": "Authoritative verification command targets the wrong repository"
+   },
+   {
+    "body": "The updated text repeatedly says `codeql.yml` is byte-identical to main and that this PR does not modify it. This PR's diff explicitly modifies `.github/workflows/codeql.yml` by adding the operational-disable banner and notes. Even though its trigger semantics are unchanged, byte identity and non-modification are factual claims and are false on this PR head.",
+    "file": "docs/branch-protection.md",
+    "fix_hint": "Replace the byte-identity/non-modification claims with the precise invariant actually preserved: the workflow triggers and executable configuration are unchanged, while comments were updated in this PR.",
+    "severity": "major",
+    "title": "Document falsely claims codeql.yml is byte-identical and unmodified"
+   },
+   {
+    "body": "The changed code-scanning guidance says the live feeders are Scorecard and the Trivy image scan. In the same diff, `compliance/gap-register.md` GX-12 says there is no Trivy/Grype container-image scan and marks that gap OPEN; the CIS controls likewise describe the image-scanning half as uncovered. This creates a new false security-control claim while attempting to remove another one.",
+    "file": "AGENTS.md",
+    "fix_hint": "Verify current CI reality and make all records agree. If GX-12 is still open, remove Trivy from AGENTS.md's live-feeder sentence. If a Trivy lane has landed, update the canonical GX-12 row and cite the actual workflow/job consistently in this PR.",
+    "severity": "major",
+    "title": "Live Trivy claim contradicts the repository's own open gap"
+   }
+  ],
+  "progress": null,
+  "summary": "The reconciliation is directionally honest about disabled CodeQL, but it introduces contradictory and non-reproducible assurance evidence. Two purportedly authoritative workflow-state checks target a different repository, the branch-protection record falsely says codeql.yml is byte-identical/unmodified in this PR, and AGENTS.md claims a live Trivy image scanner while the same diff's gap register says no such scanner exists. These are material defects in a compliance/evidence-only change and must be corrected before approval. The diff also contains imperative agent-facing text, so injection detection is set.",
+  "verdict": "request_changes"
+ }
+}
