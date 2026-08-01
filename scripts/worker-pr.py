@@ -183,9 +183,11 @@ MARKER_KINDS = {
     # can then re-emit across lease expiries forever without ever converging on the human — the
     # pre-#161 behaviour (escalate on the first observation) at least terminated.
     #
-    # dispatch-claim charges ONE of these per recovery dispatch, BEFORE it retracts the
-    # disproved reviewed-sha assertion, so it climbs on exactly the runs whose round marker never
-    # landed. Same `round=<n> run=<key>` grammar, reserved namespace and bot-login trust filter
+    # dispatch-claim charges ONE of these per recovery dispatch, at the last point before it
+    # launches the review workflow — after the reviewer lease is claimed, so a tick that found no
+    # free slot dispatches nothing and charges nothing — and it therefore climbs on exactly the
+    # runs whose round marker never landed. Same `round=<n> run=<key>` grammar, reserved
+    # namespace and bot-login trust filter
     # as every other kind, so `marker_runs` / `marker_runs_since` (and the readmission window
     # they carry) count it with no new parsing.
     "strandedrecover": "<!-- sparq-review-strandedrecover:v1",
