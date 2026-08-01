@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5253,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0dc7e2c9d0027bf273837bb502b15fb645fb9250",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "For a pull_request event, actions/checkout without an explicit ref checks out the event-time refs/pull/N/merge commit. The script then runs `git merge origin/${BASE_REF}` from that commit. HEAD_SHA is used only in the summary; it is never checked out. Thus the tested history is (old base merged with PR head) merged with current base, rather than current base merged with the PR head. The comments and diagnostics repeatedly claim the latter. Even when many ordinary clean merges produce the same files, merge direction/history can affect rename and merge behavior, so this is not a sound implementation of the claimed candidate-tree check.",
+    "file": ".github/workflows/feature-matrix.yml",
+    "fix_hint": "Make checkout start at the exact PR head, for example set actions/checkout `ref` to `${{ github.event.pull_request.head.sha }}` while retaining full history, or explicitly verify and checkout/reset to HEAD_SHA before the test merge. Then merge the resolved current base tip and verify the starting commit equals HEAD_SHA. Extend TestPreMergeC1Job to pin the explicit head checkout/verification; the existing substring tests only prove that HEAD_SHA is printed, not that it is the merge's first parent.",
+    "severity": "major",
+    "title": "Test merge starts from the stale synthetic merge commit, not the PR head"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 1's stale-check objection is now stated honestly and the merge_group backstop is pinned, but the new job does not actually start from the PR head as claimed. On pull_request, actions/checkout's default ref is the event-time synthetic refs/pull/N/merge commit. The job records HEAD_SHA but never checks it out, then merges the current base into that old synthetic merge. This grades a different merge history and is not guaranteed to reproduce the tree GitHub would create from the current base and PR head. The static tests miss this load-bearing precondition. Because this is a new major correctness finding, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
