@@ -704,6 +704,104 @@ def quarantine_required(action, author_trusted, actor_trusted):
 
 
 # ---------------------------------------------------------------------------------------------------
+# THE QUARANTINE NOTICE — de-duplicated on EVIDENCE OF THE NOTICE ITSELF (PR #1565 review round 1).
+#
+# The courtesy notice must be posted at most once per issue — and AT LEAST once. #999's first cut
+# de-duplicated on the PRE-mutation LABEL set: "`trust:untrusted` was already there, so the notice
+# must already have been posted". That inference is unsound. The label is not evidence of the
+# comment, and two ordinary paths break it PERMANENTLY, because the label is then the only
+# remembered state and it says "skip" for ever after:
+#
+#   * `concurrency.cancel-in-progress: true` — this workflow's OWN concurrency group. A run
+#     cancelled between the verified label write and `gh issue comment` leaves the label and no
+#     notice; the replacement run reads the label and skips, and so does every event after it.
+#   * The notice post is best-effort (`|| echo ::warning`). ONE failed post had exactly the same
+#     terminal effect, with no race needed at all.
+#
+# So the de-duplication now reads the thing it is actually asking about: does a notice COMMENT
+# exist? Evidence about a write must be written by the party that made it (AGENTS.md pre-flight 5),
+# so a comment counts only when BOTH hold — it is authored by the workflow's own token identity,
+# AND its FIRST line is exactly the marker below. A third party can write a comment body but not
+# its author, and cannot reach line 1 of a bot-authored comment, so neither a forged notice nor a
+# marker quoted inside some other bot comment can silence this.
+#
+# The marker AND the notice body are defined here ONCE and the workflow calls this module for both.
+# A second literal in the YAML would be the #958 shape (AGENTS.md pre-flight 4, mutually-masking
+# duplicates): re-point one copy and the other silently stops matching it, which reinstates the
+# duplicate-notice bug with both copies individually unkillable.
+
+QUARANTINE_NOTICE_MARKER = "<!-- sparq:quarantine-notice -->"
+
+# The comment AUTHOR whose notice counts as evidence. `triage-issue.yml` posts with
+# `GH_TOKEN: ${{ github.token }}`, so the author is the repository's own Actions identity. BOTH
+# spellings are accepted because the two GitHub APIs disagree about that one principal: REST reports
+# `github-actions[bot]`, while the GraphQL actor behind `gh issue view --json comments` reports
+# `github-actions`. They are a single reserved identity no third party can register, so accepting
+# both cannot admit a forger — and being wrong in the REJECT direction only ever costs a duplicate
+# notice, which is the safe direction for this control.
+QUARANTINE_NOTICE_AUTHORS = ("github-actions", "github-actions[bot]")
+
+
+def quarantine_notice_body():
+    """The quarantine notice comment, VERBATIM — the ONE definition triage-issue.yml posts.
+
+    Line 1 is the invisible provenance marker `quarantine_notice_posted()` matches on; line 2 is
+    the SPARQ agent self-identification blockquote (AGENTS.md). The marker is an HTML comment, so
+    it renders as nothing at all on the issue.
+    """
+    return (f"{QUARANTINE_NOTICE_MARKER}\n"
+            "> 🤖 SPARQ agent — this issue is from a non-collaborator, so it is **quarantined** "
+            "(`trust:untrusted`) and its content is not acted on. A maintainer can approve it by "
+            "adding a 👍 reaction.")
+
+
+def quarantine_notice_posted(comments):
+    """Has an AUTHENTIC quarantine notice already been posted on this issue?
+
+    `comments` is the `.comments` list of a `gh issue view --json comments` payload. True only for
+    a comment that is BOTH authored by `QUARANTINE_NOTICE_AUTHORS` and whose FIRST line is exactly
+    `QUARANTINE_NOTICE_MARKER` — author-filtered and line-anchored.
+
+    Anything unrecognised — a foreign author, a marker further down the body, a malformed entry —
+    reads as NOT posted, i.e. post the notice. The failure this de-duplication must never
+    reintroduce is permanent silence on a quarantined third-party issue; a duplicate notice is the
+    cheap direction and is the one this falls back to.
+    """
+    for comment in comments or ():
+        if not isinstance(comment, dict):
+            continue
+        author = comment.get("author")
+        login = author.get("login") if isinstance(author, dict) else None
+        if not isinstance(login, str) or login not in QUARANTINE_NOTICE_AUTHORS:
+            continue
+        body = str(comment.get("body") or "").replace("\r\n", "\n").replace("\r", "\n")
+        if body.split("\n", 1)[0].strip() == QUARANTINE_NOTICE_MARKER:
+            return True
+    return False
+
+
+def _quarantine_notice_cli(text):
+    """Print `1`/`0` for a `gh issue view --json comments` payload. Exits NON-ZERO if unreadable.
+
+    The caller's `|| notified=""` turns a non-zero exit into "post the notice", so an unreadable or
+    unexpectedly-shaped payload degrades to a possible DUPLICATE, never to a suppressed notice.
+    """
+    try:
+        payload = json.loads(text)
+    except ValueError as exc:
+        print(f"::warning title=quarantine::the comments payload is unreadable ({exc}) — refusing "
+              "to report the notice as already posted", file=sys.stderr)
+        return 1
+    comments = payload.get("comments") if isinstance(payload, dict) else None
+    if not isinstance(comments, list):
+        print('::warning title=quarantine::the comments payload is not {"comments": [...]} — '
+              "refusing to report the notice as already posted", file=sys.stderr)
+        return 1
+    print("1" if quarantine_notice_posted(comments) else "0")
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------------
 # LIVE APPLICATION — the fail-closed, order-controlled mutation (#582).
 #
 # THE UNKNOWN-LABEL REDUCTION IS DEFINED ONCE, HERE (registry #1490), and BOTH appliers on this
@@ -2636,8 +2734,8 @@ def _self_test():
     _alias.__dict__.update(globals())
     _alias.__name__ = "triage"
     sys.modules.setdefault("triage", _alias)
-    _step = load_sibling("retriage.py", "registry_retriage_for_seam").workflow_step_script(
-        open(_retriage_wf, encoding="utf-8").read(), "label-drift")
+    _seam = load_sibling("retriage.py", "registry_retriage_for_seam")
+    _step = _seam.workflow_step_script(open(_retriage_wf, encoding="utf-8").read(), "label-drift")
     chk("[#582] retriage.yml carries the label-drift step, and it runs under `set -e` with no "
         "`|| true` on the certification",
         (bool(_step.strip()), "set -euo pipefail" in _step,
@@ -2684,6 +2782,381 @@ print(os.environ["STUB_LABELS"])
                                     if token.startswith("--")} - declared_options(build_parser()))),
         (1, []))
 
+    # -----------------------------------------------------------------------------------------------
+    # [#999 / PR #1565 round 1] THE QUARANTINE NOTICE IS POSTED EXACTLY ONCE — AT MOST ONCE, AND AT
+    # LEAST ONCE.
+    #
+    # The LABEL write has always been idempotent (`--add-label` of a label already present is a
+    # no-op); the courtesy COMMENT was not, so every `edited` event on an already-quarantined
+    # third-party issue posted another identical notice. #999's first cut de-duplicated on the
+    # PRE-mutation LABEL set, which is unsound in the direction that matters: the label is not
+    # evidence that a comment exists, and it is the ONLY state remembered, so a single miss became
+    # PERMANENT silence. Two ordinary paths produce that miss — this job's own
+    # `concurrency.cancel-in-progress` group killing a run between the verified label write and the
+    # post, and the best-effort post simply failing. Both are executed below.
+    #
+    # The static rows pin the SHAPE (the way [#595 f5] pins the absence of `|| true`), but the guard
+    # is SHELL, and AGENTS.md pre-flight 6 is explicit that a pattern-matched shell guard is not
+    # pinned at all: `if false`, an inverted condition or a hoisted-out comment all survive a
+    # substring check. So the step body is EXTRACTED FROM THE WORKFLOW AND RUN against a stub that
+    # models the properties that matter — `--add-label` is a set union, `gh issue comment` APPENDS
+    # TO A COMMENT STORE the next event reads back, and a call can KILL the step's shell mid-run —
+    # while recording every call in order. State survives across events in one world, which is what
+    # makes "a later event still posts exactly one notice" an executable question rather than an
+    # argument.
+    # -----------------------------------------------------------------------------------------------
+    # The marker literal, pinned INDEPENDENTLY of the constant (AGENTS.md pre-flight 2b). Re-pointing
+    # it is not a free rename: every notice already on the board carries the old marker, so a repoint
+    # silently re-posts on every quarantined issue in the repository. That belongs in a row that
+    # cannot be satisfied by reading the constant back.
+    chk("[PR #1565 r1] the notice marker is EXACTLY this literal",
+        QUARANTINE_NOTICE_MARKER, "<!-- sparq:quarantine-notice -->")
+    _notice_text = quarantine_notice_body()
+    chk("[PR #1565 r1] COMPOSE/MATCH ROUND TRIP: the body this module composes is recognised by "
+        "the matcher, with the marker on LINE 1 and the SPARQ self-ID blockquote under it",
+        (quarantine_notice_posted([{"author": {"login": "github-actions"},
+                                    "body": _notice_text}]),
+         _notice_text.split("\n")[0], _notice_text.split("\n")[1].startswith("> 🤖 SPARQ agent"),
+         "trust:untrusted" in _notice_text),
+        (True, QUARANTINE_NOTICE_MARKER, True, True))
+    # WHO CAN WRITE THE THING THIS READS (AGENTS.md pre-flight 5)? On a PUBLIC repo anyone can post
+    # a comment, so a byte-identical forgery must NOT count as evidence — otherwise a drive-by
+    # commenter silences the quarantine notice on their own issue.
+    chk("[PR #1565 r1] a THIRD PARTY posting a byte-identical notice is NOT evidence — the match "
+        "is author-filtered",
+        quarantine_notice_posted([{"author": {"login": "drive-by"}, "body": _notice_text}]), False)
+    # ...and the match is LINE-ANCHORED, not a substring (pre-flight 7): a marker inside a fenced
+    # or quoted block of some other bot comment self-marks under a containment check.
+    chk("[PR #1565 r1] a marker QUOTED inside a bot comment's body does not count",
+        quarantine_notice_posted([{"author": {"login": "github-actions"},
+                                   "body": "> the reporter wrote:\n```\n"
+                                           f"{QUARANTINE_NOTICE_MARKER}\n```\n"}]), False)
+    # The accepted author set, EXACT: the two API spellings of the one Actions identity and nothing
+    # else. A suffix/prefix neighbour is a distinct, registerable login and must fail.
+    chk("[PR #1565 r1] exactly the two API spellings of the repository's own Actions identity "
+        "count as the notice's author",
+        [quarantine_notice_posted([{"author": {"login": login}, "body": _notice_text}])
+         for login in ("github-actions", "github-actions[bot]", "github-actionsx",
+                       "xgithub-actions[bot]", "jeswr", "")],
+        [True, True, False, False, False, False])
+    # EVERY unrecognised shape reads as NOT posted. The direction is the whole safety argument: a
+    # false "already posted" is permanent silence, a false "not posted" is one duplicate comment.
+    chk("[PR #1565 r1] an empty, absent or malformed comment list reads as NOT posted",
+        [quarantine_notice_posted(value)
+         for value in ([], None, [None, "x", {}, {"author": None}, {"author": {}}],
+                       [{"author": {"login": "github-actions"}}])],
+        [False, False, False, False])
+
+    def _notice_cli(text):
+        """`--quarantine-notice-posted` over `text` on stdin -> (exit code, stdout, stderr)."""
+        buffer, errors = io.StringIO(), io.StringIO()
+        saved = sys.stdin
+        sys.stdin = io.StringIO(text)
+        try:
+            with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(errors):
+                code = main(["--quarantine-notice-posted"])
+        finally:
+            sys.stdin = saved
+        return code, buffer.getvalue().strip(), errors.getvalue()
+
+    chk("[PR #1565 r1] --quarantine-notice-posted prints 1 for a payload carrying the notice and "
+        "0 for one that does not",
+        (_notice_cli(json.dumps({"comments": [{"author": {"login": "github-actions"},
+                                               "body": _notice_text}]}))[:2],
+         _notice_cli('{"comments": []}')[:2]),
+        ((0, "1"), (0, "0")))
+    _garbage = [_notice_cli(text) for text in ("", "not json", "[]", '{"comments": "nope"}')]
+    chk("[PR #1565 r1] an unreadable or mis-shaped comments payload exits NON-ZERO and prints NO "
+        "verdict — the caller's `|| notified=\"\"` then POSTS rather than going silent",
+        ([result[0] for result in _garbage], [result[1] for result in _garbage],
+         all("refusing to report" in result[2] for result in _garbage)),
+        ([1, 1, 1, 1], ["", "", "", ""], True))
+    _body_buffer = io.StringIO()
+    with contextlib.redirect_stdout(_body_buffer):
+        _body_code = main(["--quarantine-notice-body"])
+    chk("[PR #1565 r1] --quarantine-notice-body prints the notice with the marker on LINE 1 — the "
+        "workflow's only source for the body it posts",
+        (_body_code, _body_buffer.getvalue().split("\n")[0],
+         _body_buffer.getvalue().strip() == _notice_text),
+        (0, "<!-- sparq:quarantine-notice -->", True))
+
+    # THE STEP'S OWN ORDER, statically, over the EXECUTABLE lines only (the prose in this step
+    # legitimately names the commands it is explaining). The courtesy read must come AFTER the
+    # verified write: #999's cut read BEFORE it, which both delayed the trust write and made the
+    # label pre-state the thing consulted. Indices, not containment.
+    _quarantine_code = "\n".join(line for line in quarantine_body.splitlines()
+                                 if not line.strip().startswith("#"))
+    _order = {"write": _quarantine_code.find("gh issue edit "),
+              "verify": _quarantine_code.find("--json labels"),
+              "notice-read": _quarantine_code.find("--json comments"),
+              "post": _quarantine_code.find("gh issue comment ")}
+    chk("[PR #1565 r1] the step's order is write -> verify -> READ THE COMMENTS -> post, it posts "
+        "at ONE site, and no label read precedes the write",
+        (sorted(_order, key=_order.get), min(_order.values()) >= 0,
+         _quarantine_code.count("gh issue comment"), _quarantine_code.count("--json labels")),
+        (["write", "verify", "notice-read", "post"], True, 1, 1))
+    # ONE DEFINITION of the marker and the body (#958). A literal copy in the YAML is a
+    # mutually-masking duplicate: re-point either copy and the other silently stops matching it,
+    # which restores the duplicate-notice bug with both copies individually unkillable.
+    chk("[PR #1565 r1] the workflow carries NO copy of the marker or the notice prose — it calls "
+        "this module for both halves",
+        (QUARANTINE_NOTICE_MARKER in _quarantine_code, "SPARQ agent" in _quarantine_code,
+         bool(re.search(r"python3 scripts/triage\.py --quarantine-notice-posted",
+                        _quarantine_code)),
+         bool(re.search(r"python3 scripts/triage\.py --quarantine-notice-body",
+                        _quarantine_code))),
+        (False, False, True, True))
+    # THE FALLBACKS, enumerated. Exactly two, and neither is on the trust-boundary write or on its
+    # verification — the [#595 f5] rows above pin the `gh issue edit` half independently.
+    _fallbacks = [line.strip() for line in _quarantine_code.splitlines() if "||" in line]
+    chk("[PR #1565 r1] exactly TWO fallbacks in the step (the courtesy comments read and the "
+        "notice post), and NEITHER sits on the label write or its verification post-read",
+        (len(_fallbacks),
+         [any(token in line for token in ("gh issue edit", "--json labels"))
+          for line in _fallbacks]),
+        (2, [False, False]))
+
+    # The stub GitHub. `gh issue edit --add-label` is a SET UNION over a label file (the real
+    # idempotence); `gh issue view --json labels` renders it exactly as the step's own
+    # `--jq '[.labels[].name]|join(",")'` does; `gh issue view --json comments` serves the COMMENT
+    # STORE in the payload shape `_quarantine_notice_cli` parses; and `gh issue comment` APPENDS to
+    # that store, so "how many notices did this issue receive" is answerable by counting it across
+    # events. STUB_KILL_AFTER models a runner cancellation at a named call.
+    _QUARANTINE_GH_STUB = '''#!/usr/bin/env python3
+import json, os, signal, sys
+args = sys.argv[1:]
+labels_file = os.environ["STUB_LABELS_FILE"]
+comments_file = os.environ["STUB_COMMENTS_FILE"]
+with open(labels_file, encoding="utf-8") as handle:
+    live = [name for name in handle.read().split(",") if name]
+with open(comments_file, encoding="utf-8") as handle:
+    comments = json.load(handle)
+added = []
+if args[:2] == ["issue", "edit"]:
+    added = [args[index + 1] for index, token in enumerate(args) if token == "--add-label"]
+    call = "edit:" + ",".join(added)
+elif args[:2] == ["issue", "view"]:
+    call = "view:comments" if "comments" in args else "view:labels"
+elif args[:2] == ["issue", "comment"]:
+    call = "comment"
+else:
+    sys.exit("stub gh saw an unexpected call: %r" % (args,))
+with open(os.environ["STUB_GH_LOG"], "a", encoding="utf-8") as handle:
+    handle.write(call + "\\n")
+
+
+def interrupt_here():
+    # `concurrency.cancel-in-progress: true`: the step's shell is killed mid-step, AFTER this call
+    # has already taken effect on the server. The caller proves the model by asserting that NO
+    # further call reaches this log.
+    if os.environ.get("STUB_KILL_AFTER") == call:
+        os.kill(os.getppid(), signal.SIGKILL)
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
+if call.startswith("edit:"):
+    # STUB_EDIT_DROPS is the #595 f5 failure shape: the mutation REPORTS success and lands nothing.
+    if os.environ.get("STUB_EDIT_DROPS") != "1":
+        with open(labels_file, "w", encoding="utf-8") as handle:
+            handle.write(",".join(live + [name for name in added if name not in live]))
+    interrupt_here()
+    sys.exit(0)
+if call == "view:labels":
+    interrupt_here()
+    print(",".join(live))
+    sys.exit(0)
+if call == "view:comments":
+    interrupt_here()
+    print(json.dumps({"comments": comments}))
+    sys.exit(0)
+if os.environ.get("STUB_COMMENT_FAILS") == "1":
+    sys.exit(1)
+comments.append({"author": {"login": os.environ["STUB_COMMENT_AUTHOR"]},
+                 "body": args[args.index("--body") + 1]})
+with open(comments_file, "w", encoding="utf-8") as handle:
+    json.dump(comments, handle)
+interrupt_here()
+sys.exit(0)
+'''
+    # The stub reader FORWARDS to the stub `gh`, so every read lands in the same ordered call log
+    # and the write/verify/read ordering is MEASURED rather than asserted about the text.
+    # STUB_FAIL_READS names the 1-based read invocations of THIS event that must fail — a bounded
+    # retry exhaustion looks exactly like this to the caller.
+    _QUARANTINE_RETRY_STUB = '''import os, subprocess, sys
+args = sys.argv[1:]
+if args[:1] != ["read"]:
+    sys.exit("stub gh_retry refuses a non-read call: %r" % (args,))
+counter = os.environ["STUB_READ_COUNTER"]
+seen = 0
+if os.path.isfile(counter):
+    with open(counter, encoding="utf-8") as handle:
+        seen = sum(1 for line in handle if line.strip())
+with open(counter, "a", encoding="utf-8") as handle:
+    handle.write("read\\n")
+if str(seen + 1) in os.environ.get("STUB_FAIL_READS", "").split(","):
+    print("simulated transient read failure", file=sys.stderr)
+    sys.exit(1)
+sys.exit(subprocess.run(["gh", *args[1:]], check=False).returncode)
+'''
+    # Extracted by `id:`, through retriage.py's ONE step extractor (#958: no second copy). A step
+    # that cannot be resolved raises there; it is caught and reported as an empty body so a rename
+    # reds a NAMED row instead of aborting the suite and recording every row below it as a phantom
+    # kill (AGENTS.md pre-flight 4, "crash-after-partial-run").
+    _step_error = ""
+    try:
+        _quarantine_step = _seam.workflow_step_script(
+            open(triage_wf, encoding="utf-8").read(), "quarantine")
+    except Exception as exc:                       # noqa: BLE001 — reported as a row, never raised
+        _quarantine_step, _step_error = "", str(exc)
+    chk("[#999] the quarantine step body is resolvable BY ID and carries the mutation — the rows "
+        "below are running the real thing",
+        (bool(_quarantine_step.strip()), _step_error,
+         "--add-label trust:untrusted --add-label status:untriaged" in _quarantine_step),
+        (True, "", True))
+
+    def _quarantine_events(events, initial=(), comments=()):
+        """Run a SEQUENCE of quarantine events against ONE persistent stubbed GitHub.
+
+        The label set and the COMMENT STORE survive across the events, so a run that dies mid-step
+        is followed by a replacement run that sees exactly what the real replacement run would.
+
+        Returns (results, comment store) — one (exit code, ORDERED call log for THAT event, labels
+        now, combined output) per event.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            scripts = _os_vocab.path.join(directory, "scripts")
+            binaries = _os_vocab.path.join(directory, "bin")
+            _os_vocab.makedirs(scripts)
+            _os_vocab.makedirs(binaries)
+            with open(_os_vocab.path.join(scripts, "gh_retry.py"), "w",
+                      encoding="utf-8") as handle:
+                handle.write(_QUARANTINE_RETRY_STUB)
+            # The REAL module: the step calls it for BOTH halves of the notice, so these rows run
+            # `quarantine_notice_body()` and `quarantine_notice_posted()` end to end rather than a
+            # re-spelling of them.
+            shutil.copy(_os_vocab.path.abspath(__file__),
+                        _os_vocab.path.join(scripts, "triage.py"))
+            gh_path = _os_vocab.path.join(binaries, "gh")
+            with open(gh_path, "w", encoding="utf-8") as handle:
+                handle.write(_QUARANTINE_GH_STUB)
+            _os_vocab.chmod(gh_path, 0o755)
+            labels_file = _os_vocab.path.join(directory, "labels")
+            with open(labels_file, "w", encoding="utf-8") as handle:
+                handle.write(",".join(initial))
+            comments_file = _os_vocab.path.join(directory, "comments.json")
+            with open(comments_file, "w", encoding="utf-8") as handle:
+                json.dump(list(comments), handle)
+            results = []
+            for index, event in enumerate(events):
+                log = _os_vocab.path.join(directory, f"calls.{index}.log")
+                environment = dict(
+                    _os_vocab.environ, REPO="o/r", NUM="7",
+                    PATH=binaries + _os_vocab.pathsep + _os_vocab.environ.get("PATH", ""),
+                    STUB_LABELS_FILE=labels_file, STUB_COMMENTS_FILE=comments_file,
+                    STUB_GH_LOG=log,
+                    STUB_READ_COUNTER=_os_vocab.path.join(directory, f"reads.{index}.log"),
+                    STUB_FAIL_READS=event.get("fail_reads", ""),
+                    STUB_EDIT_DROPS="1" if event.get("edit_drops") else "0",
+                    STUB_COMMENT_FAILS="1" if event.get("comment_fails") else "0",
+                    STUB_COMMENT_AUTHOR=event.get("comment_author", "github-actions"),
+                    STUB_KILL_AFTER=event.get("kill_after", ""))
+                proc = _subprocess_vocab.run(
+                    ["bash", "-c", _quarantine_step], cwd=directory, env=environment,
+                    capture_output=True, text=True, timeout=120, check=False)
+                calls = []
+                if _os_vocab.path.isfile(log):
+                    with open(log, encoding="utf-8") as handle:
+                        calls = [line.strip() for line in handle if line.strip()]
+                with open(labels_file, encoding="utf-8") as handle:
+                    live = sorted(name for name in handle.read().split(",") if name)
+                results.append((proc.returncode, calls, live, proc.stdout + proc.stderr))
+            with open(comments_file, encoding="utf-8") as handle:
+                return results, json.load(handle)
+
+    def _run_quarantine_step(initial=(), comments=(), **event):
+        """ONE event against a fresh world -> (exit code, calls, labels, output, comment store)."""
+        results, store = _quarantine_events([event], initial=initial, comments=comments)
+        return (*results[0], store)
+
+    _WROTE = "edit:trust:untrusted,status:untriaged"
+    _GATED = ["status:untriaged", "trust:untrusted"]
+    _FULL = [_WROTE, "view:labels", "view:comments", "comment"]
+    # A FIRST quarantine. The whole call list is the expectation, so the courtesy read moving back
+    # in front of the mutation — where it would delay the trust write — is a visible reordering.
+    _fresh = _run_quarantine_step()
+    chk("[#999] EXECUTED: a FIRST quarantine writes both labels, VERIFIES them, then reads the "
+        "comments and posts the notice exactly once",
+        (_fresh[0], _fresh[1], _fresh[2], len(_fresh[4]), quarantine_notice_posted(_fresh[4])),
+        (0, _FULL, _GATED, 1, True))
+    # THE ORIGINAL #999 DEFECT: a repeat content event on an issue that already carries the notice
+    # re-asserts the labels and posts nothing further.
+    _repeat, _repeat_store = _quarantine_events([{}, {}])
+    chk("[#999] EXECUTED, THE DEFECT: a repeat content event on an issue that ALREADY carries the "
+        "notice re-asserts the labels, posts NO second notice, and says so",
+        ([result[0] for result in _repeat], _repeat[1][1], _repeat[1][2],
+         len(_repeat_store), "::notice" in _repeat[1][3]),
+        ([0, 0], [_WROTE, "view:labels", "view:comments"], _GATED, 1, True))
+    # THE ROW THAT KILLS THE UNSOUND DE-DUPLICATION. #999's cut skipped the notice whenever
+    # `trust:untrusted` was already present before the write; the label proves nothing about the
+    # comment, and this is that case with the label set and NO notice on the issue.
+    _labelled = _run_quarantine_step(initial=["trust:untrusted", "status:untriaged"])
+    chk("[PR #1565 r1] EXECUTED: the LABEL is not evidence of the NOTICE — an issue already "
+        "carrying `trust:untrusted` with no notice on it IS notified",
+        (_labelled[0], _labelled[1], _labelled[2], len(_labelled[4])), (0, _FULL, _GATED, 1))
+    # THE REPORTED FINDING, first path. `concurrency.cancel-in-progress: true` kills the run
+    # between the VERIFIED label write and the post. Event 1's call log is asserted to STOP at the
+    # write, which is what proves the interruption really happened rather than being asserted; the
+    # replacement event then posts, and the issue ends with exactly ONE notice.
+    (_cut, _replacement), _cut_store = _quarantine_events([{"kill_after": _WROTE}, {}])
+    chk("[PR #1565 r1] EXECUTED, THE FINDING: a run CANCELLED after the label write and before the "
+        "notice leaves the labels and NO notice — and the replacement event still posts exactly ONE",
+        (_cut[0] != 0, _cut[1], _cut[2], _replacement[0], _replacement[1], len(_cut_store)),
+        (True, [_WROTE], _GATED, 0, _FULL, 1))
+    # ...and the same permanent suppression with no race at all: the post is best-effort, so ONE
+    # failed post used to be terminal. It must warn, leave the verified quarantine standing, and be
+    # RETRIED on the next event — ending at exactly one notice, not zero and not two.
+    (_lost, _retry), _retry_store = _quarantine_events([{"comment_fails": True}, {}])
+    chk("[PR #1565 r1] EXECUTED, THE FINDING (no race needed): a notice that FAILS to post warns, "
+        "leaves the verified quarantine standing, and is retried on the next event — exactly one",
+        (_lost[0], "::warning" in _lost[3], _lost[2], _lost[1].count("comment"),
+         _retry[0], _retry[1].count("comment"), len(_retry_store)),
+        (0, True, _GATED, 1, 0, 1, 1))
+    # WHO CAN WRITE THE THING THIS READS, end to end (pre-flight 5): a third party's byte-identical
+    # forgery is already on the issue and must not silence the real notice.
+    _spoofed = _run_quarantine_step(
+        comments=[{"author": {"login": "drive-by"}, "body": _notice_text}])
+    chk("[PR #1565 r1] EXECUTED: a THIRD PARTY who posts a byte-identical notice first cannot "
+        "suppress the real one",
+        (_spoofed[0], _spoofed[1].count("comment"), len(_spoofed[4])), (0, 1, 2))
+    # The gate itself is still RESTORED when a triage-role actor strips it (#998 f1's case).
+    _restored = _run_quarantine_step(initial=["status:untriaged"])
+    chk("[#998 f1] EXECUTED: an issue whose `trust:untrusted` was STRIPPED gets it back, and is "
+        "notified because no notice exists on it yet",
+        (_restored[0], _restored[2], _restored[1].count("comment")), (0, _GATED, 1))
+    # NEGATIVE CONTROL — the [#595 f5] posture is intact end to end and the notice work did not
+    # move the verification: a write that reports success and lands nothing reds the step BEFORE
+    # anything is read or announced.
+    _dropped = _run_quarantine_step(edit_drops=True)
+    chk("[#595 f5] EXECUTED: a label write that reports success and lands NOTHING reds the step "
+        "before the comments are even read — the fail-loud verification is unchanged",
+        (_dropped[0] != 0, "refusing to report success" in _dropped[3], _dropped[1],
+         len(_dropped[4])),
+        (True, True, [_WROTE, "view:labels"], 0))
+    # THE FALLBACK DIRECTION, measured. A failed COURTESY read costs a possible duplicate notice —
+    # never the quarantine, and never the notice. (Delete the `|| notified=""` and this row reds:
+    # `set -e` would kill the step with the notice unposted and no retry recorded anywhere.)
+    _blip = _run_quarantine_step(fail_reads="2")
+    chk("[PR #1565 r1] EXECUTED: a transient failure on the courtesy COMMENTS read still writes "
+        "and verifies both labels, and degrades to POSTING the notice",
+        (_blip[0], _blip[1], _blip[2], len(_blip[4])),
+        (0, [_WROTE, "view:labels", "comment"], _GATED, 1))
+    # ...and the VERIFICATION read keeps no fallback of its own: it is the trust proof, not a
+    # courtesy.
+    _unverified = _run_quarantine_step(fail_reads="1")
+    chk("[#595 f5] EXECUTED: a failed VERIFICATION post-read reds the step and posts nothing — "
+        "only the courtesy comments read is best-effort",
+        (_unverified[0] != 0, _unverified[1].count("comment"), len(_unverified[4])), (True, 0, 0))
+
     print("triage self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -2720,6 +3193,13 @@ def build_parser():
     ap.add_argument("--action", default="", help="the issue event action (opened/unlabeled/...)")
     ap.add_argument("--author-trusted", default="0", help="1 if the issue AUTHOR is write+")
     ap.add_argument("--actor-trusted", default="0", help="1 if the event ACTOR is write+")
+    # The quarantine NOTICE pair (PR #1565 r1). One asks whether an authentic notice already exists
+    # — read off the comments themselves, never off the label — and the other composes the notice,
+    # so the marker and the body have exactly one definition between the workflow and this module.
+    ap.add_argument("--quarantine-notice-posted", action="store_true",
+                    help="read a `gh issue view --json comments` payload on stdin; print 1/0")
+    ap.add_argument("--quarantine-notice-body", action="store_true",
+                    help="print the quarantine notice comment body triage-issue.yml posts")
     return ap
 
 
@@ -2730,6 +3210,11 @@ def main(argv=None):
         return _self_test()
     if a.quarantine_decision:
         print("1" if quarantine_required(a.action, a.author_trusted, a.actor_trusted) else "0")
+        return 0
+    if a.quarantine_notice_posted:
+        return _quarantine_notice_cli(sys.stdin.read())
+    if a.quarantine_notice_body:
+        print(quarantine_notice_body())
         return 0
     if a.label_drift:
         return _label_drift_cli([x for x in a.known_labels.split(",") if x.strip()])
