@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5241,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "cf598a8b55446c9da1f1faf7c2456afc729ff094",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`evaluate()` now fans out per public crate, but `rule_matches()` applies every placeholder-free `unless_paths` glob globally. Thus a PR adding crates A and B while changing `site/src/data/surfaces.ts` only to add A suppresses `new-crate-site-advert` for both A and B; likewise, any `book/src/**` change suppresses both guide issues even if it documents only one crate. No surviving issue exists to close manually, contrary to the rules-file comment. `test_a_shared_artifact_suppresses_that_rule_for_the_whole_pr` codifies the silent-loss case that round 1 required the regression suite to prevent.",
+    "file": "scripts/flow-on.py",
+    "fix_hint": "Make suppression attributable per crate. For shared structured artifacts, inspect the changed checkout content (for example the site surface records and book summary/pages) for a crate-specific entry, or conservatively keep each per-crate follow-on unless coverage for that crate can be established. Replace the global-suppression test with a two-public-crate case where only one crate's site/guide artifact is supplied and assert that only that crate is suppressed while the other retains its follow-on and dedup key.",
+    "severity": "major",
+    "title": "Shared artifact suppression still drops follow-ons for uncovered crates"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The per-crate evaluation fixes the first half of the round-1 defect, but the multi-crate suppression path still silently loses required follow-ons. When a PR adds two public crates and updates a shared site or book file for only one, the placeholder-free `unless_paths` suppresses that rule for both crates. The new regression test explicitly blesses this unsafe behavior instead of proving that the uncovered crate retains an issue. Progress is stagnant because the prior major finding specifically called out this one-artifact/multiple-crate case, and it remains at major severity.",
+  "verdict": "request_changes"
+ }
+}
