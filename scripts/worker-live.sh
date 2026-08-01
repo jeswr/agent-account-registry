@@ -3652,7 +3652,7 @@ _purge_before_target_code() {
 #   ambiguous-upload-step     more than one does, so the name identifies nothing
 #   upload-step-not-an-upload the step runs no SHA-pinned actions/upload-artifact
 #   upload-step-path-mismatch it uploads something other than the lane's sealed directory
-#   upload-step-disabled      its condition is a constant false
+#   upload-step-disabled      its condition is not a PROVEN-LIVE form (see the allowlist below)
 # A step spans its `- name:` line to the next `- name:` or to the JOB boundary (a two-space-indented
 # key), the same span every other extractor here uses — without the job boundary the last step of a
 # job would absorb the next job's lines and could be certified by a neighbour's `uses:`.
@@ -3706,9 +3706,41 @@ if not uses:
     refuse("upload-step-not-an-upload")
 if not any(ln == "          path: " + sealed for _, ln in body):
     refuse("upload-step-path-mismatch")
+# [PR #1639 review r2] THE CONDITION ARM IS AN ALLOWLIST, NOT A HUNT FOR THE TOKEN `false`. A
+# blocklist certifies every OTHER statically falsy expression the Actions language accepts —
+# `${{ 0 }}`, `${{ '' }}`, `${{ null }}`, `${{ !true }}` all disable the step without containing
+# the word — and a disabled upload with a valid pinned `uses:` and `path:` would still have read
+# `ordered`. So the ONLY conditions that count as live are conjunctions drawn from the small
+# vocabulary these two lanes actually use, over DISTINCT context paths; everything else, known
+# falsy or merely unrecognised, refuses. Distinctness is what makes the survivors provably
+# satisfiable: each atom alone is satisfiable, and atoms over disjoint context paths cannot
+# contradict one another, so no accepted condition is constant-false. Widening this vocabulary is
+# a deliberate act — a new form must be shown live, not merely parsed.
+COND_ATOMS = (
+    re.compile(r"!?\s*(inputs\.[A-Za-z0-9_-]+)"),
+    re.compile(r"(steps\.[A-Za-z0-9_-]+\.outcome)\s*==\s*'success'"),
+)
+
+
+def condition_is_live(expr):
+    wrapped = re.fullmatch(r"\$\{\{(.*)\}\}", expr.strip())
+    if not wrapped:
+        return False
+    seen = set()
+    for atom in wrapped.group(1).split("&&"):
+        matched = [m for m in (p.fullmatch(atom.strip()) for p in COND_ATOMS) if m]
+        if not matched:
+            return False
+        path = matched[0].group(1)
+        if path in seen:
+            return False
+        seen.add(path)
+    return True
+
+
 for _, ln in body:
     cond = re.fullmatch(r" {8}if:\s*(.*)", ln)
-    if cond and re.search(r"(?<![\w.])false(?![\w.])", cond.group(1)):
+    if cond and not condition_is_live(cond.group(1)):
         refuse("upload-step-disabled")
 # DECLARED EQUIVALENT (AGENTS.md item 4): the line printed is the `uses:` invocation rather than the
 # step's `- name:` line, and no well-formed workflow can separate the two across a target-code
@@ -3751,6 +3783,10 @@ PY
 # no disabling condition — and the line that gets ORDERED is that validated `uses:` invocation, not
 # the name line. Every failure is its own named verdict (`upload-step-not-an-upload`,
 # `upload-step-path-mismatch`, `upload-step-disabled`, `ambiguous-upload-step`), never `ordered`.
+#
+# [PR #1639 review r2] The "no disabling condition" clause is an ALLOWLIST of proven-live forms,
+# because searching for the token `false` left every other statically falsy expression — `${{ 0 }}`,
+# `${{ !true }}`, `${{ '' }}` — certified as `ordered`. See `_upload_step_line`.
 #
 # Usage: _seal_before_target_code <workflow-file> <seal-subcommand> <upload-step-name> <sealed-path>
 # Matched on exact `run:` / `- name:` lines for the reason _purge_before_target_code is: these
@@ -5308,13 +5344,25 @@ WFFIX
   # `upload-*` variant breaks exactly ONE of those parts, so every clause of the validation has its
   # own killing fixture; the sha is a value that appears nowhere else in this harness (AGENTS.md
   # item 4's value-identical survivor).
+  #
+  # [PR #1639 review r2] The default condition is the SHIPPED two-atom conjunction, so the control
+  # row exercises the conjunction split, both atom shapes and the distinct-path accept in one go;
+  # the single-atom shape review-fix.yml ships is asserted on the LIVE file above. Each `off-*`
+  # variant is a DIFFERENT way to be statically falsy, and only ONE of them contains the token
+  # `false` — that is precisely the predicate the earlier revision could not distinguish.
   local seal_sha='1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d'
   _seal_upload_step() {
     local variant=$1
     printf '      - name: %s\n' "$wk_upload"
     case "$variant" in
-      off) printf '%s\n' '        if: ${{ false }}' ;;
-      *)   printf '%s\n' '        if: ${{ !inputs.dry_run }}' ;;
+      off)          printf '%s\n' '        if: ${{ false }}' ;;
+      off-zero)     printf '%s\n' '        if: ${{ 0 }}' ;;
+      off-nottrue)  printf '%s\n' '        if: ${{ !true }}' ;;
+      off-empty)    printf '%s\n' "        if: \${{ '' }}" ;;
+      off-dup)      printf '%s\n' '        if: ${{ !inputs.dry_run && inputs.dry_run }}' ;;
+      off-unwrapped) printf '%s\n' "        if: steps.bundle.outcome == 'success'" ;;
+      *) printf '%s\n' \
+           "        if: \${{ !inputs.dry_run && steps.bundle.outcome == 'success' }}" ;;
     esac
     case "$variant" in
       nouses)    : ;;
@@ -5340,6 +5388,11 @@ WFFIX
         seal)   printf '%s\n' '        run: bash ../registry/scripts/worker-live.sh bundle' >> "$out" ;;
         upload)          _seal_upload_step ok       >> "$out" ;;
         upload-off)      _seal_upload_step off      >> "$out" ;;
+        upload-off-zero)      _seal_upload_step off-zero      >> "$out" ;;
+        upload-off-nottrue)   _seal_upload_step off-nottrue   >> "$out" ;;
+        upload-off-empty)     _seal_upload_step off-empty     >> "$out" ;;
+        upload-off-dup)       _seal_upload_step off-dup       >> "$out" ;;
+        upload-off-unwrapped) _seal_upload_step off-unwrapped >> "$out" ;;
         upload-nouses)   _seal_upload_step nouses   >> "$out" ;;
         upload-unpinned) _seal_upload_step unpinned >> "$out" ;;
         upload-other)    _seal_upload_step other    >> "$out" ;;
@@ -5408,6 +5461,28 @@ WFFIX
     "upload-step-path-mismatch"
   _seal_fixture "$seal_fx" upload-off seal tool gate
   chk "#248 r1: an upload DISABLED by 'if: false' is REPORTED (the #941 step-level shape)" \
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload" "$wk_sealed")" "upload-step-disabled"
+  # [PR #1639 review r2] THE FALSY EXPRESSIONS THAT DO NOT SPELL `false`. A scan for the token
+  # certifies all five of these, and with a valid pinned `uses:` and `path:` the lane would read
+  # `ordered` while handing the artifact service nothing. Each row kills a different part of the
+  # allowlist: the first three kill the atom vocabulary, the fourth kills the DISTINCT-path clause
+  # (`!inputs.dry_run && inputs.dry_run` is a contradiction built entirely from accepted atoms), and
+  # the fifth kills the `${{ }}` wrapper requirement — a bare expression is live in Actions, so
+  # refusing it is deliberate conservatism, and it is the only fixture here that measures that.
+  _seal_fixture "$seal_fx" upload-off-zero seal tool gate
+  chk "#248 r2: an upload disabled by 'if: \${{ 0 }}' is REPORTED (falsy without the token false)" \
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload" "$wk_sealed")" "upload-step-disabled"
+  _seal_fixture "$seal_fx" upload-off-nottrue seal tool gate
+  chk "#248 r2: an upload disabled by 'if: \${{ !true }}' is REPORTED (negation, not a literal)" \
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload" "$wk_sealed")" "upload-step-disabled"
+  _seal_fixture "$seal_fx" upload-off-empty seal tool gate
+  chk "#248 r2: an upload disabled by an EMPTY-string condition is REPORTED" \
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload" "$wk_sealed")" "upload-step-disabled"
+  _seal_fixture "$seal_fx" upload-off-dup seal tool gate
+  chk "#248 r2: a CONTRADICTION over one context path is REPORTED (distinct-path clause)" \
+    "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload" "$wk_sealed")" "upload-step-disabled"
+  _seal_fixture "$seal_fx" upload-off-unwrapped seal tool gate
+  chk "#248 r2: an UNWRAPPED condition is REPORTED (only the validated \${{ }} form is proven)" \
     "$(_seal_before_target_code "$seal_fx" bundle "$wk_upload" "$wk_sealed")" "upload-step-disabled"
   _seal_fixture "$seal_fx" upload seal tool gate upload
   chk "#248 r1: two steps sharing the upload's name are REPORTED, not resolved to the early one" \
