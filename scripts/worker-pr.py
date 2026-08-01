@@ -373,7 +373,7 @@ WORKER_HEAD_RE = re.compile(r"sparq-agent/issue-([1-9][0-9]*)-[A-Za-z0-9._-]+")
 # groom's parked-PR marker ("Human attention required"). Either stands the loop down.
 HUMAN_OWNED_LABELS = ("review:needs-user", "needs:user")
 SECURITY_KEYWORDS = ("zk", "mpc", "crypto", "auth", "e2ee")
-# [OPUS-4.8] B3 / defect #2,#4: the trust-surface FILE paths. A worker PR whose diff touches ANY
+# B3 / defect #2,#4: the trust-surface FILE paths. A worker PR whose diff touches ANY
 # of these gate-weakening / orchestration-control files must NOT auto-arm regardless of its issue
 # labels — the cross-provider review still runs (automated), but the final arm click is a HUMAN's.
 # This is the ACTIVE, WIRED FILE-level control (previously the policy-row `security_paths` was
@@ -454,13 +454,55 @@ def account_hash(handle, salt):
     return hashlib.sha256(f"{handle}:{salt}".encode()).hexdigest()[:16]
 
 
-def _alert_route():
-    """Ops-alert destination (locked decision 22c): a maintainer-set ALERT_REPO (+ optional
-    ALERT_TOKEN) routes the account-enumerating alert issue to a PRIVATE repo; unset falls back
-    to the registry repo + workflow token (current behaviour)."""
-    repo = os.environ.get("ALERT_REPO") or os.environ.get("REGISTRY_REPO")
-    token = os.environ.get("ALERT_TOKEN") or os.environ.get("REGISTRY_ALERT_TOKEN")
-    return repo, token
+def _repo_confirmed_private(repo, token):
+    """True ONLY on a definitive `"private": true` from GET /repos/{repo} read under the route
+    token (issue #436, mirroring usage-alert.py's #432 round-1 helper). FAIL-CLOSED and
+    NON-RAISING: a failed lookup, an unparseable payload, a raising `gh` call, or anything but a
+    literal boolean true reads as NOT private and the caller falls back to the registry. Like
+    `_ops_alert`, this sits on the alerting path and must never propagate into the operational
+    error that triggered the alert. The response body is parsed, never echoed."""
+    try:
+        result = _run_gh(["api", f"repos/{repo}"], check=False, env={"GH_TOKEN": token})
+        if result.returncode != 0:
+            return False
+        payload = json.loads(result.stdout or "")
+    except Exception:  # noqa: BLE001 — a route probe must never mask the caller's error
+        return False
+    return isinstance(payload, dict) and payload.get("private") is True
+
+
+def _alert_route(confirmed_private=None):
+    """Ops-alert destination (locked decision 22c, hardened for issue #436): a maintainer-set
+    ALERT_REPO routes the alert issue to a PRIVATE repo, but ONLY when ALERT_TOKEN is also set,
+    ALERT_REPO is distinct from REGISTRY_REPO (case-insensitive — a "private route" naming the
+    registry IS the public repo), AND the destination is CONFIRMED private by a live
+    GET /repos/{ALERT_REPO} under ALERT_TOKEN. Every other shape falls back to the registry repo
+    + workflow token (the pre-#436 unconfigured behaviour).
+
+    Presence of the env vars is CONFIGURATION, not verification (#432 round 1): the pair can name
+    the public registry itself or any other public repository, and token presence proves nothing
+    about destination visibility. These bodies carry hashed account references rather than raw
+    handles, so the fallback is a delivery choice rather than a redaction one — but a misconfigured
+    ALERT_REPO must not silently stand in for the private channel, and a future body change must
+    not inherit a route that was never verified.
+
+    The fallback token prefers REGISTRY_ALERT_TOKEN over ALERT_TOKEN because the fallback
+    destination is the REGISTRY repo: ALERT_TOKEN is minted for the private alert repo and a
+    write to the registry under it would be refused. Before #436 the fallback was only reachable
+    when ALERT_REPO was unset, so the precedence never mattered; a rejected route now reaches it
+    with ALERT_TOKEN set.
+
+    `confirmed_private` is injectable for the self-test; the default performs the live lookup,
+    consulted only once both halves of the route are set and the same-repo case is excluded."""
+    registry_repo = os.environ.get("REGISTRY_REPO")
+    alert_repo = os.environ.get("ALERT_REPO")
+    alert_token = os.environ.get("ALERT_TOKEN")
+    if alert_repo and alert_token:
+        same_repo = alert_repo.strip().lower() == (registry_repo or "").strip().lower()
+        check = confirmed_private if confirmed_private is not None else _repo_confirmed_private
+        if not same_repo and check(alert_repo, alert_token):
+            return alert_repo, alert_token
+    return registry_repo, os.environ.get("REGISTRY_ALERT_TOKEN") or alert_token
 
 
 def _ops_alert(alert_repo, alert_token, title, body):
@@ -1219,7 +1261,7 @@ def _norm_path(path):
 
 
 def trust_surface_paths_touched(diff_files, surface_paths=DEFAULT_TRUST_SURFACE_PATHS):
-    """[OPUS-4.8] B3 / defects #2,#4: the ACTIVE FILE-level trust-surface control. Returns the
+    """B3 / defects #2,#4: the ACTIVE FILE-level trust-surface control. Returns the
     sorted subset of `diff_files` that touch a gate-weakening / orchestration-control path, so the
     ARM path can withhold auto-arm and route to a HUMAN. A path in `surface_paths` ending in `/`
     matches that directory subtree; a bare path matches itself or any descendant. Hostile-tolerant:
@@ -1776,7 +1818,7 @@ def _park_policy():
 
 
 def _pr_changed_files(repo, pr_number):
-    """[OPUS-4.8] B3: the LIVE changed-file paths of a PR (paginated). Used by ready_and_arm's
+    """B3: the LIVE changed-file paths of a PR (paginated). Used by ready_and_arm's
     trust-surface re-derivation so the arm gate keys on the actual diff (renamed paths included),
     not a planning-time snapshot. Malformed entries are dropped (fail closed toward human arm)."""
     pages = _gh_json([
@@ -5434,7 +5476,7 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     PR stays visible to the sweep for a bounded re-review instead of stalling non-draft/unarmed
     forever; if even the undo fails, this escalates to review:needs-user (never silent).
 
-    [OPUS-4.8] B3, REVISED per Decision 7 (maintainer 2026-07-18): the trust-surface set is
+    B3, REVISED per Decision 7 (maintainer 2026-07-18): the trust-surface set is
     still re-derived on LIVE changed files (renamed-path safe), but a hit no longer withholds
     the arm — approve IS the arm decision on every surface. The hits feed the POST-arm audit
     trail (_apply_trust_surface_audit: trust-surface label + one idempotent marker comment),
@@ -5983,7 +6025,7 @@ def review_outcome(args):
               "reviewed-sha stays unbound; the sweep re-reviews the current head")
         return
     post_findings(args.repo, args.pr, args.verdict_file, args.round)
-    # [OPUS-4.8] B3 / defects #2,#4: the ACTIVE FILE-level trust-surface control. Derive it from
+    # B3 / defects #2,#4: the ACTIVE FILE-level trust-surface control. Derive it from
     # the PR's own diff file set (the same list the reviewer just used). ANY gate-weakening /
     # orchestration-control path forces the security posture — the review stays automated, but an
     # approved PR that touches one is HUMAN-armed (needs-user), never auto-armed. The surface list
@@ -6996,7 +7038,7 @@ def _self_test():
     check("security label substring", security_flagged({"area:sparq-zk"}), True)
     check("security trust prefix", security_flagged({"trust:untrusted"}), True)
     check("security plain labels", security_flagged({"area:sparq-core", "role:impl"}), False)
-    # [OPUS-4.8] defect #3: per-target keyword injection flags the registry's trust areas that the
+    # defect #3: per-target keyword injection flags the registry's trust areas that the
     # builtin keyword set missed (area:worker/dispatch/set-up-account/review-loop/groom).
     check("defect#3 registry area unflagged by builtin",
           security_flagged({"area:worker", "role:impl", "status:ready"}), False)
@@ -7007,7 +7049,7 @@ def _self_test():
           security_flagged({"area:usage", "role:impl"},
                            extra_keywords=("worker", "dispatch")), False)
 
-    # [OPUS-4.8] B3 / defects #2,#4: the WIRED trust-surface FILE control (both directions +
+    # B3 / defects #2,#4: the WIRED trust-surface FILE control (both directions +
     # renamed-path + directory-subtree). A benign diff is NOT flagged; ANY gate-weakening path is.
     check("trust-surface benign diff",
           trust_surface_paths_touched(["README.md", "data/leases.json"]), [])
@@ -11080,7 +11122,76 @@ def _self_test():
     check("alert route defaults to registry", _alert_route(), ("reg/repo", "t0"))
     os.environ["ALERT_REPO"] = "private/alerts"
     os.environ["ALERT_TOKEN"] = "t1"
-    check("alert route honours ALERT_REPO", _alert_route(), ("private/alerts", "t1"))
+    _route_probe = []
+    check("alert route honours a CONFIRMED-private ALERT_REPO",
+          _alert_route(confirmed_private=lambda r, t: _route_probe.append((r, t)) or True),
+          ("private/alerts", "t1"))
+    check("alert route probes the ALERT repo under the ALERT token",
+          _route_probe, [("private/alerts", "t1")])
+    # #436: presence of both env vars is CONFIGURATION, not verification (the #432 round-1
+    # finding). An unverifiable, public, or same-repo ALERT_REPO must fall back to the registry
+    # under the REGISTRY token — a misconfigured private channel never silently stands in for one.
+    check("alert route REFUSES an UNCONFIRMED ALERT_REPO (public/failed lookup), fail closed",
+          _alert_route(confirmed_private=lambda r, t: False), ("reg/repo", "t0"))
+    os.environ["ALERT_REPO"] = "Reg/Repo"
+    _same_probe = []
+    check("alert route REFUSES ALERT_REPO == REGISTRY_REPO (case-insensitive), NO probe spent",
+          (_alert_route(confirmed_private=lambda r, t: _same_probe.append(r) or True),
+           _same_probe),
+          (("reg/repo", "t0"), []))
+    os.environ["ALERT_REPO"] = "private/alerts"
+    os.environ.pop("ALERT_TOKEN", None)
+    _half_probe = []
+    check("alert route REFUSES a half-config route (repo, no token), NO probe spent",
+          (_alert_route(confirmed_private=lambda r, t: _half_probe.append(r) or True),
+           _half_probe),
+          (("reg/repo", "t0"), []))
+    # The rejected route falls back under the REGISTRY token, not ALERT_TOKEN: the fallback
+    # destination is the registry repo, which ALERT_TOKEN is not minted for.
+    os.environ["ALERT_TOKEN"] = "t1"
+    check("alert route fallback uses REGISTRY_ALERT_TOKEN even when ALERT_TOKEN is set",
+          _alert_route(confirmed_private=lambda r, t: False), ("reg/repo", "t0"))
+    os.environ.pop("REGISTRY_ALERT_TOKEN", None)
+    check("alert route fallback degrades to ALERT_TOKEN when no REGISTRY_ALERT_TOKEN exists",
+          _alert_route(confirmed_private=lambda r, t: False), ("reg/repo", "t1"))
+    os.environ["REGISTRY_ALERT_TOKEN"] = "t0"
+    # _repo_confirmed_private itself: True ONLY on a definitive `"private": true` read under the
+    # ROUTE token; every failure shape — bad returncode, unparseable body, non-boolean value, a
+    # RAISING gh call — is False, and none of them may propagate onto the alerting path.
+    _vis_seen = []
+    _real_run_gh = globals()["_run_gh"]
+
+    def _vis_run_gh(rc, stdout, raises=False):
+        def run(args, *, input_text=None, check=True, env=None):
+            _vis_seen.append((list(args), (env or {}).get("GH_TOKEN")))
+            if raises:
+                raise WorkerPrError("SENTINEL-GH-RAISE")
+            return subprocess.CompletedProcess(["gh", *args], rc, stdout, "")
+        return run
+
+    try:
+        globals()["_run_gh"] = _vis_run_gh(0, json.dumps({"private": True, "id": 1}))
+        check("visibility probe: definitive private=true -> True, GET repos/{repo} under the "
+              "route token",
+              (_repo_confirmed_private("private/alerts", "route-tok"), _vis_seen[-1]),
+              (True, (["api", "repos/private/alerts"], "route-tok")))
+        globals()["_run_gh"] = _vis_run_gh(0, json.dumps({"private": False}))
+        check("visibility probe: a PUBLIC destination -> False (fail closed)",
+              _repo_confirmed_private("org/pub", "t"), False)
+        globals()["_run_gh"] = _vis_run_gh(1, "")
+        check("visibility probe: failed lookup -> False (never assumed private)",
+              _repo_confirmed_private("private/alerts", "t"), False)
+        globals()["_run_gh"] = _vis_run_gh(0, "SENTINEL-NOT-JSON")
+        check("visibility probe: unparseable payload -> False (fail closed)",
+              _repo_confirmed_private("private/alerts", "t"), False)
+        globals()["_run_gh"] = _vis_run_gh(0, json.dumps({"private": "true"}))
+        check("visibility probe: anything but a literal private=true bool -> False",
+              _repo_confirmed_private("private/alerts", "t"), False)
+        globals()["_run_gh"] = _vis_run_gh(0, "", raises=True)
+        check("visibility probe: a RAISING gh call -> False, never propagated",
+              _repo_confirmed_private("private/alerts", "t"), False)
+    finally:
+        globals()["_run_gh"] = _real_run_gh
     for key in ("REGISTRY_REPO", "REGISTRY_ALERT_TOKEN", "ALERT_REPO", "ALERT_TOKEN"):
         os.environ.pop(key, None)
     # ---- ready_and_arm wiring (Decision 7 revision, sol r1 on #257): approved trust-surface
@@ -13106,7 +13217,7 @@ def main():
     arm.add_argument("--reviewer-provider", required=True)
     arm.add_argument("--arm", choices=("true", "false"), required=True)
     arm.add_argument("--issue", type=int)
-    # [OPUS-4.8] B3: the live trust-surface arm gate's path list (repeatable; from policy
+    # B3: the live trust-surface arm gate's path list (repeatable; from policy
     # security_paths). [issue #166] Unioned onto the mandatory DEFAULT_TRUST_SURFACE_PATHS floor
     # (resolve_trust_surface_paths) — it extends the defaults; empty -> defaults alone (fail closed).
     arm.add_argument("--surface-path", action="append", default=[],
@@ -13134,7 +13245,7 @@ def main():
     rout.add_argument("--round", required=True, type=int)
     rout.add_argument("--max-rounds", required=True, type=int)
     rout.add_argument("--security", action="store_true")
-    # [OPUS-4.8] B3 / defects #2,#4: the WIRED trust-surface FILE list from the target policy
+    # B3 / defects #2,#4: the WIRED trust-surface FILE list from the target policy
     # row's `security_paths` (repeatable). Any PR-diff path under one of these forces the human
     # arm even for a benign-labelled PR. [issue #166] Unioned onto the mandatory
     # DEFAULT_TRUST_SURFACE_PATHS floor (it extends the defaults); empty -> the defaults alone.

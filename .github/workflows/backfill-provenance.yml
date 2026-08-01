@@ -12,15 +12,27 @@
 # or `review:pass` is recorded but never drafted, because drafting evicts it from the queue.
 # DRY RUN unless apply=true.
 name: backfill-provenance
-run-name: backfill-provenance ${{ inputs.target_repo }} apply=${{ inputs.apply }}
+run-name: backfill-provenance ${{ inputs.target_repo || 'ALL enabled' }} apply=${{ inputs.apply || github.event_name == 'schedule' }}
 
 on:
+  # [#1544] Every run in this workflow's history was a HUMAN invoking it, and an orphaned worker PR
+  # is fail-closed INVISIBLE to the review loop until its record exists — so the population only
+  # drained when somebody remembered. Measured 2026-08-01: sparq recorded 5 and the registry
+  # recorded 3 in one session, both "nobody pointed it at this repo lately".
+  schedule:
+    - cron: '23 */4 * * *'
   workflow_dispatch:
     inputs:
       target_repo:
-        description: Target owner/repository (must be enabled in policy/repos.toml)
-        required: true
-        default: sparq-org/sparq
+        description: >-
+          Target owner/repository (must be ENABLED in policy/repos.toml). Leave EMPTY to sweep
+          every enabled target, which is what the schedule does.
+        required: false
+        # [#1544] NO default. A `default:` is materialised for workflow_dispatch, so any value here
+        # makes "leave EMPTY to sweep every enabled target" unreachable from the UI/API — the manual
+        # path would silently disagree with its own description AND with the schedule. Scheduled
+        # runs are unaffected either way (a schedule supplies no `inputs` context at all), so this
+        # only fixes the manual half.
         type: string
       apply:
         description: Write records + convert to draft (false = dry run)
@@ -37,12 +49,62 @@ on:
 
 permissions: {}
 
-concurrency:
-  group: backfill-provenance
-  cancel-in-progress: false
-
 jobs:
+  # [#1544] Targets are READ FROM POLICY, never listed here. A hardcoded copy of the enabled set is
+  # the exact duplication that took dispatch fully down on 2026-08-01 (#1537/#1540: policy enabled a
+  # third repo, the workflow's manifest did not, CLAIM failed closed). One source of truth.
+  targets:
+    name: Resolve enabled targets from policy
+    if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      repos: ${{ steps.resolve.outputs.repos }}
+    steps:
+      - name: Checkout registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4.2.2
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            policy/repos.toml
+          sparse-checkout-cone-mode: false
+      - name: Resolve
+        id: resolve
+        env:
+          REQUESTED: ${{ inputs.target_repo }}
+        run: |
+          set -euo pipefail
+          python3 - <<'EOF' | tee -a "$GITHUB_OUTPUT"
+          import json, os, tomllib
+          requested = (os.environ.get("REQUESTED") or "").strip()
+          policy = tomllib.load(open("policy/repos.toml", "rb"))["repos"]
+          enabled = sorted(n for n, r in policy.items()
+                           if isinstance(r, dict) and r.get("enabled"))
+          # A manual run keeps its explicit single target; a scheduled run sweeps EVERY enabled
+          # repo. Fail loud on an unknown manual target rather than silently sweeping everything.
+          if requested:
+              if requested not in enabled:
+                  raise SystemExit(f"target_repo {requested!r} is not an ENABLED policy row: {enabled}")
+              repos = [requested]
+          else:
+              repos = enabled
+          if not repos:
+              raise SystemExit("policy enables no repos — refusing to run with an empty matrix")
+          print("repos=" + json.dumps(repos))
+          EOF
+
   backfill:
+    needs: targets
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJSON(needs.targets.outputs.repos) }}
+    # Per-TARGET concurrency: a workflow-level group would serialise the matrix and let one slow
+    # repo starve the others. Moved here because workflow-level `concurrency` cannot read `matrix`.
+    concurrency:
+      group: backfill-provenance-${{ matrix.repo }}
+      cancel-in-progress: false
     name: Backfill missing provenance records (ledger branch)
     # The salt is a secret: refuse to run from any non-default ref (a modified branch copy of
     # this workflow must never see it — the sol-audit arbitrary-ref class).
@@ -65,14 +127,14 @@ jobs:
       - name: Checkout public target for protected routing data (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: ${{ inputs.target_repo }}
+          repository: ${{ matrix.repo }}
           path: target-routing
           persist-credentials: false
 
       - name: Enforce the policy row (enabled target + ITS validated routing pointer)
         id: policy
         env:
-          TARGET_REPO: ${{ inputs.target_repo }}
+          TARGET_REPO: ${{ matrix.repo }}
         run: |
           set -euo pipefail
           [[ "$TARGET_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || { echo '::error::unsafe target repo'; exit 1; }
@@ -103,8 +165,8 @@ jobs:
           # non-draft PR needing conversion is WARNed with the manual command (github.token
           # has no target write; the outage population is already draft).
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
-          TARGET_REPO: ${{ inputs.target_repo }}
-          APPLY: ${{ inputs.apply }}
+          TARGET_REPO: ${{ matrix.repo }}
+          APPLY: ${{ inputs.apply || github.event_name == 'schedule' }}
           NO_DRAFT_CONVERT: ${{ inputs.no_draft_convert }}
           ROUTING_FILE: ${{ steps.policy.outputs.routing_file }}
         run: |

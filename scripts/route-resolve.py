@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [OPUS-4.8] Registry self-management: the routing resolver for jeswr/agent-account-registry.
+# Registry self-management: the routing resolver for jeswr/agent-account-registry.
 # A copy of the sparq target's scripts/route-resolve.py; dispatch-plan.py imports resolve().
 """route-resolve.py — resolve an issue's labels to (model_chain, agent, escalate).
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [OPUS-4.8] Model-access health alerting (registry issue #32 consumes the UNCONSUMED
+# Model-access health alerting (registry issue #32 consumes the UNCONSUMED
 # worker-live.sh exit-class; part of #28 zero-dispatch visibility; #39 ALERT_TOKEN fail-silent).
 #
 # WHY this exists: the pipeline silently stalled for hours when Anthropic-side model access failed

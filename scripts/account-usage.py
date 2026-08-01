@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [OPUS-4.8] Probe live per-account usage for usage-aware dispatch. Emits a JSON map
+# Probe live per-account usage for usage-aware dispatch. Emits a JSON map
 #   {handle: {"status","5h_util","5h_reset","7d_util","7d_reset", (fable fields), (opus5 fields)}}
 #     for anthropic accounts
 #   {handle: {"exempt": true, ("backoff_until": epoch...)}}  for PROBE-EXEMPT providers (openai/codex)

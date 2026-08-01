@@ -479,7 +479,7 @@ _run_headless_harness() {
   harness_wall_seconds=$(( $(date +%s) - harness_started_at ))
   _extract_usage_telemetry "$model_log" "$harness" "$worker_root" "$harness_wall_seconds" || true
   if [[ "$rc" -ne 0 ]]; then
-    # [OPUS-4.8] canary diagnostic: emit ONLY a sanitized error CLASS (never the raw
+    # canary diagnostic: emit ONLY a sanitized error CLASS (never the raw
     # model output/credential) so failures are debuggable without leaking secrets.
     # HOST-OBSERVABLE SIGNALS ONLY (review defect #4): classify from the nonzero CLI exit code
     # plus the CLI's OWN error text — its stderr stream and, from stdout, ONLY lines carrying the
@@ -623,7 +623,7 @@ run_model() {
   # anything it can observe); the host creates the worker branch AFTER the run and asserts HEAD
   # never moved. `git switch -c` carries the model's uncommitted edits onto the new branch.
   _run_headless_harness "$prompt" allow
-  # [OPUS-4.8] Lift any model-declared follow-ups OUT of the target tree BEFORE the change-detection +
+  # Lift any model-declared follow-ups OUT of the target tree BEFORE the change-detection +
   # commit, so they become issues (worker.yml) but are NEVER committed. Doing it before the
   # "no repository changes" check means a follow-ups-only run correctly registers as no real work.
   if [[ -f "${TARGET_DIR:-.}/.worker-followups.jsonl" ]]; then
@@ -798,7 +798,7 @@ run_gate() {
     crate-scoped)
       [[ -f Cargo.toml ]] || die 'crate-scoped gate requires Cargo.toml'
       if [[ -z "$packages" ]]; then
-        # [OPUS-4.8] No area:<crate> label. Legitimate for a docs/non-crate change (e.g. a
+        # No area:<crate> label. Legitimate for a docs/non-crate change (e.g. a
         # role:docs task edits AGENTS.md only) — there is no crate to build, and the PR's CI
         # docs-quality gate is the real backstop. But it is a REAL error if the diff actually
         # touches crate source with no crate label, so fail closed in that case.
@@ -872,7 +872,7 @@ run_gate() {
       printf 'worker-live: workspace gate passed\n'
       ;;
     registry-selftest)
-      # [OPUS-4.8] python/actions gate for a self-managed target (the registry itself): the
+      # python/actions gate for a self-managed target (the registry itself): the
       # crate-scoped cargo gate does not fit a python repo. Fail-closed, and NON-VACUOUS — a run
       # that touched a script but found no runnable suite is an error, not a silent pass.
       registry_selftest_gate
@@ -2360,7 +2360,7 @@ with open(issue_file, encoding="utf-8") as handle:
 raw = " ".join(str(issue.get("title", "")).split())
 if not raw:
     raise SystemExit("worker-live: issue title is empty")
-# [OPUS-4.8] Build a Conventional-Commits PR title. `.github/workflows/pr-title.yml` validates it,
+# Build a Conventional-Commits PR title. `.github/workflows/pr-title.yml` validates it,
 # and because main uses squash-merge the PR TITLE becomes the release-plz-parsed commit subject. A
 # migrated issue title is "sq-<id>: <desc>", whose "sq-<id>" reads as an invalid type → the check
 # fails on EVERY worker PR. Derive an allowed type from role/kind, scope from area:<crate>, and keep
@@ -3592,8 +3592,13 @@ _purge_before_target_code() {
   fi
 }
 
-# PURE (self-tested): print the step id of every `worker`-job token mint that does NOT disable
-# the action's token-revocation post phase. Expected output is EMPTY.
+# PURE (self-tested): print the step id of every token mint in the GATE-RUNNING job that does NOT
+# disable the action's token-revocation post phase. Expected output is EMPTY.
+#
+# Usage: _worker_mints_missing_revoke_skip <workflow-file> [job-name]
+# The gate-running job is `worker` in worker.yml (the default) and `run` in review-fix.yml — the
+# two jobs that execute `worker-live.sh gate`, i.e. target-controlled code. Any OTHER job is out of
+# scope by construction: no target code runs there, so a post-phase revoker is not "after the gate".
 #
 # WHY (PR #310 round 3 blocker, the gap #575 left open). actions/create-github-app-token by
 # default registers a POST-job phase that REVOKES the installation token — authenticating WITH
@@ -3602,28 +3607,43 @@ _purge_before_target_code() {
 # silent about revocation puts a credential-bearing process on the runner strictly later than
 # the gate: exactly the shape `_tokens_after_gate` exists to ban, but invisible to it, because
 # no `GH_TOKEN:` ever appears in the workflow text — the action supplies the token internally.
-# Every worker-job mint must therefore set `skip-token-revoke: true` and rely on the 60-minute
-# installation TTL plus narrow scoping instead. The isolated `publish`/`final_state` jobs keep
-# the default revoker: no target code ever runs there.
+# Every gate-running-job mint must therefore set `skip-token-revoke: true` and rely on the
+# 60-minute installation TTL plus narrow scoping instead. The isolated `publish`/`final_state`
+# jobs keep the default revoker: no target code ever runs there.
+#
+# [issue #1285] This applies to BOTH lanes. review-fix.yml's fix lane runs the SAME hostile gate,
+# so its `run`-job mints sit in front of the same post-phase revoker; the job name is a parameter
+# rather than a hard-coded `worker` precisely so the fix lane cannot be silently exempt.
 #
 # Job boundary is a two-space-indented key (same convention as `_tokens_after_gate`), so the
-# clean jobs' own legitimate, revoking mints are deliberately not counted.
+# clean jobs' own legitimate, revoking mints are deliberately not counted. The job name is matched
+# EXACTLY (compared as a string, never as a regex), so `run` cannot also match `run-something`.
+#
+# [PR #1522 round 2] `skip-token-revoke` only reaches the action as an INPUT, i.e. as a child of
+# that step's OWN `with:` mapping. The same line under the step's `env:` (or any other sibling
+# mapping) is an environment variable the action never reads, so the post-job revoker is still
+# registered — while a scan that matched the key anywhere inside the step would call that mint
+# protected. So the key is counted ONLY at with-child indentation while inside the `with:` block:
+# step-level keys sit at eight spaces and close the mapping, their children at ten.
 _worker_mints_missing_revoke_skip() {
-  awk '
+  awk -v job="${2:-worker}" '
     /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
       if (injob && mint && !skip) print id
-      mint=0; skip=0; id="(unnamed)"
-      injob = ($0 ~ /^  worker:[[:space:]]*$/)
+      mint=0; skip=0; inwith=0; id="(unnamed)"
+      key=$0; sub(/^  /,"",key); sub(/:[[:space:]]*$/,"",key)
+      injob = (key == job)
       next
     }
     !injob { next }
     /^      -[[:space:]]/ {
       if (mint && !skip) print id
-      mint=0; skip=0; id="(unnamed)"
+      mint=0; skip=0; inwith=0; id="(unnamed)"
     }
+    /^        [A-Za-z0-9_.-]+:/ { inwith=0 }
+    /^        with:[[:space:]]*$/ { inwith=1 }
     /^[[:space:]]*id:[[:space:]]/ { ln=$0; sub(/^[[:space:]]*id:[[:space:]]*/,"",ln); id=ln }
     /^[[:space:]]*uses:[[:space:]]*actions\/create-github-app-token@/ { mint=1 }
-    /^[[:space:]]*skip-token-revoke:[[:space:]]*true[[:space:]]*$/ { skip=1 }
+    inwith && /^          skip-token-revoke:[[:space:]]*true[[:space:]]*$/ { skip=1 }
     END { if (injob && mint && !skip) print id }
   ' "$1"
 }
@@ -5638,6 +5658,110 @@ YAML
   chk "(#91 r2) ...and the lease release + the outcome record both WAIT for the publisher" \
     "$(grep -Fc 'needs: [claim, run, publish]' "$rf_wf" || true):$(grep -Fc 'needs: [resolve, claim, run, publish]' "$rf_wf" || true)" \
     "1:1"
+
+  # --- [issue #1285] THE HALF OF #575 THE FIX LANE NEVER INHERITED. Everything above is about
+  # tokens the workflow WRITES DOWN after the gate, and `_tokens_after_gate` now reads zero on both
+  # lanes. create-github-app-token's default revocation POST phase writes nothing down and still
+  # runs a token-bearing process after ALL normal steps — i.e. after the fix lane's
+  # `worker-live.sh gate` has executed target-controlled build scripts as the runner user. #126
+  # closed that on worker.yml's `worker` job only; the fix lane's `run` job runs the SAME gate, so
+  # the identical ban is asserted on it here. ---
+  chk "#1285 (LIVE): every fix-lane run-job token mint disables the post-gate revocation phase" \
+    "$(_worker_mints_missing_revoke_skip "$rf_wf" run | wc -l | tr -d ' ')" "0"
+  # NON-VACUITY, both regression directions and against an empty read: the `run` job really does
+  # mint two tokens, and each of the two shapes that reopen the hole — an explicit opt-in (false)
+  # and silence (key absent) — must report BOTH of them.
+  local rf_revoke_false="$tmp/review-fix-revoke-false.yml" rf_revoke_absent="$tmp/review-fix-revoke-absent.yml"
+  sed 's/^          skip-token-revoke: true$/          skip-token-revoke: false/' "$rf_wf" > "$rf_revoke_false"
+  sed '/^          skip-token-revoke: true$/d' "$rf_wf" > "$rf_revoke_absent"
+  chk "#1285: a fix-lane mint with skip-token-revoke: false is REPORTED (non-vacuous)" \
+    "$(_worker_mints_missing_revoke_skip "$rf_revoke_false" run | wc -l | tr -d ' ')" "2"
+  chk "#1285: a fix-lane mint SILENT about revocation is REPORTED (non-vacuous)" \
+    "$(_worker_mints_missing_revoke_skip "$rf_revoke_absent" run | wc -l | tr -d ' ')" "2"
+  # ...and the scan stays JOB-SCOPED on this file too: the publisher and the outcome job run no
+  # target code, so their legitimately-revoking mints must NOT be flagged even when the whole file
+  # is stripped of the key. Without this the LIVE zero above could be an artefact of over-reach
+  # being impossible to notice.
+  chk "#1285: the clean publish/outcome mints are NOT flagged (scan is gate-job scoped)" \
+    "$(_worker_mints_missing_revoke_skip "$rf_revoke_absent" run | grep -Ec 'app-token-(publish|outcome|arm)' || true)" "0"
+  chk "#1285: ...and those clean-job mints really exist to be skipped (control)" \
+    "$(grep -Ec '^        id: app-token-(publish|outcome|arm)$' "$rf_wf" || true)" "3"
+  # PLACEMENT, not mere presence. `skip-token-revoke` disables the revoker only as an ACTION INPUT
+  # — a child of that step's own `with:`. Under the step's `env:` it is an environment variable the
+  # action never reads: the credential-bearing post phase is still registered, and the LIVE zero
+  # above would stay green while the hole is open. Neither the false nor the absent mutant can
+  # catch that (both only vary the key AT the correct place), so the third regression direction is
+  # the same key, same step, WRONG mapping — every mint must still be reported.
+  # The key is re-attached as a sibling `env:` mapping DIRECTLY AFTER the action's `with:` block —
+  # the ordering a real edit produces, and the one that exercises both halves of the placement
+  # guard: the `with:` opener AND the step-level key that must CLOSE it (leave the mapping open and
+  # this misplaced child reads as an input again).
+  local rf_revoke_misplaced="$tmp/review-fix-revoke-misplaced.yml"
+  awk '
+    function flush() { if (pending) { print "        env:"; print "          skip-token-revoke: true"; pending=0 } }
+    /^[[:space:]]*uses:[[:space:]]*actions\/create-github-app-token@/ { mint=1 }
+    inwith && $0 !~ /^          / && $0 !~ /^[[:space:]]*$/ { pending=1; inwith=0; mint=0 }
+    mint && /^        with:[[:space:]]*$/ { inwith=1 }
+    { flush(); print }
+    END { if (inwith) pending=1; flush() }
+  ' "$rf_revoke_absent" > "$rf_revoke_misplaced"
+  chk "#1285: skip-token-revoke under the step env: mapping (not its with:) is STILL REPORTED" \
+    "$(_worker_mints_missing_revoke_skip "$rf_revoke_misplaced" run | wc -l | tr -d ' ')" "2"
+  # ...over a fixture that really did RELOCATE the key rather than lose it — otherwise the line
+  # above merely re-asserts the absent mutant it was built from. Each mint in the file carries the
+  # key exactly once, as a child of an `env:` mapping (structurally valid YAML, just the wrong
+  # mapping), and the base fixture it was grown from carries none at all.
+  chk "#1285: ...and that fixture relocated the key, one per mint, each under an env: mapping" \
+    "$(grep -A1 '^        env:$' "$rf_revoke_misplaced" | grep -c '^          skip-token-revoke: true$' || true):$(grep -c '^          skip-token-revoke: true$' "$rf_revoke_absent" || true):$(grep -c 'uses:[[:space:]]*actions/create-github-app-token@' "$rf_wf" || true)" \
+    "6:0:6"
+  # ...and DEPTH is part of placement too: an input is a DIRECT child of `with:`, so the same text
+  # nested deeper — inside a block scalar the action passes through as a value — is not an input
+  # either. Asserted next to the accepting shape so the depth anchor is shown to reject only the
+  # text that is not an input, rather than rejecting everything (which would make the LIVE zeros
+  # unreachable rather than true).
+  local rf_revoke_depth="$tmp/revoke-depth-fixture.yml"
+  cat > "$rf_revoke_depth" <<'WFDEPTH'
+jobs:
+  run:
+    steps:
+      - name: a mint whose with: mapping merely CONTAINS the text, nested in a block scalar
+        id: app-token-textonly
+        uses: actions/create-github-app-token@v3
+        with:
+          private-key: |
+            skip-token-revoke: true
+      - name: a mint that really passes the input
+        id: app-token-proper
+        uses: actions/create-github-app-token@v3
+        with:
+          skip-token-revoke: true
+WFDEPTH
+  chk "#1285: only a DIRECT with:-child counts — deeper block-scalar text is still REPORTED" \
+    "$(_worker_mints_missing_revoke_skip "$rf_revoke_depth" run | tr '\n' ',')" "app-token-textonly,"
+  # The job name is compared as a STRING, not a regex: an unrelated job whose name merely contains
+  # the gate job's name must not be scanned, and a job that does not exist must read empty rather
+  # than falling through to "scan everything".
+  local rf_jobname_fix="$tmp/revoke-jobname-fixture.yml"
+  cat > "$rf_jobname_fix" <<'WFREV'
+jobs:
+  run-cleanup:
+    steps:
+      - name: a mint in a DIFFERENT job that merely shares a name prefix
+        id: app-token-elsewhere
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: x
+  run:
+    steps:
+      - name: the gate job's own silent mint
+        id: app-token-gatejob
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: x
+WFREV
+  chk "#1285: job match is exact — only the real gate job is scanned, unknown job reads empty" \
+    "$(_worker_mints_missing_revoke_skip "$rf_jobname_fix" run | tr '\n' ',')$(_worker_mints_missing_revoke_skip "$rf_jobname_fix" nosuchjob | wc -l | tr -d ' ')" \
+    "app-token-gatejob,0"
 
   # --- [issue #568] the re-check must accept the workflow's OWN label lifecycle, and the claim
   # step must establish ownership BEFORE it takes the shared label. The claim step moves the issue

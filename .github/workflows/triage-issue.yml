@@ -115,8 +115,10 @@ jobs:
       # PR #595 finding 5: the QUARANTINE labels are a TRUST BOUNDARY, so their write is fail-loud.
       # It used to carry `|| true`: a failed edit left third-party content with NO trust:untrusted
       # and NO status:untriaged while the job reported success — silently un-quarantined, and
-      # invisible to retriage (which only revisits status:untriaged). The edit now fails the step
-      # (`set -e`, no `|| true`) and a post-read PROVES both labels landed before the step goes
+      # invisible even to the bidirectional (#586) retriage sweep: BOTH of its lanes are keyed on a
+      # status attestation (status:untriaged for promote, status:ready for re-park/repair) and such
+      # an issue carries neither, so retriage.plan calls it not-retriageable. The edit now fails
+      # the step (`set -e`, no `|| true`) and a post-read PROVES both labels landed before it goes
       # green. Only the courtesy NOTIFICATION stays best-effort — it is not a state transition, and
       # it emits a ::warning rather than vanishing. scripts/triage.py --self-test statically
       # asserts this shape so the `|| true` cannot come back on the label write.

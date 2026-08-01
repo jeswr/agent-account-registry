@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# [OPUS-4.8] Web-login broker core (review-hardened S4): run a provider's device/token login, surface
+# Web-login broker core (review-hardened S4): run a provider's device/token login, surface
 # the sign-in URL+code, poll for completion, and extract the token — WITHOUT ever persisting the token
 # in a diagnostic log. The token is written only to $OUTDIR/token (mode 600) and the credential kind
 # to $OUTDIR/credential_format. A trap shreds the transient raw capture on ANY exit.

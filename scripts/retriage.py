@@ -17,6 +17,21 @@ directions:
               own drift makes enumerable (the lost-`role:*` case: `triage()` re-derives the role)
               is repaired in place. Strictly better than a re-park — it needs no human — and it is
               the SAME classifier verdict, not a second notion of completeness.
+  * ADOPT   — an issue on NEITHER lane, carrying no `status:*` and no `priority:*` at all, is put
+              back on `status:untriaged` (registry #1180). See THE ORPHAN LANE below.
+
+THE ORPHAN LANE (registry #1180). The two lanes above are boards keyed on a `status:*` label, so
+they can only see issues some EARLIER write already succeeded in labelling. `triage()` plans the
+priority and the status attestation as ONE `gh issue edit`, and GitHub fails the whole call when a
+single `--add-label` names a label the repository does not define — so a failed batch leaves an
+issue with no priority (never dispatchable: `valid_priority()` gates readiness), no status (absent
+from the untriaged census) and, decisively, on NEITHER board. The recovery mechanism was keyed on
+the label whose write failed, which made it structurally blind to exactly the population the
+failure creates: 40 open issues, measured, silently undispatchable and in no census. So the sweep
+now also queries a board that depends on NO prior successful write — `is_orphan`, "no `status:` and
+no `priority:`" — and adopts what it finds onto `status:untriaged`, the state that is true of it.
+That is a third BOARD, not a third notion of completeness: every gate below still runs first, the
+write is the same fail-closed applier, and the readiness transition stays with the promotion lane.
 
 WHO MAY BE RETRIAGED (registry #487). The author trust gate is the FIRST thing `plan()` checks,
 and until now it recognised exactly two automation identities: the maintainer and the orchestrator
@@ -26,11 +41,14 @@ opened would return `untrusted-author` and be neither promotable out of `status:
 demotable on a label regression. #487 already shipped the per-repo `allow_actions_bot_issues`
 opt-in and wired it into dispatch CLAIM (`dispatch-claim._issue_is_trusted`) and the curator
 (`curate-frontier.trusted_author`); this sweep was the residual consumer. It now reads the SAME
-policy row, so triage trust cannot drift from admission trust. This is a LATENT-CONSISTENCY fix
-and is INERT on this repo today: the sweep's board is exactly the `status:untriaged` and
-`status:ready` lane queries, and nothing labels a `github-actions[bot]` issue onto either lane
-(see the "[registry #487] THE ACTIONS-BOT TRIAGE OPT-IN" block in the self-test for the executed
-board-membership assertion and the upstream unit this waits on). The opt-in admits the EXACT login
+policy row, so triage trust cannot drift from admission trust. This was a LATENT-CONSISTENCY fix,
+INERT while the sweep's board was exactly the `status:untriaged` and `status:ready` lane queries —
+nothing labels a `github-actions[bot]` issue onto either lane. The #1180 ORPHAN board is lane-LESS,
+so it CAN hand this gate an actions-bot issue and the opt-in is live: without the per-repo
+`allow_actions_bot_issues` row such an orphan reads `untrusted-author` and is skipped, i.e. it is
+listed and logged but never written — fail-closed, exactly as before, and never widened by the new
+board (see the "[registry #487] THE ACTIONS-BOT TRIAGE OPT-IN" block in the self-test for the
+executed board-membership assertion). The opt-in admits the EXACT login
 `github-actions[bot]` and nothing else — never a `<x>[bot]` suffix match, which is the defect #487
 closed on the dispatch side, since a suffix would admit any unrelated or compromised GitHub App.
 It widens TRIAGE only: it grants no admission, no arming and no merge, and every park below is
@@ -108,13 +126,18 @@ ACTIONS_BOT_LOGIN = "github-actions[bot]"
 CLAIM_OWNED = {"status:in-progress", "status:in-progress-review"}
 # The actions that WRITE. `--apply` mutates for each of them through the one shared applier; every
 # other verdict is a no-op skip (fail-closed: an unknown action never becomes a write).
-WRITING_ACTIONS = ("promote", "repark", "repair")
-# The two lane attestations this sweep moves an issue between. Exactly one of them must be on the
-# issue after ANY accepted action: an issue on NEITHER lane is invisible to the readiness engine
-# AND to this sweep's own board queries, i.e. terminally stranded (registry #510's lane invariant).
-LANE_LABELS = frozenset({"status:ready", "status:untriaged"})
-# The verdict a decision is downgraded to when its unknown-label reduction cannot be applied safely.
-UNSAFE_DROP_REASON = "unknown-label-unsafe-drop"
+WRITING_ACTIONS = ("promote", "repark", "repair", "adopt")
+# The writing actions whose post-state lands on the PARK lane and therefore attest NOTHING about
+# readiness. `drop_is_safe` needs only "did this plan land on a lane at all" for these, where a
+# promote/repair must additionally still classify READY without any dropped label. Adopt joins
+# repark here because an orphan is by definition an issue triage never finished (registry #1180).
+PARKING_ACTIONS = frozenset({"repark", "adopt"})
+# The two lane attestations this sweep moves an issue between, and the verdict a decision is
+# downgraded to when its unknown-label reduction cannot be applied safely. Both are POINTERS, not
+# copies (registry #1490): the reduction they belong to now lives in `triage.py` and is shared with
+# `triage.py --apply`, so a second spelling here is the #958 shape waiting to happen.
+LANE_LABELS = static_triage.LANE_LABELS
+UNSAFE_DROP_REASON = static_triage.UNSAFE_DROP_REASON
 NON_DISPATCHABLE = _ready.NON_DISPATCHABLE            # kind:epic
 # Bounded, rate-limit-safe sweep: an explicit per-run cap and a runaway ceiling on the paginated
 # snapshot. A partial page must never be mistaken for the whole board.
@@ -129,6 +152,29 @@ SWEEP_MAX_PAGES = 20
 
 class SweepError(RuntimeError):
     """A snapshot this sweep refuses to act on (runaway size, or a partial/malformed page)."""
+
+
+def is_orphan(labels):
+    """Is this the residue of a triage batch that DIED before it wrote anything? (registry #1180)
+
+    NO `status:*` and NO `priority:*` label at all. That conjunction is not a heuristic — it is the
+    exact fingerprint of the all-or-nothing failure: `triage()` plans its priority AND its status
+    attestation in ONE `gh issue edit`, so when the edit is lost (one unknown `--add-label` fails
+    the whole call) the issue is left with neither. Measured on this repo: 40 open issues in that
+    state, every one created the same day, none of them dispatchable (`valid_priority()` is
+    required for readiness), none of them in the untriaged census, and — the part that made it
+    unrecoverable — none of them on EITHER of this sweep's two lane boards, which are keyed on the
+    very `status:*` label the failed write was supposed to add.
+
+    DELIBERATELY NARROW, because adopting is a WRITE. An issue that has a priority but no status,
+    or a status this module does not recognise, is NOT this population and is left alone: the
+    conjunction is what distinguishes a dead batch from a partially hand-labelled issue. Widening
+    it later is a decision with its own evidence; guessing here would put writes on issues no
+    measurement says are broken.
+    """
+    labels = set(labels)
+    return not any(label.startswith("status:") for label in labels) \
+        and not any(label.startswith("priority:") for label in labels)
 
 
 def actions_bot_trust(policy_file, repo):
@@ -221,7 +267,13 @@ def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage,
     if NON_DISPATCHABLE in labels:
         return {"action": "skip", "reason": "epic"}
     untriaged = "status:untriaged" in labels
-    if not untriaged and "status:ready" not in labels:
+    # THE ORPHAN LANE (registry #1180). A backstop whose board is keyed on the label the failed
+    # write was supposed to add is structurally blind to exactly the population that failure
+    # creates. `is_orphan` is the third board — a query that depends on NO prior successful write —
+    # and it is reached only after every gate above has already had its say, so an orphan that is
+    # untrusted, gated, held, deferred, machine-parked, claim-owned or an epic is still skipped.
+    orphan = not untriaged and "status:ready" not in labels
+    if orphan and not is_orphan(labels):
         return {"action": "skip", "reason": "not-retriageable"}
     try:
         # #598: the issue's REAL type, not the literal `"task"` this used to pass. With the literal,
@@ -244,6 +296,26 @@ def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage,
     # the #586 lanes too — the repair lane's whole job is writing back the `role:*` the issue lost,
     # and the re-park lane may re-route an incumbent role on its way out of `status:ready`.
     role = result["role"]
+    if orphan:
+        # ADOPT — put the issue back on the sweep's OWN board, in the state that is TRUE of it:
+        # never triaged. `status:untriaged`, not `status:ready`, even when the classifier calls the
+        # label set complete: the promotion lane above already owns that transition, with all of
+        # its guards, and it runs on the very next tick now that the issue is on a lane. A backstop
+        # that took the risky transition itself would be a second promotion path.
+        #
+        # `needs:area` is stripped from the write for the SAME reason the re-park lane strips it
+        # (see below): this sweep SKIPS every `needs:*`-gated issue, so minting that gate here
+        # would strand the issue behind a door the sweep itself refuses to open — and the orphan
+        # board is the only board that could ever have reached it.
+        #
+        # `remove` is kept as the classifier planned it. For an orphan it can only ever contain
+        # surplus `role:*` labels (the single-role strip): `triage()` intersects its removals with
+        # the issue's own labels, and an orphan carries no `status:*`, no `priority:*` and — having
+        # passed the gate above — no `needs:*`, so there is nothing else left for it to name.
+        add -= {"needs:area"}
+        add.discard("status:ready")
+        add.add("status:untriaged")
+        return {"action": "adopt", "add": sorted(add), "remove": sorted(remove), "role": role}
     if untriaged:
         if not result["ready"]:
             # A CONTRADICTORY dual-status issue (`status:untriaged` alongside a stale
@@ -410,110 +482,50 @@ def snapshot(pages, cap=SWEEP_CAP, ceiling=SWEEP_CEILING, rotation=0):
 def apply_decision(current, decision, edit, view, read_state=None, warn=None):
     """Apply an ACCEPTED decision through the SHARED fail-closed applier (triage.apply_triage).
 
-    Every writing action goes through here — `promote`, and the #586 `repark`/`repair` lanes — so
-    the two directions of the sweep cannot drift into two mutation paths. `ready` is the projected
-    attestation (a re-park is on its way OUT of `status:ready`); `role` is the intended single role,
-    which the applier adds and VERIFIES before it strips any incumbent.
+    Every writing action goes through here — `promote`, the #586 `repark`/`repair` lanes and the
+    #1180 `adopt` lane — so no direction of the sweep can drift into a second mutation path.
+    `ready` is the projected attestation (a re-park and an adopt both land on `status:untriaged`);
+    `role` is the intended single role, which the applier adds and VERIFIES before it strips any
+    incumbent.
 
     Returns {"ok": bool, "warnings": [...]}. ok=False must turn the workflow step RED — never
     swallow it, and never let the shell short-circuit past the post-condition (PR #595 finding 3).
     """
     result = {"add": set(decision.get("add", ())), "remove": set(decision.get("remove", ())),
-              "ready": decision.get("action") != "repark", "role": decision.get("role"),
-              "warnings": []}
+              "ready": decision.get("action") not in PARKING_ACTIONS,
+              "role": decision.get("role"), "warnings": []}
     return static_triage.apply_triage(current, result, edit, view, warn, read_state=read_state)
 
 
 def validate_labels(decision, known_labels):
     """Reduce a decision to the labels the target repo ACTUALLY has. Returns (decision, dropped).
 
-    registry #510. `triage.triage()` already refuses to DERIVE a `role:*` label the repo lacks
-    (#582), but that is one label family out of several: the derived `priority:P4` floor and the
-    `status:*` lane attestations reached `gh issue edit` unchecked. GitHub rejects the WHOLE edit
-    when any single `--add-label` names a label the repository does not have, so one unknown
-    suggestion lost the entire mutation — the add-first role verification included — exited the
-    applier 1, and re-tripped identically on every following tick because nothing about the issue
-    had changed. Validating here, against the label set the run already fetched once, converts that
-    permanent red run into a named, per-label log line.
+    registry #510, and since #1490 the reduction itself is ONE implementation,
+    `triage.validate_plan`, shared with `triage.py --apply` — which had the same hole for every
+    non-`role:*` family. The contract (what is validated, why `remove` is NOT, what
+    `known_labels is None` means) is stated there, once; this wrapper adds only the part that is
+    retriage's own: WHICH decisions are writes.
 
-    WHAT IS VALIDATED, and what deliberately is not:
-      * `add` — every label, because each one is an API-level CREATE-OR-FAIL of the whole edit.
-      * the intended `role` — validated even though it is usually already in `add`, because
-        `apply_triage` writes the target INDEPENDENTLY of `add` (its add-before-strip phase 1 fires
-        whenever the target is not already on the issue). Dropping it here also withdraws every
-        `role:*` STRIP from the plan: that is #582's rule read from the other side — an incumbent
-        role is never stripped for a replacement this run has refused to write.
-      * `remove` is NOT validated. Removals are drawn from the issue's own live label set
-        (`triage()` intersects them with it), and a label ON an issue exists in the repository by
-        construction; filtering removals could only ever fail to strip something that must go.
-
-    `known_labels is None` means "label set unknown" and validates nothing — the same contract
-    `triage(known_labels=...)` uses. `_apply_cli` never passes None (it falls back to a live
-    `repo_label_set` read), so the tolerance exists for direct/plan-only callers, not for the sweep.
-    A non-writing decision is returned untouched: a skip has nothing to validate.
+    A non-writing decision is returned untouched — a skip has nothing to validate.
     """
-    if known_labels is None or decision.get("action") not in WRITING_ACTIONS:
+    if decision.get("action") not in WRITING_ACTIONS:
         return decision, []
-    known = set(known_labels)
-    add = list(decision.get("add", ()))
-    remove = list(decision.get("remove", ()))
-    role = decision.get("role")
-    target = f"{static_triage.ROLE_PREFIX}{role}" if role else None
-    unknown_target = bool(target) and target not in known
-    dropped = sorted({label for label in add if label not in known}
-                     | ({target} if unknown_target else set()))
-    if not dropped:
-        return decision, []
-    reduced = dict(decision)
-    reduced["add"] = sorted(label for label in add if label in known)
-    if unknown_target:
-        reduced["role"] = None
-        reduced["remove"] = sorted(label for label in remove
-                                   if not label.startswith(static_triage.ROLE_PREFIX))
-    else:
-        reduced["remove"] = sorted(remove)
-    return reduced, dropped
+    return static_triage.validate_plan(decision, known_labels)
 
 
 def drop_is_safe(decision, live_labels, issue_type, known_labels):
     """Is a decision REDUCED by `validate_labels` still the transition it claims to be?
 
-    registry #510. "Drop the unknown label and apply the rest" is only safe while the rest still
-    stands on its own, and for this classifier it frequently does not — every label it suggests is
-    load-bearing for the verdict that produced it. The measured case: an unprioritised
-    `status:untriaged` issue is promoted only BECAUSE the derived `priority:P4` floor makes it
-    triage-complete. Write the promotion without that floor and the post-state is a `status:ready`
-    issue with no readable priority, which `derive_priority` declines to floor a second time
-    (`ready-attested-regression`, the #586 lane) — so the very next tick re-parks it, the tick after
-    that promotes it again, and the sweep oscillates with two writes forever. Refusing is strictly
-    better AND agrees with the classifier: without the label the issue is not triage-complete, and
-    the correct action for an incomplete `status:untriaged` issue is to leave it parked.
-
-    Two named invariants, checked against the post-state the REDUCED write would produce:
-
-      * LANE — exactly one of `status:ready` / `status:untriaged` survives. A half-applied status
-        transition (the attestation dropped, its opposite still stripped) puts the issue on NEITHER
-        lane, where the readiness engine cannot see it and this sweep's own board queries cannot
-        select it again: terminal, and precisely the stranding #586 exists to undo.
-      * PREMISE — a decision that ATTESTS `status:ready` (promote/repair) must still classify READY
-        without the dropped labels. A re-park attests nothing, so it needs only to land on the park
-        lane, from which the promotion lane re-admits it the moment the label set is fixed.
-
-    Fail-closed: a classifier that raises here means the premise is unproven, which is a refusal.
+    registry #510; the LANE and PREMISE invariants and their measured oscillation argument live
+    with the shared implementation, `triage.reduced_write_is_safe` (#1490). This wrapper supplies
+    the one retriage-shaped input it takes: what the decision ATTESTS. A promote/repair attests
+    `status:ready`; a re-park and an adopt attest nothing — the SAME action->ready conversion
+    `apply_decision` makes when it hands a decision to the shared applier, read from the one
+    `PARKING_ACTIONS` spelling so the two cannot disagree about a lane.
     """
-    post = (set(live_labels) | set(decision.get("add", ()))) - set(decision.get("remove", ()))
-    lanes = post & LANE_LABELS
-    if len(lanes) != 1:
-        return False
-    if decision.get("action") == "repark":
-        return "status:untriaged" in lanes
-    if "status:ready" not in lanes:
-        return False
-    try:
-        return bool(static_triage.triage(post, issue_type, trusted=True,
-                                         known_labels=known_labels)["ready"])
-    except Exception:                                     # noqa: BLE001 — unproven means refused
-        return False
+    return static_triage.reduced_write_is_safe(
+        decision, live_labels, issue_type, known_labels,
+        attests_ready=decision.get("action") not in PARKING_ACTIONS)
 
 
 def workflow_step_script(text, step_id):
@@ -1062,6 +1074,84 @@ def _self_test():
         plan(repaired, "owner", "app[bot]", "none"),
         {"action": "skip", "reason": "ready-consistent"})
 
+    # ---------------------------------------------------------------------------------------------
+    # [registry #1180] THE ORPHAN LANE. A triage batch that died at the mutation leaves an issue
+    # with NO priority and NO status — undispatchable, absent from the untriaged census, and (the
+    # part that made it unrecoverable) on neither lane board, because both boards are keyed on the
+    # very `status:*` label the failed write was supposed to add. The rows below are the planner
+    # half; the BOARD half is executed against the real workflow step further down.
+    # ---------------------------------------------------------------------------------------------
+    # The measured fingerprint: the labels a `[from:agent, role:impl, self-improvement]` issue is
+    # left with when `add=['needs:area','priority:P4','role:impl','status:untriaged']` is lost whole.
+    orphan_doc = labelled("from:agent", "role:impl", "self-improvement")
+    got = plan(orphan_doc, "owner", "app[bot]", "none")
+    # `.get` throughout, so DELETING the lane reports readable rows rather than a KeyError.
+    chk("[#1180] an issue with NO status and NO priority is ADOPTED onto status:untriaged",
+        (got["action"], "status:untriaged" in got.get("add", ())), ("adopt", True))
+    # The write must be the RECOVERY, not a bare lane label: without the derived priority floor the
+    # issue stays undispatchable, which is the half of the defect that is not about visibility.
+    chk("[#1180] ...and the adoption carries the derived priority floor, so the issue stops being "
+        "permanently undispatchable",
+        static_triage.DERIVED_PRIORITY in got.get("add", ()))
+    # Two things the adoption must NOT do. `status:ready` belongs to the promotion lane, which owns
+    # that transition WITH its guards and reaches this issue on the very next tick now that it is on
+    # a board; and `needs:area` is a gate this sweep skips, so minting it here would strand the
+    # issue behind a door only the orphan board could ever have opened.
+    chk("[#1180] ...never straight to status:ready, and never minting the needs:area gate the "
+        "sweep itself refuses to reopen",
+        ("status:ready" in got.get("add", ()), "needs:area" in got.get("add", ())),
+        (False, False))
+    chk("[#1180] ...and the adoption is a FIXED POINT — the next tick plans no second write",
+        plan(applied(orphan_doc, got), "owner", "app[bot]", "none")["action"] != "adopt")
+    # An orphan the classifier calls COMPLETE (role + area + the derived floor => ready) still
+    # parks, for the same reason: the promotion lane, not the backstop, decides readiness.
+    complete = plan(labelled("role:impl", "area:dispatch"), "owner", "app[bot]", "none")
+    chk("[#1180] an orphan the classifier calls READY is still adopted to untriaged, NOT promoted",
+        (complete["action"], complete.get("add")),
+        ("adopt", [static_triage.DERIVED_PRIORITY, "status:untriaged"]))
+    # NEGATIVE CONTROLS. `is_orphan` is a CONJUNCTION on purpose (adopting is a write): an issue
+    # that has one half of the pair is not the dead-batch population and is left alone. Each row
+    # below dies if the predicate is loosened to either disjunct.
+    chk("[#1180] a lane-less issue WITH a priority is not the dead-batch population — untouched",
+        plan(labelled("role:impl", "priority:P2"), "owner", "app[bot]", "none"),
+        {"action": "skip", "reason": "not-retriageable"})
+    chk("[#1180] a lane-less issue WITH some other status: label is likewise untouched",
+        plan(labelled("role:impl", "status:blocked"), "owner", "app[bot]", "none"),
+        {"action": "skip", "reason": "not-retriageable"})
+    # ...and every gate above the lane check still governs the orphan board. An orphan is reached by
+    # a query, so this is the ONLY thing standing between a lane-less issue and a write.
+    for gate, reason in ((("trust:untrusted",), "gated:trust:untrusted"),
+                         (("needs:design",), "gated:needs:design"),
+                         (("kind:epic",), "epic"),
+                         (("status:in-progress",), "claim-owned")):
+        chk(f"[#1180] an orphan carrying {gate[0]} is still SKIPPED ({reason}), never adopted",
+            plan(labelled("role:impl", *gate), "owner", "app[bot]", "none").get("reason"), reason)
+    chk("[#1180] an orphan under an explicit orchestration hold is skipped",
+        plan(labelled("role:impl", body=HOLD_MARKER), "owner", "app[bot]", "none"),
+        {"action": "skip", "reason": "explicit-hold"})
+    chk("[#1180] an orphan from an UNTRUSTED author is skipped — the new board widens no trust",
+        plan(labelled("role:impl", author="drive-by"), "owner", "app[bot]", "none"),
+        {"action": "skip", "reason": "untrusted-author"})
+    # An adopt is a WRITE, so it must ride the same #510/#1490 unknown-label reduction as every
+    # other lane — and be REFUSED when the reduction would leave the issue on no lane at all.
+    chk("[#1180] an adopt is a WRITING action, so validate_labels reduces it like any other write",
+        validate_labels(dict(got), ["status:untriaged", "role:impl"])[1],
+        [static_triage.DERIVED_PRIORITY])
+    chk("[#1180] ...and an adopt whose status:untriaged does not EXIST is refused, never applied "
+        "half-way onto no lane at all",
+        drop_is_safe(validate_labels(dict(got), ["role:impl", "priority:P4"])[0],
+                     label_set(orphan_doc), "", ["role:impl", "priority:P4"]),
+        False)
+    chk("[#1180] ...while the same reduction against a repo that HAS the lane label is safe",
+        drop_is_safe(validate_labels(dict(got), ["role:impl", "status:untriaged"])[0],
+                     label_set(orphan_doc), "", ["role:impl", "status:untriaged"]),
+        True)
+    # An adopt lands on the PARK lane, so it must attest NOTHING about readiness — the same
+    # conversion the applier makes. A stray `!= "repark"` here would claim a ready premise for an
+    # issue the classifier never called complete.
+    chk("[#1180] adopt is a PARKING action: it attests no readiness in either consumer",
+        ("adopt" in WRITING_ACTIONS, "adopt" in PARKING_ACTIONS), (True, True))
+
     # ---- the bounded, fail-closed snapshot ----
     def api(number, *names, login="owner", updated="2026-07-01T00:00:00Z"):
         return {"number": number, "user": {"login": login}, "body": "",
@@ -1589,6 +1679,52 @@ def _self_test():
                    (code, roles_of(repaired.labels), "status:ready" in repaired.labels,
                     repaired.calls[:1]) == (0, {"role:impl"}, True, [(["role:impl"], [])])))
 
+    # [registry #1180] THE ORPHAN LANE, THROUGH THE REAL ENTRYPOINT. The rows further up call
+    # plan() directly; this one proves `--apply` actually WRITES for the new action. Dropping
+    # "adopt" from WRITING_ACTIONS makes `_apply_cli` `return 0` having mutated nothing — exactly
+    # the silent no-op #605 round 2 caught for the repair lane — so the orphan would stay off every
+    # board while the run reported success.
+    full = known | {static_triage.DERIVED_PRIORITY}   # a repo that HAS its whole taxonomy
+    # The workflow-derived argv carries `--known-labels` bound to `known`, so the ORACLE has to be
+    # re-bound alongside the fake repo or the floor would be dropped as unknown by #1490's gate.
+    full_argv = [",".join(sorted(full)) if token == ",".join(sorted(known)) else token
+                 for token in apply_argv]
+    adopted = FakeGh({"role:impl", "area:dispatch"}, full)
+    code, _seen = run_apply_argv(adopted, argv=full_argv)
+    checks.append(("[#1180] the workflow-shaped ARGV ADOPTS an orphan onto the untriaged lane, "
+                   "with the priority floor that makes it dispatchable again",
+                   (code, "status:untriaged" in adopted.labels, "status:ready" in adopted.labels,
+                    static_triage.DERIVED_PRIORITY in adopted.labels, roles_of(adopted.labels))
+                   == (0, True, False, True, {"role:impl"})))
+    # A role-LESS orphan (the classifier can derive nothing) must still be adopted: being on a
+    # board is the whole point, and the applier's own role invariant must not withhold the lane
+    # label — `status:untriaged` is precisely where it wants a role-less issue to sit.
+    roleless = FakeGh({"from:agent"}, full)
+    code, _seen = run_apply_argv(roleless, argv=full_argv)
+    checks.append(("[#1180] a role-LESS orphan is still adopted onto the untriaged lane, never "
+                   "left on no board at all",
+                   (code, "status:untriaged" in roleless.labels, roles_of(roleless.labels))
+                   == (0, True, set())))
+    # A repo MISSING the floor label reduces the write (#510/#1490) instead of losing it: the lane
+    # label still lands, because an adoption attests no readiness and "on a board, unprioritised"
+    # is strictly better than "on no board at all". The promote lane floors it once the label
+    # exists. Dies if `adopt` is ever treated as attesting readiness — the reduction would then be
+    # refused and the orphan would stay invisible for exactly as long as the label is missing.
+    degraded = FakeGh({"role:impl", "area:dispatch"}, known)   # `known` has no priority:P4
+    code, _seen = run_apply_argv(degraded)
+    checks.append(("[#1180] with the floor label MISSING the adoption still lands the lane — "
+                   "degraded, never withheld",
+                   (code, "status:untriaged" in degraded.labels,
+                    static_triage.DERIVED_PRIORITY in degraded.labels) == (0, True, False)))
+    # ...and the TWO-STEP recovery closes: the adopted issue is no longer an orphan (it has a lane
+    # now), so the very next tick is the ordinary PROMOTION lane — with all of its guards — rather
+    # than a second adoption. This is why the backstop never takes the readiness transition itself.
+    code, _seen = run_apply_argv(adopted, argv=full_argv)
+    checks.append(("[#1180] the next tick hands the adopted issue to the PROMOTION lane, which is "
+                   "what actually returns it to the dispatch frontier",
+                   (code, "status:ready" in adopted.labels,
+                    "status:untriaged" in adopted.labels) == (0, True, False)))
+
     # [#605 review ROUND 2, finding 3] THE ORCHESTRATION HOLD IS READ LIVE, NOT FROM THE SNAPSHOT.
     # `_apply_cli` refreshed only `labels`; the `body` that decides the hold still came from the
     # board snapshot taken BEFORE pagination, so a `<!-- orchestration:hold -->` added between the
@@ -1746,9 +1882,24 @@ def _self_test():
         ({"action": "repair", "add": [], "remove": [], "role": None}, ["role:ci"]))
     chk("[#510] no label set means no validation (the documented `None` contract)",
         validate_labels(_promote510, None), (_promote510, []))
-    chk("[#510] a non-writing decision is never touched",
-        validate_labels({"action": "skip", "reason": "epic"}, set()),
-        ({"action": "skip", "reason": "epic"}, []))
+    # The one thing the wrapper owns since #1490: WHICH decisions are writes. Carrying labels on the
+    # skip is what makes the gate OBSERVABLE — measured, a `{"action": "skip", "reason": "epic"}`
+    # fixture has nothing to reduce, so removing the gate returned the identical value and the row
+    # could not fail. Fail-closed: an unknown or future action is a NO-WRITE, never something the
+    # reducer quietly turns into a smaller write.
+    chk("[#510] a non-writing decision is never touched, even one carrying labels",
+        validate_labels({"action": "skip", "reason": "epic", "add": ["role:soundness"],
+                         "remove": [], "role": "soundness"}, set()),
+        ({"action": "skip", "reason": "epic", "add": ["role:soundness"], "remove": [],
+          "role": "soundness"}, []))
+    # [#1490] ...and the reduction itself is the SHARED object, not a second spelling of it. The
+    # literal is written out here on purpose: comparing the constant against itself cannot fail.
+    chk("[#1490] the lane labels and the unsafe-drop reason are triage.py's, by identity — the "
+        "reduction has ONE definition and this module points at it (AGENTS.md: #958)",
+        (LANE_LABELS is static_triage.LANE_LABELS,
+         UNSAFE_DROP_REASON is static_triage.UNSAFE_DROP_REASON,
+         UNSAFE_DROP_REASON, sorted(LANE_LABELS)),
+        (True, True, "unknown-label-unsafe-drop", ["status:ready", "status:untriaged"]))
 
     # drop_is_safe: the two named invariants that decide whether the REDUCED write may be applied.
     chk("[#510] LANE INVARIANT: a reduction that leaves the issue on NEITHER lane is refused "
@@ -1987,14 +2138,45 @@ if "/collaborators/" in target:
 if os.environ["STUB_PAYLOAD"] == "object":
     print(json.dumps({"message": "Not Found"}))
     sys.exit(0)
-# A lane-LESS board query is SERVED, not refused: the stub must not be the thing that catches an
-# unfiltered sweep, or the "[#487] the sweep board is EXACTLY the two lane queries" row below would
-# be asserting the stub's strictness instead of the workflow's. It answers with a short page so the
-# page accounting the #605 rows check is undisturbed and that row is the ONLY thing that goes red.
 label = target.split("labels=")[1].split("&")[0] if "labels=" in target else ""
 page = int(target.split("&page=")[1])   # NOT "page=" — `per_page=100` matches that first
-base = 1000000 if label.endswith("ready") else (2000000 if not label else 0)
-count = 7 if not label else (100 if page <= int(os.environ["STUB_FULL_PAGES"]) else 7)
+if not label:
+    # The registry #1180 ORPHAN scan. A lane-LESS query is SERVED, not refused: the stub must never
+    # be the thing that decides which documents the reduction keeps, or the rows below would be
+    # asserting the stub's strictness instead of the workflow's. So this page is DISCRIMINATING —
+    # one true orphan and three documents the workflow's own jq reduction has to drop — and short,
+    # so the page accounting the #605 rows check stays readable.
+    #
+    # [#1180 review round 1] The orphan scan's shape guard, its short-page break, its page
+    # increment and its max-pages refusal are a SECOND, INDEPENDENT copy of the lane loop's, and
+    # item 4 of AGENTS.md's pre-flight is explicit that duplicated guards are individually
+    # unkillable while only one copy ever executes. STUB_PAYLOAD / STUB_FULL_PAGES cannot reach
+    # this copy: STUB_PAYLOAD is answered above for EVERY request, so the first labeled lane dies
+    # first and the scan never runs, and STUB_FULL_PAGES is read only on the labeled branch below.
+    # So the unfiltered lane gets its OWN knobs, and the rows that use them leave the labeled lanes
+    # completely healthy — the mutant has to be caught here or not at all.
+    if os.environ.get("STUB_ORPHAN_PAYLOAD", "array") == "object":
+        print(json.dumps({"message": "Not Found"}))
+        sys.exit(0)
+    def doc(number, labels, **extra):
+        return dict({"number": number, "user": {"login": "owner"}, "body": "", "labels": labels,
+                     "updated_at": "2026-07-01T00:00:00Z"}, **extra)
+    if page <= int(os.environ.get("STUB_ORPHAN_FULL_PAGES", "0")):
+        # A FULL (100-document) unfiltered page whose RESIDUE is 60 — the reduction has real work
+        # to do on it, and `got` is still read from the unreduced page, which is what the short-page
+        # break has to be measured against. Numbers are page-derived and share no prefix with the
+        # short page or either lane, so a page the loop re-fetched instead of advancing is visible.
+        print(json.dumps([doc(3000000 + page * 1000 + index,
+                              [] if index < 60 else [{"name": "priority:P2"}])
+                          for index in range(100)]))
+        sys.exit(0)
+    print(json.dumps([doc(2000001, []),                                    # the orphan
+                      doc(2000002, [{"name": "priority:P2"}]),             # has a priority
+                      doc(2000003, [{"name": "status:ready"}]),            # has a status
+                      doc(2000004, [], pull_request={"url": "x"})]))       # a PULL REQUEST
+    sys.exit(0)
+base = 1000000 if label.endswith("ready") else 0
+count = 100 if page <= int(os.environ["STUB_FULL_PAGES"]) else 7
 print(json.dumps([{"number": base + page * 1000 + index, "user": {"login": "owner"},
                    "body": "", "labels": [{"name": label}],
                    "updated_at": "2026-07-01T00:00:00Z"} for index in range(count)]))
@@ -2016,9 +2198,15 @@ if str(nth) in {token for token in os.environ.get("STUB_FAIL_APPLIES", "").split
     sys.exit(1)
 '''
 
-    def run_sweep_step(full_pages=2, payload="array", run_number=3, fail_applies=""):
+    def run_sweep_step(full_pages=2, payload="array", run_number=3, fail_applies="",
+                       orphan_payload="array", orphan_full_pages=0):
         """Execute the REAL sweep step body. Returns (exit code, log text, page-file names,
-        window line count, applier invocation count, API targets the step actually requested)."""
+        window line count, applier invocation count, API targets the step actually requested,
+        and the reduced ORPHAN pages in page order).
+
+        `orphan_payload`/`orphan_full_pages` steer the LANE-LESS request only, so a row can put
+        the orphan scan under a malformed page or past the request ceiling while both labeled
+        lanes still complete normally (#1180 review round 1)."""
         with tempfile.TemporaryDirectory() as directory:
             root = os.path.join(directory, "repo")
             os.makedirs(os.path.join(root, "scripts"))
@@ -2033,6 +2221,8 @@ if str(nth) in {token for token in os.environ.get("STUB_FAIL_APPLIES", "").split
                                MAINTAINER_LOGIN="owner", APP_BOT_LOGIN="app[bot]",
                                GITHUB_RUN_NUMBER=str(run_number),
                                STUB_FULL_PAGES=str(full_pages), STUB_PAYLOAD=payload,
+                               STUB_ORPHAN_PAYLOAD=orphan_payload,
+                               STUB_ORPHAN_FULL_PAGES=str(orphan_full_pages),
                                STUB_APPLY_LOG=log, STUB_TARGET_LOG=targets_path,
                                STUB_FAIL_APPLIES=fail_applies,
                                STUB_REAL_RETRIAGE=os.path.abspath(__file__))
@@ -2055,48 +2245,127 @@ if str(nth) in {token for token in os.environ.get("STUB_FAIL_APPLIES", "").split
             if os.path.isfile(targets_path):
                 with open(targets_path, encoding="utf-8") as handle:
                     targets = [line.strip() for line in handle if line.strip()]
+            # registry #1180: what the ORPHAN reduction actually kept, EVERY page of it in page
+            # order, so the jq predicate is asserted by its OUTPUT rather than by its text and a
+            # scan that stopped early or re-reduced one page is visible as a shape change.
+            # A mutated guard can leave a reduced page EMPTY or non-array (the step's own jq
+            # refused it). That is reported as `None` for the page rather than raised: a traceback
+            # here would abort the suite and record every row below it as a phantom kill —
+            # AGENTS.md pre-flight item 4, "crash-after-partial-run" (measured: mutating the orphan
+            # shape guard to `if false` did exactly this, 0 of 212 checks reached).
+            orphans = []
+            for name in sorted((name for name in pages if name.startswith("page-orphan-")),
+                               key=lambda name: int(name.split("-")[2].split(".")[0])):
+                with open(os.path.join(sweep_temp, name), encoding="utf-8") as handle:
+                    try:
+                        page = json.load(handle)
+                    except ValueError:
+                        page = None
+                    orphans.append([item["number"] for item in page]
+                                   if isinstance(page, list) and all(isinstance(item, dict)
+                                                                     and "number" in item
+                                                                     for item in page)
+                                   else None)
             return (completed.returncode, completed.stdout + completed.stderr, pages, window,
-                    applies, targets)
+                    applies, targets, orphans)
 
-    # 2 full pages + a short third page per lane = 207 issues per lane, 414 in all, cap 80.
-    # `got=0` (the truncation mutation) fetches ONE page per lane and applies a truncated board:
-    # the page-file list and the reported board total both change, so this row dies on it.
-    code, log, pages, window, applies, targets = run_sweep_step(full_pages=2)
+    # 2 full pages + a short third page per lane = 207 issues per lane, plus the ONE orphan the
+    # lane-less scan's reduction keeps = 415, cap 80. `got=0` (the truncation mutation) fetches ONE
+    # page per lane and applies a truncated board: the page-file list and the reported board total
+    # both change, so this row dies on it.
+    code, log, pages, window, applies, targets, orphans = run_sweep_step(full_pages=2)
     checks.append(("[#605 r2 f2] the step reads until a SHORT page arrives, on BOTH lanes",
-                   (code, pages) == (0, ["page-ready-1.json", "page-ready-2.json",
+                   (code, pages) == (0, ["page-orphan-1.json",
+                                         "page-ready-1.json", "page-ready-2.json",
                                          "page-ready-3.json", "page-untriaged-1.json",
                                          "page-untriaged-2.json", "page-untriaged-3.json"])))
-    checks.append(("[#605 r2 f2] ...and the COMPLETE board reaches the snapshot (414 = 2x(200+7))",
-                   "414 board issue(s)" in log))
+    checks.append(("[#605 r2 f2] ...and the COMPLETE board reaches the snapshot "
+                   "(415 = 2x(200+7) + 1 orphan)", "415 board issue(s)" in log))
     checks.append(("[#605 r2 f2] ...and the capped window is what the applier is actually fed",
                    (window, applies) == (80, 80)))
-    # [registry #487] BOARD MEMBERSHIP — the honest scope of the opt-in, asserted by EXECUTION.
-    # The rows above prove the widening WORKS on a document handed to plan(); this one proves WHICH
-    # documents production can ever hand it. Every board request the real step body issues carries
-    # a `labels=` filter, and the filter values are exactly the two lanes — so an issue carrying
-    # NEITHER lane label is never fetched, never snapshotted, never passed to `--apply`, and
-    # `plan()` (hence the #487 trust gate) is never reached for it. That is why this unit is inert
-    # on this repo today rather than "covering" the alert-responder class, and it is what a reader
-    # must not be allowed to forget. Dies on: dropping `labels=$label` from the board query
-    # (an unfiltered board would sweep every open issue), and on adding/renaming/removing a lane.
+    # [registry #1180] THE ORPHAN BOARD, ASSERTED BY OUTPUT. The stub serves a DISCRIMINATING
+    # lane-less page — one true orphan, one issue with a priority, one with a status, and one PULL
+    # REQUEST — and the reduction that reaches the snapshot must be exactly the orphan. Dies on:
+    # dropping either half of the conjunction (2000002 / 2000003 would join the board and be
+    # WRITTEN to), dropping the `pull_request` filter (2000004 would), and on `select(...)` being
+    # inverted or removed altogether (all four would).
+    checks.append(("[#1180] the lane-less scan is REDUCED to the orphan residue — an issue with a "
+                   "priority, an issue with a status and a pull request are all dropped",
+                   orphans == [[2000001]]))
+    # [registry #487 / #1180] BOARD MEMBERSHIP — the honest scope of the opt-in, asserted by
+    # EXECUTION. The rows above prove the widening WORKS on a document handed to plan(); this one
+    # proves WHICH documents production can ever hand it. The board is exactly three queries: the
+    # two `labels=`-filtered lanes, and the ONE lane-less open-issue scan #1180 added — which is
+    # precisely why the #487 opt-in is no longer inert (an actions-bot ORPHAN now reaches plan(),
+    # where the trust gate still refuses it unless the per-repo row says otherwise). Dies on:
+    # dropping `labels=$label` from a lane query (an unfiltered lane would sweep every open issue
+    # WITHOUT the orphan reduction), adding/renaming/removing a lane, and on a second unfiltered
+    # query appearing.
     board = [target for target in targets if "/issues?" in target]
     lanes = {target.split("labels=")[1].split("&")[0] for target in board if "labels=" in target}
-    checks.append(("[#487] the sweep board is EXACTLY the two lane queries — an issue on no lane "
-                   "is never fetched, so plan() and its trust gate are never reached for it",
-                   (bool(board), all("labels=" in target for target in board), lanes)
-                   == (True, True, {"status:untriaged", "status:ready"})))
+    scans = {target for target in board if "labels=" not in target}
+    checks.append(("[#487/#1180] the sweep board is EXACTLY the two lane queries plus the ONE "
+                   "lane-less orphan scan — nothing else is ever fetched",
+                   (bool(board), lanes, scans)
+                   == (True, {"status:untriaged", "status:ready"},
+                       {"repos/o/r/issues?state=open&per_page=100&page=1"})))
     # The REQUEST ceiling: 25 full pages against max_pages=20. Deleting the ceiling's own `exit 1`,
     # or `if false`, or a raised max_pages all let the loop run to the short page and exit 0.
-    code, log, pages, _window, applies, _targets = run_sweep_step(full_pages=25)
+    code, log, pages, _window, applies, _targets, _orphans = run_sweep_step(full_pages=25)
     checks.append(("[#605 r2 f2] a board past the REQUEST ceiling fails the step CLOSED at page 20",
                    (code != 0, "larger than 20 pages" in log,
                     len([name for name in pages if name.startswith("page-untriaged-")]), applies)
                    == (True, True, 20, 0)))
     # The page-SHAPE guard: `jq 'length'` alone returns 2 for {"message": "Not Found"}, which is
     # `-lt 100`, so an error document used to break the loop and be swept as a complete board.
-    code, log, _pages, _window, applies, _targets = run_sweep_step(payload="object")
+    code, log, _pages, _window, applies, _targets, _orphans = run_sweep_step(payload="object")
     checks.append(("[#605 r2 f2] a non-array page payload fails the step CLOSED, never sweeps",
                    (code != 0, "not a JSON array" in log, applies) == (True, True, 0)))
+
+    # -------------------------------------------------------------------------------------------
+    # [registry #1180, review ROUND 1] THE ORPHAN SCAN'S OWN PAGINATION GUARDS, INDEPENDENTLY
+    # EXECUTED. The three rows above steer EVERY request, so the first labeled lane dies first and
+    # the lane-less loop never runs — its shape guard, its ceiling and its short-page break are a
+    # duplicated copy borrowing the first copy's coverage, which AGENTS.md pre-flight item 4 names
+    # as the shape that makes each copy individually unkillable. Every row below therefore leaves
+    # BOTH labeled lanes healthy (asserted: all 6 labeled requests are served) and mutates only the
+    # unfiltered lane, so the only thing that can turn the step red is the orphan copy itself.
+    # -------------------------------------------------------------------------------------------
+    code, log, _pages, _window, applies, targets, _orphans = run_sweep_step(orphan_payload="object")
+    labeled = [target for target in targets if "/issues?" in target and "labels=" in target]
+    checks.append(("[#1180 r1] a non-array ORPHAN page fails the step CLOSED with both labeled "
+                   "lanes served — the orphan `jq -e` type guard is what refuses",
+                   (code != 0, "the orphan board page 1 is not a JSON array" in log,
+                    applies, len(labeled)) == (True, True, 0, 6)))
+    # The orphan REQUEST ceiling: 25 full unfiltered pages against the same max_pages=20, with the
+    # labeled lanes short-paging normally at 3 requests each. Dies on deleting the orphan ceiling's
+    # own `exit 1`, on `if false`, and on a raised/dropped max_pages — each of those runs the scan
+    # to the short page and exits 0 with 80 applies. `page-orphan-*` counted EXACTLY, not `>=`, so
+    # an off-by-one in the refusal's own `-ge` is a different number here, not the same pass.
+    code, log, pages, _window, applies, targets, _orphans = run_sweep_step(orphan_full_pages=25)
+    labeled = [target for target in targets if "/issues?" in target and "labels=" in target]
+    scanned = [target for target in targets if "/issues?" in target and "labels=" not in target]
+    checks.append(("[#1180 r1] an ORPHAN scan past the REQUEST ceiling fails the step CLOSED at "
+                   "page 20, having made exactly 20 unfiltered REQUESTS, with both labeled lanes "
+                   "served",
+                   (code != 0, "the open-issue scan is larger than 20 pages" in log,
+                    len(scanned), len([name for name in pages
+                                       if name.startswith("page-orphan-")]),
+                    applies, len(labeled)) == (True, True, 20, 20, 0, 6)))
+    # A MULTI-PAGE orphan scan that terminates on a short page: two full pages (100 documents each,
+    # residue 60) then the discriminating short page (residue 1). Dies on a premature break (`got`
+    # read from the REDUCED page instead of the raw one, or `-lt 100` loosened — 60 < 100, so the
+    # scan would stop after page 1 and the board total would be 474, not 535), on the reduction
+    # reading a fixed `scan-1.json` (page 2's residue would repeat page 1's numbers), and on every
+    # page being written to one `page-orphan.json` (the page list collapses to a single entry).
+    code, log, _pages, _window, applies, _targets, orphans = run_sweep_step(orphan_full_pages=2)
+    checks.append(("[#1180 r1] a multi-page ORPHAN scan pages to its short terminal page and EVERY "
+                   "reduced page reaches the snapshot (535 = 2x(200+7) + 60 + 60 + 1)",
+                   (code, applies,
+                    [None if page is None else len(page) for page in orphans],
+                    [None if not page else page[0] for page in orphans],
+                    "535 board issue(s)" in log)
+                   == (0, 80, [60, 60, 1], [3001000, 3002000, 2000001], True)))
 
     # [registry #510] PER-ISSUE ERROR ISOLATION, EXECUTED. A GENUINE write failure — the class that
     # is still an error, as opposed to a dropped unknown label — must be RECORDED per issue, must
@@ -2106,7 +2375,7 @@ if str(nth) in {token for token in os.environ.get("STUB_FAIL_APPLIES", "").split
     # the loop, dropping the `failed=1` bookkeeping (code would be 0), and on a sweep that stops at
     # the first failure (applies would be 1, not 80). The green control is the very first
     # `run_sweep_step` row above — same board, no injected failure, exit 0 with the same 80 applies.
-    code, log, _pages, _window, applies, _targets = run_sweep_step(fail_applies="1,2")
+    code, log, _pages, _window, applies, _targets, _orphans = run_sweep_step(fail_applies="1,2")
     checks.append(("[#510] a genuine per-issue write failure is recorded, the OTHER 78 issues are "
                    "still processed, and the step exits non-zero once AFTER the loop",
                    (code != 0, applies, log.count("fail-closed retriage FAILED"),

@@ -43,7 +43,7 @@ ChainPreferenceError = _chain_preference.ChainPreferenceError
 
 
 POLICY_PATH = "policy/repos.toml"
-# [OPUS-4.8] "registry-selftest" is the python/actions gate profile for a self-managed target
+# "registry-selftest" is the python/actions gate profile for a self-managed target
 # (the registry itself) — the crate-scoped cargo gate does not fit a python repo. worker-live.sh
 # run_gate implements it: run every touched script's --self-test, the full recent-wave suite, and
 # bash -n / actionlint on touched shell + workflow files. Fail-closed.
@@ -75,7 +75,7 @@ POLICY_FIELDS = {
     "max_attempts",
     "trust",
 }
-# [OPUS-4.8] Optional usage-aware-dispatch controls (default off / 0.10 -> backward compatible):
+# Optional usage-aware-dispatch controls (default off / 0.10 -> backward compatible):
 #   require_usage       = bool  — when true, a TOTAL usage-probe failure HOLDS the repo (fail-closed)
 #                                 rather than falling back to the ungated static cap.
 #   usage_safety_margin = float in [0,1) — fraction of EACH rate-limit window that must remain free to
@@ -89,7 +89,7 @@ POLICY_FIELDS = {
 #   review_queue_ttl_minutes = positive int — how long a PR may sit review:needs before alerting.
 #   cross_provider_fallback  = bool — opt-in same-provider degrade when the opposite provider is
 #                              starved; default False = stay queued + alert (the honest default).
-# [OPUS-4.8] security_paths (B3 / defects #2,#4): the additive FILE-level trust-surface control
+# security_paths (B3 / defects #2,#4): the additive FILE-level trust-surface control
 # for the review lane. A worker PR whose diff touches ANY listed path/prefix routes its ARM to a
 # HUMAN even for a benign-labelled PR — CONSUMED by review-fix.yml (review-outcome + ready-and-arm
 # pass it to worker-pr.trust_surface_paths_touched). NOT a dead tier: [issue #166] this list is
@@ -914,6 +914,71 @@ agent = "docs-agent"
             lambda: resolve("unknown/repo", "impl", policy, routing))
     rejects("disabled repo fails closed", "is disabled",
             lambda: resolve("example/disabled", "impl", policy, routing))
+    # [OPUS-5] EVERY STAGED (enabled=false) ROW MUST SURVIVE ITS OWN ENABLE.
+    #
+    # `_policy_row` rejects a disabled target BEFORE validating its remaining fields, so a staged row
+    # can carry an invalid `gate_profile`, an unknown key or a malformed type and stay silently green
+    # for as long as it is disabled — then fail closed the moment someone performs the "one-line
+    # enable" its comment promises. Round-1 review on #1479 caught exactly that: the staged
+    # jeswr/solid-sdk row shipped `gate_profile = "node-workspace"`, which is not in GATE_PROFILES
+    # and has no worker branch, and nothing could see it.
+    #
+    # This validates EVERY disabled row as if it were enabled, on a COPY, so the promise is proven at
+    # gate time rather than discovered at activation time. It is deliberately a loop over all staged
+    # rows, not a fixture naming solid-sdk: the next staged target inherits the guarantee for free.
+    # ⚠️ THE SHIPPED FILE, NOT THE FIXTURE. `policy` here is the self-test's own fixture doc, which
+    # contains `example/disabled` and knows nothing about the real staged targets — a first cut of
+    # this guard looped over it, reported ok on ['example/disabled'], and SURVIVED restoring the
+    # invalid `node-workspace` profile it exists to catch. A guard that cannot see the artifact it
+    # guards is worse than none: it reads green forever. Load policy/repos.toml.
+    import copy as _copy
+    import tomllib as _tomllib
+    _shipped = _tomllib.loads(
+        (Path(__file__).resolve().parents[1] / "policy" / "repos.toml").read_text(encoding="utf-8"))
+    _staged = [name for name, row in (_shipped.get("repos") or {}).items()
+               if isinstance(row, dict) and not row.get("enabled")]
+    # ⚠️ The LIVE loop below may legitimately have nothing to do — every staged target eventually
+    # gets enabled. An earlier cut asserted `_staged` was non-empty, which made this guard BLOCK the
+    # very activation it exists to de-risk. But simply allowing an empty loop makes the guard
+    # vacuous the moment the policy has no staged rows, which is exactly the failure mode it was
+    # written against. So the two questions are SEPARATED: the FIXTURE below proves the validation
+    # LOGIC always (regardless of live policy), and the live loop applies that proven logic to
+    # whatever staged rows actually ship.
+    _fixture_repo = "example/staged-probe"
+    _fixture = {"repos": {_fixture_repo: {**_shipped["repos"][sorted(
+        n for n, r in _shipped["repos"].items() if isinstance(r, dict) and r.get("enabled"))[0]],
+        "enabled": False, "gate_profile": "definitely-not-a-profile"}}}
+    _fixture_probe = _copy.deepcopy(_fixture)
+    _fixture_probe["repos"][_fixture_repo]["enabled"] = True
+    try:
+        _policy_row(_fixture_repo, _fixture_probe)
+    except Exception as _fx:      # noqa: BLE001 — the message IS the assertion
+        check("the staged-row validation LOGIC rejects an unsatisfiable profile under enable",
+              "unknown gate_profile" in str(_fx), True)
+    else:
+        raise AssertionError(
+            "the staged-row validation logic did NOT reject a bogus gate_profile under `enabled = "
+            "true` — this guard cannot protect any staged row, live or future")
+    # ⚠️ `_validated` is appended to ONLY after `_policy_row` RETURNS, and the check below compares
+    # it against the independently-derived `_staged`. Round-2 review caught the first cut ending in
+    # `check(..., sorted(_staged), sorted(_staged))` — a value compared with ITSELF, which stays
+    # green (and preserves the check count) if this whole loop is deleted. A guard whose own removal
+    # is invisible protects nothing; the expected value must be PRODUCED BY THE WORK.
+    _validated = []
+    for _name in sorted(_staged):
+        _probe = _copy.deepcopy(_shipped)
+        _probe["repos"][_name]["enabled"] = True
+        try:
+            _policy_row(_name, _probe)
+        except Exception as _exc:        # noqa: BLE001 — the message IS the assertion
+            raise AssertionError(
+                f"staged row {_name!r} does NOT survive `enabled = true`: {_exc}. A staged target "
+                "whose only documented activation step is flipping `enabled` must validate under "
+                "that flip, or the promise is false and the enable fails closed.") from _exc
+        _validated.append(_name)
+    check("every staged (disabled) row survives its own one-line enable",
+          _validated, sorted(_staged))
+
     rejects("unknown role fails closed", "unknown role",
             lambda: resolve("sparq-org/sparq", "destroy", policy, routing))
     rejects("multiple roles fail closed", "ambiguous role labels",

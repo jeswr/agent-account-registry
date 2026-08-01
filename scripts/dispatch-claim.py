@@ -583,11 +583,28 @@ def plan_package(areas):
 
 
 def packages_conflict(left, right):
-    """THE exclusion predicate over two partition keys — DELEGATED to lease_schema, for the same
-    reason `plan_package` is: PLAN's assemble filter, CLAIM's live re-check, the cross-lane ledger
-    view and the allocator's own `partition_available` must all decide with ONE function. A key
-    names a SET of areas, so two rows exclude iff their sets INTERSECT; `__global__` is the
-    universal set and still serializes in both directions."""
+    """THE exclusion predicate over two partition KEYS — DELEGATED to lease_schema, for the same
+    reason `plan_package` is: the cross-lane ledger view (`sibling_lease_conflict`) and the
+    allocator's own `partition_available` must decide with ONE function. A key names a SET of
+    areas, so two rows exclude iff their sets INTERSECT; `__global__` is the universal set and
+    still serializes in both directions.
+
+    SCOPE — this is not the only implementation of that semantics, and a widening applied here
+    reaches only the two LEDGER legs. PLAN's assemble filter and CLAIM's live re-check decide
+    against the busy UNION of atoms via `partition_defer_attribution`, which shares `package_areas`
+    (the set semantics, the fail-closed universal reading) but NOT this function. The two are
+    equivalent by TEST, not by construction — the self-test pins PLAN and CLAIM deciding
+    identically and pins the union arm to intersect rather than membership-test. Change one and the
+    scheduler contradicts itself; see `research/1011-global-partition-bounded-concurrency.md` §4/§9.3.
+
+    WHETHER `__global__` SHOULD SERIALIZE AT ALL — bounded N-slot concurrency instead of exclusion
+    — is a DECIDED question, not an open one: see registry #677 point 1 / #1011, recorded in
+    `research/1011-global-partition-bounded-concurrency.md`. N slots either schedule a population
+    that is not runnable (the measured holders are inert OPEN PRs, not queued rows) or delete the
+    disjointness invariant for the admitted pairs, and the class that admits — same crate,
+    textually disjoint, jointly wrong — is one no gate grades and no reviewer reads. The lever is
+    NARROWING a cause on evidence that proves the footprint, which keeps BOTH implementations of
+    the exclusion intact rather than suspending either."""
     return _lease_schema.packages_conflict(left, right)
 
 
@@ -4961,7 +4978,7 @@ def _current_issue_matches(repo, item, trusted_bots, allow_actions_bot_issues=Fa
 
 
 def _target_tokens_map():
-    """[OPUS-4.8] defects #1,#5: the PER-OWNER target App-token map. dispatch.yml mints one App
+    """defects #1,#5: the PER-OWNER target App-token map. dispatch.yml mints one App
     token per DISTINCT manifest owner and passes {owner: token} as JSON in TARGET_GH_TOKENS. The
     single-target legacy env TARGET_GH_TOKEN is still honoured as a fallback (mapped to the first
     manifest owner via TARGET_GH_TOKEN_OWNER), so a single-target deployment is unchanged. This is
@@ -8375,7 +8392,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 # generic defer line here.
                 defer_reasons["live-busy-crate"] += 1
                 continue
-            # [OPUS-4.8] Per-item resilience: a single item's trust/route/policy resolution failure
+            # Per-item resilience: a single item's trust/route/policy resolution failure
             # must SKIP that item, not abort the whole dispatch (which would strand the other ready
             # issues and mark the run failed). Global setup errors above still abort as before.
             try:
@@ -13663,6 +13680,38 @@ def _self_test():
         Path(__file__).resolve().parents[1] / "scripts" / "policy-resolve.py")
     _ENABLED_REPO = "jeswr/agent-account-registry"
     _DEFERRED_REPO = "sparq-org/sparq"
+
+    # ---- [#1451] THE SHIPPED MANIFEST MUST EQUAL THE SHIPPED ENABLED SET ----------------------
+    # REGRESSION 2026-08-01, a FULL dispatch outage: PR #1535 enabled `jeswr/solid-sdk` in
+    # policy/repos.toml but left `DISPATCH_TARGET_REPOS` in .github/workflows/dispatch.yml naming
+    # only two repos. `run_claim` compares them as SETS and raises "PLAN target manifest does not
+    # exactly match enabled registry policy", so CLAIM failed CLOSED on every executed tick and
+    # ZERO workers launched until the YAML caught up.
+    #
+    # The enabled set is therefore DUPLICATED across a .toml and a .yml, and nothing compared the
+    # two SHIPPED copies — the production check only ever saw a plan built from the manifest, so
+    # the divergence was undetectable until it reached a live tick. This asserts the real files.
+    _wf_text = (Path(__file__).resolve().parents[1]
+                / ".github" / "workflows" / "dispatch.yml").read_text(encoding="utf-8")
+    _wf_match = re.search(r"^  DISPATCH_TARGET_REPOS: '(.+)'$", _wf_text, re.M)
+    assert _wf_match, (
+        "could not find DISPATCH_TARGET_REPOS in dispatch.yml — if it was renamed or reformatted, "
+        "REPOINT this guard; deleting it restores a silent full-outage mode")
+    _manifest_repos = set(json.loads(_wf_match.group(1)))
+    _policy_enabled = _enabled_repositories(_repos_doc, _enable_policy)
+    assert _manifest_repos == _policy_enabled, (
+        "dispatch.yml's DISPATCH_TARGET_REPOS does NOT equal the enabled rows in "
+        f"policy/repos.toml. manifest={sorted(_manifest_repos)} "
+        f"enabled={sorted(_policy_enabled)}. run_claim compares these as SETS and fails CLAIM "
+        "CLOSED on a mismatch, so this is a FULL dispatch outage (zero workers), not a degraded "
+        "sweep. Enabling a repo in policy REQUIRES adding it to the workflow manifest.")
+    # NON-VACUOUS: the same comparison must REJECT a manifest that drops an enabled repo, so this
+    # asserts a fact about the two SHIPPED files rather than about a comparison that always agrees.
+    assert (_manifest_repos - {sorted(_policy_enabled)[0]}) != _policy_enabled, (
+        "the manifest/policy comparison accepted a manifest with an enabled repo REMOVED — it "
+        "cannot detect the divergence it exists to catch")
+
+
     _shipped_authors = _enable_policy.review_enrolment_authors(_ENABLED_REPO, _repos_doc)
     _deferred_authors = _enable_policy.review_enrolment_authors(_DEFERRED_REPO, _repos_doc)
     assert _shipped_authors, (
