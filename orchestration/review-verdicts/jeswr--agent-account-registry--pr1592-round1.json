@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1592,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1417b3236f2991192947707910ca2b481e83071a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "This diff exists because the documented enum silently fell behind scripts/policy-resolve.py:55 \u2014 'registry-selftest' was added to GATE_PROFILES and put into shipped use by the registry's own row (policy/repos.toml:197) without the field-reference comment being updated. Nothing in the self-test suite compares the two, so the same drift can recur in either direction the next time a profile is added or retired, and a future reader following this comment block could believe a valid profile is unsupported (or, worse in the other direction, that a retired one is still valid).\n\nThis is genuinely a nit and NOT a condition of approval: the comment is prose, the validator is the real authority and is unchanged, and demanding a new test harness as the price of a one-line docs correction would be scope creep on an otherwise clean fix. Recording it only so the underlying cause is visible rather than fixed-and-forgotten.",
+    "file": "policy/repos.toml",
+    "fix_hint": "Optional, and reasonably deferred to a separate change: add a small non-vacuous assertion to the policy-resolve.py --self-test that parses the `#   gate_profile           = ...` line out of policy/repos.toml, extracts the double-quoted tokens, and asserts the resulting set equals GATE_PROFILES exactly (set equality, not a subset check \u2014 a subset check would pass vacuously if the comment listed nothing). To keep it non-vacuous, pair it with a negative case proving the comparison flips red when the two differ, in the same style as the existing staged-row guard at policy-resolve.py:1043-1054. If the comment's format is considered too brittle to parse, the honest alternative is to leave it as-is rather than ship a check that silently no-ops when the regex stops matching.",
+    "severity": "nit",
+    "title": "No guard prevents this comment from drifting out of sync with GATE_PROFILES again"
+   }
+  ],
+  "progress": null,
+  "summary": "Single-line documentation fix to the field-reference comment block in policy/repos.toml: the documented gate_profile enum now includes \"registry-selftest\". This corrects genuine doc-vs-code drift and is COMPLETE and ACCURATE.\n\nVerified against the enforcement points (none of which this diff touches):\n\n1. Authority match. scripts/policy-resolve.py:55 defines GATE_PROFILES = {\"none\", \"lint-only\", \"crate-scoped\", \"workspace\", \"registry-selftest\"}, and _policy_row (line 255-256) rejects anything outside it with \"unknown gate_profile\". The updated comment is now an EXACT set match with the validator \u2014 no member added that the validator would reject, none omitted.\n\n2. The profile is real, not aspirational. worker-live.sh run_gate has a live `registry-selftest)` branch (line 874) implementing the python --self-test suite + bash -n/actionlint, and it is demonstrably fail-closed: no runnable suite dies (line 2072), an unvalidated touched control file dies (2073-2074), an empty changed-path list dies (1960), and an unavailable dependency is ENV-BLOCKED rather than treated as a pass (1954). So the docs are not advertising a profile with no worker branch.\n\n3. Already in shipped use. The registry's own row (policy/repos.toml:197) has carried gate_profile = \"registry-selftest\" for some time; the comment block was simply stale. This diff makes documentation catch up to reality \u2014 it does not enable, widen, or introduce anything.\n\n4. Completeness. The enum is enumerated in exactly two places repo-wide (the repos.toml comment and GATE_PROFILES). Greps over *.md and the whole tree surface no other stale listing, so there is no half-updated second copy.\n\nTrust-plane lens: zero behavioural surface. No validator, route, self-test, arm path, permissions block or match_labels set is deleted, relaxed or skipped; no default-allow path is opened. Comment-only, so there is no test to be vacuous \u2014 the existing non-vacuous guard at policy-resolve.py:1043-1054 (which assert\u2026 [truncated 222 chars]",
+  "verdict": "approve"
+ }
+}
