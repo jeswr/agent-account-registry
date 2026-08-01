@@ -2257,6 +2257,46 @@ DefuseOutcome = PhaseOutcome
 defuse_exit_failure = phase_exit_failure
 
 
+def age_park_predicate_kind(cause: str) -> str | None:
+    """Which recovery predicate decides a park receipt's ``cause`` token — None when NONE does.
+
+    THE ONE definition of the DECIDABLE cause vocabulary, and it is deliberately asked of the
+    TOKEN READ BACK off the receipt rather than of AGE_PARK_CAUSES. A receipt is DURABLE and that
+    table is not: it is derived from BAD_MERGE_STATES and from the reasons stale_worker_pr_reason
+    returns, both of which get edited, while a receipt minted under the old vocabulary stays on
+    the PR forever. "Could today's table mint this cause" and "can this sweep decide this cause"
+    are therefore different questions, and only the second one bounds the park.
+
+    age_park_cause_recovered DISPATCHES on this answer instead of re-testing the tokens, so
+    "which causes can be decided" and "which causes ARE decided" cannot drift apart — the
+    mutually-masking duplicate-guard shape AGENTS.md pre-flight item 4 names. AGE_PARK_CAUSES is
+    left as an INDEPENDENT vocabulary on purpose: collapsing the two onto shared constants would
+    make the self-test that binds them (every mintable cause is decidable) true by construction,
+    i.e. unable to fail, and a mapped cause with no predicate is exactly the silent permanent
+    hold [registry #873] is about."""
+    if cause == "orphan-draft":
+        return "orphan-draft"
+    if cause.startswith("merge-"):
+        return "merge"
+    return None
+
+
+def age_park_exit_reachable(cause: str) -> bool:
+    """Can ANY tick of this sweep ever re-admit a machine age park carrying this ``cause``?
+    PURE, and derived from age_park_predicate_kind so it states no vocabulary of its own.
+
+    False is a CAUSE-SHAPED proof of permanence — an observation about the park, not about
+    elapsed time: with no predicate for the token, age_park_cause_recovered can only ever refuse,
+    so no number of further ticks changes anything. That matters beyond this file, because
+    dispatch-claim's park census records such a park as
+    park_policy.PARK_REFUSAL_FOREIGN_EPISODE and classifies it EXIT-REACHABLE on the strength of
+    a CLAIM park_policy states explicitly — "it is only ever emitted for a park whose owning
+    mechanism has a machine exit". THIS sweep is that owning mechanism, so this is the only place
+    the claim can be falsified, and a park that falsifies it is reported rather than left to be
+    counted as self-healing forever."""
+    return age_park_predicate_kind(cause) is not None
+
+
 def age_park_cause_recovered(
     cause: str,
     pull: dict[str, Any],
@@ -2288,27 +2328,34 @@ def age_park_cause_recovered(
     Every ambiguity fails toward STAYING PARKED: an unreadable/conflicting provenance read, a
     malformed merge state, and an unrecognised cause token all return False. An unrecognised
     token in particular must never re-admit — a cause we cannot check is a cause we cannot prove
-    recovered, and guessing here would turn the bounded exit into an unbounded retry."""
-    if cause == "orphan-draft":
+    recovered, and guessing here would turn the bounded exit into an unbounded retry. It is
+    refused FIRST, off age_park_predicate_kind, so an undecidable token spends no live read and
+    the vocabulary dispatched on here is the SAME one age_park_exit_reachable reports to the
+    caller — one definition, so a token the exit cannot decide can never be reported as
+    exit-reachable (or the reverse)."""
+    kind = age_park_predicate_kind(cause)
+    if kind is None:
+        return False, f"cause {cause!r} has no recovery predicate — never auto-re-admitted"
+    if kind == "orphan-draft":
         state, _record = live_provenance()
         if state == "admits":
             return True, "an admissible provenance record now exists on the live ledger ref"
         if state == "indeterminate":
             return False, "the live provenance read was unavailable or conflicting"
         return False, "still no admissible provenance record on the live ledger ref"
-    if cause.startswith("merge-"):
-        if live_provenance()[0] == "admits":
-            return True, ("an admissible provenance record now exists on the live ledger ref, so "
-                          "the review loop owns this PR's repair and groom no longer parks it")
-        merge_state = pull.get("mergeable_state")
-        if merge_state is None:
-            merge_state = "unknown"
-        if not isinstance(merge_state, str):
-            return False, "the live merge state is malformed"
-        if merge_state in BAD_MERGE_STATES:
-            return False, f"the merge state is still {merge_state}"
-        return True, f"the merge state recovered to {merge_state}"
-    return False, f"cause {cause!r} has no recovery predicate — never auto-re-admitted"
+    # kind == "merge" — the only remaining decidable shape; a token that reached here has already
+    # been proven decidable, so there is no third fall-through to guess at.
+    if live_provenance()[0] == "admits":
+        return True, ("an admissible provenance record now exists on the live ledger ref, so "
+                      "the review loop owns this PR's repair and groom no longer parks it")
+    merge_state = pull.get("mergeable_state")
+    if merge_state is None:
+        merge_state = "unknown"
+    if not isinstance(merge_state, str):
+        return False, "the live merge state is malformed"
+    if merge_state in BAD_MERGE_STATES:
+        return False, f"the merge state is still {merge_state}"
+    return True, f"the merge state recovered to {merge_state}"
 
 
 def _execute_age_unpark_actions(
@@ -2365,19 +2412,41 @@ def _execute_age_unpark_actions(
         reads, which is how four sparq PRs stayed in that state for ~17 hours. A grant OLDER than
         the live park is a completed re-admission plus a later, unrelated park: no contradiction,
         and a correction there would point a human at undoing a valid park.
+      - AND THE POPULATION IT DECLINES IS COUNTED, INCLUDING A ZERO ROW ([registry #873]). A park
+        this phase declines on its own cause is the phase working correctly; a park it declines
+        because the cause has NO PREDICATE AT ALL is this phase promising an exit it cannot
+        deliver, and the two are the same log line ("age park stands") and the same label state.
+        They are separated into two gauges — see `standing`/`unreachable` below — because only the
+        second one is a defect, and it is the one nothing else in the estate can see.
 
     Every failure is PER-PR: one unreadable PR never stops the rest.
 
-    Returns (outcome, grants, convergences, stalls). GRANTS are new re-admissions and are what
-    AGE_UNPARK_MAX governs; CONVERGENCES are retries of one already-authorised, never-effected
-    write and change no decision — they are counted apart so neither can be read as the other.
-    STALLS are neither: they are a GAUGE of PRs currently in the announced-but-held contradiction,
-    re-counted every tick because the state persists until a human acts."""
+    Returns (outcome, grants, convergences, stalls, standing, unreachable). GRANTS are new
+    re-admissions and are what AGE_UNPARK_MAX governs; CONVERGENCES are retries of one
+    already-authorised, never-effected write and change no decision — they are counted apart so
+    neither can be read as the other. STALLS are neither: they are a GAUGE of PRs currently in the
+    announced-but-held contradiction, re-counted every tick because the state persists until a
+    human acts. STANDING and UNREACHABLE are gauges of the same shape, over the declined
+    population."""
     attempted = 0
     completed = 0
     unparked = 0      # NEW grants: one per park receipt, governed by AGE_UNPARK_MAX
     converged = 0     # RETRIES of an already-granted, never-effected unlabel: state-change-free
     stalled = 0       # GAUGE: re-admissions announced on PRs a human-owned hold still holds out
+    # [registry #873] GAUGE: machine age parks this tick DECLINED ON THEIR OWN CAUSE — scoped to
+    # exactly that branch, so a human-owned hold, an unproven grant and an unclearable label
+    # (each of which has its own reported reason) are NOT folded in. This is the population whose
+    # generation cannot advance: nothing re-parks a PR already wearing the machine label, and
+    # since [registry #1292] the generation counts GRANTS, so a park that is never re-admitted
+    # never climbs toward AGE_UNPARK_MAX either. It is a gauge, not a decision — the sweep still
+    # writes nothing here — but it has to be COUNTABLE, because "how big is the population that
+    # only a cause can move" is the number any future bound has to be sized against.
+    standing = 0
+    # [registry #873] GAUGE (a SUBSET of `standing`): declined parks whose cause has no recovery
+    # predicate at all, so no tick can EVER grant them. Counted apart because it is the only part
+    # of the standing population whose permanence is PROVABLE without a clock, and because it
+    # falsifies a claim another checkout root makes about this sweep — see age_park_exit_reachable.
+    unreachable = 0
     deferrals: list[str] = []
     for repo, api in apis.items():
         for number, listed in sorted(pulls.get(repo, {}).items()):
@@ -2644,8 +2713,26 @@ def _execute_age_unpark_actions(
                         registry_api, registry_repo, repo, number),
                 )
                 if not recovered:
+                    standing += 1
                     print(f"age park stands {repo}#{number} (cause={owed['cause']} "
                           f"gen={owed['gen']}): {why}")
+                    # [registry #873] The park whose exit does not exist. Every other standing
+                    # park is waiting on a predicate that CAN answer differently on a later tick;
+                    # this one is waiting on a predicate that was never written, so "it stands"
+                    # and "it will stand forever" are the same sentence. Reported as an ALERT
+                    # rather than escalated: a machine writing the human-owned terminal off its
+                    # own vocabulary gap is a decision this issue deliberately does not take, and
+                    # a cause-shaped bound belongs in the class split, not in a log line.
+                    if not age_park_exit_reachable(owed["cause"]):
+                        unreachable += 1
+                        print(
+                            f"ALERT PR {repo}#{number}: age park cause={owed['cause']} has NO "
+                            "recovery predicate in this sweep, so no tick can ever re-admit it "
+                            f"— `{park_policy.MACHINE_PARK_PR_LABEL}` is a PERMANENT machine "
+                            "hold here and only a human can move this PR. The park census "
+                            f"records it as `{park_policy.PARK_REFUSAL_FOREIGN_EPISODE}` and "
+                            "classifies it exit-reachable because THIS sweep is supposed to own "
+                            "an exit for it; for this cause that is false")
                     continue
                 if not _clearable():
                     print(f"age park stands {repo}#{number}: "
@@ -2702,6 +2789,8 @@ def _execute_age_unpark_actions(
         unparked,
         converged,
         stalled,
+        standing,
+        unreachable,
     )
 
 
@@ -3897,7 +3986,8 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         pull_actions, groomable, target_tokens, now, defuse_stale_seconds, bot_login
     )
 
-    unpark_outcome, unpark_count, converge_count, stalled_count = _execute_age_unpark_actions(
+    (unpark_outcome, unpark_count, converge_count, stalled_count,
+     standing_count, unreachable_count) = _execute_age_unpark_actions(
         pulls, groomable, registry_api, registry_repo, bot_login
     )
 
@@ -4121,6 +4211,12 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         f"stale_pr_deferred={len(stale_outcome.deferred)} "
         f"age_unparked={unpark_count} age_converged={converge_count} "
         f"age_unpark_stalled={stalled_count} "
+        # [registry #873] Emitted UNCONDITIONALLY, zero row included: the number this reports is
+        # "how many machine age parks did the sweep decline again this tick", and a gauge that
+        # only appears when it is non-zero trains its reader to treat absence as health
+        # (AGENTS.md pre-flight item 8).
+        f"age_park_standing={standing_count} "
+        f"age_park_exit_unreachable={unreachable_count} "
         f"age_unpark_deferred={len(unpark_outcome.deferred)} "
         f"detect_deferred={len(detect_outcome.deferred)} "
         f"snapshot_deferred={len(snapshot_outcome.deferred)} "
@@ -8569,6 +8665,51 @@ def _self_test() -> int:
             ),
             ([], True, True),
         )
+        # [registry #873] ...AND IT IS COUNTED. `stands_log` is the ordinary declined park —
+        # one standing, zero unreachable, no permanence ALERT, because a `merge-*` cause CAN
+        # answer differently on a later tick. `unpark_log` above is the tick that granted its
+        # re-admission instead, so the gauge is pinned in BOTH directions on real sweeps rather
+        # than being a counter that is always 1. The trailing space is load-bearing: without it
+        # `=1` also matches `=10`.
+        check(
+            "[#873] the declined-park GAUGE counts the standing park, reports it as decidable, "
+            "and reads ZERO on a tick that re-admitted instead",
+            (
+                "age_park_standing=1 " in stands_log,
+                "age_park_exit_unreachable=0 " in stands_log,
+                "has NO recovery predicate" in stands_log,
+                "age_park_standing=0 " in unpark_log,
+            ),
+            (True, True, False, True),
+        )
+
+        # [registry #873] THE PARK WITH NO EXIT AT ALL, end to end through the REAL sweep. The
+        # receipt on this PR carries a cause token no predicate decides — the shape a durable
+        # receipt takes once the mint vocabulary moves under it — so `review:parked` here is a
+        # PERMANENT machine hold: the hand-off derives no new reason while the label is live, the
+        # generation counts grants that will never be made, and AGE_UNPARK_MAX is therefore never
+        # reached. The sweep must SAY so and still write nothing.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/43/comments": [
+                _park_receipt_comment(1, 43, cause="ci-red")],
+            **_bot_park_timeline(43)}
+        unreachable_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(43, "dirty", ("review:parked",), fresh=True),))
+        check(
+            "[#873] a machine age park whose cause has NO recovery predicate is ALERTed as a "
+            "permanent hold, counted in its own gauge, names the census code whose "
+            "exit-reachable claim it falsifies — and nothing is written",
+            (
+                terminal_sweep_env["writes"],
+                "ALERT PR owner/repo#43" in unreachable_log,
+                "cause=ci-red has NO recovery predicate" in unreachable_log,
+                park_policy.PARK_REFUSAL_FOREIGN_EPISODE in unreachable_log,
+                "age_park_standing=1 " in unreachable_log,
+                "age_park_exit_unreachable=1 " in unreachable_log,
+            ),
+            ([], True, True, True, True, True),
+        )
+        terminal_sweep_env["pages"] = {}
 
         # A GENUINE human-question park is never auto-re-admitted — it carries no machine label,
         # so the exit phase never even considers it. Drop the MACHINE_PARK_PR_LABEL membership
@@ -9288,6 +9429,62 @@ def _self_test() -> int:
             age_park_cause_recovered("teleported", {"mergeable_state": "clean"},
                                      lambda: ("admits", {}))[0],
             False,
+        )
+
+        # ---- [registry #873] THE PARK WHOSE EXIT DOES NOT EXIST ---------------------------------
+        # The decidable vocabulary, asked of the token as it comes OFF THE RECEIPT. Both near
+        # misses matter and neither is theoretical: `merge` without the dash is what a truncated
+        # or hand-edited receipt yields, and a cause token is compared byte-for-byte, so a case
+        # variant must not be decided either. Every False here is a park this sweep can only ever
+        # refuse — which is precisely the fact the ALERT below is derived from.
+        check(
+            "[#873] age_park_exit_reachable decides EXACTLY the two predicate shapes — a "
+            "dash-less `merge`, a case variant and a suffixed `orphan-draft` are all UNDECIDABLE",
+            (age_park_exit_reachable("orphan-draft"),
+             age_park_exit_reachable("merge-dirty"),
+             age_park_exit_reachable("merge-behind"),
+             age_park_exit_reachable("merge"),
+             age_park_exit_reachable("Orphan-Draft"),
+             age_park_exit_reachable("orphan-draft-x"),
+             age_park_exit_reachable("")),
+            (True, True, True, False, False, False, False),
+        )
+        # THE WRITER/READER BINDING, and the reason AGE_PARK_CAUSES is NOT built from the same
+        # constants age_park_predicate_kind tests: the hand-off writes the MACHINE class for
+        # exactly the causes in this table, on the promise that the exit phase can decide them, and
+        # a new entry added with no matching predicate would keep that promise silently false —
+        # every PR it parks would be permanent, machine-owned and censused as exit-reachable. With
+        # one shared constant this row could not fail; with two independently-authored
+        # vocabularies it fails the moment they diverge. (AGENTS.md pre-flight item 2b/2c.)
+        check(
+            "[#873] EVERY cause the hand-off can MINT is decidable by the exit phase — a mapped "
+            "AGE_PARK_CAUSES entry with no recovery predicate would write the machine soft hold "
+            "on a park nothing can ever clear",
+            sorted(c for c in AGE_PARK_CAUSES.values() if not age_park_exit_reachable(c)),
+            [],
+        )
+        # NON-VACUITY of the row above: it is a real quantifier over a real table, so a cause
+        # added without a predicate reds it. Modelled here rather than by mutating the module,
+        # because the assertion has to be shown capable of failing at all.
+        check(
+            "[#873] MUTATION: a mapped cause with no predicate is DETECTED by that quantifier",
+            sorted(c for c in {**AGE_PARK_CAUSES, "ci red": "ci-red"}.values()
+                   if not age_park_exit_reachable(c)),
+            ["ci-red"],
+        )
+        # ...and the undecidable answer is reached BEFORE any live read. A park that can never be
+        # granted must not spend a provenance call on every tick forever, and the refusal must name
+        # the token it could not decide — an operator reading "cause X has no recovery predicate"
+        # can add one; "the park stands" tells them nothing to act on.
+        _undecidable_reads: list[int] = []
+        check(
+            "[#873] an undecidable cause is refused WITHOUT a live provenance read, and the "
+            "refusal NAMES the token",
+            (age_park_cause_recovered(
+                "ci-red", {"mergeable_state": "clean"},
+                lambda: (_undecidable_reads.append(1), ("admits", {}))[1]),
+             _undecidable_reads),
+            ((False, "cause 'ci-red' has no recovery predicate — never auto-re-admitted"), []),
         )
         check(
             "an INDETERMINATE live provenance read keeps the orphan-draft park (never re-admit on "
