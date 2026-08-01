@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5576,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e070ff3fa310801be78c14827d267541c57eece5",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The skill says each generated element costs C(n,t) local PRF calls, but the implemented party-local path evaluates C(n-1,t) PRFs per party and n*C(n-1,t) across the in-process generation of all n shares. C(n,t) is the number of distinct setup seeds and is only the cost of the separate central oracle pass. The implementation's shares_at documentation correctly describes the actual cost.",
+    "file": "skills/mpc/SKILL.md",
+    "fix_hint": "Describe the online cost as C(n-1,t) PRF evaluations per party, or n*C(n-1,t) for this in-process simulation to produce all shares. Reserve C(n,t) for setup seed count and the simulation-only central-value oracle. The same wording in PrssRandomness's rustdoc should be corrected when this documentation is updated.",
+    "severity": "minor",
+    "title": "PRSS evaluation cost is misstated"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding. The real shared_mask path now constructs a PartyView containing only held keys and invokes PRF evaluation inside PartyView::share_at; the observer fires immediately before that evaluation. The load-bearing test exercises this same path, compares observed accesses with each party's exact held-key set, independently checks the resulting shares against the global polynomial, and includes a meaningful mutation that splices a forbidden key through the same interface and demonstrates that instrumentation catches an otherwise value-invisible access. The implementation and design record consistently retain the simulated-setup, in-process, semi-honest, non-deployable, and externally unaudited caveats. One minor documentation cost mismatch remains, but it does not affect protocol correctness or security. Progress is improving because the previous major seed-locality/test-validity issue is fixed and only a documentation issue remains.",
+  "verdict": "approve"
+ }
+}
