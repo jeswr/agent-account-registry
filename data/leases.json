@@ -1,14 +1,3 @@
 {
- "leases": [
-  {
-   "account": "9e13ea21abf27e68",
-   "claim_id": "ed0cda66c72848fbb4657b73ff0eb1a0",
-   "holder": "sparq-org/sparq#3298@30686156203.1",
-   "package": "sparq-fedplan-mpc,sparq-mpc",
-   "role": "soundness",
-   "model": "opus5",
-   "issued_at": 1785562614,
-   "expires_at": 1785568914
-  }
- ]
+ "leases": []
 }
