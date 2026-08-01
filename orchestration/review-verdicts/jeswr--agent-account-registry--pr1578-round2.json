@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1578,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "98c81288f0c0120d29831f5da28980302b0d6380",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change remains correct and complete. The provenance job now grants the narrowly required `issues: write` permission and exports the exact four route inputs consumed by `_alert_route()`, while the existing confirmed-private routing and registry fallback behavior remain fail-closed. The parsed-YAML checks pin the full permission map and exact expressions, and the runtime replay exercises the real resolver with ambient route variables cleared, including a negative replay of the former no-route configuration. I found no correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
