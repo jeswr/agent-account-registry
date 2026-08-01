@@ -1,0 +1,47 @@
+# [OPUS-5] ALERT ON THE STOCK, NOT THE RUN — parked PRs only a human can clear (registry #1573).
+#
+# `dispatch-claim` already names this population on every executed tick, in a `::warning::` inside a
+# dispatch log, on ticks that are usually floor-held. Nothing else reflects it: no issue, no label,
+# no dashboard. Measured 2026-08-01, items had waited up to nine days. This routes it to the same
+# upsert-and-close `ops-alert` transport the ci-latency/plan/usage alerts already use.
+#
+# ⚠️ IT IS ITS OWN WORKFLOW ON PURPOSE. The first attempt added this step to groom.yml and groom
+# STOPPED INGESTING (action_required, jobs=0) — the eighth instance of the unexplained class in
+# registry #1566, reverted in #1581. A NEW workflow file has ZERO blast radius on existing lanes: if
+# GitHub declines to ingest THIS file, only this alert stops, and every other lane is untouched.
+# That is #1566's standing recommendation — observe the workflow hunk alone, before anything depends
+# on it — and it is why the delivery path changed rather than the script.
+#
+# The script changes NO gate. Every refusal it reports is correct and stays exactly as it is.
+name: park-stock-alert
+
+on:
+  schedule:
+    # Offset off the top of the hour; this is a reporting lane, not a control lane.
+    - cron: "37 */2 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  issues: write   # create/edit/comment/close exactly ONE `ops-alert` issue
+
+# Singleton: an overlapping fire (cron + manual kick) would race two writers onto the same
+# upserted alert issue and could duplicate it. cancel-in-progress:false so a live run finishes.
+concurrency:
+  group: park-stock-alert-singleton
+  cancel-in-progress: false
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REGISTRY_REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      MAINTAINER_HANDLE: jeswr
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Self-test the parked-PR stock alert (hermetic fixtures)
+        run: python3 scripts/park-stock-alert.py --self-test
+      - name: Alert on parked PRs that only a human can clear
+        run: python3 scripts/park-stock-alert.py
