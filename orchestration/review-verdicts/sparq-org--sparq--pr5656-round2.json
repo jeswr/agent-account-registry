@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5656,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "12127f4508eabb8a69f78ff0bd349ec3dd38f43c",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_SCCACHE_ENABLER` matches the install, wrapper-enable, and stats steps, but not `Export Actions cache credentials for sccache`: its non-comment body contains only `actions/github-script` and the ACTIONS_* variable names. Consequently, deleting or weakening that step's `if:` guard would not fail `test_every_sccache_enabler_is_guarded_by_the_dispatch_input`. That contradicts the load-bearing claim in `.github/workflows/ci.yml` and the research note that all four arm steps are pinned, and can expose `ACTIONS_RUNTIME_TOKEN` through `GITHUB_ENV` on automatic runs.",
+    "file": "scripts/tests/test_mergequeue_cache_posture.py",
+    "fix_hint": "Extend the structural matcher (or add a dedicated credential-export matcher/test) so the step that exports `ACTIONS_RESULTS_URL`, `ACTIONS_CACHE_URL`, or `ACTIONS_RUNTIME_TOKEN` must carry exactly `github.event.inputs.sccache_ab == 'on'`. Add a mutation-style assertion/fixture demonstrating that removing this specific guard makes the suite fail.",
+    "severity": "major",
+    "title": "Guard test misses the cache-credential export step"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The dispatch-only design is mostly intact, but the structural safety test does not cover one of the four guarded experiment steps despite the workflow and research note claiming that all four are pinned. In particular, the credential-export step is invisible to the enabler regex. Removing its guard would therefore leave a cache-service runtime token exported job-wide on automatic push/PR/merge-group runs while the advertised guard test remained green. This is a new major security/test-validity finding relative to round 1, so progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
