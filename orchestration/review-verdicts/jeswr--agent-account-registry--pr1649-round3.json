@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1649,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ecd1390774adb9b51b71e8970e94c41d76284f05",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 approval remains supported. Each widened per-object handler catches ordinary runtime failures at the object boundary, records a masked and bounded cause, continues later objects, and still contributes to the shared phase-level systemic-failure decision after lease reclamation. The new end-to-end masking cases independently exercise all four production call sites and compare the complete emitted ALERT line against a fixed literal that is independent of the masking regex, size limit, and injected-message construction, so a wiring regression at any single handler is observable. The non-GroomError continuation cases also verify later-object work, lease release, per-phase census output, and all-failed nonzero precedence. No correctness, soundness, test-validity, or security issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
