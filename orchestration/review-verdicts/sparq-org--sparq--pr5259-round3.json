@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5259,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c320ad0731f014f48da9d8d396f7dacd0b1c87b5",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "main calls run_gate_once first; evaluate_once/render_verdict may emit the summary and return a final 0/1, and only then does main call save_state_file. If the process is evicted or the state write fails after rendering but before os.replace, the durable carrier remains the previous nonterminal record. A retry reloads that record and can fetch a changed sibling set, reopening an early red as green or an early green as red. terminal_exit therefore protects ordinary sequential duplicates only after a successful post-verdict save; it does not close retry after an ambiguous transport failure as claimed in the new comments/design record. The existing atomic-write test covers preserving the old file during a failed write, but that is exactly the unsafe outcome once the verdict has already been published.",
+    "file": "scripts/ci_summary_gate.py",
+    "fix_hint": "Make persistence and verdict publication ordered so the terminal decision is durably committed before any externally authoritative verdict is emitted. For example, separate pure decision computation from rendering, save the state containing terminal_exit atomically, then render/publish that recorded decision; design the future check-run carrier transaction accordingly. Add a real CLI/transport-path test that forces save_state_file to fail after an early decision, retries with the opposite sibling set, and proves no opposite verdict can be published (or narrow the claims and explicitly leave this as a Phase-2 transport obligation if Phase 1 cannot provide that guarantee).",
+    "severity": "major",
+    "title": "Verdict is externally rendered before its terminal marker is durably saved"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2's sequential duplicate-delivery defect is addressed for successfully persisted records: terminal_exit is validated, stamped on the verdict paths, and replayed without fetching, with real-path early-red and early-green tests. However, the claimed durable-decision handling still has an untested write-after-render gap. The CLI renders/emits the verdict inside run_gate_once and only afterward calls save_state_file. A crash or storage error between those operations leaves the prior nonterminal record, so a retry can re-evaluate a changed sibling set and produce the opposite verdict. This is specifically the ambiguous-transport-failure case the new documentation claims to close. Because this is a new major finding, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
