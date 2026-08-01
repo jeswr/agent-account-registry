@@ -99,6 +99,16 @@
    "model": "sol",
    "issued_at": 1785547945,
    "expires_at": 1785552145
+  },
+  {
+   "account": "dc2d751954080e13",
+   "claim_id": "9f6c9cac6e9e41569de6fe905efaa750",
+   "holder": "review:sparq-org/sparq#5483@dispatch-30677940601.1",
+   "package": "js",
+   "role": "review",
+   "model": "sol",
+   "issued_at": 1785547953,
+   "expires_at": 1785552153
   }
  ]
 }
