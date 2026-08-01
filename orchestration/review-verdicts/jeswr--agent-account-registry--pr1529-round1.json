@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1529,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6be5c20f53d391a9589c1cd9d15bb563ca3981e9",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The workflow adds a second pagination implementation for the unfiltered orphan scan, including its own JSON-array guard, short-page termination, page increment, and max-pages refusal. However, `run_sweep_step(payload=\"object\")` makes the first labeled-lane request malformed, so execution exits before the orphan scan; the shape assertion therefore cannot detect deletion or weakening of the orphan guard. Likewise, `full_pages=25` affects only labeled requests because the stub always returns a short unfiltered page, so the ceiling test never reaches the orphan ceiling branch. Mutants such as removing the orphan `jq -e` check (while returning an object only for the unfiltered request), prematurely treating its first full page as short, or weakening its max-pages refusal can survive behind the still-correct earlier lane controls. These are duplicated guards and must not borrow coverage from the first copy: a truncated or malformed unfiltered scan could be accepted as complete and feed a partial writing board.",
+    "file": "scripts/retriage.py",
+    "fix_hint": "Extend the executable workflow harness so the stub can vary labeled and unfiltered responses independently. Add orphan-specific cases that let both labeled lanes complete normally, then (1) return a malformed payload on the unfiltered request and assert nonzero exit with zero applies, and (2) return full unfiltered pages through the configured ceiling and assert refusal at exactly that ceiling with zero applies and the expected request/page count. Also exercise a multi-page orphan scan with a short terminal page and assert every reduced orphan page reaches the snapshot, which kills premature-break/page-increment regressions. Ensure each mutant run completes the pristine check count rather than dying earlier in an unrelated lane.",
+    "severity": "major",
+    "title": "Orphan pagination fail-closed guards are not independently executed"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe orphan adoption planner is narrowly gated and the happy-path workflow reduction is exercised, but the new workflow pagination boundary is not adversarially tested on its own. The malformed-page and request-ceiling tests stop in the pre-existing labeled-lane loop, so they provide no evidence that the duplicated orphan-loop guards execute or fail closed. Because this is the production enumeration seam for a writing action, the uncovered controls are a major, non-vacuity issue.",
+  "verdict": "request_changes"
+ }
+}
