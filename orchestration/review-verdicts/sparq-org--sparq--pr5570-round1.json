@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 5570,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6e95a5fda5b9908d6b6b71f07e85e86fde2baa08",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The banner says 'The Pages cutover discussed below is complete' and that 'future-tense cutover steps below are retained as historical retirement criteria'. The cutover this record discusses is not the sq-iigf source-mode flip; it is the step at lines 66-67 and 80-82: 'repoint the bench.yml seed step / benchmark-data publishing at the site export. **This is the actual retirement step**; the standalone UI files come out only here.' That has not happened. .github/workflows/pages.yml states plainly that it 'does NOT touch the benchmark-data branch \u2014 bench.yml keeps' writing it, and its 'Overlay benchmark dashboard(s) (dev/bench*) from benchmark-data' step git-archives that tree into out/dev/ \u2014 i.e. the standalone bench/dashboard/ files are still the live served artifact, exactly as the record's verdict warns. The gating gaps (in-site trend charts sq-hsyg, scaling charts) are likewise still open. Labelling those criteria 'historical' inverts the record's DO-NOT-RETIRE verdict and could lead a future agent to delete bench/dashboard/ and take the published dashboard down.",
+    "file": "research/dashboard-retirement-assessment.md",
+    "fix_hint": "Scope the banner to what actually completed: e.g. 'The separate sq-iigf Pages *source-mode* cutover (branch-served -> Actions producer) is done repo-side and its runbook has been rewritten as a topology/provenance record. The Pages cutover named in this record's Verdict \u2014 repointing the bench.yml seed step / benchmark-data publishing at the site export \u2014 is still OPEN, as are the in-site trend/scaling-chart gates; the retirement criteria below remain live, not historical.' Drop the 'historical retirement criteria' sentence entirely.",
+    "severity": "major",
+    "title": "Banner declares a cutover complete that this record's own verdict lists as still-pending \u2014 reads as clearing the retirement gate"
+   },
+   {
+    "body": "The banner says 'references below to a pending Pages mount are retained as historical analysis'. Section 8 (line ~191) calls the Pages mount 'The one genuinely blocked item ... a product decision, not a settings flip', and that is still true at this head: .github/workflows/docs.yml still carries 'WHY IT DOES NOT DEPLOY TO PAGES', still uploads the rendered guide as 'CI artifact only \u2014 NOT a Pages deploy', and still says 'When the cutover bead lands, this lane gains the deploy job'; .github/workflows/pages.yml correspondingly says the guide 'wants a published home too; until that root question is decided'. The guide is not mounted. Describing the analysis as historical suppresses an open blocker and the /guide-subpath decision it frames.",
+    "file": "research/docs-site-single-sourcing-anti-drift.md",
+    "fix_hint": "Reword to distinguish the two: the sq-iigf source-mode cutover completed and its runbook was rewritten; the guide's Pages mount discussed in \u00a78 remains OPEN (docs.yml still ships no deploy job). Remove the 'historical analysis' framing, or restrict it to the specific pre-cutover source-mode statements it truly applies to.",
+    "severity": "major",
+    "title": "Banner calls the pending Pages mount 'historical analysis', but the mount is still blocked in-repo"
+   },
+   {
+    "body": "docs/pages-cutover-runbook.md is explicit that the cutover is 'done on the repo side' while 'The matching Pages service setting is reported as flipped but is not verified by this document', and its Provenance section separates artifact-shape claims (established by workflow source) from service-setting claims (relayed from an undated pages.yml comment). Both new banners assert unqualified completion, re-introducing precisely the overclaim the runbook rewrite removed. The same wording appears in research/dashboard-retirement-assessment.md.",
+    "file": "research/docs-site-single-sourcing-anti-drift.md",
+    "fix_hint": "Say 'complete on the repo side (producer workflow exists); the Pages service setting is reported flipped but unverified \u2014 see the runbook's Provenance section' rather than a bare 'is complete', in both banners.",
+    "severity": "minor",
+    "title": "'Complete' drops the hedge the linked runbook deliberately makes about unverified Pages service settings"
+   }
+  ],
+  "progress": null,
+  "summary": "Docs-only PR adding a 'Post-record status' banner to two research records, asserting that 'the Pages cutover is complete'. The second half of each banner is accurate (docs/pages-cutover-runbook.md was indeed rewritten as a post-cutover topology/provenance record, commit 902766e9). The completion claim is not. Two distinct problems. (1) The banners conflate the sq-iigf Pages *source-mode* cutover (branch-served -> Actions producer, done repo-side) with the cutover each record actually discusses, which is still open. In research/dashboard-retirement-assessment.md the 'Pages cutover' is explicitly 'the actual retirement step' \u2014 repointing the bench.yml seed step / benchmark-data publishing at the site export \u2014 and .github/workflows/pages.yml states it 'does NOT touch the benchmark-data branch' and instead git-archives dev/ from that branch as an overlay, i.e. bench.yml still owns the seed and the standalone dashboard is still the live artifact. Its gating gaps (in-site trend + scaling charts, sq-hsyg) are also still open. In research/docs-site-single-sourcing-anti-drift.md the pending item is the guide's Pages mount, and .github/workflows/docs.yml still ships no deploy job ('When the cutover bead lands, this lane gains the deploy job'), while pages.yml still says the root question is undecided. So calling those sections 'historical analysis'/'historical retirement criteria' tells a future reader to disregard live blockers \u2014 the same failure mode #5545 was filed to fix, in the opposite direction. (2) Even for the part that is done, 'complete' is stronger than the linked runbook allows: the runbook is careful that the cutover is 'done on the repo side' while the Pages *service setting* is 'reported as flipped but is not verified by this document'. The banner drops that hedge. Docs-only, no code risk, but the change asserts a completion the repo contradicts, so it should be reworded before merge.",
+  "verdict": "request_changes"
+ }
+}
