@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5537,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "993aace13b01fcd9caba775697c98181627be569",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly re-asserts the three existing vendored dimension IRIs as sec-prop:SecurityProperty subjects, exposes matching public constants, includes them in ALL_SECPROP_IRIS, and updates the public usage documentation. The focused test parses the actual embedded Turtle and verifies each exact IRI/type pair on the real vocabulary path; the pre-existing registry subject-presence test also now covers the added constants. The asserted IRIs, labels, and types match the vendored source, and the prose continues to distinguish annotation-based reasoning from cryptographic assurance and references the pending sq-qhy4 audit gate.",
+  "verdict": "approve"
+ }
+}
