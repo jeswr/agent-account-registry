@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 5505,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6306345f67408d52da29a7ab3aec17354ce52b6f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "runSecureThreshold reconstructs localSums modulo FIELD_P and compares that residue with threshold. Each individual contribution is only constrained below FIELD_P, so two or more accepted parties can have a mathematical sum >= FIELD_P. For example, two contributions of FIELD_P - 1 reconstruct to FIELD_P - 2; a threshold of FIELD_P - 1 incorrectly yields false even though the actual sum is much larger. This contradicts the displayed claim `\u03a3 contributions \u2265 threshold` and can silently produce a wrong verdict on accepted live-store rows. The current tests only use a small total and do not exercise wraparound.",
+    "file": "gui/app/src/lib/mpc-sim.ts",
+    "fix_hint": "Define and enforce a range invariant that guarantees the aggregate cannot wrap (including a validated threshold), or implement a comparison protocol/representation that correctly handles the intended aggregate range. Add boundary tests with a sum at and above FIELD_P and verify the displayed mathematical predicate, not merely field reconstruction.",
+    "severity": "major",
+    "title": "Threshold verdict is wrong when contributions sum past the field prime"
+   },
+   {
+    "body": "isUnsatisfiable treats any message containing `execution failed`, `assert`, or `constraint` as an unsatisfiable false claim. Those generic fragments can also occur for malformed ACIR, incompatible nightly APIs, witness encoding bugs, or other execution failures. zk-tool.tsx then tells the user that no proof exists and that the real circuit refused the false claim. The two negative tests (404 and out-of-memory) do not cover these realistic ambiguous failures, so a broken prover can be presented as successful soundness evidence.",
+    "file": "gui/app/src/lib/zk-witness.ts",
+    "fix_hint": "Classify refusal from a typed Noir error/code or a narrowly verified, version-pinned error shape specific to the expected verdict constraint. Treat every unknown execution/assertion/constraint error as a prover error. Add tests demonstrating that unrelated assertion, malformed-circuit, and generic execution failures remain errors.",
+    "severity": "major",
+    "title": "Broad error matching can misreport prover failures as cryptographic refusal"
+   },
+   {
+    "body": "The test explicitly says the bb.js proving path is only exercised by opening the tool. Consequently nothing in this PR verifies that the copied ACIR works with the newly pinned nightly bb.js/noir_js versions, that the declared input encoding and verifierTarget options match the artifact, that the honest claim verifies, that the opposite claim fails for the intended constraint, or that the reported public inputs omit the witness. Pure witness-selection tests cannot substantiate the PR's central real-proving claims.",
+    "file": "gui/app/src/lib/zk-witness.test.ts",
+    "fix_hint": "Add an integration test using the shipped ACIR and pinned prover dependencies that proves and verifies at least one committed value, checks the expected public inputs/witness exclusion, and confirms the opposite verdict fails through the narrowly classified unsatisfiable path. If browser-only infrastructure prevents this, do not promote the tool to working or make the proof/refusal claims until a real-path gate exists.",
+    "severity": "major",
+    "title": "No automated test exercises the load-bearing proof and verification path"
+   }
+  ],
+  "progress": null,
+  "summary": "The change is not sound as shipped. The MPC threshold result silently becomes a comparison over the sum modulo the field prime, and the ZK refusal path can label broad execution failures as proof that a false claim is unsatisfiable. In addition, the load-bearing browser proving path has no automated test despite the UI and documentation making strong claims about actual proof generation, verification, and public inputs.",
+  "verdict": "request_changes"
+ }
+}
