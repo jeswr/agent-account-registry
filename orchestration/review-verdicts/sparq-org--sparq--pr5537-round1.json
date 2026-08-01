@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5537,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "deb2ed890f58cb4688ffeae3f66dd1a7b92e33ba",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The vendored source declares each IRI only as an instance of sec-prop:SecurityProperty (itself a class of concepts). This patch additionally asserts owl:ObjectProperty for all three, yet repeatedly says it re-asserts the original declaration and \u2018refines nothing\u2019. Object-property typing is a new ontology assertion and is unnecessary for satisfying the secx:property range or the subject-presence guard. The test checks only SecurityProperty typing, so it does not justify this added semantic claim.",
+    "file": "crates/sparq-trust/ontologies/zkp-sparql/secprop-ext.ttl",
+    "fix_hint": "Declare each vendored subject only as `a sec-prop:SecurityProperty`, preserving the vendored semantics, and adjust the comments accordingly. If owl:ObjectProperty typing is genuinely required, document the intended ontology extension honestly and add a test/design justification that establishes why treating these vendored concept individuals as properties is sound.",
+    "severity": "major",
+    "title": "Vendored individuals are given an unvendored owl:ObjectProperty type"
+   },
+   {
+    "body": "This adds three `pub const` items and changes `ALL_SECPROP_IRIS`, which is a public API change. The repository maintenance rule requires the matching skill and crate README to be updated in the same change, but the diff contains neither. Consumers of the documented secprop-vocab surface therefore cannot discover the new registry entries from its maintained usage contract.",
+    "file": "crates/sparq-trust/src/secprop.rs",
+    "fix_hint": "Update the matching secprop-vocab documentation in `skills/access-control/SKILL.md` and the `sparq-trust` crate README in this PR to describe the three vendored dimension constants and their inclusion in `ALL_SECPROP_IRIS`.",
+    "severity": "major",
+    "title": "New public constants are not reflected in the matching usage documentation"
+   }
+  ],
+  "progress": null,
+  "summary": "The vendored IRIs and labels match the vendored YAML-LD, and the new test exercises subject/type presence through the real Turtle parser. However, the patch does more than the stated re-assertion: it newly classifies three vendored SecurityProperty individuals as owl:ObjectProperty values while claiming it refines nothing. It also adds public Rust constants without updating the documented public surface required by the repository maintenance rule.",
+  "verdict": "request_changes"
+ }
+}
