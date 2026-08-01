@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1500,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "118defb2caa2e57844802d540fa7a3cf61a42302",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The prior major finding is resolved. Cancelled runs are no longer treated solely by conclusion: only cancelled runs newer than the newest ingestion verdict are retained as candidates, and a lane clears only when a candidate's own measured, positive, non-boolean job count proves that GitHub created its job graph. Zero, missing, unreadable, malformed, stale, and unbound evidence all fail closed. The live wiring fetches those candidate job counts only for lanes whose newest verdict is a rejection, preserves string-key binding, caps work toward the conservative direction, and announces truncation. The added detector and live-path tests distinguish cancelled/zero, cancelled/nonzero, and cancelled/unreadable cases and exercise ordering, cutoff, binding, transport recovery, and production wiring without relying on the implementation constant for the cap fixture. The self-observation addition is also tightly bound to scheduled event, repository, direct workflow path, workflow identity, and newest sampled run id, with explicit refusal and end-to-end tests. I found no remaining correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
