@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5529,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6b8eba542da470e7ee92964ce870130a1c2757aa",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The prior-round finding remains unchanged. `env PATH=\"/nonexistent\" bash \"$SCRIPT\" ...` asks `env` to locate `bash` using the replaced PATH, so it returns 127 before build-guide.sh runs. The assertion therefore passes even if the builder's `command -v mdbook` guard is removed or broken.",
+    "file": "scripts/tests/test_build_guide.sh",
+    "fix_hint": "Resolve bash before replacing PATH (for example, capture `BASH_BIN=$(command -v bash)` and invoke `env PATH=/nonexistent \"$BASH_BIN\" \"$SCRIPT\" ...`). Also assert that stderr contains the builder's actionable `mdbook not found` diagnostic so the test proves the intended branch executed.",
+    "severity": "minor",
+    "title": "Missing-mdbook test still passes without executing the builder"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The production guide publishing path and its anti-drift checks remain coherent, but the prior round's minor test-validity defect is unchanged: the absent-mdbook case still replaces PATH before resolving bash, so it can pass without executing build-guide.sh. No blocker or major correctness, soundness, or security issue was found in the supplied diff.",
+  "verdict": "approve"
+ }
+}
