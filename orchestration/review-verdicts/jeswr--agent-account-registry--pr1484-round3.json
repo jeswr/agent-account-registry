@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1484,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4b8623c45cb65d87e0a6aee003b006cd82e4a428",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`repair_lane_owned` accepts a `dirty` pull from the target repository without inspecting `pull.head.sha`. Both `stale_worker_pr_reason` and `age_park_cause_recovered` therefore treat that pull as repair-lane-owned. But `enumerate_review_items` unconditionally rejects the pull at `if not SAFE_SHA.fullmatch(sha)` before reaching the conflict-first `needs-rebase` branch. A missing, non-string-normalized, short, or otherwise malformed live head SHA thus creates the same silent terminal stall: no new visible age park, or a standing park removed with its once-bounded grant spent, while dispatch emits nothing on every sweep. The integration fixture's `_rl_pull` always supplies `_rl_sha`, and the negative delivery matrix varies only the repository, so the test suite cannot expose this mismatch.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Make the shared entry/exit ownership proof require the same well-formed live head SHA that dispatch requires, failing closed when it is absent or malformed. Add paired negative tests that pass the identical same-repository dirty posture with missing and malformed `head.sha` through both groom decisions and the real enumerator; they should retain/keep the visible park while enumeration returns no item. Include the valid-SHA positive control for both new-park exemption and standing-park re-admission.",
+    "severity": "major",
+    "title": "Repair ownership still omits dispatch's terminal head-SHA gate"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 correctly closes the prior round's foreign/deleted-head-repository hole and adds strong exact-match, malformed-shape, park-entry, park-exit, and real-enumerator tests for that predicate. However, `repair_lane_owned` still proves only the merge state and head repository, while dispatch has another permanent shape gate before `needs-rebase`: the live head SHA must be a well-formed 40-hex value. A same-repository dirty PR with a missing or malformed `head.sha` is therefore exempted from a new age park, or consumes its bounded re-admission grant if already parked, but dispatch can never emit its repair item. The new delivery tests always provide a valid SHA, so they cannot detect this posture. This is a new major delivery-proof gap after the prior repository-specific finding was fixed, so progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
