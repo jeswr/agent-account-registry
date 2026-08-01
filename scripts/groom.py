@@ -9763,38 +9763,76 @@ def _self_test() -> int:
             ([{"e" * 32}], True, True, True),
         )
 
-        # (4) THE MASKING CONTRACT on the newly-widened path. GroomError is defined as never
-        # carrying a credential and always bounded, because it is only ever built through
-        # _masked_detail. An ARBITRARY exception has had no such treatment, and its text now
-        # reaches the operator log — so each widened handler routes it through the same contract.
-        # Drop `_masked_detail` from a handler and a token-shaped string leaks and a runaway
-        # message floods the log; both directions are asserted here.
+        # (4) THE MASKING CONTRACT, at EVERY ONE of the four widened handlers. GroomError is
+        # defined as never carrying a credential and always bounded, because it is only ever built
+        # through _masked_detail. An ARBITRARY exception has had no such treatment, and its text
+        # now reaches the operator log — so each widened handler routes it through
+        # _deferral_detail. That helper is SHARED, which is precisely why one scenario cannot
+        # stand for four: the residual defect is a WIRING defect. Put `str(exc)` back at ONE call
+        # site and the helper stays correct while that handler leaks arbitrary exception text —
+        # invisible to every boundary/continuation row above, whose refusals carry a short,
+        # single-line, non-secret message. So the leak is driven END TO END through each call
+        # site, one scenario per site, each asserted independently.
         def _raise_leaky() -> None:
             raise ValueError(
                 "malformed park receipt stamp\n(ghs_deferralleak87654321)\n" + "y" * 5000
             )
 
-        vd_masked_log, _vd_masked_error, _vd_masked_releases = _sweep_with_refusals(
-            {},
-            pulls=(_stale_worker_pr(31), _stale_worker_pr(32)),
-            side_effects={("GET", "/repos/owner/repo/pulls/31", 1): _raise_leaky},
-        )
-        vd_masked_alerts = [line for line in vd_masked_log.splitlines()
-                            if line.startswith("ALERT PR owner/repo#31:")]
-        check(
-            "#774: a non-GroomError's text goes through the SAME masking contract — credential "
-            "SHAPE masked, collapsed to ONE line, and BOUNDED (the raiser's message here is over "
-            "5000 characters and spans three lines)",
-            (
-                "ghs_deferralleak87654321" in vd_masked_log,
-                len(vd_masked_alerts),
-                vd_masked_alerts[0].startswith(
-                    "ALERT PR owner/repo#31: malformed park receipt stamp (***) yyy")
-                if vd_masked_alerts else "",
-                len(vd_masked_alerts[0]) < 500 if vd_masked_alerts else -1,
-            ),
-            (False, 1, True, True),
-        )
+        class _LeakyPages(dict):
+            """The comments read the age-unpark loop makes, raising the leaky failure.
+
+            The unpark loop reaches its handler through the page store rather than through a
+            request, so it is injected here instead of via `side_effects`."""
+
+            def get(self, key, default=None):
+                if key == "/repos/owner/repo/issues/33/comments":
+                    _raise_leaky()
+                return super().get(key, default)
+
+        def _leaky_unpark_log() -> str:
+            terminal_sweep_env["pages"] = _LeakyPages(_bot_park_timeline(33))
+            try:
+                return _sweep_with_refusals({}, pulls=(recovered_pr,))[0]
+            finally:
+                terminal_sweep_env["pages"] = {}
+
+        # The whole expected line is a LITERAL: no term of it is read from `_TOKEN_SHAPE`,
+        # `GH_DETAIL_LIMIT` or the raiser (AGENTS.md pre-flight item 2b/2c). Widening the mask,
+        # raising the bound or dropping the collapse each moves the emitted line away from this
+        # fixed string instead of moving the expectation along with the code. `y * 365` is the
+        # truncation the 400-character bound performs on a 5035-character message, and the
+        # trailing `…` is the marker that says truncation happened at all.
+        leaky_detail = "malformed park receipt stamp (***) " + "y" * 365 + "…"
+        for site, prefix, tail, run_leaky in (
+            ("stale-PR detection", "ALERT PR owner/repo#31:", "stale PR detection deferred",
+             lambda: _sweep_with_refusals(
+                 {}, pulls=(_stale_worker_pr(31), _stale_worker_pr(32)),
+                 side_effects={("GET", "/repos/owner/repo/pulls/31", 1): _raise_leaky})[0]),
+            ("issue status repair", "ALERT issue owner/repo#41:", "status repair deferred",
+             lambda: _sweep_with_refusals(
+                 {}, issues=(_repairable_issue(41), _repairable_issue(42)),
+                 side_effects={
+                     ("POST", "/repos/owner/repo/issues/41/labels", 1): _raise_leaky})[0]),
+            ("stale-PR hand-off", "ALERT PR owner/repo#31:", "stale PR hand-off deferred",
+             lambda: _sweep_with_refusals(
+                 {}, pulls=(_stale_worker_pr(31), _stale_worker_pr(32)),
+                 side_effects={
+                     ("POST", "/repos/owner/repo/issues/31/labels", 1): _raise_leaky})[0]),
+            ("age un-park", "ALERT PR owner/repo#33:", "age un-park deferred", _leaky_unpark_log),
+        ):
+            leaky_log = run_leaky()
+            check(
+                f"#774 ({site}): THIS handler's deferral goes through the masking contract — "
+                "credential SHAPE masked, collapsed to ONE line, truncated at the bound (the "
+                "raiser's message spans three lines and is over 5000 characters). Wire this one "
+                "call site back to `str(exc)`, leaving the shared helper untouched, and the raw "
+                "token, both newlines and all 5000 characters reach the operator log",
+                (
+                    "ghs_deferralleak87654321" in leaky_log,
+                    [line for line in leaky_log.splitlines() if line.startswith(prefix)],
+                ),
+                (False, [f"{prefix} {leaky_detail} — {tail}"]),
+            )
 
         # ---- issue #649: the THREE residual head-of-line aborts, END TO END --------------------
         # #648 closed every loop whose fix was #644's mechanical record-and-continue. These three
