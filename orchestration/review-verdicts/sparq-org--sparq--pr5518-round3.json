@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5518,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4616836e7166ad46fadd6a077b17fc55716526f3",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The text still claims that nothing else in the tree pulls a Radix primitive. The script only proves that every installed @radix-ui package belongs to the radix-ui barrel's transitive closure; it does not prove that another lockfile package cannot also depend on one of those same packages. This does not affect the closure sizes or the used-versus-unused artifact-byte calculation.",
+    "file": "research/nextjs-optimize-package-imports-radix-upstream.md",
+    "fix_hint": "Remove the exclusivity claim, or extend the reproduction to scan dependency edges from all lockfile package entries and report non-barrel reverse dependents. Keep the exact-set assertion as evidence that the barrel accounts for every installed @radix-ui package.",
+    "severity": "minor",
+    "title": "Closure equality still does not establish exclusive dependency provenance"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-2 minor finding remains unchanged: the reproduction proves that the barrel closure equals the installed @radix-ui package set, but it does not inspect reverse dependency edges and therefore cannot establish the stronger claim that nothing else in the tree pulls a Radix primitive. This wording overreach does not undermine the measured closure sizes, byte partition, or upstream recommendation. No correctness, soundness, test-validity, or security issue requiring changes was found.",
+  "verdict": "approve"
+ }
+}
