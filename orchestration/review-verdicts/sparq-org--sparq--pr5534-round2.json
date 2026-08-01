@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5534,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "08c06916d2e8c6e6b5176c25fe363724866db4c4",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains sound on the supplied diff. The lower bound is derived from completed scheduled runs' job lists rather than the lossy run aggregate; qualifying runs require positive shard coverage, success for every observed full-matrix shard, and no genuine job failure. Rejected-run health, persistent failures, stale-backstop horizon fallback, and cold-start behavior are explicit. Tests exercise the classifier and real command construction for accepted cancelled aggregates, genuine failures, cancelled/skipped/missing shards, newest-bound selection, stale horizon selection, cold start, and report-only mode. No correctness, security, or vacuous-test issue is apparent. Findings are unchanged from round 1 (none), so progress is stagnant by the required scale.",
+  "verdict": "approve"
+ }
+}
