@@ -43,12 +43,12 @@
   {
    "account": "9e13ea21abf27e68",
    "claim_id": "5802a30b0e9747b7847800acead5c3ec",
-   "holder": "sparq-org/sparq#3455@dispatch-30679982629.1",
+   "holder": "sparq-org/sparq#3455@30680148593.1",
    "package": "sparq-canon",
    "role": "impl",
    "model": "opus5",
-   "issued_at": 1785551425,
-   "expires_at": 1785557725
+   "issued_at": 1785551465,
+   "expires_at": 1785557765
   },
   {
    "account": "dc2d751954080e13",
