@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5595,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d045f8a0ef7ec9732941893fd1ea325c3ed5bc34",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly replaces the two production secret-scalar multiplications with a fixed-width, always-add ladder while preserving an appropriately narrow and honest security claim: arkworks field operations remain unasserted constant-time, no timing measurement is claimed, and external audit remains pending. The arithmetic selection yields either the supplied affine point or the Edwards identity, the loop covers the scalar field's fixed modulus width, and the implementation scrubs its temporary scalar-byte copy. The focused tests are non-vacuous: they differentially compare edge and randomized scalars on generator and non-generator bases against arkworks, pin the high-bit width and zero identity case, and verify both production call sites retain exact key/signature values. Documentation and the audit register consistently describe the remediation as partial. I could not execute the test because cargo is unavailable in this checkout environment, but found no correctness, soundness, or security defect in the diff-scoped evidence.",
+  "verdict": "approve"
+ }
+}
