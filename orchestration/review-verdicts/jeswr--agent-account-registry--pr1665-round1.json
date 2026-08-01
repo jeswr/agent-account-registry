@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1665,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "583e9f1a72f3a82a860d22b0d19930885c4a96c0",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`claims_about_the_route` only searches for `can write there`, `can write to`, `write access`, `able to write`, and `may write there`, with `ALERT_TOKEN` required only before the phrase. Reintroducing the same false contract as, for example, `ALERT_TOKEN is authorized to create issues in ALERT_REPO` or `ALERT_TOKEN has permission to write there` produces `[]` and leaves the census green. A claim with the capability phrase before `ALERT_TOKEN` is also missed. Thus the assertion advertised as reding the file whenever the stronger claim reappears does not test the semantic property and can pass on the wrong answer. The identical detector is copied into the other changed alert scripts, so their local rows share the hole.",
+    "file": "scripts/metrics-alert.py",
+    "fix_hint": "Replace the open-ended semantic promise with an enforceable canonical contract: centralize the allowed route description (or an exact canonical marker/text) and assert each consumer uses it, while separately testing router behavior. If a banned-language detector remains, cover capability synonyms and both token/claim orders with red fixtures; do not claim it detects every stronger statement unless that scope is mechanically enforceable. Apply the corrected guard consistently to every changed copy.",
+    "severity": "major",
+    "title": "The prose guard misses equivalent write-capability claims"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe edited prose accurately distinguishes presence-only routing from the hardened visibility check, but the new prose regression test is not sound enough to enforce its stated contract. It detects only five hard-coded phrases and therefore remains green for ordinary equivalent claims that again promise write capability. Because preventing that stronger claim from returning is the principal tested guarantee of this change, this is a major, non-vacuity defect. Round 1, so progress is null.",
+  "verdict": "request_changes"
+ }
+}
