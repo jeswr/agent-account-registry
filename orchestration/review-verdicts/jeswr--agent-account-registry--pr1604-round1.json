@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1604,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3a07c282c00f62c4ae2445904d907a7543473e22",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe notice now names the repository's actual approval mechanism: removal of `trust:untrusted` by a write-capable maintainer. That wording agrees with the existing actor-bound, fail-closed quarantine decision and accurately warns that an unauthorized label removal is restored. The marker and first-line layout used for authentic de-duplication are unchanged. The added self-test independently requires an explicit label-removal instruction and rejects both the obsolete reaction wording and emoji, so neither deleting all approval guidance nor retaining the misleading affordance passes. No trust check, routing rule, workflow permission, or untrusted-text execution surface is weakened.",
+  "verdict": "approve"
+ }
+}
