@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5661,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "172e7eac5fc9a7104f8a8f2c772ce3305bfec93e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The workflow-inventory test is non-vacuous, imports the existing top-level `on:` parser, checks exact set equality for currently triggering workflows, and soundly checks every documented removed lane against the live trigger set. The updated documentation matches the tested inventory and clearly distinguishes structural trigger presence from operational enablement (CodeQL) and historical duration measurements. The focused test passes at the PR head, and no correctness, soundness, test-validity, or security defect was found.",
+  "verdict": "approve"
+ }
+}
