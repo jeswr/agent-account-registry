@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5253,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "23bf0e73ce625399d3f57b32532c868178269b16",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The job fetches and merges the current base only during an existing pull_request run. A subsequent merge to the base branch does not trigger this workflow for the open PR, so the completed green `premerge-c1` check remains green without evaluating the new base. Example: the job passes for head H against base B1; afterward B2 lands and cleanly combines with H into a C1-invalid tree; no PR event reruns this job, so it still reports success. This is the same stale-check lifecycle described in the rationale, merely with a smaller timing window. The merge_group backstop may catch it, but the claimed pre-queue PR verdict is not established.",
+    "file": ".github/workflows/feature-matrix.yml",
+    "fix_hint": "Add a mechanism that actually reevaluates open PRs when the base changes, or move/enforce this invariant on a ref/event whose SHA necessarily includes the latest base (such as the merge_group result). If GitHub's event model cannot provide a reliable pre-queue check, narrow the job's claim and do not treat its old success as proof about the current merge candidate. Add a test of the event/lifecycle wiring rather than only checking YAML substrings.",
+    "severity": "major",
+    "title": "Guard remains stale when the base advances after this job finishes"
+   }
+  ],
+  "progress": null,
+  "summary": "The new job does test against the base tip as of job execution, but it does not solve the stated stale-green condition: GitHub does not rerun this pull_request workflow when the base advances after the job has completed. Consequently its successful check can remain attached to the PR while newer base commits create exactly the clean-merge C1 violation this job is intended to catch. The added tests only assert static YAML substrings and do not cover that lifecycle gap.",
+  "verdict": "request_changes"
+ }
+}
