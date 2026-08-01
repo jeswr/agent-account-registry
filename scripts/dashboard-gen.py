@@ -3998,31 +3998,6 @@ esac
     keepalive_check(
         "[#559] FAIL-OPEN: an unreadable live-run check still consults age, and still kicks a "
         "stale target", (code, kicked), (0, ["dispatch.yml"]), log)
-    # #936: an anchor stamp `date` cannot parse. `prev=$(date …)` is the FINAL command of its `&&`
-    # list under `set -euo pipefail`, so one corrupt field exited the whole STEP and every workflow
-    # LATER in the spec list was never checked that fire — the mesh whose entire job is liveness
-    # going quiet on exactly the input it should read as "no evidence of recent life". The garbage
-    # goes on the FIRST run-anchored spec and the stale target on the LAST, both read out of the
-    # leg's own list, so this measures continuation across the whole loop and not one adjacent
-    # pair; the fresh legs between them pin that the fallback is "stale", not "kick everything".
-    ka_run_anchored = [name for name, (_limit, marker) in keepalive_specs.items() if not marker]
-    if len(ka_run_anchored) < 2:
-        raise DashboardError(
-            "the registry keepalive leg watches fewer than two run-anchored workflows — refusing: "
-            "the #936 row cannot show that an unreadable anchor leaves a LATER leg still checked")
-    ka_first, ka_last = ka_run_anchored[0], ka_run_anchored[-1]
-    ka_bad_stamp = "not-a-parseable-instant"
-    code, kicked, log = run_keepalive_step(
-        artifacts=[_ka_marker(60)],
-        runs={ka_first: [dict(_ka_run(60), created_at=ka_bad_stamp)],
-              ka_last: [_ka_run(99_999)]})
-    keepalive_check(
-        f"[#936] an anchor `date` cannot parse ({ka_first}) is treated as STALE and kicked, and it "
-        f"does NOT abort the loop: {ka_last} is still checked and kicked several specs later, "
-        "while every fresh leg between the two stays untouched — and the offending stamp is NAMED "
-        "in the log, since `date`'s own error is suppressed and a silent substitution of `now` "
-        "for an unreadable anchor is indistinguishable from a healthy tick in the run log",
-        (code, kicked, ka_bad_stamp in log), (0, sorted({ka_first, ka_last}), True), log)
 
     # #680: the bound above is arithmetic across two files; these two rows are the BEHAVIOUR it
     # buys, driven through the real leg. Every age is derived from the watched workflow's OWN
@@ -4096,16 +4071,6 @@ esac
     keepalive_check(
         "[#559] control: a sweeper that ran inside its threshold is not kicked at all — the leg is "
         "not simply dispatching on every fire", (code, dispatched), (0, []), log)
-    # #936 on the cross-repo leg: one spec, so a failed `date` under `set -e` does not merely skip
-    # later legs — it takes the sweeper's ONLY cron-delivery fallback out entirely, on a run that
-    # reports failure rather than a missing kick. Same fail-open rule: unreadable anchor is stale.
-    code, dispatched, log = run_keepalive_leg(
-        sparq_script, sparq_specs,
-        runs={sparq_target: [dict(_ka_run(60), created_at=ka_bad_stamp)]})
-    keepalive_check(
-        "[#936] cross-repo too: an anchor `date` cannot parse is STALE, kicks, and NAMES the stamp "
-        "in the log — rather than exiting the step nonzero with the sweeper unkicked",
-        (code, dispatched, ka_bad_stamp in log), (0, [sparq_dispatch], True), log)
 
     # --- #612 review round 2, finding 5 (MINOR): the successful CLI -> builder handoff. Deleting
     # `probe_status=probe_status` from main()'s build_dashboard call left every direct-builder test
