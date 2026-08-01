@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5501,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9586f45ca77ada023ab1778e74df2b95efe12bb2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is internally consistent and fail-closed as scoped. P-384 dispatch resolves the curve profile before selecting SHA-384, uses the matching RustCrypto verifier, and is pinned by both published W3C vectors and negative cross-profile/tamper tests. The JSON-LD envelope removes proofValue, copies the document context onto the proof configuration, restricts remote context loading to the caller-provided map, rejects named graphs and proof arrays, and delegates to the existing RDF-native verifier. Public API documentation and the relevant ZK design/audit posture remain explicit that this is off-circuit, caller-keyed, not externally audited, and does not establish an in-circuit property. No hostile reviewer-directed instruction was found in the diff.",
+  "verdict": "approve"
+ }
+}
