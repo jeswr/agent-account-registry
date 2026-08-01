@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1548,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b22f08f47a37fd920f0892cb24fffe392ad77c14",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The diff only removes hard-coded model identity markers from comments and docstrings, preserving all executable code, tests, workflow behavior, and trust controls byte-for-byte apart from those comments. This is complete and consistent with model-agnostic SPARQ identity requirements. No hostile reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
