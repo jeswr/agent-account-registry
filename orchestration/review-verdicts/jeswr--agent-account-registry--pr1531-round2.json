@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1531,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "32723f576e0e53503bb7ee8b03eede31d75e5454",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change remains correct and complete under the adversarial trust-plane lens. All three routes select ALERT_REPO only after a token-scoped GET positively returns a literal boolean `private: true`; failed, raising, malformed, public, non-boolean, same-repository, and half-configured cases do not inherit private-route status. The standalone scripts fall back under the ambient registry credential, while worker-pr preserves its established registry-alert credential semantics and avoids propagating probe failures through the alerting path. The self-tests independently exercise the routing decisions, probe repository/token binding, no-probe short circuits, strict response parsing, and production alert-create wiring. I found no diff-supported correctness, security, injection, or test-vacuity issue requiring changes.",
+  "verdict": "approve"
+ }
+}
