@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5542,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "36ffd3acb6b382793b9d0f053d36532146d76f01",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 finds no correctness, soundness, test-validity, or security regression. The implementation remains fail-closed at construction: selection indices and duplicate assignments are validated, envelope participation must exactly equal assigned sources, routing/envelope operator facts are cross-checked, and hidden operators cannot carry disclosed operands. Revalidation compares all committed semantic fields and has a digest-mismatch catch-all. The real-pipeline tests exercise omitted and extra participants, hidden-operand mutation, dropped sources including a trailing pattern, rerouting, and digest tampering. Documentation consistently limits the feature to canonicality/transcript integrity, explicitly denies cryptographic soundness or privacy, identifies the semi-honest and unaudited posture, and keeps proof binding deferred on the named audit gates. With the prior round also clean, progress is stagnant by the mandated scale (materially the same zero findings), not a negative quality judgment.",
+  "verdict": "approve"
+ }
+}
