@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1550,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "df7b7d1f318bd9337416dadd3268d96ee754e691",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_agent_from_role_flag` validates only that the value is a boolean, then returns it. Consequently, a match-label route containing `agent_from_role = false` is accepted and behaves exactly as if the declaration were absent. The new README contract says that anything but boolean `true` fails closed, and the implementation comments describe the option as an explicit declaration; accepting `false` creates the same inert-declaration hazard that the code correctly rejects on role/default tables. The PLAN resolver mirrors this acceptance, so cross-resolver agreement remains green and cannot detect a maintainer typo or an incorrectly generated value. The self-tests cover strings, integers, lists, and null, but omit the only value-identical survivor: `False`.",
+    "file": "scripts/policy-resolve.py",
+    "fix_hint": "When the key is present on an allowed match-label route, require its value to be exactly `True`; reject explicit `False` in both `policy-resolve.py` and `route-resolve.py`. Add red tests for `agent_from_role = false` to both resolver self-tests and the cross-resolver malformed-declaration checks. If explicit false is intentionally supported, revise all fail-closed documentation and add a non-vacuous test that pins that alternative contract.",
+    "severity": "major",
+    "title": "Explicit `agent_from_role = false` is silently accepted instead of failing closed"
+   }
+  ],
+  "progress": null,
+  "summary": "The role-directed persona design is implemented consistently across PLAN and CLAIM for `true`, and the worker seam is guarded by the declared fix capability. However, the new declaration is not fail-closed according to its own documented contract: an explicit boolean `false` is accepted as a silent no-op even though the README and code comments say anything other than boolean `true` must be rejected. Because this is trust-plane configuration and both resolvers currently agree on accepting the inert value, the agreement gate will not expose the mistake.",
+  "verdict": "request_changes"
+ }
+}
