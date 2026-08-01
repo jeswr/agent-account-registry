@@ -24,10 +24,17 @@ removes it after the design pass, then the retriage path promotes.
 
 THE ROLE INVARIANT (registry #582 / #225 — a LIVE defect, not a hypothetical):
     An issue must NEVER leave triage with `status:ready` and no `role:*` label.
-A role-less `status:ready` issue is SILENTLY UNDISPATCHABLE and TERMINAL: ready-issues.py requires
-`role:*` for readiness (`has_role`), so the dispatcher never sees it; retriage.py only reconsiders
-`status:untriaged` issues, so it never sees it either; curate/groom skip it for their own reasons.
-Nothing recovers it — it has to be repaired by hand.
+A role-less `status:ready` issue is SILENTLY UNDISPATCHABLE: ready-issues.py requires `role:*` for
+readiness (`has_role`), so the dispatcher never sees it, and curate/groom skip it for their own
+reasons. Since #586 it is no longer TERMINAL — retriage.py's sweep is BIDIRECTIONAL, boarding
+`status:ready` issues as well as `status:untriaged` ones, and this is exactly its REPAIR lane: the
+classifier re-derives the lost `role:*` and the applier writes it back in place (or, when the drift
+does not restore enumerability, RE-PARKS the issue to `status:untriaged` so the promotion lane
+re-admits it on label restore). That recovery is a scheduled tick away and CONDITIONAL — the
+role must exist in the target repo's LIVE label set (#582/#510), and retriage skips every
+`needs:*`/`trust:untrusted`-gated, held, claim-owned, `status:deferred`, machine-parked or epic
+issue BEFORE it classifies. So the invariant stays triage's to hold: never emit the state and leave
+the sweep to clean it up.
 
 The live defect that motivated this module's fail-closed machinery: the role transition emitted
 `role:soundness` for trust-plane keyword matches, a label that DOES NOT EXIST in this repository's
@@ -540,6 +547,100 @@ def triage(labels, issue_type=DEFAULT_ISSUE_TYPE, trusted=True, known_labels=Non
 
 
 # ---------------------------------------------------------------------------------------------------
+# THE LABEL-VOCABULARY DRIFT GUARD (#582 acceptance 4) — a STANDING check, not a per-issue one.
+#
+# Everything above is per-ISSUE and REACTIVE: `triage()` refuses to strip a role for a replacement
+# the repo does not define, `retriage.validate_labels` drops an unknown suggestion before the write,
+# and `apply_triage` repairs a violated post-condition. Each fires only once an issue has already
+# reached the hole, one issue at a time, and only for the labels THAT issue's plan happens to name.
+# None of them can answer the question #582 actually asked: *can this planner emit a label this
+# repository does not define at all?* `role:soundness` was emittable for months — by every
+# trust-plane area, i.e. the whole orchestration surface — and nothing said so until issues had
+# already been stranded role-less and ready.
+#
+# So the vocabulary is CERTIFIED against the repository's live label set on a schedule
+# (`.github/workflows/retriage.yml`, job `label-drift`), independently of whether any issue is
+# being triaged. It fails closed in both directions: an emittable label the repo does not define
+# is a non-zero exit with the label NAMED, and an EMPTY/unreadable repo label set is also a
+# non-zero exit — "I could not read the label set" must never read as "no drift".
+#
+# COMPUTED FROM THE DERIVATION TABLES, never from a hand-listed literal: the whole point is that
+# re-pointing a table at a new role (the #582 edit that would flip TRUST_PLANE_ROLE to
+# `"soundness"`) moves this set with it, so the guard sees the new label the moment the code can
+# emit it — before an issue does. The self-test proves that by re-pointing a table and asserting
+# the drift report follows.
+
+def derivable_roles():
+    """Every role VALUE `_role` can return — the union of EVERY rung of its derivation ladder.
+
+    A rung missing here is a role label this guard would never certify, so each is taken from the
+    table the ladder actually reads: the trust-plane constant, the kind map, the type map, the
+    UI/infra surface lanes (evaluated through `_role` itself, since those lanes derive rather than
+    map), and the #225 area defaults.
+    """
+    roles = ({TRUST_PLANE_ROLE} | set(ROLE_BY_KIND.values()) | set(ROLE_BY_TYPE.values())
+             | set(AREA_ROLE_DEFAULT.values())
+             | {_role([label], "") for label in UI_SURFACE_LABELS + INFRA_SURFACE_LABELS})
+    return {role for role in roles if role}
+
+
+# The non-role labels the triage SURFACE writes. `status:ready`/`status:untriaged` are the two lane
+# attestations, `needs:area` is the park, `DERIVED_PRIORITY` is the floor (sparq#4809) — all four
+# planned by `triage()` — and `trust:untrusted` is written by triage-issue.yml's quarantine step,
+# which is part of the same surface and fails its own post-read if the label does not exist. The
+# self-test cross-checks this tuple against BOTH producers: the labels `triage()` really plans over
+# a branch-covering corpus, and the `--add-label` tokens in the workflow's quarantine step.
+NON_ROLE_VOCABULARY = ("status:ready", "status:untriaged", "needs:area", DERIVED_PRIORITY,
+                       "trust:untrusted")
+
+
+class LabelVocabularyError(RuntimeError):
+    """The planner's vocabulary could not be certified — e.g. an empty/unreadable repo label set."""
+
+
+def emittable_labels():
+    """EVERY label the triage surface can write, derived from the tables it writes from."""
+    return frozenset({f"{ROLE_PREFIX}{role}" for role in derivable_roles()}
+                     | set(NON_ROLE_VOCABULARY))
+
+
+def label_drift(known_labels):
+    """The emittable labels the repository does NOT define, sorted. Fail-closed on an empty set.
+
+    An empty `known_labels` is the shape a failed/garbled label-set read produces, and it would
+    otherwise report EVERY label as drifted or (worse, if inverted) nothing at all. It raises
+    instead, so the caller cannot mistake an unread label set for a clean one.
+    """
+    known = set(known_labels)
+    if not known:
+        raise LabelVocabularyError(
+            "the repository label set is EMPTY or unreadable — refusing to certify the triage "
+            "vocabulary against nothing (registry #582)")
+    return sorted(emittable_labels() - known)
+
+
+def _label_drift_cli(known_labels):
+    """`--label-drift`: certify the vocabulary against a repo label set. 0 clean, 1 drifted."""
+    vocabulary = sorted(emittable_labels())
+    try:
+        missing = label_drift(known_labels)
+    except LabelVocabularyError as exc:
+        print(f"::error title=triage label drift::{exc}")
+        return 1
+    # The census emits on EVERY run, including the healthy zero row (AGENTS.md pre-flight 8): a
+    # guard that is silent when clean gives an operator no way to tell "certified" from "never ran".
+    print(f"triage label vocabulary: {len(vocabulary)} emittable labels checked against "
+          f"{len(set(known_labels))} repository labels; missing={len(missing)}")
+    if missing:
+        print(f"::error title=triage label drift::the triage planner can emit "
+              f"{len(missing)} label(s) this repository does not define: {', '.join(missing)} — "
+              "create them or fix the derivation tables in scripts/triage.py; an issue triaged "
+              "with one of these lands mislabelled or role-less-and-ready (registry #582)")
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------------
 # QUARANTINE AUTHORIZATION — who may clear `trust:untrusted` (#607; PR #998 round 1 finding 1).
 #
 # `triage-issue.yml` fires on label events (#607) so a lost triage label is reclassified at the
@@ -595,6 +696,118 @@ def quarantine_required(action, author_trusted, actor_trusted):
 
 # ---------------------------------------------------------------------------------------------------
 # LIVE APPLICATION — the fail-closed, order-controlled mutation (#582).
+#
+# THE UNKNOWN-LABEL REDUCTION IS DEFINED ONCE, HERE (registry #1490), and BOTH appliers on this
+# surface run it: `triage.py --apply` below and `retriage.py --apply`, whose `validate_labels` /
+# `drop_is_safe` are now thin action-shape adapters over these two functions. It shipped for
+# retriage first (registry #510); `triage.py --apply` validated only the target `role:*` (#582) and
+# sent `status:ready`, `status:untriaged`, `needs:area` and the derived `priority:P4` floor to the
+# API unchecked. Copying the reduction into a second applier is the #958 shape — two definitions,
+# one of which silently stops matching the other — so it moved here instead, to the module retriage
+# already imports (the dependency runs retriage -> triage; the reverse would be a cycle).
+
+# The two lane attestations every applier on this surface moves an issue between. Exactly one of
+# them must survive ANY write: an issue on NEITHER lane is invisible to the readiness engine AND to
+# retriage's own board queries, i.e. terminally stranded. `retriage.LANE_LABELS` IS this object.
+LANE_LABELS = frozenset({"status:ready", "status:untriaged"})
+# The verdict a plan is downgraded to when its unknown-label reduction cannot be applied safely.
+# One spelling, read by both appliers' logs and by retriage's `skip` reason.
+UNSAFE_DROP_REASON = "unknown-label-unsafe-drop"
+
+
+def validate_plan(plan, known_labels):
+    """Reduce a planned write to the labels the target repo ACTUALLY has. Returns (plan, dropped).
+
+    `plan` is any mapping carrying `add` / `remove` / `role` — a `triage()` result or a
+    `retriage.plan()` decision. GitHub fails the WHOLE `gh issue edit` when any single
+    `--add-label` names a label the repository does not define, so one unknown suggestion loses the
+    entire mutation — the add-first role verification included — exits the applier 1, and re-trips
+    identically on every following tick because nothing about the issue has changed (measured: run
+    29883925637, `'role:soundness' not found`, cleared only by a manual relabel). Validating here,
+    against the label set the run already fetched once, converts that permanent red run into a
+    named, per-label log line.
+
+    WHAT IS VALIDATED, and what deliberately is not:
+      * `add` — every label, because each one is an API-level CREATE-OR-FAIL of the whole edit.
+      * the intended `role` — validated even though it is usually already in `add`, because
+        `apply_triage` writes the target INDEPENDENTLY of `add` (its add-before-strip phase 1 fires
+        whenever the target is not already on the issue). Dropping it here also withdraws every
+        `role:*` STRIP from the plan: that is #582's rule read from the other side — an incumbent
+        role is never stripped for a replacement this run has refused to write.
+      * `remove` is NOT validated. Removals are drawn from the issue's own live label set
+        (`triage()` intersects them with it), and a label ON an issue exists in the repository by
+        construction; filtering removals could only ever fail to strip something that must go.
+
+    `known_labels is None` means "label set unknown" and validates nothing — the same contract
+    `triage(known_labels=...)` uses. Neither applier passes None (both fall back to a live
+    `repo_label_set` read), so the tolerance exists for direct/plan-only callers.
+    """
+    if known_labels is None:
+        return plan, []
+    known = set(known_labels)
+    add = list(plan.get("add", ()))
+    remove = list(plan.get("remove", ()))
+    role = plan.get("role")
+    target = f"{ROLE_PREFIX}{role}" if role else None
+    unknown_target = bool(target) and target not in known
+    dropped = sorted({label for label in add if label not in known}
+                     | ({target} if unknown_target else set()))
+    if not dropped:
+        return plan, []
+    reduced = dict(plan)
+    reduced["add"] = sorted(label for label in add if label in known)
+    if unknown_target:
+        reduced["role"] = None
+        reduced["remove"] = sorted(label for label in remove
+                                   if not label.startswith(ROLE_PREFIX))
+    else:
+        reduced["remove"] = sorted(remove)
+    return reduced, dropped
+
+
+def reduced_write_is_safe(plan, live_labels, issue_type, known_labels, attests_ready):
+    """Is a plan REDUCED by `validate_plan` still the transition it claims to be?
+
+    "Drop the unknown label and apply the rest" is only safe while the rest still stands on its
+    own, and for this classifier it frequently does not — every label it suggests is load-bearing
+    for the verdict that produced it. The measured case: an unprioritised issue is ready only
+    BECAUSE the derived `priority:P4` floor makes it triage-complete. Write `status:ready` without
+    that floor and the post-state is a ready issue with no readable priority, which
+    `derive_priority` declines to floor a second time (`ready-attested-regression`, the #586 lane)
+    — so the very next tick re-parks it, the tick after that promotes it again, and the surface
+    oscillates with two writes forever. Refusing is strictly better AND agrees with the classifier:
+    without the label the issue is not triage-complete, and the correct action for an incomplete
+    issue is to leave it parked.
+
+    `attests_ready` is what the plan CLAIMS: `triage()`'s own `ready` verdict for `triage.py
+    --apply`, and `action != "repark"` for retriage — the same conversion retriage's
+    `_decision_to_result` already makes when it hands a decision to `apply_triage`.
+
+    Two named invariants, checked against the post-state the REDUCED write would produce:
+
+      * LANE — exactly one of `status:ready` / `status:untriaged` survives. A half-applied status
+        transition (the attestation dropped, its opposite still stripped) puts the issue on NEITHER
+        lane, where the readiness engine cannot see it and retriage's board queries cannot select
+        it again: terminal, and precisely the stranding #586 exists to undo.
+      * PREMISE — a plan that ATTESTS `status:ready` must still classify READY without the dropped
+        labels. A park attests nothing, so it needs only to land on the park lane, from which the
+        promotion lane re-admits it the moment the label set is fixed.
+
+    Fail-closed: a classifier that raises here means the premise is unproven, which is a refusal.
+    """
+    post = (set(live_labels) | set(plan.get("add", ()))) - set(plan.get("remove", ()))
+    lanes = post & LANE_LABELS
+    if len(lanes) != 1:
+        return False
+    if not attests_ready:
+        return "status:untriaged" in lanes
+    if "status:ready" not in lanes:
+        return False
+    try:
+        return bool(triage(post, issue_type, trusted=True, known_labels=known_labels)["ready"])
+    except Exception:                                     # noqa: BLE001 — unproven means refused
+        return False
+
 
 def apply_triage(current, result, edit, view, warn=None, read_state=None):
     """Apply a triage `result` to a live issue FAIL-CLOSED. Returns {"ok":bool,"warnings":[...]}.
@@ -620,9 +833,15 @@ def apply_triage(current, result, edit, view, warn=None, read_state=None):
         restores the incumbent role; an AMBIGUOUS role set (e.g. a concurrent actor injecting
         `role:ci` during a docs->impl transition) is repaired down to the single intended role. If
         the intended role cannot be determined safely — or the repair does not land — `status:ready`
-        is DEMOTED to `status:untriaged` so retriage (which only revisits `status:untriaged`) owns
-        the issue. An ambiguous `status:ready` issue is otherwise terminal: route-resolve rejects it
-        (AmbiguousRoleError), ready-issues keeps it ready, and retriage never looks at it.
+        is DEMOTED to `status:untriaged`, the lane retriage's PROMOTION direction owns and the
+        safest landing state. The demotion is still load-bearing after #586 made the sweep
+        bidirectional, because the `status:ready` direction deliberately does NOT recover THIS
+        issue: retriage composes `ready-issues.exclusion_reason` with the classifier, `has_role`
+        passes on ANY `role:*` so the exclusion predicate sees nothing wrong, and both authorities
+        agreeing is a `ready-consistent` skip (collapsing an ambiguous role set is this module's
+        own event-driven lane, by retriage's docstring). Left ready, the issue is dropped by
+        `routing_refusal` and rejected by route-resolve (AmbiguousRoleError) — attributably, since
+        #122/#586, but never repaired. Demoting is what puts it back on a lane that recovers it.
     ok=False is returned on every violation, so the caller's exit status turns the workflow RED.
     """
     warns = list(result.get("warnings", ()))
@@ -837,6 +1056,31 @@ def _apply_cli(repo, number, issue_type):
     except RoleInvariantError as exc:
         print(f"::error title=triage #{number}::{exc}")
         return 1
+    # registry #1490: the LAST gate before the API, and the one `retriage.py --apply` has run since
+    # #510. `triage()` above refuses to DERIVE a `role:*` this repo lacks (#582) — but that is one
+    # label family out of several, and `status:ready`, `status:untriaged`, `needs:area` and the
+    # derived `priority:P4` floor all reached `gh issue edit` unchecked. One missing taxonomy label
+    # therefore lost the WHOLE edit, turned this workflow red for the issue, and re-tripped on
+    # every subsequent issue event. The scheduled `label-drift` job makes such a label visible; this
+    # is what the per-issue applier does when one is already missing.
+    result, dropped = validate_plan(result, known)
+    for label in dropped:
+        print(f"::warning title=triage #{number}::classifier suggested unknown label {label} — "
+              f"dropped (it does not exist in {repo}'s label set, and GitHub fails the WHOLE label "
+              f"edit on one unknown name; registry #1490)")
+    if dropped and not reduced_write_is_safe(result, current, issue_type, known,
+                                             attests_ready=result["ready"]):
+        # Applying what survives would strand or oscillate the issue (see reduced_write_is_safe):
+        # write NOTHING this tick. Deliberately NOT an error exit — a repository missing one of its
+        # own taxonomy labels is a config defect the `label-drift` job names, not a reason to redden
+        # every issue event forever, and a red run is exactly what registry #510/#1490 exist to end.
+        print(f"::warning title=triage #{number}::the plan depended on {', '.join(dropped)}; "
+              f"applying only the labels that survive would leave the issue worse, so this tick "
+              f"writes NOTHING (registry #1490 — a no-op with a log, not a red run). Create the "
+              f"missing label(s) to unblock it")
+        print(f"triage #{number}: role={result['role']} ready={result['ready']} "
+              f"add=[] remove=[] dropped={dropped} {UNSAFE_DROP_REASON}")
+        return 0
     outcome = apply_triage(current, result, edit, view, warn, read_state=read_state)
     print(f"triage #{number}: role={result['role']} ready={result['ready']} "
           f"add={sorted(result['add'])} remove={sorted(result['remove'])}")
@@ -1592,10 +1836,195 @@ def _self_test():
          f"role:{TRUST_PLANE_ROLE}" in buffer.getvalue()), (0, True, True))
 
     # -----------------------------------------------------------------------------------------------
+    # [registry #1490] `--apply` VALIDATES EVERY LABEL IT WRITES, NOT JUST THE ROLE.
+    # `triage()` refuses to DERIVE a `role:*` this repo lacks (#582) — but that is ONE label family.
+    # `status:ready`, `status:untriaged`, `needs:area` and the derived `priority:P4` floor reached
+    # `gh issue edit` unchecked, and GitHub fails the WHOLE edit on a single unknown `--add-label`:
+    # one missing taxonomy label therefore reddened triage-issue.yml for that issue and
+    # re-tripped on every subsequent issue event — exactly the recurrence #510 measured on the
+    # retriage side. The reduction is now ONE implementation — `validate_plan` +
+    # `reduced_write_is_safe` — and BOTH appliers run it (`retriage.validate_labels`/`drop_is_safe`
+    # are action-shape adapters over these, pinned by retriage's own #510 rows).
+    #
+    # Every plan below is a REAL `triage()` result, never a hand-built dict: a plan assembled here
+    # would measure the fixture rather than the classifier (AGENTS.md pre-flight 2b/2c). The missing
+    # label is spelled as a LITERAL on purpose — deriving it from `DERIVED_PRIORITY` would make the
+    # row agree with the code whatever the code emits.
+    # -----------------------------------------------------------------------------------------------
+    _p4_missing = REAL - {"priority:P4"}
+    _floored = {"area:dispatch", "role:impl", "status:untriaged"}
+    _reduced1490, _dropped1490 = validate_plan(triage(_floored, "task", known_labels=_p4_missing),
+                                               _p4_missing)
+    chk("[#1490] a NON-ROLE label this repository does not define is dropped BY NAME while every "
+        "label that does exist survives",
+        (_dropped1490, sorted(_reduced1490["add"]), sorted(_reduced1490["remove"])),
+        (["priority:P4"], ["status:ready"], ["status:untriaged"]))
+    # NEGATIVE CONTROL, and the row that stops the one above from being satisfied by a reducer that
+    # simply drops things: against the COMPLETE label set the same plan passes through untouched.
+    _whole1490, _nodrop1490 = validate_plan(triage(_floored, "task", known_labels=REAL), REAL)
+    chk("[#1490] NEGATIVE CONTROL: against the COMPLETE label set the SAME plan is unchanged and "
+        "nothing is reported dropped",
+        (_nodrop1490, sorted(_whole1490["add"]), sorted(_whole1490["remove"])),
+        ([], ["priority:P4", "status:ready"], ["status:untriaged"]))
+    chk("[#1490] PREMISE INVARIANT: the reduced write still attests status:ready, but the "
+        "post-state no longer classifies READY without the dropped floor — refused, because "
+        "applying it "
+        "oscillates promote<->repark, two writes per two ticks, forever",
+        reduced_write_is_safe(_reduced1490, _floored, "task", _p4_missing,
+                              attests_ready=_reduced1490["ready"]), False)
+    # ...and the invariant refuses an UNSAFE write, not every write. A park attests nothing, so a
+    # dropped `needs:area` still lands the issue on exactly one lane and IS applied.
+    _na_missing = REAL - {"needs:area"}
+    _arealess = {"role:impl", "priority:P2"}
+    _park1490, _pdropped1490 = validate_plan(triage(_arealess, "task", known_labels=_na_missing),
+                                             _na_missing)
+    chk("[#1490] ...and a reduction that still lands on exactly ONE lane is SAFE (the guard "
+        "refuses unsafe writes, not all writes)",
+        (_pdropped1490, sorted(_park1490["add"]),
+         reduced_write_is_safe(_park1490, _arealess, "task", _na_missing,
+                               attests_ready=_park1490["ready"])),
+        (["needs:area"], ["status:untriaged"], True))
+    # LANE INVARIANT: the attestation dropped while its opposite is still stripped leaves the issue
+    # on NEITHER lane — invisible to the readiness engine AND to retriage's board queries, i.e.
+    # terminal. Reached through the real reducer, from a repository that has no `status:ready`.
+    _sr_missing = REAL - {"status:ready"}
+    _lane1490, _ldropped1490 = validate_plan(triage(_floored, "task", known_labels=_sr_missing),
+                                             _sr_missing)
+    chk("[#1490] LANE INVARIANT: a reduction that would leave the issue on NEITHER lane is refused",
+        (_ldropped1490, sorted(_lane1490["remove"]),
+         reduced_write_is_safe(_lane1490, _floored, "task", _sr_missing,
+                               attests_ready=_lane1490["ready"])),
+        (["status:ready"], ["status:untriaged"], False))
+
+    # THE REST OF THE SHARED CONTRACT — the branches `triage()`'s own producer cannot reach, so
+    # their plans are written out. They are NOT hypothetical: `retriage.plan()` emits exactly these
+    # shapes (a decision carrying a `role` that is not in `add`; a promote that attests readiness
+    # without stripping `status:untriaged`), and retriage's #510 rows pin them against that real
+    # producer. Measured with `python3 -m trace --count --missing` BEFORE they were written: these
+    # were the only never-executed lines of the shared region under either suite — and three of them
+    # are fail-closed refusals, which is the worst place to have an unexecuted line.
+    chk("[#1490] no label set means no validation — the documented `None` contract, shared "
+        "verbatim with `triage(known_labels=None)`",
+        validate_plan({"add": ["role:soundness"], "remove": [], "role": "soundness"}, None),
+        ({"add": ["role:soundness"], "remove": [], "role": "soundness"}, []))
+    chk("[#1490] an unknown ROLE clears the role AND withdraws every role:* strip — #582's rule "
+        "read from the other side: never strip an incumbent for a replacement this run refuses to "
+        "write (apply_triage writes the target INDEPENDENTLY of `add`)",
+        validate_plan({"add": ["status:ready"], "remove": ["role:docs", "status:untriaged"],
+                       "role": "soundness"}, REAL),
+        ({"add": ["status:ready"], "remove": ["status:untriaged"], "role": None},
+         ["role:soundness"]))
+    chk("[#1490] a plan that ATTESTS readiness but whose post-state sits on the PARK lane is "
+        "refused (one lane survives, but not the one the plan claims)",
+        reduced_write_is_safe({"add": [], "remove": []},
+                              {"status:untriaged", "role:impl", "area:dispatch", "priority:P2"},
+                              "task", REAL, attests_ready=True), False)
+    # ...and the OTHER half of `len(lanes) != 1`, which is the ONLY half that guard uniquely
+    # decides. MEASURED: with a ZERO-lane post-state, deleting the lane check changes no answer —
+    # the attested-lane check below returns the same False — so `if len(lanes) != 1` survived every
+    # assertion in BOTH suites until this row existed. A post-state on BOTH lanes is a real,
+    # already-corrupt issue, and confirming a write against it is how it stays corrupt: the
+    # readiness engine and the sweep would each see a different, contradictory answer.
+    _bothlanes = {"status:ready", "status:untriaged", "role:impl", "area:dispatch", "priority:P2"}
+    chk("[#1490] LANE INVARIANT, the half only IT decides: a post-state on BOTH lanes is refused "
+        "in either direction — without the guard the ready side re-classifies READY and the park "
+        "side sees its lane label, so both would be applied",
+        (reduced_write_is_safe({"add": [], "remove": []}, _bothlanes, "task", REAL,
+                               attests_ready=True),
+         reduced_write_is_safe({"add": [], "remove": []}, _bothlanes, "task", REAL,
+                               attests_ready=False)),
+        (False, False))
+    # FAIL-CLOSED: an unproven premise is a refusal, never an exception that reaches the caller.
+    # Captured rather than asserted directly so that DELETING the try/except reds this row cleanly
+    # instead of aborting the suite (AGENTS.md pre-flight 4, crash-after-partial-run).
+    _real_triage1490 = triage
+    try:
+        globals()["triage"] = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("classifier"))
+        try:
+            _premise1490 = reduced_write_is_safe(
+                {"add": ["status:ready"], "remove": ["status:untriaged"]},
+                {"status:untriaged", "role:impl", "area:dispatch"}, "task", REAL,
+                attests_ready=True)
+        except Exception as exc:                                  # noqa: BLE001
+            _premise1490 = f"RAISED {type(exc).__name__}"
+    finally:
+        globals()["triage"] = _real_triage1490
+    chk("[#1490] a classifier that RAISES means the premise is unproven, which is a refusal — not "
+        "an exception the applier propagates", _premise1490, False)
+
+    # THE ENTRY POINT, END TO END. Every row above calls the reducers DIRECTLY, so an `_apply_cli`
+    # that never invokes them keeps all of them green — entry points are where a fabricating bug
+    # survives (AGENTS.md pre-flight 1) and this fix is worth nothing one layer short of the API
+    # call (pre-flight 11). So drive the REAL `_apply_cli` against a fake GitHub whose `edit` raises
+    # on an unknown `--add-label` exactly as the API does.
+    # MUTATION TRIPWIRE: delete the `validate_plan` call from `_apply_cli` and the fake raises,
+    # `apply_triage` reports ok=False, and the first row below goes red on BOTH `code == 0` and
+    # `calls == []`. Make the refusal unconditional instead and the two ACCEPT rows go red.
+    #
+    # The no-op reason is spelled as a LITERAL, never read back from `UNSAFE_DROP_REASON`: an
+    # assertion that compares what the applier printed against the constant it printed FROM cannot
+    # fail whatever that constant becomes (AGENTS.md pre-flight 2b — measured, not hypothetical: a
+    # mutant that repointed the constant survived every row here until this was written out).
+    _reason1490 = "unknown-label-unsafe-drop"
+
+    def run_apply(start, known, issue_type="task"):
+        live, revision, calls = set(start), [0], []
+
+        def fake_edit(add, remove):
+            unknown = sorted(set(add) - set(known))
+            if unknown:              # GitHub fails the WHOLE edit on one unknown name
+                raise RuntimeError(f"'{unknown[0]}' not found")
+            calls.append((sorted(add), sorted(remove)))
+            live.update(add)
+            live.difference_update(remove)
+            revision[0] += 1
+
+        saved_gh, saved_labels = live_gh, repo_label_set
+        out = io.StringIO()
+        try:
+            globals()["live_gh"] = lambda repo, number, title="triage": (
+                lambda: (set(live), revision[0]), lambda: set(live), fake_edit,
+                lambda message: print(f"::warning::{message}"))
+            globals()["repo_label_set"] = lambda repo: set(known)
+            with contextlib.redirect_stdout(out):
+                status = _apply_cli("o/r", "7", issue_type)
+        finally:
+            globals()["live_gh"], globals()["repo_label_set"] = saved_gh, saved_labels
+        return status, calls, live, out.getvalue()
+
+    _code, _calls, _live, _out = run_apply(_floored, _p4_missing)
+    chk("[#1490] THE LIVE FAILURE: --apply drops the unknown label with a per-issue log line, "
+        "writes NOTHING, leaves the issue byte-identical, and stays GREEN (before this it exited 1 "
+        "and did so again on every following issue event)",
+        (_code, _calls, _live == _floored,
+         "classifier suggested unknown label priority:P4" in _out, _reason1490 in _out),
+        (0, [], True, True, True))
+    # ...and re-running is the SAME no-op with the same log. Nothing about the issue changed, so
+    # this is exactly what the next `labeled`/`edited` event does to it.
+    _code2, _calls2, _live2, _out2 = run_apply(_live, _p4_missing)
+    chk("[#1490] re-running on the SAME issue is a no-op-with-log — the recurrence cannot recur",
+        (_code2, _calls2, _live2 == _floored, _reason1490 in _out2), (0, [], True, True))
+    # THE ACCEPT DIRECTION. An applier that refused on ANY drop would pass both rows above.
+    _code3, _calls3, _live3, _out3 = run_apply(_arealess, _na_missing)
+    chk("[#1490] a SAFE reduction is APPLIED: the surviving labels are written in one edit and "
+        "only the unknown one is withheld",
+        (_code3, _calls3, sorted(_live3), _reason1490 in _out3),
+        (0, [(["status:untriaged"], [])], ["priority:P2", "role:impl", "status:untriaged"], False))
+    # ...and the UNREDUCED path is untouched: a complete label set still writes the whole plan.
+    _code4, _calls4, _live4, _out4 = run_apply(_floored, REAL)
+    chk("[#1490] NEGATIVE CONTROL: against the COMPLETE label set --apply writes the FULL plan, "
+        "derived priority floor included, and reports no drop",
+        (_code4, _calls4, sorted(_live4), _reason1490 in _out4),
+        (0, [(["priority:P4", "status:ready"], ["status:untriaged"])],
+         ["area:dispatch", "priority:P4", "role:impl", "status:ready"], False))
+
+    # -----------------------------------------------------------------------------------------------
     # [PR #595 finding 5] THE QUARANTINE LABEL WRITE IS FAIL-LOUD. `gh issue edit ... || true` on the
     # trust:untrusted/status:untriaged write meant a failed mutation left third-party content
     # UN-QUARANTINED while the job reported success — the worst failure mode on this surface, and
-    # invisible to retriage (which only revisits status:untriaged). Pinned statically so it cannot
+    # invisible even to the bidirectional (#586) retriage sweep, whose two lanes are BOTH keyed on a
+    # status attestation (status:untriaged / status:ready) that such an issue carries NEITHER of, so
+    # `retriage.plan` returns `not-retriageable` for it. Pinned statically so it cannot
     # regress: the label mutation carries no `|| true`, the step runs under `set -e`, and a post-read
     # proves both labels landed. (Only the courtesy comment may be best-effort.)
     wf_body = "\n".join(line for line in open(triage_wf, encoding="utf-8").read().splitlines()
@@ -2057,6 +2486,189 @@ def _self_test():
         (DERIVED_PRIORITY in _gated["add"], _gated["ready"], "status:ready" in _gated["add"]),
         (True, False, False))
 
+    # -----------------------------------------------------------------------------------------------
+    # [#582 acceptance 4] THE LABEL-VOCABULARY DRIFT GUARD.
+    #
+    # The per-issue controls above are all REACTIVE — they fire once an issue has already reached
+    # the hole, for the labels that issue's plan happens to name. This section pins the STANDING
+    # question: can the planner emit a label the repository does not define AT ALL?
+    # -----------------------------------------------------------------------------------------------
+    import os as _os_vocab  # noqa: PLC0415 — this suite imports os function-locally throughout
+    import shutil
+    import subprocess as _subprocess_vocab
+    import tempfile
+    import types
+
+    # The vocabulary, pinned to an INDEPENDENT literal (AGENTS.md pre-flight 2b). Every element is
+    # written out by hand rather than read back from ROLE_LABELS/NON_ROLE_VOCABULARY/
+    # DERIVED_PRIORITY, so adding a derivable role or a new emitted label — the exact edit that
+    # created #582 — cannot move the code and its expectation together. `role:soundness` is
+    # ABSENT here because this repository does not define it; that absence is the decision #582
+    # took, and this row is where a re-introduction is caught.
+    chk("[#582] the certified vocabulary is EXACTLY this set (pinned independently of the tables)",
+        sorted(emittable_labels()),
+        ["needs:area", "priority:P4", "role:ci", "role:docs", "role:impl", "role:research",
+         "role:site", "status:ready", "status:untriaged", "trust:untrusted"])
+    # ...and it is COMPUTED from the derivation tables, not hard-coded: re-point one table at the
+    # historical `soundness` value and the guard must report it as drift. This is the row that
+    # makes the flip contemplated in TRUST_PLANE_ROLE's TODO safe — the vocabulary follows the code
+    # the moment the code can emit the label, BEFORE any issue is triaged with it.
+    _repo_labels = set(emittable_labels()) | {"area:docs", "priority:P1", "kind:bug"}
+    chk("[#582] a repo that defines the whole vocabulary shows NO drift",
+        label_drift(_repo_labels), [])
+    # THE OFFLINE HALF OF THE SAME QUESTION. The scheduled job answers it against the LIVE label
+    # set; this answers it here, in the gate, against `REAL` — the label snapshot pinned above
+    # (gh label list, 2026-07-25). So a vocabulary addition that this repository does not define is
+    # caught by the author's own `--self-test`, before the change is even pushed, and the workflow
+    # remains the authority on drift the snapshot cannot see (a label deleted on the live board).
+    chk("[#582] every emittable label exists in the pinned live registry label snapshot — the "
+        "scheduled guard is GREEN on today's board",
+        label_drift(REAL), [])
+    _saved_area = dict(AREA_ROLE_DEFAULT)
+    try:
+        AREA_ROLE_DEFAULT["worker"] = "soundness"
+        chk("[#582] THE HISTORICAL DEFECT: a derivation table re-pointed at `role:soundness` — a "
+            "label this repository does not define — is reported as drift by NAME, before any "
+            "issue is stranded role-less-and-ready",
+            (label_drift(_repo_labels), _role(["area:worker"], "task")),
+            (["role:soundness"], TRUST_PLANE_ROLE))
+    finally:
+        AREA_ROLE_DEFAULT.clear()
+        AREA_ROLE_DEFAULT.update(_saved_area)
+    chk("[#582] ...and the re-point is undone, so the rows below judge the real tables",
+        label_drift(_repo_labels), [])
+    # FAIL-CLOSED ON AN UNREADABLE LABEL SET: an empty read is what a failed/garbled `gh label
+    # list` produces, and reporting it as "no drift" is the same silence #582 was made of.
+    _empty = "no drift reported"
+    try:
+        label_drift([])
+    except LabelVocabularyError as exc:
+        _empty = str(exc)
+    chk("[#582] an EMPTY/unreadable repo label set is REFUSED, never read as clean",
+        ("refusing to certify" in _empty, "EMPTY or unreadable" in _empty), (True, True))
+
+    # CLOSURE — the vocabulary really covers what `triage()` plans. The corpus is pinned by the set
+    # of adds it produces, so a corpus that silently stops planning anything (or a `triage()` that
+    # stops adding) reds the FIRST row rather than making the second one vacuously true.
+    _corpus = [(["priority:P2", "kind:docs", "area:docs"], "task"),          # role:docs + ready
+               (["priority:P1", "area:worker"], "feature"),                  # trust-plane role
+               (["priority:P2", "area:ci"], "feature"),                      # role:ci
+               (["priority:P2", "area:dashboard"], "feature"),               # role:site
+               (["priority:P3", "kind:research", "area:usage"], "task"),     # role:research
+               (["area:usage"], "feature"),                                  # the derived floor
+               (["role:impl"], "feature"),                                   # needs:area park
+               (["priority:P1", "area:docs", "needs:user"], "task")]         # gated -> untriaged
+    _planned = set().union(*(triage(labels, kind)["add"] for labels, kind in _corpus))
+    chk("[#582] the closure corpus really exercises the emitters (a corpus that plans nothing "
+        "proves nothing)",
+        sorted(_planned),
+        ["needs:area", "priority:P4", "role:ci", "role:docs", "role:impl", "role:research",
+         "role:site", "status:ready", "status:untriaged"])
+    chk("[#582] every label triage() plans to ADD is in the certified vocabulary",
+        sorted(_planned - emittable_labels()), [])
+    # ...and the OTHER producer on this surface: the quarantine step's own label writes. It is part
+    # of the triage surface and its post-read fails the step if a label does not exist, so those
+    # labels must be certified by the same guard.
+    _quarantine_writes = sorted(re.findall(r"--add-label (\S+)", quarantine_body))
+    chk("[#582] the quarantine step writes exactly these labels (input pinned, not inferred)",
+        _quarantine_writes, ["status:untriaged", "trust:untrusted"])
+    chk("[#582] ...and every one of them is in the certified vocabulary",
+        sorted(set(_quarantine_writes) - emittable_labels()), [])
+
+    # THE CLI CONTRACT, exercised through main() — 0 clean, 1 drifted, 1 unreadable. Each row
+    # asserts the EXIT CODE and the message, because the workflow step below reads only the exit
+    # code and an operator reads only the annotation.
+    def _drift_cli(*argv):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = main(["--label-drift", *argv])
+        return code, buffer.getvalue()
+
+    _clean_code, _clean_out = _drift_cli("--known-labels", ",".join(sorted(_repo_labels)))
+    chk("[#582] --label-drift exits 0 on a complete label set, and CENSUSES the zero row (a silent "
+        "clean run is indistinguishable from one that never ran)",
+        (_clean_code, "missing=0" in _clean_out, "::error" in _clean_out), (0, True, False))
+    _red_code, _red_out = _drift_cli(
+        "--known-labels", ",".join(sorted(_repo_labels - {"role:impl"})))
+    chk("[#582] --label-drift exits 1 and NAMES the missing label",
+        (_red_code, "::error" in _red_out, "role:impl" in _red_out, "missing=1" in _red_out),
+        (1, True, True, True))
+    _bare_code, _bare_out = _drift_cli()
+    chk("[#582] --label-drift with NO label set exits 1 (fail closed), never 0",
+        (_bare_code, "::error" in _bare_out), (1, True))
+
+    # -----------------------------------------------------------------------------------------------
+    # THE YAML SEAM — the guard's step body is EXECUTED, not pattern-matched (AGENTS.md pre-flight
+    # 6: "the YAML seam is where the vacuity lives"). The step is run twice against a stubbed
+    # `gh_retry` that serves a label set from the environment: a COMPLETE set must exit 0 and a set
+    # with one vocabulary label missing must exit non-zero. Between them they kill a dropped
+    # `--known-labels` (the complete run would then exit 1 on the empty-set refusal), a `|| true`
+    # or dropped `--label-drift` (the deficient run would exit 0), and a hard-coded label list in
+    # the shell (the deficient run would exit 0).
+    # -----------------------------------------------------------------------------------------------
+    _retriage_wf = _os_vocab.path.join(root, ".github/workflows/retriage.yml")
+    # The step extractor lives in retriage.py (ONE definition — it is retriage.yml's own file), so
+    # it is imported rather than re-spelled here. `sys.modules["triage"]` is seeded with THIS
+    # module's own namespace first, because retriage.py does `import triage`: under
+    # `python3 scripts/triage.py --self-test` that would exec this file a SECOND time as a distinct
+    # module object, which silently breaks `python3 -m trace --count` — the import copy's zero
+    # counts overwrite the running copy's, so every executed line in this file reports as
+    # never-executed and AGENTS.md pre-flight 1 becomes unusable on the module that needs it most.
+    # Measured before the seed: `labels = set(labels)` in `triage()` read `>>>>>>` instead of 119.
+    # The alias is built from `globals()` rather than from `sys.modules[__name__]` because under
+    # `-m trace` this script has NO sys.modules entry at all (`__main__` is trace's own module).
+    _alias = types.ModuleType("triage")
+    _alias.__dict__.update(globals())
+    _alias.__name__ = "triage"
+    sys.modules.setdefault("triage", _alias)
+    _step = load_sibling("retriage.py", "registry_retriage_for_seam").workflow_step_script(
+        open(_retriage_wf, encoding="utf-8").read(), "label-drift")
+    chk("[#582] retriage.yml carries the label-drift step, and it runs under `set -e` with no "
+        "`|| true` on the certification",
+        (bool(_step.strip()), "set -euo pipefail" in _step,
+         [line.strip() for line in _step.splitlines() if "|| true" in line]),
+        (True, True, []))
+    _GH_RETRY_LABEL_STUB = '''import os, sys
+args = sys.argv[1:]
+if args[:2] != ["read", "label"]:
+    sys.exit(f"stub gh_retry refuses {args}")
+print(os.environ["STUB_LABELS"])
+'''
+
+    def _run_drift_step(labels):
+        """Execute the workflow's OWN step body against a stubbed label-set read."""
+        with tempfile.TemporaryDirectory() as directory:
+            scripts = _os_vocab.path.join(directory, "scripts")
+            _os_vocab.makedirs(scripts)
+            with open(_os_vocab.path.join(scripts, "gh_retry.py"), "w",
+                      encoding="utf-8") as handle:
+                handle.write(_GH_RETRY_LABEL_STUB)
+            shutil.copy(_os_vocab.path.abspath(__file__),
+                        _os_vocab.path.join(scripts, "triage.py"))
+            environment = dict(_os_vocab.environ, REPO="o/r",
+                               STUB_LABELS=",".join(sorted(labels)))
+            proc = _subprocess_vocab.run(
+                ["bash", "-c", _step], cwd=directory, env=environment, capture_output=True,
+                text=True, timeout=120, check=False)
+            return proc.returncode, proc.stdout + proc.stderr
+
+    _step_ok, _step_ok_out = _run_drift_step(_repo_labels)
+    chk("[#582] EXECUTED: the workflow step certifies a complete label set and exits 0",
+        (_step_ok, "missing=0" in _step_ok_out), (0, True))
+    _step_red, _step_red_out = _run_drift_step(_repo_labels - {"role:impl"})
+    chk("[#582] EXECUTED: the workflow step FAILS on a repository missing an emittable label, and "
+        "names it — the #582 shape caught before an issue is triaged with it",
+        (_step_red != 0, "role:impl" in _step_red_out, "::error" in _step_red_out),
+        (True, True, True))
+    # The flag the step passes must be one the parser DECLARES (PR #595 finding 2's class), read
+    # out of the workflow FILE so a renamed flag lands here rather than live.
+    _drift_argvs = [argv for argv in workflow_argvs(_retriage_wf, "triage.py", {"REPO": "o/r"})
+                    if "--label-drift" in argv]
+    chk("[#582] retriage.yml's drift invocation exists and every flag it passes is DECLARED",
+        (len(_drift_argvs), sorted({token for argv in _drift_argvs for token in argv
+                                    if token.startswith("--")} - declared_options(build_parser()))),
+        (1, []))
+
     print("triage self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -2080,6 +2692,11 @@ def build_parser():
     ap.add_argument("--number", default="")
     ap.add_argument("--known-labels", default="",
                     help="comma-separated repo label set; enables the #582 existence check")
+    # The standing vocabulary certification retriage.yml's `label-drift` job runs (#582). Reads the
+    # SAME `--known-labels` oracle the per-issue existence check uses, so there is one spelling of
+    # "the repository's label set" across this CLI.
+    ap.add_argument("--label-drift", action="store_true",
+                    help="exit 1 if the planner can emit a label --known-labels does not define")
     # The quarantine authorization decision triage-issue.yml gates its quarantine step on. Prints
     # `1` (apply/restore the quarantine) or `0`. Defaults are the UNTRUSTED spelling on every flag,
     # so a dropped argument fails closed to `1` rather than silently un-quarantining.
@@ -2099,6 +2716,8 @@ def main(argv=None):
     if a.quarantine_decision:
         print("1" if quarantine_required(a.action, a.author_trusted, a.actor_trusted) else "0")
         return 0
+    if a.label_drift:
+        return _label_drift_cli([x for x in a.known_labels.split(",") if x.strip()])
     if a.apply:
         if not a.repo or not a.number:
             ap.error("--apply requires --repo and --number")

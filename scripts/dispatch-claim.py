@@ -543,7 +543,27 @@ GLOBAL_RESERVATION_CAUSES = (
 CAUSE_NO_PROVENANCE_NARROWED = "missing-provenance-narrowed"   # no record, but the PR's OWN
                                                                # `area:*` labels bound its blast
                                                                # radius — reserve THOSE, not global
-RESERVATION_CAUSES = GLOBAL_RESERVATION_CAUSES + (CAUSE_NO_PROVENANCE_NARROWED,)
+
+# [registry #677 point 1] The SIXTH cause, and a non-member of GLOBAL_RESERVATION_CAUSES for the
+# identical structural reason as the fifth: it names a reservation that is NARROWED, so a bucket
+# for it in a census whose population is "rows holding `__global__`" could never be non-zero.
+#
+# It is the LAST of the four global paths that #772 measured and #4821 left standing:
+# `source-unlisted` was the single largest residual (7 of the 14 `__global__`-carrying ticks over
+# the 101 executed 2026-07-27..28) and #677 names it as the "unknown crate vs genuinely repo-wide"
+# distinction the partition never drew. A CLOSED source issue is not evidence of a repo-wide blast
+# radius — it is evidence of nothing at all — so where the PR itself declares path-derived
+# `area:*` labels, THOSE bound it, exactly as they do on the missing-provenance branch.
+#
+# UNLIKE the fifth cause, this population needs NO separate census: its provenance record is
+# admissible, so `enumerate_review_items` emits the PR every tick and its review loop advances.
+# #4821's counter exists because a narrowed unprovenanced PR is invisible to that enumerator and
+# would otherwise go dark; there is no such residual harm here.
+CAUSE_SOURCE_UNLISTED_NARROWED = "source-unlisted-narrowed"    # valid record, source issue
+                                                               # closed/unlisted, but the PR's OWN
+                                                               # `area:*` labels bound it
+RESERVATION_CAUSES = GLOBAL_RESERVATION_CAUSES + (
+    CAUSE_NO_PROVENANCE_NARROWED, CAUSE_SOURCE_UNLISTED_NARROWED)
 
 
 def plan_package(areas):
@@ -563,11 +583,28 @@ def plan_package(areas):
 
 
 def packages_conflict(left, right):
-    """THE exclusion predicate over two partition keys — DELEGATED to lease_schema, for the same
-    reason `plan_package` is: PLAN's assemble filter, CLAIM's live re-check, the cross-lane ledger
-    view and the allocator's own `partition_available` must all decide with ONE function. A key
-    names a SET of areas, so two rows exclude iff their sets INTERSECT; `__global__` is the
-    universal set and still serializes in both directions."""
+    """THE exclusion predicate over two partition KEYS — DELEGATED to lease_schema, for the same
+    reason `plan_package` is: the cross-lane ledger view (`sibling_lease_conflict`) and the
+    allocator's own `partition_available` must decide with ONE function. A key names a SET of
+    areas, so two rows exclude iff their sets INTERSECT; `__global__` is the universal set and
+    still serializes in both directions.
+
+    SCOPE — this is not the only implementation of that semantics, and a widening applied here
+    reaches only the two LEDGER legs. PLAN's assemble filter and CLAIM's live re-check decide
+    against the busy UNION of atoms via `partition_defer_attribution`, which shares `package_areas`
+    (the set semantics, the fail-closed universal reading) but NOT this function. The two are
+    equivalent by TEST, not by construction — the self-test pins PLAN and CLAIM deciding
+    identically and pins the union arm to intersect rather than membership-test. Change one and the
+    scheduler contradicts itself; see `research/1011-global-partition-bounded-concurrency.md` §4/§9.3.
+
+    WHETHER `__global__` SHOULD SERIALIZE AT ALL — bounded N-slot concurrency instead of exclusion
+    — is a DECIDED question, not an open one: see registry #677 point 1 / #1011, recorded in
+    `research/1011-global-partition-bounded-concurrency.md`. N slots either schedule a population
+    that is not runnable (the measured holders are inert OPEN PRs, not queued rows) or delete the
+    disjointness invariant for the admitted pairs, and the class that admits — same crate,
+    textually disjoint, jointly wrong — is one no gate grades and no reviewer reads. The lever is
+    NARROWING a cause on evidence that proves the footprint, which keeps BOTH implementations of
+    the exclusion intact rather than suspending either."""
     return _lease_schema.packages_conflict(left, right)
 
 
@@ -1775,6 +1812,60 @@ def reserving_areas(areas, exempt=None):
     return frozenset(area for area in areas if area not in exempt)
 
 
+def unlisted_source_narrowing(issue_labels, issue_number, pr_areas):
+    """PURE. The areas a provenanced PR whose SOURCE ISSUE IS UNLISTED reserves instead of
+    `__global__`, or None when it must still fail closed to the serializing partition.
+
+    [registry #677 point 1] THE ONE READER of this decision, called by BOTH legs that describe
+    the same PR — `busy_packages_of_pulls` (what the PR OCCUPIES) and `enumerate_review_items`
+    (what its review ROW reserves). They must move TOGETHER or not at all: a narrowed occupancy
+    whose review row still mints `__global__` is inert, because the review lease serializes the
+    whole ledger for as long as it is live (`sibling_lease_conflict`), and the reverse is the
+    round-2 P2 LINKAGE PARITY failure — two legs describing one PR differently. Sharing the
+    function removes the drift axis instead of promising parity in prose, exactly as
+    `plan_package` does for the partition reduction.
+
+    WHAT IT NARROWS, AND WHY THAT IS SOUND. `source-unlisted` means the provenance record is
+    valid and its source issue is absent from the open-issue map — i.e. CLOSED. The old rule read
+    that absence as "unknown blast radius" and seized the serializing partition, but a closed
+    issue is not evidence of a repo-wide footprint; it is evidence of nothing. The PR's own
+    `area:*` labels are, on a target that runs `scripts/pr-area-labels.py`, a machine-derived
+    attestation of its CHANGED PATHS that is fail-closed in the same direction as this rule (no
+    label at all when the file list is missing, truncated, unattributable, or wider than
+    `max_areas`), which is the identical evidence sparq#4821 already admits one branch above.
+    Where that evidence does not exist the PR declares nothing and this returns None, so a target
+    with no deriver keeps today's behaviour with no per-target flag.
+
+    IT ALSO CLOSES A PLAN/CLAIM DIVERGENCE RATHER THAN OPENING ONE. PLAN's occupancy rule for an
+    open PR is `ready-issues._pr_reserving_packages` — declared areas, no global fallback — and
+    `unit_reservations` folds in only the source issues PRESENT in the snapshot, so a closed
+    source contributes nothing THERE either. PLAN has always reserved exactly the PR's declared
+    areas for this population; CLAIM alone invented the global hold and then deferred every row
+    PLAN had planned on that basis. `_pr_reserving_packages`'s own docstring names the resolution:
+    "if [the two sides] ever are [unified], CLAIM is the side that moves".
+
+    THREE FAIL-CLOSED REFUSALS, each of which returns None:
+      * the map is UNREADABLE (not a dict) or the issue IS listed — this is not the unlisted
+        branch at all. A degraded `_live_issue_labels` read must not present every provenanced PR
+        as unlisted and drop its SOURCE issue's areas from the union; only a proven absence from a
+        readable map narrows. A key present with a malformed value is "present but unreadable" and
+        keeps the global hold.
+      * the PR declares NOTHING — the blast radius is genuinely unknown, which is the case the
+        serializing partition exists for.
+      * the PR declares the literal `area:__global__` — the CLOSED-ENUM guard sparq#4821 needed
+        for the same shape: such a row must reach a cause `global_reservation_census` accepts, or
+        an unusual board would abort a tick at the closed-enum recorder instead of completing.
+
+    STRICT NARROWING: the returned set is a subset of `pr_areas` and never contains
+    `__global__`, so this can only ever REMOVE atoms from a reservation, never promote one."""
+    if not isinstance(issue_labels, dict) or issue_number in issue_labels:
+        return None
+    narrowed = frozenset(area for area in pr_areas if isinstance(area, str) and area)
+    if not narrowed or GLOBAL_PACKAGE in narrowed:
+        return None
+    return narrowed
+
+
 def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None,
                            parked_pr_labels=None, occupancy=None):
     """PURE busy-area union for the PLAN conflict partition (registry issue #27): every open
@@ -1833,18 +1924,21 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
       * `source-no-areas` — the source issue is OPEN and carries no `area:`. If it is
         `status:in-progress*` it ALREADY reserves `__global__` on the PLAN side under the
         unchanged CANDIDATE-side `packages_of` rule, so narrowing it here alone buys nothing.
+        STILL NOT NARROWED, and `unlisted_source_narrowing` refuses it BY CONSTRUCTION (the issue
+        is listed), so the two cases cannot be collapsed by a later edit to this branch.
       * `source-unlisted` — the source issue is CLOSED, hence absent from PLAN's occupancy
-        entirely, so this branch invents a reservation PLAN never made in exactly the way the
-        missing-provenance branch does. MEASURED over 101 executed dispatch ticks (2026-07-27
+        entirely, so this branch invented a reservation PLAN never made in exactly the way the
+        missing-provenance branch did. MEASURED over 101 executed dispatch ticks (2026-07-27
         12:54Z - 2026-07-28 14:52Z): 14 ticks carried a `__global__` reservation and SEVEN of them
         — sparq-org/sparq#3620 on six consecutive ticks (source issue #3321, closed 07-25) and
         #4681 on one (source issue #2781, closed 21s before the tick read it) — were this cause.
-        It is the single largest residual, and it is deliberately NOT narrowed HERE because it
-        cannot be narrowed here ALONE: `enumerate_review_items` emits the same PR as a review row
-        whose package is `__global__` (asserted in this file's own self-test), so narrowing only
-        the reservation would leave the two legs describing the same PR differently — the exact
-        LINKAGE PARITY failure the round-2 P2 note above exists to prevent. Both sides have to
-        move together, which is a separate change.
+        It was the single largest residual and it is NOW NARROWED (registry #677 point 1), by the
+        change this paragraph used to defer: it could never be narrowed here ALONE, because
+        `enumerate_review_items` emits the same PR as a review row whose package is `__global__`,
+        so narrowing only the reservation would leave the two legs describing the same PR
+        differently — the exact LINKAGE PARITY failure the round-2 P2 note above exists to
+        prevent. BOTH legs now mint from the ONE shared `unlisted_source_narrowing`, which is why
+        they cannot drift; see its docstring for the soundness and fail-closed argument.
 
     THE ASSUMPTION, STATED. A target whose PR `area:` labels are NOT derived fail-closed could
     under-reserve here. On the provenanced path PR labels only ever WIDEN a union, so this is the
@@ -1924,9 +2018,18 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
                 if not issue_areas:
                     cause = GLOBAL_CAUSE_SOURCE_NO_AREAS
             else:
-                areas |= {GLOBAL_PACKAGE}  # closed/unlisted source: the enumerator still
-                                           # emits this PR as `__global__` — mirror it
-                cause = GLOBAL_CAUSE_SOURCE_UNLISTED
+                # [registry #677 point 1] closed/unlisted source. The PR's OWN path-derived
+                # `area:*` labels bound it where they exist; otherwise the blast radius is
+                # unknown and the reservation fails closed to the serializing partition. The
+                # enumerator's row for this PR is minted from the SAME helper, so the two legs
+                # cannot describe it differently — see `unlisted_source_narrowing`.
+                narrowed = unlisted_source_narrowing(issue_labels, record["issue"], areas)
+                if narrowed is None:
+                    areas |= {GLOBAL_PACKAGE}
+                    cause = GLOBAL_CAUSE_SOURCE_UNLISTED
+                else:
+                    areas = set(narrowed)  # already the PR's declared set; nothing unioned in
+                    cause = CAUSE_SOURCE_UNLISTED_NARROWED
         elif areas and GLOBAL_PACKAGE not in areas:
             # [sparq#4821] missing/invalid linkage, but the PR's OWN path-derived `area:*` labels
             # bound its blast radius — reserve exactly those. Still fail-closed (it reserves
@@ -3779,6 +3882,16 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         lease_free = (f"fix:{repo}#{number}" not in live_keys
                       and f"review:{repo}#{number}" not in live_keys)
         areas = sorted(label[5:] for label in source_labels if label.startswith("area:"))
+        if not areas:
+            # [registry #677 point 1] LINKAGE PARITY on the package. The occupancy leg narrows a
+            # provenanced PR whose source issue is UNLISTED (closed) to the PR's own declared
+            # `area:*` set; the row this leg emits must reserve the SAME thing, or the review
+            # lease it mints re-serializes the whole ledger and the narrowing buys nothing. ONE
+            # shared decision function, never a second copy of its conditions — the helper itself
+            # refuses the LISTED-but-area-less source (`source-no-areas`, still `__global__` on
+            # both legs) and every unreadable-map case, so this cannot widen the population the
+            # occupancy leg narrowed.
+            areas = sorted(unlisted_source_narrowing(issue_labels, issue_number, pr_areas) or ())
         reviewed = REVIEWED_SHA_RE.search(pull.get("body") or "")
         reviewed_match = bool(reviewed and reviewed.group(1) == sha)
 
@@ -18275,6 +18388,117 @@ agent = "impl"
     assert GLOBAL_PACKAGE in busy_packages_of_pulls(
         repo, [pull(60, "sparq-agent/issue-8-1-1", sha_a, labels=["area:crate-z"])],
         {8: ["role:impl"]}, busy_prov)
+
+    # ---- [registry #677 point 1] `source-unlisted` NARROWS, AND BOTH LEGS MOVE TOGETHER --------
+    # The last of #772's four global paths, and the largest measured residual: 7 of the 14
+    # `__global__`-carrying ticks over 101 executed ones were a valid record whose source issue had
+    # been CLOSED (sparq-org/sparq#3620 on six consecutive ticks, #4681 on one). A closed issue is
+    # not evidence of a repo-wide blast radius, so the PR's OWN path-derived `area:*` labels bound
+    # it — exactly as they do on the missing-provenance branch (sparq#4821).
+    #
+    # THE PAIR OF ASSERTIONS IS THE POINT. Narrowing the OCCUPANCY alone is inert: the review row
+    # this PR still emits would mint a `__global__` LEASE that re-serializes the whole ledger while
+    # it is live. Narrowing the ROW alone is the round-2 P2 linkage-parity failure. So each half is
+    # asserted separately, against the real producers — reverting either one reds exactly one line.
+    _unlisted_labelled = pull(61, "sparq-agent/issue-999-1-1", sha_a,
+                              labels=["area:crate-a", "area:crate-z"])
+    assert busy_packages_of_pulls(repo, [_unlisted_labelled], issue_labels, busy_prov) == {
+        "crate-a", "crate-z"}, "a closed source issue must not widen a declared PR to __global__"
+    _unlisted_items = enumerate_review_items(repo, [_unlisted_labelled], busy_prov, [],
+                                             issue_labels, now)
+    assert [item["package"] for item in _unlisted_items] == [
+        plan_package(["crate-a", "crate-z"])], _unlisted_items
+    # A SINGLE declared area is its own row, for the reason sparq#4821 recorded: a two-area
+    # fixture cannot see a mutant that reads `len(areas) > 1`, and 23 of 67 open sparq worker PRs
+    # declare exactly one.
+    _unlisted_one = pull(61, "sparq-agent/issue-999-1-1", sha_a, labels=["area:crate-a"])
+    assert busy_packages_of_pulls(repo, [_unlisted_one], issue_labels, busy_prov) == {"crate-a"}
+    assert [item["package"] for item in enumerate_review_items(
+        repo, [_unlisted_one], busy_prov, [], issue_labels, now)] == ["crate-a"]
+    # THE WHOLE-LANE CONSEQUENCE at the leg that actually drops rows: the holder's own crate goes,
+    # its sibling survives. `plan_items` names crate-a and crate-b. Pre-fix this returned [] —
+    # which is the `PLAN complete: 0 issue item(s)` in registry #677.
+    assert [item["number"] for item in filter_busy_area_items(
+        plan_items, repo, [_unlisted_labelled], issue_labels, busy_prov,
+        leases=[], now=now)] == [9], "one unlisted-source holder must no longer drop every item"
+    # ...and the narrowing is NEVER a release: its OWN crate is still genuinely reserved.
+    assert filter_busy_area_items([plan_items[0]], repo, [_unlisted_labelled], issue_labels,
+                                  busy_prov, leases=[], now=now) == []
+    # THE THREE FAIL-CLOSED REFUSALS, each with a PR that DOES declare areas — so every one of
+    # them is a live test of a guard rather than of the empty-declaration case above.
+    #   (a) the source issue is LISTED but area-less (`source-no-areas`): NOT this branch. Pinned
+    #       on both legs, because collapsing the two causes is the one edit that would make this
+    #       narrowing swallow a population PLAN still reserves `__global__` for.
+    _listed_no_areas = pull(60, "sparq-agent/issue-8-1-1", sha_a, labels=["area:crate-z"])
+    assert busy_packages_of_pulls(repo, [_listed_no_areas], {8: ["role:impl"]}, busy_prov) == {
+        "crate-z", GLOBAL_PACKAGE}
+    assert [item["package"] for item in enumerate_review_items(
+        repo, [_listed_no_areas], busy_prov, [], {8: ["role:impl"]}, now)] == [GLOBAL_PACKAGE]
+    #   (b) the issue map is UNREADABLE (not a dict). A degraded `_live_issue_labels` read must not
+    #       present every provenanced PR as unlisted and silently drop its SOURCE issue's areas
+    #       from the union. Kills dropping the `isinstance(issue_labels, dict)` guard.
+    assert busy_packages_of_pulls(repo, [_unlisted_labelled], None, busy_prov) == {
+        "crate-a", "crate-z", GLOBAL_PACKAGE}
+    #   (c) the key is PRESENT with a malformed value — "present but unreadable", not absent.
+    #       Kills relaxing `issue_number in issue_labels` to a truthiness/list test.
+    assert busy_packages_of_pulls(repo, [_unlisted_labelled], {999: "role:impl"}, busy_prov) == {
+        "crate-a", "crate-z", GLOBAL_PACKAGE}
+    # THE CLOSED-ENUM EDGE, same shape as sparq#4821's: a PR wearing the literal `area:__global__`
+    # reserves the serializing partition, so it must reach a cause `global_reservation_census`
+    # ACCEPTS. Routing it through the narrowed cause would make the recorder RAISE and abort a tick
+    # that used to complete, so the DispatchError is converted into a named failure — a crash is
+    # not a kill.
+    _unlisted_global_label = pull(61, "sparq-agent/issue-999-1-1", sha_a,
+                                  labels=[f"area:{GLOBAL_PACKAGE}", "area:crate-a"])
+    _unlisted_global_occ = []
+    assert busy_packages_of_pulls(repo, [_unlisted_global_label], issue_labels, busy_prov,
+                                  occupancy=_unlisted_global_occ) == {GLOBAL_PACKAGE, "crate-a"}
+    try:
+        _unlisted_global_census = global_reservation_census(_unlisted_global_occ)
+    except DispatchError as exc:                                          # pragma: no cover
+        raise AssertionError(
+            "an `area:__global__`-labelled unlisted-source PR must NOT be routed through the "
+            "narrowed cause: `source-unlisted-narrowed` is not in GLOBAL_RESERVATION_CAUSES, so "
+            f"the closed-enum census raised instead of counting it and aborted the tick — {exc}"
+        ) from exc
+    assert _unlisted_global_census == {GLOBAL_CAUSE_SOURCE_UNLISTED: 1}, _unlisted_global_census
+    # THE CAUSE IS ATTRIBUTED TO ITS OWN BUCKET, in both directions: the narrowed row is NOT in
+    # the `__global__` census (it holds no global partition) and NOT in sparq#4821's counter
+    # either (that population is the RECORDLESS one, whose review loop does not advance — this
+    # PR's record is admissible and it is enumerated every tick, which is why it needs no
+    # separate census of its own).
+    _unlisted_occ = []
+    busy_packages_of_pulls(repo, [_unlisted_labelled], issue_labels, busy_prov,
+                           occupancy=_unlisted_occ)
+    assert [row[5] for row in _unlisted_occ] == [CAUSE_SOURCE_UNLISTED_NARROWED], _unlisted_occ
+    assert global_reservation_census(_unlisted_occ) == {}, _unlisted_occ
+    assert unprovenanced_narrowed_holders(_unlisted_occ) == [], _unlisted_occ
+    # ...and the UN-narrowed unlisted holder still lands in `source-unlisted`, so the two causes
+    # cannot be collapsed into one another.
+    _unlisted_bare_occ = []
+    busy_packages_of_pulls(repo, [stray_closed], issue_labels, busy_prov,
+                           occupancy=_unlisted_bare_occ)
+    assert global_reservation_census(_unlisted_bare_occ) == {GLOBAL_CAUSE_SOURCE_UNLISTED: 1}, \
+        _unlisted_bare_occ
+    assert CAUSE_SOURCE_UNLISTED_NARROWED not in GLOBAL_RESERVATION_CAUSES, (
+        "a narrowed row never holds `__global__`, so a bucket for it in the global census would "
+        "be structurally unreachable")
+    assert CAUSE_SOURCE_UNLISTED_NARROWED in RESERVATION_CAUSES
+    # The shared decision function is a STRICT NARROWING of the PR's declared set and can never
+    # mint the serializing partition — the direction argument in its docstring rests on this.
+    for _pr_areas in ({"crate-a"}, {"crate-a", "crate-z"}, set(), {GLOBAL_PACKAGE},
+                      {GLOBAL_PACKAGE, "crate-a"}, {"", None, "crate-a"}):
+        _narrowed = unlisted_source_narrowing({}, 999, _pr_areas)
+        if _narrowed is None:
+            continue
+        assert _narrowed <= _pr_areas and GLOBAL_PACKAGE not in _narrowed, (_pr_areas, _narrowed)
+    assert unlisted_source_narrowing({}, 999, {GLOBAL_PACKAGE, "crate-a"}) is None
+    assert unlisted_source_narrowing({}, 999, set()) is None
+    assert unlisted_source_narrowing({999: []}, 999, {"crate-a"}) is None
+    assert unlisted_source_narrowing({}, 999, {"crate-a"}) == frozenset({"crate-a"})
+    print("  ok   #677 point 1: a valid record whose SOURCE ISSUE IS CLOSED reserves the PR's own "
+          "declared areas, on BOTH legs — and still fails closed on an area-less PR, a listed "
+          "area-less source, an unreadable issue map, and an `area:__global__` label")
     # a global plan item never co-runs with ANY in-flight worker PR
     assert filter_busy_area_items([{"number": 3, "package": "__global__", "deferred": False}],
                                   repo, [in_review], issue_labels, busy_prov,

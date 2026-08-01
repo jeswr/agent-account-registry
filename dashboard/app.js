@@ -270,8 +270,11 @@ function renderRepositoryAgents(activity, activeAgents) {
   const table = byId("repo-agents-table");
   const head = byId("repo-agents-head");
   const body = byId("repo-agents-body");
+  // Issue #78: the generator seeds one row per SERVICED repository, so an empty row set no longer
+  // means "the fleet is quiet" — it means the payload named no serviced repository at all (a
+  // pre-#78 or foreign snapshot). Say that, rather than reporting an idle fleet we did not observe.
   if (!activity.repositories.length) {
-    empty.textContent = "No agents currently active.";
+    empty.textContent = "No serviced repositories in this snapshot.";
     empty.hidden = false;
     table.hidden = true;
     head.replaceChildren();
@@ -281,11 +284,19 @@ function renderRepositoryAgents(activity, activeAgents) {
 
   const header = node("tr");
   header.append(node("th", "", "Repository"));
+  // Issue #78: the row total is what makes a ZERO row legible. On a fully quiet tick no model is
+  // live anywhere, so `models` is empty and the per-model columns alone would render a table of
+  // repository names with no numbers on it — the census would still be hiding the answer.
+  header.append(node("th", "numeric", "Agents"));
   for (const model of models) header.append(node("th", "numeric", model));
   const rows = [];
   for (const repository of activity.repositories) {
     const row = node("tr");
     row.append(node("td", "repository", repository.repository));
+    // Summed over the row's OWN counts, not over `models`, so a column set that ever narrowed
+    // cannot silently shrink the total an operator reads.
+    const live = Object.values(repository.counts).reduce((sum, count) => sum + count, 0);
+    row.append(node("td", "numeric", String(live)));
     for (const model of models) row.append(node("td", "numeric", String(repository.counts[model] || 0)));
     rows.push(row);
   }

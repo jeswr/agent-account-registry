@@ -159,12 +159,16 @@ AREA_PARK_LABEL = "needs:area"
 # The actions that WRITE. `--apply` mutates for each of them through the one shared applier; every
 # other verdict is a no-op skip (fail-closed: an unknown action never becomes a write).
 WRITING_ACTIONS = ("promote", "repark", "repair", "unpark-area")
-# The two lane attestations this sweep moves an issue between. Exactly one of them must be on the
-# issue after ANY accepted action: an issue on NEITHER lane is invisible to the readiness engine
-# AND to this sweep's own board queries, i.e. terminally stranded (registry #510's lane invariant).
-LANE_LABELS = frozenset({"status:ready", "status:untriaged"})
-# The verdict a decision is downgraded to when its unknown-label reduction cannot be applied safely.
-UNSAFE_DROP_REASON = "unknown-label-unsafe-drop"
+# The two lane attestations this sweep moves an issue between, and the verdict a decision is
+# downgraded to when its unknown-label reduction cannot be applied safely. Both are POINTERS, not
+# copies (registry #1490): the reduction they belong to now lives in `triage.py` and is shared with
+# `triage.py --apply`, so a second spelling here is the #958 shape waiting to happen. The lane
+# invariant they carry is unchanged (registry #510): exactly one lane label must be on the issue
+# after ANY accepted action — including `unpark-area`, whose label-only strip leaves the lane it
+# found untouched — because an issue on NEITHER lane is invisible to the readiness engine AND to
+# this sweep's own board queries, i.e. terminally stranded.
+LANE_LABELS = static_triage.LANE_LABELS
+UNSAFE_DROP_REASON = static_triage.UNSAFE_DROP_REASON
 NON_DISPATCHABLE = _ready.NON_DISPATCHABLE            # kind:epic
 # Bounded, rate-limit-safe sweep: an explicit per-run cap and a runaway ceiling on the paginated
 # snapshot. A partial page must never be mistaken for the whole board.
@@ -509,93 +513,31 @@ def apply_decision(current, decision, edit, view, read_state=None, warn=None):
 def validate_labels(decision, known_labels):
     """Reduce a decision to the labels the target repo ACTUALLY has. Returns (decision, dropped).
 
-    registry #510. `triage.triage()` already refuses to DERIVE a `role:*` label the repo lacks
-    (#582), but that is one label family out of several: the derived `priority:P4` floor and the
-    `status:*` lane attestations reached `gh issue edit` unchecked. GitHub rejects the WHOLE edit
-    when any single `--add-label` names a label the repository does not have, so one unknown
-    suggestion lost the entire mutation — the add-first role verification included — exited the
-    applier 1, and re-tripped identically on every following tick because nothing about the issue
-    had changed. Validating here, against the label set the run already fetched once, converts that
-    permanent red run into a named, per-label log line.
+    registry #510, and since #1490 the reduction itself is ONE implementation,
+    `triage.validate_plan`, shared with `triage.py --apply` — which had the same hole for every
+    non-`role:*` family. The contract (what is validated, why `remove` is NOT, what
+    `known_labels is None` means) is stated there, once; this wrapper adds only the part that is
+    retriage's own: WHICH decisions are writes.
 
-    WHAT IS VALIDATED, and what deliberately is not:
-      * `add` — every label, because each one is an API-level CREATE-OR-FAIL of the whole edit.
-      * the intended `role` — validated even though it is usually already in `add`, because
-        `apply_triage` writes the target INDEPENDENTLY of `add` (its add-before-strip phase 1 fires
-        whenever the target is not already on the issue). Dropping it here also withdraws every
-        `role:*` STRIP from the plan: that is #582's rule read from the other side — an incumbent
-        role is never stripped for a replacement this run has refused to write.
-      * `remove` is NOT validated. Removals are drawn from the issue's own live label set
-        (`triage()` intersects them with it), and a label ON an issue exists in the repository by
-        construction; filtering removals could only ever fail to strip something that must go.
-
-    `known_labels is None` means "label set unknown" and validates nothing — the same contract
-    `triage(known_labels=...)` uses. `_apply_cli` never passes None (it falls back to a live
-    `repo_label_set` read), so the tolerance exists for direct/plan-only callers, not for the sweep.
-    A non-writing decision is returned untouched: a skip has nothing to validate.
+    A non-writing decision is returned untouched — a skip has nothing to validate.
     """
-    if known_labels is None or decision.get("action") not in WRITING_ACTIONS:
+    if decision.get("action") not in WRITING_ACTIONS:
         return decision, []
-    known = set(known_labels)
-    add = list(decision.get("add", ()))
-    remove = list(decision.get("remove", ()))
-    role = decision.get("role")
-    target = f"{static_triage.ROLE_PREFIX}{role}" if role else None
-    unknown_target = bool(target) and target not in known
-    dropped = sorted({label for label in add if label not in known}
-                     | ({target} if unknown_target else set()))
-    if not dropped:
-        return decision, []
-    reduced = dict(decision)
-    reduced["add"] = sorted(label for label in add if label in known)
-    if unknown_target:
-        reduced["role"] = None
-        reduced["remove"] = sorted(label for label in remove
-                                   if not label.startswith(static_triage.ROLE_PREFIX))
-    else:
-        reduced["remove"] = sorted(remove)
-    return reduced, dropped
+    return static_triage.validate_plan(decision, known_labels)
 
 
 def drop_is_safe(decision, live_labels, issue_type, known_labels):
     """Is a decision REDUCED by `validate_labels` still the transition it claims to be?
 
-    registry #510. "Drop the unknown label and apply the rest" is only safe while the rest still
-    stands on its own, and for this classifier it frequently does not — every label it suggests is
-    load-bearing for the verdict that produced it. The measured case: an unprioritised
-    `status:untriaged` issue is promoted only BECAUSE the derived `priority:P4` floor makes it
-    triage-complete. Write the promotion without that floor and the post-state is a `status:ready`
-    issue with no readable priority, which `derive_priority` declines to floor a second time
-    (`ready-attested-regression`, the #586 lane) — so the very next tick re-parks it, the tick after
-    that promotes it again, and the sweep oscillates with two writes forever. Refusing is strictly
-    better AND agrees with the classifier: without the label the issue is not triage-complete, and
-    the correct action for an incomplete `status:untriaged` issue is to leave it parked.
-
-    Two named invariants, checked against the post-state the REDUCED write would produce:
-
-      * LANE — exactly one of `status:ready` / `status:untriaged` survives. A half-applied status
-        transition (the attestation dropped, its opposite still stripped) puts the issue on NEITHER
-        lane, where the readiness engine cannot see it and this sweep's own board queries cannot
-        select it again: terminal, and precisely the stranding #586 exists to undo.
-      * PREMISE — a decision that ATTESTS `status:ready` (promote/repair) must still classify READY
-        without the dropped labels. A re-park attests nothing, so it needs only to land on the park
-        lane, from which the promotion lane re-admits it the moment the label set is fixed.
-
-    Fail-closed: a classifier that raises here means the premise is unproven, which is a refusal.
+    registry #510; the LANE and PREMISE invariants and their measured oscillation argument live
+    with the shared implementation, `triage.reduced_write_is_safe` (#1490). This wrapper supplies
+    the one retriage-shaped input it takes: what the decision ATTESTS. A promote/repair attests
+    `status:ready`; a re-park attests nothing — the SAME action->ready conversion
+    `_decision_to_result` already makes when it hands a decision to the shared applier.
     """
-    post = (set(live_labels) | set(decision.get("add", ()))) - set(decision.get("remove", ()))
-    lanes = post & LANE_LABELS
-    if len(lanes) != 1:
-        return False
-    if decision.get("action") == "repark":
-        return "status:untriaged" in lanes
-    if "status:ready" not in lanes:
-        return False
-    try:
-        return bool(static_triage.triage(post, issue_type, trusted=True,
-                                         known_labels=known_labels)["ready"])
-    except Exception:                                     # noqa: BLE001 — unproven means refused
-        return False
+    return static_triage.reduced_write_is_safe(
+        decision, live_labels, issue_type, known_labels,
+        attests_ready=decision.get("action") != "repark")
 
 
 def workflow_step_script(text, step_id):
@@ -2067,9 +2009,24 @@ def _self_test():
         ({"action": "repair", "add": [], "remove": [], "role": None}, ["role:ci"]))
     chk("[#510] no label set means no validation (the documented `None` contract)",
         validate_labels(_promote510, None), (_promote510, []))
-    chk("[#510] a non-writing decision is never touched",
-        validate_labels({"action": "skip", "reason": "epic"}, set()),
-        ({"action": "skip", "reason": "epic"}, []))
+    # The one thing the wrapper owns since #1490: WHICH decisions are writes. Carrying labels on the
+    # skip is what makes the gate OBSERVABLE — measured, a `{"action": "skip", "reason": "epic"}`
+    # fixture has nothing to reduce, so removing the gate returned the identical value and the row
+    # could not fail. Fail-closed: an unknown or future action is a NO-WRITE, never something the
+    # reducer quietly turns into a smaller write.
+    chk("[#510] a non-writing decision is never touched, even one carrying labels",
+        validate_labels({"action": "skip", "reason": "epic", "add": ["role:soundness"],
+                         "remove": [], "role": "soundness"}, set()),
+        ({"action": "skip", "reason": "epic", "add": ["role:soundness"], "remove": [],
+          "role": "soundness"}, []))
+    # [#1490] ...and the reduction itself is the SHARED object, not a second spelling of it. The
+    # literal is written out here on purpose: comparing the constant against itself cannot fail.
+    chk("[#1490] the lane labels and the unsafe-drop reason are triage.py's, by identity — the "
+        "reduction has ONE definition and this module points at it (AGENTS.md: #958)",
+        (LANE_LABELS is static_triage.LANE_LABELS,
+         UNSAFE_DROP_REASON is static_triage.UNSAFE_DROP_REASON,
+         UNSAFE_DROP_REASON, sorted(LANE_LABELS)),
+        (True, True, "unknown-label-unsafe-drop", ["status:ready", "status:untriaged"]))
 
     # drop_is_safe: the two named invariants that decide whether the REDUCED write may be applied.
     chk("[#510] LANE INVARIANT: a reduction that leaves the issue on NEITHER lane is refused "

@@ -105,12 +105,19 @@ def package_areas(package: Any) -> frozenset | None:
 def packages_conflict(left: Any, right: Any) -> bool:
     """Whether two partition keys exclude each other: TRUE iff their area sets INTERSECT.
 
-    THE one conflict predicate. Every enforcement site — the allocator's `partition_available`,
-    the cross-lane `sibling_lease_conflict`, the PLAN assemble filter and the CLAIM-time live
-    re-check — decides with this function rather than with `==`/`in` over the key STRING, because
-    a widening applied at one site and not at another admits work the other half then refuses,
-    which is worse than either. The universal key intersects everything, so `__global__` on either
-    side still serializes in both directions exactly as before."""
+    THE conflict predicate over two KEYS. Both LEDGER enforcement sites — the allocator's
+    `partition_available` and the cross-lane `sibling_lease_conflict` — decide with this function
+    rather than with `==`/`in` over the key STRING, because a widening applied at one site and not
+    at another admits work the other half then refuses, which is worse than either. The universal
+    key intersects everything, so `__global__` on either side still serializes in both directions
+    exactly as before.
+
+    The two OPEN-PR sites (`dispatch-claim.filter_busy_area_items` and
+    `revalidate_items_against_live_pulls`) decide against the expanded busy UNION and reach this
+    semantics through `partition_defer_attribution`, which shares `package_areas` but not this
+    function — a second implementation, equivalent by test rather than by construction. Any change
+    to the exclusion RULE (not merely to set parsing) has to land in both; see
+    `research/1011-global-partition-bounded-concurrency.md` §4."""
     left_areas, right_areas = package_areas(left), package_areas(right)
     if left_areas is None or right_areas is None:
         return True

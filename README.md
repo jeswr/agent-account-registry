@@ -887,6 +887,39 @@ the parsed document in memory and required to come back named.
   quarantine path, removing that persistence primitive at its source. Drift ABORTS without
   mutating human-owned issue state; `final_state` returns the issue to the pool.
 
+- A FAILED local gate no longer discards the model's work — it RETAINS it for diagnosis (issue #33).
+  The publisher writes nothing whatsoever to the target — that is unchanged — but it keeps the same
+  digest-verified, pre-gate bundle as a 30-day artifact of the failing run
+  (`gate-failed-issue-<N>-<run>-<attempt>`), so a human debugging a systematic gate failure still
+  has the failing tree instead of a 1-day artifact nothing ever reads. It fires only on a gate that
+  RAN and returned `failure` (a skipped/absent verdict — e.g. a toolchain step that died after the
+  pre-gate seal — is not a failure and retains nothing), and only for a bundle that matched the
+  pre-gate record. The issue still converges to `status:deferred`.
+
+  **The diagnostic is an ARTIFACT, not a branch, and that is the security property.** Retaining the
+  work as a Git ref in the target — even under a namespace invisible to provenance reconciliation,
+  the review enumerator and `groom` — would not make it inert: the push carries a
+  contents+workflows-write App token, so it raises a `push` event in the target and any `on: push`
+  workflow there runs as a consequence, including one the candidate bundle itself adds under
+  `.github/workflows/`. That would let gate-FAILED, unreviewed content reach target-side execution
+  with the target's own Actions capabilities and secrets. An artifact executes nothing, is scoped to
+  this run in this repository, and the retention step is ordered BEFORE every App-token mint in the
+  job.
+
+  **What a failed gate may hold, exactly.** Ordering alone only says no credential exists *during*
+  the upload, so the publisher's contents+workflows+issues+PR-write mint is itself keyed on gate
+  success and a verified bundle: on a failed gate it SKIPS and its token is empty, and every
+  target-touching step below it (checkout, pre-publish trust re-check, push/PR) stays skipped as
+  before. The one credential the failure lane does reach is a separate `issues: write`-ONLY token
+  for follow-up filing — the lane that must survive a refused patch (issue #40), so that declared
+  out-of-scope work is still captured. It can open an issue and nothing else: no ref, no code, no
+  workflow, no pull request.
+
+  **Scope: nothing consumes that artifact automatically.** The next attempt still starts the model
+  from a fresh default-branch checkout and the fix loop only ever operates on an existing pull
+  request's head, so this lane does NOT resume a failed attempt and does NOT avoid re-paying the
+  model cost. A recovery consumer is separate, unbuilt work.
+
 ## Registering a new account (web-login broker)
 
 You don't paste tokens manually. Instead:

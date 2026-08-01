@@ -204,6 +204,28 @@ jobs:
             : > "$base_retirements"
           fi
           suite=$(bash scripts/worker-live.sh print-selftest-suite "$base_manifest" "$base_retirements")
+          # [issue #1371] THE #824 DEPENDENCY PREFLIGHT, in the lane where the green is
+          # load-bearing. registry_selftest_gate OPENS with this check — "an unrunnable row must
+          # never be confused with a failing one" — but this step calls the CLI arms directly, so
+          # until now the required `gate` was the one lane that ran the suite unpreflighted.
+          # MEASURED on a checkout with neither jq nor PyYAML (diagnosing #1346): 29 of the 56
+          # enrolled rows reported FAILING, with output that reads exactly like real defects —
+          # `policy-resolve` announcing that every enrolled PR would be merged on a self-attested
+          # record, `retriage`'s #605 pagination assertions red — every one an artifact of the two
+          # absent dependencies (the seam probes `import yaml` lazily and read the exception as "not
+          # proof of wiring"; the fake-`gh` shims shell out to `jq` and exit 127). The same tree is
+          # 56/56 green with both installed. Fail-closed either way, so this is diagnosis, not a
+          # hole: refuse under the ENV-BLOCKED class BEFORE the loop instead of printing 29 rows a
+          # reader will act on. Both dependencies are provisioned for this job (PyYAML by the
+          # hash-locked install step above), so a refusal here is a runner/provisioning regression,
+          # never a finding about the tree under test.
+          #
+          # The suite argument is QUOTED and the arm requires exactly one: an unquoted expansion,
+          # which would preflight only the first entry, refuses instead. This call is pinned
+          # ADJACENT to the derivation above by worker-live.sh's --self-test, so deleting it,
+          # suppressing it with `|| true`, wrapping it in an `if false`, or moving it after the loop
+          # is itself a red.
+          bash scripts/worker-live.sh preflight-selftest-env "$suite"
           n=0
           # Every enrolled self-test runs through worker-live.sh's `run-selftest` SANDBOX, never
           # directly: it puts a refusing `gh` shim first on PATH and reds if any self-test reached
