@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4313,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6882d1e62e866c936595d11e4c624a3ba2347177",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The README still says streaming serialization provides \"smaller peak memory\". The change removes the whole-document rendering String and therefore reduces serialization-time buffering, but it does not guarantee a lower process high-water mark. The PR's construct-stream documentation explicitly reports that larger graph-materialization transients can dominate VmHWM and mask the removed allocation. This is the same minor issue recorded in round 3.",
+    "file": "crates/sparq-cli/README.md",
+    "fix_hint": "Replace \"smaller peak memory\" with a structural claim such as \"avoids allocating the whole rendered document as one String\" or \"reduces serialization-time buffering\".",
+    "severity": "minor",
+    "title": "Peak-memory claim remains stronger than the implementation guarantees"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is materially unchanged from round 3. The streaming implementation remains sound as scoped: graph evaluation completes before serialization, large GET responses use bounded chunks, small and empty results preserve Content-Length behavior, HEAD remains buffered, and the real-path protocol tests check byte identity, Turtle reparsing, HEAD, empty results, and pre-stream budget refusal. The CLI broken-pipe test is non-vacuous and checks the child status and stderr. The prior minor documentation overstatement remains: the CLI README still categorically promises smaller peak memory even though the PR's own benchmark notes explain that process peak RSS did not separate and may be dominated by earlier graph materialization. This does not block approval but should be corrected to describe reduced serialization buffering/allocation.",
+  "verdict": "approve"
+ }
+}
