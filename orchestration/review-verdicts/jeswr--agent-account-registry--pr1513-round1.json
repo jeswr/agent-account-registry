@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1513,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "bd32323280a37b62224c78c22ac15d18ab497231",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The diff only corrects stale explanatory comments and docstrings to reflect the bidirectional retriage behavior introduced by #586. The revised claims match the implementation: retriage boards only status:untriaged/status:ready issues, skips gates and ownership states before classification, repairs a role-less ready issue when classifier output restores enumerability, and deliberately leaves an ambiguous-role ready issue unchanged because exclusion_reason accepts any role while routing_refusal rejects multiple roles. The quarantine failure explanation is also accurate: an issue with neither status attestation is not retriageable. No executable behavior, trust check, workflow permission, or test assertion is changed, and no reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
