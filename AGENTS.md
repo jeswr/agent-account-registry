@@ -30,8 +30,15 @@ measured the cost of duplication directly — two copies of one guard make each 
 unkillable.
 
 1. **Line coverage FIRST — and read it LINE-granular, not function-granular.** Run the module's own
-   `--self-test` under `python3 -m trace --count` (stdlib; nothing to install) and list the
-   **never-executed LINES** before you mutate anything. Four for four as a predictor of where
+   `--self-test` under `python3 -m trace --count --missing -C <dir> <script> --self-test` (stdlib;
+   nothing to install), then read `<dir>/<module>.cover` and list its `^>>>>>>` **never-executed
+   LINES** before you mutate anything. **`--count` alone never writes a `>>>>>>` marker**: uncovered
+   lines have a blank count prefix unless `--missing` is present, so grepping a count-only report
+   always returns a vacuous zero. `-C <dir>` also writes a cover file for every module touched,
+   including stdlib modules; select the file by the module's own name, never by globbing and taking
+   the first result. Run a script that derives `REPO_ROOT` from `__file__` only at a path with the
+   real repository tree beside it: a self-test that dies during path discovery can still leave a
+   cover file from a run that measured nothing. Four for four as a predictor of where
    mutants survive: **#756** (`cmd_record` + `_read_json` never executed → the shipped tree
    printed `planned_rows=4` where the mutant printed `0`), **#956** (the module's **only two write
    methods** had never executed anywhere), **#937** (`main` + `_gh_readers` at 0 % → **13 of 13**
@@ -46,6 +53,8 @@ unkillable.
    10**; **#941**'s `_escalate_two_head` had **1 of 3 call sites covered at 3/3 confidence**, which
    **#945** re-derived as **3 of 4 site lines never executed while the enclosing functions read
    75 %**. ⚠️ **Validate the coverage instrument against a function you know is never called**:
+   temporarily append a never-called function, rerun the exact command, and confirm its executable
+   line appears as `>>>>>>` in the module's own cover file before trusting the report.
    #756's counted docstring lines as covered, scored a never-called function at 6.2 %, and printed
    *"no code unit is entirely unexecuted"*; #956's reported zero uncovered lines from a mode that
    **cannot emit one**. An instrument that cannot fail has told you nothing.
