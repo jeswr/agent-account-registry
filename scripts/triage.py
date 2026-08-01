@@ -752,6 +752,45 @@ _LOGIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?$")
 APPROVAL_REACTOR_PROBE_CAP = 50
 
 
+def approval_probe_order(logins, priority_logins):
+    """The candidates to probe, IN PROBE ORDER, plus how many the cap drops. (PR #1628 r1 f1.)
+
+    THE CAP MUST NOT BE ORDERABLE BY THE ATTACKER. Capping a SORTED candidate list on its own is a
+    public-input denial of the whole durable-approval behaviour: anyone can react on a public
+    repository, so 50 sock-puppet logins that sort before the maintainer's push every real approval
+    off the end of the probed prefix, the step reports `maintainer_approved=0`, and the next content
+    event re-quarantines an issue the maintainer had deliberately released. A cap whose contents a
+    third party chooses is not a bound on the adversary, it is a lever for one.
+
+    So the EXACT-MATCH trusted identities — the same `MAINTAINER_LOGIN` / `APP_BOT_LOGIN` the
+    caller's `trust_of` recognises BY NAME — are hoisted to the front and are CAP-EXEMPT: no volume
+    of reactions can displace them, and because `trust_of` answers for those two without an API call
+    at all, hoisting them costs the quota the cap protects exactly nothing. The general population is
+    probed after them, up to the cap; the caller stops at its first trusted reactor.
+
+    A priority login is only ever emitted if it ACTUALLY REACTED (`logins` is the intersection
+    filter): this function can promote evidence, never manufacture it, so a mis-set login variable
+    cannot conjure an approval — and since every emitted login comes from `approval_reactors()`, the
+    `_LOGIN_RE` hygiene the caller's API path depends on holds for the priority entries too.
+
+    THE RESIDUAL IS NAMED, NOT HIDDEN: a write+ COLLABORATOR who is neither exact-match identity is
+    still only recognised by a permission probe, so a flood can still push one past the cap. That
+    candidate is DROPPED, which withholds an approval (fail-closed), the drop is warned about with a
+    count by the caller, and the exact-match path plus the label-removal path both remain open.
+    Closing that residual needs an authoritative write+ collaborator enumeration rather than a bigger
+    guess at the cap; it is out of scope here and filed separately.
+
+    Returns `(ordered candidates, dropped count)`.
+    """
+    candidates = list(dict.fromkeys(logins))
+    reacted = set(candidates)
+    priority = [login for login in dict.fromkeys(priority_logins or ()) if login in reacted]
+    hoisted = set(priority)
+    rest = [login for login in candidates if login not in hoisted]
+    return (priority + rest[:APPROVAL_REACTOR_PROBE_CAP],
+            max(0, len(rest) - APPROVAL_REACTOR_PROBE_CAP))
+
+
 def approval_reactors(reactions):
     """Every LOGIN that left a 👍 on this issue — CANDIDATES only, never an approval verdict.
 
@@ -774,12 +813,17 @@ def approval_reactors(reactions):
     return sorted(logins)
 
 
-def _approval_reactors_cli(text):
+def _approval_reactors_cli(text, priority_logins=()):
     """Print the 👍 reactor logins, one per line, for a reactions read on stdin. NON-ZERO if unreadable.
 
     `gh api --paginate` emits ONE JSON array per page, concatenated, so the pages are decoded in
     SEQUENCE rather than by a single `json.loads` — which sees trailing data at the start of page 2
     and raises, turning a merely long reaction list into a hard refusal.
+
+    `priority_logins` are the caller's EXACT-MATCH trusted identities; they are printed first and are
+    exempt from the probe cap, so an attacker cannot bury a real approval under sock-puppet reactions
+    (`approval_probe_order()` carries that argument). They are still only CANDIDATES — this side
+    never answers "approved", and the caller puts every line through its own write+ probe.
 
     The caller's `|| reactors=""` turns any non-zero exit into NOT APPROVED. That is the whole
     fail-closed contract of this reader: an unreadable reaction list must never read as approval.
@@ -802,14 +846,13 @@ def _approval_reactors_cli(text):
                   "refusing to report a maintainer approval", file=sys.stderr)
             return 1
         entries.extend(page)
-    logins = approval_reactors(entries)
-    if len(logins) > APPROVAL_REACTOR_PROBE_CAP:
-        print(f"::warning title=quarantine::{len(logins)} 👍 reactors exceed the "
-              f"{APPROVAL_REACTOR_PROBE_CAP}-candidate probe cap — "
-              f"{len(logins) - APPROVAL_REACTOR_PROBE_CAP} candidate(s) are NOT probed and so are "
-              "NOT treated as approvals; a maintainer can still release the issue by removing the "
-              "`trust:untrusted` label", file=sys.stderr)
-        logins = logins[:APPROVAL_REACTOR_PROBE_CAP]
+    logins, dropped = approval_probe_order(approval_reactors(entries), priority_logins)
+    if dropped:
+        print(f"::warning title=quarantine::{dropped} 👍 candidate(s) are NOT probed and so are NOT "
+              f"treated as approvals — the non-exact-match candidates exceed the "
+              f"{APPROVAL_REACTOR_PROBE_CAP}-candidate probe cap. The exact-match maintainer/App "
+              "identities are probed FIRST and are exempt from the cap, and a maintainer can still "
+              "release the issue by removing the `trust:untrusted` label", file=sys.stderr)
     for login in logins:
         print(login)
     return 0
@@ -2378,6 +2421,7 @@ def _self_test():
     # is visible here; a containment check sees none of those.
     _decision_subst = {"ACTION": "SENTINEL-ACTION", "author_trusted": "SENTINEL-AUTHOR",
                        "actor_trusted": "SENTINEL-ACTOR", "approved": "SENTINEL-APPROVED",
+                       "MAINTAINER_LOGIN": "SENTINEL-MAINTAINER", "APP_BOT_LOGIN": "SENTINEL-APP",
                        "REPO": "o/r", "NUM": "7"}
     chk("[#1009] the decision argv the workflow passes is EXACTLY these flags, in this order, each "
         "bound to its OWN shell variable",
@@ -2386,10 +2430,29 @@ def _self_test():
         ["--quarantine-decision", "--action", "SENTINEL-ACTION",
          "--author-trusted", "SENTINEL-AUTHOR", "--actor-trusted", "SENTINEL-ACTOR",
          "--maintainer-approved", "SENTINEL-APPROVED"])
-    chk("[#1009] ...and the reactions filter is invoked with EXACTLY `--approval-reactors` — it "
-        "reads its payload from stdin and takes no login or approval argument of its own",
+    # ...and the reactions filter's OWN argv, whole. It reads its payload from stdin and takes no
+    # approval argument — but it DOES take the two cap-exempt identities (PR #1628 r1 f1), and each
+    # must be bound to its OWN env variable: wire both `--priority-login`s to `$MAINTAINER_LOGIN`
+    # and the App bot's 👍 is silently crowdable again, which a containment check would not see.
+    # Distinct sentinels + adjacency, per pre-flight 6.
+    chk("[#1009/#1628 r1 f1] ...and the reactions filter is invoked with EXACTLY "
+        "`--approval-reactors` plus the two EXACT-MATCH identities as cap-exempt priority logins",
         next((argv for argv in workflow_argvs(triage_wf, "triage.py", _decision_subst)
-              if "--approval-reactors" in argv), None), ["--approval-reactors"])
+              if "--approval-reactors" in argv), None),
+        ["--approval-reactors", "--priority-login", "SENTINEL-MAINTAINER",
+         "--priority-login", "SENTINEL-APP"])
+    # The identities the filter is handed are the SAME two `trust_of` matches by name. Both sides are
+    # read off the workflow FILE and checked against each other AND against the hand-written pair —
+    # equality alone would be satisfied by two EMPTY sets, i.e. by a `trust_of` that exact-matches
+    # nothing. A third env variable on one side only, or a rename, reds this rather than quietly
+    # shipping a priority set `trust_of` does not recognise: a login hoisted there is a login no
+    # probe can then approve, which is the crowd-out defect wearing a different hat.
+    _priority_flags = sorted(set(re.findall(r"--priority-login \"\$(\w+)\"", trust_body)))
+    chk("[#1628 r1 f1] the cap-exempt priority logins are EXACTLY the logins `trust_of` trusts by "
+        "exact match — no third identity, and none of them invented for the reactor path",
+        (_priority_flags,
+         _priority_flags == sorted(set(re.findall(r'\[ "\$1" = "\$(\w+)" \]', trust_body)))),
+        (["APP_BOT_LOGIN", "MAINTAINER_LOGIN"], True))
     # ONE SPELLING OF THE WRITE+ RULE, bound across the two files that own one (#958; #1009 asked
     # for exactly this rather than a third copy). The workflow's `case` arm above and
     # `trust-gate.py`'s WRITE_PLUS are independent definitions in files with no shared owner, and
@@ -3216,14 +3279,17 @@ print(os.environ["STUB_LABELS"])
                             "jeswr", "agent-account-registry[bot]", "a-1")]),
         ["a-1", "agent-account-registry[bot]", "jeswr"])
 
-    def _reactors_cli(text):
+    def _reactors_cli(text, *priority):
         """`--approval-reactors` over `text` on stdin -> (exit code, stdout lines, stderr)."""
+        argv = ["--approval-reactors"]
+        for login in priority:
+            argv += ["--priority-login", login]
         buffer, errors = io.StringIO(), io.StringIO()
         saved = sys.stdin
         sys.stdin = io.StringIO(text)
         try:
             with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(errors):
-                code = main(["--approval-reactors"])
+                code = main(argv)
         finally:
             sys.stdin = saved
         return code, buffer.getvalue().split(), errors.getvalue()
@@ -3262,12 +3328,63 @@ print(os.environ["STUB_LABELS"])
     chk("[#1009] the candidate list is capped at the declared probe cap, and the drop is WARNED "
         "about with the count — never silently truncated",
         (APPROVAL_REACTOR_PROBE_CAP, len(_capped[1]), _capped[0],
-         "3 candidate(s) are NOT probed" in _capped[2]), (50, 50, 0, True))
+         "3 👍 candidate(s) are NOT probed" in _capped[2]), (50, 50, 0, True))
     _uncapped = _reactors_cli(json.dumps(
         [_reaction(f"user-{index:03d}") for index in range(APPROVAL_REACTOR_PROBE_CAP)]))
     chk("[#1009] NEGATIVE CONTROL: a list AT the cap is passed through whole and warns about "
         "nothing",
         (len(_uncapped[1]), _uncapped[2]), (50, ""))
+    # -----------------------------------------------------------------------------------------------
+    # [PR #1628 r1 f1] THE CAP MUST NOT BE ORDERABLE BY THE ATTACKER. Anyone can react on a public
+    # repository, so capping a SORTED candidate list handed the flooder the choice of WHICH
+    # candidates survive: 50 sock-puppets sorting before `jeswr` pushed the maintainer's own 👍 off
+    # the probed prefix, the step reported NOT approved, and the next content event re-quarantined an
+    # issue the maintainer had deliberately released — a deterministic public-input denial of the
+    # durable approval this PR exists to add. The exact-match identities are now hoisted and exempt.
+    # -----------------------------------------------------------------------------------------------
+    # `aaa-###` sorts BEFORE both exact-match identities, so every one of these rows is genuinely
+    # crowd-shaped: the trusted login is beyond the sorted prefix the cap keeps.
+    _flood = [_reaction(f"aaa-{index:03d}") for index in range(APPROVAL_REACTOR_PROBE_CAP + 10)]
+    _crowded = _reactors_cli(json.dumps(_flood + [_reaction("jeswr")]), "jeswr",
+                             "agent-account-registry[bot]")
+    chk("[PR #1628 r1 f1] a flood of 60 third-party 👍 CANNOT bury the maintainer's own: the "
+        "exact-match identity is probed FIRST and is exempt from the cap",
+        (_crowded[0], _crowded[1][0], "jeswr" in _crowded[1], len(_crowded[1]),
+         "10 👍 candidate(s) are NOT probed" in _crowded[2]),
+        (0, "jeswr", True, APPROVAL_REACTOR_PROBE_CAP + 1, True))
+    # THE KILL: the SAME corpus with no priority identity declared is the pre-fix behaviour. If the
+    # hoist is deleted (or the workflow stops passing the logins) the row above degrades to exactly
+    # this, so the two together fail in opposite directions and neither is vacuous.
+    _crowded_out = _reactors_cli(json.dumps(_flood + [_reaction("jeswr")]))
+    chk("[PR #1628 r1 f1] KILL CONTROL: with NO priority identity the very same flood does bury "
+        "`jeswr` — the corpus really is beyond the cap, so the row above is not vacuous",
+        ("jeswr" in _crowded_out[1], len(_crowded_out[1])), (False, APPROVAL_REACTOR_PROBE_CAP))
+    # The App bot is the other exact-match identity, and it is hoisted from the SAME flood.
+    _crowded_app = _reactors_cli(json.dumps(_flood + [_reaction("agent-account-registry[bot]")]),
+                                 "jeswr", "agent-account-registry[bot]")
+    chk("[PR #1628 r1 f1] ...and the registry App bot's 👍 is hoisted out of the same flood",
+        (_crowded_app[1][0], len(_crowded_app[1])),
+        ("agent-account-registry[bot]", APPROVAL_REACTOR_PROBE_CAP + 1))
+    # FAIL-CLOSED: hoisting PROMOTES evidence, it never manufactures it. A priority login that left
+    # no reaction must not be printed — otherwise a mis-set login variable alone would hand the
+    # caller a candidate to trust-probe, and the exact-match identities pass `trust_of` BY NAME, so
+    # that one line would be an approval nobody gave.
+    chk("[PR #1628 r1 f1] a priority login that did NOT react is not emitted — the hoist can "
+        "promote evidence, never invent it",
+        (_reactors_cli(json.dumps([_reaction("amy")]), "jeswr")[:2],
+         _reactors_cli("[]", "jeswr")[:2]), ((0, ["amy"]), (0, [])))
+    # ORDERING AND HYGIENE of the ordering function itself, directly: priority first in the order the
+    # caller declared, no duplicate line for a hoisted login, and the general population still
+    # capped. A hoisted login left in `rest` too would be probed twice — quota the cap exists to
+    # protect.
+    chk("[PR #1628 r1 f1] the probe order is priority-first, de-duplicated, and the rest is capped",
+        approval_probe_order(["aaa", "bbb", "jeswr"], ["jeswr", "aaa", "jeswr"]),
+        (["jeswr", "aaa", "bbb"], 0))
+    chk("[PR #1628 r1 f1] the DROP COUNT counts only the non-exempt candidates the cap discards",
+        [approval_probe_order([f"aaa-{index:03d}" for index in range(count)] + ["jeswr"],
+                              ["jeswr"])[1]
+         for count in (0, APPROVAL_REACTOR_PROBE_CAP, APPROVAL_REACTOR_PROBE_CAP + 7)],
+        [0, 0, 7])
 
     # THE STEP'S OWN ORDER, statically, over the EXECUTABLE lines only (the prose in this step
     # legitimately names the commands it is explaining). The courtesy read must come AFTER the
@@ -3697,6 +3814,37 @@ sys.exit(subprocess.run(["gh", *args[1:]], check=False).returncode)
         ("1", "0", 0, ["api repos/o/r/collaborators/ext/permission --jq .permission",
                        "api repos/o/r/issues/7/reactions --paginate",
                        "api repos/o/r/collaborators/aaa/permission --jq .permission"]))
+    # [PR #1628 r1 f1] EXECUTED, END TO END: the crowd-out attack against the durable approval.
+    # `aaa-###` sorts before `jeswr`, so 60 of them fill the whole sorted prefix the cap keeps; the
+    # maintainer's own 👍 sits beyond it. Before the hoist this step reported `maintainer_approved=0`
+    # and re-quarantined on this very event. The WHOLE call log is the expectation: `trust_of`
+    # recognises the maintainer BY NAME, so the exemption is not just correct but FREE — not one of
+    # the 60 sock-puppets is ever probed.
+    _flood_reactions = [{"content": "+1", "user": {"login": f"aaa-{index:03d}"}}
+                        for index in range(APPROVAL_REACTOR_PROBE_CAP + 10)]
+    _flood_code, _flood_outputs, _flood_calls, _flood_log = _run_trust_step(
+        reactions=_flood_reactions + [{"content": "+1", "user": {"login": "jeswr"}}])
+    chk("[PR #1628 r1 f1] EXECUTED: 60 third-party 👍 sorting ahead of the maintainer do NOT bury "
+        "the maintainer's own — the issue is still released, and no sock-puppet is ever probed",
+        (_flood_code, _flood_outputs.get("maintainer_approved"),
+         _flood_outputs.get("quarantine"), _flood_calls),
+        (0, "1", "0", ["api repos/o/r/collaborators/ext/permission --jq .permission",
+                       "api repos/o/r/issues/7/reactions --paginate"]))
+    # THE ANNOUNCED RESIDUAL (AGENTS.md: "no silent caps"). A write+ COLLABORATOR who is neither
+    # exact-match identity is recognised only by a permission probe, so a flood CAN still push one
+    # past the cap. That withholds an approval — the fail-closed direction — and it is WARNED about
+    # with a count in the step log rather than passing silently. Pinned so the bound stays a stated
+    # bound: if the drop ever stops being announced, or starts dropping the exempt identities, this
+    # row and the one above disagree.
+    _resid_code, _resid_outputs, _resid_calls, _resid_log = _run_trust_step(
+        permissions={"zzz": "write"},
+        reactions=_flood_reactions + [{"content": "+1", "user": {"login": "zzz"}}])
+    chk("[PR #1628 r1 f1] EXECUTED, ANNOUNCED BOUND: a non-exact-match write-role 👍 pushed past "
+        "the cap withholds the approval (fail-closed) and the drop is WARNED with its count",
+        (_resid_code, _resid_outputs.get("maintainer_approved"), _resid_outputs.get("quarantine"),
+         "11 👍 candidate(s) are NOT probed" in _resid_log,
+         [call for call in _resid_calls if "/collaborators/zzz/" in call]),
+        (0, "0", "1", True, []))
     # THE CONTENT FILTER IS LOAD-BEARING: the reactor is fully trusted here, so only the reaction's
     # own content name can keep this quarantined. Widen the filter past `+1` and this reds.
     chk("[#1009] EXECUTED: a 👎/heart from a WRITE+ login is not an approval — only 👍 counts",
@@ -3790,6 +3938,12 @@ def build_parser():
     # see `approval_reactors()` for why this side must never answer "approved".
     ap.add_argument("--approval-reactors", action="store_true",
                     help="read a reactions API payload on stdin; print the 👍 reactor logins")
+    # The CAP-EXEMPT identities (PR #1628 r1 f1). The caller passes the SAME exact-match logins its
+    # own `trust_of` recognises by name, so a flood of third-party reactions cannot push a real
+    # approval off the end of the probed prefix. Still candidates: a login here is printed only if
+    # it actually reacted, and the caller trust-probes every line it gets.
+    ap.add_argument("--priority-login", action="append", default=[],
+                    help="an exact-match trusted login to probe FIRST, exempt from the probe cap")
     # The quarantine NOTICE pair (PR #1565 r1). One asks whether an authentic notice already exists
     # — read off the comments themselves, never off the label — and the other composes the notice,
     # so the marker and the body have exactly one definition between the workflow and this module.
@@ -3810,7 +3964,7 @@ def main(argv=None):
                                          a.maintainer_approved) else "0")
         return 0
     if a.approval_reactors:
-        return _approval_reactors_cli(sys.stdin.read())
+        return _approval_reactors_cli(sys.stdin.read(), a.priority_login)
     if a.quarantine_notice_posted:
         return _quarantine_notice_cli(sys.stdin.read())
     if a.quarantine_notice_body:

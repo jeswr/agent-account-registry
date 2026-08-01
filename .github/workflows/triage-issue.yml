@@ -119,9 +119,16 @@ jobs:
           # THE FALLBACK DIRECTION IS DELIBERATE and is the one place a fallback belongs in this
           # step: an unreadable reaction list yields NO candidates, hence NOT approved, which can
           # only ever ADD quarantine. (The decision call below still has none — see there.)
+          # THE PROBE CAP IS NOT ORDERABLE BY THE ATTACKER (PR #1628 r1 f1). Candidates are capped
+          # because each one costs a permission call on a list a drive-by controls — but capping a
+          # SORTED list alone let 50 sock-puppet logins that sort earlier bury the maintainer's own
+          # 👍, reporting NOT approved and re-quarantining on the next edit. The two EXACT-MATCH
+          # identities below are handed to the filter as cap-exempt and are probed first; `trust_of`
+          # answers for them BY NAME, so hoisting them costs no API call at all.
           approved=0
           reactors=$(python3 scripts/gh_retry.py read api "repos/$REPO/issues/$NUM/reactions" --paginate \
-            | python3 scripts/triage.py --approval-reactors) || reactors=""
+            | python3 scripts/triage.py --approval-reactors \
+                --priority-login "$MAINTAINER_LOGIN" --priority-login "$APP_BOT_LOGIN") || reactors=""
           while IFS= read -r reactor; do
             [ -n "$reactor" ] || continue
             if [ "$(trust_of "$reactor")" = "1" ]; then
