@@ -149,21 +149,6 @@ jobs:
       # policy change adding a third owner fails here instead of silently dropping that owner's
       # token (which would reintroduce the wrong-owner-token bug). Repo names are not secret; tee
       # keeps the minted scope visible in the run log.
-      # [#1573] The estate already computes this population every executed dispatch tick and
-      # reports it ONLY to a workflow log. This routes it to the same upsert-and-close ops-alert
-      # transport the ci-latency/plan/usage alerts use. It changes NO gate.
-      - name: Alert on parked PRs only a human can clear (#1573)
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REGISTRY_REPO: ${{ github.repository }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          MAINTAINER_HANDLE: jeswr
-        run: |
-          set -euo pipefail
-          python3 scripts/park-stock-alert.py --self-test
-          python3 scripts/park-stock-alert.py
-
       - name: Resolve enabled target repos per owner from policy
         id: owners
         run: |
