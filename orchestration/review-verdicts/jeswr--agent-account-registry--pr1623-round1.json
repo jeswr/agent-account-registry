@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1623,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0d551e3599ad55ecac0df4ad65a2f59a2b5a2af2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly makes both open-issue and open-pull pagination explicitly oldest-first, preventing concurrent creations from shifting already-read rows onto later pages while retaining the fail-closed duplicate guards. The new tests exercise the real paginator, independently pin exact query tokens, validate that the fixture reproduces the former newest-first race, cover both production call sites, and verify both duplicate-guard shapes. Existing test fixtures are updated to the new exact request paths. No trust check, permission boundary, or untrusted-text execution path is weakened.",
+  "verdict": "approve"
+ }
+}
