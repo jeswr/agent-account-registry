@@ -296,6 +296,11 @@ RECORD_KNOWN_FIELDS = RECORD_BASE_FIELDS | RECORD_NO_CHANGE_FIELDS
 MAX_UNKNOWN_RECORD_FIELDS = 8
 ORIGIN_WRITE = "write"   # a record THIS release is introducing: the vocabulary above is closed
 ORIGIN_READ = "read"     # a record already on the shared ledger: additive growth is tolerated
+# The CLOSED set of postures. `_validate_record` branches exhaustively over it rather than testing
+# `== ORIGIN_WRITE` and letting everything else mean READ: the read posture is the permissive one,
+# so an unrecognised origin — a typo'd literal at a future call site — must not be the value that
+# silently selects it.
+RECORD_ORIGINS = frozenset({ORIGIN_WRITE, ORIGIN_READ})
 #
 # WHY THE TWO POSTURES DIFFER (issue #739 — a strict read allowlist made every additive field a
 # self-inflicted outage). A worker run's registry checkout is pinned at DISPATCH and its health job
@@ -808,8 +813,10 @@ def _validate_record(r, origin, known=RECORD_KNOWN_FIELDS):
     (with the raw-handle pattern refused everywhere) — nothing can carry a raw identifier,
     Markdown/HTML markup, an injected marker, or an unbounded blob into the PUBLIC ledger.
 
-    `origin` states which side of the rolling-upgrade seam the record comes from and has NO default,
-    so a future call site must declare its posture rather than inherit the wrong one by omission
+    `origin` states which side of the rolling-upgrade seam the record comes from, has NO default and
+    must be one of RECORD_ORIGINS, so a future call site must declare its posture rather than inherit
+    the wrong one by omission OR by typo — an unrecognised origin is refused as a ValueError (the
+    class every caller here fails closed on) instead of falling through to the permissive read side
     (issue #739). ORIGIN_WRITE: this release is introducing the record, the field vocabulary is
     CLOSED, and any undeclared field is refused outright. ORIGIN_READ: the record is already on the
     shared ledger and may have been written by a later release, so a field this module does not know
@@ -821,6 +828,12 @@ def _validate_record(r, origin, known=RECORD_KNOWN_FIELDS):
     still run — and exists so the self-test can drive this as a reader one release behind, which is
     exactly where #733's traceback came from. Every production call site takes the module's own
     RECORD_KNOWN_FIELDS."""
+    if origin not in RECORD_ORIGINS:
+        # Refused BEFORE the record is looked at: the branch below is exhaustive over the two
+        # postures, and the fallback posture is the permissive one. A ValueError (not an
+        # AssertionError/TypeError) because every caller of this contract fails closed on exactly
+        # that class — a mis-declared origin must refuse the record, not escape their handlers.
+        raise ValueError("model-health record validated with an unknown origin posture")
     if not isinstance(r, dict):
         raise ValueError("model-health ledger contains a non-object entry")
     if not all(isinstance(field, str) for field in r):
@@ -4561,6 +4574,16 @@ def _test_forward_compatibility(chk):
         _raises(lambda: _validate_record(ahead, ORIGIN_READ)), False)
     chk("[#739] `origin` has no default, so a new call site cannot inherit the wrong posture",
         _raises_type(lambda: _validate_record(ahead), TypeError), True)
+    # ...and REQUIRING the argument is not the same as VALIDATING it. The permissive posture is the
+    # fallback of any `== ORIGIN_WRITE` test, so a typo'd write-side literal would admit `ahead`'s
+    # undeclared field on the very path that is supposed to refuse it. The origin below is a LITERAL
+    # near-miss of ORIGIN_WRITE, carried by the SAME record the two rows above split on: deleting the
+    # RECORD_ORIGINS membership check turns this row green (it would validate as READ and return),
+    # and the class is asserted because every caller here catches ValueError and nothing else.
+    chk("[#739] a MISSPELLED origin is refused rather than falling through to the permissive read "
+        "posture", _outcome(lambda: _validate_record(ahead, "writ")), "ValueError")
+    chk("[#739] ...and so is an origin of the wrong type entirely",
+        _outcome(lambda: _validate_record(rec(), None)), "ValueError")
 
     # ---- THE SEAM. append_record read-modify-writes the WHOLE blob, so both postures have to hold
     # at the one call site that actually PUTs: refuse to INTRODUCE an undeclared field, and never

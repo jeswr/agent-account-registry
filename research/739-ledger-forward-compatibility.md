@@ -81,8 +81,12 @@ unrecognised fields for the raw-handle pattern, which `lease_schema` does not do
 
 ## 4. The mechanism as shipped
 
-`_validate_record` takes an **`origin` with no default** (omitting it is a `TypeError`, so a future
-call site must state its posture instead of inheriting the wrong one):
+`_validate_record` takes an **`origin` with no default** (omitting it is a `TypeError`) that is also
+**checked for membership in `RECORD_ORIGINS`** (anything else is a `ValueError`), so a future call
+site must state its posture instead of inheriting the wrong one by omission *or* by typo. Requiring
+the argument alone would not have been enough: `READ` is the permissive posture and would have been
+the fallback of any `== ORIGIN_WRITE` test, so a misspelled write-side literal would have quietly
+admitted undeclared fields. The two postures are:
 
 - **`ORIGIN_WRITE`** — `make_record`, and the record `append_record` is introducing. The vocabulary
   (`RECORD_KNOWN_FIELDS`) is **CLOSED**; any undeclared field is refused outright, exactly as
