@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5548,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3ed0e0eba7f79c2de779275c123494bdcb20a43e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The design now explicitly explains why an existential `solidx:inDoc` guard and document-qualified intermediates over untagged triples are insufficient, requires per-triple provenance or loader-minted document-qualified triples for P3, retains shared-subject dependency edges until that hardening lands, and mandates a non-vacuous split-authorization RED-then-GREEN regression. The phased dependencies and fallback posture remain conservative, and uncertainties (including unanalysed ODRL interaction) are disclosed as prerequisites rather than claimed solved. No new correctness, soundness, test-validity, or security issue is evident in the diff-scoped design record.",
+  "verdict": "approve"
+ }
+}
