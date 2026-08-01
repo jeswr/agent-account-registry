@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1637,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4ba49ebd9953b1753e1ddeb7af9dd0bef911b231",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 1 defines the property as no row array ever being readable on the ledger ref. Sections 3 and 6 correctly establish that A and B run only after a commit is public, while section 4 calls C necessary but insufficient. Nevertheless section 7 says the property is true going forward after steps 1\u20133, even though step 2 explicitly permits omitting B and C is only a self-tested obligation in one future collector. A direct write, a second producer, or a regression that reaches the contents API still makes the rows publicly readable before A fails the dashboard; even B would only alarm after disclosure. This also makes the section 5 statement that only C can achieve the property too strong given the document's own admission that C is insufficient alone.",
+    "file": "research/891-ledger-observability-row-refusal.md",
+    "fix_hint": "Either narrow the target property to detection/refusal by the dashboard and state that the sequence does not prevent ledger publication, or specify an enforceable pre-write control that covers every writer able to update data/observability.json (with bypass/direct-write assumptions made explicit). Remove the claim that steps 1\u20133 establish the absolute section 1 property unless the design actually closes all write paths before publication.",
+    "severity": "major",
+    "title": "The proposed sequence cannot make the stated ledger property true"
+   }
+  ],
+  "progress": null,
+  "summary": "The record usefully distinguishes consumer refusal from prevention, but its final sequencing contradicts that analysis and claims an absolute ledger property that the recommended controls cannot establish. Because this is the load-bearing design conclusion, the document is not sound enough to approve as written.",
+  "verdict": "request_changes"
+ }
+}
