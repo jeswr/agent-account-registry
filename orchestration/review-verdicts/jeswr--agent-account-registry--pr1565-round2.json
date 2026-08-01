@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1565,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a718a1d17797294c527653b115be564b5bc448ae",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-1 cancellation finding is resolved. De-duplication now reads author-filtered, line-anchored evidence of the notice itself rather than inferring it from the quarantine label, and unreadable/missing evidence falls toward retrying the courtesy notice without weakening the fail-loud label write or verification. The executable workflow-step tests cover interruption after the persisted label mutation, a failed comment post followed by retry, forged third-party comments, courtesy-read failure, and the unchanged fail-closed verification path. I found no blocker or major issue in the diff.",
+  "verdict": "approve"
+ }
+}
