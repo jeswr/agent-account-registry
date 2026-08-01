@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "51bde6688e140866",
-   "claim_id": "a5b3242979f64bb48bf9d5ed3583721e",
-   "holder": "sparq-org/sparq#5148@30710068804.1",
-   "package": "ci",
-   "role": "ci",
-   "model": "opus5",
-   "issued_at": 1785604779,
-   "expires_at": 1785611079
-  },
-  {
-   "account": "51bde6688e140866",
    "claim_id": "b0d8fe37f80a4a57a14feeac61044ad6",
    "holder": "jeswr/agent-account-registry#1301@30710247779.1",
    "package": "groom",
