@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5556,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bbff73528dd9a2343ad7e28621f0e0c6bd747e4e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major finding is resolved. The revised decision record now accurately states that neither gate-new-crate.py nor assert_workspace_tree enforces registration of a newly added crate in the root workspace manifest, and it no longer relies on area:workspace to serialize such PRs. Instead it documents the actual conservative invariant: unknown sparq-* area keys share the rule-3 (sparq,) bucket, while unresolved changed paths cause area derivation to emit no labels and occupancy reserves no fallback global area. The paired self-tests are non-vacuous for that invariant: unknown crate keys serialize, while the otherwise identical pair using recognized disjoint crate keys dispatches concurrently. The added Cargo.toml attribution assertion also pins the independent root-manifest mapping. No correctness, security, or test-validity issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
