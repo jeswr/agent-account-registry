@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5357,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d460484e050889b931cc4b83b5cae09a09992d6f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [
+   {
+    "body": "Section 8 now promises that every phase and both shipped-code defects are queued, but supplies no bead IDs or issue URLs and explicitly says to backfill them after they are minted. That does not resolve round 1: the committed artifact still relies on future Markdown bookkeeping, including for the attacker-triggerable factorial-allocation defect in section 6.1. Under the repository contract, planned follow-up must already exist as beads and out-of-scope discoveries must already be filed or linked through the self-improvement issue lane.",
+    "file": "research/sparq-canon-oxrdf03-bridge-removal.md",
+    "fix_hint": "Create or deduplicate the beads for phases 1-8 and the self-improvement issues for sections 6.1 and 2.2a, then replace the backfill promise with their concrete IDs/URLs before landing this record. If any item is already tracked, link that existing record instead of creating a duplicate.",
+    "severity": "major",
+    "title": "The phased plan still leaves all follow-up work untracked"
+   },
+   {
+    "body": "Sections 1 and 8 substantially improve the prior autonomy problem by requiring all local preparation to proceed and isolating publication. However, they justify the remaining `needs:user` state by calling opening the third-party PR intrinsically owner-only. The standing rule permits a block for external credentials/access the agent literally lacks, not merely because an action is characterized as owner-filed. The record establishes no-network execution for the investigation pass, but not a durable owner-only restriction for later networked agents.",
+    "file": "research/sparq-canon-oxrdf03-bridge-removal.md",
+    "fix_hint": "State the concrete blocker as unavailable third-party publication credentials/access when that is actually the case. If an authorized future agent has the necessary access, require it to publish without waiting for greenlight; otherwise queue only that credential-dependent action.",
+    "severity": "minor",
+    "title": "Publication is described as owner-only instead of access-blocked"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 improves the autonomy wording and narrows the publication-only credential boundary, but the principal tracking defect remains materially unchanged: the record still contains eight actionable phases and two live out-of-scope defects without any concrete bead IDs or self-improvement issue URLs. It says they will be queued with the record's landing and backfilled later, which is still a Markdown promise rather than the repository-required tracked work. The publication phase is now substantially clearer, but it should describe the blocker as unavailable external access/credentials rather than an intrinsically owner-only action. Because the same major tracking finding persists, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
