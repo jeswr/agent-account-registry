@@ -22170,6 +22170,71 @@ agent = "impl"
     print("  ok   #738: role:impl is single-rung AND escalating; starvation defers transiently with "
           "its own counted reason before any park")
 
+    # [registry #720] AN OPUS5 PREMIUM-QUOTA CLIFF IS A CAPACITY PARK, NEVER `needs:user`.
+    # account-usage.py now OBSERVES claude-opus-5's rate-limit headers and select-and-claim gates
+    # opus5 admission on the premium bucket it declares (`_opus5_eligible`). opus5 is the SOLE
+    # anthropic tier, and `review`/`soundness`/`research`/the security override are all single-rung
+    # opus5 chains with no fallback — so the first thing a bucket cliff can do is take every one of
+    # them out at once. Where that lands is the whole question: a capacity exhaustion is
+    # machine-recoverable BY DEFINITION and belongs in the machine-owned `status:parked` hold with
+    # an automatic re-admission path, not on the maintainer's front door (registry #703).
+    #
+    # This is the COMPOSITION, driven through the REAL allocator and the LIVE routing table — the
+    # pure-function rows in select-and-claim's own suite cannot see which arm of the ladder a cliff
+    # reaches. `_o5_fresh` has healthy WHOLE-ACCOUNT headroom throughout: that is the point, because
+    # it is exactly what the pre-#720 gate admitted on.
+    _o5_alloc = _load_module("registry_select_and_claim_720",
+                             Path(__file__).resolve().parent / "select-and-claim.py")
+    _o5_accounts = [{"handle": "o5a", "models": ["opus5"], "max_concurrent_workers": 2,
+                     "available": True}]
+    _o5_fresh = {"status": "allowed", "5h_util": "0.05", "5h_reset": 1, "7d_util": "0.05",
+                 "7d_reset": 2}
+    _o5_cliff = {"o5a": {**_o5_fresh, _o5_alloc.OPUS5_PREMIUM_WINDOW_KEY: "7d_oi",
+                         _o5_alloc.OPUS5_PREMIUM_UTIL_KEY: "0.97"}}
+    _o5_ok = {"o5a": {**_o5_fresh, _o5_alloc.OPUS5_PREMIUM_WINDOW_KEY: "7d_oi",
+                      _o5_alloc.OPUS5_PREMIUM_UTIL_KEY: "0.02"}}
+    _o5_cliff_cap = _o5_alloc.dynamic_concurrency(_o5_accounts, _o5_cliff, ["opus5"])
+    _o5_ok_cap = _o5_alloc.dynamic_concurrency(_o5_accounts, _o5_ok, ["opus5"])
+    # The PAIR: a cliff yields zero eligible capacity, and the same fleet with bucket headroom does
+    # not — so the row below is the gate and not a fixture that can never dispatch.
+    assert (_o5_cliff_cap, _o5_ok_cap) == (0, 2), (_o5_cliff_cap, _o5_ok_cap)
+    # A cliff is MEASURED exhaustion (a live, non-empty usage map with a zero cap), so it takes the
+    # STARVED arm — not the `usage is None` arm, which is an unmeasured fleet that merely defers.
+    assert escalate_starved(True, _o5_cliff, _o5_cliff_cap) is True
+    assert escalate_starved(True, _o5_ok, _o5_ok_cap) is False
+    # Every single-rung opus5 route in the LIVE table escalates, so none of them can silently defer
+    # forever. MUTANT: drop `escalate = true` from any of them => this reds.
+    _o5_routes = [_r for _r in tomllib.loads(
+        (Path(__file__).resolve().parents[1] / "orchestration" / "routing.toml")
+        .read_text(encoding="utf-8")).get("route", []) if _r.get("model_chain") == ["opus5"]]
+    assert _o5_routes, "the live routing table declares no single-rung opus5 route"
+    assert all(_r.get("escalate") is True for _r in _o5_routes), _o5_routes
+    # AND THE ARM IT REACHES IS THE MACHINE-OWNED ONE. Decided on the PARSED tree, over the body of
+    # the production `if escalate_starved(...)` branch only: a capacity cliff must park through
+    # `_park_source_issue` (the `status:parked` soft hold, which the deferred-retry lane lifts by
+    # itself when capacity recovers) and must NEVER route through `_pr_needs_user`. Textually this
+    # is unassertable — both spellings appear all over this file — and every pure row above stays
+    # green if the branch is re-pointed at the human terminal.
+    _o5_ifs = [_node for _node in ast.walk(ast.parse(_dispatch_src))
+               if isinstance(_node, ast.If) and isinstance(_node.test, ast.Call)
+               and isinstance(_node.test.func, ast.Name)
+               and _node.test.func.id == "escalate_starved"]
+    assert len(_o5_ifs) == 1, (
+        f"expected exactly one production `if escalate_starved(...)` branch, found {len(_o5_ifs)} "
+        "— refusing to assert against a branch that cannot be located (fail closed)")
+    _o5_branch_calls = {_n.func.id for _stmt in _o5_ifs[0].body for _n in ast.walk(_stmt)
+                        if isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name)}
+    assert "_park_source_issue" in _o5_branch_calls, (
+        "the starved arm must park through _park_source_issue (the machine-owned status:parked "
+        "soft hold with an automatic re-admission path)")
+    for _forbidden in ("_pr_needs_user", "_issue_needs_user_landed"):
+        assert _forbidden not in _o5_branch_calls, (
+            f"an opus5 quota cliff must never reach {_forbidden}: registry #703 — a capacity "
+            "exhaustion is machine-recoverable by definition and must not terminate on the "
+            "maintainer's desk")
+    print("  ok   #720: an opus5 premium-bucket cliff is MEASURED capacity exhaustion, takes the "
+          "starved arm, and parks machine-owned (status:parked) — never needs:user")
+
     # Issue #116: a starved escalate route must NOT convert one transient usage snapshot into a
     # permanent human terminal. escalate_persist_decision separates the momentary-starved predicate
     # (escalate_starved, above) from the bounded, PERSISTENT decision to escalate to needs:user.

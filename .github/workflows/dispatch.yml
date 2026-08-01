@@ -1919,6 +1919,12 @@ jobs:
       # into the account issues' front-matter so per-account tier limits stop being "TBD".
       # Best-effort; the allocator ignores the extra `limits:` line entirely.
       - name: Persist probed tier limits to the account catalog
+        # [#720] `id:` so account-usage.py's --self-test can LOCATE this step and pin its argv
+        # exactly. This is the durable half of the opus5 observation: the snapshot lives in
+        # $RUNNER_TEMP for one tick, this step is what writes what the probe SAW into the account
+        # issues. An inert step (deleted, `if: false`, a renamed flag) means the question #720 asks
+        # is never answered by data, so the seam is asserted structurally, not by substring.
+        id: persist-limits
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}

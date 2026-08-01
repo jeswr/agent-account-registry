@@ -424,16 +424,17 @@ SAFETY_MARGIN = 0.10  # default fraction of each window that must remain free to
 # remaining headroom. Set margin >= a typical worker's per-window burn to actually prevent half-finishes.
 # Per-repo overridable via policy `usage_safety_margin`. Projected-burn admission is tracked as follow-up.
 
-# [FABLE-5] Models whose OWN weekly sub-quota (the account-usage `fable_7d_oi_*` window) must ALSO have
-# headroom before a worker starts — routing one of these to an account with low WHOLE-account usage but an
-# exhausted premium bucket fails mid-run and burns credits. account-usage.py only ever emits the fable
-# sub-quota fields for the claude-fable-5 alias; keep this in sync with any alias that maps to that bucket.
-# opus5 (claude-opus-5, the primary anthropic tier since 2026-07-24) is DELIBERATELY not listed yet:
-# its rate-limit bucket mapping is unobserved, and wiring it to the fable probe would gate opus5
-# admissions on ANOTHER model's headers. Revisit once account-usage observes claude-opus-5 headers
-# (add the alias here + emit its sub-quota fields there in the same change).
-PREMIUM_MODELS = frozenset({"fable"})
+# [FABLE-5] Models whose OWN weekly sub-quota must ALSO have headroom before a worker starts —
+# routing one of these to an account with low WHOLE-account usage but an exhausted premium bucket
+# fails mid-run and burns credits. The alias -> gate map lives below `_fable_eligible` /
+# `_opus5_eligible` (it holds the gates themselves, so PREMIUM_MODELS cannot name an alias that has
+# no rule and quietly fall through to the whole-account test).
 FABLE_WINDOW = "fable_7d_oi"  # prefix of the fable sub-quota util/reset keys in the usage map
+# [#720] The keys account-usage.py's claude-opus-5 OBSERVATION writes into a usage entry. The window
+# NAME is the arming signal: it is present iff that probe actually saw a rate-limit window the
+# whole-account 5h/7d pair does not cover, so observation and enforcement are the same fact.
+OPUS5_PREMIUM_WINDOW_KEY = "opus5_premium_window"
+OPUS5_PREMIUM_UTIL_KEY = "opus5_premium_util"
 
 # --- EXEMPTION IS NOT REACHABILITY (registry #639) -------------------------------------------------
 # The probe exemption (issue #29) answers ONE question: this provider publishes no usage headers, so
@@ -496,9 +497,51 @@ def _fable_eligible(u, margin):
     return util is not None and (1.0 - util) >= margin
 
 
+def _opus5_eligible(u, margin):
+    """[#720] Headroom test for the opus5 premium sub-quota, ARMED BY OBSERVATION.
+
+    opus5 (claude-opus-5) has been the SOLE anthropic tier since the 2026-07-26 deprecation, and it
+    was never premium-gated because its rate-limit mapping was unobserved — so whole-account 5h/7d
+    headroom was the only thing admitting an opus5 worker. That is genuine protection ONLY IF
+    Anthropic publishes no separate bucket for claude-opus-5. account-usage.py now OBSERVES that
+    (`_assemble_opus5`) and declares what it saw, and this reads the declaration. Three states,
+    deliberately NOT fable's two:
+
+      * NO window declared -> True. The probe saw no rate-limit window beyond the whole-account
+        pair (or could not observe at all), so the 5h/7d gate above is the whole story and
+        admission is EXACTLY what it is today. This is the no-regression arm, and it is why the
+        gate could land before the answer was known: absence of evidence must not park the fleet's
+        only anthropic tier, which is a machine-recoverable capacity condition escalating onto a
+        human's desk (#703).
+      * a window IS declared and READABLE -> require >= margin headroom IN THAT WINDOW.
+      * a window IS declared and UNREADABLE -> False. An unknown premium bucket is precisely the
+        case where whole-account headroom is misleading, so refuse rather than fall back to it.
+    """
+    if not isinstance(u, dict) or OPUS5_PREMIUM_WINDOW_KEY not in u:
+        return True                                   # unobserved / no distinct bucket -> as today
+    window = u.get(OPUS5_PREMIUM_WINDOW_KEY)
+    if not isinstance(window, str) or not window.strip():
+        return False                                  # declared but unnameable -> unreadable
+    util = _usage_num(u.get(OPUS5_PREMIUM_UTIL_KEY))
+    # Same SHAPE validation the base windows get (issue #196): a `nan` utilization makes every
+    # comparison false and a NEGATIVE one looks like excess headroom, so both would admit an
+    # account whose premium bucket is in an unknown state.
+    if util is None or not (0.0 <= util <= 1.0):
+        return False                                  # present but unreadable -> refuse, never
+    return (1.0 - util) >= margin                     # fall back to whole-account headroom
+
+
+# The alias -> premium-sub-quota gate map. PREMIUM_MODELS is DERIVED from it rather than written
+# beside it: two hand-maintained copies of one membership are how an alias comes to be premium in
+# name and ungated in fact (#945 — a duplicated guard makes each copy individually unkillable).
+PREMIUM_WINDOW_GATES = {"fable": _fable_eligible, "opus5": _opus5_eligible}
+PREMIUM_MODELS = frozenset(PREMIUM_WINDOW_GATES)
+
+
 def usage_eligible(u, margin=SAFETY_MARGIN, model=None, now=None):
     """Fail-closed admission test for STARTING a worker (of `model`) on an account. Beyond the whole-account
-    5h/7d headroom, a PREMIUM_MODELS route (fable) additionally requires FABLE sub-quota headroom.
+    5h/7d headroom, a PREMIUM_MODELS route (fable, opus5) additionally requires ITS OWN premium
+    sub-quota to have headroom — see PREMIUM_WINDOW_GATES.
 
     PROBE-EXEMPT providers (openai/codex — maintainer decision 2026-07-17, registry issue #29): their
     usage is not observable via any API, so the fail-closed require-usage arm does NOT apply to them —
@@ -548,8 +591,14 @@ def usage_eligible(u, margin=SAFETY_MARGIN, model=None, now=None):
         # Require a finite fraction in [0,1]; anything else is fail-closed ineligible.
         if util is None or not (0.0 <= util <= 1.0) or (1.0 - util) < margin:
             return False                              # unknown, malformed, or too little headroom
-    if model in PREMIUM_MODELS and not _fable_eligible(u, margin):
-        return False                                  # [FABLE-5] whole-account fine, but Fable bucket isn't
+    if model is not None and not isinstance(model, str):
+        # isinstance FIRST, the same reason the reachability arm above does it: a forged/ill-typed
+        # alias (an unhashable `[]` from a hand-edited chain) makes the dict lookup below RAISE and
+        # abort the whole dispatch instead of failing closed on this one account.
+        return False
+    premium_gate = PREMIUM_WINDOW_GATES.get(model)
+    if premium_gate is not None and not premium_gate(u, margin):
+        return False                                  # whole-account fine, but the premium bucket isn't
     return True
 
 
@@ -3575,6 +3624,89 @@ def _self_test():
           usage_eligible({**fresh, "fable_ok": False}, model="fable"), False)
     check("fable ineligible: 7d_oi window unknown",
           usage_eligible({**fresh, "fable_ok": True}, model="fable"), False)
+
+    # ---- [#720] opus5 premium sub-quota: OBSERVE, then gate --------------------------------------
+    # opus5 is the SOLE anthropic tier. Before #720 nothing gated it on a premium bucket, so an
+    # account with healthy WHOLE-ACCOUNT headroom admitted an opus5 worker even if its own bucket
+    # was exhausted — the worker then fails MID-RUN, burning credits and a lease. `fresh` below is
+    # exactly that account: 5h/7d at 10 %, i.e. the pre-#720 gate says "plenty of room".
+    #
+    # WHO WRITES THESE FIELDS: account-usage.py's `_assemble_opus5`, from the headers claude-opus-5
+    # really returned. Its own self-test drives THESE key names through THIS function, so a rename
+    # on either side reds there; the rows here pin the DECISION each observation must produce.
+    opus5_cliff = {**fresh, "opus5_probe": "observed",
+                   OPUS5_PREMIUM_WINDOW_KEY: "7d_oi", OPUS5_PREMIUM_UTIL_KEY: "0.96"}
+    opus5_room = {**opus5_cliff, OPUS5_PREMIUM_UTIL_KEY: "0.05"}
+    # (1) THE OBLIGATION: healthy whole-account headroom, exhausted opus5 bucket -> REFUSED.
+    #     MUTANT: remove "opus5" from PREMIUM_WINDOW_GATES, or make `_opus5_eligible` return True
+    #     unconditionally => this flips.
+    check("[#720] REFUSED: whole-account headroom is healthy but the opus5 bucket is exhausted",
+          usage_eligible(opus5_cliff, model="opus5"), False)
+    # ... and the PAIR that proves the row above is the gate and not a broken fixture.
+    check("[#720] ADMITTED: the same account with headroom IN the opus5 bucket",
+          usage_eligible(opus5_room, model="opus5"), True)
+    # (2) NO REGRESSION: an account with NO opus5 bucket data at all behaves exactly as today.
+    #     MUTANT: make an absent window fail closed => the fleet's only anthropic tier parks on the
+    #     first tick this ships, which is the outcome #720 explicitly refuses.
+    check("[#720] NO REGRESSION: no opus5 bucket data -> admitted, as before",
+          (usage_eligible(fresh, model="opus5"),
+           usage_eligible({**fresh, "opus5_probe": "error"}, model="opus5"),
+           usage_eligible({**fresh, "opus5_probe": "no-headers"}, model="opus5")),
+          (True, True, True))
+    # (3) FAIL CLOSED ON THE CLIFF, NOT OPEN: a DECLARED bucket that cannot be read must refuse
+    #     rather than fall back to whole-account headroom — an unknown premium bucket is exactly the
+    #     case where whole-account headroom is misleading. Each shape below admitted pre-#720.
+    for _label, _bad in (("absent utilization", None), ("empty", ""), ("garbage", "unavailable"),
+                         ("NaN", "nan"), ("negative (fake headroom)", "-1"),
+                         ("out of range", "1.5"), ("non-string window", 7),
+                         ("blank window name", "   ")):
+        _entry = {**opus5_cliff}
+        if _label in ("non-string window", "blank window name"):
+            _entry[OPUS5_PREMIUM_WINDOW_KEY] = _bad
+            _entry[OPUS5_PREMIUM_UTIL_KEY] = "0.05"     # a HEALTHY util must not rescue it
+        elif _bad is None:
+            _entry.pop(OPUS5_PREMIUM_UTIL_KEY)
+        else:
+            _entry[OPUS5_PREMIUM_UTIL_KEY] = _bad
+        check(f"[#720] REFUSED: opus5 bucket declared but unreadable ({_label})",
+              usage_eligible(_entry, model="opus5"), False)
+    # (4) The bucket is MODEL-SPECIFIC (the issue #450 lesson, re-asked for opus5): an exhausted
+    #     opus5 bucket must not erase the same account's slots for any other alias.
+    check("[#720] a cliffed opus5 bucket leaves haiku/sonnet/sol routing on that account untouched",
+          (usage_eligible(opus5_cliff, model="haiku"), usage_eligible(opus5_cliff, model="sonnet"),
+           usage_eligible(opus5_cliff, model=None)),
+          (True, True, True))
+    # (5) PREMIUM_MODELS is DERIVED from the gate map, so an alias can never be premium in name and
+    #     ungated in fact. MUTANT: re-introduce a hand-written `PREMIUM_MODELS = frozenset({...})`
+    #     that omits opus5 => the membership row flips while every gate row above stays green.
+    check("[#720] every premium alias HAS a gate, and every gate IS a premium alias",
+          (PREMIUM_MODELS, frozenset(PREMIUM_WINDOW_GATES), "opus5" in PREMIUM_MODELS),
+          (frozenset({"fable", "opus5"}), frozenset({"fable", "opus5"}), True))
+    # (6) An ill-typed alias must fail CLOSED, never raise: an unhashable value from a hand-edited
+    #     chain would abort the whole dispatch at the dict lookup (the OverflowError lesson).
+    check("[#720] an ill-typed model alias is refused, not raised",
+          (usage_eligible(fresh, model=["opus5"]), usage_eligible(fresh, model=7)), (False, False))
+    # (7) THE CLIFF DELIVERS INTO A CAPACITY CONDITION, NOT A ROUTING ONE. dispatch-claim's
+    #     `escalate_starved(escalate, usage, effective_cap)` reads exactly two things: a live usage
+    #     map (NOT None) and a zero effective cap. A cliffed fleet must produce BOTH — a measured,
+    #     non-empty snapshot whose eligible capacity is zero — because that is what routes to the
+    #     machine-owned `status:parked` capacity hold with an automatic re-admission path, instead
+    #     of the `usage is None` arm (an unmeasured fleet, which merely defers with no receipt).
+    #     The dispatch-claim self-test asserts the other half of this composition against the LIVE
+    #     routing table's single-rung opus5 chains.
+    O5 = [{"handle": "o5a", "models": ["opus5"], "max_concurrent_workers": 2, "available": True},
+          {"handle": "o5b", "models": ["opus5"], "max_concurrent_workers": 2, "available": True}]
+    cliffed_fleet = {"o5a": dict(opus5_cliff), "o5b": dict(opus5_cliff)}
+    healthy_fleet = {"o5a": dict(opus5_room), "o5b": dict(opus5_room)}
+    check("[#720] a fleet-wide opus5 bucket cliff is MEASURED capacity exhaustion (cap 0, map live)",
+          (dynamic_concurrency(O5, cliffed_fleet, ["opus5"]), cliffed_fleet == {},
+           choose_account(O5, [], ["opus5"], "p", "r", now, usage=cliffed_fleet)),
+          (0, False, None))
+    check("[#720] ... and the same fleet with bucket headroom still serves opus5 (not a dead fixture)",
+          (dynamic_concurrency(O5, healthy_fleet, ["opus5"]),
+           choose_account(O5, [], ["opus5"], "p", "r", now, usage=healthy_fleet)),
+          (4, "o5a"))
+
     # choose_account: fable route skips a fable-exhausted account, picks the healthy one.
     F = [{"handle": "fa", "models": ["fable"], "max_concurrent_workers": 1, "available": True},
          {"handle": "fb", "models": ["fable"], "max_concurrent_workers": 1, "available": True}]
