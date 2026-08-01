@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5603,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b0befc68bbca536450e0424c82c4fafb23e71ff4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 5.1 requires ground predicates only for premise join atoms, while safety merely requires head variables to occur in a premise join. A rule can therefore have a variable predicate in its conclusion and derive predicates from the active domain, so derived triples are not bounded by a fixed set P of rule-head predicates and may require an |A|^3 bound. More seriously, the engine's Term model supports compound List/Triple terms: a safe head can construct a new compound term from premise-bound variables, and recursive rules can nest such terms indefinitely without a blank node or a Func/ListGen/Binder builtin. Thus the assertion in 5.2 that existential invention is the only other term source is false, and conditions (1)-(5) do not by themselves prove termination or PTIME data complexity. The companion design file then overstates this as a proven bound.",
+    "file": "research/trust-admission-cost-decidability.md",
+    "fix_hint": "Strengthen BAF to require ground IRI predicates in conclusions and forbid term constructors (quoted triples/lists/formulae, as applicable) in recursive heads, or explicitly account for and prove a finite constructor depth/domain. Then revise A, P, the closure/work bounds, membership table, and the summary in solid-trust-graph-authz-design.md. Add concrete accepted/rejected rule examples or a checker-oriented test plan showing variable-head-predicate and recursive compound-head cases are outside the fragment.",
+    "severity": "major",
+    "title": "BAF conditions do not imply the claimed finite |P|*|A|^2 Herbrand base"
+   }
+  ],
+  "progress": null,
+  "summary": "The analysis is careful about exposure and caveats, but its load-bearing BAF termination/complexity theorem is not established by the stated five conditions. In particular, the fragment restricts only premise predicates and blank-node existentials; it does not require ground head predicates or forbid compound term construction in rule heads. Consequently the claimed fixed binary Herbrand base and closure bound do not follow. Because the design summary promotes this as a proven bound, the record needs correction before approval.",
+  "verdict": "request_changes"
+ }
+}
