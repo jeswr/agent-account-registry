@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1498,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0a104555e3355998d5fb872b558640497eb66ed2",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 correction remains complete and accurate. The design record distinguishes the two possible bounded-N mechanisms, evaluates their measured benefit and safety separately, preserves the fail-closed N=1 recommendation, and accurately identifies the four enforcement sites split between the key-vs-key ledger predicate and the independent key-vs-busy-union open-PR predicate. Its overrule requirements cover both implementations, PLAN/CLAIM and ledger agreement, one-sided mutation detection, malformed-cap fail-closed behavior, occupancy accounting, and durable co-tenancy evidence. The accompanying changes are documentation/docstring-only and correct the former single-predicate description without changing executable behavior, weakening a trust check, exposing credentials, or expanding workflow execution. No reviewer-directed prompt injection appears in the diff.",
+  "verdict": "approve"
+ }
+}
