@@ -24,10 +24,17 @@ removes it after the design pass, then the retriage path promotes.
 
 THE ROLE INVARIANT (registry #582 / #225 — a LIVE defect, not a hypothetical):
     An issue must NEVER leave triage with `status:ready` and no `role:*` label.
-A role-less `status:ready` issue is SILENTLY UNDISPATCHABLE and TERMINAL: ready-issues.py requires
-`role:*` for readiness (`has_role`), so the dispatcher never sees it; retriage.py only reconsiders
-`status:untriaged` issues, so it never sees it either; curate/groom skip it for their own reasons.
-Nothing recovers it — it has to be repaired by hand.
+A role-less `status:ready` issue is SILENTLY UNDISPATCHABLE: ready-issues.py requires `role:*` for
+readiness (`has_role`), so the dispatcher never sees it, and curate/groom skip it for their own
+reasons. Since #586 it is no longer TERMINAL — retriage.py's sweep is BIDIRECTIONAL, boarding
+`status:ready` issues as well as `status:untriaged` ones, and this is exactly its REPAIR lane: the
+classifier re-derives the lost `role:*` and the applier writes it back in place (or, when the drift
+does not restore enumerability, RE-PARKS the issue to `status:untriaged` so the promotion lane
+re-admits it on label restore). That recovery is a scheduled tick away and CONDITIONAL — the
+role must exist in the target repo's LIVE label set (#582/#510), and retriage skips every
+`needs:*`/`trust:untrusted`-gated, held, claim-owned, `status:deferred`, machine-parked or epic
+issue BEFORE it classifies. So the invariant stays triage's to hold: never emit the state and leave
+the sweep to clean it up.
 
 The live defect that motivated this module's fail-closed machinery: the role transition emitted
 `role:soundness` for trust-plane keyword matches, a label that DOES NOT EXIST in this repository's
@@ -826,9 +833,15 @@ def apply_triage(current, result, edit, view, warn=None, read_state=None):
         restores the incumbent role; an AMBIGUOUS role set (e.g. a concurrent actor injecting
         `role:ci` during a docs->impl transition) is repaired down to the single intended role. If
         the intended role cannot be determined safely — or the repair does not land — `status:ready`
-        is DEMOTED to `status:untriaged` so retriage (which only revisits `status:untriaged`) owns
-        the issue. An ambiguous `status:ready` issue is otherwise terminal: route-resolve rejects it
-        (AmbiguousRoleError), ready-issues keeps it ready, and retriage never looks at it.
+        is DEMOTED to `status:untriaged`, the lane retriage's PROMOTION direction owns and the
+        safest landing state. The demotion is still load-bearing after #586 made the sweep
+        bidirectional, because the `status:ready` direction deliberately does NOT recover THIS
+        issue: retriage composes `ready-issues.exclusion_reason` with the classifier, `has_role`
+        passes on ANY `role:*` so the exclusion predicate sees nothing wrong, and both authorities
+        agreeing is a `ready-consistent` skip (collapsing an ambiguous role set is this module's
+        own event-driven lane, by retriage's docstring). Left ready, the issue is dropped by
+        `routing_refusal` and rejected by route-resolve (AmbiguousRoleError) — attributably, since
+        #122/#586, but never repaired. Demoting is what puts it back on a lane that recovers it.
     ok=False is returned on every violation, so the caller's exit status turns the workflow RED.
     """
     warns = list(result.get("warnings", ()))
@@ -2009,7 +2022,9 @@ def _self_test():
     # [PR #595 finding 5] THE QUARANTINE LABEL WRITE IS FAIL-LOUD. `gh issue edit ... || true` on the
     # trust:untrusted/status:untriaged write meant a failed mutation left third-party content
     # UN-QUARANTINED while the job reported success — the worst failure mode on this surface, and
-    # invisible to retriage (which only revisits status:untriaged). Pinned statically so it cannot
+    # invisible even to the bidirectional (#586) retriage sweep, whose two lanes are BOTH keyed on a
+    # status attestation (status:untriaged / status:ready) that such an issue carries NEITHER of, so
+    # `retriage.plan` returns `not-retriageable` for it. Pinned statically so it cannot
     # regress: the label mutation carries no `|| true`, the step runs under `set -e`, and a post-read
     # proves both labels landed. (Only the courtesy comment may be best-effort.)
     wf_body = "\n".join(line for line in open(triage_wf, encoding="utf-8").read().splitlines()
