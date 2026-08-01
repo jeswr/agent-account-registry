@@ -345,9 +345,10 @@ MISSED_FIX_LIMIT = 6  # consecutive missed fix dispatches per round before needs
 # round marker LAST — so a recovery review that crashes before it leaves the round count flat and
 # the recovery re-emits on every tick that re-derives the posture, never converging on the human
 # hand-off #161 reserved for repeated failure. `strandedrecover` markers are written by the
-# DISPATCH (below, at the last point before `workflow run` — so only a recovery that really was
-# dispatched is charged), so they climb on exactly the runs the round marker misses; this many of
-# them for one recovery round is the terminal.
+# DISPATCH (below, only once `workflow run` has CONFIRMED the launch — so a failed or ambiguous
+# launch charges nothing and this human-owned terminal stays out of machine failure's reach), so
+# they climb on exactly the runs the round marker misses; this many of them for one recovery round
+# is the terminal.
 STRANDED_RECOVERY_LIMIT = 3
 # The worker-pr MARKER_KINDS key those markers are recorded under. The self-test asserts it is a
 # real member of that table, so renaming the kind in worker-pr.py reds here instead of silently
@@ -7005,12 +7006,12 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # repeated failure. (The pre-#161 behaviour escalated on the first observation, so the
             # loop terminated; #161 traded that for a bound it cannot always increment.)
             #
-            # `strandedrecover` is written by the DISPATCH itself — at the LAST point before
-            # `workflow run`, once the reviewer lease is claimed and the cross-provider assertions
-            # have passed — so it counts exactly the recoveries that were dispatched and whose
-            # round marker never landed. Nothing that stands the item down short of a dispatch
-            # (no free slot, a lease error, an unsafe claim, the #708 launch invariant) charges
-            # anything: this terminal is human-owned, and machine capacity may not reach one.
+            # `strandedrecover` is written by the DISPATCH itself — immediately after `workflow
+            # run` CONFIRMS the launch — so it counts exactly the recoveries that were dispatched
+            # and whose round marker never landed. Nothing that stands the item down short of a
+            # confirmed launch (no free slot, a lease error, an unsafe claim, the #708 launch
+            # invariant, a failed or ambiguous `workflow run`) charges anything: this terminal is
+            # human-owned, and machine failure may not reach one.
             # It is keyed to the round the recovery WOULD consume (`rounds + 1`): a
             # recovery that DID record its round moves the key forward and the counter starts
             # over, so a reset always means a round was genuinely recorded — never merely that
@@ -7375,8 +7376,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # round"; a no-slot tick dispatches nothing, so charging it would both write false
                 # evidence and let pure machine capacity starvation drive a question-class park
                 # (the class the taxonomy note on PARK_CAUSE_SITES_869 explicitly says capacity is
-                # NOT). The charge therefore sits at the DISPATCH, after the lease is acquired and
-                # validated — see the record-marker write just before `workflow run` below.
+                # NOT). The charge therefore sits at the CONFIRMED DISPATCH — see the
+                # record-marker write just AFTER `workflow run` returns 0, below.
                 try:
                     _run_target_helper(script_dir, repo, "worker-pr.py", [
                         "stranded-recover", "--repo", repo, "--pr", str(number),
@@ -7541,48 +7542,6 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 fix_dispatch["defer:unsafe-claim"] += 1
             print(f"defer review {repo}#{number}: {violation}; released + skipped")
             continue
-        # ---- [registry #406] CHARGE THE DURABLE STRANDED RECOVERY ATTEMPT ----------------------
-        # The LAST thing before the dispatch, and the FIRST point at which "a recovery review is
-        # being dispatched" is a true statement: the reviewer lease is claimed and the
-        # cross-provider assertions have passed, so nothing between here and `workflow run` can
-        # stand the item down. Everything upstream — the no-slot defer, a lease error, an unsafe
-        # claim, the #708 launch invariant — leaves the item UNCHARGED, because the budget above
-        # spends its attempts on a HUMAN-owned terminal and machine capacity must never be able to
-        # reach one (that is the missed-fix budget's `park_class="capacity"` job, one lane over).
-        #
-        # The residual over-count is one tick, in the safe direction: a marker recorded for a
-        # `workflow run` that then fails spends one attempt toward a human. The under-count is the
-        # one that must not exist — an attempt that is never counted can never converge.
-        #
-        # `recovery_round` is the SAME value the budget above counted (one derivation, reused, not
-        # re-derived): a charge keyed to a different round than the budget reads would leave the
-        # counter climbing on a key nothing checks.
-        #
-        # A write failure RELEASES the lease and dispatches nothing, as a counted lane error.
-        # Unlike the missed-fix marker below it needs no direct human escalation of its own: no
-        # review has run, so the item is exactly as enumerable next tick as it was this one, and a
-        # recovery that cannot be counted therefore never happens at all rather than happening
-        # uncountably. (The retraction upstream already landed, which is the same posture any
-        # other post-retraction refusal leaves behind.)
-        if item["state"] == "stranded":
-            try:
-                _run_target_helper(script_dir, repo, "worker-pr.py", [
-                    "record-marker", "--repo", repo, "--pr", str(number),
-                    "--kind", STRANDED_RECOVERY_MARKER_KIND,
-                    "--round", str(recovery_round), "--run-key", run_key,
-                    "--bot-login", bot_login])
-            except DispatchError as exc:
-                released = _release_failed_dispatch(allocator, registry_repo, claim_id)
-                if not released:
-                    print("::error::the stranded recovery's lease could not be released "
-                          "(claim still active until expiry)")
-                lanes[lane]["error"] += 1
-                defer_reasons["stranded-attempt-marker-write-failed"] += 1
-                print(f"::error::defer review {repo}#{number}: the durable stranded "
-                      f"recovery-attempt marker could not be recorded ({exc}); NOT "
-                      "dispatching, because a recovery this tick cannot count is a recovery "
-                      "the round-independent budget can never bound")
-                continue
         result = _run_gh([
             "workflow", "run", "review-fix.yml",
             "--repo", registry_repo,
@@ -7619,6 +7578,58 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 fix_dispatch["defer:dispatch-launch-failed"] += 1
             print(f"defer review {repo}#{number}: {mode} dispatch failed; skipped")
             continue
+        # ---- [registry #406] CHARGE THE DURABLE STRANDED RECOVERY ATTEMPT ----------------------
+        # AFTER the launch is CONFIRMED, and nowhere earlier. `workflow run` returning 0 is the
+        # only point on this path at which "a recovery review was dispatched" becomes a FACT
+        # rather than an intention, and the counter this feeds spends its attempts on a
+        # HUMAN-owned needs-user whose stated evidence is literally "N recovery dispatches
+        # recorded no review round".
+        #
+        # Charged one line EARLIER (the round-1 position, immediately before the launch) the
+        # marker survives the branch just above — which releases the lease, counts
+        # `dispatch-launch-failed` and starts NOTHING — so STRANDED_RECOVERY_LIMIT transient
+        # workflow-dispatch failures walk the PR into that terminal with evidence for N reviews
+        # that never ran. That is machine failure reaching a human-owned terminal, which every
+        # other stand-down on this path is careful to prevent: the no-slot defer, the lease
+        # error, the unsafe claim and the #708 launch invariant all leave the item UNCHARGED for
+        # exactly that reason (capacity gets the missed-fix budget's `park_class="capacity"`
+        # treatment one lane over, never a question-class park). An AMBIGUOUS launch — a nonzero
+        # exit from a POST that may or may not have reached the API — takes the same branch and
+        # is likewise not charged: fail closed by refusing to fabricate a dispatch, never by
+        # inventing evidence for a human hand-off.
+        #
+        # The residual is the reverse window — the launch succeeded and this write (or this
+        # process) then dies — and that is the deliberate direction. An uncharged attempt is
+        # LOUD (the counted lane error below, plus the workflow run that really did start), costs
+        # at most one attempt of the budget, and leaves the item exactly as enumerable next tick;
+        # a charged non-attempt is silent, permanent, and points a human at a PR nothing ever
+        # reviewed. Over-counting a HUMAN-owned terminal is the failure this budget may not have.
+        #
+        # `recovery_round` is the SAME value the budget above counted (one derivation, reused, not
+        # re-derived): a charge keyed to a different round than the budget reads would leave the
+        # counter climbing on a key nothing checks.
+        #
+        # The lease is NOT released on a write failure here (unlike the round-1 position, which
+        # ran before the launch): the review run that owns this claim has already started, so
+        # releasing would hand its account to a second dispatch. And unlike the missed-fix marker
+        # on the no-lease branch above, this needs no human escalation of its own — that budget
+        # can never accrue while its write fails, whereas this one accrues again on the very next
+        # recovery attempt, and needs-user rides the same target API that just refused this
+        # comment.
+        if item["state"] == "stranded":
+            try:
+                _run_target_helper(script_dir, repo, "worker-pr.py", [
+                    "record-marker", "--repo", repo, "--pr", str(number),
+                    "--kind", STRANDED_RECOVERY_MARKER_KIND,
+                    "--round", str(recovery_round), "--run-key", run_key,
+                    "--bot-login", bot_login])
+            except DispatchError as exc:
+                lanes[lane]["error"] += 1
+                defer_reasons["stranded-attempt-marker-write-failed"] += 1
+                print(f"::error::review {repo}#{number}: the stranded recovery WAS dispatched "
+                      f"but its durable recovery-attempt marker could not be recorded ({exc}); "
+                      "this attempt is UNCHARGED, so the round-independent budget cannot count "
+                      "it toward the human hand-off")
         launched += 1
         pending_telemetry["launched"] = True
         lanes[lane]["launched"] += 1
@@ -16190,9 +16201,20 @@ def _self_test():
         if args and args[0] == "stranded-recover" and fake.get("stranded_retract_raises"):
             raise DispatchError("simulated retraction failure")
         # [registry #406] The durable recovery-attempt marker write can fail like any other
-        # target write; `marker_write_raises` drives the fail-closed leg (charge, then nothing).
+        # target write; `marker_write_raises` drives the leg where the launch already happened
+        # and the charge for it cannot be recorded.
         if args and args[0] == "record-marker" and fake.get("marker_write_raises"):
             raise DispatchError("simulated marker write failure")
+        # [registry #406] `record_markers` makes this fake DURABLE: a recorded marker joins the
+        # comment fixture the NEXT tick reads, in the exact grammar `marker_runs` parses. That is
+        # what lets a multi-tick row measure the CHARGED COUNT — whether repeated attempts
+        # actually accumulate toward the human terminal — instead of only one tick's argv.
+        if args and args[0] == "record-marker" and fake.get("record_markers"):
+            fake.setdefault("comments", []).append({
+                "user": {"login": bot}, "created_at": "2026-07-30T00:00:00Z",
+                "body": f"x {wiring_worker_pr.MARKER_KINDS[args[args.index('--kind') + 1]]} "
+                        f"round={args[args.index('--round') + 1]} "
+                        f"run={args[args.index('--run-key') + 1]} -->"})
 
     def live_pull(*, draft, labels=(), body="", auto_merge=None, mergeable=True,
                   base_ref="main"):
@@ -16528,7 +16550,10 @@ def _self_test():
 
             def launching_run_gh(args, *, check=True):
                 launch_runs.append(list(args))
-                return subprocess.CompletedProcess(args, 0)
+                # [registry #406] `launch_rc` drives the FAILED-launch leg: `gh workflow run`
+                # exiting nonzero (a transient dispatch failure, or an ambiguous POST) releases
+                # the lease and starts nothing, so it must charge no recovery attempt.
+                return subprocess.CompletedProcess(args, fake.get("launch_rc", 0))
 
             real_launch_gh = _run_gh
             try:
@@ -16543,10 +16568,11 @@ def _self_test():
                 launched, reasons = run_items([stranded_item], allocator=alloc,
                                               routing=strand_routing)
                 # [registry #406] The recovery-attempt marker is charged LAST — after the
-                # retraction and after the lease, immediately before the launch — so this order
-                # is the ordering assertion: a record-marker moved ahead of stranded-recover
-                # would be a charge made upstream of `allocator.claim`, which is what let a
-                # no-slot tick bill a recovery that never happened.
+                # retraction, after the lease, and after `workflow run` confirms the launch — so
+                # this order is the ordering assertion: a record-marker moved ahead of
+                # stranded-recover would be a charge made upstream of `allocator.claim`, which is
+                # what let a no-slot tick bill a recovery that never happened. (Row (vii) is what
+                # pins it to the far side of the LAUNCH; this row cannot see that seam.)
                 assert [(script, args[0]) for script, args in helper_calls] == [
                     ("worker-pr.py", "stranded-recover"),
                     ("worker-pr.py", "record-marker")], helper_calls
@@ -16736,42 +16762,25 @@ def _self_test():
                 assert [(script, args[0]) for script, args in helper_calls] == [
                     ("worker-pr.py", "needs-user")], helper_calls
                 assert _s_launched == 0 and _s_alloc.calls == [], (_s_launched, _s_alloc.calls)
-                # (v) THE CHARGE IS FAIL-CLOSED: an attempt marker that cannot be recorded
-                # launches NOTHING and RELEASES the reviewer lease it had already claimed — an
-                # uncountable recovery never happens at all, rather than happening uncountably.
-                # Counted as a lane error, never a green defer. Dropping the release here would
-                # hold an account slot until expiry on every failed write.
+                # (v) THE CHARGE FOLLOWS THE LAUNCH, so a failed marker write cannot un-launch
+                # one. The review run already OWNS this claim, so the lease is deliberately NOT
+                # released here (releasing would hand its account to a second dispatch against
+                # the same PR while the first is running), and the dispatch is counted as the
+                # dispatch it was. The uncharged attempt is instead a LOUD counted lane error:
+                # swallowing it would leave the budget silently short of the human hand-off.
                 fake["marker_write_raises"] = True
-                _s_launched, _s_reasons, _s_alloc, _ = strand_run([])
+                _s_launched, _s_reasons, _s_alloc, _s_log = strand_run([])
                 assert [(script, args[0]) for script, args in helper_calls] == [
                     ("worker-pr.py", "stranded-recover"),
                     ("worker-pr.py", "record-marker")], helper_calls
-                assert _s_launched == 0 and launch_runs == [], (_s_launched, launch_runs)
-                assert _s_alloc.calls == [("review", ["sol", "luna"])], _s_alloc.calls
-                assert _s_alloc.releases == ["ab" * 16], _s_alloc.releases
+                assert _s_launched == 1, (_s_launched, _s_log)
+                assert [arg for args in launch_runs for arg in args
+                        if arg.startswith("mode=")] == ["mode=review"], launch_runs
+                assert _s_alloc.releases == [], _s_alloc.releases
                 assert _s_reasons["stranded-attempt-marker-write-failed"] == 1, _s_reasons
                 assert _lane_summary(run_items.lanes)["review"] == {
-                    "planned": 1, "launched": 0, "deferred": 0, "error": 1}, run_items.lanes
-                # ...and a release that FAILS is said out loud (issue #118's rule, on this leg):
-                # the claim stays active until expiry, so reporting it as cleanly released would
-                # hide a burned account slot. The refusal itself is unchanged — still one lane
-                # error, still no launch — because it was already the fail-closed answer.
-                class _StuckAllocator(LaunchingAllocator):
-                    def release(self, *_args, **_kwargs):
-                        return False
-
-                launch_runs.clear()
-                fake["pull"] = live_pull(draft=True, labels=["review:needs"],
-                                         body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
-                fake["comments"] = []
-                _stuck_log = io.StringIO()
-                with contextlib.redirect_stdout(_stuck_log):
-                    _s_launched, _s_reasons = run_items(
-                        [stranded_item], allocator=_StuckAllocator(), routing=strand_routing)
-                assert _s_launched == 0 and launch_runs == [], (_s_launched, launch_runs)
-                assert _s_reasons["stranded-attempt-marker-write-failed"] == 1, _s_reasons
-                assert "lease could not be released" in _stuck_log.getvalue(), \
-                    _stuck_log.getvalue()
+                    "planned": 1, "launched": 1, "deferred": 0, "error": 1}, run_items.lanes
+                assert "::error::" in _s_log and "UNCHARGED" in _s_log, _s_log
                 fake.pop("marker_write_raises", None)
                 # (vi) THE NO-SLOT TICK IS NOT AN ATTEMPT — the same fixture, the same posture,
                 # one attempt short of the limit, with an allocator that has no free reviewer.
@@ -16792,6 +16801,98 @@ def _self_test():
                 assert _s_launched == 0 and launch_runs == [], (_s_launched, launch_runs)
                 assert _s_alloc.calls == [("review", ["sol", "luna"])], _s_alloc.calls
                 assert _s_reasons["review:no-slot"] == 1, _s_reasons
+                # (vii) A FAILED `workflow run` IS NOT AN ATTEMPT EITHER. The lease is claimed,
+                # the retraction lands, the production argv is emitted — and `gh workflow run`
+                # exits NONZERO, so the branch above releases the lease, counts
+                # `dispatch-launch-failed` and starts no review. The recovery budget's terminal is
+                # a HUMAN-owned needs-user whose stated evidence is "N recovery dispatches
+                # recorded no review round", so a launch that never happened may not be billed
+                # against it. Charging one line earlier — immediately BEFORE `_run_gh`, which is
+                # where this counter first sat — reds this row: `record-marker` reappears in
+                # helper_calls, and the accumulation loop below parks the PR on evidence for
+                # reviews that never ran.
+                _saved_attempt = os.environ.get("GITHUB_RUN_ATTEMPT")
+                try:
+                    fake["launch_rc"] = 1
+                    fake["record_markers"] = True
+                    _s_launched, _s_reasons, _s_alloc, _ = strand_run([])
+                    assert [(script, args[0]) for script, args in helper_calls] == [
+                        ("worker-pr.py", "stranded-recover")], helper_calls
+                    assert _s_launched == 0, _s_launched
+                    # ...and it really did REACH the launch. Without this the row would pass for
+                    # any earlier defer (the no-slot tick already satisfies "no record-marker"),
+                    # which is the vacuous form of the same assertion.
+                    assert [arg for args in launch_runs for arg in args
+                            if arg.startswith("mode=")] == ["mode=review"], launch_runs
+                    assert _s_alloc.calls == [("review", ["sol", "luna"])], _s_alloc.calls
+                    assert _s_alloc.releases == ["ab" * 16], _s_alloc.releases
+                    assert _s_reasons["dispatch-launch-failed"] == 1, _s_reasons
+                    assert _lane_summary(run_items.lanes)["review"] == {
+                        "planned": 1, "launched": 0, "deferred": 0, "error": 1}, run_items.lanes
+                    # ...and REPEATING that failure cannot walk the PR into the terminal. `fake`
+                    # now records every marker the dispatcher writes back into the comment fixture
+                    # the NEXT tick reads, each tick under its own run key the way a real re-run
+                    # is keyed — so this loop measures the CHARGED COUNT, not one tick's argv.
+                    # LIMIT+1 consecutive failed launches record nothing and never hand off.
+                    strand_comments = []
+                    for _attempt in range(STRANDED_RECOVERY_LIMIT + 1):
+                        os.environ["GITHUB_RUN_ATTEMPT"] = str(100 + _attempt)
+                        _s_launched, _s_reasons, _s_alloc, _ = strand_run(strand_comments)
+                        assert [(script, args[0]) for script, args in helper_calls] == [
+                            ("worker-pr.py", "stranded-recover")], (_attempt, helper_calls)
+                        assert _s_launched == 0 and strand_comments == [], \
+                            (_attempt, strand_comments)
+                    # THE POSITIVE CONTROL for that loop — the same harness, the same fixture, the
+                    # same number of ticks, with the launch SUCCEEDING. Each confirmed dispatch
+                    # now charges, the count reaches STRANDED_RECOVERY_LIMIT, and the next tick
+                    # hands off to the human. Without this row the loop above proves nothing: an
+                    # accumulator that could never park would satisfy it no matter what the
+                    # launch outcome did.
+                    fake["launch_rc"] = 0
+                    strand_comments = []
+                    parked, launched_each = [], []
+                    for _attempt in range(STRANDED_RECOVERY_LIMIT + 1):
+                        os.environ["GITHUB_RUN_ATTEMPT"] = str(200 + _attempt)
+                        _s_launched, _s_reasons, _s_alloc, _ = strand_run(strand_comments)
+                        launched_each.append(_s_launched)
+                        parked.append([args[0] for _script, args in helper_calls] == [
+                            "needs-user"])
+                    assert parked == [False] * STRANDED_RECOVERY_LIMIT + [True], parked
+                    # ...and every charged tick is one that LAUNCHED, while the parking tick
+                    # launches nothing: the count that reached the terminal is a count of real
+                    # dispatches, which is exactly what the terminal's evidence claims.
+                    assert launched_each == [1] * STRANDED_RECOVERY_LIMIT + [0], launched_each
+                    assert len(strand_comments) == STRANDED_RECOVERY_LIMIT, strand_comments
+                    # ...and on the failed-launch leg a release that ITSELF fails is said out loud
+                    # (issue #118's rule): the claim stays active until expiry, so reporting it as
+                    # cleanly released would hide a burned account slot. The refusal is otherwise
+                    # unchanged — no launch, one lane error, and still no attempt charged.
+                    class _StuckAllocator(LaunchingAllocator):
+                        def release(self, *_args, **_kwargs):
+                            return False
+
+                    fake["launch_rc"] = 1
+                    launch_runs.clear()
+                    fake["pull"] = live_pull(draft=True, labels=["review:needs"],
+                                             body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+                    fake["comments"] = []
+                    _stuck_log = io.StringIO()
+                    with contextlib.redirect_stdout(_stuck_log):
+                        _s_launched, _s_reasons = run_items(
+                            [stranded_item], allocator=_StuckAllocator(), routing=strand_routing)
+                    assert _s_launched == 0, _s_launched
+                    assert [(script, args[0]) for script, args in helper_calls] == [
+                        ("worker-pr.py", "stranded-recover")], helper_calls
+                    assert _s_reasons["dispatch-launch-failed"] == 1, _s_reasons
+                    assert "lease could not be released" in _stuck_log.getvalue(), \
+                        _stuck_log.getvalue()
+                finally:
+                    fake.pop("launch_rc", None)
+                    fake.pop("record_markers", None)
+                    if _saved_attempt is None:
+                        os.environ.pop("GITHUB_RUN_ATTEMPT", None)
+                    else:
+                        os.environ["GITHUB_RUN_ATTEMPT"] = _saved_attempt
 
                 # ==== #657: THE CLAIM LEG, THROUGH THE REAL DISPATCH LOOP ====================
                 # Everything above this point exercises PLAN. These four rows drive
