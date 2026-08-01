@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1639,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "518bd9034dbf03c415b883f23ba66d9e4b7950a9",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_upload_step_line` calls a step disabled only when its `if:` expression contains the standalone word `false`. A mutation such as `if: ${{ 0 }}`, `if: ${{ null }}`, `if: ${{ '' }}`, or `if: ${{ !true }}` is also statically falsy in the Actions expression language, but passes this scan; the valid pinned `uses:` and `path:` then cause `_seal_before_target_code` to return `ordered` even though no artifact is handed to the service. The sole disabling fixture uses literal `false`, so it cannot detect this incomplete predicate. This is the remaining condition variant of round 1's blocker, not proof of the stated non-disabled invariant.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Make the condition validation fail closed for statically disabled expressions (or restrict accepted upload conditions to explicitly validated forms appropriate to these lanes), and add named negative fixtures using falsy values that do not contain the token `false`, at minimum `if: ${{ 0 }}` and `if: ${{ !true }}`. Verify each fixture reaches `upload-step-disabled` rather than another refusal.",
+    "severity": "blocker",
+    "title": "Disabled upload conditions without the token false are certified"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe upload name is now bound to a unique, SHA-pinned upload action and exact sealed path, which addresses most of round 1. However, the claimed executability check still recognizes only conditions containing the literal token `false`; GitHub Actions has other statically falsy expressions, so a disabled upload can still be certified as `ordered`. Because this leaves the same marquee evidence path fail-open at the condition seam, changes are still required.",
+  "verdict": "request_changes"
+ }
+}
