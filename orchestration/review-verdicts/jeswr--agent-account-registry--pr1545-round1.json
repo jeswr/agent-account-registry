@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1545,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0253bc80e88dff35a74cfe0da9cea9d9ac929a7c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_validate_record` only rejects extra fields when `origin == ORIGIN_WRITE`; every other value, including a typo such as `\"writ\"`, falls through to `_tolerable_unknown_field` and is handled exactly like `ORIGIN_READ`. Requiring the argument but not validating its value therefore does not make a future call site declare its posture fail-closed, as the docstring and design record claim. A misspelled write-side constant would silently admit undeclared fields into the record-validation path. The self-test checks only that omitting the argument raises `TypeError`, so it cannot detect this failure mode.",
+    "file": "scripts/model-health.py",
+    "fix_hint": "At the start of `_validate_record`, reject any `origin` not exactly in `{ORIGIN_READ, ORIGIN_WRITE}` with `ValueError` (or otherwise branch exhaustively). Add a non-vacuous test passing a literal invalid origin together with an undeclared field and assert the invalid origin is refused; retain the existing tests for the two valid postures.",
+    "severity": "major",
+    "title": "Unknown origin values silently select the permissive read posture"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe forward-compatible read behavior is carefully scoped and the added tests cover many important seams, but the new trust-boundary discriminator itself is not fail-closed. An invalid or misspelled origin silently receives read tolerance, so the implementation does not uphold its documented guarantee that call sites explicitly select one of the two postures.",
+  "verdict": "request_changes"
+ }
+}
