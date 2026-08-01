@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5649,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "81ec17ae309c9bb3c7c64e38f09e10b4a96e2c4d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`heads_name_party_collection` defines collection-ness as `party_collection_members(h)` being non-empty. That cannot distinguish a plain party IRI from a PartyCollection for which this request supplied zero membership edges. Consequently, a collection-valued prohibition with no evidence bypasses the one-shot fallback and persists only the collection IRI as a deny head; member sessions match by identity alone and escape the deny. The same flaw affects an ALLOW `neq`/`isNoneOf` collection carve-out: it persists an exception matcher for the collection IRI that excludes no member, widening the grant. This contradicts the stated fail-closed invariant and is especially important because the public API explicitly documents empty results for both cases.",
+    "file": "crates/sparq-solid/src/odrl_bridge.rs",
+    "fix_hint": "Carry explicit collection identity/type information separately from the member list (for example, request-supplied known PartyCollection IRIs or policy type metadata) and use that for the DENY/carve-out fallback decision; do not infer collection-ness from a non-empty edge set. Add real enforcement-path tests for a collection-valued prohibition and collection carve-out with zero supplied membership edges, showing that no conditional deny/grant is emitted and no unrelated/member session is widened.",
+    "severity": "major",
+    "title": "Collection safety check fails when membership evidence is empty"
+   }
+  ],
+  "progress": null,
+  "summary": "The ALLOW expansion is narrowly tested, but the fail-closed DENY/carve-out guard only recognizes a collection when this particular request supplies at least one membership edge for that head. With absent evidence (and likewise when a caller knows the IRI is a PartyCollection but supplies no member edge), the new code emits the unsafe persisted condition it says must be avoided. The added tests cover the positive-evidence case and therefore miss this fail-open path.",
+  "verdict": "request_changes"
+ }
+}
