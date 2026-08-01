@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5280,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "aa2c005ba734e19efd15a37b64a8614ae968de2c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly separates execution of fuzz/PR-authored code from the job holding write permissions, disables persisted checkout credentials in the execution job, transfers the randomized-failure log via an artifact, and limits the elevated filer job to failed schedule or push-to-main runs. The replay guard fails closed for empty or absent corpora while exempting randomized mode, and its hermetic self-test covers both rejection and acceptance paths. Untrusted log content is fence-defused at both the reader and rendering boundary, with a non-vacuous round-trip self-test. I found no correctness, soundness, test-validity, or security defect in the diff.",
+  "verdict": "approve"
+ }
+}
