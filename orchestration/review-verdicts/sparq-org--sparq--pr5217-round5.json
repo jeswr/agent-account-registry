@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5217,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bef9bf4f2601d974abfe5c2793f58e1acd12714c",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "decompose_run() includes any job whose conclusion is not null, cancelled, or skipped. This admits failure, timed_out, action_required, and other non-success outcomes. Such jobs can terminate before later steps execute, producing truncated totals and incomplete step inventories; including them in per-leg medians can understate runtime, distort imbalance and fold recommendations, and omit slow steps. The test named test_incomplete_jobs_are_excluded_from_the_sample still covers only cancelled, skipped, and running jobs, so it cannot detect this case.",
+    "file": "scripts/ci_leg_inventory.py",
+    "fix_hint": "Restrict topology-steering observations to jobs whose conclusion is exactly \"success\". If non-success jobs are useful diagnostically, keep them in a separate population that cannot affect aggregation or derived findings. Add a fixture with successful observations plus a short failed job and assert the failed job is excluded from decompose_run()/collect_fixture aggregation.",
+    "severity": "major",
+    "title": "Failed jobs still contaminate representative timing observations"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4's major measurement-validity defect remains unchanged. decompose_run() still accepts every conclusion except null, cancelled, and skipped, so failed, timed-out, action-required, and other non-success jobs can enter medians and topology recommendations despite potentially truncated durations and step inventories. The fixture test still omits a failed-job counterexample. Progress is therefore stagnant.",
+  "verdict": "request_changes"
+ }
+}
