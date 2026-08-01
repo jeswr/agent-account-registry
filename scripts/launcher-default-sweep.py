@@ -40,7 +40,14 @@ arms exist here and both are pinned by a KNOWN POSITIVE:
   * :class:`ast.Attribute` — ``run=subprocess.run``, including an aliased module
     (``import subprocess as sp`` -> ``run=sp.Popen``).
   * :class:`ast.Name` — ``run=_run`` where ``_run`` is bound to a launcher by
-    ``from subprocess import run as _run`` or by ``_run = subprocess.run``.
+    ``from subprocess import run as _run``, by ``_run = subprocess.run``, by the ANNOTATED
+    spelling of that assignment (``_run: object = subprocess.run``, an :class:`ast.AnnAssign`),
+    or TRANSITIVELY (``_run = subprocess.run`` then ``_alias = _run``).
+
+Those last two are the same hazard with a rename or a colon in front of it, and a resolver that
+recognised only the direct ``_run = subprocess.run`` reported CLEAN on both — handing anyone a
+one-token bypass of the standing assertion. Every spelling above is pinned by its own known
+positive below.
 
 ⚠️ The Name arm has **no live instance in this repo today** (measured: 288 Name-shaped defaults,
 none resolving to a launcher). It is proven by synthetic fixtures only, and that is stated rather
@@ -114,20 +121,68 @@ class Census(NamedTuple):
     name_defaults: int
 
 
+def _name_bindings(tree: ast.AST) -> list[tuple[str, ast.expr]]:
+    """Every ``<Name> = <expr>`` in the file, whatever statement spells it.
+
+    ``ast.Assign`` is not the only assignment node: ``runner: object = subprocess.run`` is an
+    :class:`ast.AnnAssign` and binds exactly the same launcher. A resolver that reads only
+    ``Assign`` reports CLEAN on the annotated spelling, which is a one-colon bypass of the whole
+    check. Parallel unpacking (``runner, flag = subprocess.run, True``) is the same bypass with a
+    comma, and is split element-wise here.
+
+    KNOWN BOUND, stated rather than implied: a STARRED target (``a, *rest = ...``) makes the two
+    sides different lengths and is skipped, and a launcher reached through a call, a container or
+    an attribute (``functools.partial(subprocess.run, ...)``, ``TABLE['run']``) is not a Name
+    binding at all. Those are under-collection — the direction this check is weakest in — so they
+    are named here and tracked, not quietly assumed absent.
+    """
+    bindings: list[tuple[str, ast.expr]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                bindings.append((target.id, value))
+            elif (isinstance(target, ast.Tuple) and isinstance(value, ast.Tuple)
+                    and len(target.elts) == len(value.elts)):
+                bindings.extend((element.id, bound)
+                                for element, bound in zip(target.elts, value.elts)
+                                if isinstance(element, ast.Name))
+    return bindings
+
+
 def _module_launcher_aliases(tree: ast.AST) -> tuple[set[str], set[str]]:
     """(names bound to the `subprocess` MODULE, names bound to a launcher CALLABLE).
 
-    Both import spellings and the assignment spelling, because the Name arm is worthless if it
+    Both import spellings and every assignment spelling, because the Name arm is worthless if it
     only recognises the literal identifiers a launcher happens to be called today:
 
         import subprocess as sp            -> module alias  {"subprocess", "sp"}
+        sp2 = sp                           -> module alias  {"sp2"}
         from subprocess import run as _run -> callable alias {"_run"}
         _run = subprocess.run              -> callable alias {"_run"}
+        _run: object = subprocess.run      -> callable alias {"_run"}   (ast.AnnAssign)
+        _alias = _run                      -> callable alias {"_alias"} (transitive)
 
-    Assignments are collected from ANYWHERE in the file, not just module level. A function-local
-    ``run = subprocess.run`` used as a nested default is exotic, but the direction of the error
-    matters more than the tidiness: over-collecting names can only make this check report MORE,
-    and this check's failure mode of record is reporting less.
+    The last three are not hypotheticals: each binds the real launcher at import exactly as the
+    direct spelling does, so a resolver that recognises only ``name = subprocess.run`` hands anyone
+    a rename or a type annotation as a way past the standing assertion.
+
+    Resolution is a FIXPOINT, not a single ordered pass: ``alias = runner`` may be written before
+    ``runner = subprocess.run``, and one pass in source order would resolve the chain only in the
+    lucky direction. The loop re-reads every binding until it learns nothing new, so a chain of any
+    length and any order collapses.
+
+    Bindings are collected from ANYWHERE in the file, not just module level, and a name once
+    resolved is never un-resolved by a later rebinding to something inert. Both are deliberate: a
+    function-local ``run = subprocess.run`` used as a nested default is exotic, and a rebound name
+    is rarer still, but the direction of the error matters more than the tidiness. Over-collecting
+    names can only make this check report MORE, and this check's failure mode of record — the one
+    #992 shipped on — is reporting less.
     """
     module_aliases = {"subprocess"}
     callable_aliases: set[str] = set()
@@ -140,19 +195,19 @@ def _module_launcher_aliases(tree: ast.AST) -> tuple[set[str], set[str]]:
             for alias in node.names:
                 if alias.name in LAUNCHERS:
                     callable_aliases.add(alias.asname or alias.name)
-    # A second pass: `_run = sp.run` can only be resolved once the module aliases are known.
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
-        value = node.value
-        if not (isinstance(value, ast.Attribute)
-                and value.attr in LAUNCHERS
-                and isinstance(value.value, ast.Name)
-                and value.value.id in module_aliases):
-            continue
-        for target in node.targets:
-            if isinstance(target, ast.Name):
-                callable_aliases.add(target.id)
+    # Assignments can only be resolved once the imports are known — and each newly resolved alias
+    # can resolve another, so iterate to a fixpoint. Bounded: every round either grows a set drawn
+    # from the file's finite identifiers or ends the loop.
+    bindings = _name_bindings(tree)
+    changed = True
+    while changed:
+        before = (len(module_aliases), len(callable_aliases))
+        for name, value in bindings:
+            if isinstance(value, ast.Name) and value.id in module_aliases:
+                module_aliases.add(name)
+            elif _binds_launcher(value, module_aliases, callable_aliases):
+                callable_aliases.add(name)
+        changed = (len(module_aliases), len(callable_aliases)) != before
     return module_aliases, callable_aliases
 
 
@@ -324,6 +379,64 @@ def _self_test() -> int:
           [f.render() for f in scan_source(assigned_name, "fixture.py")[0]],
           ["fixture.py:3 go(runner=_LAUNCH)"])
 
+    annotated_name = (
+        "import subprocess\n"
+        "_LAUNCH: object = subprocess.run\n"
+        "def go(argv, runner=_LAUNCH):\n"
+        "    return runner(argv)\n"
+    )
+    check("KNOWN POSITIVE (ast.Name, ANNOTATED assignment): `_LAUNCH: object = subprocess.run` is "
+          "an ast.AnnAssign, so a resolver reading only ast.Assign is bypassed by one colon",
+          [f.render() for f in scan_source(annotated_name, "fixture.py")[0]],
+          ["fixture.py:3 go(runner=_LAUNCH)"])
+
+    transitive_name = (
+        "import subprocess\n"
+        "_LAUNCH = subprocess.check_call\n"
+        "_ALIAS = _LAUNCH\n"
+        "def go(argv, runner=_ALIAS):\n"
+        "    return runner(argv)\n"
+    )
+    check("KNOWN POSITIVE (ast.Name, TRANSITIVE rebinding): a launcher renamed once still binds "
+          "the launcher — one hop of indirection is not a fix",
+          [f.render() for f in scan_source(transitive_name, "fixture.py")[0]],
+          ["fixture.py:4 go(runner=_ALIAS)"])
+
+    transitive_backwards = (
+        "import subprocess\n"
+        "def go(argv, runner=_ALIAS):\n"
+        "    return runner(argv)\n"
+        "_ALIAS = _LAUNCH\n"
+        "_LAUNCH = subprocess.run\n"
+    )
+    check("KNOWN POSITIVE (transitive, resolved AGAINST source order): a chain whose links are "
+          "written below the def and in REVERSE order needs more than one pass — this is the row "
+          "that goes red if the fixpoint degrades to a single ordered sweep",
+          [f.render() for f in scan_source(transitive_backwards, "fixture.py")[0]],
+          ["fixture.py:2 go(runner=_ALIAS)"])
+
+    unpacked_name = (
+        "import subprocess\n"
+        "_LAUNCH, _QUIET = subprocess.run, True\n"
+        "def go(argv, runner=_LAUNCH):\n"
+        "    return runner(argv)\n"
+    )
+    check("KNOWN POSITIVE (ast.Name, PARALLEL UNPACKING): `a, b = subprocess.run, True` binds the "
+          "launcher to `a` — a resolver reading the target as one Name sees a Tuple and moves on",
+          [f.render() for f in scan_source(unpacked_name, "fixture.py")[0]],
+          ["fixture.py:3 go(runner=_LAUNCH)"])
+
+    aliased_module_by_assignment = (
+        "import subprocess\n"
+        "sp = subprocess\n"
+        "def launch(argv, spawn=sp.Popen):\n"
+        "    return spawn(argv)\n"
+    )
+    check("KNOWN POSITIVE (ast.Attribute over an ASSIGNED module alias): `sp = subprocess` hides "
+          "the launcher from a resolver that only reads `import subprocess as sp`",
+          [f.render() for f in scan_source(aliased_module_by_assignment, "fixture.py")[0]],
+          ["fixture.py:3 launch(spawn=sp.Popen)"])
+
     wrapped_signature = (
         "import subprocess\n"
         "def run_gh_read(\n"
@@ -382,6 +495,17 @@ def _self_test() -> int:
     check("KNOWN NEGATIVE: a parameter literally named `run` defaulting to a NON-launcher does "
           "not fire — the Name arm resolves the binding, never the parameter's name",
           [f.render() for f in scan_source(same_name_not_a_launcher, "fixture.py")[0]], [])
+
+    transitive_non_launcher = (
+        "import json\n"
+        "_HELPER = json.dumps\n"
+        "_ALIAS = _HELPER\n"
+        "def go(argv, run=_ALIAS):\n"
+        "    return run(argv)\n"
+    )
+    check("KNOWN NEGATIVE: a transitive chain ending at a NON-launcher stays silent — the "
+          "fixpoint propagates a resolved binding, it does not treat indirection itself as guilt",
+          [f.render() for f in scan_source(transitive_non_launcher, "fixture.py")[0]], [])
 
     inert_attributes = (
         "import subprocess\n"
