@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5568,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e8c52f208f77a8c0d38184811f17d260149a7332",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The selective-disclosure addition is correctly scoped as an opt-in delegation seam rather than an in-repo verifier. The implementation fails closed when no verifier supports the suite, delegates before producing a commitment, commits only the disclosed credential graph after acceptance, keeps the whole-credential and selective-disclosure token spaces separate, and attributes successful acceptance to the host verifier. The tests exercise the load-bearing real control paths: unavailable and unsupported verifiers do not ingest, rejection propagates without ingestion, acceptance commits exactly the disclosed triples, and inputs are forwarded unchanged. Documentation consistently disclaims selective-disclosure soundness, unlinkability, and external audit status, and the public-surface skill is updated. No correctness, soundness, test-validity, or security defect requiring changes is evident in the diff.",
+  "verdict": "approve"
+ }
+}
