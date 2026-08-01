@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5259,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "84ae91b34fadeb370789241342419745614f0951",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`GateState.from_dict` independently accepts every present persisted field and defaults missing fields. Consequently a partial carrier such as `{\"attempt\": max_total_polls - 1}` preserves an almost-exhausted budget while resetting `stable`, history, and the other coupled decision state. On the next one-shot evaluation, a single terminal-green observation advances `attempt` to the maximum; because the normal settle condition is not met, `run_gate_once` calls `render_budget_exhausted`, whose pending-zero graceful-timeout path renders that one observation green. This contradicts the stated fail-safe property that unreadable/partial state restarts the window and never shortens it. A truncated write that remains valid JSON, a schema-version mismatch, or manual/cache corruption can therefore manufacture a premature pass once this entry point is wired.",
+    "file": "scripts/ci_summary_gate.py",
+    "fix_hint": "Validate the persisted carrier as one atomic, versioned record before accepting any of it: require exactly all persisted fields with strict types/ranges and cross-field invariants, otherwise return a completely fresh `GateState` (including `attempt = 0`). Prefer atomic temp-file-plus-rename writes as well. Add a real-path test using an almost-exhausted partial JSON state and a terminal-green fetch, asserting it cannot return 0 after one observation; update the existing partial-state test to require a full restart rather than preserving `attempt`.",
+    "severity": "major",
+    "title": "Partial persisted state can bypass the settle and startup safety windows"
+   }
+  ],
+  "progress": null,
+  "summary": "The resident-loop extraction appears structurally faithful, but the new persisted-state boundary can accept a partial yet syntactically valid state that shortens the safety windows and can produce a premature green verdict. The tests explicitly encode this unsafe behavior by retaining `attempt` while resetting omitted fields, despite the implementation and documentation claiming that partial/corrupt state only restarts the window. This must be fixed before the one-shot seam is considered correct, even though it is not wired to the required check yet.",
+  "verdict": "request_changes"
+ }
+}
