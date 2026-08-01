@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5621,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "57619680f1929fa71d17d13c313d9525a431ef77",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The documentation update is internally consistent and appropriately scoped. It distinguishes the stale 2026-07-10 snapshot from the operative pre-cutover windows, reports sample definitions and exclusions, preserves both matched and broader baselines, acknowledges that the conservative median improvement falls slightly below the original projection, and limits the single-run hop decomposition to pole location rather than causal attribution. The mechanism check supports that the intended coverage legs were skipped while ratchet gates remained active. No executable behavior, security boundary, or test logic changes, and the diff contains no instruction-like prompt injection.",
+  "verdict": "approve"
+ }
+}
