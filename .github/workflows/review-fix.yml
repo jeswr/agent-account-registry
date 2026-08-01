@@ -1237,6 +1237,8 @@ jobs:
           permission-contents: read
           permission-issues: write
           permission-pull-requests: write
+          # No post-phase revoker in this job — see the fix mint's rationale below.
+          skip-token-revoke: true
 
       # [issue #91 review r2] NO TARGET CONTENTS WRITE — this token used to carry
       # contents+workflows write so the post-gate `push` step could use it, which put a
@@ -1256,6 +1258,19 @@ jobs:
           permission-contents: read
           permission-issues: write
           permission-pull-requests: write
+          # [issue #1285] POST-PHASE CREDENTIAL BAN — the half of #575 this lane never inherited.
+          # Moving the push into the isolated `publish` job removed every token-bearing step the
+          # workflow WRITES DOWN after the gate, but by default this action also registers a
+          # post-job phase that REVOKES the installation token, authenticating WITH that token.
+          # Action post phases run after ALL normal steps, i.e. after `worker-live.sh gate` has
+          # executed the target's own build scripts, proc-macros and tests as this runner user —
+          # so a silent mint still puts a credential-bearing process on the runner strictly later
+          # than the gate, invisible to a `GH_TOKEN:` text scan. This lane runs the SAME gate as
+          # worker.yml, so it takes the same answer: no revoker here, rely on the 60-minute
+          # installation TTL plus the narrow scoping above. The clean `publish`/`outcome` jobs
+          # keep the default revoker — no target code ever runs there. worker-live.sh's boundary
+          # self-test enforces this on every mint in this job.
+          skip-token-revoke: true
 
       - name: Verify target App identity and default branch
         id: target
