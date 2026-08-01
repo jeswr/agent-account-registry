@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5599,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bfbbf476f9c30751c65db6d74d69fc643bbd2d34",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new enum documentation says Solid permits either 401 or 403 for a definitive deny to an anonymous requester. The Solid Protocol instead says that when valid credentials are absent for a resource requiring them, the server MUST return 401 (unless 404 is preferred for security reasons), and Solid-OIDC likewise requires 401 plus WWW-Authenticate for an unauthenticated request to a protected resource. Calling unconditional 403 'correctness-neutral' therefore overstates conformance and hides a protocol/interoperability defect: clients can rely on the 401 challenge to initiate authentication. The same incorrect claim is repeated in the README, SKILL, and test documentation.",
+    "file": "crates/sparq-solid/src/decide.rs",
+    "fix_hint": "Do not state that Solid permits this unconditional 403 mapping. Either change the HTTP shell to distinguish unauthenticated protected-resource requests and emit the required 401 challenge, with an integration test, or explicitly document the current 403 behavior as a known non-conformance/limitation rather than a permitted stricter choice. Update all changed copies consistently.",
+    "severity": "major",
+    "title": "Anonymous 403 behavior is incorrectly described as permitted by Solid"
+   },
+   {
+    "body": "The new test claims to pin `sparq-server`'s `solid_authz::deny_status_code` and prevent the docs and shipped shell from drifting, but `http_status` is a test-local reimplementation. It has no dependency on or call into the server mapper, so the test stays green if the actual shell changes independently. It only proves the assertions about its own helper and is vacuous for the cross-crate invariant claimed by the test.",
+    "file": "crates/sparq-solid/tests/fail_closed_status_mapping.rs",
+    "fix_hint": "Put the mapping test alongside `deny_status_code` in sparq-server or expose/test an appropriate shared mapping function used by the real request path. Ensure the test exercises an actual anonymous HTTP request far enough to verify both the status and required authentication challenge when implementing the conformant 401 lane.",
+    "severity": "major",
+    "title": "Regression test does not exercise the shipped HTTP status mapper"
+   }
+  ],
+  "progress": null,
+  "summary": "The change aligns sparq-solid's documentation with the server's current 403 behavior, but it incorrectly claims that Solid permits 403 for an unauthenticated request to a protected resource. The Solid Protocol and Solid-OIDC require 401 (with the protocol allowing 404 in the stated security case), so this turns an implementation mismatch into misleading conformance documentation. The added regression test also tests a local replica of the mapping rather than the shipped server mapping it claims to pin.",
+  "verdict": "request_changes"
+ }
+}
