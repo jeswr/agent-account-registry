@@ -251,7 +251,7 @@ def _write_env(token):
     return env
 
 
-def _secret_write(token, repo, run=subprocess.run):
+def _secret_write(token, repo, run=None):
     """The authoritative write probe (review r3 #1): `gh secret set --env dispatch-secrets` on
     the disposable canary secret — the EXACT operation onboarding and the rotation write-back
     perform post-#101, exercising `Environments: write` which the public-key GET (read-only)
@@ -260,7 +260,17 @@ def _secret_write(token, repo, run=subprocess.run):
     throttle-vs-denial discriminator; it never carries the token (the PAT travels via GH_TOKEN
     in the child env and GH_DEBUG is stripped) and is never echoed into details or logs. The
     canary value goes via stdin — never argv — purely to keep the repo's no-secrets-in-argv
-    convention, though the value is not secret."""
+    convention, though the value is not secret.
+
+    [#992] `run` defaults to None and is resolved at CALL time, NOT bound to `subprocess.run` in
+    the signature. A parameter default is evaluated once at import, so an import-time binding
+    would (a) hand a call site that forgets `run=` the real launcher — a LIVE `gh secret set
+    --env dispatch-secrets` — and (b) be unreachable by the only seam a test has without editing
+    the call, patching the module attribute. This body is safe today only because every call site
+    passes `run=`; resolving here makes `subprocess.run` the single seam instead of one forgotten
+    keyword. `scripts/launcher-default-sweep.py` holds the same line across `scripts/*.py`."""
+    if run is None:
+        run = subprocess.run
     try:
         result = run(["gh", "secret", "set", CANARY_SECRET, "-R", repo, "--env", CANARY_ENV],
                      input=CANARY_VALUE, capture_output=True, text=True,
@@ -1242,6 +1252,26 @@ def _self_test():
         raise OSError(f"boom {SENTINEL}")
     chk("_secret_write: runner exception reduces to its class name (never the message)",
         _secret_write(SENTINEL, "o/r", run=raise_run), {"status": None, "error": "OSError"})
+
+    # [#992] THE DEFAULT ITSELF, not just the injected path. Every row above passes `run=`
+    # explicitly, so all of them stay green under `def _secret_write(..., run=subprocess.run)` —
+    # the import-time binding that hands a caller who forgets the keyword a LIVE `gh secret set
+    # --env dispatch-secrets`. This is the one row that exercises the OMITTED argument: it patches
+    # the module attribute (the only seam a test can reach without editing the call site) and
+    # requires the patch to be REACHED. Re-binding the default reds it, because the default would
+    # still hold the real launcher captured at import.
+    _saved_run = subprocess.run
+    seen.clear()
+    try:
+        subprocess.run = probe_run(_Proc(0))
+        w_default = _secret_write(SENTINEL, "o/r")
+    finally:
+        subprocess.run = _saved_run
+    chk("[#992] _secret_write resolves the runner at CALL time — with run= omitted the module "
+        "attribute is the seam, so an import-time default cannot hide a live gh write",
+        (w_default, seen.get("argv")),
+        ({"status": 204, "headers": {}, "message": ""},
+         ["gh", "secret", "set", CANARY_SECRET, "-R", "o/r", "--env", CANARY_ENV]))
 
     # --- upsert: idempotent rolling issue against a stubbed gh (usage-alert.py pattern).
     class _Run:

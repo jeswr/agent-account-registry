@@ -24,6 +24,7 @@ groom-mint-alert.py
 groom.py
 http_transient.py
 latch-watchdog.py
+launcher-default-sweep.py
 lease_schema.py
 ledger-invariant.py
 ledger_retry.py
