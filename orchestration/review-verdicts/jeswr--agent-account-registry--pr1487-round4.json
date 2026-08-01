@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1487,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6f8ca59756e3b10f5c67a5efcd9f12b1535040f4",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 correction remains sound. Malformed nested label entries are rejected fail-closed, including on the removal-only transition where filtering an unreadable entry would otherwise fabricate evidence of absence. The delete-before-add sequence, atomic add, live postcondition, and tests for ordering, half-writes, unparsable responses, transition content, and healthy completion are coherent and non-vacuous. No blocker, major, or other diff-scoped issue is supported by the evidence.",
+  "verdict": "approve"
+ }
+}
