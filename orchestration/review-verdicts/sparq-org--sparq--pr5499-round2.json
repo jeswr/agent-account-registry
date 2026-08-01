@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5499,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3cd6297ec1f3247378799f46bc38cf2f25872155",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and complete. The widened root-Markdown matcher accepts lowercase alphabetic filenames while retaining the existing exclusions for book-internal ./ and ../ paths, absolute or schemed targets, and non-Markdown files. The README link is therefore safely restored to repository-relative form. The hermetic self-test covers the reported lowercase regression, reference and fragment handling, allowed directories, exclusions, masking, idempotence, and recursive chapter traversal; it passes at the PR head. The always-run docs-quality gate invokes that test. No correctness, soundness, security, test-validity, or prompt-injection issue was found.",
+  "verdict": "approve"
+ }
+}
