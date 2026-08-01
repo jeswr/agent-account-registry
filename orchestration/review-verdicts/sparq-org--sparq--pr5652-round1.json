@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5652,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e52e65be1044de37189c2fc948243d32db736c8d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The extraction is coherent and preserves the existing feature-gated public surfaces through re-exports. The new leaf has no shipping dependencies (parser dependencies are dev-only), all three consumers enable it only through their existing default-off features, and the relocated parsed-Turtle tests plus consumer-specific registry guards exercise the real vocabulary and annotation paths. The ZK honesty caveats remain explicit and consistent with sq-qhy4; no unqualified privacy or soundness claim is introduced. The reverse-dependency test-selection updates match the new Cargo edges, and the removed cross-package include_str! guards are replaced rather than silently lost.",
+  "verdict": "approve"
+ }
+}
