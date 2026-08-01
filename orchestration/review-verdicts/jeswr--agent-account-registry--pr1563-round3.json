@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1563,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "aa7b1c50ef7e967541ee70f82e00ff7a3ab356d8",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change adds an always-emitted, bounded conflict-stage census without altering frontier selection or weakening any trust check. The pre-selection reservation snapshot correctly separates in-flight occupancy from keys acquired by the current frontier; collision, cross-cutting, GLOBAL-held, zero-board, ranking/cap, and no-double-count paths are covered by exact full-line assertions. Existing per-issue defer assertions remain exact after the two log families are separated. I found no blocker or major correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
