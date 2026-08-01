@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1531,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "32723f576e0e53503bb7ee8b03eede31d75e5454",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change consistently adds positive, token-scoped verification of private alert destinations across all three affected alert paths. Public, same-repository, half-configured, failed, malformed, and non-boolean visibility results fall back without carrying the private-route token in the standalone alert scripts; worker-pr preserves its established registry-alert token semantics. The new self-tests exercise both the routing helpers and production wiring, including repository/token argument binding and no-probe short circuits. I found no diff-supported correctness, security, or test-vacuity issue requiring changes.",
+  "verdict": "approve"
+ }
+}
