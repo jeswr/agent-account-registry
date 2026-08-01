@@ -1,16 +1,6 @@
 {
  "leases": [
   {
-   "account": "dc2d751954080e13",
-   "claim_id": "d9ef5b9410ef411383b332b13c077828",
-   "holder": "sparq-org/sparq#3295@30705435631.1",
-   "package": "gui",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1785597221,
-   "expires_at": 1785603521
-  },
-  {
    "account": "51bde6688e140866",
    "claim_id": "d7c6ff414bf34f269d704e96111a0f20",
    "holder": "fix:sparq-org/sparq#5603@30705448699.1",
@@ -19,26 +9,6 @@
    "model": "opus5",
    "issued_at": 1785597249,
    "expires_at": 1785603549
-  },
-  {
-   "account": "51bde6688e140866",
-   "claim_id": "e96752675e3945f1ab682112fd5031da",
-   "holder": "jeswr/agent-account-registry#1561@dispatch-30705276192.1",
-   "package": "ci",
-   "role": "ci",
-   "model": "opus5",
-   "issued_at": 1785597249,
-   "expires_at": 1785599949
-  },
-  {
-   "account": "58b7c92faa5b5ca5",
-   "claim_id": "4a120baa8350497dba5e4be0dfd8e200",
-   "holder": "jeswr/agent-account-registry#1000@dispatch-30705276192.1",
-   "package": "workflows",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785597255,
-   "expires_at": 1785599955
   }
  ]
 }
