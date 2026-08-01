@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1584,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4b3961d14ef6de793748f5753ce9f8738e34dc81",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`no_change_census` filters out every record whose `exit_class` is not `no_change` before selecting the latest attempt per base run id. For a retained sequence such as `117.1 = no_change` followed by `117.2 = success`, attempt 2 is discarded and attempt 1 remains in `latest`, so the run is still counted as having left the tree unchanged even though its final execution produced a diff. This contradicts the documented one-vote-per-run/latest-outcome semantics and can falsely sustain `worker-no-change`. The added rerun fixture uses two no-change records, so it stays green through this bug.",
+    "file": "scripts/metrics.py",
+    "fix_hint": "Select the latest attributable record per base run id across all validated exit classes first, then include that run in the census only when the selected record's `exit_class` is `no_change`. Add non-vacuous transition tests for `no_change -> success` (must not count) and `success -> no_change` (must count), with attempt order opposed to ledger order as appropriate.",
+    "severity": "major",
+    "title": "A successful rerun cannot supersede an earlier no-change attempt"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe prior denominator mismatch is addressed by folding records to one vote per GitHub run, but the fold is applied only after non-no-change outcomes have been discarded. Consequently, a later successful rerun cannot supersede an earlier no-change attempt: the run remains charged as no-change and can falsely sustain the new alert. The new rerun test covers only two no-change attempts, so it does not exercise this outcome transition.",
+  "verdict": "request_changes"
+ }
+}
