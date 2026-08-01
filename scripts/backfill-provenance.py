@@ -1117,6 +1117,78 @@ def _workflow(name):
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
+def _if_condition(node):
+    """`(an `if:` is PRESENT, its parsed value as text)` for a workflow job or step.
+
+    Two parts because a bare `.get("if")` cannot tell an ABSENT condition from `if: false`: PyYAML
+    gives the latter the boolean `False`, which any `or ""` then launders into the same empty
+    string an unconditional job reads as. Deleting a guard and making it inert are different
+    experiments (AGENTS.md pre-flight 3), so they must read differently HERE, at the report."""
+    return ("if" in node, "" if "if" not in node else str(node.get("if")))
+
+
+def _heredoc_bodies(script):
+    """Every QUOTED-heredoc body (`<<'EOF' … EOF`) in a shell `run:` block, in order.
+
+    Quoted means the shell expands nothing, so the body is verbatim source and can be parsed as
+    the language it is piped into. An unquoted heredoc is skipped on purpose: its text is not
+    what runs."""
+    lines, bodies, index = script.splitlines(), [], 0
+    while index < len(lines):
+        opener = re.search(r"<<'([A-Za-z_][A-Za-z0-9_]*)'", lines[index])
+        index += 1
+        if not opener:
+            continue
+        body = []
+        while index < len(lines) and lines[index].strip() != opener.group(1):
+            body.append(lines[index])
+            index += 1
+        bodies.append("\n".join(body))
+    return bodies
+
+
+def _ast_names(node):
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def _policy_derived_output_keys(run, source):
+    """The `key=` GITHUB_OUTPUT names this shell step PRINTS whose value is DERIVED, by assignment
+    dataflow, from the file `source` — as opposed to merely printed somewhere near a mention of it.
+
+    Containment cannot tell a live resolver from one that hardcodes its answer while the literal
+    survives in a COMMENT, a dead branch, a no-op, or a neighbouring step. All four are valid
+    workflow YAML, all four lint clean, and a hardcoded copy of the enabled set is precisely the
+    duplication that took dispatch down on 2026-08-01 (#1537/#1540). Both cases read as NOT
+    derived here: a comment has no AST node to seed from, and a hardcoded `repos = [...]` severs
+    the chain between the file and the printed value.
+
+    Taint is seeded by the `source` literal appearing as a real Constant, propagated across simple
+    assignments to a fixpoint, and then REQUIRED of the printed expression."""
+    keys = set()
+    for body in _heredoc_bodies(run):
+        try:
+            tree = ast.parse(body)
+        except SyntaxError:      # not Python — it cannot be the resolver
+            continue
+        assigns = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)]
+        tainted = set()
+        for _ in range(len(assigns) + 1):    # fixpoint: each pass taints at least one more target
+            for assign in assigns:
+                seeded = any(isinstance(n, ast.Constant) and n.value == source
+                             for n in ast.walk(assign.value))
+                if seeded or (_ast_names(assign.value) & tainted):
+                    tainted |= {t.id for t in assign.targets if isinstance(t, ast.Name)}
+        for call in ast.walk(tree):
+            if not (isinstance(call, ast.Call) and getattr(call.func, "id", "") == "print"):
+                continue
+            printed = "".join(n.value for n in ast.walk(call)
+                              if isinstance(n, ast.Constant) and isinstance(n.value, str))
+            named = re.match(r"([A-Za-z_][A-Za-z0-9_-]*)=", printed)
+            if named and (_ast_names(call) & tainted):
+                keys.add(named.group(1))
+    return sorted(keys)
+
+
 def worker_yaml_shape_report():
     """Findings about the LIVE worker.yml, each asserted by the self-test."""
     jobs = _workflow("worker.yml")["jobs"]
@@ -1188,7 +1260,12 @@ def backfill_workflow_seam_report(workflow=None):
     needs = [needs] if isinstance(needs, str) else sorted(needs or [])
     matrix = ((job.get("strategy") or {}).get("matrix") or {})
     targets_job = workflow["jobs"].get("targets") or {}
-    targets_run = "\n".join(str(s.get("run") or "") for s in (targets_job.get("steps") or []))
+    # The resolver is the step that OWNS `id: resolve` — the same id the job's `outputs.repos`
+    # reads. Located by that id and never by "whichever step mentions the policy file": that
+    # ambiguity is itself the defect (an unrelated step can carry the literal while the executable
+    # resolver hardcodes its list), and the mutant table below fires exactly that decoy.
+    resolve_step = next((s for s in (targets_job.get("steps") or [])
+                         if s.get("id") == "resolve"), None)
     step = next((s for s in steps if "backfill-provenance.py" in str(s.get("run") or "")), None)
     run = str((step or {}).get("run") or "")
     guard = str(job.get("if") or "")
@@ -1234,10 +1311,22 @@ def backfill_workflow_seam_report(workflow=None):
         "matrix_needs": needs,
         "matrix_repo_expr": str(matrix.get("repo")),
         "targets_repos_output": str((targets_job.get("outputs") or {}).get("repos") or ""),
-        # One source of truth. A hardcoded copy of the enabled set is the exact duplication that
-        # took dispatch fully down on 2026-08-01 (#1537/#1540: policy enabled a third repo, the
-        # workflow's manifest did not, CLAIM failed closed).
-        "targets_policy_sourced": "policy/repos.toml" in targets_run,
+        # ...all of which is DEAD if the resolver never EXECUTES. `if: false` on the targets job,
+        # or on its resolve step, is valid workflow YAML, passes actionlint, produces no matrix
+        # output, and therefore SKIPS the dependent backfill job — with every other finding in
+        # this report still green. That is the #941 seam (an `if: false` on a resolver step and on
+        # its whole job each survived 76/76 checks) landing on this workflow, so both are pinned by
+        # exact value and reported presence-first so a DELETED guard and an INERT one differ.
+        "targets_job_gate": _if_condition(targets_job),
+        "resolve_step_gate": (resolve_step is not None, *_if_condition(resolve_step or {})),
+        # One source of truth, proven by DATAFLOW through the step that owns `id: resolve` rather
+        # than by the literal occurring anywhere in the job. A hardcoded copy of the enabled set is
+        # the exact duplication that took dispatch fully down on 2026-08-01 (#1537/#1540: policy
+        # enabled a third repo, the workflow's manifest did not, CLAIM failed closed) — and a
+        # hardcoded resolver can keep that literal in a comment or a neighbouring step, which
+        # satisfies containment while publishing a list policy never authorised.
+        "resolve_policy_derived_outputs": _policy_derived_output_keys(
+            str((resolve_step or {}).get("run") or ""), "policy/repos.toml"),
     }
 
 
@@ -1607,8 +1696,45 @@ def _self_test():
           seam["matrix_repo_expr"], "${{ fromJSON(needs.targets.outputs.repos) }}")
     check("...which the resolver actually publishes", seam["targets_repos_output"],
           "${{ steps.resolve.outputs.repos }}")
-    check("...from policy/repos.toml — one source of truth for the enabled set (#1537/#1540)",
-          seam["targets_policy_sourced"], True)
+    # ...and the resolver has to RUN. Everything above describes a chain that produces nothing at
+    # all if the targets job or its resolve step is skipped, and a skipped `needs:` dependency
+    # takes the backfill job with it — silently, GREEN, sweeping no repos. So the condition on each
+    # is asserted by exact value, not by its absence being assumed.
+    check("the target resolver JOB is executable on the intended events — conditioned ONLY on the "
+          "default-branch ref guard (`if: false` here skips the whole recovery lane)",
+          seam["targets_job_gate"],
+          (True, "${{ github.ref == format('refs/heads/{0}', "
+                 "github.event.repository.default_branch) }}"))
+    check("...and the resolve step itself is PRESENT and UNCONDITIONAL",
+          seam["resolve_step_gate"], (True, False, ""))
+    check("...and THAT step derives its `repos=` output from policy/repos.toml by dataflow — one "
+          "source of truth (#1537/#1540), not a literal loose somewhere in the job",
+          seam["resolve_policy_derived_outputs"], ["repos"])
+    # That finding is only worth its name if it can say NO, so the analyser is exercised directly
+    # on the cases containment cannot separate — and on a heredoc that is not Python at all, which
+    # must fail CLOSED (not-derived) rather than abort this suite from inside a report.
+    _derived_keys = _policy_derived_output_keys
+    _heredoc = "set -euo pipefail\npython3 - <<'EOF' | tee -a \"$GITHUB_OUTPUT\"\n%s\nEOF\n"
+    check("dataflow: a resolver that READS the policy file and prints what it derived is sourced",
+          _derived_keys(_heredoc % ('import json, tomllib\n'
+                                    'rows = tomllib.load(open("policy/repos.toml", "rb"))\n'
+                                    'enabled = sorted(rows["repos"])\n'
+                                    'print("repos=" + json.dumps(enabled))'),
+                        "policy/repos.toml"), ["repos"])
+    check("...while the SAME step printing a HARDCODED list is NOT sourced, even though it still "
+          "loads the file (the mutually-masking decoy containment reads as green)",
+          _derived_keys(_heredoc % ('import json, tomllib\n'
+                                    'rows = tomllib.load(open("policy/repos.toml", "rb"))\n'
+                                    'print("repos=" + json.dumps(["some-owner/some-name"]))'),
+                        "policy/repos.toml"), [])
+    check("...nor is a mention of the policy file that survives only in a COMMENT",
+          _derived_keys(_heredoc % ('import json\n# the enabled set from policy/repos.toml\n'
+                                    'repos = ["some-owner/some-name"]\n'
+                                    'print("repos=" + json.dumps(repos))'),
+                        "policy/repos.toml"), [])
+    check("...and a heredoc that is not Python fails CLOSED, without aborting this suite",
+          _derived_keys("cat <<'SH'\njq -r '.repos[]' policy/repos.toml\nSH\n",
+                        "policy/repos.toml"), [])
 
     # ---- the #1544 YAML-seam MUTANT TABLE ----------------------------------------------------
     # The checks above prove this report can read a CORRECT workflow; they do not prove it would
@@ -1624,12 +1750,29 @@ def _self_test():
         return doc.get("on") if "on" in doc else doc.get(True)
 
     def _resolve_step(doc):
-        # An ANCHOR, not a search: if no step reads the policy file, the mutant is malformed and
-        # must say so rather than raise a bare StopIteration from inside the table.
-        hits = [s for s in doc["jobs"]["targets"]["steps"]
-                if "policy/repos.toml" in str(s.get("run") or "")]
-        assert len(hits) == 1, f"seam mutant anchor: {len(hits)} steps read policy/repos.toml"
+        # An ANCHOR, not a search: the resolver is the step carrying the `id:` that the job's
+        # `outputs.repos` reads. Anchoring instead on "the step that mentions policy/repos.toml"
+        # would make the decoy mutant below unwritable — that ambiguity IS the defect. If the id is
+        # gone the mutant is malformed and must say so, not raise a bare StopIteration.
+        hits = [s for s in doc["jobs"]["targets"]["steps"] if s.get("id") == "resolve"]
+        assert len(hits) == 1, f"seam mutant anchor: {len(hits)} steps carry `id: resolve`"
         return hits[0]
+
+    def _hardcode_resolver_keeping_the_literal(doc):
+        """The DECOY: the resolver publishes a list policy never authorised, while
+        `policy/repos.toml` survives verbatim in a comment inside that same step AND in a
+        neighbouring step. Every substring/containment reading of "sourced from policy" stays
+        GREEN; only the dataflow finding sees it."""
+        _resolve_step(doc)["run"] = (
+            'set -euo pipefail\n'
+            'python3 - <<\'EOF\' | tee -a "$GITHUB_OUTPUT"\n'
+            'import json\n'
+            '# the enabled set from policy/repos.toml, kept in sync by hand\n'
+            'repos = ["some-owner/some-name"]\n'
+            'print("repos=" + json.dumps(repos))\n'
+            'EOF\n')
+        doc["jobs"]["targets"]["steps"].append(
+            {"name": "Note", "run": 'echo "source of truth: policy/repos.toml"'})
 
     for _name, _edit, _key, _want in (
             ("the schedule is deleted (back to dispatch-only, the #1544 defect)",
@@ -1654,10 +1797,34 @@ def _self_test():
                  repo=["some-owner/some-name"]), "matrix_repo_expr", "['some-owner/some-name']"),
             ("the resolver stops publishing its list (the matrix then expands to NOTHING)",
              lambda d: d["jobs"]["targets"].pop("outputs"), "targets_repos_output", ""),
+            # The resolver's CONDITIONALITY, deleted and made inert, at both levels. `if: false` on
+            # the job and on the step each survived 76/76 checks in #941; nothing above notices
+            # either, because every other link of the chain is still spelled correctly.
+            ("the targets JOB is disabled with `if: false` (the dependent backfill job is then "
+             "SKIPPED — green, and it sweeps nothing)",
+             lambda d: d["jobs"]["targets"].update({"if": False}), "targets_job_gate",
+             (True, "False")),
+            ("the targets job's ref guard is DELETED (a branch copy could resolve targets)",
+             lambda d: d["jobs"]["targets"].pop("if"), "targets_job_gate", (False, "")),
+            ("the RESOLVE step is made inert with `if: false` (it publishes no output, so the "
+             "matrix expands to NOTHING)",
+             lambda d: _resolve_step(d).update({"if": False}), "resolve_step_gate",
+             (True, True, "False")),
+            ("the resolve step is deleted outright (`steps.resolve.outputs.repos` reads empty)",
+             lambda d: d["jobs"]["targets"].update(
+                 steps=[s for s in d["jobs"]["targets"]["steps"] if s.get("id") != "resolve"]),
+             "resolve_step_gate", (False, False, "")),
+            # The DECOY, and the plain repoint. The first is the case a containment check cannot
+            # represent: a hardcoded resolver with the literal alive elsewhere. The second is the
+            # honest edit — the resolver reads a different file — and both must red the SAME
+            # finding, because the question asked is "is the published list derived from policy?"
+            ("the resolver hardcodes its list while `policy/repos.toml` survives in a comment AND "
+             "in a neighbouring step (containment reads this as sourced-from-policy)",
+             _hardcode_resolver_keeping_the_literal, "resolve_policy_derived_outputs", []),
             ("the enabled set is copied into the workflow instead of read from policy",
              lambda d: _resolve_step(d).update(run=str(_resolve_step(d)["run"]).replace(
                  "policy/repos.toml", "some-owner/some-name")),
-             "targets_policy_sourced", False),
+             "resolve_policy_derived_outputs", []),
     ):
         # A mutant that cannot be APPLIED (its anchor is gone — exactly what happens when the
         # schedule or `needs:` this table edits has already been deleted) must red its OWN row and
