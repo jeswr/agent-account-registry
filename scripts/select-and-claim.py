@@ -1660,7 +1660,8 @@ def format_catalog_audit(dropped, skew, catalogs):
 
 def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
           account_pool=None, holder_prefix="", max_holder_concurrent=None, usage=None,
-          margin=SAFETY_MARGIN, account_slot_bound=False, return_reason=False):
+          margin=SAFETY_MARGIN, account_slot_bound=False, return_reason=False,
+          partition_scoped=True):
     """CAS-claim a lease. Returns {account, secret_ref, model, claim_id} or None (none free).
     Raises LeaseIOError when an account WAS eligible but the ledger write kept failing — that is an
     infrastructure failure (persistent CAS contention, or the contents-API PUT rejected outright,
@@ -1693,7 +1694,29 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
         key = holder_key(holder)
         if key and any(holder_key(lease.get("holder")) == key for lease in live):
             return result(None, "pr-single-flight")
-        if holder_prefix and not partition_available(live, holder_prefix, package):
+        # [#1480] `partition_scoped=False` drops ONLY the package dimension, and ONLY for a
+        # lane whose runs cannot write. The lease is still WRITTEN with its real package, so
+        # every other consumer of the ledger — `sibling_lease_conflict`, the busy-area legs,
+        # groom's sweeps — sees this holder exactly as before; nothing downstream is widened.
+        #
+        # WHY THIS CANNOT UN-SERIALISE A WRITE (research/1011 §9.2, "prove the class empty"):
+        # `partition_available` filters by `holder_prefix`, which dispatch-claim builds as
+        # f"{holder_namespace}{repo}#" with holder_namespace ∈ {"review:", "fix:"}. The namespaces
+        # are DISJOINT, so a review claim only ever consulted OTHER REVIEW leases — it never saw a
+        # fix or worker lease, and they never saw it, at this predicate. Skipping the check for
+        # reviews therefore creates exactly ONE new co-tenancy: review-vs-review.
+        #
+        # That class is empty by construction, not by assumption: review-fix.yml takes `mode` as a
+        # REQUIRED `type: choice` input (one run, one mode, no mid-run escalation), documents it as
+        # "review (opposite provider, read-only) or fix (same provider, edit+push)", and gates
+        # EVERY commit/push site — including the push job itself — on `inputs.mode == 'fix'`.
+        # Two concurrent reviews on one crate perform zero writes between them.
+        #
+        # MEASURED COST OF NOT DOING THIS (tick 30691154452): lane review planned=37 launched=9
+        # deferred=28, review:conflict=23 — the largest single loss in the dispatch, and precisely
+        # the "plans work the allocator then refuses, every tick, forever" state §9.3 warns about.
+        if partition_scoped and holder_prefix and not partition_available(
+                live, holder_prefix, package):
             return result(None, "package-single-flight")
         if max_holder_concurrent is not None:
             if max_holder_concurrent <= 0 or not holder_prefix:
@@ -3349,6 +3372,57 @@ def _self_test():
             account_slot_bound=True, return_reason=True)
     check("reasoned claim defers a package lease conflict", (conflict, why),
           (None, "package-single-flight"))
+
+    # ---- [#1480] REVIEW drops the PACKAGE dimension; every write lane keeps it -----------------
+    # Measured motivation (tick 30691154452): lane review planned=37 launched=9 deferred=28 with
+    # review:conflict=23 — the largest single loss in the dispatch, and exactly the "plans work the
+    # allocator then refuses, every tick, forever" state research/1011 §9.3 names.
+    #
+    # SOUNDNESS (§9.2 "prove the class empty", by construction rather than assumption):
+    # `partition_available` filters by holder_prefix, and dispatch-claim builds it as
+    # f"{holder_namespace}{repo}#" with holder_namespace in {"review:", "fix:"}. Those namespaces
+    # are DISJOINT, so this predicate NEVER related a review to a write. The controls below pin
+    # that fact, so the only co-tenancy this opens is review-vs-review — and review-fix.yml gates
+    # every commit/push site, the push job included, on `inputs.mode == 'fix'`.
+    _rev_board = [make_lease("acctsol", "review:o/r#40@r.1", "crate-a", "review", "sol", now, 100)]
+    with _StubLedger(sol12, _rev_board):
+        admitted, why_ok = claim(
+            "r", "crate-a", "review", ["sol"], "review:o/r#41@r.1", now,
+            account_pool=["acctsol"], holder_prefix="review:o/r#",
+            account_slot_bound=True, return_reason=True, partition_scoped=False)
+    check("[#1480 RED] a REVIEW claim is ADMITTED onto a crate another REVIEW already holds",
+          (admitted is not None, why_ok or None), (True, None))
+    # CONTROL 1 — the invariant that is NOT being relaxed. Same board, same package, scoped=True
+    # (what every write lane passes): still refused. A suite where this also admits has deleted
+    # package single-flight outright rather than scoping it.
+    with _StubLedger(sol12, _rev_board):
+        still_refused = claim(
+            "r", "crate-a", "review", ["sol"], "review:o/r#42@r.1", now,
+            account_pool=["acctsol"], holder_prefix="review:o/r#",
+            account_slot_bound=True, return_reason=True)
+    check("[#1480 CONTROL] the SAME board still refuses when partition_scoped stays True",
+          still_refused, (None, "package-single-flight"))
+    # CONTROL 2 — per-PR single-flight is untouched: dropping the package dimension must not let
+    # one PR be reviewed twice concurrently.
+    with _StubLedger(sol12, [
+            make_lease("acctsol", "review:o/r#41@r.1", "crate-a", "review", "sol", now, 100)]):
+        dup = claim(
+            "r", "crate-b", "review", ["sol"], "review:o/r#41@r.2", now,
+            account_pool=["acctsol"], holder_prefix="review:o/r#",
+            account_slot_bound=True, return_reason=True, partition_scoped=False)
+    check("[#1480 CONTROL] pr-single-flight still bites with the package dimension dropped",
+          dup, (None, "pr-single-flight"))
+    # CONTROL 3 — the soundness premise itself, asserted rather than argued: a FIX lease is
+    # INVISIBLE to a review claim's partition check and vice versa, because the holder namespaces
+    # are disjoint. This is what proves no WRITE was ever serialised by this predicate, so removing
+    # it for reviews cannot un-serialise one.
+    _fix_board = [make_lease("acctsol", "fix:o/r#40@r.1", "crate-a", "fix", "sol", now, 100)]
+    check("[#1480 CONTROL] a live FIX lease is invisible to a REVIEW partition check",
+          partition_available(_fix_board, "review:o/r#", "crate-a"), True)
+    check("[#1480 CONTROL] a live REVIEW lease is invisible to a FIX partition check",
+          partition_available(_rev_board, "fix:o/r#", "crate-a"), True)
+    check("[#1480 CONTROL] ...while same-namespace FIX-vs-FIX still conflicts",
+          partition_available(_fix_board, "fix:o/r#", "crate-a"), False)
     with _StubLedger(sol12, [
             make_lease("acctsol", f"fix:o/r#{number}@r.1", f"crate-{number}", "fix", "sol",
                        now, 100)

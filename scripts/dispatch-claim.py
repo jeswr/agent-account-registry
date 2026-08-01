@@ -7449,6 +7449,13 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # S=0 fails closed.  No static per-lane ceiling can strand an idle provider.
                 account_slot_bound=True,
                 return_reason=True,
+                # [#1480] A `review` run is READ-ONLY (review-fix.yml gates every commit/push
+                # site, including the push job, on `inputs.mode == 'fix'`), so two reviews on one
+                # crate cannot collide. `partition_available` is holder_prefix-scoped and the
+                # namespaces are disjoint ("review:" vs "fix:"), so this drops ONLY
+                # review-vs-review serialisation — no write lane ever consulted, or was consulted
+                # by, this predicate. `fix` keeps the package single-flight unchanged.
+                partition_scoped=(mode != "review"),
             )
         except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
             defer_reasons["lease-error"] += 1
@@ -22964,6 +22971,34 @@ def _starvation_sweep_self_test():
                for node in _ast.walk(_pr_labels_kw.value)), \
         "pr_review_labels= must derive from the sweep's live `labels` read — a literal would make " \
         "the label-plan gate decide about a PR that does not exist"
+    # ---- [#1480] THE REVIEW PARTITION-SCOPE WIRING -------------------------------------------
+    # The allocator change is inert unless the review/fix dispatch call actually passes
+    # `partition_scoped`, and it is DANGEROUS if that value is a bare literal:
+    #   * `partition_scoped=True`  silently reverts the width fix while looking wired;
+    #   * `partition_scoped=False` drops package single-flight for the FIX lane too, which DOES
+    #     un-serialise concurrent writes to one crate — the failure research/1011 §9.2 is about.
+    # So the value must be an expression that READS `mode`. A literal of either polarity fails.
+    _alloc_calls = [node for node in _ast.walk(_ast.parse(
+        Path(__file__).resolve().read_text(encoding="utf-8")))
+        if isinstance(node, _ast.Call)
+        and isinstance(node.func, _ast.Attribute)
+        and node.func.attr == "claim"
+        and any(kw.arg == "holder_prefix" for kw in node.keywords)
+        and any(kw.arg == "return_reason" for kw in node.keywords)]
+    assert len(_alloc_calls) == 1, (
+        f"expected exactly ONE reasoned allocator.claim call site, found {len(_alloc_calls)} — "
+        "if the review/fix dispatch grew a second, this guard must cover BOTH or it protects the "
+        "one nobody edits")
+    _scope_kw = [kw for kw in _alloc_calls[0].keywords if kw.arg == "partition_scoped"]
+    assert _scope_kw, (
+        "the review/fix allocator.claim call must pass partition_scoped= — without it the review "
+        "lane keeps serialising read-only work behind a write-safety rule (#1480)")
+    assert any(isinstance(node, _ast.Name) and node.id == "mode"
+               for node in _ast.walk(_scope_kw[0].value)), (
+        "partition_scoped= must be an expression reading `mode`, never a literal: True silently "
+        "reverts the fix, and False extends it to the FIX lane and un-serialises concurrent "
+        "writes to one crate (research/1011 §9.2)")
+
     # [review round 1, B3/M14] THE READ-ONLY GATE'S WIRING. The guard above matches only calls
     # carrying ALL of _void_kwargs, and the read-only CLAIM proof gate deliberately carries four of
     # the five (no `void_offered`) — so NOTHING referenced its wiring and deleting it passed the
