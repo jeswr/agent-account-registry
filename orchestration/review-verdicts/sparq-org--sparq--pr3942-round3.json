@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3942,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "692b37487f635f36616bc9e6d49d598ded55aa28",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "term_to_ntriples fails closed only for invalid literal language/direction metadata. The `bnode` branch appends term.value after `_:` without validating the blank-node-label grammar, while the catch-all branch returns term.value verbatim whenever triple is absent. TermRef is public and Deserialize, so an edited value such as `{\"kind\":\"triple\",\"value\":\"attacker-controlled SPARQL\"}` reaches DELETE/INSERT syntax unchanged. Unknown kinds take the same branch. This contradicts the new all-or-nothing safety contract and leaves an executable injection path.",
+    "file": "crates/sparq-forms/src/diff.rs",
+    "fix_hint": "Make serialization accept only the explicit kinds `iri`, `bnode`, `literal`, and `triple`; reject unknown kinds. For `triple`, require structured components and recursively serialize them (or parse and validate the carried text as exactly one RDF triple term before re-emitting it). Validate blank-node labels against the applicable N-Triples grammar before emission. Add malicious deserialization tests for an opaque triple value, an unknown kind, and a punctuation-bearing blank-node label, each proving that no update is emitted.",
+    "severity": "major",
+    "title": "Deserialized term kinds and blank-node labels still permit SPARQL injection"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 fixes both prior findings: language/direction metadata is now validated with all-or-nothing update construction, and the computed-field test asserts the exact default and feature-enabled results. However, the same public, deserializable TermRef still has other unvalidated serialization branches: arbitrary/\"triple\" kinds without structured components are copied verbatim, and blank-node labels are emitted verbatim. Either can place attacker-controlled SPARQL syntax into an update. Because this is a new major finding despite resolution of the old findings, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
