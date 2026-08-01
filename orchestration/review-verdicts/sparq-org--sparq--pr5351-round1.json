@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5351,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d27a4b8c41de2e835203167213f53a886826f9d9",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change consistently derives waiting, progress, liveness, and timeout behavior from the same declared-advisory complement used by the final verdict, while preserving a fail-closed hold for the only potentially widened empty-gating-set path. The focused tests exercise the real polling loop and cover both directions: pending advisory jobs no longer block a terminal green gating set, while pending/failing gating jobs remain awaited and fail closed; advisory-only pending startup cannot pass; liveness and progress ignore advisory activity. The complete hermetic ci-summary test suite passes (193 tests, 3 skipped). No correctness, security, vacuity, or instruction-injection issue was found in the supplied diff.",
+  "verdict": "approve"
+ }
+}
