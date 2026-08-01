@@ -13,12 +13,12 @@
   {
    "account": "dc2d751954080e13",
    "claim_id": "dc63e1dd2b6548e3b17a2d9a59640dfa",
-   "holder": "review:sparq-org/sparq#5558@dispatch-30702459177.1",
+   "holder": "review:sparq-org/sparq#5558@30702618739.1",
    "package": "sparq-canon",
    "role": "review",
    "model": "sol",
-   "issued_at": 1785592369,
-   "expires_at": 1785596569
+   "issued_at": 1785592407,
+   "expires_at": 1785596607
   },
   {
    "account": "dc2d751954080e13",
