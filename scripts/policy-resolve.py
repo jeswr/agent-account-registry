@@ -939,6 +939,12 @@ agent = "docs-agent"
                if isinstance(row, dict) and not row.get("enabled")]
     assert _staged, ("this guard must have at least one staged row to validate; if the policy ever "
                      "has none, DELETE the guard rather than let it pass vacuously")
+    # ⚠️ `_validated` is appended to ONLY after `_policy_row` RETURNS, and the check below compares
+    # it against the independently-derived `_staged`. Round-2 review caught the first cut ending in
+    # `check(..., sorted(_staged), sorted(_staged))` — a value compared with ITSELF, which stays
+    # green (and preserves the check count) if this whole loop is deleted. A guard whose own removal
+    # is invisible protects nothing; the expected value must be PRODUCED BY THE WORK.
+    _validated = []
     for _name in sorted(_staged):
         _probe = _copy.deepcopy(_shipped)
         _probe["repos"][_name]["enabled"] = True
@@ -949,8 +955,9 @@ agent = "docs-agent"
                 f"staged row {_name!r} does NOT survive `enabled = true`: {_exc}. A staged target "
                 "whose only documented activation step is flipping `enabled` must validate under "
                 "that flip, or the promise is false and the enable fails closed.") from _exc
+        _validated.append(_name)
     check("every staged (disabled) row survives its own one-line enable",
-          sorted(_staged), sorted(_staged))
+          _validated, sorted(_staged))
 
     rejects("unknown role fails closed", "unknown role",
             lambda: resolve("sparq-org/sparq", "destroy", policy, routing))
