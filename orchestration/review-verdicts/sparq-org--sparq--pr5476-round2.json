@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5476,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a75242d73acb80a2ae921e716d06fb0073989914",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains correct and complete. It adds `book/**/*.md` to markdownlint's authoritative glob configuration and to the offline lychee input list, while keeping the workflow comments aligned with the actual gate scope. The JSONC syntax and quoted workflow glob are consistent with the existing mechanisms. The mdBook include-directive comments do not alter execution and accurately distinguish those directives from Markdown links. No correctness, soundness, security, or test-validity issue is evident. Because round 1 also approved with no findings and this round introduces no findings, progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
