@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1522,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b56ad1c1bba02a6cefd0ddcf53bbdd26bae71d85",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_worker_mints_missing_revoke_skip` matches `skip-token-revoke: true` with arbitrary leading whitespace and without tracking the YAML `with:` mapping. For example, moving the line under `env:` in either mint step would still set `skip=1`, but `actions/create-github-app-token` would not receive the input and would register its credential-bearing post-job revoker. The LIVE zero would remain green. The false/absent mutants only exercise value and presence at the currently correct location, so they do not detect this placement failure. This makes the trust-boundary assertion fail-open at the YAML seam.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Parse enough step structure to require `skip-token-revoke: true` as an exact child of that mint step's `with:` mapping (including the expected indentation), and add a non-crashing fixture that relocates the same key under `env:` or another sibling mapping and asserts that the mint is reported. Preserve the exact job boundary and mint-population controls.",
+    "severity": "major",
+    "title": "Revocation guard accepts skip-token-revoke outside the action's with mapping"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe workflow currently configures both run-job mints correctly, and the job-name selection is exact. However, the new guard does not establish that `skip-token-revoke: true` is an input to the token action: it accepts that text anywhere in the step. A misplaced key under `env:` or another nested mapping therefore leaves the revocation post phase enabled while the live assertion reports zero. Because this is a newly identified major trust-boundary gap relative to round 1's clean approval, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
