@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1491,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "60ed963d67d17e44c79ea57a6ed3ccf4f690c859",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The durable charge still occurs only after the recovery launch, and a `DispatchError` from `record-marker` merely increments in-memory telemetry. If each launched reviewer dies before `review-outcome` writes its round marker and each post-launch attempt-marker write fails, the next tick again sees neither a round nor an attempt marker. Repeating that real failure sequence leaves both durable counters flat, so `STRANDED_RECOVERY_LIMIT` is never reached. Row (v) confirms one launch is uncharged, while the only new multi-tick negative loop sets `launch_rc = 1` and therefore tests launches that never happened; it does not exercise repeated successful launches followed by marker-write failure. The claim that this window costs at most one attempt is not enforced, because the same window can recur on every tick.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Add durable pre-launch reservation/commit accounting or another fail-closed reconciliation mechanism that bounds confirmed launches whose post-launch marker cannot be written, without treating an unconfirmed launch as completed work. Add a multi-tick test where every workflow launch succeeds, every reviewer dies before recording its round, and every attempt-marker write fails; assert dispatches still converge to a safe bounded state without fabricated human-terminal evidence.",
+    "severity": "major",
+    "title": "Repeated post-launch marker failures still bypass the recovery bound"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-4 major remains unresolved. The new multi-tick tests prove convergence when confirmed launches can successfully write durable attempt markers, and prove that failed launches do not charge. They still do not provide a durable bound when the launch succeeds but every post-launch `record-marker` write fails: each tick launches a recovery, the reviewer may die before recording a round, both durable counters remain unchanged, and the same recovery can be dispatched again indefinitely. Row (v) exercises that seam only once and explicitly accepts the uncharged state; the repeated-loop coverage is for `launch_rc = 1`, a different path that launches no review. Because the same major remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
