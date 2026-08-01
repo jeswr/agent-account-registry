@@ -510,17 +510,8 @@ jobs:
               last=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?per_page=1" \
                      --jq '.workflow_runs[0].created_at // empty' || true)
             fi
-            # UNREADABLE ANCHOR == UNREADABLE READ (#936). `date` exits nonzero on a stamp it
-            # cannot parse, and as the final command of an `&&` list under `set -euo pipefail`
-            # that killed the whole STEP: every workflow LATER in the spec list was then silently
-            # never checked that fire. Same fail-open rule as the reads above — an anchor that
-            # cannot be read is treated as STALE (prev=0, what an absent anchor already means),
-            # so the mesh kicks instead of going quiet on the one job whose purpose is liveness.
             prev=0
-            if [ -n "$last" ] && ! prev=$(date -u -d "$last" +%s 2>/dev/null); then
-              echo "keepalive: ${wf} ${anchor} anchor '${last}' is unreadable — treating as stale"
-              prev=0
-            fi
+            [ -n "$last" ] && prev=$(date -u -d "$last" +%s)
             age=$(( now - prev ))
             if [ "$age" -gt "$limit" ]; then
               echo "keepalive: ${wf} last ${anchor} ${age}s ago (limit ${limit}s) — dispatching"
@@ -574,14 +565,8 @@ jobs:
             fi
             last=$(gh api "repos/sparq-org/sparq/actions/workflows/${wf}/runs?per_page=1" \
                    --jq '.workflow_runs[0].created_at // empty' || true)
-            # UNREADABLE ANCHOR == UNREADABLE READ (#936), same rule as the registry leg above: an
-            # unparseable stamp exited the `&&` list nonzero and `set -e` killed the step, so the
-            # sweeper's only cron-delivery fallback went quiet instead of kicking. Treat as stale.
             prev=0
-            if [ -n "$last" ] && ! prev=$(date -u -d "$last" +%s 2>/dev/null); then
-              echo "keepalive: sparq-org/sparq ${wf} run anchor '${last}' is unreadable — treating as stale"
-              prev=0
-            fi
+            [ -n "$last" ] && prev=$(date -u -d "$last" +%s)
             age=$(( now - prev ))
             if [ "$age" -gt "$limit" ]; then
               echo "keepalive: sparq-org/sparq ${wf} last ran ${age}s ago (limit ${limit}s) — dispatching"
