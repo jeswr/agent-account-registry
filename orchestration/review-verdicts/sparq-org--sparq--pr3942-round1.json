@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3942,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a8549d789831c7e1f72c18228fe40144b9f261b1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`term_to_ntriples` appends `TermRef.direction` verbatim after `--`. `TermRef` is public and deserializable, and form descriptions are intended for JSON consumers, so a returned form can be modified or reconstructed with a direction such as `rtl . } INSERT DATA { <...> <...> <...> . } #`. Passing that form to `to_sparql_update` incorporates the payload as SPARQL syntax rather than an RDF literal direction. RDF 1.2 permits only `ltr` or `rtl`; the write path must fail closed instead of trusting the struct field.",
+    "file": "crates/sparq-forms/src/diff.rs",
+    "fix_hint": "Validate direction as exactly `ltr` or `rtl` before serialization (and preferably validate the associated language tag as well). Change serialization/update construction to return an error for invalid term metadata, or otherwise exclude invalid changes; add a test that mutates/deserializes an invalid direction containing SPARQL punctuation and proves no executable update is produced.",
+    "severity": "major",
+    "title": "Unvalidated base direction permits SPARQL injection"
+   },
+   {
+    "body": "The test and public documentation state that without `computed` a `sh:values` field has an EMPTY value vector, but the assertion only checks that the vector is not exactly `[\"stale\"]`. Any arbitrary non-stale value, including an incorrectly evaluated or leaked value, passes. Because this test also runs with `computed` enabled, it cannot express the two feature-state expectations as written.",
+    "file": "crates/sparq-forms/tests/rdf12_roles.rs",
+    "fix_hint": "Under `#[cfg(not(feature = \"computed\"))]`, assert `computed.values.is_empty()`. Under `#[cfg(feature = \"computed\")]`, assert the expected computed value (for this fixture, `Bob`) while still asserting that `stale` is absent.",
+    "severity": "minor",
+    "title": "Default-feature computed-field test does not prove values are empty"
+   }
+  ],
+  "progress": null,
+  "summary": "The RDF 1.2 direction support is not safe on the public write path: a caller-controlled `TermRef.direction` is interpolated into SPARQL without validation or escaping. This can turn a form edit into additional SPARQL syntax. The computed-field implementation itself is feature-gated and avoids asserted-value fallback, but its default-state acceptance test does not actually assert the documented empty-values invariant.",
+  "verdict": "request_changes"
+ }
+}
