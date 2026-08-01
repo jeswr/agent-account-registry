@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1519,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "691e69e1f45dcde4b07e7ecc18700210e699933f",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_workflow_job_key` still bounds the job with `(?=^  \\S|\\Z)`. A two-space comment satisfies that lookahead even though YAML ignores comment-only lines for mapping structure. Placing `  # keepalive controls` after the captured `runs-on: ubuntu-latest` and before `    if: false` truncates the block: `runs-on` supplies the positive control, while `if` incorrectly reads as absent, so the live row stays green although GitHub disables the job. The new `synthetic_job` contains only `    # if: ...`, a four-space comment, and does not test the round-3 boundary case.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Make job-boundary detection skip comment-only lines while still refusing missing or ambiguous job definitions. Add the exact independent regression fixture: a two-space comment between `runs-on: ubuntu-latest` and a four-space `if: false`, and assert that the gate is still returned while the positive control occurs before the comment.",
+    "severity": "major",
+    "title": "A job-indented comment still hides subsequent job gates"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 major remains unchanged. `_workflow_job_key` still ends its capture at `(?=^  \\S|\\Z)`, so a valid two-space YAML comment is treated as the next job boundary. The added synthetic job retains only a four-space comment inside the job and therefore does not exercise the reported bypass. If a two-space comment follows `runs-on` and precedes `    if: false`, the positive control remains visible while the gate is truncated from the captured block; the production assertion consequently reports `(None, \"ubuntu-latest\")` and passes although the job is disabled. Because the same soundness defect remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
