@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5603,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1a6b14dd100b15217f11b623641c0f6aba1589d3",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. BAF now requires ground IRI predicates in conclusions (condition 3), so the fixed rule-head predicate set P and the |P|*|A|^2 derived-fact bound follow; it also forbids variable-bearing compound terms in conclusions (condition 6), excluding the recursive list/quoted-triple construction that invalidated termination. The revised active-domain definition accounts for the finite outputs of acyclic generators, the membership table is rechecked against both added conditions, and the companion design accurately labels the result as argued rather than machine-checked and enforcement as not shipped. The accepted/rejected examples provide a concrete checker-oriented plan for both previously missed cases. No correctness, soundness, test-validity, or security issue remains in this analysis-only change.",
+  "verdict": "approve"
+ }
+}
