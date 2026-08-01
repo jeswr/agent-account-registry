@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1563,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8409030670a1861e9a0cd333c76420b196a8e22d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`compute_ready` rejects a candidate whose packages are `{GLOBAL}` whenever `taken` contains any area (`if GLOBAL in pkgs and taken`). `frontier_census`, however, only increments `blocked` for `pkgs & held`; `{GLOBAL}` has no intersection with an area-specific held set. For example, one open PR holding `worker` plus one ready issue with no `area:` label produces `candidates=1 frontier=0 conflict-deferred=1 reserved_areas=1 free_areas=1 blocked-by-reserved: none`. The special case only handles the inverse (`GLOBAL in held`). Thus a frontier stopped by real reserved occupancy can still claim that no reservation blocks demand, and there is no self-test for this third conflict branch's census evidence.",
+    "file": "scripts/ready-issues.py",
+    "fix_hint": "Account explicitly for deferred candidates containing `GLOBAL` when any non-global reservation is held, using an unambiguous bounded attribution that does not double-count, and add an exact-text self-test with an area-specific occupant and a cross-cutting ready candidate. Ensure the output cannot read `blocked-by-reserved: none` for that blocked tick.",
+    "severity": "major",
+    "title": "Cross-cutting candidates blocked by area occupancy are not attributed"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe always-emitted census and its ordinary area-conflict tests are sound, but the new attribution is incomplete for one of compute_ready's existing conflict rules: a cross-cutting candidate blocked by an area-specific occupant is counted as deferred while being attributed to no reservation. That makes a materially blocked frontier still report `blocked-by-reserved: none`, contrary to the census's stated purpose and exactness claims.",
+  "verdict": "request_changes"
+ }
+}
