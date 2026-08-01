@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1510,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "cff5f11724542d0df91eeae18e51985c06b778d2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_premium_window` appends every key ending in `-utilization`; it never checks `window not in BASE_WINDOWS`, despite the constant, docstring, comments, and tests all defining that exclusion. Therefore a normal response containing only `5h-utilization` and `7d-utilization` returns one of those windows instead of `None`. The new `[#720] base-only headers declare NO premium window` self-test must fail. In production, every normal opus5 probe with base headers will falsely declare a premium window; with mixed headers, a base window can also win the max-utilization selection and hide the actual premium bucket.",
+    "file": "scripts/account-usage.py",
+    "fix_hint": "Exclude `5h` and `7d` before adding candidates (for example, require a non-empty window that is not in `BASE_WINDOWS`), then run the complete `account-usage.py --self-test` and preserve the base-only and mixed-window assertions as red tests for this guard.",
+    "severity": "blocker",
+    "title": "Premium-window detection never excludes the base 5h/7d windows"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRequest changes: the new opus5 premium-window classifier does not implement its defining base-window exclusion. As written, ordinary 5h/7d headers are treated as premium buckets, and the newly added self-test deterministically fails on its base-only fixture. This is both a shipped correctness defect and direct evidence that the proposed change is not test-clean.",
+  "verdict": "request_changes"
+ }
+}
