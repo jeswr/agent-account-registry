@@ -141,6 +141,19 @@
 # read_source_with_retry — a BOUNDED retry that re-raises rather than degrading to empty text,
 # since empty text resolves to the empty surface, which is the all-22-uncovered false alarm itself.
 #
+# TRANSIENT API reads (issue #1025) — the same class as #819/#1208, but at the READ this guard
+# starts from. `GET /repos/<repo>` resolves the default branch; it reads NONE of the three #101
+# settings, yet a failure of it took the historical "anything unclassifiable keeps the settings
+# verdict" path and printed the maintainer remediation. Measured over 30 runs: 3 of 21 concluded
+# GUARD ticks lost (~14 %), each one instructing a human to change three settings that were
+# verified CORRECT — on the repo's secret-exfiltration boundary, during an incident, where the two
+# likely outcomes are a no-op and a WEAKENED configuration. A control that fails closed is only
+# safe while the message it emits on failure is TRUE. Two fixes, neither of which admits a tick:
+# every `gh api` GET now runs through the shared BOUNDED RETRY (scripts/gh_retry.py), and a failure
+# of a read that CANNOT report a setting gets its own exit — naming the request and its status, not
+# the settings. Reads whose failure CAN be the #101 condition (a 404 on the environment GET IS
+# "the environment is missing") keep the positive-evidence-only rule untouched.
+#
 # Pure verdict helpers + a stubbed-gh flow (including value-never-echoed sentinels) run under
 # --self-test (registry-selftest gate).
 import importlib.util
@@ -153,31 +166,39 @@ import sys
 import time
 
 
-def _load_gh_403():
-    """Load scripts/gh_403.py (same checkout) — THE 403 taxonomy, shared with plan-snapshot
-    (registry #1208). By PATH, not `import gh_403`: `scripts/` is not a package and the CWD a
-    workflow step runs from is not this directory.
+def _load_sibling(filename, module_name, consequence):
+    """Load `scripts/<filename>` (same checkout) by PATH, not `import <name>`: `scripts/` is not a
+    package and the CWD a workflow step runs from is not this directory.
 
     FAILS LOUD AND CLOSED, by design, and NAMED. This module is a fail-closed control, so a
     missing dependency must never degrade a check into a verdict it did not earn — that is the
     2026-07-25 dispatch halt (#616's undeclared `grant-account.py` load) verbatim. The two
     protections against ever reaching this branch in production are the same two that closed that
-    class: `scripts/gh_403.py` is declared in SELF_TEST_LIVE_INPUTS, and
+    class: every file loaded here is declared in SELF_TEST_LIVE_INPUTS, and
     sparse_checkout_covers_verdict pins that list to the guard job's sparse-checkout block, so an
     omission goes red in pr-gate's full checkout instead of halting dispatch."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gh_403.py")
-    spec = importlib.util.spec_from_file_location("registry_gh_403_for_guard", path)
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None or not os.path.exists(path):
         raise SystemExit(
-            f"::error::secrets-guard: the shared 403 taxonomy ({path}) is unavailable, so a failed "
-            "GitHub read cannot be classified — refusing to verify anything (fail closed). Add "
-            "scripts/gh_403.py to the secrets-guard job's sparse-checkout list in dispatch.yml.")
+            f"::error::secrets-guard: {consequence} ({path}) — refusing to verify anything (fail "
+            f"closed). Add scripts/{filename} to the secrets-guard job's sparse-checkout list in "
+            "dispatch.yml.")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-gh_403 = _load_gh_403()
+# THE 403 taxonomy, shared with plan-snapshot (registry #1208).
+gh_403 = _load_sibling(
+    "gh_403.py", "registry_gh_403_for_guard",
+    "the shared 403 taxonomy is unavailable, so a failed GitHub read cannot be classified")
+# THE bounded-retry layer for idempotent reads (issue #1025). Every `gh api` GET below runs through
+# it, so one blipped read costs a bounded, jittered retry instead of the whole dispatch tick.
+gh_retry = _load_sibling(
+    "gh_retry.py", "registry_gh_retry_for_guard",
+    "the shared bounded-retry layer is unavailable, so a transient GitHub read could not be "
+    "retried and one API blip would stand the whole dispatcher down")
 
 ENVIRONMENT = "dispatch-secrets"
 REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
@@ -1222,6 +1243,10 @@ SELF_TEST_LIVE_INPUTS = (
     # review time, which is the control that exists because #616's undeclared by-path script load
     # halted dispatch for a day.
     "scripts/gh_403.py",
+    # THE BOUNDED-RETRY LAYER (issue #1025). Loaded at MODULE IMPORT by _load_sibling for the same
+    # reason gh_403.py is, and pinned here for the same reason: its absence is not a degraded check
+    # but a dead module, and `--self-test` drives the real retry loop through it.
+    "scripts/gh_retry.py",
     "scripts/worker-live.sh",
     "scripts/worker-pr.py",
     "policy/repos.toml",
@@ -2334,8 +2359,27 @@ def classify_read_failure(stderr):
     return "transient"
 
 
-def _api(path, transient_reads=None, budget_reads=None):
-    """Read-only `gh api` GET. Returns the parsed JSON document, or None on any failure —
+def read_failure_descriptor(path, status, attempts=None):
+    """Pure: how ONE read this guard could not use is named in an operator-facing line — the
+    endpoint, its HTTP status when one could be recovered, and how many bounded attempts were spent.
+
+    Deliberately the ONLY thing said about such a read: gh's stderr is never surfaced (it can carry
+    request bodies under GH_DEBUG=api, and an error page is remote-controlled content), and the
+    STATUS is the one fact that both names the transport failure and is safe to print.
+
+    `attempts` is omitted (None) when the caller does not know the count — a response that ARRIVED
+    and was merely unusable is not "N failed attempts", and claiming a number nobody measured is
+    the same kind of confident-but-false line this whole issue is about."""
+    where = f"HTTP {status}" if status else "no HTTP status recoverable"
+    spent = f" after {attempts} bounded attempt(s)" if attempts is not None else ""
+    return f"{path} -> {where}{spent}"
+
+
+def _api(path, transient_reads=None, budget_reads=None, unreadable_reads=None,
+         sleep=None, log=None):
+    """Read-only `gh api` GET, through the shared BOUNDED-RETRY layer (issue #1025: this guard is
+    gating, so one blipped read used to cost the whole dispatch tick — measured at ~14 % of ticks).
+    Returns the parsed JSON document, or None on any failure —
     sanitized: neither stderr nor the payload is ever echoed (GH_DEBUG=api can echo request
     bodies; an error page is remote-controlled content).
 
@@ -2351,25 +2395,57 @@ def _api(path, transient_reads=None, budget_reads=None):
     they select only the wording. A caller that passes `transient_reads` but not `budget_reads`
     gets the pre-#1208 behaviour with budget failures folded back into the transient list, so no
     proven-unverified read is ever LOST by this split — that would be the one way this change could
-    turn an unverified failure back into a settings accusation."""
-    result = subprocess.run(["gh", "api", path], capture_output=True, text=True)
+    turn an unverified failure back into a settings accusation.
+
+    `unreadable_reads` (issue #1025) is the RESIDUAL of those two: a read that did not complete and
+    that this guard could prove NOTHING about — no throttle marker, no budget wording, an
+    unrecoverable status, a truncated body. It is passed ONLY for endpoints whose failure cannot be
+    a settings claim (see main): for those, "the read failed" is ABSENCE of evidence about the
+    settings, so the historical "keep the settings verdict on anything unclassifiable" polarity is
+    not merely unhelpful, it is FALSE. Endpoints whose failure CAN be the #101 condition — a 404 on
+    the environment GET IS "the environment is missing" — deliberately do NOT pass it and keep the
+    positive-evidence-only rule exactly as it was.
+
+    `sleep`/`log` are the retry layer's injection points, threaded so the self-test drives the REAL
+    loop without sleeping and without the layer's stderr diagnostics.
+
+    BOUNDED AGAINST THE JOB TIMEOUT. run_gh sleeps on its exponential schedule only (it never
+    forwards a server Retry-After), so one exhausted read costs 2+4+8+16s plus jitter — under 35s —
+    and an exhausted FIRST read short-circuits the other two. Worst case is therefore well inside
+    the guard job's `timeout-minutes: 5`: this cannot convert an availability blip into a timeout,
+    which would be the same lost tick wearing a different colour."""
+    result = gh_retry.run_gh(
+        ["api", path],
+        sleep=sleep if sleep is not None else gh_retry.sleep_backoff,
+        log=log)
     if result.returncode != 0:
+        # `result.stderr` is gh's own diagnostic with the GH_DEBUG=api trace already scrubbed out
+        # by the retry layer; the status was recovered from the message OR that trace.
         kind = classify_read_failure(getattr(result, "stderr", ""))
-        # The PATH only. stderr is never surfaced: it can carry request bodies under
-        # GH_DEBUG=api, and an error page is remote-controlled content.
+        # The PATH (and, for the residual class, the STATUS) only. stderr is never surfaced: it
+        # can carry request bodies under GH_DEBUG=api, and an error page is remote-controlled
+        # content.
         if kind == "budget" and budget_reads is not None:
             budget_reads.append(path)
         elif kind in ("transient", "budget") and transient_reads is not None:
             transient_reads.append(path)
+        elif unreadable_reads is not None:
+            unreadable_reads.append(read_failure_descriptor(
+                path, getattr(result, "gh_http_status", None),
+                getattr(result, "gh_attempts", 1)))
         return None
     try:
         document = json.loads(result.stdout)
     except ValueError:
+        # The request succeeded and the payload did not parse. That is still "I could not read it",
+        # never a settings finding.
+        if unreadable_reads is not None:
+            unreadable_reads.append(read_failure_descriptor(path, "200 (unparseable body)"))
         return None
     return document
 
 
-def main():
+def main(sleep=None, log=None):
     repo = os.environ.get("REGISTRY_REPO", "")
     if not REPO_RE.fullmatch(repo):
         print("::error::secrets-guard: REGISTRY_REPO is unsafe or unset (fail closed)")
@@ -2398,30 +2474,50 @@ def main():
     # machine-cleared wait, not an availability blip, and telling an operator otherwise invites the
     # one response that makes it worse. Same fail-closed decision. See classify_read_failure.
     budget_reads = []
+    # The RESIDUAL "could not look" class (issue #1025): a read that did not complete and carried
+    # no throttle/budget evidence at all — `gh: HTTP 503` (gh's bare status form has no textual
+    # marker), an unrecoverable status, a truncated body. Populated ONLY for reads whose failure
+    # cannot be a settings claim; see the `repos/<repo>` call below.
+    unreadable_reads = []
     unverified = []
 
     def _unverified(message):
         """Record a failure caused by a read that did not complete. Attributed to the unverified
         class only when the read that produced it was PROVEN not to be a settings finding —
-        transient OR budget-exhausted. Both are "the guard could not look"; neither is evidence
-        about any setting."""
+        transient, budget-exhausted, OR (#1025) a failure of an endpoint that cannot report a
+        setting at all. All three are "the guard could not look"; none is evidence about any
+        setting."""
         failures.append(message)
-        if transient_reads or budget_reads:
+        if transient_reads or budget_reads or unreadable_reads:
             unverified.append(message)
 
-    repo_doc = _api(f"repos/{repo}", transient_reads, budget_reads)
+    # THE SETTINGS-AGNOSTIC READ (issue #1025). `GET /repos/<repo>` resolves the default branch —
+    # the name the branch-policy assertion is compared AGAINST. It reads none of the three #101
+    # settings, so NO failure of it, of any class, can be evidence that a setting is wrong; it is
+    # absence of evidence. This is the ONLY call site that passes `unreadable_reads`, and that
+    # scoping is the whole safety argument: the environment GET below keeps the positive-evidence-
+    # only rule, because a 404 there IS the "environment is missing" condition.
+    repo_path = f"repos/{repo}"
+    repo_doc = _api(repo_path, transient_reads, budget_reads, unreadable_reads,
+                    sleep=sleep, log=log)
     default_branch = repo_doc.get("default_branch") if isinstance(repo_doc, dict) else None
     if not isinstance(default_branch, str) or not default_branch:
-        _unverified("cannot resolve the repository default branch (fail closed)")
+        if not unreadable_reads and not transient_reads and not budget_reads:
+            # The GET completed and parsed, but carried no usable `default_branch`. Still not a
+            # settings finding — it is a response this guard cannot use.
+            unreadable_reads.append(read_failure_descriptor(
+                repo_path, "200 (no `default_branch` field)"))
+        _unverified(f"cannot resolve the repository default branch from `{repo_path}` "
+                    "(fail closed)")
     else:
         environment_doc = _api(f"repos/{repo}/environments/{ENVIRONMENT}",
-                               transient_reads, budget_reads)
+                               transient_reads, budget_reads, sleep=sleep, log=log)
         if environment_doc is None:
             _unverified(f"environment `{ENVIRONMENT}` is missing or unreadable")
         else:
             policies_doc = _api(
                 f"repos/{repo}/environments/{ENVIRONMENT}/deployment-branch-policies",
-                transient_reads, budget_reads)
+                transient_reads, budget_reads, sleep=sleep, log=log)
             policy_ok, reason = branch_policy_verdict(
                 environment_doc, policies_doc, default_branch)
             if not policy_ok:
@@ -2456,7 +2552,7 @@ def main():
                       "same condition and writes no anchor (#1190), so the first doorbell ring "
                       "after the reset executes immediately and this guard verifies then. If PLAN "
                       "is failing too, it is this same exhaustion — see #819, #1208.")
-            else:
+            elif transient_reads:
                 print(f"::error::secrets-guard: TRANSIENT — {len(transient_reads)} GitHub read(s) "
                       f"failed for an availability reason "
                       f"({', '.join(sorted(set(transient_reads)))}), "
@@ -2465,6 +2561,24 @@ def main():
                       "closed until a tick completes the reads, and recovers on its own when they "
                       "do. If the dispatcher is also failing in PLAN, this is the same "
                       "request-budget exhaustion — see scripts/dispatch-tick-floor.py (#819).")
+            else:
+                # THE RESIDUAL (issue #1025). The read did not complete and nothing about WHY it
+                # failed could be proven — but the endpoint it failed on cannot report a setting,
+                # so the one thing that IS known is that no setting was evaluated. Naming the
+                # request and its status is the honest report; naming the settings would send a
+                # human to change a configuration this guard never looked at, on the repo's
+                # secret-exfiltration boundary, during an incident.
+                print(f"::error::secrets-guard: INFRASTRUCTURE — {len(unreadable_reads)} GitHub "
+                      f"read(s) did not complete "
+                      f"({'; '.join(sorted(set(unreadable_reads)))}; attempt counts are the "
+                      "shared bounded retry in scripts/gh_retry.py, which does not replay a "
+                      "permanently-refused read), so the maintainer settings are UNVERIFIED, not "
+                      "known-wrong. This is NOT a settings finding and NO maintainer action is "
+                      "implied: an unreadable API is ABSENCE of evidence about those settings, "
+                      "never evidence against them, and the endpoint named above reports none of "
+                      "them — do not reconfigure anything on the strength of this line. The guard "
+                      "fails closed until a tick completes the read, and recovers on its own when "
+                      "it does (#1025).")
         else:
             print(f"::error::{REMEDIATION}")
         return 1
@@ -3969,7 +4083,10 @@ printf '5\n'
     calls = []
     responses = {}
 
-    def fake_run(cmd, capture_output=False, text=False):
+    def fake_run(cmd, **kwargs):
+        # `**kwargs`: the reads now go through gh_retry.run_gh, which passes `check`, `env` and
+        # `input` on top of capture_output/text. Each ATTEMPT lands here, so `calls` counts real
+        # subprocess invocations — that is what makes the #1025 retry row non-vacuous.
         calls.append(list(cmd))
         return responses.get(cmd[2], _Result(1))
 
@@ -3990,7 +4107,9 @@ printf '5\n'
         os.environ["ALL_SECRETS"] = all_secrets
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
-            rc = main()
+            # The REAL retry loop runs (every attempt hits `fake_run` and is counted); only the
+            # WALL-CLOCK wait and the layer's own stderr diagnostics are suppressed.
+            rc = main(sleep=lambda *args, **kwargs: None, log=lambda line: None)
         return rc, buffer.getvalue()
 
     verified_docs = {repo_path: {"default_branch": "master"},
@@ -4027,13 +4146,119 @@ printf '5\n'
                           policies_path: good_policies})
         chk("flow: all-branches environment -> rc 1 (default-allow refused)",
             (rc_all, "All branches" in out_all), (1, True))
-        rc_branch, out_branch = run_main(empty_scope, {repo_path: None})
+        rc_branch, _out_branch = run_main(empty_scope, {repo_path: None})
         chk("flow: unreadable default branch -> rc 1 (fail closed)", rc_branch, 1)
-        # ...and, with no PROOF the read was transient, it keeps the historical verdict. The
-        # classification can only ever DEMOTE on positive evidence; it never suppresses silently.
-        chk("flow: an UNCLASSIFIABLE read failure still prints the remediation (positive evidence "
-            "only — absence of a throttle marker is not proof of a throttle)",
-            "REQUIRED maintainer settings" in out_branch, True)
+        # ...and, with no PROOF the read was transient, a failure that COULD be a settings finding
+        # keeps the historical verdict. The classification can only ever DEMOTE on positive
+        # evidence; it never suppresses silently. #1025 scoped that rule to endpoints whose failure
+        # can actually report a setting — the ENVIRONMENT GET is one (a 404 there IS the #101
+        # "environment is missing" condition), the default-branch GET is not — so the row moved
+        # HERE and the polarity it protects is unchanged.
+        rc_envblip, out_envblip = run_main(
+            empty_scope, {repo_path: {"default_branch": "master"}, env_path: None,
+                          policies_path: good_policies})
+        chk("flow: an UNCLASSIFIABLE failure of a read that CAN report a setting (the environment "
+            "GET) still prints the remediation (positive evidence only — absence of a throttle "
+            "marker is not proof of a throttle)",
+            (rc_envblip, REMEDIATION in out_envblip, "INFRASTRUCTURE" in out_envblip),
+            (1, True, False))
+
+        # ---- #1025: a transient API read must not accuse settings it never looked at ----------
+        # GUARD failed on ~14 % of ticks and, because PLAN/CLAIM/ALERT are downstream, took the
+        # whole dispatch tick with it — while printing the #101 remediation naming three settings
+        # that were verified CORRECT. The `repos/<repo>` GET resolves the default branch and reads
+        # NONE of those settings, so its failure is ABSENCE of evidence about them.
+        #
+        # THE PRE-EXISTING ROW ABOVE PINS THE RETURN CODE ONLY, which is exactly why this shape
+        # survived: it asserted the refusal and never the message. These pin the MESSAGE, in both
+        # directions.
+        # `transport` is what the emitted text must say about HOW the read failed — the fact an
+        # operator needs to tell a 503 from a 404 without ever seeing the raw stderr. Asserting
+        # only "no remediation" would be satisfied by printing nothing useful at all.
+        for label, stderr, transport in (
+                # gh's BARE status form. No word in it matches the transient marker table, so this
+                # is the shape that fell through to the settings verdict in production.
+                ("gh's bare status form — no textual marker at all", "gh: HTTP 503", "HTTP 503"),
+                ("gh's prose form", "gh: Service Unavailable (HTTP 503)",
+                 "failed for an availability reason"),
+                ("a statusless drop", "SENTINEL-STDERR", "no HTTP status recoverable")):
+            rc_i, out_i = run_main(empty_scope, {repo_path: None}, stderr=stderr)
+            chk(f"#1025: an unreadable default-branch GET ({label}) fails CLOSED, NAMES the "
+                f"failing request AND the transport failure ({transport!r}), and NEVER prints the "
+                "maintainer-settings remediation",
+                (rc_i, repo_path in out_i, transport in out_i, REMEDIATION in out_i,
+                 "REQUIRED maintainer settings" in out_i, ENVIRONMENT in out_i),
+                (1, True, True, False, False, False))
+        # The read that SUCCEEDS and is still useless: HTTP 200 with no `default_branch`. Same
+        # class — the guard has no branch name to compare the policy against, so it evaluated
+        # nothing — and the same obligation: fail closed, say what happened, accuse no setting.
+        rc_nofield, out_nofield = run_main(empty_scope, {repo_path: {"name": "registry"}})
+        chk("#1025: a `repos/<repo>` GET that SUCCEEDS but carries no `default_branch` is the "
+            "same absence of evidence — rc 1, the response is NAMED, no remediation",
+            (rc_nofield, "no `default_branch` field" in out_nofield,
+             REMEDIATION in out_nofield), (1, True, False))
+        rc_i503, out_i503 = run_main(empty_scope, {repo_path: None}, stderr="gh: HTTP 503")
+        chk("#1025: ...and the residual report NAMES THE STATUS of the failing request (an "
+            "operator must be able to tell a 503 from a 404 without the raw stderr, which is "
+            "never echoed)",
+            ("HTTP 503" in out_i503, "INFRASTRUCTURE —" in out_i503,
+             "SENTINEL-STDERR" in out_i503), (True, True, False))
+        # THE RETRY, MEASURED. "the wording is right" would stay green with no retry at all, and a
+        # single blipped read would still cost the tick — which is half of what this issue is
+        # about. Count SUBPROCESS INVOCATIONS of the default-branch GET: pre-#1025 this was 1.
+        chk("#1025: the default-branch GET is RETRIED to the shared bounded-retry ceiling before "
+            "the guard refuses (pre-fix: exactly ONE attempt, one blip = one lost tick)",
+            [cmd[2] for cmd in calls].count(repo_path), gh_retry.MAX_ATTEMPTS)
+        # ...and a read that recovers on a retry must produce a fully VERIFIED tick, not a refusal:
+        # the retry has to be load-bearing, not merely counted.
+        flaky = {"n": 0}
+        real_fake = fake_run
+
+        def flaky_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            if cmd[2] == repo_path:
+                flaky["n"] += 1
+                if flaky["n"] < 3:
+                    return _Result(1, stderr="gh: HTTP 503")
+            return responses.get(cmd[2], _Result(1))
+
+        subprocess.run = flaky_run
+        try:
+            rc_recover, out_recover = run_main(empty_scope, verified_docs)
+        finally:
+            subprocess.run = real_fake
+        chk("#1025: a default-branch GET that 503s twice and then succeeds VERIFIES the tick — "
+            "the retry admits the run it used to lose (this is the throughput half of the bug)",
+            (rc_recover, "verified" in out_recover, flaky["n"]), (0, True, 3))
+        # THE INVERSE, without which this fix could 'pass' by never accusing anything: a setting
+        # that was actually EVALUATED and is genuinely wrong must still print the FULL remediation,
+        # byte for byte, and must NOT be demoted to an infrastructure report.
+        chk("#1025 INVERSE: an EVALUATED, genuinely-wrong deployment-branch policy (all-branches) "
+            "still prints the FULL maintainer remediation — the fix is about the DIAGNOSIS, never "
+            "about refusing less",
+            (rc_all, REMEDIATION in out_all, "INFRASTRUCTURE" in out_all,
+             "All branches" in out_all), (1, True, False, True))
+        # KNOWN POSITIVE on the new path: a real settings finding alongside an unreadable
+        # settings-agnostic read still refuses LOUDLY with the remediation. The demotion is only
+        # ever "EVERY failure traces to a read that did not complete".
+        rc_kp25, out_kp25 = run_main(leaked, {repo_path: None}, stderr="gh: HTTP 503")
+        chk("#1025 KNOWN POSITIVE: a real repo-scope secret leak alongside an unreadable "
+            "default-branch GET still prints the remediation, NAME surfaced, VALUE never echoed",
+            (rc_kp25, REMEDIATION in out_kp25, "REGISTRY_ADMIN_APP_KEY" in out_kp25,
+             "sentinel-private-key" in out_kp25), (1, True, True, False))
+        # SCOPING, asserted rather than commented: `unreadable_reads` is passed for the
+        # settings-agnostic read ONLY. A 404 on the ENVIRONMENT GET is the #101 condition itself,
+        # so it must keep the remediation — widening the demotion to every read would silently
+        # suppress the very finding this guard exists to make.
+        rc_env404, out_env404 = run_main(
+            empty_scope, {repo_path: {"default_branch": "master"}, env_path: None,
+                          policies_path: good_policies},
+            stderr="gh: Not Found (HTTP 404)")
+        chk("#1025 SCOPING: a 404 on the ENVIRONMENT GET is the #101 condition and keeps its "
+            "remediation — the settings-agnostic demotion must not widen to reads that CAN report "
+            "a setting",
+            (rc_env404, REMEDIATION in out_env404, "INFRASTRUCTURE" in out_env404),
+            (1, True, False))
 
         # ---- #819: an API outage must not manufacture a maintainer action item --------------
         # The 06:19-06:32Z runs printed the #101 remediation having verified NOTHING: the first
