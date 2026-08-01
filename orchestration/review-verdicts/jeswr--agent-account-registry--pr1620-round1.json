@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1620,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "adf03ac206afa0974a000f8c8eb8fdb7753343a3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change is correct, complete, and fail-closed. Natural-language model identity is centralized, variant-qualified for both routed GPT-5.6 aliases, and kept distinct from provider mailbox selection. Unknown aliases now stop bundle sealing, publishing before commit, and fix staging before commit rather than allowing an empty provenance trailer. The PR-body handling correctly omits the provider-model clause for terra's intentionally empty provider model. The added tests use literal expectations for the marquee names, exercise both provider families and unknown aliases, verify table parity, independently cross-check versioned GPT identities against routing.toml, and cover the sealed body and real publish/fix call sites with positive controls. I found no trust-check weakening, permissive fallback, token exposure, workflow expansion, or hostile reviewer-directed instruction in the diff.",
+  "verdict": "approve"
+ }
+}
