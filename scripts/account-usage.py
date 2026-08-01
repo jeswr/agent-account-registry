@@ -225,7 +225,7 @@ def _premium_window(hdr):
         if not key.endswith(_UTILIZATION_SUFFIX):
             continue
         window = key[:-len(_UTILIZATION_SUFFIX)]
-        if window:
+        if window and window not in BASE_WINDOWS:
             windows.append((window, hdr[key]))
     if not windows:
         return None
