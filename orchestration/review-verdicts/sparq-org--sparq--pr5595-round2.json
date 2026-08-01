@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5595,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d045f8a0ef7ec9732941893fd1ea325c3ed5bc34",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains sound and honest on the diff-scoped evidence. The fixed-width ladder iterates over the scalar field modulus width, performs a doubling and addition on every bit, and arithmetically selects either the affine base or the Edwards identity; its focused differential tests cover zero, maximal/high-bit, randomized scalars, and a non-generator base against the prior arkworks implementation. The production call-site test independently pins public-key and nonce-commitment equality and verifies the resulting signature. The audit documentation consistently limits the claim to removal of scalar-dependent control-flow shape, explicitly preserves the not-asserted-constant-time posture for arkworks field operations, notes the lack of instrumented timing evidence, and retains the research-grade/external-audit caveat. No hostile reviewer-directed instruction was detected. Findings are unchanged from round 1 (none), so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
