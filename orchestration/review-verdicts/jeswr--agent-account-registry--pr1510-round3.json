@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1510,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d0efa0426da72beb92ded01ba8ef72fa144fc022",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_assemble_opus5` defines `answered = bool(hdr)`, but `_parse_rate_headers` includes every unified header, including `status`. Thus a completed response such as `{\"status\": \"allowed\"}` with no utilization headers is considered authoritative: `_premium_window` finds nothing, the persisted `known_window` is not re-declared, and `_opus5_eligible` admits on healthy base headroom. A status header proves that a response arrived; it does not prove that the premium bucket disappeared, because none of the rate-limit utilization state needed to make that conclusion was readable. This recreates the prior fail-open behavior on a partial/header-shape response. The tests cover `{}` and full base utilization headers but omit this decisive intermediate shape.",
+    "file": "scripts/account-usage.py",
+    "fix_hint": "Treat a response as authoritative for clearing remembered premium-window state only when it contains sufficient readable utilization state (at minimum, explicitly define and validate the required base-window evidence). Otherwise retain the known window without utilization so admission refuses. Add a cross-tick test whose second probe returns only `anthropic-ratelimit-unified-status` and assert the known window survives and `usage_eligible(..., model=\"opus5\")` is false.",
+    "severity": "blocker",
+    "title": "A status-only response erases a known bucket and admits without utilization"
+   },
+   {
+    "body": "The recovery path intentionally omits `opus5_premium_window` when a header-bearing response no longer declares a bucket, but `persist_limits` calls `_limits_line` and skips the issue entirely when it returns `None`. `_limits_line` only emits truthy `LIMIT_KEYS`; utilization/status fields do not count. Therefore, if the current base/premium responses expose no `*-limit` values, the old catalog line containing `opus5_premium_window` is never replaced. The current snapshot admits, but the next tick reloads the stale window and a failed probe refuses the account again. The cross-tick fixture hides this by injecting `5h_limit=10`, so it cannot detect the production no-limit case.",
+    "file": "scripts/account-usage.py",
+    "fix_hint": "Represent and persist an explicit cleared observation for successfully probed opus5 accounts even when no other limit values are present, without conflating that with an absent/failed usage entry. Add a three-tick production-path test: persist a discovered bucket; process an authoritative base-only response with no `*_limit` headers and verify the catalog token is removed; then simulate a probe failure and verify no stale window is resurrected.",
+    "severity": "major",
+    "title": "Authoritative bucket removal is not durable when no limit values remain"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRequest changes: the prior round's write-only persistence defect is repaired, but two new production gaps remain in the durable observation lifecycle. A response containing only a unified status header is incorrectly treated as authoritative proof that the premium bucket disappeared, immediately reopening admission despite unreadable utilization. Separately, even a genuinely authoritative disappearance is not persisted when the snapshot has no remaining LIMIT_KEYS, so the old bucket returns from the catalog on the next tick. The former is a fail-open trust-plane defect and the latter breaks the claimed automatic recovery. Because these are new findings relative to round 2, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
