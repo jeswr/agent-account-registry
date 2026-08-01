@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5665,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5a5507bc3de5c4da3e999ae242159812a95594be",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The workflow changes consistently gate rust-cache saves to the main ref while leaving restores enabled, and the pull-request-only mutation lane is explicitly exempted because it has no main-ref run capable of seeding its automatic job cache. The structural test widens discovery to pull_request/merge_group workflows, pins representative inclusion and exclusion cases, checks every discovered rust-cache step, and validates the exemption's current trigger and key configuration. The focused unittest suite passes. No correctness, soundness, security, or test-validity issue was found in the diff.",
+  "verdict": "approve"
+ }
+}
