@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5461,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ee808413e0577a205ea474b701097f190333cafe",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`lane_admission()` correctly renames the positive result to ELIGIBLE and admits that registry provenance is required and unreadable, but `decide()` still returns `flag` for that upper-bound population. The module and AGENTS.md explicitly say `review:unreviewed` reads as \"enrolled, awaiting review\"; changing the reason string to disclaim enrollment cannot change what the persisted label communicates to every other observer. A worker-shaped same-repo bot PR with no provenance record is therefore still labelled even though no worker can enumerate it. `registry-lane-unconfirmed` only detects the ambiguity later and only as a census count; it does not repair the false state written to the PR. This is the same load-bearing gap from round 2.",
+    "file": "scripts/verdict-bridge.py",
+    "fix_hint": "Do not add `review:unreviewed` from ELIGIBLE alone. Require an authoritative registry-produced enrollment/provenance signal before writing an enrollment-shaped label, or use a distinct label whose semantics explicitly mean only \"author-side eligible, enrollment unconfirmed\" and ensure all census/consumer logic treats it that way. Add a real-path test showing a syntactically eligible PR lacking registry provenance is never given an enrollment-shaped label; the alarm may separately surface it after the threshold.",
+    "severity": "major",
+    "title": "ELIGIBLE PRs are still labelled as enrolled without provenance"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 adds an explicit residual census and improves the naming/documentation of the author-side predicate, but it does not resolve the prior major correctness problem. The bridge still applies `review:unreviewed` to every merely ELIGIBLE PR even though the diff repeatedly defines that label as reading \"enrolled, awaiting review\" and acknowledges that registry provenance\u2014and therefore actual enrollment\u2014is unobservable. The new census measures the resulting uncertain population after it ages, but measurement does not make the label truthful or prevent a never-enrolled PR from being presented as enrolled. The finding therefore remains materially the same severity and progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
