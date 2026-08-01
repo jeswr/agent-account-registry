@@ -975,20 +975,24 @@ def _workflow_step_script(text, step_id):
     return _workflow_step_block(text, step_id, "run")
 
 
-def _workflow_step_env(text, step_id):
-    """The `env:` mapping of the step whose `id:` is `step_id`, as {NAME: raw expression text}.
+def _workflow_step_mapping(text, step_id, key):
+    """The `<key>:` mapping of the step whose `id:` is `step_id`, as {name: raw value text}.
 
     #612 review round 4: deleting `SECRETS_STEP_OUTCOME: ${{ steps.acct-secrets.outcome }}` from the
     probe step survived the suite, because the executed body reads the variable from the process
     environment the HARNESS supplies — execution can never see a missing workflow-level wiring. A
     mapping (rather than a substring search) is what makes "this step defines this variable, from
     that step's outcome" falsifiable, and resolving the step id it names is what stops the wiring
-    from pointing at a step that no longer exists."""
+    from pointing at a step that no longer exists.
+
+    #935 review round 1 shares the reader with `with:`: an action's INPUTS are wiring by exactly
+    the same argument — nothing a harness can execute observes which owner/repository/permission a
+    mint step asked for, so the only place that is falsifiable is the YAML."""
     lines = _workflow_step(text, step_id).split("\n")
-    heads = [index for index, line in enumerate(lines) if line.strip() == "env:"]
+    heads = [index for index, line in enumerate(lines) if line.strip() == f"{key}:"]
     if len(heads) != 1:
         raise DashboardError(
-            f"step `id: {step_id}` has {len(heads)} `env:` mappings, expected exactly 1")
+            f"step `id: {step_id}` has {len(heads)} `{key}:` mappings, expected exactly 1")
     head = heads[0]
     indent = len(lines[head]) - len(lines[head].lstrip())
     mapping = {}
@@ -1001,8 +1005,13 @@ def _workflow_step_env(text, step_id):
         if separator:
             mapping[name.strip()] = value.strip()
     if not mapping:
-        raise DashboardError(f"step `id: {step_id}` has an empty `env:` mapping — refusing")
+        raise DashboardError(f"step `id: {step_id}` has an empty `{key}:` mapping — refusing")
     return mapping
+
+
+def _workflow_step_env(text, step_id):
+    """The `env:` mapping of the step whose `id:` is `step_id`, as {NAME: raw expression text}."""
+    return _workflow_step_mapping(text, step_id, "env")
 
 
 def _workflow_step_key(text, step_id, key):
@@ -4149,21 +4158,68 @@ esac
     sparq_env = _workflow_step_env(dashboard_workflow, "sparq-keepalive-dispatch")
     minted = re.fullmatch(r"\$\{\{\s*steps\.([A-Za-z0-9_-]+)\.outputs\.token\s*\}\}",
                           sparq_env.get("GH_TOKEN") or "")
-    # A wiring naming a step that no longer exists must go RED on this row, never abort the suite
-    # part-way: every row below an unhandled refusal stops running and the mutant reads as a kill.
-    minted_resolves = bool(minted) and not _raises_dashboard(
-        lambda: _workflow_step(dashboard_workflow, minted.group(1)))
+    # ...and WHAT THE PRODUCER IS, not merely that something answers to its id. Round 1's review:
+    # resolving the step id proved only that SOME step carries it, so a same-id `run: echo` no-op —
+    # or the same mint re-pointed at another owner/repository, or asked for `permission-actions:
+    # read` — left the tuple identical while the dispatch can no longer obtain the cross-repo
+    # actions:write credential this leg exists to spend. Every input the credential's SCOPE depends
+    # on is pinned by equality, including the App the secrets name: a mint fed a different App's
+    # id/key is a different (possibly uninstalled) identity on sparq-org.
+    #
+    # A wiring naming a step that no longer exists, or one that is no longer a mint at all, must go
+    # RED on this row and never abort the suite part-way: every row below an unhandled refusal
+    # stops running and the mutant reads as a kill.
+    def _minted_by(text, step_id):
+        try:
+            uses = _workflow_step_key(text, step_id, "uses")
+            inputs = _workflow_step_mapping(text, step_id, "with")
+        except DashboardError:
+            return None
+        # The pin's trailing ` # v3.2.0` annotates the SHA; it is not part of the reference.
+        return ((uses or "").partition(" #")[0].strip(), inputs.get("app-id"),
+                inputs.get("private-key"), inputs.get("owner"), inputs.get("repositories"),
+                inputs.get("permission-actions"))
+
+    mint_pin = ("actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
+                "${{ secrets.REGISTRY_ADMIN_APP_ID }}", "${{ secrets.REGISTRY_ADMIN_APP_KEY }}",
+                "sparq-org", "sparq", "write")
     check("[#935] the cross-repo leg is GATED on a minted App token and RUNS on that same minted "
-          "token, resolved by step id — dropping or weakening either wiring leaves every executed "
-          "row above green while the sweeper's only fallback is dead",
+          "token, and the step it names IS the SHA-pinned App mint scoped to sparq-org/sparq with "
+          "actions:write — dropping or weakening any of those wirings leaves every executed row "
+          "above green while the sweeper's only fallback is dead",
           (_workflow_step_key(dashboard_workflow, "sparq-keepalive-dispatch", "if"),
            sparq_env.get("GH_TOKEN"),
            minted.group(1) if minted else None,
-           minted_resolves),
+           _minted_by(dashboard_workflow, minted.group(1)) if minted else None),
           ("steps.sparq-keepalive-token.outputs.token != ''",
            "${{ steps.sparq-keepalive-token.outputs.token }}",
            "sparq-keepalive-token",
-           True))
+           mint_pin))
+    # ...and that the row above is the thing killing those mutants, driven as mutations of the LIVE
+    # file so neither reads its own stub: a same-id non-mint step is a NAMED miss rather than a
+    # raise (the suite keeps running, so the row count is the same red-or-green), and a redirected
+    # scope is read back changed rather than defaulted away.
+    noop_mint = ("      - name: synthetic\n"
+                 "        id: sparq-keepalive-token\n"
+                 "        run: |\n"
+                 "          true\n")
+
+    def _mint_input(text, slot):
+        """One slot of the producer's identity under a mutation, or None when the mutant left no
+        readable mint — indexing a miss here would abort the suite on the very mutant this row
+        exists to prove is survivable, which is how the count stops being comparable."""
+        found = _minted_by(text, "sparq-keepalive-token")
+        return found[slot] if found else None
+
+    check("[#935] the producer pin is falsifiable: a same-id non-mint step reads as None without "
+          "aborting the suite, and a redirected owner or downgraded permission is read back as "
+          "the changed value",
+          (_minted_by(noop_mint, "sparq-keepalive-token"),
+           _mint_input(dashboard_workflow.replace("          owner: sparq-org\n",
+                                                  "          owner: jeswr\n"), 3),
+           _mint_input(dashboard_workflow.replace("          permission-actions: write\n",
+                                                  "          permission-actions: read\n"), 5)),
+          (None, "jeswr", "read"))
     # The extractor's OWN guards, driven directly: the live step has exactly one `if:` at its own
     # column, so neither the nesting bound nor the absent/duplicate paths execute above — and an
     # extractor that answered `nested-must-not-count` (or first-wins on a duplicate) would make the
