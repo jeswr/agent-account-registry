@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5487,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8228ff868daa91cdcd7a6b042f02c4dd6606d1c0",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "collect_json_chunks_capped receives each chunk as an owned String, so the engine has already allocated and serialized the complete chunk before chunk.len() is compared with the 8 MiB cap. The engine flush threshold cannot make this a hard bound because a whole row is appended before the threshold is checked; a single stored literal may therefore make one arbitrarily large chunk. This contradicts the claims that allocation is refused before it is made and that peak memory is bounded by the cap plus an innocuous in-flight chunk. The added test uses four 3 MiB literals, so it tests accumulated Vec growth but cannot detect one oversized chunk.",
+    "file": "crates/sparq-server/src/http.rs",
+    "fix_hint": "Enforce the byte budget incrementally inside serialization before growing a String beyond the limit, such as through a capped writer/sink used by row and literal serialization. Add a regression test with one stored literal larger than the degraded budget that proves serialization aborts before allocating or copying its full lexical form; instrumentation or a focused serializer allocation/byte-write assertion is needed. Otherwise revise the feature and documentation so they do not claim a hard allocation bound.",
+    "severity": "major",
+    "title": "The degraded cap still runs after an oversized engine chunk is allocated"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 leaves the prior major allocation-bound defect materially unchanged. The degraded collector checks the cap only after the engine has constructed and transferred an owned String chunk. Engine chunking is threshold-based after write_row appends an entire row, so one dictionary-resident literal can still create an arbitrarily large temporary chunk before the callback rejects it. The regression test still uses four separate 3 MiB literals, exercising only accumulated-body rejection and not the single-chunk hole. Progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
