@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1506,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "77310aedf7259f28533df55d616432be32bbfda8",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The validator still performs the prohibited-key lookup only under `if isinstance(flow, dict) and \"leases\" in flow`. A parseable snapshot such as `{\"schema\":\"registry-observability/v1\",\"flow\":[{\"leases\":[{\"label\":\"ab12cd340a5f9e71\"}]}]}` therefore returns no violations even though the public bytes contain the refused per-account array. The `alien` self-test instead makes the entire document a list, which is rejected by the earlier top-level-object check and does not exercise this bypass. This is materially the same defect recorded in round 4.",
+    "file": "scripts/ledger-invariant.py",
+    "fix_hint": "When `flow` is present, fail closed unless its value is an object; preserve acceptance of an absent `flow` only if that is intentional. Add a literal fixture with an object top level and a non-object `flow` containing nested `leases`, assert the specifically classified `validate()` refusal, and include it in the real CLI exit-code table with expected code 1.",
+    "severity": "major",
+    "title": "Non-object flow still bypasses the public-byte lease-row invariant"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-4 bypass remains unchanged. `_snapshot_violations` rejects a non-object top-level document, but a valid top-level object whose present `flow` value is a list, string, null, or other non-object still returns no violations. The self-test again covers only a non-object top-level document, so it does not exercise the reported seam. Because the same major finding remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
