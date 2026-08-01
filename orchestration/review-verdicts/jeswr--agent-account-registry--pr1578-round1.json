@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1578,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "98c81288f0c0120d29831f5da28980302b0d6380",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly makes both terminal provenance failure alerts deliverable from the provenance job: the fallback route receives the registry repository and workflow token, the job grants the narrowly required issues:write permission, and the optional private route retains the existing confirmed-private fail-closed behavior. The parsed-YAML seam checks pin the complete permission map and exact environment expressions, while the runtime replay exercises the real route resolver and proves the former no-route shape remains distinguishable. I found no correctness, soundness, test-validity, or security blocker in the diff.",
+  "verdict": "approve"
+ }
+}
