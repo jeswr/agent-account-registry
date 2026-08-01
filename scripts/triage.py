@@ -748,12 +748,13 @@ _LOGIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?$")
 # permission API call. Probing every one of them would let a drive-by burn the run's whole API quota
 # on a single issue. The bound is announced, never silent (AGENTS.md: "no silent caps"): the CLI
 # emits a ::warning naming how many candidates it dropped, and a dropped candidate is simply NOT an
-# approval — the fail-closed direction.
+# approval — the fail-closed direction. Since PR #1628 r2 the cap applies ONLY to candidates already
+# intersected with the authoritative collaborator roster, so its contents are owner-controlled.
 APPROVAL_REACTOR_PROBE_CAP = 50
 
 
-def approval_probe_order(logins, priority_logins):
-    """The candidates to probe, IN PROBE ORDER, plus how many the cap drops. (PR #1628 r1 f1.)
+def approval_probe_order(logins, priority_logins, eligible):
+    """The candidates to probe, IN PROBE ORDER, plus how many the cap drops. (PR #1628 r1 f1/r2 f1.)
 
     THE CAP MUST NOT BE ORDERABLE BY THE ATTACKER. Capping a SORTED candidate list on its own is a
     public-input denial of the whole durable-approval behaviour: anyone can react on a public
@@ -762,23 +763,37 @@ def approval_probe_order(logins, priority_logins):
     event re-quarantines an issue the maintainer had deliberately released. A cap whose contents a
     third party chooses is not a bound on the adversary, it is a lever for one.
 
-    So the EXACT-MATCH trusted identities — the same `MAINTAINER_LOGIN` / `APP_BOT_LOGIN` the
-    caller's `trust_of` recognises BY NAME — are hoisted to the front and are CAP-EXEMPT: no volume
-    of reactions can displace them, and because `trust_of` answers for those two without an API call
-    at all, hoisting them costs the quota the cap protects exactly nothing. The general population is
-    probed after them, up to the cap; the caller stops at its first trusted reactor.
+    TWO INDEPENDENT DEFENCES, because r1's first half alone did not close it:
+
+      * The EXACT-MATCH trusted identities — the same `MAINTAINER_LOGIN` / `APP_BOT_LOGIN` the
+        caller's `trust_of` recognises BY NAME — are hoisted to the front and are CAP-EXEMPT: no
+        volume of reactions can displace them, and because `trust_of` answers for those two without
+        an API call at all, hoisting them costs the quota the cap protects exactly nothing.
+      * `eligible` is the AUTHORITATIVE COLLABORATOR ROSTER (`collaborator_logins()` over a
+        `GET /repos/{owner}/{repo}/collaborators` read), and the general population is intersected
+        with it BEFORE the cap is applied. That is what r1 was missing: hoisting only the two
+        exact-match logins left every other write/maintain/admin collaborator inside the
+        attacker-orderable prefix, so 50 lexicographically earlier sock-puppets still buried a
+        write-role approval the product contract promises to honour. Membership of the roster is
+        chosen by the repository owner and CANNOT be written by a reactor, so the set the cap now
+        bounds is not third-party input at all. Dropping a non-roster reactor costs no approval
+        either: `trust_of` can only answer write+ for an exact-match identity or a collaborator, so
+        a login on neither list was never going to be an approval.
 
     A priority login is only ever emitted if it ACTUALLY REACTED (`logins` is the intersection
     filter): this function can promote evidence, never manufacture it, so a mis-set login variable
     cannot conjure an approval — and since every emitted login comes from `approval_reactors()`, the
-    `_LOGIN_RE` hygiene the caller's API path depends on holds for the priority entries too.
+    `_LOGIN_RE` hygiene the caller's API path depends on holds for the priority entries too. The
+    roster is likewise only ever a FILTER: a login on it that did not react is never emitted.
 
-    THE RESIDUAL IS NAMED, NOT HIDDEN: a write+ COLLABORATOR who is neither exact-match identity is
-    still only recognised by a permission probe, so a flood can still push one past the cap. That
-    candidate is DROPPED, which withholds an approval (fail-closed), the drop is warned about with a
-    count by the caller, and the exact-match path plus the label-removal path both remain open.
-    Closing that residual needs an authoritative write+ collaborator enumeration rather than a bigger
-    guess at the cap; it is out of scope here and filed separately.
+    `eligible` has no default ON PURPOSE. A caller that forgets it must fail loudly rather than
+    silently inherit the crowdable r1 behaviour.
+
+    THE REMAINING BOUND IS OWNER-SHAPED, NOT ATTACKER-SHAPED, and it is announced (AGENTS.md: "no
+    silent caps"): a repository with more than `APPROVAL_REACTOR_PROBE_CAP` collaborators, all of
+    whom react, can still cap one of them out. Nobody outside the collaborator list can create that
+    state, the exact-match hoist survives it, the drop is warned about with a count, and the
+    label-removal path remains open.
 
     Returns `(ordered candidates, dropped count)`.
     """
@@ -786,9 +801,60 @@ def approval_probe_order(logins, priority_logins):
     reacted = set(candidates)
     priority = [login for login in dict.fromkeys(priority_logins or ()) if login in reacted]
     hoisted = set(priority)
-    rest = [login for login in candidates if login not in hoisted]
+    roster = set(eligible or ())
+    rest = [login for login in candidates if login not in hoisted and login in roster]
     return (priority + rest[:APPROVAL_REACTOR_PROBE_CAP],
             max(0, len(rest) - APPROVAL_REACTOR_PROBE_CAP))
+
+
+def collaborator_logins(entries):
+    """Every LOGIN in a `GET /repos/{owner}/{repo}/collaborators` read — the AUTHORITATIVE roster.
+
+    THIS IS AN ELIGIBILITY FILTER, NOT A TRUST VERDICT. The entries carry a `permissions` object,
+    and reading write+ off it here would be a THIRD spelling of the write+ rule that the workflow's
+    `trust_of` and `trust-gate.py`'s `WRITE_PLUS` already own between them (#958) — so every
+    collaborator is returned regardless of role and the caller still puts each one through its own
+    probe. A `read`/`triage`-role collaborator therefore survives this filter and is REJECTED one
+    step later, which is where that rule is allowed to live.
+
+    Anything unrecognised — a non-dict entry, a missing or malformed login — contributes nothing,
+    i.e. a SMALLER roster, i.e. fewer approvals: the fail-closed direction. `_LOGIN_RE` applies for
+    the same reason it does to reactors, since these logins gate a path the caller interpolates.
+    """
+    logins = set()
+    for entry in entries or ():
+        if not isinstance(entry, dict):
+            continue
+        login = entry.get("login")
+        if isinstance(login, str) and _LOGIN_RE.match(login):
+            logins.add(login)
+    return logins
+
+
+def _decode_api_pages(text):
+    """Decode a `gh api --paginate` payload -> `(entries, None)` or `(None, reason)`.
+
+    `--paginate` emits ONE JSON array per page, CONCATENATED, so the pages are decoded in SEQUENCE
+    rather than by a single `json.loads` — which sees trailing data at the start of page 2 and
+    raises, turning a merely long list into a hard refusal. Both paginated reads on this surface
+    (the reactions and the collaborator roster) share this one decoder rather than each carrying a
+    copy of the page walk (#958).
+    """
+    decoder = json.JSONDecoder()
+    index, entries = 0, []
+    while index < len(text):
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index >= len(text):
+            break
+        try:
+            page, index = decoder.raw_decode(text, index)
+        except ValueError as exc:
+            return None, f"unreadable ({exc})"
+        if not isinstance(page, list):
+            return None, "not a JSON array"
+        entries.extend(page)
+    return entries, None
 
 
 def approval_reactors(reactions):
@@ -813,43 +879,54 @@ def approval_reactors(reactions):
     return sorted(logins)
 
 
-def _approval_reactors_cli(text, priority_logins=()):
+def _approval_reactors_cli(text, priority_logins, roster_text):
     """Print the 👍 reactor logins, one per line, for a reactions read on stdin. NON-ZERO if unreadable.
 
-    `gh api --paginate` emits ONE JSON array per page, concatenated, so the pages are decoded in
-    SEQUENCE rather than by a single `json.loads` — which sees trailing data at the start of page 2
-    and raises, turning a merely long reaction list into a hard refusal.
+    `text` is the issue's reactions payload and `roster_text` the repository's collaborator payload,
+    both `gh api --paginate` output (see `_decode_api_pages`).
 
     `priority_logins` are the caller's EXACT-MATCH trusted identities; they are printed first and are
-    exempt from the probe cap, so an attacker cannot bury a real approval under sock-puppet reactions
-    (`approval_probe_order()` carries that argument). They are still only CANDIDATES — this side
-    never answers "approved", and the caller puts every line through its own write+ probe.
+    exempt from the probe cap. `roster_text` is what bounds EVERYONE ELSE (PR #1628 r2 f1): the
+    general population is intersected with the authoritative collaborator roster before the cap is
+    applied, so the surviving prefix is chosen by the repository owner rather than by whoever
+    reacted. Both arguments are REQUIRED — see `approval_probe_order()` for why.
+
+    Every emitted login is still only a CANDIDATE: this side never answers "approved", and the caller
+    puts every line through its own write+ probe.
+
+    THE THREE FAILURE DIRECTIONS, all towards LESS approval:
+      * `roster_text is None` (the caller passed no `--collaborators` at all) is a WIRING error, not
+        a runtime one, and exits 2 — no candidate list at all, because a reader that silently
+        degraded to "no roster filter" would be exactly the r1 defect back again.
+      * an unreadable reactions payload exits 1.
+      * an unreadable or EMPTY roster is announced and leaves the roster empty, which narrows this
+        run to the two exact-match identities. A collaborators-read blip must not also cost the
+        maintainer their own 👍, and it must not cost the run's exit code either — the caller's
+        `|| reactors=""` would then drop the exact-match candidates too.
 
     The caller's `|| reactors=""` turns any non-zero exit into NOT APPROVED. That is the whole
     fail-closed contract of this reader: an unreadable reaction list must never read as approval.
     """
-    decoder = json.JSONDecoder()
-    index, entries = 0, []
-    while index < len(text):
-        while index < len(text) and text[index].isspace():
-            index += 1
-        if index >= len(text):
-            break
-        try:
-            page, index = decoder.raw_decode(text, index)
-        except ValueError as exc:
-            print(f"::warning title=quarantine::the reactions payload is unreadable ({exc}) — "
-                  "refusing to report a maintainer approval", file=sys.stderr)
-            return 1
-        if not isinstance(page, list):
-            print("::warning title=quarantine::the reactions payload is not a JSON array — "
-                  "refusing to report a maintainer approval", file=sys.stderr)
-            return 1
-        entries.extend(page)
-    logins, dropped = approval_probe_order(approval_reactors(entries), priority_logins)
+    if roster_text is None:
+        print("::warning title=quarantine::no collaborator roster was supplied "
+              "(--collaborators) — refusing to report a maintainer approval", file=sys.stderr)
+        return 2
+    entries, error = _decode_api_pages(text)
+    if error is not None:
+        print(f"::warning title=quarantine::the reactions payload is {error} — "
+              "refusing to report a maintainer approval", file=sys.stderr)
+        return 1
+    roster_entries, roster_error = _decode_api_pages(roster_text)
+    eligible = collaborator_logins(roster_entries)
+    if roster_error is not None or not eligible:
+        print(f"::warning title=quarantine::the collaborator roster is "
+              f"{roster_error or 'EMPTY'} — only the exact-match maintainer/App identities can be "
+              "approved on this run, and a maintainer can still release the issue by removing the "
+              "`trust:untrusted` label", file=sys.stderr)
+    logins, dropped = approval_probe_order(approval_reactors(entries), priority_logins, eligible)
     if dropped:
         print(f"::warning title=quarantine::{dropped} 👍 candidate(s) are NOT probed and so are NOT "
-              f"treated as approvals — the non-exact-match candidates exceed the "
+              f"treated as approvals — the non-exact-match COLLABORATORS who reacted exceed the "
               f"{APPROVAL_REACTOR_PROBE_CAP}-candidate probe cap. The exact-match maintainer/App "
               "identities are probed FIRST and are exempt from the cap, and a maintainer can still "
               "release the issue by removing the `trust:untrusted` label", file=sys.stderr)
@@ -2409,6 +2486,16 @@ def _self_test():
                         r'"repos/\$REPO/issues/\$NUM/reactions"', trust_body)),
          bool(re.search(r'python3 scripts/triage\.py --approval-reactors', trust_body)),
          "content" in trust_body, "+1" in trust_body), (True, True, False, False))
+    # ...and the ELIGIBILITY ROSTER is read the same way (PR #1628 r2 f1): the same bounded-retry
+    # READ wrapper, from the repository's own collaborators endpoint. `permissions` must NOT appear
+    # in this step — reading write+ off the roster entries here would be a THIRD spelling of the
+    # rule `trust_of` and trust-gate.py's WRITE_PLUS already own between them (#958), and it would
+    # let the roster answer a question it is not authoritative for.
+    chk("[PR #1628 r2 f1] the trust step derives the eligible set from the repository's OWN "
+        "collaborators endpoint, through gh_retry, and reads no permission off it",
+        (bool(re.search(r'python3 scripts/gh_retry\.py read api "repos/\$REPO/collaborators" '
+                        r'--paginate', trust_body)),
+         "permissions" in trust_body), (True, False))
     chk("[#1009] EVERY 👍 reactor is put through `trust_of` — the SAME exact-match/write+ probe the "
         "author and the actor get, so an unfiltered reaction read (sparq #4743) cannot ship",
         bool(re.search(r'\[ "\$\(trust_of "\$reactor"\)" = "1" \]', trust_body)), True)
@@ -2422,7 +2509,7 @@ def _self_test():
     _decision_subst = {"ACTION": "SENTINEL-ACTION", "author_trusted": "SENTINEL-AUTHOR",
                        "actor_trusted": "SENTINEL-ACTOR", "approved": "SENTINEL-APPROVED",
                        "MAINTAINER_LOGIN": "SENTINEL-MAINTAINER", "APP_BOT_LOGIN": "SENTINEL-APP",
-                       "REPO": "o/r", "NUM": "7"}
+                       "roster": "SENTINEL-ROSTER", "REPO": "o/r", "NUM": "7"}
     chk("[#1009] the decision argv the workflow passes is EXACTLY these flags, in this order, each "
         "bound to its OWN shell variable",
         next((argv for argv in workflow_argvs(triage_wf, "triage.py", _decision_subst)
@@ -2431,16 +2518,28 @@ def _self_test():
          "--author-trusted", "SENTINEL-AUTHOR", "--actor-trusted", "SENTINEL-ACTOR",
          "--maintainer-approved", "SENTINEL-APPROVED"])
     # ...and the reactions filter's OWN argv, whole. It reads its payload from stdin and takes no
-    # approval argument — but it DOES take the two cap-exempt identities (PR #1628 r1 f1), and each
-    # must be bound to its OWN env variable: wire both `--priority-login`s to `$MAINTAINER_LOGIN`
-    # and the App bot's 👍 is silently crowdable again, which a containment check would not see.
-    # Distinct sentinels + adjacency, per pre-flight 6.
-    chk("[#1009/#1628 r1 f1] ...and the reactions filter is invoked with EXACTLY "
-        "`--approval-reactors` plus the two EXACT-MATCH identities as cap-exempt priority logins",
+    # approval argument — but it DOES take the roster file (PR #1628 r2 f1) and the two cap-exempt
+    # identities (r1 f1), and each must be bound to its OWN variable: wire both `--priority-login`s
+    # to `$MAINTAINER_LOGIN` and the App bot's 👍 is silently crowdable again, and DROP
+    # `--collaborators` and every other write-role approval is crowdable again — neither of which a
+    # containment check would see. Distinct sentinels + adjacency, per pre-flight 6.
+    chk("[#1009/#1628 r1 f1/r2 f1] ...and the reactions filter is invoked with EXACTLY "
+        "`--approval-reactors`, the collaborator roster, and the two EXACT-MATCH identities as "
+        "cap-exempt priority logins",
         next((argv for argv in workflow_argvs(triage_wf, "triage.py", _decision_subst)
               if "--approval-reactors" in argv), None),
-        ["--approval-reactors", "--priority-login", "SENTINEL-MAINTAINER",
-         "--priority-login", "SENTINEL-APP"])
+        ["--approval-reactors", "--collaborators", "SENTINEL-ROSTER",
+         "--priority-login", "SENTINEL-MAINTAINER", "--priority-login", "SENTINEL-APP"])
+    # The roster file the filter is handed is the one the collaborators READ wrote — one variable,
+    # written and consumed. Two different names would leave the filter reading an empty file on
+    # every run, which degrades silently to the exact-match-only posture: a fail-closed direction,
+    # but one that would quietly un-fix this finding with every row above still green.
+    chk("[PR #1628 r2 f1] the roster the filter reads is the SAME shell variable the collaborators "
+        "read wrote — not a second, always-empty path",
+        (bool(re.search(r'read api "repos/\$REPO/collaborators" --paginate > "\$roster"',
+                        trust_body)),
+         sorted(set(re.findall(r"--collaborators \"\$(\w+)\"", trust_body)))),
+        (True, ["roster"]))
     # The identities the filter is handed are the SAME two `trust_of` matches by name. Both sides are
     # read off the workflow FILE and checked against each other AND against the hand-written pair —
     # equality alone would be satisfied by two EMPTY sets, i.e. by a `trust_of` that exact-matches
@@ -2467,20 +2566,22 @@ def _self_test():
         (["admin", "maintain", "write"], ["admin", "maintain", "write"]))
     # EVERY `||` IN THIS STEP, enumerated exactly and IN ORDER (the pattern [PR #1565 r1] uses on
     # the quarantine step; `trust_body` is already comment-stripped, so this reads executable lines
-    # only). One is the exact-match trust disjunction; the other three are fallbacks and every one
+    # only). One is the exact-match trust disjunction; the other four are fallbacks and every one
     # of them degrades towards MORE quarantine — an unreadable permission reads as `none`, an
-    # unreadable reaction list yields no candidates, an empty line yields no probe. NONE sits on
-    # the decision call, which must go RED rather than guess.
-    _TRUST_OR_LINES = ('[ "$1" = "$APP_BOT_LOGIN" ]', "|| echo none", '|| reactors=""',
-                       "|| continue")
+    # unreadable collaborator roster leaves an EMPTY roster (so only the exact-match identities can
+    # be approved), an unreadable reaction list yields no candidates, an empty line yields no probe.
+    # NONE sits on the decision call, which must go RED rather than guess.
+    _TRUST_OR_LINES = ('[ "$1" = "$APP_BOT_LOGIN" ]', "|| echo none", '|| : > "$roster"',
+                       '|| reactors=""', "|| continue")
     _trust_fallbacks = [line.strip() for line in trust_body.splitlines() if "||" in line]
-    chk("[#1009] the trust step's `||` lines are EXACTLY the exact-match trust disjunction, the "
-        "permission probe, the reactions read and the reactor-loop empty skip — and NONE sits on "
-        "the `--quarantine-decision` call",
+    chk("[#1009/#1628 r2 f1] the trust step's `||` lines are EXACTLY the exact-match trust "
+        "disjunction, the permission probe, the collaborator roster read, the reactions read and "
+        "the reactor-loop empty skip — and NONE sits on the `--quarantine-decision` call",
         ([[marker in line for marker in _TRUST_OR_LINES] for line in _trust_fallbacks],
          ["--quarantine-decision" in line for line in _trust_fallbacks]),
-        ([[True, False, False, False], [False, True, False, False], [False, False, True, False],
-          [False, False, False, True]], [False, False, False, False]))
+        ([[True, False, False, False, False], [False, True, False, False, False],
+          [False, False, True, False, False], [False, False, False, True, False],
+          [False, False, False, False, True]], [False, False, False, False, False]))
     # Pinned as the WHOLE expression: a substring check survives `&& false`, and the second row
     # kills a re-introduced event-type allowlist (the exact defect round 1 found) by name.
     quarantine_if = step_if(quarantine_body)
@@ -3279,22 +3380,69 @@ print(os.environ["STUB_LABELS"])
                             "jeswr", "agent-account-registry[bot]", "a-1")]),
         ["a-1", "agent-account-registry[bot]", "jeswr"])
 
-    def _reactors_cli(text, *priority):
-        """`--approval-reactors` over `text` on stdin -> (exit code, stdout lines, stderr)."""
+    # THE COLLABORATOR ROSTER (PR #1628 r2 f1) — parsed before the CLI rows, since every one of them
+    # now runs with one. It is an ELIGIBILITY filter, never a trust verdict: a `read`-role
+    # collaborator is on the roster and is rejected one step later by the caller's `trust_of`, which
+    # is why nothing here reads the entries' `permissions` object (#958 — that rule has two owners
+    # already and this must not become a third).
+    chk("[PR #1628 r2 f1] the collaborator roster is every login in the payload, at ANY permission "
+        "level — eligibility, not trust",
+        sorted(collaborator_logins([{"login": "amy", "permissions": {"push": True}},
+                                    {"login": "reader", "permissions": {"pull": True}},
+                                    {"login": "agent-account-registry[bot]"}])),
+        ["agent-account-registry[bot]", "amy", "reader"])
+    chk("[PR #1628 r2 f1] a malformed roster entry, and a login that is not a valid GitHub login, "
+        "contribute NOTHING — a smaller roster is fewer approvals",
+        [sorted(collaborator_logins(value)) for value in
+         ([], None, [None, "amy", 7, {}, {"login": None}, {"login": "../../admin"},
+                     {"login": "a b"}, {"login": "a\namy"}, {"login": "amy"}])],
+        [[], [], ["amy"]])
+    # The page walk is now shared by BOTH paginated reads on this surface, so it is pinned once,
+    # directly: concatenated pages accumulate, and a non-array page or trailing garbage is an error
+    # rather than a partial answer.
+    chk("[PR #1628 r2 f1] `--paginate` pages are decoded in SEQUENCE, and a mis-shaped page is an "
+        "ERROR rather than a partial read",
+        [_decode_api_pages('[{"login": "a"}] [{"login": "b"}]\n')[0],
+         _decode_api_pages("[]")[0], _decode_api_pages("  ")[0],
+         _decode_api_pages('{"message": "Not Found"}')[1],
+         _decode_api_pages("[1,2")[1] is not None],
+        [[{"login": "a"}, {"login": "b"}], [], [], "not a JSON array", True])
+
+    def _reactors_cli(text, *priority, roster=(), no_roster=False, missing_file=False):
+        """`--approval-reactors` over `text` on stdin -> (exit code, stdout lines, stderr).
+
+        `roster` is the collaborator payload this run is handed, passed through a REAL FILE exactly
+        as the workflow passes it: a list of logins, or a raw string for the malformed-payload rows.
+        `no_roster` drops the flag entirely (the wiring error) and `missing_file` points it at a
+        path that does not exist (the runtime blip).
+        """
         argv = ["--approval-reactors"]
         for login in priority:
             argv += ["--priority-login", login]
-        buffer, errors = io.StringIO(), io.StringIO()
-        saved = sys.stdin
-        sys.stdin = io.StringIO(text)
-        try:
-            with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(errors):
-                code = main(argv)
-        finally:
-            sys.stdin = saved
+        with tempfile.TemporaryDirectory() as directory:
+            path = _os_vocab.path.join(directory, "collaborators.json")
+            if not missing_file:
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(roster if isinstance(roster, str)
+                                 else json.dumps([{"login": login} for login in roster]))
+            if not no_roster:
+                argv += ["--collaborators", path]
+            buffer, errors = io.StringIO(), io.StringIO()
+            saved = sys.stdin
+            sys.stdin = io.StringIO(text)
+            try:
+                with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(errors):
+                    code = main(argv)
+            finally:
+                sys.stdin = saved
         return code, buffer.getvalue().split(), errors.getvalue()
+    # The roster these parsing rows run with is written out BY HAND, not derived from the reaction
+    # corpus: an "everyone who reacted is eligible" fixture would make the intersection a no-op and
+    # every row below it blind to the filter (AGENTS.md pre-flight 2c).
+    _ROSTER = ["amy", "bob", "zzz"]
     chk("[#1009] --approval-reactors prints one login per line for a reactions payload",
-        _reactors_cli(json.dumps([_reaction("amy"), _reaction("bob", "heart")]))[:2],
+        _reactors_cli(json.dumps([_reaction("amy"), _reaction("bob", "heart")]),
+                      roster=_ROSTER)[:2],
         (0, ["amy"]))
     # `gh api --paginate` CONCATENATES one JSON array per page. A single json.loads() sees trailing
     # data at the start of page 2 and refuses — so a long reaction list would fail closed and a
@@ -3302,16 +3450,26 @@ print(os.environ["STUB_LABELS"])
     chk("[#1009] a MULTI-PAGE `--paginate` payload (concatenated JSON arrays) is read whole — an "
         "approval on page 2 still counts",
         _reactors_cli(json.dumps([_reaction("amy")]) + "\n"
-                      + json.dumps([_reaction("bob")]))[:2],
+                      + json.dumps([_reaction("bob")]), roster=_ROSTER)[:2],
         (0, ["amy", "bob"]))
+    # ...and so is the ROSTER's own pagination: a collaborator listed on page 2 of the roster is
+    # still eligible. Both reads take the same page walk, and this is the row that says so from the
+    # roster side — a single `json.loads()` there would silently shrink the roster instead of
+    # failing, which is an approval quietly withheld.
+    chk("[PR #1628 r2 f1] a MULTI-PAGE COLLABORATOR roster is read whole — a collaborator on "
+        "page 2 is still eligible",
+        _reactors_cli(json.dumps([_reaction("bob")]),
+                      roster='[{"login": "amy"}]\n[{"login": "bob"}]')[:2],
+        (0, ["bob"]))
     # `gh` terminates its output with a newline, and an issue with no reactions yields `[]`. Both
     # must read as a clean EMPTY candidate list (exit 0, nothing printed), never as a refusal — a
     # refusal here would be indistinguishable from an unreadable payload in the caller's log.
     chk("[#1009] a payload with trailing whitespace, and an EMPTY reaction list, read cleanly as "
         "no candidates",
-        [_reactors_cli(text)[:2] for text in ("[]\n", "  \n", json.dumps([_reaction("amy")]) + "\n")],
+        [_reactors_cli(text, roster=_ROSTER)[:2]
+         for text in ("[]\n", "  \n", json.dumps([_reaction("amy")]) + "\n")],
         [(0, []), (0, []), (0, ["amy"])])
-    _bad_reactions = [_reactors_cli(text) for text in
+    _bad_reactions = [_reactors_cli(text, roster=_ROSTER) for text in
                       ("not json", '{"message": "Not Found"}', "[1,2", '[{"content": "+1"}] {')]
     chk("[#1009] an unreadable or mis-shaped reactions payload exits NON-ZERO and prints NO login "
         "— the caller's `|| reactors=\"\"` then reads as NOT APPROVED",
@@ -3319,49 +3477,108 @@ print(os.environ["STUB_LABELS"])
          all("refusing to report a maintainer approval" in result[2]
              for result in _bad_reactions)),
         ([1, 1, 1, 1], [[], [], [], []], True))
-    # THE PROBE CAP IS ANNOUNCED, NEVER SILENT (AGENTS.md: "no silent caps"). The reaction list is
-    # third-party controlled and unbounded, and each candidate costs the caller one permission API
-    # call, so an uncapped probe lets a drive-by burn the run's API quota on one issue. Dropping a
-    # candidate can only ever WITHHOLD an approval, and the warning names the count.
-    _capped = _reactors_cli(json.dumps(
-        [_reaction(f"user-{index:03d}") for index in range(APPROVAL_REACTOR_PROBE_CAP + 3)]))
+    # THE PROBE CAP IS ANNOUNCED, NEVER SILENT (AGENTS.md: "no silent caps"). Each candidate costs
+    # the caller one permission API call, so the probe stays bounded even when the roster itself is
+    # large. Dropping a candidate can only ever WITHHOLD an approval, and the warning names the
+    # count. The corpus here is ROSTERED — post-r2 that is the only way to reach the cap at all.
+    _CAP_LOGINS = [f"user-{index:03d}" for index in range(APPROVAL_REACTOR_PROBE_CAP + 3)]
+    _capped = _reactors_cli(json.dumps([_reaction(login) for login in _CAP_LOGINS]),
+                            roster=_CAP_LOGINS)
     chk("[#1009] the candidate list is capped at the declared probe cap, and the drop is WARNED "
         "about with the count — never silently truncated",
         (APPROVAL_REACTOR_PROBE_CAP, len(_capped[1]), _capped[0],
          "3 👍 candidate(s) are NOT probed" in _capped[2]), (50, 50, 0, True))
-    _uncapped = _reactors_cli(json.dumps(
-        [_reaction(f"user-{index:03d}") for index in range(APPROVAL_REACTOR_PROBE_CAP)]))
+    _uncapped = _reactors_cli(json.dumps([_reaction(login) for login in _CAP_LOGINS[:-3]]),
+                              roster=_CAP_LOGINS)
     chk("[#1009] NEGATIVE CONTROL: a list AT the cap is passed through whole and warns about "
         "nothing",
         (len(_uncapped[1]), _uncapped[2]), (50, ""))
     # -----------------------------------------------------------------------------------------------
-    # [PR #1628 r1 f1] THE CAP MUST NOT BE ORDERABLE BY THE ATTACKER. Anyone can react on a public
-    # repository, so capping a SORTED candidate list handed the flooder the choice of WHICH
-    # candidates survive: 50 sock-puppets sorting before `jeswr` pushed the maintainer's own 👍 off
-    # the probed prefix, the step reported NOT approved, and the next content event re-quarantined an
-    # issue the maintainer had deliberately released — a deterministic public-input denial of the
-    # durable approval this PR exists to add. The exact-match identities are now hoisted and exempt.
+    # [PR #1628 r2 f1] THE ELIGIBLE SET IS DERIVED AUTHORITATIVELY, NOT FROM THE REACTION LIST.
+    #
+    # Round 1 hoisted the two EXACT-MATCH identities out of the cap and left it there. That was half
+    # a fix: every OTHER write/maintain/admin collaborator was still selected out of a SORTED prefix
+    # of an attacker-written list, so 50 lexicographically earlier sock-puppets still buried a
+    # write-role 👍 — the same deterministic public-input denial, against the very approvals the
+    # quarantine notice promises to honour ("a maintainer with write access"). The general population
+    # is now INTERSECTED WITH THE COLLABORATOR ROSTER before the cap is applied, and roster
+    # membership is the repository owner's to write and no reactor's.
     # -----------------------------------------------------------------------------------------------
-    # `aaa-###` sorts BEFORE both exact-match identities, so every one of these rows is genuinely
-    # crowd-shaped: the trusted login is beyond the sorted prefix the cap keeps.
-    _flood = [_reaction(f"aaa-{index:03d}") for index in range(APPROVAL_REACTOR_PROBE_CAP + 10)]
+    # `aaa-###` sorts BEFORE every trusted login used here, so each row is genuinely crowd-shaped:
+    # without a defence the trusted login is beyond the sorted prefix the cap keeps.
+    _FLOOD_LOGINS = [f"aaa-{index:03d}" for index in range(APPROVAL_REACTOR_PROBE_CAP + 10)]
+    _flood = [_reaction(login) for login in _FLOOD_LOGINS]
+    # THE FIX, at the unit level: `zzz` is an ordinary write-role collaborator — NOT an exact-match
+    # identity, so the r1 hoist does nothing for it — and it survives 60 sock-puppets because the
+    # sock-puppets are not on the roster. Nothing is dropped by the cap, so nothing is warned about.
+    _rostered = _reactors_cli(json.dumps(_flood + [_reaction("zzz")]), "jeswr",
+                              "agent-account-registry[bot]", roster=_ROSTER)
+    chk("[PR #1628 r2 f1] a NON-exact-match collaborator's 👍 survives 60 sock-puppet reactions: "
+        "the flooders are not on the roster, so they never enter the capped set at all",
+        (_rostered[0], _rostered[1], _rostered[2]), (0, ["zzz"], ""))
+    # THE KILL: the SAME corpus with the 60 flooders ON the roster is the pre-fix selection, and it
+    # does bury `zzz`. So the corpus really is beyond the cap and the row above is not vacuous —
+    # delete the `login in roster` intersection and the two rows swap answers.
+    _crowded_out = _reactors_cli(json.dumps(_flood + [_reaction("zzz")]), "jeswr",
+                                 "agent-account-registry[bot]",
+                                 roster=_FLOOD_LOGINS + ["zzz"])
+    chk("[PR #1628 r2 f1] KILL CONTROL: with the flooders ON the roster the very same corpus does "
+        "bury `zzz` — the cap really does bite, so the row above measures the intersection",
+        ("zzz" in _crowded_out[1], len(_crowded_out[1]),
+         "11 👍 candidate(s) are NOT probed" in _crowded_out[2]),
+        (False, APPROVAL_REACTOR_PROBE_CAP, True))
+    # THE ROSTER IS A FILTER, NEVER A SOURCE. A collaborator who left no reaction is not a candidate:
+    # if the roster could ADD lines the caller would trust-probe a write+ login that approved
+    # nothing, which is an approval nobody gave.
+    chk("[PR #1628 r2 f1] a rostered collaborator who did NOT react is not emitted — the roster "
+        "filters evidence, it never supplies it",
+        (_reactors_cli(json.dumps([_reaction("amy")]), roster=_ROSTER)[:2],
+         _reactors_cli("[]", roster=_ROSTER)[:2]), ((0, ["amy"]), (0, [])))
+    # FAIL-CLOSED ON THE ROSTER ITSELF, in all three shapes. A MISSING `--collaborators` is a WIRING
+    # error and is refused outright (exit 2, no candidates) — a reader that degraded to "no filter"
+    # would be the r1 defect restored. An unreadable FILE and an unreadable/EMPTY PAYLOAD are
+    # runtime blips: they exit 0 with the exact-match identities still probed, because the caller's
+    # `|| reactors=""` would otherwise turn a collaborators outage into the maintainer losing their
+    # own 👍 as well.
+    _no_flag = _reactors_cli(json.dumps([_reaction("zzz")]), "jeswr", no_roster=True)
+    chk("[PR #1628 r2 f1] NO `--collaborators` at all is a WIRING error: non-zero, no candidate "
+        "printed — never a silent fall back to the unfiltered prefix",
+        (_no_flag[0], _no_flag[1], "no collaborator roster was supplied" in _no_flag[2]),
+        (2, [], True))
+    _degraded = [_reactors_cli(json.dumps(_flood + [_reaction("jeswr"), _reaction("zzz")]),
+                               "jeswr", "agent-account-registry[bot]", **kwargs)
+                 for kwargs in ({"missing_file": True}, {"roster": '{"message": "Not Found"}'},
+                                {"roster": []})]
+    chk("[PR #1628 r2 f1] an unreadable FILE, an unreadable PAYLOAD and an EMPTY roster all narrow "
+        "the run to the EXACT-MATCH identities, announce it, and still exit 0",
+        ([result[0] for result in _degraded], [result[1] for result in _degraded],
+         all("the collaborator roster is" in result[2] for result in _degraded)),
+        ([0, 0, 0], [["jeswr"], ["jeswr"], ["jeswr"]], True))
+    # -----------------------------------------------------------------------------------------------
+    # [PR #1628 r1 f1] ...AND THE EXACT-MATCH HOIST IS STILL LOAD-BEARING, as the second, independent
+    # defence: it holds even when the crowd IS on the roster, which is the one shape the intersection
+    # cannot bound (a repository with more than 50 collaborators, all of whom react). Note the
+    # difference from the rows above — these floods are ROSTERED, so the cap genuinely bites here.
+    # -----------------------------------------------------------------------------------------------
     _crowded = _reactors_cli(json.dumps(_flood + [_reaction("jeswr")]), "jeswr",
-                             "agent-account-registry[bot]")
-    chk("[PR #1628 r1 f1] a flood of 60 third-party 👍 CANNOT bury the maintainer's own: the "
+                             "agent-account-registry[bot]", roster=_FLOOD_LOGINS)
+    chk("[PR #1628 r1 f1] a flood of 60 ROSTERED 👍 CANNOT bury the maintainer's own: the "
         "exact-match identity is probed FIRST and is exempt from the cap",
         (_crowded[0], _crowded[1][0], "jeswr" in _crowded[1], len(_crowded[1]),
          "10 👍 candidate(s) are NOT probed" in _crowded[2]),
         (0, "jeswr", True, APPROVAL_REACTOR_PROBE_CAP + 1, True))
-    # THE KILL: the SAME corpus with no priority identity declared is the pre-fix behaviour. If the
-    # hoist is deleted (or the workflow stops passing the logins) the row above degrades to exactly
-    # this, so the two together fail in opposite directions and neither is vacuous.
-    _crowded_out = _reactors_cli(json.dumps(_flood + [_reaction("jeswr")]))
-    chk("[PR #1628 r1 f1] KILL CONTROL: with NO priority identity the very same flood does bury "
-        "`jeswr` — the corpus really is beyond the cap, so the row above is not vacuous",
-        ("jeswr" in _crowded_out[1], len(_crowded_out[1])), (False, APPROVAL_REACTOR_PROBE_CAP))
-    # The App bot is the other exact-match identity, and it is hoisted from the SAME flood.
+    # THE KILL for the hoist specifically: the SAME rostered corpus with no priority identity
+    # declared is the pre-r1 behaviour. If the hoist is deleted (or the workflow stops passing the
+    # logins) the row above degrades to exactly this.
+    _hoist_off = _reactors_cli(json.dumps(_flood + [_reaction("jeswr")]),
+                               roster=_FLOOD_LOGINS + ["jeswr"])
+    chk("[PR #1628 r1 f1] KILL CONTROL: with NO priority identity the very same rostered flood "
+        "does bury `jeswr` — so the hoist row above is not vacuous either",
+        ("jeswr" in _hoist_off[1], len(_hoist_off[1])), (False, APPROVAL_REACTOR_PROBE_CAP))
+    # The App bot is the other exact-match identity, and it is hoisted from the SAME flood. An App is
+    # never a collaborator, so the roster can never carry it — the hoist is the ONLY thing that can.
     _crowded_app = _reactors_cli(json.dumps(_flood + [_reaction("agent-account-registry[bot]")]),
-                                 "jeswr", "agent-account-registry[bot]")
+                                 "jeswr", "agent-account-registry[bot]", roster=_FLOOD_LOGINS)
     chk("[PR #1628 r1 f1] ...and the registry App bot's 👍 is hoisted out of the same flood",
         (_crowded_app[1][0], len(_crowded_app[1])),
         ("agent-account-registry[bot]", APPROVAL_REACTOR_PROBE_CAP + 1))
@@ -3371,20 +3588,38 @@ print(os.environ["STUB_LABELS"])
     # that one line would be an approval nobody gave.
     chk("[PR #1628 r1 f1] a priority login that did NOT react is not emitted — the hoist can "
         "promote evidence, never invent it",
-        (_reactors_cli(json.dumps([_reaction("amy")]), "jeswr")[:2],
-         _reactors_cli("[]", "jeswr")[:2]), ((0, ["amy"]), (0, [])))
+        (_reactors_cli(json.dumps([_reaction("amy")]), "jeswr", roster=_ROSTER)[:2],
+         _reactors_cli("[]", "jeswr", roster=_ROSTER)[:2]), ((0, ["amy"]), (0, [])))
     # ORDERING AND HYGIENE of the ordering function itself, directly: priority first in the order the
     # caller declared, no duplicate line for a hoisted login, and the general population still
     # capped. A hoisted login left in `rest` too would be probed twice — quota the cap exists to
     # protect.
     chk("[PR #1628 r1 f1] the probe order is priority-first, de-duplicated, and the rest is capped",
-        approval_probe_order(["aaa", "bbb", "jeswr"], ["jeswr", "aaa", "jeswr"]),
+        approval_probe_order(["aaa", "bbb", "jeswr"], ["jeswr", "aaa", "jeswr"],
+                             ["aaa", "bbb", "ccc"]),
         (["jeswr", "aaa", "bbb"], 0))
     chk("[PR #1628 r1 f1] the DROP COUNT counts only the non-exempt candidates the cap discards",
         [approval_probe_order([f"aaa-{index:03d}" for index in range(count)] + ["jeswr"],
-                              ["jeswr"])[1]
+                              ["jeswr"], [f"aaa-{index:03d}" for index in range(count)])[1]
          for count in (0, APPROVAL_REACTOR_PROBE_CAP, APPROVAL_REACTOR_PROBE_CAP + 7)],
         [0, 0, 7])
+    # ...and the ELIGIBILITY filter, isolated from the cap entirely: a non-rostered reactor is not a
+    # candidate at ANY volume, and is not counted as a cap drop either (it was never bounded away —
+    # it simply cannot be write+). `bbb` is on the roster and `ccc` is not, from one call.
+    chk("[PR #1628 r2 f1] a reactor who is not on the roster is not a candidate, and is NOT "
+        "reported as a cap drop",
+        approval_probe_order(["bbb", "ccc", "jeswr"], ["jeswr"], ["aaa", "bbb"]),
+        (["jeswr", "bbb"], 0))
+    # `eligible` has NO DEFAULT: a caller that forgets it must fail loudly, not inherit the r1
+    # behaviour. This is the one place that contract is executable.
+    try:
+        approval_probe_order(["aaa"], [])                              # noqa: PLE1120 — the point
+        _missing_eligible = "accepted"
+    except TypeError:
+        _missing_eligible = "TypeError"
+    chk("[PR #1628 r2 f1] `approval_probe_order` REFUSES to run without an eligibility roster — "
+        "the crowdable two-argument form cannot be called back into existence",
+        _missing_eligible, "TypeError")
 
     # THE STEP'S OWN ORDER, statically, over the EXECUTABLE lines only (the prose in this step
     # legitimately names the commands it is explaining). The courtesy read must come AFTER the
@@ -3688,6 +3923,16 @@ if args == ["api", f"repos/{repo}/issues/{num}/reactions", "--paginate"]:
         sys.exit(1)
     print(os.environ["STUB_REACTIONS"])
     sys.exit(0)
+# The AUTHORITATIVE COLLABORATOR ROSTER (PR #1628 r2 f1). Served as the real endpoint does, one
+# JSON object per collaborator carrying its own `permissions` — the step is expected to use it as
+# an ELIGIBILITY filter only and to keep probing each login for the write+ answer.
+if args == ["api", f"repos/{repo}/collaborators", "--paginate"]:
+    if os.environ.get("STUB_COLLABORATORS_FAIL") == "1":
+        print("simulated collaborators read failure", file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps([{"login": login, "permissions": {permission: True}}
+                      for login, permission in json.loads(os.environ["STUB_ROSTER"]).items()]))
+    sys.exit(0)
 if (len(args) == 4 and args[0] == "api" and args[2:] == ["--jq", ".permission"]
         and args[1].startswith(f"repos/{repo}/collaborators/")
         and args[1].endswith("/permission")):
@@ -3718,8 +3963,14 @@ sys.exit(subprocess.run(["gh", *args[1:]], check=False).returncode)
         (True, "", True, True))
 
     def _run_trust_step(action="edited", author="ext", actor=None, permissions=None,
-                        reactions=(), reactions_fail=False, reactions_raw=None):
+                        reactions=(), reactions_fail=False, reactions_raw=None,
+                        roster=None, collaborators_fail=False):
         """Execute the workflow's OWN trust step against a stubbed GitHub.
+
+        `roster` is the {login: permission} map the COLLABORATORS endpoint answers with, and
+        defaults to `permissions` — the honest default, since the endpoint that answers a login's
+        permission is the endpoint that lists it. Passing them apart is how the crowd rows put a
+        flood of reactors on the issue WITHOUT putting them on the repository.
 
         Returns (exit code, {output name: value}, ordered gh call log, combined output).
         """
@@ -3749,7 +4000,9 @@ sys.exit(subprocess.run(["gh", *args[1:]], check=False).returncode)
                 STUB_PERMISSIONS=json.dumps(permissions or {}),
                 STUB_REACTIONS=(json.dumps(list(reactions)) if reactions_raw is None
                                 else reactions_raw),
-                STUB_REACTIONS_FAIL="1" if reactions_fail else "0", STUB_GH_LOG=log)
+                STUB_REACTIONS_FAIL="1" if reactions_fail else "0", STUB_GH_LOG=log,
+                STUB_ROSTER=json.dumps((permissions if roster is None else roster) or {}),
+                STUB_COLLABORATORS_FAIL="1" if collaborators_fail else "0")
             proc = _subprocess_vocab.run(
                 ["bash", "-c", _trust_step], cwd=directory, env=environment, capture_output=True,
                 text=True, timeout=120, check=False)
@@ -3812,39 +4065,81 @@ sys.exit(subprocess.run(["gh", *args[1:]], check=False).returncode)
         (_early_outputs.get("maintainer_approved"), _early_outputs.get("quarantine"), _early_code,
          _early_calls),
         ("1", "0", 0, ["api repos/o/r/collaborators/ext/permission --jq .permission",
+                       "api repos/o/r/collaborators --paginate",
                        "api repos/o/r/issues/7/reactions --paginate",
                        "api repos/o/r/collaborators/aaa/permission --jq .permission"]))
-    # [PR #1628 r1 f1] EXECUTED, END TO END: the crowd-out attack against the durable approval.
-    # `aaa-###` sorts before `jeswr`, so 60 of them fill the whole sorted prefix the cap keeps; the
-    # maintainer's own 👍 sits beyond it. Before the hoist this step reported `maintainer_approved=0`
-    # and re-quarantined on this very event. The WHOLE call log is the expectation: `trust_of`
-    # recognises the maintainer BY NAME, so the exemption is not just correct but FREE — not one of
-    # the 60 sock-puppets is ever probed.
+    # [PR #1628 r1 f1 / r2 f1] EXECUTED, END TO END: the crowd-out attack against the durable
+    # approval. `aaa-###` sorts before every trusted login here, so 60 of them fill the whole sorted
+    # prefix the cap keeps and the real 👍 sits beyond it. Before the fix this step reported
+    # `maintainer_approved=0` and re-quarantined on this very event.
     _flood_reactions = [{"content": "+1", "user": {"login": f"aaa-{index:03d}"}}
                         for index in range(APPROVAL_REACTOR_PROBE_CAP + 10)]
-    _flood_code, _flood_outputs, _flood_calls, _flood_log = _run_trust_step(
-        reactions=_flood_reactions + [{"content": "+1", "user": {"login": "jeswr"}}])
-    chk("[PR #1628 r1 f1] EXECUTED: 60 third-party 👍 sorting ahead of the maintainer do NOT bury "
-        "the maintainer's own — the issue is still released, and no sock-puppet is ever probed",
-        (_flood_code, _flood_outputs.get("maintainer_approved"),
-         _flood_outputs.get("quarantine"), _flood_calls),
-        (0, "1", "0", ["api repos/o/r/collaborators/ext/permission --jq .permission",
-                       "api repos/o/r/issues/7/reactions --paginate"]))
-    # THE ANNOUNCED RESIDUAL (AGENTS.md: "no silent caps"). A write+ COLLABORATOR who is neither
-    # exact-match identity is recognised only by a permission probe, so a flood CAN still push one
-    # past the cap. That withholds an approval — the fail-closed direction — and it is WARNED about
-    # with a count in the step log rather than passing silently. Pinned so the bound stays a stated
-    # bound: if the drop ever stops being announced, or starts dropping the exempt identities, this
-    # row and the one above disagree.
+    # THE ROUND-2 FINDING, EXECUTED. `zzz` is an ordinary WRITE-role collaborator — not an
+    # exact-match identity, so r1's hoist does nothing for it — and the 60 flooders are reactors
+    # only, never on the repository. Round 1 dropped `zzz` and re-quarantined; the roster
+    # intersection now honours the approval. The WHOLE call log is the expectation, so the fix is
+    # also shown to be CHEAP: one roster read replaces the 50 sock-puppet permission probes, and
+    # `zzz` is the only login probed out of 61 reactors.
     _resid_code, _resid_outputs, _resid_calls, _resid_log = _run_trust_step(
         permissions={"zzz": "write"},
         reactions=_flood_reactions + [{"content": "+1", "user": {"login": "zzz"}}])
-    chk("[PR #1628 r1 f1] EXECUTED, ANNOUNCED BOUND: a non-exact-match write-role 👍 pushed past "
-        "the cap withholds the approval (fail-closed) and the drop is WARNED with its count",
+    chk("[PR #1628 r2 f1] EXECUTED, THE FINDING: a NON-exact-match write-role 👍 buried under 60 "
+        "sock-puppet reactions is HONOURED — the flooders are not collaborators, so they are never "
+        "candidates, and only `zzz` is probed",
         (_resid_code, _resid_outputs.get("maintainer_approved"), _resid_outputs.get("quarantine"),
-         "11 👍 candidate(s) are NOT probed" in _resid_log,
-         [call for call in _resid_calls if "/collaborators/zzz/" in call]),
+         "👍 candidate(s) are NOT probed" in _resid_log, _resid_calls),
+        (0, "1", "0", False,
+         ["api repos/o/r/collaborators/ext/permission --jq .permission",
+          "api repos/o/r/collaborators --paginate",
+          "api repos/o/r/issues/7/reactions --paginate",
+          "api repos/o/r/collaborators/zzz/permission --jq .permission"]))
+    # THE KILL CONTROL for that row, end to end: put the 60 flooders ON the roster and the very same
+    # corpus goes back to burying `zzz` — quarantined, with the drop announced. So the corpus really
+    # is beyond the cap and the row above is measuring the intersection, not a corpus that never
+    # reached the bound. (Delete the `login in roster` filter and these two swap answers.)
+    _crowd_code, _crowd_outputs, _crowd_calls, _crowd_log = _run_trust_step(
+        permissions={"zzz": "write"},
+        roster=dict({f"aaa-{index:03d}": "read"
+                     for index in range(APPROVAL_REACTOR_PROBE_CAP + 10)}, zzz="write"),
+        reactions=_flood_reactions + [{"content": "+1", "user": {"login": "zzz"}}])
+    chk("[PR #1628 r2 f1] EXECUTED, KILL CONTROL: with the 60 flooders ON the roster the same "
+        "corpus DOES bury `zzz` — the cap bites, and the drop is announced with its count",
+        (_crowd_code, _crowd_outputs.get("maintainer_approved"), _crowd_outputs.get("quarantine"),
+         "11 👍 candidate(s) are NOT probed" in _crowd_log,
+         [call for call in _crowd_calls if "/collaborators/zzz/" in call]),
         (0, "0", "1", True, []))
+    # ...and the exact-match hoist still holds against that SAME rostered flood — the second,
+    # independent defence, and a free one: `trust_of` recognises the maintainer BY NAME, so not one
+    # of the 60 rostered sock-puppets is ever probed.
+    _flood_code, _flood_outputs, _flood_calls, _flood_log = _run_trust_step(
+        roster={f"aaa-{index:03d}": "read" for index in range(APPROVAL_REACTOR_PROBE_CAP + 10)},
+        reactions=_flood_reactions + [{"content": "+1", "user": {"login": "jeswr"}}])
+    chk("[PR #1628 r1 f1] EXECUTED: 60 ROSTERED 👍 sorting ahead of the maintainer do NOT bury the "
+        "maintainer's own — the issue is still released, and no sock-puppet is ever probed",
+        (_flood_code, _flood_outputs.get("maintainer_approved"),
+         _flood_outputs.get("quarantine"), _flood_calls),
+        (0, "1", "0", ["api repos/o/r/collaborators/ext/permission --jq .permission",
+                       "api repos/o/r/collaborators --paginate",
+                       "api repos/o/r/issues/7/reactions --paginate"]))
+    # FAIL-CLOSED ON THE ROSTER READ, executed. A collaborators outage must narrow the run to the
+    # exact-match identities, not reopen the crowdable prefix and not red the step (which would skip
+    # the quarantine write below it). Both directions are pinned from one fixture: `zzz`'s write-role
+    # 👍 is withheld, and the maintainer's is still honoured.
+    _outage_write = _run_trust_step(
+        permissions={"zzz": "write"}, collaborators_fail=True,
+        reactions=[{"content": "+1", "user": {"login": "zzz"}}])
+    _outage_exact = _run_trust_step(
+        permissions={"zzz": "write"}, collaborators_fail=True,
+        reactions=[{"content": "+1", "user": {"login": "zzz"}},
+                   {"content": "+1", "user": {"login": "jeswr"}}])
+    chk("[PR #1628 r2 f1] EXECUTED, FAIL-CLOSED: an unreadable collaborator roster withholds the "
+        "write-role approval and announces it, while the exact-match maintainer's 👍 still counts "
+        "— and neither run reds the step",
+        (_outage_write[0], _outage_write[1].get("maintainer_approved"),
+         _outage_write[1].get("quarantine"), "the collaborator roster is" in _outage_write[3],
+         _outage_exact[0], _outage_exact[1].get("maintainer_approved"),
+         _outage_exact[1].get("quarantine")),
+        (0, "0", "1", True, 0, "1", "0"))
     # THE CONTENT FILTER IS LOAD-BEARING: the reactor is fully trusted here, so only the reaction's
     # own content name can keep this quarantined. Widen the filter past `+1` and this reds.
     chk("[#1009] EXECUTED: a 👎/heart from a WRITE+ login is not an approval — only 👍 counts",
@@ -3882,6 +4177,7 @@ sys.exit(subprocess.run(["gh", *args[1:]], check=False).returncode)
         "read, so it can neither be probed nor re-point that read",
         (_evil_outputs.get("quarantine"), _evil_code, _evil_calls),
         ("1", 0, ["api repos/o/r/collaborators/ext/permission --jq .permission",
+                  "api repos/o/r/collaborators --paginate",
                   "api repos/o/r/issues/7/reactions --paginate"]))
     # THE PRE-EXISTING PATHS, unchanged by the approval axis (pre-flight 11: check what the
     # transition delivers into). A trusted author is still trusted and never quarantined; a WRITE+
@@ -3944,6 +4240,13 @@ def build_parser():
     # it actually reacted, and the caller trust-probes every line it gets.
     ap.add_argument("--priority-login", action="append", default=[],
                     help="an exact-match trusted login to probe FIRST, exempt from the probe cap")
+    # The AUTHORITATIVE eligibility roster (PR #1628 r2 f1) — a file holding a
+    # `GET /repos/{owner}/{repo}/collaborators --paginate` payload. Every non-exact-match candidate
+    # is intersected with it BEFORE the cap, so which candidates survive is the repository owner's
+    # choice and not the flooder's. REQUIRED for --approval-reactors: its absence exits non-zero
+    # rather than degrading to the unbounded-prefix behaviour it exists to remove.
+    ap.add_argument("--collaborators", default=None,
+                    help="path to a collaborators API payload; bounds the non-exact-match candidates")
     # The quarantine NOTICE pair (PR #1565 r1). One asks whether an authentic notice already exists
     # — read off the comments themselves, never off the label — and the other composes the notice,
     # so the marker and the body have exactly one definition between the workflow and this module.
@@ -3964,7 +4267,18 @@ def main(argv=None):
                                          a.maintainer_approved) else "0")
         return 0
     if a.approval_reactors:
-        return _approval_reactors_cli(sys.stdin.read(), a.priority_login)
+        # An UNREADABLE roster file is a runtime blip and degrades to the empty roster (announced by
+        # the reader); a MISSING `--collaborators` is a wiring error and is refused outright.
+        roster_text = None
+        if a.collaborators is not None:
+            try:
+                with open(a.collaborators, encoding="utf-8") as handle:
+                    roster_text = handle.read()
+            except OSError as exc:
+                print(f"::warning title=quarantine::the collaborator roster file is unreadable "
+                      f"({exc})", file=sys.stderr)
+                roster_text = ""
+        return _approval_reactors_cli(sys.stdin.read(), a.priority_login, roster_text)
     if a.quarantine_notice_posted:
         return _quarantine_notice_cli(sys.stdin.read())
     if a.quarantine_notice_body:

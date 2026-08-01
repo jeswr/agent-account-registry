@@ -119,15 +119,25 @@ jobs:
           # THE FALLBACK DIRECTION IS DELIBERATE and is the one place a fallback belongs in this
           # step: an unreadable reaction list yields NO candidates, hence NOT approved, which can
           # only ever ADD quarantine. (The decision call below still has none — see there.)
-          # THE PROBE CAP IS NOT ORDERABLE BY THE ATTACKER (PR #1628 r1 f1). Candidates are capped
-          # because each one costs a permission call on a list a drive-by controls — but capping a
-          # SORTED list alone let 50 sock-puppet logins that sort earlier bury the maintainer's own
-          # 👍, reporting NOT approved and re-quarantining on the next edit. The two EXACT-MATCH
-          # identities below are handed to the filter as cap-exempt and are probed first; `trust_of`
-          # answers for them BY NAME, so hoisting them costs no API call at all.
+          # THE PROBE CAP IS NOT ORDERABLE BY THE ATTACKER (PR #1628 r1 f1, r2 f1). Candidates are
+          # capped because each one costs a permission call on a list a drive-by controls — but
+          # capping a SORTED list alone let 50 sock-puppet logins that sort earlier bury a real 👍,
+          # reporting NOT approved and re-quarantining on the next edit. Two things stop that now.
+          # The two EXACT-MATCH identities below are handed to the filter as cap-exempt and probed
+          # first; `trust_of` answers for them BY NAME, so hoisting them costs no API call at all.
+          # And EVERY OTHER candidate is intersected with the repository's own COLLABORATOR ROSTER
+          # before the cap applies — r1 hoisted only the two exact-match logins, which left every
+          # other write/maintain/admin collaborator inside the prefix a flooder chooses. Roster
+          # membership is the owner's to write and no reactor's, so the capped set is no longer
+          # third-party input; and since `trust_of` can only answer write+ for an exact-match login
+          # or a collaborator, intersecting drops no approval that could ever have been granted.
+          # A FAILED ROSTER READ narrows the run to the exact-match identities (announced by the
+          # filter) rather than reopening the flood — the fail-closed direction.
           approved=0
+          roster=$(mktemp)
+          python3 scripts/gh_retry.py read api "repos/$REPO/collaborators" --paginate > "$roster" || : > "$roster"
           reactors=$(python3 scripts/gh_retry.py read api "repos/$REPO/issues/$NUM/reactions" --paginate \
-            | python3 scripts/triage.py --approval-reactors \
+            | python3 scripts/triage.py --approval-reactors --collaborators "$roster" \
                 --priority-login "$MAINTAINER_LOGIN" --priority-login "$APP_BOT_LOGIN") || reactors=""
           while IFS= read -r reactor; do
             [ -n "$reactor" ] || continue
