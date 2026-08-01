@@ -151,7 +151,7 @@ worker_success_floor    = 0.5  # worker-failing below 50% success with any worke
 # gate_profile "lint-only": the repo's own .github/workflows/gate.yml already lands a `gate`
 # check on pull_request, so the merge contract matches sparq's without any new CI.
 [repos."jeswr/solid-sdk"]
-enabled = false
+enabled = true
 routing = "orchestration/routing.toml"
 account_pool = ["acct01", "acct02", "acct04", "acct2css", "acct3css", "acct4css", "acct05", "acct07"]
 max_concurrent = 6            # conservative first bound for a new target; raise on evidence
