@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5253,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6aff29ca3aafbe39929b5f583f34f8ed54729ed3",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 fixes the prior major finding: actions/checkout is now explicitly pinned to github.event.pull_request.head.sha with full history, and the merge step fails closed unless git rev-parse HEAD exactly equals HEAD_SHA before merging the resolved origin/base branch. The accompanying TestPreMergeC1Job assertion now pins both the explicit checkout ref and the runtime HEAD verification, so the previous vacuous coverage (HEAD_SHA merely appearing in reporting) is gone. The remaining workflow behavior is consistently and candidly scoped: conflicts produce no C1 verdict, the tested base SHA is published, and merge_group remains the authoritative non-stale check. No hostile reviewer-directed instruction was detected in the diff.",
+  "verdict": "approve"
+ }
+}
