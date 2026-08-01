@@ -3592,8 +3592,13 @@ _purge_before_target_code() {
   fi
 }
 
-# PURE (self-tested): print the step id of every `worker`-job token mint that does NOT disable
-# the action's token-revocation post phase. Expected output is EMPTY.
+# PURE (self-tested): print the step id of every token mint in the GATE-RUNNING job that does NOT
+# disable the action's token-revocation post phase. Expected output is EMPTY.
+#
+# Usage: _worker_mints_missing_revoke_skip <workflow-file> [job-name]
+# The gate-running job is `worker` in worker.yml (the default) and `run` in review-fix.yml — the
+# two jobs that execute `worker-live.sh gate`, i.e. target-controlled code. Any OTHER job is out of
+# scope by construction: no target code runs there, so a post-phase revoker is not "after the gate".
 #
 # WHY (PR #310 round 3 blocker, the gap #575 left open). actions/create-github-app-token by
 # default registers a POST-job phase that REVOKES the installation token — authenticating WITH
@@ -3602,18 +3607,24 @@ _purge_before_target_code() {
 # silent about revocation puts a credential-bearing process on the runner strictly later than
 # the gate: exactly the shape `_tokens_after_gate` exists to ban, but invisible to it, because
 # no `GH_TOKEN:` ever appears in the workflow text — the action supplies the token internally.
-# Every worker-job mint must therefore set `skip-token-revoke: true` and rely on the 60-minute
-# installation TTL plus narrow scoping instead. The isolated `publish`/`final_state` jobs keep
-# the default revoker: no target code ever runs there.
+# Every gate-running-job mint must therefore set `skip-token-revoke: true` and rely on the
+# 60-minute installation TTL plus narrow scoping instead. The isolated `publish`/`final_state`
+# jobs keep the default revoker: no target code ever runs there.
+#
+# [issue #1285] This applies to BOTH lanes. review-fix.yml's fix lane runs the SAME hostile gate,
+# so its `run`-job mints sit in front of the same post-phase revoker; the job name is a parameter
+# rather than a hard-coded `worker` precisely so the fix lane cannot be silently exempt.
 #
 # Job boundary is a two-space-indented key (same convention as `_tokens_after_gate`), so the
-# clean jobs' own legitimate, revoking mints are deliberately not counted.
+# clean jobs' own legitimate, revoking mints are deliberately not counted. The job name is matched
+# EXACTLY (compared as a string, never as a regex), so `run` cannot also match `run-something`.
 _worker_mints_missing_revoke_skip() {
-  awk '
+  awk -v job="${2:-worker}" '
     /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
       if (injob && mint && !skip) print id
       mint=0; skip=0; id="(unnamed)"
-      injob = ($0 ~ /^  worker:[[:space:]]*$/)
+      key=$0; sub(/^  /,"",key); sub(/:[[:space:]]*$/,"",key)
+      injob = (key == job)
       next
     }
     !injob { next }
@@ -5638,6 +5649,58 @@ YAML
   chk "(#91 r2) ...and the lease release + the outcome record both WAIT for the publisher" \
     "$(grep -Fc 'needs: [claim, run, publish]' "$rf_wf" || true):$(grep -Fc 'needs: [resolve, claim, run, publish]' "$rf_wf" || true)" \
     "1:1"
+
+  # --- [issue #1285] THE HALF OF #575 THE FIX LANE NEVER INHERITED. Everything above is about
+  # tokens the workflow WRITES DOWN after the gate, and `_tokens_after_gate` now reads zero on both
+  # lanes. create-github-app-token's default revocation POST phase writes nothing down and still
+  # runs a token-bearing process after ALL normal steps — i.e. after the fix lane's
+  # `worker-live.sh gate` has executed target-controlled build scripts as the runner user. #126
+  # closed that on worker.yml's `worker` job only; the fix lane's `run` job runs the SAME gate, so
+  # the identical ban is asserted on it here. ---
+  chk "#1285 (LIVE): every fix-lane run-job token mint disables the post-gate revocation phase" \
+    "$(_worker_mints_missing_revoke_skip "$rf_wf" run | wc -l | tr -d ' ')" "0"
+  # NON-VACUITY, both regression directions and against an empty read: the `run` job really does
+  # mint two tokens, and each of the two shapes that reopen the hole — an explicit opt-in (false)
+  # and silence (key absent) — must report BOTH of them.
+  local rf_revoke_false="$tmp/review-fix-revoke-false.yml" rf_revoke_absent="$tmp/review-fix-revoke-absent.yml"
+  sed 's/^          skip-token-revoke: true$/          skip-token-revoke: false/' "$rf_wf" > "$rf_revoke_false"
+  sed '/^          skip-token-revoke: true$/d' "$rf_wf" > "$rf_revoke_absent"
+  chk "#1285: a fix-lane mint with skip-token-revoke: false is REPORTED (non-vacuous)" \
+    "$(_worker_mints_missing_revoke_skip "$rf_revoke_false" run | wc -l | tr -d ' ')" "2"
+  chk "#1285: a fix-lane mint SILENT about revocation is REPORTED (non-vacuous)" \
+    "$(_worker_mints_missing_revoke_skip "$rf_revoke_absent" run | wc -l | tr -d ' ')" "2"
+  # ...and the scan stays JOB-SCOPED on this file too: the publisher and the outcome job run no
+  # target code, so their legitimately-revoking mints must NOT be flagged even when the whole file
+  # is stripped of the key. Without this the LIVE zero above could be an artefact of over-reach
+  # being impossible to notice.
+  chk "#1285: the clean publish/outcome mints are NOT flagged (scan is gate-job scoped)" \
+    "$(_worker_mints_missing_revoke_skip "$rf_revoke_absent" run | grep -Ec 'app-token-(publish|outcome|arm)' || true)" "0"
+  chk "#1285: ...and those clean-job mints really exist to be skipped (control)" \
+    "$(grep -Ec '^        id: app-token-(publish|outcome|arm)$' "$rf_wf" || true)" "3"
+  # The job name is compared as a STRING, not a regex: an unrelated job whose name merely contains
+  # the gate job's name must not be scanned, and a job that does not exist must read empty rather
+  # than falling through to "scan everything".
+  local rf_jobname_fix="$tmp/revoke-jobname-fixture.yml"
+  cat > "$rf_jobname_fix" <<'WFREV'
+jobs:
+  run-cleanup:
+    steps:
+      - name: a mint in a DIFFERENT job that merely shares a name prefix
+        id: app-token-elsewhere
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: x
+  run:
+    steps:
+      - name: the gate job's own silent mint
+        id: app-token-gatejob
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: x
+WFREV
+  chk "#1285: job match is exact — only the real gate job is scanned, unknown job reads empty" \
+    "$(_worker_mints_missing_revoke_skip "$rf_jobname_fix" run | tr '\n' ',')$(_worker_mints_missing_revoke_skip "$rf_jobname_fix" nosuchjob | wc -l | tr -d ' ')" \
+    "app-token-gatejob,0"
 
   # --- [issue #568] the re-check must accept the workflow's OWN label lifecycle, and the claim
   # step must establish ownership BEFORE it takes the shared label. The claim step moves the issue
