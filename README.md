@@ -849,7 +849,9 @@ the parsed document in memory and required to come back named.
   account by the salted fingerprint `sha256(handle + ':' + PROVENANCE_SALT)[:16]` ONLY (locked
   decision 22a) — `model-health.account_hash` refuses to derive without both handle and salt and
   `make_record` fail-closed validates the assembled record so a raw `acctNN` can never be written
-  (#202); `dashboard-gen` validates the observability lease label against the fingerprint shape and
+  (#202), and the same handle scan covers a field that a **newer** release of `model-health.py`
+  added and this reader does not recognise, so #739's forward-compatible read is not a hole in it
+  (`research/739-ledger-forward-compatibility.md`); `dashboard-gen` validates the observability lease label against the fingerprint shape and
   `_assert_private` backstops every known raw handle over the FINISHED public document;
   `lease_schema.ACCOUNT` and `select-and-claim.ACCOUNT_FINGERPRINT_RE` `fullmatch` 16 hex characters
   in the ledger and nothing else; and `account-whoami.yml` /

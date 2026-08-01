@@ -282,6 +282,60 @@ MAX_USAGE_TOKENS = 1_000_000_000
 MAX_WALL_SECONDS = 7 * 24 * 3600
 MAX_ISSUE_NUMBER = 2_147_483_647
 
+# --- THE RECORD FIELD VOCABULARY, and the READ/WRITE asymmetry around it (issue #739) ----------
+# Declared ONCE here so the write posture, the read posture and the self-test's old-reader
+# simulation all derive from the same set instead of restating it (the #958 shape).
+RECORD_BASE_FIELDS = frozenset({
+    "ts", "provider", "account", "model_alias", "exit_class", "run_id", "reset_hint"})
+RECORD_NO_CHANGE_FIELDS = frozenset({
+    "input_tokens", "output_tokens", "wall_seconds", "issue", "why_no_diff"})
+RECORD_KNOWN_FIELDS = RECORD_BASE_FIELDS | RECORD_NO_CHANGE_FIELDS
+# At most this many unrecognised field names may ride on ONE stored record before the reader calls
+# the document malformed. Additive schema growth adds fields one or two at a time; a record wearing
+# a dozen is junk, and an unbounded key count is a size vector on a PUBLIC read path.
+MAX_UNKNOWN_RECORD_FIELDS = 8
+ORIGIN_WRITE = "write"   # a record THIS release is introducing: the vocabulary above is closed
+ORIGIN_READ = "read"     # a record already on the shared ledger: additive growth is tolerated
+#
+# WHY THE TWO POSTURES DIFFER (issue #739 — a strict read allowlist made every additive field a
+# self-inflicted outage). A worker run's registry checkout is pinned at DISPATCH and its health job
+# can execute tens of minutes later, so every registry deploy is a rolling upgrade with pre-merge
+# READERS still live against this one shared, mutable ledger. #733 added `why_no_diff` to the writer
+# and the reader in ONE commit; three in-flight runs dispatched before that commit then died on
+# `unexpected field(s) ['why_no_diff']` — and because validate_ledger raises on the FIRST unknown
+# field of ANY record, one new-shape record made the WHOLE ledger unreadable to them, so every
+# health append in those runs was lost, not just the new one. The blast radius is wider than the
+# recorder: dashboard-gen renders nothing, account-usage's reactive backoff fails open, and every
+# park predicate below (capacity_recovery_evidence / park_cause_provable / _readable_window) folds
+# to "no evidence". A convention ("land the reader a release early") does not fix this — conventions
+# are exactly what fail, and the next one-PR field addition repeats it automatically.
+#
+# WHAT IS *NOT* RELAXED. The strict allowlist is load-bearing (#202: a poisoned record must not
+# survive a reader) and none of it moves:
+#   * WRITE posture is unchanged and total — make_record and the record append_record introduces are
+#     refused outright for ANY undeclared field, so this repo can never PUT a field it has not
+#     declared. Forward tolerance is therefore a property of records written by a DIFFERENT release,
+#     never a licence for this one.
+#   * READ posture still validates every KNOWN field with the identical grammars, so a raw handle,
+#     Markdown in reset_hint, an unknown provider/class or a bad enum still fails the whole ledger
+#     loud, exactly as before.
+#   * The PRIVACY invariant is universal because the ledger itself is PUBLIC: an unrecognised
+#     field's value is scanned for the raw `acctNN` handle pattern and refuses the document if it
+#     carries one (README "Security posture", locked decision 22a).
+# What is deliberately NOT constrained is the unrecognised value's TYPE or SHAPE — constraining it
+# would re-create the identical incompatibility the moment a future field is a list or an object.
+# That is sound because an unrecognised field has no SINK: every consumer of a health record reads
+# fields BY NAME, so an unknown one is never folded, compared, or interpolated into an alert body
+# (the sink-specific grammars — e.g. reset_hint's Markdown allowlist — exist for fields that ARE
+# republished). Its bytes are still counted by _record_bytes and bounded by RETENTION_CEILING_BYTES.
+# The NAME is constrained (token grammar + count cap) because names are what this module prints in
+# its warning, and a name carrying a newline could forge a `::` workflow annotation.
+#
+# ONE-TIME BOOTSTRAP OBLIGATION. Readers deployed BEFORE this change are still strict, so this
+# change must itself age out of the in-flight worker population before the next additive field is
+# written. It is the last field addition that needs that wait; see research/739-ledger-forward-
+# compatibility.md.
+
 # --- thresholds (WHY each is what it is). Tuned to page on a real stall, stay quiet on churn.
 # PROVIDER-OUTAGE: >=3 launch failures within 30 min from >= max(2, ceil(enabled-fleet/2)) distinct
 # accounts whose PER-ACCOUNT tail runs contain no interleaved success (a success clears only ITS
@@ -462,7 +516,7 @@ def make_record(provider, account_h, model_alias, exit_class, run_id, now, reset
     for field, value in no_change_fields.items():
         if value is not None:
             rec[field] = value
-    _validate_record(rec)
+    _validate_record(rec, ORIGIN_WRITE)
     return rec
 
 
@@ -655,19 +709,33 @@ def prune(records, now):
     return [kept[i] for i in sorted(selected)]
 
 
-def validate_ledger(document):
+def validate_ledger(document, known=RECORD_KNOWN_FIELDS):
     """Fail-closed shape check mirroring the lease ledger validator: {records:[...]} with well
     formed entries. A malformed ledger raises rather than silently resetting the window. Every entry
     is checked with the SAME `_validate_record` contract used at construction, so a poisoned record
-    (a raw handle, an unknown provider, an injected marker field) is rejected identically at read,
-    at write, and on the pre-PUT document check (issue #202)."""
+    (a raw handle, an unknown provider, an injected marker) is rejected identically at read, at
+    write, and on the pre-PUT document check (issue #202).
+
+    This is the READ posture: a field name outside `known` is a record written by a LATER release of
+    this module, not a poisoning, so it is tolerated (and reported) instead of failing the whole
+    ledger — see the RECORD_KNOWN_FIELDS block for why the two postures differ and exactly what is
+    NOT relaxed (issue #739). `known` is a parameter solely so the self-test can drive this function
+    as a reader one release behind; production always passes the module's own vocabulary."""
     if not isinstance(document, dict) or set(document) != {"records"}:
         raise ValueError("model-health ledger top level is malformed")
     records = document["records"]
     if not isinstance(records, list):
         raise ValueError("model-health ledger records field is malformed")
+    tolerated = set()
     for r in records:
-        _validate_record(r)
+        tolerated.update(_validate_record(r, ORIGIN_READ, known=known))
+    if tolerated:
+        # Never silent: a tolerated field means this reader is behind the writer. The names have
+        # already passed the token grammar, so printing them cannot forge an annotation.
+        print(f"::warning::model-health: ledger carries {len(tolerated)} field(s) this reader does "
+              f"not know ({', '.join(sorted(tolerated))}) — records written by a NEWER release; "
+              "their known fields were validated normally and the unknown ones carried through "
+              "untouched (issue #739)", file=sys.stderr)
     return records
 
 
@@ -715,23 +783,62 @@ def _is_bounded_int(value, minimum, maximum):
             and minimum <= value <= maximum)
 
 
-def _validate_record(r):
+def _tolerable_unknown_field(name, value):
+    """One unrecognised field on a STORED record is readable-through (issue #739) when its NAME is
+    token-shaped and bounded — names are what the reader prints, and a name carrying a newline could
+    forge a `::` workflow annotation — and when its rendered VALUE does not embed the raw `acctNN`
+    handle pattern, because the ledger is PUBLIC and that privacy invariant is universal (README
+    "Security posture", locked decision 22a). The value's TYPE and SHAPE are deliberately
+    unconstrained: an unrecognised field has no sink (every consumer reads records BY NAME), and
+    constraining it would re-create the incompatibility the moment a future field is a list."""
+    if not isinstance(name, str) or not name or len(name) > RECORD_FIELD_MAX_LEN:
+        return False
+    if not _TOKEN_FIELD_RE.fullmatch(name):
+        return False
+    return not _HANDLE_PATTERN_RE.search(str(value))
+
+
+def _validate_record(r, origin, known=RECORD_KNOWN_FIELDS):
     """Fail-closed field validation for ONE health record — the single contract shared by
     make_record (construction), validate_ledger (read), and append_record's pre-PUT document check.
     Raises ValueError on any malformed field. Enforced identically at write and read so a poisoned
     record can neither be constructed nor survive a reader (issue #202): the account is a salted
     hash and never a raw acctNN handle, the provider is catalog-bounded, the class is a known fold
-    target, every other string field is bounded AND matches its field-specific allowlist grammar
-    (with the raw-handle pattern refused everywhere), and no unexpected field may ride along —
-    nothing can carry a raw identifier, Markdown/HTML markup, an injected marker, or an unbounded
-    blob into the PUBLIC ledger."""
+    target, and every other string field is bounded AND matches its field-specific allowlist grammar
+    (with the raw-handle pattern refused everywhere) — nothing can carry a raw identifier,
+    Markdown/HTML markup, an injected marker, or an unbounded blob into the PUBLIC ledger.
+
+    `origin` states which side of the rolling-upgrade seam the record comes from and has NO default,
+    so a future call site must declare its posture rather than inherit the wrong one by omission
+    (issue #739). ORIGIN_WRITE: this release is introducing the record, the field vocabulary is
+    CLOSED, and any undeclared field is refused outright. ORIGIN_READ: the record is already on the
+    shared ledger and may have been written by a later release, so a field this module does not know
+    is tolerated when `_tolerable_unknown_field` accepts it and refuses the document otherwise.
+    Returns the set of tolerated unknown field names (empty on the write side) so the caller can
+    report that it is reading ahead of itself.
+
+    `known` narrows the ALLOWLIST only — the field-specific checks for fields this module knows
+    still run — and exists so the self-test can drive this as a reader one release behind, which is
+    exactly where #733's traceback came from. Every production call site takes the module's own
+    RECORD_KNOWN_FIELDS."""
     if not isinstance(r, dict):
         raise ValueError("model-health ledger contains a non-object entry")
-    no_change_fields = {"input_tokens", "output_tokens", "wall_seconds", "issue", "why_no_diff"}
-    extra = set(r) - ({"ts", "provider", "account", "model_alias", "exit_class", "run_id",
-                       "reset_hint"} | no_change_fields)
-    if extra:
+    if not all(isinstance(field, str) for field in r):
+        # Refused by NAME, before anything sorts or prints it: a non-string key is not additive
+        # schema growth in any release, and it would otherwise raise TypeError past the ValueError
+        # handlers every caller below fails closed on.
+        raise ValueError("model-health record has a non-string field name")
+    no_change_fields = set(RECORD_NO_CHANGE_FIELDS) & set(known)
+    extra = set(r) - set(known)
+    if extra and origin == ORIGIN_WRITE:
         raise ValueError(f"model-health record has unexpected field(s) {sorted(extra)}")
+    if len(extra) > MAX_UNKNOWN_RECORD_FIELDS:
+        raise ValueError("model-health record carries too many unrecognised fields")
+    for field in sorted(extra):
+        if not _tolerable_unknown_field(field, r[field]):
+            # Deliberately does NOT echo the offending name/value — it failed the very grammar that
+            # makes it safe to print.
+            raise ValueError("model-health record has an unreadable unrecognised field")
     if not isinstance(r.get("ts"), int) or isinstance(r.get("ts"), bool):
         raise ValueError("model-health record has a malformed timestamp")
     if r.get("provider") not in VALID_RECORD_PROVIDERS:
@@ -756,7 +863,7 @@ def _validate_record(r):
     if r.get("exit_class") != CLASS_NO_CHANGE:
         if present_no_change:
             raise ValueError("model-health record has no-change fields on another exit class")
-        return
+        return extra
     if not _is_bounded_int(r.get("issue"), 1, MAX_ISSUE_NUMBER):
         raise ValueError("model-health no_change issue is malformed")
     for field in ("input_tokens", "output_tokens"):
@@ -770,6 +877,7 @@ def _validate_record(r):
     # whole check.
     if "why_no_diff" in r and r["why_no_diff"] not in NO_CHANGE_REASONS:
         raise ValueError("model-health no_change why_no_diff is not a known reason")
+    return extra
 
 
 def _per_account_tail_failures(records, window_seconds, now):
@@ -1048,7 +1156,7 @@ def capacity_recovery_evidence(records, parked_at, now):
         return None
     for record in records:
         try:
-            _validate_record(record)
+            _validate_record(record, ORIGIN_READ)
         except ValueError:
             return None
     cooldowns = auth_cooldowns(records, now)
@@ -1114,7 +1222,7 @@ def park_cause_provable(records, parked_at, now):
         return False
     for record in records:
         try:
-            _validate_record(record)
+            _validate_record(record, ORIGIN_READ)
         except ValueError:
             return False
     cause = {}
@@ -1135,7 +1243,7 @@ def _readable_window(records, now):
         return None
     for record in records:
         try:
-            _validate_record(record)
+            _validate_record(record, ORIGIN_READ)
         except ValueError:
             return None
     return sorted((record for record in records
@@ -2170,7 +2278,13 @@ def append_record(api, registry_repo, record, now, retries=CAS_RETRIES, skip_if=
         # Validate the COMPLETE assembled document before the PUT (issue #202): a malformed record —
         # e.g. a raw handle that bypassed make_record — must fail LOUD here, never leak to the PUBLIC
         # ledger and then get rejected by every subsequent reader (a silent self-poisoning write).
+        # TWO POSTURES, and the split is the point (issue #739). The record THIS run introduces is
+        # checked on the WRITE side, so its field vocabulary stays closed and this release can never
+        # PUT an undeclared field. The assembled document — which carries records written by OTHER
+        # releases straight back through this read-modify-write — is checked on the READ side, so a
+        # newer writer's additive field neither blocks this append nor is silently erased by it.
         try:
+            _validate_record(record, ORIGIN_WRITE)
             validate_ledger({"records": records})
         except ValueError as exc:
             raise HealthError(f"refusing to write a malformed model-health record: {exc}") from exc
@@ -2939,12 +3053,12 @@ def _self_test():
     chk("a stored why_no_diff survives the READ validator", _raises(
         lambda: _validate_record(make_record(
             "openai", hash_a, "codex", CLASS_NO_CHANGE, "1", now,
-            issue=500, why_no_diff="underspecified"))), False)
+            issue=500, why_no_diff="underspecified"), ORIGIN_READ)), False)
     chk("a HAND-FORGED why_no_diff is rejected by the READ validator too", _raises(
         lambda: _validate_record({
             "ts": now, "provider": "openai", "account": hash_a, "model_alias": "codex",
             "exit_class": CLASS_NO_CHANGE, "run_id": "1", "issue": 500,
-            "why_no_diff": "not-a-reason"})), True)
+            "why_no_diff": "not-a-reason"}, ORIGIN_READ)), True)
     # The ENVELOPE is where the reason crosses the sanitized handoff: index in, name out.
     chk("the envelope decodes a reason INDEX to its vocabulary name",
         _parse_no_change_envelope("no-change-v1 issue:500,why:3")["why_no_diff"], "too_large")
@@ -4204,6 +4318,15 @@ def _self_test():
         base.update(over)
         return {"records": [base]}
     chk("ledger read accepts a well-formed record", validate_ledger(_led()) is not None, True)
+    # The document-shape guards had never been EXECUTED by this suite (measured with
+    # `trace --count --missing` while auditing #739's edits to the same function), so each was
+    # individually deletable with 500 checks green.
+    chk("ledger read rejects a malformed top level",
+        _raises(lambda: validate_ledger({"records": [], "extra": 1})), True)
+    chk("ledger read rejects a non-list records field",
+        _raises(lambda: validate_ledger({"records": {}})), True)
+    chk("ledger read rejects a non-object entry (as a ValueError, not an AttributeError)",
+        _outcome(lambda: validate_ledger({"records": [["not", "an", "object"]]})), "ValueError")
     chk("ledger read rejects raw-handle account",
         _raises(lambda: validate_ledger(_led(account="acct01"))), True)
     chk("ledger read rejects an unknown provider",
@@ -4212,8 +4335,14 @@ def _self_test():
         _raises(lambda: validate_ledger(_led(exit_class="weird"))), True)
     chk("ledger read rejects a non-printable field",
         _raises(lambda: validate_ledger(_led(model_alias="a\nb"))), True)
-    chk("ledger read rejects an unexpected extra field",
+    # An UNRECOGNISED field is no longer whole-ledger fatal by itself (issue #739 — that is what
+    # made every additive field a rolling-upgrade outage); what still refuses the document is the
+    # PRIVACY invariant riding inside one. This row's kill is the handle scan in
+    # _tolerable_unknown_field, and _test_forward_compatibility pins both sides of the split.
+    chk("ledger read rejects a raw handle smuggled in an unrecognised field",
         _raises(lambda: validate_ledger(_led(handle="acct01"))), True)
+    chk("the WRITE side still refuses the unrecognised field outright",
+        _raises(lambda: _validate_record(_led(handle="ok")["records"][0], ORIGIN_WRITE)), True)
     # Review round 1 of PR #444: a hand-forged ledger entry carrying a raw handle or printable
     # Markdown in ANY free-form field must die at READ too — the reader shares _validate_record
     # with construction, so these go green only while the field grammars + handle-pattern check
@@ -4239,6 +4368,8 @@ def _self_test():
     chk("ledger read requires issue attribution on no_change",
         _raises(lambda: validate_ledger(_led(exit_class=CLASS_NO_CHANGE))), True)
 
+    # ---- #739: the READ/WRITE posture split across the rolling-upgrade seam -------------------
+    ok = _test_forward_compatibility(chk) and ok
     # ---- CAS writer against a stub API (create + append + conflict retry) --------------------
     ok = _test_cas(chk) and ok
     # ---- #200: CAS writer is idempotent (dedup) + bounded jittered retry ---------------------
@@ -4314,6 +4445,34 @@ def _raises(fn):
         return True
 
 
+def _raises_type(fn, exc_type):
+    """True when `fn` raises EXACTLY this exception type — distinct from `_raises`, which folds the
+    validator's whole ValueError/HealthError family. Used where the TYPE is the assertion (issue
+    #739: `_validate_record`'s `origin` has no default, so omitting it must be a TypeError at the
+    call site rather than a silently inherited posture). Any other exception propagates."""
+    try:
+        fn()
+        return False
+    except exc_type:
+        return True
+
+
+def _outcome(fn):
+    """`fn()`'s value, or the CLASS NAME of the exception that escaped it.
+
+    For guards whose deletion fails by CRASHING rather than by answering wrongly. `_raises` folds
+    only ValueError/HealthError, so a deleted guard that lets a TypeError/AttributeError through
+    aborts the whole suite instead of reddening one row — and a crash-after-partial-run records as
+    a kill while every check below it never ran (AGENTS.md AUTHOR pre-flight §4). Folding the class
+    name into the compared VALUE turns that into a NAMED red row, and where the expected value is
+    "ValueError" it additionally asserts the fail-closed CONTRACT: every reader here catches
+    ValueError and nothing else, so a guard raising another class is not protecting them."""
+    try:
+        return fn()
+    except BaseException as exc:       # the class name IS part of the assertion
+        return type(exc).__name__
+
+
 class _StubAPI:
     """In-memory contents API for the CAS writer test. `conflict_first` simulates a lost CAS race
     on the first PUT (a 409) so the retry loop is exercised. Ledger-branch discipline (issue #28)
@@ -4358,6 +4517,148 @@ class _StubAPI:
 
     def records(self):
         return json.loads(base64.b64decode(self._blob).decode())["records"]
+
+
+def _test_forward_compatibility(chk):
+    """Issue #739: the ledger is a SHARED, mutable blob, and a worker's registry checkout is pinned
+    at DISPATCH while its health job runs tens of minutes later — so every deploy is a rolling
+    upgrade with pre-merge READERS still live. #733 added `why_no_diff` to the writer and to the
+    reader's allowlist in ONE commit; three in-flight runs then died on
+    `unexpected field(s) ['why_no_diff']`, and because the reader raised on the first unknown field
+    of any record the failure was WHOLE-LEDGER — every health append in those runs was lost.
+
+    Both directions are pinned here, and they are the experiment: the READ side must tolerate a
+    field a later release added, and the WRITE side must still refuse one outright. If either row
+    below could go green with the other's behaviour, the split has collapsed into a relaxation."""
+    now, salt = 4_000_000, "s3cret"
+    ah = account_hash("acct07", salt)
+
+    def rec(**over):
+        base = {"ts": now, "provider": "anthropic", "account": ah, "exit_class": "auth",
+                "model_alias": "fable", "run_id": "77.1"}
+        base.update(over)
+        return base
+
+    # ---- THE REGRESSION, stated exactly as #739 states it: validate what THIS release WRITES with
+    # a reader ONE RELEASE BEHIND. `known` is narrowed by the field #733 actually added, so this
+    # drives the identical allowlist line that produced the three tracebacks.
+    behind = RECORD_KNOWN_FIELDS - {"why_no_diff"}
+    written = make_record("openai", ah, "codex", CLASS_NO_CHANGE, "77.1", now,
+                          issue=500, why_no_diff="underspecified")
+    chk("[#739] a reader ONE RELEASE BEHIND reads what THIS release writes",
+        _raises(lambda: validate_ledger({"records": [written]}, known=behind)), False)
+    # ...and the blast radius is the point: one new-shape record must not take the whole window with
+    # it. Deleting the read tolerance flips this to a 0-record exception, not a 2-record answer.
+    chk("[#739] the records beside it are not collateral damage",
+        _outcome(lambda: len(validate_ledger(
+            {"records": [rec(), written, rec(run_id="78.1")]}, known=behind))), 3)
+
+    # ---- THE TRUST CHECK THAT DOES NOT MOVE. Same record, same field, opposite posture.
+    ahead = rec(shipped_next_release=1)
+    chk("[#739] the WRITE posture refuses an undeclared field...",
+        _raises(lambda: _validate_record(ahead, ORIGIN_WRITE)), True)
+    chk("[#739] ...while the READ posture carries the SAME record through",
+        _raises(lambda: _validate_record(ahead, ORIGIN_READ)), False)
+    chk("[#739] `origin` has no default, so a new call site cannot inherit the wrong posture",
+        _raises_type(lambda: _validate_record(ahead), TypeError), True)
+
+    # ---- THE SEAM. append_record read-modify-writes the WHOLE blob, so both postures have to hold
+    # at the one call site that actually PUTs: refuse to INTRODUCE an undeclared field, and never
+    # ERASE one a newer writer already stored (a stripping reader would silently downgrade the
+    # shared ledger on every append an old worker makes).
+    guarded = _StubAPI(seed=[])
+    chk("[#739] append_record refuses to INTRODUCE an undeclared field",
+        _raises(lambda: append_record(guarded, "o/r", rec(sneaky_field="x"), now)), True)
+    chk("[#739] ...and nothing reached the ledger",
+        (guarded.last_put_branch, guarded.records()), (None, []))
+    carried = _StubAPI(seed=[rec(run_id="1.1", shipped_next_release={"a": [1, 2]})])
+    chk("[#739] append_record still APPENDS onto a ledger a newer writer has touched",
+        _outcome(lambda: append_record(
+            carried, "o/r", make_record("anthropic", ah, "fable", "success", "2.1", now + 1),
+            now + 1)), 2)
+    chk("[#739] ...and CARRIES the newer writer's field through the read-modify-write",
+        [r.get("shipped_next_release") for r in carried.records()], [{"a": [1, 2]}, None])
+
+    # ---- FAIL-CLOSED, unchanged. Tolerance is for a NAME a later release could plausibly ship;
+    # everything else still refuses the whole document. The value's TYPE is deliberately free (a
+    # future field may be a list or an object) but the PUBLIC-ledger privacy invariant is not.
+    bad_name = rec()
+    bad_name["bad\nname"] = 1
+    markup_name = rec()
+    markup_name["<!--marker-->"] = 1
+    long_name = rec()
+    long_name["f" * 65] = 1
+    empty_name = rec()
+    empty_name[""] = 1
+    # A non-string key BESIDE a string one is the case that matters: on a key set of mixed types
+    # `sorted()` raises TypeError, which is not a ValueError and so escapes every fail-closed
+    # handler below. A lone non-string key is caught by _tolerable_unknown_field regardless, so
+    # testing only that shape leaves the guard unkillable.
+    nonstring_name = rec()
+    nonstring_name[7] = "x"
+    nonstring_name["future_note"] = "ok"
+    for label, poisoned in (
+            ("a raw acctNN handle smuggled in an unrecognised field (the ledger is PUBLIC)",
+             rec(future_note="leased to acct01")),
+            ("...the same handle NESTED inside a structured value",
+             rec(future_note={"who": ["acct02"]})),
+            ("a field name carrying a newline (it would forge a :: workflow annotation)", bad_name),
+            ("a field name carrying Markdown/HTML", markup_name),
+            ("a field name over 64 characters", long_name),
+            ("an empty field name", empty_name)):
+        chk(f"[#739] READ still refuses {label}",
+            _raises(lambda p=poisoned: validate_ledger({"records": [p]})), True)
+    # The non-string key is asserted on the exception CLASS, not merely on "something raised":
+    # every fail-closed reader below catches ValueError only, and without the guard `sorted()`
+    # raises TypeError on a mixed key set — which escapes all of them AND aborts this suite mid-run
+    # rather than reddening a row.
+    chk("[#739] READ refuses a NON-STRING field name beside a string one, as a ValueError",
+        _outcome(lambda: validate_ledger({"records": [nonstring_name]})), "ValueError")
+    chk("[#739] ...so the park predicates fail CLOSED on it rather than exploding past their "
+        "ValueError handlers",
+        (_outcome(lambda: _readable_window([nonstring_name], now)),
+         _outcome(lambda: park_cause_provable([nonstring_name], now, now))), (None, False))
+
+    # The cap is asserted on LITERALS, never on the constant the code reads (an input derived from
+    # MAX_UNKNOWN_RECORD_FIELDS stays green at any value of it), plus one explicit drift lock.
+    chk("[#739] eight unrecognised fields still read (the cap is 8, not fewer)",
+        _raises(lambda: validate_ledger(
+            {"records": [rec(**{f"f{i}": i for i in range(8)})]})), False)
+    chk("[#739] nine refuses the document (the cap is 8, not more)",
+        _raises(lambda: validate_ledger(
+            {"records": [rec(**{f"f{i}": i for i in range(9)})]})), True)
+    chk("[#739] the tested cap IS the shipped cap", MAX_UNKNOWN_RECORD_FIELDS, 8)
+
+    for value in (None, [], {"a": 1}, 12.5, True, "free text, punctuated!"):
+        chk(f"[#739] an unrecognised field valued {value!r} is readable (shape is not constrained)",
+            _raises(lambda v=value: validate_ledger({"records": [rec(future_note=v)]})), False)
+
+    # ---- THE WIDER BLAST RADIUS. The recorder was only the loudest victim: every park predicate
+    # folds an unreadable window to "no evidence", so a new-shape record silently froze the aged-out
+    # park exits too. These read the window through _validate_record's fail-closed callers.
+    window = [rec(ts=now - 100, run_id="1.1"),
+              rec(ts=now - 50, run_id="2.1", shipped_next_release=1)]
+    clean = [{k: v for k, v in r.items() if k != "shipped_next_release"} for r in window]
+    chk("[#739] the park predicates still SEE a window a newer writer has touched",
+        _readable_window(window, now) is None, False)
+    chk("[#739] ...and park_cause_provable answers identically with and without the new field",
+        (park_cause_provable(window, now, now), park_cause_provable(clean, now, now)), (True, True))
+
+    # ---- NEVER SILENT. A reader that is behind the writer says so, by name.
+    import contextlib
+    import io
+    loud = io.StringIO()
+    with contextlib.redirect_stderr(loud):
+        _outcome(lambda: validate_ledger({"records": [rec(future_note="ok"),
+                                                      rec(run_id="2.1", other_note="ok")]}))
+    heard = loud.getvalue()
+    chk("[#739] a tolerated field is REPORTED by name (reading ahead is visible, not swallowed)",
+        ("::warning::" in heard and "future_note" in heard and "other_note" in heard), True)
+    quiet = io.StringIO()
+    with contextlib.redirect_stderr(quiet):
+        _outcome(lambda: validate_ledger({"records": [rec()]}))
+    chk("[#739] ...and a ledger this reader fully understands stays quiet", quiet.getvalue(), "")
+    return True
 
 
 def _test_cas(chk):
