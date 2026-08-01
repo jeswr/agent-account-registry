@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5496,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "917ce70837941f063965766678a52e2cb5f756d4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "commitment_digest hashes a flat sequence of fixed-width parts: holder_tag followed by that holder's commitments, but includes neither holder_count nor each segment's commitment count. Consequently distinct federations can have the same preimage without breaking SHA-512: one holder A with commitments [x, holder_tag(B), y] hashes the same part sequence as holders A:[x] and B:[y]. FieldWord is explicitly opaque and accepts arbitrary bytes, so a commitment may equal holder_tag(B). This falsifies the doc claim that moving commitments between holders necessarily changes the digest and means FreshnessBinding::tag does not structurally bind the claimed holder partition, even though the full public-input layout does.",
+    "file": "crates/sparq-mpc/src/federated_binding.rs",
+    "fix_hint": "Encode holder_count and each holder's commitment count into commitment_digest (using canonical integer bytes/words) before the corresponding segment, mirroring reconstruct_public_inputs. Add a regression test constructing the exact collision above and asserting the corrected digests differ; the test should demonstrate that the old flattened preimages were identical so it is non-vacuous. Update the comments that currently claim holder-tag prefixing alone binds re-attribution.",
+    "severity": "major",
+    "title": "commitment_digest omits holder and commitment arities"
+   }
+  ],
+  "progress": null,
+  "summary": "The new layer is carefully caveated and most shape checks are fail-closed, but the aggregate commitment digest does not unambiguously encode holder-segment boundaries. That contradicts the stated attribution invariant and leaves the freshness tag structurally ambiguous for adversarial FieldWord inputs. The existing test uses ordinary commitment values and does not exercise this boundary collision.",
+  "verdict": "request_changes"
+ }
+}
