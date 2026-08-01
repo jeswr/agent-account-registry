@@ -2614,8 +2614,13 @@ def _self_test():                                                       # noqa: 
     # the population rather than merely asserting it is small, so it reds on a SECOND repo being
     # enrolled alongside a trigger change (the blast-radius widening #916 deliberately deferred)
     # AND on the list being emptied, which would make every sweep vacuous forever.
-    check("the sweep's population is EXACTLY the registry, and only `jeswr`",
-          live_targets, [("jeswr/agent-account-registry", ("jeswr",))])
+    # [#1451] REPOINTED, not relaxed — the freeze control names the population, so it grows with
+    # the rollout instead of being loosened. sparq's enrolment has landed; jeswr/solid-sdk is
+    # enabled and deliberately NOT enrolled, so a THIRD repo joining still reds this.
+    check("the sweep's population is EXACTLY the registry and sparq, and only `jeswr` "
+          "(jeswr/solid-sdk is enabled and deliberately NOT enrolled — it is the control)",
+          live_targets, [("jeswr/agent-account-registry", ("jeswr",)),
+                         ("sparq-org/sparq", ("jeswr",))])
     check("...and a disabled row is never a target",
           enrolled_targets({"repos": {"o/r": {"enabled": False,
                                               "review_enrolment_authors": ["x"]}}},

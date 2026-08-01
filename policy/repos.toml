@@ -241,9 +241,11 @@ cross_provider_fallback = false
 #     the #42 armed-SHA invariant is DETECTED and reported for this class every tick
 #     (dispatch-claim.enumerate_disarm_observations) and acted on by a human.
 #
-# SCOPE: this repo ONLY, deliberately. sparq-org/sparq has the denser population (30 of 34 open
-# non-draft PRs on 2026-07-27) but it is not the repo this lane maintains; a one-repo rollout gives
-# a real signal on the trust plane itself before widening. sparq is a follow-up, not an oversight.
+# SCOPE [#1451, 2026-08-01]: the one-repo rollout has COMPLETED and sparq-org/sparq is now
+# enrolled too — it carried the denser population all along (30 of 34 open non-draft PRs on
+# 2026-07-27), and the staged rollout bought a real signal on the trust plane before widening to it.
+# jeswr/solid-sdk is now the enabled-but-deliberately-un-enrolled CONTROL that four separate guards
+# contrast against; do not enrol it without repointing them (grep `EXACTLY the registry`).
 #
 # ORDERING: mint-provenance.py REFUSES to mint an orchestrator record for a repo whose list is
 # empty, so this line is the PRECONDITION for the record half existing at all. On the tick this
