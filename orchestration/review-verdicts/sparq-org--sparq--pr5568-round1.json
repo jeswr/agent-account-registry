@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5568,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e8c52f208f77a8c0d38184811f17d260149a7332",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The selective-disclosure addition is an honestly scoped, opt-in delegation seam rather than an in-repo cryptographic verifier. The acceptance path is gated by both suite support and an explicit successful host-verifier result before commitment; unsupported, unavailable, rejecting, and empty-credential paths fail closed. The public API keeps whole-credential and selective-disclosure suite token spaces separate, forwards the complete presentation to the host, attributes successful decisions to the verifier, and records only explicitly caveated provenance. Tests exercise the load-bearing fail-closed behavior, rejection behavior, token separation, verbatim forwarding, disclosed-subset commitment equivalence, provenance, and canonicalization ordering. Documentation consistently disclaims selective-disclosure soundness and unlinkability, states that external audit sq-qhy4 remains pending, updates the matching skill, and keeps the feature off by default with no new dependency.",
+  "verdict": "approve"
+ }
+}
