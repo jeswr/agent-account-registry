@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1614,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c0b20b64f0e0ce1a8185eb2591121b9059f7dd39",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nApproved. The watchdog now routes its idempotent GitHub GET reads through the shared bounded-retry layer while leaving issue/label mutations on the existing single-attempt transport. Retry exhaustion and unread or malformed populations still propagate as AlarmError/rc=2 rather than becoming healthy defaults. The lazy path load preserves the thin-checkout cron-map consumer, and the watchdog sparse checkout plus REQUIRED_FILES/YAML-seam assertions carry and pin the helper on the live path. The added tests are non-vacuous at the subprocess boundary: they count real gh attempts and backoffs, distinguish transient 503 from permanent 404 and invalid JSON, verify the actual argv is read-scoped, and assert both recovered and persistently failed whole-tick exit codes. No trust check, permission boundary, credential handling, or audit binding is weakened.",
+  "verdict": "approve"
+ }
+}
