@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1605,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c20a6b24dd571ca07eb2d47564096526aecded7d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`backfill_workflow_seam_report()` checks the backfill step's conditionality, but it never checks the `targets` job or its `resolve` step for an `if:` condition. Adding `if: false` to either is valid workflow YAML and prevents the matrix output from being produced; the dependent backfill job is then skipped, yet all newly added shipped-shape assertions still pass. The mutant table likewise has no deleted/inert experiment for these controls. This is the exact fail-silent YAML seam the change says it covers.",
+    "file": "scripts/backfill-provenance.py",
+    "fix_hint": "Report and assert that the `targets` job and the policy-resolving step are executable under the intended events (including explicit absence/exact value of any `if:`). Add non-crashing mutants that make each condition inert and verify a named finding changes while the complete self-test row count is preserved.",
+    "severity": "major",
+    "title": "The target resolver can be disabled with `if: false` without failing the self-test"
+   },
+   {
+    "body": "`targets_policy_sourced` is true when the literal `policy/repos.toml` occurs anywhere in any `run` string in the targets job. The actual resolver can hardcode its enabled repository list while an unrelated step, dead branch, comment, or no-op retains that literal, and the marquee one-source-of-truth assertion stays green. The supplied mutant only replaces the sole current occurrence, so it does not exercise this mutually masking/decoy case.",
+    "file": "scripts/backfill-provenance.py",
+    "fix_hint": "Bind the finding structurally to the exact step that owns `id: resolve` and prove that this executable step parses the policy and emits its derived enabled set. Add a decoy mutant that hardcodes the resolver while retaining `policy/repos.toml` elsewhere; the shipped assertion must fail.",
+    "severity": "major",
+    "title": "Policy sourcing is proven by a vacuous cross-step substring"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new seam coverage does not yet enforce the full executable resolver path it claims to protect. In particular, a valid `if: false` mutation can disable the resolver while every added check and every mutant-table row remains green. The policy-source finding is also only a broad substring test across all target-job steps, so it can be satisfied by dead or unrelated text while the actual resolver is hardcoded. These are fail-silent YAML-seam survivors on the marquee trust-plane behavior, so this round requires changes.",
+  "verdict": "request_changes"
+ }
+}
