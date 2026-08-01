@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1597,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ed7ae006508d9a1882515cb2597443a3d0c86606",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly hoists admissible-provenance ownership ahead of both draft and non-draft age parking, while retaining fail-closed parking for provenance-less drafts and provenance-less non-drafts in every bad merge state. The production sweep passes the provenance decision at both planning and mutation-boundary re-evaluation, and the new end-to-end tests independently exercise those call sites, including a mid-sweep provenance race. The merge-park recovery extension is exact-match on the live admission result and remains behind the existing machine-owned-label, human-hold, receipt, generation-cap, recency, and consume-once controls. Tests pin the bad-state input set literally, cover absent and malformed merge states, assert literal outcomes, and distinguish owned from orphan behavior. No trust check is weakened, no permissive default is introduced, and no reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
