@@ -1004,6 +1004,33 @@ def _workflow_step_env(text, step_id):
     return mapping
 
 
+def _workflow_step_key(text, step_id, key):
+    """The raw one-line scalar value of the step's OWN top-level `<key>:`, or None if absent.
+
+    #935: a step's `if:` decides whether its body runs at all, and executing that body — which is
+    all the keepalive harness below can do — can never see the gate. Bounded to the step's own key
+    indentation, so a `key:` nested inside `with:`/`env:` cannot satisfy an assertion about the
+    step itself, and two of them at that indent is a refusal rather than a first-wins guess."""
+    lines = _workflow_step(text, step_id).split("\n")
+    indent = len(lines[0]) - len(lines[0].lstrip()) + 2
+    values = []
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        # The `- ` of the sequence entry holds the first key at the same column as the rest.
+        here = (" " * indent + line.lstrip()[2:]
+                if index == 0 and line.lstrip().startswith("- ") else line)
+        if (len(here) - len(here.lstrip())) != indent:
+            continue
+        name, separator, value = here.strip().partition(":")
+        if separator and name.strip() == key:
+            values.append(value.strip())
+    if len(values) > 1:
+        raise DashboardError(
+            f"step `id: {step_id}` has {len(values)} top-level `{key}:` keys, expected at most 1")
+    return values[0] if values else None
+
+
 def _js_function_body(text, name):
     """The brace-matched body of `function <name>(...)` in a JS source, or raise.
 
@@ -4071,6 +4098,70 @@ esac
     keepalive_check(
         "[#559] control: a sweeper that ran inside its threshold is not kicked at all — the leg is "
         "not simply dispatching on every fire", (code, dispatched), (0, []), log)
+
+    # --- #935: the SEAM around that leg, which executing the body can never reach. The four rows
+    # above drive the script; production runs it only behind a step-level `if:`, and only on the
+    # token the mint step before it produces. Measured on this tree with all four green: `if: false`
+    # on the step survived the whole suite as it then stood (249 checks) — the keepalive would never
+    # run again, silently, since a skipped step concludes the job green — and rewiring GH_TOKEN to
+    # the default `github.token` survived it too, which is not silent but breaks exactly when the
+    # leg is needed (that token has no access in sparq-org, so the kick 403s at the moment of the
+    # kick and never at any other time). #935 names this leg as the hardest silent break to notice
+    # from the registry side, and both survivors are that break. Pinned by EQUALITY on the raw
+    # expression text — a containment check is satisfied by `... != '' && false` (pre-flight item 6).
+    # ------------------------------------------------------------------------------------------
+    sparq_env = _workflow_step_env(dashboard_workflow, "sparq-keepalive-dispatch")
+    minted = re.fullmatch(r"\$\{\{\s*steps\.([A-Za-z0-9_-]+)\.outputs\.token\s*\}\}",
+                          sparq_env.get("GH_TOKEN") or "")
+    # A gate naming a step that no longer exists must go RED here, not abort the suite half-way:
+    # every row below an unhandled refusal never runs and the mutant records as a kill anyway.
+    minted_resolves = bool(minted) and not _raises_dashboard(
+        lambda: _workflow_step(dashboard_workflow, minted.group(1)))
+    check("[#935] the cross-repo leg is GATED on a minted token and RUNS on that same minted token, "
+          "resolved by step id — deleting or weakening either wiring leaves every executed row "
+          "above green while the sweeper's only fallback is dead",
+          (_workflow_step_key(dashboard_workflow, "sparq-keepalive-dispatch", "if"),
+           sparq_env.get("GH_TOKEN"),
+           minted.group(1) if minted else None,
+           minted_resolves),
+          ("steps.sparq-keepalive-token.outputs.token != ''",
+           "${{ steps.sparq-keepalive-token.outputs.token }}",
+           "sparq-keepalive-token",
+           True))
+    # The extractor's OWN guards, driven directly: the live step has exactly one `if:` at its own
+    # indent, so neither the nesting bound nor the absent/duplicate paths execute above — and an
+    # extractor that answered `nested-must-not-count` (or first-wins on a duplicate) would make the
+    # row above pass against a step that has no gate at all.
+    synthetic_nested = ("      - name: synthetic\n"
+                        "        id: synthetic-step\n"
+                        "        with:\n"
+                        "          if: nested-must-not-count\n"
+                        "        run: |\n"
+                        "          true\n")
+    synthetic_gated = synthetic_nested.replace("          if: nested-must-not-count\n",
+                                               "          ref: main\n"
+                                               "        if: own-gate\n")
+    check("[#935] the step-key extractor reads the step's OWN keys: a nested `if:` is not one, an "
+          "absent gate is None rather than a default, and two at that indent is a refusal",
+          (_workflow_step_key(synthetic_nested, "synthetic-step", "if"),
+           _workflow_step_key(synthetic_gated, "synthetic-step", "if"),
+           _workflow_step_key(synthetic_gated, "synthetic-step", "name"),
+           _raises_dashboard(lambda: _workflow_step_key(
+               synthetic_gated.replace("        run: |\n",
+                                       "        if: second-gate\n        run: |\n"),
+               "synthetic-step", "if"))),
+          (None, "own-gate", "synthetic", True))
+    # The gate is only worth asserting if a gate is what production has: an `if:` on the enclosing
+    # JOB would skip both legs of the mesh with the row above still green, so the job that carries
+    # them must have none. Read from the raw workflow text at job-key indentation, because the step
+    # extractor cannot see the level above it.
+    keepalive_job = re.search(r"(?ms)^  cron-keepalive:\n(.*?)(?=^  \S|\Z)", dashboard_workflow)
+    check("[#935] ...and the job carrying BOTH keepalive legs is itself ungated — an `if:` one "
+          "level up skips the mesh entirely and no executed row can see it",
+          (bool(keepalive_job),
+           [line.strip() for line in (keepalive_job.group(1) if keepalive_job else "").split("\n")
+            if re.fullmatch(r"    if:.*", line)]),
+          (True, []))
 
     # --- #612 review round 2, finding 5 (MINOR): the successful CLI -> builder handoff. Deleting
     # `probe_status=probe_status` from main()'s build_dashboard call left every direct-builder test
