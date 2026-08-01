@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1662,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a02df0c5e4a6a9a33e553aa5cf46691a8fd1bea8",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_execute_age_unpark_actions` now returns six values `(outcome, grants, convergences, stalls, standing, unreachable)`, and its docstring and caller reflect that, but its signature remains `tuple[PhaseOutcome, int, int, int]`. This makes the public type contract inaccurate and can produce false static-analysis errors for the updated six-value unpacking.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Update the return annotation to `tuple[PhaseOutcome, int, int, int, int, int]` (or introduce a named result type if preferred).",
+    "severity": "minor",
+    "title": "Return annotation still describes the old four-element tuple"
+   }
+  ],
+  "progress": null,
+  "summary": "The change is sound and fail-closed: durable receipt causes are classified independently from the current mint vocabulary, undecidable causes are refused before live reads, and the new standing/unreachable gauges are emitted unconditionally and exercised through real sweep paths, including a zero row and a no-write permanent-hold case. The independent writer/reader vocabulary assertion is non-vacuous. I found one minor annotation defect but no blocker or major issue.",
+  "verdict": "approve"
+ }
+}
