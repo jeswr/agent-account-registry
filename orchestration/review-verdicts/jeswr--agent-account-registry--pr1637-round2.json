@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1637,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "fe28d2b1e92207d412ea804453b42a00dff475ea",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The sequencing summary says \"every reaction here is post-publication,\" but sections 3, 4, and 6 correctly characterize C as a producer-side check that acts before the collector publishes. The intended limitation is that A and B are post-publication and C covers only one prospective writer, not that C itself reacts after publication.",
+    "file": "research/891-ledger-observability-row-refusal.md",
+    "fix_hint": "Say that A and B react only after publication, while C acts pre-publication but constrains only the collector and cannot cover direct PUTs or other writers.",
+    "severity": "minor",
+    "title": "Section 7 incorrectly calls every reaction post-publication"
+   }
+  ],
+  "progress": "improving",
+  "summary": "The prior major finding is resolved: the record now consistently distinguishes the aspirational branch property from the achievable refusal/detection posture, explicitly states that A\u2013C do not prevent publication across all write paths, and identifies the enforceable pre-write coverage that would be required. The recommendation and sequencing are sound for a findings-only design record. One minor wording inconsistency remains in section 7, but it does not undermine the corrected conclusion.",
+  "verdict": "approve"
+ }
+}
