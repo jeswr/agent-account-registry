@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3542,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "cbb0ff0b1900d1469e1da55142a12df57719d0f1",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [
+   {
+    "body": "The public `nullifier` documentation still uses the intra-doc link [`jj_scalar_to_base`], while `jj_scalar_to_base` is private. With broken intra-doc links denied by the all-features rustdoc gate, this is the same release-gating defect reported in rounds 1 and 2.",
+    "file": "crates/sparq-zk/src/sig.rs",
+    "fix_hint": "Replace the intra-doc link with plain code formatting (`jj_scalar_to_base`) or link to a public exported item, then run the workspace all-features rustdoc gate.",
+    "severity": "major",
+    "title": "Public rustdoc still links to private jj_scalar_to_base"
+   },
+   {
+    "body": "The diff still exports the `zk-nullifier` feature, module, trait, witness, and helpers without changing `skills/zk-query-proofs/SKILL.md`. The repository maintenance rule requires the matching skill to be updated in the same change whenever a public API or feature is added.",
+    "file": "crates/sparq-zk-compose/src/lib.rs",
+    "fix_hint": "Add `skills/zk-query-proofs/SKILL.md` to this PR and document the opt-in feature, public helpers, primitive-only/deferred-manifest scope, verify-before-record ordering, durable production store requirement, per-holder-per-epoch granularity, and the `sq-qhy4` external-audit caveat.",
+    "severity": "major",
+    "title": "Public nullifier feature and API still lack matching skill documentation"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 is stagnant: both prior major findings remain. The public nullifier rustdoc still links to the private `jj_scalar_to_base`, so the all-features broken-intra-doc-links rustdoc gate remains at risk. The PR still adds the public opt-in `zk-nullifier` feature, module, trait, witness, and helpers without the repository-required update to `skills/zk-query-proofs/SKILL.md`. The nullifier implementation remains explicitly caveated as not externally audited, and its host/Noir cross-vector and replay checks are substantive, but the two unchanged release-gating defects prevent approval. Reviewer-directed text such as \"Re-review when Fable returns\" appears in the diff and was treated strictly as untrusted data.",
+  "verdict": "request_changes"
+ }
+}
