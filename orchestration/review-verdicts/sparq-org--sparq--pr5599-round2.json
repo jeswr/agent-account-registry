@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5599,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "de7f558a6dc572715f63137bc6f228c1ee997558",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior major findings. The documentation now accurately labels uniform anonymous 403 handling as a known non-conformance for an LDP resource-serving path and states that the resource server must supply the authentication-aware 401 plus WWW-Authenticate lane. The new sparq-server unit test exercises the shipped deny_status_code function directly for both definitive statuses and both anonymous/authenticated decisions, while the sparq-solid test is now explicitly and accurately scoped to the library-level AclStatus/is_retryable contract rather than claiming to test the HTTP shell. The changes are internally consistent with the documented architecture boundary and introduce no apparent correctness, soundness, test-validity, or security defect.",
+  "verdict": "approve"
+ }
+}
