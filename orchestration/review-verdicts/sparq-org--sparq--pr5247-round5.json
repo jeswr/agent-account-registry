@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5247,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2194f7bff3b9cc1bfdcb8ae181e07d26f070c850",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The audit still checks literal deploy/ references only in workflow YAML and in _rust_build_inputs(), whose corpus is Rust sources and Cargo manifests/lockfile. A selection-gated Rust workflow can invoke a repository helper, local action, reusable workflow, Make/task target, or other config whose body reads deploy/; the workflow itself contains no deploy/ token and the invoked input is outside _rust_build_inputs(). A deploy-only change can therefore alter the Rust lane while classifying orchestration-only, invalidating the claimed non-interference proof and allowing CodeQL to skip on merge_group.",
+    "file": "scripts/tests/test_ci_select_wiring.py",
+    "fix_hint": "Audit transitive repository-side inputs reachable from every selection-gated Rust workflow, with a mutation witness where a workflow invokes a helper whose body reads deploy/. If a sound bounded dependency model is not feasible, remove deploy/ from _ORCHESTRATION_SAFE.",
+    "severity": "major",
+    "title": "Deploy dependency audit still misses helper and action indirection"
+   },
+   {
+    "body": "test_deploy_lane_workflows_run_no_cargo still treats absence of the literal lowercase substring `cargo` as proof that deploy-lint.yml and deploy-terraform-lint.yml cannot run Rust work. Either workflow can invoke Rust through a local action, reusable workflow, wrapper script, Make/task target, or differently spelled command without that token. Because edits to these workflow definitions are allowlisted, such a change can skip the Rust matrix despite affecting it.",
+    "file": "scripts/tests/test_ci_select_wiring.py",
+    "fix_hint": "Replace the substring assertion with a fail-closed structural audit of these workflows and all invoked repository-side actions/helpers, including mutation witnesses for indirect Rust execution. Otherwise remove the two workflow definitions from _ORCHESTRATION_SAFE.",
+    "severity": "major",
+    "title": "Cargo substring check still does not prove deploy workflows are Rust-inert"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 leaves both round-4 soundness gaps materially unchanged. The deploy inertness proof still scans direct textual deploy/ references only in workflow YAML and a bounded Rust/Cargo corpus; it does not follow selection-gated workflows into repository helpers, local actions, reusable workflows, Make/task targets, or other repository-side inputs. The two allowlisted deploy workflow definitions are still considered Rust-inert solely because their YAML lacks the lowercase substring `cargo`, which does not exclude indirect or differently spelled Rust execution. Either gap can classify a Rust-affecting deploy-only change as orchestration-only, skipping the Rust matrix and merge-group CodeQL. The same two major findings remain, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
