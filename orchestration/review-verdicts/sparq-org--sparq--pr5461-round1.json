@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5461,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8678db2d6441c65b8c1089c3ed6f011a5b8d5243",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`lane_reachability()` checks only head ref, head repository, and whether the author is a bot, while its docstring acknowledges that the registry also requires a provenance record. It then returns `REACHABLE` and permits `review:unreviewed` for that upper-bound population. A worker-shaped bot PR with no registry provenance record will therefore still be labelled as enrolled even though the worker cannot enumerate it. `scripts/review_lane_alarm.py` repeats the same incomplete predicate, so `mislabelled-unreviewed` will also miss this exact residual class. This contradicts the load-bearing claim that flagging requires positive evidence of worker reachability.",
+    "file": "scripts/verdict-bridge.py",
+    "fix_hint": "Make the bridge and alarm consult an authoritative signal that includes the provenance admission gate (for example, expose a registry-produced enrollment/claim signal that this repository can read), or change the label/flow so it does not claim enrollment until the registry confirms it. Add a test for a worker-pattern, same-repo bot PR whose provenance record is absent and prove it is neither flagged nor omitted from the mislabelled census. Do not treat the current upper bound as `REACHABLE`.",
+    "severity": "major",
+    "title": "Reachability omits the registry provenance gate"
+   }
+  ],
+  "progress": null,
+  "summary": "The new reachability predicate is only a syntactic upper bound, not the worker's actual admission predicate. The code itself states that the registry additionally requires a provenance record, but a syntactically eligible PR is nevertheless labelled as awaiting review without proving that record exists. That preserves the same labelled-but-unreviewable backlog class this PR claims to eliminate, and the alarm uses the same incomplete predicate so it will not detect those cases.",
+  "verdict": "request_changes"
+ }
+}
