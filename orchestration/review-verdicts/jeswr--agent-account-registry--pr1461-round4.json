@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1461,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c3d0356db5b7b0c662dbffe0a8cc9a97ed48d009",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`live_park_clearable` authorizes from a point-in-time timeline read, but `_apply_cli` later calls `apply_decision`, which sends `needs:area` to the ordinary unconditional removal path. Neither the issue revision nor the latest application event is revalidated at the mutation seam. If a maintainer removes and re-applies `needs:area` after the timeline read but before `edit`, the sweep deletes that newer human hold. The post-condition only checks resulting labels/role consistency and therefore neither detects the provenance change nor restores the hold. The new end-to-end tests use a static timeline and do not exercise ownership changing at the edit seam.",
+    "file": "scripts/retriage.py",
+    "fix_hint": "Bind the delete to the evidence that authorized it. Immediately before mutation, re-read and compare the live revision and latest application event; refuse the delete if either changed. Because GitHub label edits are not atomic CAS operations, verify timeline/revision again after the write and restore `needs:area` while returning failure if a newer proven-human application raced the removal. Add an end-to-end seam test that changes ownership from bot-applied to human-applied between planning and edit, asserting the human hold remains and the run fails closed.",
+    "severity": "major",
+    "title": "Ownership proof is still not bound to the label deletion"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 major remains unresolved. The code still proves ownership while planning, then passes an unconditional label removal to the shared applier without binding that mutation to the timeline/revision that authorized it. A remove-and-reapply race can therefore replace the machine-owned `needs:area` with a human-owned hold between the ownership read and edit, and the sweep will delete the newer hold. The post-write check verifies label/role state, not ownership provenance, so it cannot detect or repair that violation. No new diff-supported finding is added; progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
