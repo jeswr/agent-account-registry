@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1658,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "bf95f925a5582d592e9d52642eea75a9829707f6",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`minted_resolves` proves only that some workflow step has the referenced ID. It does not prove that this step uses the pinned `actions/create-github-app-token`, targets `sparq-org/sparq`, or requests `permission-actions: write`. For example, replacing the mint step with a same-ID no-op (or changing its owner/repository/permission) leaves the new four-tuple exactly equal to the expected value, yet the dispatch cannot obtain the cross-repository actions:write credential. Thus the row's claim that the leg runs on a minted App token is not supported by the evidence path, and the critical producer-to-consumer transition remains deletable/redirectable without a red test.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Parse the referenced producer step and assert its relevant top-level/action configuration independently: exact SHA-pinned create-github-app-token `uses`, `owner: sparq-org`, `repositories: sparq`, and `permission-actions: write` (plus the expected secret inputs if those are part of the contract). Add non-crashing negative fixtures or mutations for a same-ID non-mint step and for redirected/removed permission so each makes a named row fail while the total check count remains unchanged.",
+    "severity": "major",
+    "title": "The App-token producer is only checked for ID existence"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new seam check correctly pins the dispatch step's `if:` and `GH_TOKEN` expressions by equality and exercises the extractor's nesting/duplicate behavior. However, its advertised App-token guarantee stops at resolving an arbitrary step ID. The producer can cease minting the required cross-repository, actions:write token while every new row remains green, leaving the fallback silently dead. Because this is the evidence path for the marquee control and the missed mutations are production-breaking, changes are required.",
+  "verdict": "request_changes"
+ }
+}
