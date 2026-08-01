@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5649,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "be240715275510728bee1f956ede93144e94aa42",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete on diff-scoped review. Collection identity is retained independently from request membership evidence; positive allow heads expand only to evidenced members, while collection-valued denies, carve-outs, and zero-evidence allows take the one-shot path. The tests exercise both emitted graph shape and the real PodStore enforcement path, including zero-edge and policy-stated membership cases, and are not vacuous. I found no correctness, soundness, security, or test-validity issue. Progress is stagnant because round 3 already had zero findings and this round likewise has none. Targeted tests could not be rerun because cargo is unavailable in the checkout environment.",
+  "verdict": "approve"
+ }
+}
