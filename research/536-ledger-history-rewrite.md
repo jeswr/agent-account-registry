@@ -176,12 +176,45 @@ and can start at any moment while `dispatch.yml` is live.
 > no shipped mechanism that quiesces the 17; the operator disables them individually, or a small
 > script is written for it first (follow-up filed).
 
-**Q. Quiesce.** `gh workflow disable` each of the 17, then **assert** each reports
+**Q. Quiesce — in two parts, both fail-closed.** A run that was admitted before the disable landed
+and PUTs during the rewrite is the one race that silently loses data, and `disable` does not close
+it: **disabling stops NEW runs; it cancels nothing already admitted.**
+
+*Q1 — disable and assert.* `gh workflow disable` each of the 17, then **assert** each reports
 `disabled_manually` via `gh api repos/{repo}/actions/workflows/{wf} --jq .state` — the assert-don't-assume
 pattern `migrate-secrets.sh:443-453` already shipped for the same class of race (#328: `gh workflow
 disable` resolves against **active** workflows only, so a no-op selector miss looks like success).
-Then wait out the longest in-flight worker lease TTL and confirm no queued runs remain. A run that
-starts before the disable lands and PUTs during the rewrite is the one race that silently loses data.
+
+*Q2 — drain.* Q1 alone is not quiescence. **Do not substitute a lease-TTL wait for a drain**: the
+lease TTL bounds how long a *claim* stays valid, not how long a *run* executes. And `make_lease`
+(`select-and-claim.py:694`) is the **only** lease constructor in `scripts/`, so most of the 17 —
+`groom`, `metrics`, `dashboard`, `model-health`, `pat-validity`, the provenance minters — hold no
+lease at all, and their runtime is unbounded by any TTL. Nor is "no queued runs" sufficient:
+`queued` is one of **five** non-terminal statuses, and an `in_progress` job is precisely the one that
+can PUT after the pre-push verification.
+
+The check this needs already ships, for this exact hazard, in the writer set's sibling migration:
+`drain_check_no_live_writers` (`migrate-secrets.sh:487-500`) with `NONTERMINAL_FILTER`
+(`:422`). Reuse it verbatim, over the 17 instead of the four —
+
+- **one unfiltered `gh run list --all -R {repo} --workflow {wf} --limit 1000 --json status,databaseId`
+  snapshot per workflow**, with `queued | in_progress | requested | waiting | pending` filtered
+  **client-side** from that single snapshot. Not a per-status query loop: five queries read five
+  different instants, and a run advancing `requested → queued` between them is missed by all five
+  (that is round-8 finding 2 on `migrate-secrets.sh`, already paid for once).
+- `--all` is **load-bearing** — gh's name-based `--workflow` lookup excludes *disabled* workflows,
+  which after Q1 is all 17.
+- **Require zero across all 17**, and fail closed on anything else: a listing that errors, a count
+  that does not parse, or any non-zero count aborts the window. Poll until the invariant holds or
+  abandon and re-schedule; **never** proceed on a timeout.
+
+If the operator instead **cancels** in-flight runs (`gh run cancel`) to shorten the wait, that is a
+request, not a stop: cancellation is only complete once the run reaches a terminal status, so the
+same Q2 snapshot is still the proof. Cancel, then drain; do not cancel *instead of* draining.
+
+Q2's zero is a statement about one instant, and Q1 is what keeps it true afterwards — disabled
+workflows admit no new runs, so no writer can execute between the drain and the push. Step P's
+lease re-check is the belt to that braces.
 
 **B. Back up.** Push the current tip to a durable ref (`git push origin origin/ledger:refs/heads/ledger-pre-536`)
 **before** touching anything. It defeats the point of the purge to keep it forever — but it is the
@@ -205,10 +238,21 @@ they are clean, and rewriting them only risks the record stores that `groom` rea
 
 **V. Verify** — §6, on the rewritten mirror, **before** the push.
 
-**P. Push.** `git push --force-with-lease=refs/heads/ledger:<recorded tip sha> origin ledger`.
+**P. Push.** Immediately before pushing, **re-fetch `origin/ledger` and confirm the tip is still the
+SHA recorded at step B**; if it moved, a writer survived Q2 — abort, resume, and re-run the window
+from Q. Then `git push --force-with-lease=refs/heads/ledger:<that recorded tip sha> origin ledger`.
 Plain `--force` is wrong here for the ordinary reason (`resolve-conflicts.py:973` uses the lease form
 for the same reason): if a writer slipped past step Q, the lease fails and the ledger is not
 silently truncated.
+
+Be exact about what the lease covers, because it is narrower than it looks: `--force-with-lease`
+compares the remote ref against the recorded SHA **at the moment the push is served**. It rejects a
+write that landed *before* the push; it cannot stop a surviving job that PUTs *after* it — that
+write simply lands on the rewritten branch as a normal fast-forward commit, and if it carries a
+pre-#212 lease row it reintroduces the exposure. **Q2's zero, held open by Q1's disable, is the only
+thing that excludes that case**; the lease is a second line, not the defence. Step C's post-checks
+run before any `enable`, so a tip that has advanced past the pushed SHA when C runs is the detection
+of last resort.
 
 **C. Post-checks, before resuming anything.**
 - `python3 scripts/ledger-invariant.py` against a fresh checkout of the rewritten branch — the
@@ -299,5 +343,7 @@ The reasoning, stated so it can be argued with:
   trust-plane change. The rewrite mechanics and the §6 check both need review before anyone arms
   them; nothing here should be read as a security sign-off.
 - **Any timing claim.** No wall-clock figures appear above by design: the window's length is
-  dominated by the longest in-flight lease TTL and by GitHub's own force-push and GC behaviour,
-  neither of which is measurable from a work box.
+  dominated by how long step Q2's drain takes to reach zero — i.e. by the longest *in-flight writer
+  run*, which no lease TTL bounds — and by GitHub's own force-push and GC behaviour. Neither is
+  measurable from a work box, which is also why Q2 polls an invariant rather than sleeping a
+  duration.
