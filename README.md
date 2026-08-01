@@ -305,16 +305,16 @@ a rolling `data/cache-affinity.json`), never in the public repos.
   Security `match_labels` routes are exempt on both sides: an implementor preference must never
   re-order a soundness chain. Verify a target with
   `python3 scripts/cross-resolver-agreement.py --target-root <checkout>`, which drives **both**
-  resolvers over a 22-row label matrix and reports any row they decide differently.
+  resolvers over a 25-row label matrix and reports any row they decide differently.
   Live instance: the maintainer's 2026-07-26 `area:gui` carve-out (sparq PR #4211).
 
 - **Whether a persona may run a MUTATING lane is DECLARED, never inferred from its name** (#285).
   `review-fix.yml`'s fix lane runs the model under the persona the source issue's own route names,
   so a docs/CI PR is fixed under the brief it was implemented under rather than the general
-  implementer's. But a route may name a **verdict-only** persona — this repo's security override
-  routes to `registry-reviewer`, whose brief is read-only and says its job is "never a fix" —
-  and handing that brief to a fixer instructs it not to edit the PR at all. So adoption is gated
-  on a capability the target declares beside its routes:
+  implementer's. But a route may name a **verdict-only** persona — `registry-reviewer`, whose brief
+  is read-only and says its job is "never a fix" — and handing that brief to a fixer instructs it
+  not to edit the PR at all. So adoption is gated on a capability the target declares beside its
+  routes:
 
   ```toml
   [agents.registry-impl]
@@ -333,6 +333,35 @@ a rolling `data/cache-affinity.json`), never in the public repos.
   exactly as it did before this existed, while one that has it cannot reach the fixer through
   silence. `dispatch-claim.py`'s self-test pins each declaration against the brief
   `worker-live.sh` actually loads.
+
+- **A security override supplies the POSTURE; the role row supplies the PERSONA** (#1397).
+  `match_labels` overrides win over role routes by design, and on this repo the keywords
+  (`worker`, `dispatch`, `review-loop`, `groom`, `set-up-account`, `security`, …) match the
+  surfaces most in need of *implementation*. With the override also naming `registry-reviewer`,
+  every **implementation** run on a trust-surface issue was dispatched with a system prompt telling
+  the model not to write code (`worker.yml` resolves `WORKER_AGENT` from exactly this field): a
+  compliant model produces no diff, and a model that implements anyway does so with none of the
+  implementer obligations that brief carries. An override may therefore declare
+
+  ```toml
+  [[route]]
+  match_labels = ["dispatch", "worker", "review-loop", "groom", "security"]   # abridged
+  model_chain  = ["opus5"]
+  agent = "registry-reviewer"   # the ROLELESS fallback — no role row to direct from
+  agent_from_role = true        # a routed issue's persona comes from its own role = "<role>" row
+  escalate = true
+  ```
+
+  so `{role:impl, area:review-loop}` resolves `registry-impl` while `role:review` still resolves
+  `registry-reviewer`. **Only the persona moves**: the `model_chain`, `escalate` and the
+  `match_labels` keyword union the arm-side classifier reads are returned exactly as declared, so
+  the soundness tier, `escalate_starved` and the human-arm on trust-surface PRs are unchanged. It
+  is opt-in **data** implemented by *both* resolvers (a redirect only one side implements is a
+  permanent `route-policy-failed` defer), anything but the boolean `true` fails closed, and it is
+  rejected outright on a role route or in `[defaults]` where it would be inert. Backing it up,
+  `worker.yml` passes `policy-resolve.py --require-fix-capable`: that lane always mutates the
+  checkout, so a persona the target does not declare `fix_capable = true` fails the resolve job
+  closed instead of burning a worker slot on a model told not to edit.
 
 ## Adding an account — step-by-step runbook (an agent can follow this verbatim)
 

@@ -119,10 +119,19 @@ DISPATCHER_OWNED_STATUS = frozenset({
 # `match_labels` security rule is evaluated before ANY role route. The security rule's keyword list
 # is IDENTICAL to SEC_KEYWORDS below (asserted by the self-test), so every issue this branch fires
 # on is — by construction — matched by the Phase-1 security override and routed to
-# model_chain ["opus5"] / agent registry-reviewer / escalate=true, and its eventual PR is
+# model_chain ["opus5"] / escalate=true, and its eventual PR is
 # HUMAN-armed (worker-pr.py / dispatch-claim.py read the same match_labels keywords). The role
-# label's own chain is NEVER consulted for these issues, so the role label only has to (a) exist
+# label's own CHAIN is NEVER consulted for these issues, so the role label only has to (a) exist
 # and (b) be a configured role route so route-resolve does not raise UnknownRoleError.
+#
+# [#1397] Its AGENT now IS consulted: the security override declares `agent_from_role = true`, so
+# the persona (which `.claude/agents/<agent>.md` brief worker.yml hands the model) comes from the
+# derived role's row while the chain/escalate stay the override's. That STRENGTHENS the interim
+# value rather than weakening the posture — `impl` was already the honest description of this work,
+# and the persona it now selects is the implementer instead of a verdict-only brief that told the
+# model not to write code. It does add a (c) to the list above: the derived role's route must name
+# a persona whose brief authorises editing, which the worker enforces fail-closed
+# (`policy-resolve --require-fix-capable`) rather than assuming.
 #
 # THE ARGUMENT IS ONLY TRUE IF *EVERY* PRODUCER OF THIS CONSTANT IS PHASE-1 MATCHED — PR #595
 # review finding 1 found a producer that was NOT. `ROLE_BY_KIND["security"]` mapped `kind:security`
@@ -1705,7 +1714,13 @@ def _self_test():
     policy_resolve = load_sibling("policy-resolve.py", "registry_policy_resolve")
     policy_doc = tomllib.load(open(os.path.join(root, "policy/repos.toml"), "rb"))
     SELF_REPO = "jeswr/agent-account-registry"
-    SOUNDNESS = (["opus5"], "registry-reviewer", True)
+    # The SOUNDNESS POSTURE a Phase-1 match must produce: the pinned soundness chain and the human
+    # escalation. [#1397] The AGENT is the `role = "impl"` implementer, not the verdict-only
+    # reviewer, because the security override declares `agent_from_role = true` — the posture
+    # (chain, escalate, and the arm-side keyword union that human-arms the eventual PR) is the
+    # override's and is unchanged; only the BRIEF the worker loads follows the derived role. Every
+    # label set below derives TRUST_PLANE_ROLE, so `registry-impl` here IS the trust-plane persona.
+    SOUNDNESS = (["opus5"], "registry-impl", True)
 
     def resolved(labels):
         """(derived role, route-resolve verdict, policy-resolve verdict) for a POST-TRIAGE label

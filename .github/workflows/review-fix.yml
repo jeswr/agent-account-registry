@@ -658,10 +658,13 @@ jobs:
           # fixing. worker-live.sh resolves it to `.claude/agents/<agent>.md` in the target.
           #
           # ADOPTION IS CAPABILITY-GATED, NOT NAME-GATED ([#285] review r2). A `[[route]]` may
-          # name a VERDICT-ONLY persona: on THIS repo the security override
-          # (`review-loop`/`dispatch`/`worker`/...) routes to `registry-reviewer`, whose checked-in
+          # name a VERDICT-ONLY persona — on THIS repo `registry-reviewer`, whose checked-in
           # brief is read-only (Read/Glob/Grep), mutates nothing but `.review-verdict.json` and
-          # says its job is "never a fix". Handing THAT brief to the `worker-live.sh fix` step
+          # says its job is "never a fix". ([#1397] The security override
+          # (`review-loop`/`dispatch`/`worker`/...) used to hand that persona to every trust-surface
+          # lane; it now declares `agent_from_role = true`, so a routed issue's persona comes from
+          # its own role row and only a ROLELESS one still reads the reviewer. The gate below does
+          # not depend on which route names what.) Handing a verdict-only brief to `worker-live.sh fix`
           # instructs the fixer not to edit the PR at all: a compliant model produces no diff and a
           # model that does edit is violating its own system prompt.
           #

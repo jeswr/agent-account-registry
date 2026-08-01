@@ -200,11 +200,17 @@ def _self_test():
 
     # a TRUST-SURFACE issue (area:worker) -> opus5-led (opus tail fallback, 2026-07-24) +
     # escalate (security override beats role).
+    #
+    # [#1397] The PERSONA, though, comes from the `role = "impl"` row: the override declares
+    # `agent_from_role = true`, so a trust-surface IMPLEMENTATION row is planned with the
+    # implementer's brief instead of the verdict-only reviewer's (which told the model not to write
+    # code). The chain and `escalate` — the soundness posture CLAIM compares for exact equality —
+    # are the override's, unchanged.
     sec = compute_ready([iss(2, R + ["priority:P0", "role:impl", "area:worker"])])
     row = plan_dispatch(sec, doc)[0]
     chk("worker -> opus5 only", row["model_chain"], ["opus5"])
-    chk("worker -> reviewer/escalate", (row["agent"], row["escalate"]),
-        ("registry-reviewer", True))
+    chk("worker -> implementer persona on the soundness chain/escalate",
+        (row["agent"], row["escalate"]), ("registry-impl", True))
     chk("worker role stays declared", row["role"], "impl")
 
     # a docs issue -> its route (haiku-led).

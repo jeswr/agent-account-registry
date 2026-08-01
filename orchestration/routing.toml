@@ -152,6 +152,34 @@ agent = "registry-impl"
 # where BOTH resolvers and the arm-side classifier read it. triage.py's SEC_KEYWORDS must stay
 # IDENTICAL to this list — its self-test asserts the equality and enumerates every trust-plane
 # kind, so dropping this keyword turns the enrolled suite red.
+#
+# [#1397] `agent_from_role = true` — THIS OVERRIDE SUPPLIES THE POSTURE, THE ROLE ROW SUPPLIES THE
+# PERSONA. Everything above stays exactly as it was: the keyword list, `model_chain = ["opus5"]`
+# and `escalate = true` are what the arm-side classifier, `escalate_starved` and the soundness tier
+# read, and none of them move. What moves is the ONE field that decides which
+# `.claude/agents/<agent>.md` brief worker.yml hands the model.
+#
+# THE DEFECT IT FIXES. This override wins over the role row by design, so an IMPLEMENTATION issue
+# on any trust surface (`area:worker`, `area:dispatch`, `area:review-loop`, `area:groom`,
+# `area:set-up-account`, `kind:security`, ...) resolved `agent = "registry-reviewer"` — a
+# VERDICT-ONLY persona whose checked-in brief gives it Read/Glob/Grep, requires a byte-identical
+# tree, permits writing only `.review-verdict.json` and states "your job is a single honest
+# verdict, never a fix". worker.yml threads `steps.policy.outputs.agent` -> `WORKER_AGENT` ->
+# `worker-live.sh --append-system-prompt-file .claude/agents/$WORKER_AGENT.md`, so the trust-plane
+# issues this repo most needs implemented were the ones dispatched with a system prompt telling the
+# model not to write code: a compliant model produces no diff ("model produced no repository
+# changes"), and a model that does implement is acting against its own system prompt — without the
+# implementer obligations that brief does not carry (fail-closed posture, non-vacuous self-tests,
+# the followups file, the draft-PR contract).
+#
+# WHAT IT RESOLVES TO NOW. `{role:impl, area:review-loop}` -> ["opus5"] / registry-impl / escalate,
+# while `role:review` still resolves `registry-reviewer` through the `role = "review"` row below.
+# The redirect needs a role row to direct FROM, so a ROLELESS trust-surface issue keeps the
+# `agent = "registry-reviewer"` declared here (unchanged, and the worker refuses to run a lane it
+# cannot implement — see `policy-resolve --require-fix-capable`).
+#
+# The agent named here is therefore the ROLELESS fallback, not the persona a routed issue gets. It
+# must stay declared in [agents] above like every other routed persona.
 [[route]]
 match_labels = [
   "dispatch", "worker", "set-up-account", "review-loop", "groom",
@@ -159,6 +187,7 @@ match_labels = [
 ]
 model_chain = ["opus5"]
 agent = "registry-reviewer"
+agent_from_role = true
 escalate = true
 
 # ---------------------------------------------------------------------------------------------------
