@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5241,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "95aec930700549007de584f037956a3a71d2cc5d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`new_crate(added)` returns the first matching manifest, `build_context` creates one global `{crate}` value, and each rule is evaluated only once. Therefore a merged PR that adds two public `crates/*/Cargo.toml` files produces the three follow-ons for only the first crate; the second crate's website, guide, and test-method work is silently lost. This is inconsistent with `gate-new-crate.py::added_crates`, which deliberately returns every newly added crate, and the added tests do not exercise this valid input shape. The global `unless_paths` suppression also cannot associate an artifact with the particular new crate when more than one is added.",
+    "file": "scripts/flow-on.py",
+    "fix_hint": "Evaluate `when_new_crate_public` rules once per added public crate (using the shared G1 `added_crates` detector or an equivalent list), build a crate-specific context for each result, and make suppression crate-aware where the artifact path permits it. Add a regression test that adds at least two public crate manifests and asserts distinct site, guide, and test-method follow-ons and dedup keys for both crates, including the case where only one crate's follow-on artifact is supplied.",
+    "severity": "major",
+    "title": "Only the first new public crate receives follow-on issues"
+   }
+  ],
+  "progress": null,
+  "summary": "The new rules work for the single-crate cases covered by the tests, but the implementation silently handles only the first newly added crate. Since the existing G1 detector explicitly supports multiple added crates, a PR adding two public crates would mint follow-ons for only one and leave the other untracked. This is a completeness defect in the automation and needs a per-crate evaluation model plus a multi-crate regression test.",
+  "verdict": "request_changes"
+ }
+}
