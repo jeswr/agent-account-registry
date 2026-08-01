@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5461,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8678db2d6441c65b8c1089c3ed6f011a5b8d5243",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "lane_reachability() checks head ref, head repository, and bot authorship, then returns REACHABLE. Its own docstring says registry admission additionally requires a provenance record that can only narrow the population. Consequently a worker-shaped same-repo bot PR without that record is still flagged as review:unreviewed even though the worker cannot enumerate it. scripts/review_lane_alarm.py shares this incomplete predicate, so mislabelled-unreviewed also misses the same residual class. This is materially the same correctness gap reported in round 1.",
+    "file": "scripts/verdict-bridge.py",
+    "fix_hint": "Require an authoritative registry-produced signal that includes provenance admission before returning REACHABLE or applying review:unreviewed, or use a label/flow that does not claim enrollment until registry confirmation. Add a real-path test for a syntactically eligible same-repo bot PR with no provenance record, proving it is not flagged and remains visible in the residual census. An acknowledged upper bound must not be named or treated as REACHABLE.",
+    "severity": "major",
+    "title": "Reachability still omits the registry provenance admission gate"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 does not resolve the prior major finding. The new predicate exactly mirrors three syntactic author-side gates, but the diff explicitly states that the registry additionally requires a provenance record. Despite acknowledging that missing admission condition, lane_reachability() still returns REACHABLE and decide() still applies review:unreviewed. The alarm uses the same upper-bound predicate, so it also cannot census worker-shaped bot PRs that lack registry provenance. The claimed positive proof of worker reachability therefore remains incomplete.",
+  "verdict": "request_changes"
+ }
+}
