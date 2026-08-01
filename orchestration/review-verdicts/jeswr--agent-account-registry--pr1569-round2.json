@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1569,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "54832f82a8e0866228f9d720f82556bc368c115d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains correct and complete for the queue-normalization failure mode. Every malformed present container or row is still tolerated and dropped, but now emits a reason-specific diagnostic; valid rows remain unchanged and silent. The only input value echoed is a class string passed through the existing printable, 16-character-bounded sanitizer, while other diagnostics expose only fixed field text and safe built-in type names from the JSON-shaped input. The tests use independent literal expectations and non-vacuously cover the integer-class regression, malformed/null/missing inputs, valid silence, continued publication after total queue loss, reason specificity, and newline/oversize log-injection cases. No trust check is weakened, no reviewer-directed instruction appears in the diff, and no new issue is supported relative to the prior approved round.",
+  "verdict": "approve"
+ }
+}
