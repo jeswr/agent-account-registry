@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5409,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "88acdce97ace4863ebd2e7150c5f7232a4b4cc68",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The round-3 defect remains in read_varint. At i == 9, payload.checked_shl(63) returns Some because 63 is a valid shift count, even when payload > 1; the excess significant bits are discarded. A terminal tenth byte such as 0x02 can therefore be accepted and normalized to a smaller u64, contradicting the documented rejection of values wider than 64 bits and the fail-closed lookup_multihash contract. No test exercises this boundary.",
+    "file": "crates/sparq-vectors/src/external_key.rs",
+    "fix_hint": "Before combining byte ten, reject i == 9 when payload > 1, or use checked arithmetic that detects value overflow rather than merely an invalid shift count. Add tests for the maximal valid u64 varint and invalid terminal tenth-byte payloads such as 0x02 and 0x7f, including a parse_multihash or lookup_multihash assertion proving the public path rejects them.",
+    "severity": "major",
+    "title": "Ten-byte varints still overflow u64 and decode as another value"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is stagnant: the same major fail-closed varint overflow remains. On the tenth byte, checked_shl(63) checks only that the shift count is valid; it does not detect payload bits discarded above bit 63. Thus a terminal payload greater than 1 can be accepted and normalized to another u64 value. The tests still do not cover the maximal valid ten-byte u64 encoding or invalid tenth-byte payloads through parse_multihash/lookup_multihash.",
+  "verdict": "request_changes"
+ }
+}
