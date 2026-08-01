@@ -197,9 +197,12 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           MAINTAINER_HANDLE: jeswr
           # Privacy routing (locked decision 22c, issue #39): scripts/metrics-alert.py routes to a
-          # maintainer-set PRIVATE ALERT_REPO only when ALERT_TOKEN can write there; otherwise the
+          # maintainer-set PRIVATE ALERT_REPO only when ALERT_TOKEN is PRESENT; otherwise the
           # registry repo under the ambient token. The body carries NO account handles (it reports
           # only the metrics job RESULT + run link), so that fallback is safe.
+          # #1021: presence is the WHOLE test here — this router does not probe the token's write
+          # capability at ALERT_REPO and does not verify that ALERT_REPO is private (unlike the
+          # #432/#436 hardened router in usage-alert.py). Do not describe it as if it did.
           ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
         run: |

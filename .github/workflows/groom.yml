@@ -748,9 +748,13 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           MAINTAINER_HANDLE: jeswr
           # Privacy routing (locked decision 22c, issue #39): scripts/groom-alert.py routes to a
-          # maintainer-set PRIVATE ALERT_REPO only when ALERT_TOKEN can write there; otherwise the
-          # registry repo under the ambient token. The body carries NO account handles (it reports
-          # only the groom job RESULT + run link), so that fallback is safe.
+          # maintainer-set PRIVATE ALERT_REPO only when ALERT_TOKEN is PRESENT, ALERT_REPO differs
+          # from this registry, and that destination is CONFIRMED private by a live GET /repos read
+          # (#432 r1 / #436); otherwise the registry repo under the ambient token. The body carries
+          # NO account handles (it reports only the groom job RESULT + run link), so that fallback
+          # is safe.
+          # #1021: presence and VISIBILITY are what is checked. The token's write capability at
+          # ALERT_REPO is never probed, so this comment must not say that it is.
           ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
         run: |

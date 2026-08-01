@@ -9,7 +9,7 @@
 # upserts/auto-closes a rolling `ops-alert` issue.
 #
 # Mirrors plan-alert.py (issue #38) / usage-alert.py (issue #39) hardening exactly:
-#  - _alert_route: the private ALERT_REPO is the destination ONLY when ALERT_TOKEN can write there
+#  - _alert_route: the private ALERT_REPO is the destination ONLY when ALERT_TOKEN is PRESENT
 #    AND that destination is POSITIVELY VERIFIED private (issue #436, matching the #432 round-1
 #    hardening of usage-alert/model-health/pat-validity); a half-configured deployment (repo set,
 #    token missing), a same-repo misconfiguration, or an unverifiable destination falls back to the
@@ -28,6 +28,7 @@
 #    uncaught JSONDecodeError crashing the alert; the next scheduled tick retries.
 #
 # Pure decide()/_alert_route() + a stubbed-gh flow test run under --self-test (registry-selftest).
+import ast
 import json
 import os
 import subprocess
@@ -192,6 +193,100 @@ def main():
     return 0
 
 
+def _test_alert_route_contract(chk):
+    """#1021: the router's PROSE must not promise more than the router ENFORCES, and this module
+    must carry exactly ONE copy of the router.
+
+    What `_alert_route` tests of ALERT_TOKEN is its TRUTHINESS. The token is then used to READ
+    `GET /repos/{ALERT_REPO}` — which establishes the destination's VISIBILITY (#432 r1 / #436),
+    not the token's ability to write an issue there. So a comment saying the private destination is
+    selected only once the token has been shown able to write there states a strictly stronger
+    contract than the code enforces. #1021 found that one sentence copied verbatim across six alert
+    scripts, where any single copy could drift back while the suite stayed green on the others —
+    the #945 mutually-masking-duplicate shape applied to prose.
+
+    The prose census scans this module with THIS FUNCTION'S OWN LINES REMOVED, so the banned
+    phrases and the detector fixtures can be written literally below without the census matching
+    itself; that exclusion is derived from the parsed AST, and its own row reds if it cannot find
+    this function. Every row below is independently killable: blunt the claim detector so it cannot
+    fire, widen it so it fires on unrelated prose, paste a second router into this file,
+    reintroduce the claim anywhere outside this function, add a real capability probe to the
+    router, or drop the token half of the router's guard."""
+    def claims_about_the_route(text):
+        """Every write-capability claim `text` makes ABOUT THE ALERT ROUTE, deduped and sorted.
+
+        `text` is flattened to one whitespace-collapsed lowercase string first, so a claim broken
+        across a wrapped comment or docstring line is still found; a hit then counts only when
+        ALERT_TOKEN is named within the preceding 160 characters (~two wrapped lines). BOTH
+        directions of that scoping were measured while writing this. Unscoped, the detector
+        flagged groom-mint-alert.py's unrelated "anyone with write access" note about
+        workflow_dispatch triggers — a false positive. Scoped, it still caught usage-alert.py's
+        rendered maintainer hint, which told the operator the private route needs a token that
+        could write to the destination — a true one, fixed in the same change."""
+        flat = " ".join(text.lower().split())
+        found = []
+        for claim in ("can write there", "can write to", "write access", "able to write",
+                      "may write there"):
+            cursor = flat.find(claim)
+            while cursor != -1:
+                if "alert_token" in flat[max(0, cursor - 160):cursor]:
+                    found.append(claim)
+                cursor = flat.find(claim, cursor + 1)
+        return sorted(set(found))
+
+    # VALIDATE THE DETECTOR BEFORE TRUSTING ITS SILENCE. On a clean tree every `find` returns -1,
+    # so without these two fixtures the whole scoping loop above never executes even once and the
+    # census below reports `[]` whatever it is pointed at — an instrument that cannot fire has
+    # said nothing (AGENTS.md AUTHOR pre-flight #1, which is how this hole was found).
+    chk("#1021: the claim detector FIRES on route prose that makes the claim, including when the "
+        "claim wraps onto the line after ALERT_TOKEN",
+        claims_about_the_route("the private ALERT_REPO is the destination\n"
+                               "ONLY when ALERT_TOKEN\ncan write there; otherwise "
+                               "the registry"),
+        ["can write there"])
+    chk("#1021: ... and stays SILENT on a write-capability sentence about something that is not "
+        "the route",
+        claims_about_the_route("workflow_dispatch can be run from any ref by anyone with write "
+                               "access, so it is excluded from the tick allowlist"), [])
+    source = open(__file__, encoding="utf-8").read()
+    definitions = [node for node in ast.walk(ast.parse(source))
+                   if isinstance(node, ast.FunctionDef)]
+    chk("#1021: exactly ONE _alert_route definition in this module (a second copy makes each "
+        "copy individually unkillable)",
+        len([node for node in definitions if node.name == "_alert_route"]), 1)
+    census = [node for node in definitions if node.name == "_test_alert_route_contract"]
+    chk("#1021: the prose census can locate its own body to exclude it from the scan",
+        len(census), 1)
+    # The scan excludes THIS function's own lines — derived from the parsed AST, not hard-coded —
+    # so the banned phrases and the fixtures above can be written literally without self-matching.
+    lines = source.splitlines()
+    scanned = "\n".join(lines[:census[0].lineno - 1] + lines[census[0].end_lineno:])
+    # The verdict is pinned TOGETHER WITH two properties of the text it was measured on, because
+    # `[]` is also what an empty input returns: a census pointed at nothing would otherwise read
+    # exactly like a clean module (AGENTS.md pre-flight #3's conditionally-inert mutant, which
+    # survived the first version of this row). `def _alert_route(` proves the scan covered the
+    # module; the ABSENCE of this function's own nested helper name proves the exclusion really
+    # removed this function and not some other span.
+    chk("#1021: no write-CAPABILITY claim survives in this module's alert-route prose, measured "
+        "over a scan that demonstrably covers the router and excludes only this function",
+        (claims_about_the_route(scanned), "def _alert_route(" in scanned,
+         "claims_about_the_route" in scanned),
+        ([], True, False))
+    # Behavioural statement of the contract the prose is now allowed to make. These literals appear
+    # nowhere else in this harness, so a substituted value cannot collide with a fixture's.
+    chk("#1021: PRESENCE + CONFIRMED-private, not capability — a credential that obviously "
+        "cannot write anything still selects ALERT_REPO, exactly as a good one does",
+        _alert_route("org/priv-1021", "not-a-credential-1021", "org/reg-1021",
+                     confirmed_private=lambda r, t: True),
+        ("org/priv-1021", "not-a-credential-1021"))
+    probe_1021 = []
+    chk("#1021: ... and an EMPTY ALERT_TOKEN never does, with the visibility check left uncalled",
+        (_alert_route("org/priv-1021", "", "org/reg-1021",
+                      confirmed_private=lambda r, t: probe_1021.append(r) or True),
+         probe_1021),
+        (("org/reg-1021", None), []))
+
+
 def _self_test():
     ok = True
 
@@ -231,6 +326,8 @@ def _self_test():
     chk("route: no repo -> registry",
         _alert_route("", "tok", "org/registry",
                      confirmed_private=lambda r, t: True), ("org/registry", None))
+    # The router's PROSE must not outrun what the router ENFORCES (#1021).
+    _test_alert_route_contract(chk)
     # decide(): success-only closure (`skipped` must not close), upsert on hard fail
     chk("decide: failure -> upsert", decide("failure", False), "upsert")
     chk("decide: failure w/ open -> upsert", decide("failure", True), "upsert")
