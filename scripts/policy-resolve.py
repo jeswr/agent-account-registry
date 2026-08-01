@@ -937,8 +937,28 @@ agent = "docs-agent"
         (Path(__file__).resolve().parents[1] / "policy" / "repos.toml").read_text(encoding="utf-8"))
     _staged = [name for name, row in (_shipped.get("repos") or {}).items()
                if isinstance(row, dict) and not row.get("enabled")]
-    assert _staged, ("this guard must have at least one staged row to validate; if the policy ever "
-                     "has none, DELETE the guard rather than let it pass vacuously")
+    # ⚠️ The LIVE loop below may legitimately have nothing to do — every staged target eventually
+    # gets enabled. An earlier cut asserted `_staged` was non-empty, which made this guard BLOCK the
+    # very activation it exists to de-risk. But simply allowing an empty loop makes the guard
+    # vacuous the moment the policy has no staged rows, which is exactly the failure mode it was
+    # written against. So the two questions are SEPARATED: the FIXTURE below proves the validation
+    # LOGIC always (regardless of live policy), and the live loop applies that proven logic to
+    # whatever staged rows actually ship.
+    _fixture_repo = "example/staged-probe"
+    _fixture = {"repos": {_fixture_repo: {**_shipped["repos"][sorted(
+        n for n, r in _shipped["repos"].items() if isinstance(r, dict) and r.get("enabled"))[0]],
+        "enabled": False, "gate_profile": "definitely-not-a-profile"}}}
+    _fixture_probe = _copy.deepcopy(_fixture)
+    _fixture_probe["repos"][_fixture_repo]["enabled"] = True
+    try:
+        _policy_row(_fixture_repo, _fixture_probe)
+    except Exception as _fx:      # noqa: BLE001 — the message IS the assertion
+        check("the staged-row validation LOGIC rejects an unsatisfiable profile under enable",
+              "unknown gate_profile" in str(_fx), True)
+    else:
+        raise AssertionError(
+            "the staged-row validation logic did NOT reject a bogus gate_profile under `enabled = "
+            "true` — this guard cannot protect any staged row, live or future")
     # ⚠️ `_validated` is appended to ONLY after `_policy_row` RETURNS, and the check below compares
     # it against the independently-derived `_staged`. Round-2 review caught the first cut ending in
     # `check(..., sorted(_staged), sorted(_staged))` — a value compared with ITSELF, which stays
