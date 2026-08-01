@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1584,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "af022db52f535b8a5aafb451a98dee9157c13e9f",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`read_health_window` deliberately publishes `None` on an unreadable ledger, which becomes `worker_no_change_rate_1h: null`. `_worker_no_change_pred` returns false for that null, and `compute_recoveries` interprets `not any(pred(row) ...)` as confirmed clearance. Therefore, after `recover_snapshots` consecutive ledger-read failures, a collected target is eligible to auto-close its existing `worker-no-change` alert even though there is no evidence the condition cleared. The collection-token guard does not help because the target itself was collected successfully; only this auxiliary signal is absent. The current tests assert that null does not fire, but never assert that null does not recover, so this fail-open path remains uncovered.",
+    "file": "scripts/metrics.py",
+    "fix_hint": "Make recovery tri-state for this class: distinguish measurable-and-clear from unavailable. Require every recovery-window row to contain a numeric no-change rate (and the sample semantics needed by the predicate) before adding `WORKER_NO_CHANGE` to recoveries. Add a non-vacuous test starting from an existing alert/recovery candidate and show that two null-rate snapshots do not produce the `(target, WORKER_NO_CHANGE)` recovery key, while two measured healthy snapshots still do.",
+    "severity": "major",
+    "title": "Unreadable no-change telemetry can auto-close a live alert"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new no-change alert fires fail-closed on missing telemetry, but its recovery path does not: two unreadable-ledger snapshots are treated as two clear snapshots and can auto-close an existing alert. That contradicts the stated null-as-no-evidence contract and the reconciler's own requirement for confirmed recovery. Because round 3 had no findings and this is a new major finding, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
