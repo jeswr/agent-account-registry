@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1510,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b83ffa7ef358ab790ec2c66f30928eb7d3c8a2cf",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_assemble_opus5` still sets `answered = bool(hdr)`. `_parse_rate_headers` retains `anthropic-ratelimit-unified-status`, so a completed response containing only `status: allowed` makes `answered` true even though it contains no readable base-window utilization evidence. `_premium_window` then returns `None`, the persisted `known_window` is not re-declared, and healthy base headroom admits opus5. The new recovery test uses `base_only`, which includes both 5h and 7d utilization, and therefore does not exercise the decisive status-only shape identified in round 3.",
+    "file": "scripts/account-usage.py",
+    "fix_hint": "Only clear remembered premium-window state when the response contains explicitly defined, validated utilization evidence sufficient to be authoritative. Otherwise retain the known window without utilization so admission refuses. Add a cross-tick test whose next response contains only `anthropic-ratelimit-unified-status` and assert the known window survives and opus5 admission is false.",
+    "severity": "blocker",
+    "title": "Status-only responses still erase a proven bucket and fail open"
+   },
+   {
+    "body": "The persistence path still cannot represent an authoritative empty limits observation. `_limits_line` emits only truthy `LIMIT_KEYS`, and `persist_limits` skips an account when `_limits_line` returns `None`. Adding `opus5_premium_limit` to `LIMIT_KEYS` does not help when the authoritative response has utilization/status headers but no `*-limit` values: the old catalog line containing `opus5_premium_window` is never replaced, so the next tick reloads the stale window. The cross-tick helper still injects `5h_limit=10`, masking this production case.",
+    "file": "scripts/account-usage.py",
+    "fix_hint": "Persist an explicit cleared observation for a successfully and authoritatively probed opus5 account even when no other `LIMIT_KEYS` value remains, while continuing to distinguish an absent or failed usage entry. Add a three-tick production-path test: persist a discovered bucket; process an authoritative base-only response with no limit headers and verify the catalog token is removed; then fail the next probe and verify the stale window is not resurrected.",
+    "severity": "major",
+    "title": "Bucket removal still is not durable when no limit values remain"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRequest changes: both round-3 defects remain in the submitted diff. A status-only unified response is still treated as authoritative and clears a previously proven premium window, reopening admission without readable utilization. Even when disappearance is genuinely authoritative, a snapshot with no remaining persisted limit values still produces no replacement line, so the stale window remains in the catalog and is resurrected on the next failed probe. The added tests still omit these exact production shapes. Because the same blocker and major finding remain at the same severities, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
