@@ -149,9 +149,12 @@ The `worker_no_change_*` block (registry #987 / #466 AC3) is censused from
 `data/model-health.json` on this same branch, read through model-health's own validator. A health
 record carries no target repo, so a row is charged to a target through the ONLY link there is: its
 `run_id` is `<workflow run id>.<attempt>`, matched against the run ids of the worker runs already
-attributed to that target above. That keeps the census and its denominator over one population, so
-the rate can never exceed 1; a row whose run id is empty or belongs to another target is charged to
-NOBODY. An unreadable health ledger publishes `null` across the four fields — never a reassuring 0.
+attributed to that target above. A row whose run id is empty or belongs to another target is charged
+to NOBODY. The count is ONE VOTE PER RUN: the ledger retains every separately executed attempt of a
+full re-run (`123.1` and `123.2` are two real outcomes there), while the Actions list contributes
+one run object per run id, so the attempts fold — numerator and denominator stay over one
+population and the rate can never exceed 1. A folded run reports its LATEST attempt's reason and
+issue. An unreadable health ledger publishes `null` across the four fields — never a reassuring 0.
 
 The current snapshot is also CAS-written to `data/metrics.json` on the `ledger` branch (same
 per-target shape plus a top-level `alerts: [...]`). The sole Pages owner, `dashboard.yml`, copies it

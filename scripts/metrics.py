@@ -49,7 +49,8 @@
 #         "worker_success_rate_1h": float | null,
 #         # [#987] the NO-CHANGE gate, per target: how much of the fleet's work produced nothing.
 #         # All four are null when the model-health ledger yielded no attributable signal — never 0.
-#         "worker_no_change_1h": int | null,        # no_change health rows from THIS hour's runs
+#         "worker_no_change_1h": int | null,        # THIS hour's worker RUNS that produced no diff
+#                                                   # (one vote per run id: re-run attempts fold)
 #         "worker_no_change_rate_1h": float | null, # /worker_attempts_1h (0 attempts => null)
 #         "worker_no_change_by_reason_1h": {"<why_no_diff>": int, ...} | null,  # CLOSED vocabulary,
 #                                                   # every reason always present (zero rows included)
@@ -174,28 +175,47 @@ def no_change_census(records, run_ids):
     ATTRIBUTION. A health record carries no target repo, so it is charged to a target through the
     ONLY thing that links it to one: `run_id` is `<workflow run id>.<attempt>` (worker.yml's health
     step), and `run_ids` is the set of worker-run ids ALREADY attributed to this target by run-name
-    and windowed by conclusion time. Using that same set — rather than a second timestamp filter —
-    is what keeps `no_change <= worker_attempts_1h` true by construction, so the published rate can
-    never exceed 1. An UNATTRIBUTABLE row (empty/absent run_id, or one whose run is not this
-    target's) is charged to NOBODY: guessing a target here would invent wasted runs for a repo that
-    never had them.
+    and windowed by conclusion time — that same set, rather than a second timestamp filter. An
+    UNATTRIBUTABLE row (empty/absent run_id, or one whose run is not this target's) is charged to
+    NOBODY: guessing a target here would invent wasted runs for a repo that never had them.
+
+    ONE RUN, ONE VOTE. The census FOLDS to the base run id, so a run is counted at most once however
+    many of its attempts are on the ledger. The denominator counts RUN OBJECTS — the Actions list
+    returns one per run id whatever attempt it is on — while the ledger deliberately RETAINS each
+    separately EXECUTED attempt of a full re-run: `123.1` and `123.2` are two real outcomes there,
+    not a replay (model-health `_record_identity`). Counting both against a denominator of one would
+    publish a rate above 1 and could sustain `worker-no-change` off a single re-run; the fold is
+    what puts numerator and denominator over one population and keeps `no_change <=
+    worker_attempts_1h` true by construction. A run's REASON and ISSUE are taken from its LATEST
+    no-change attempt — the outcome it finally had — with ledger order breaking a tie an unparsable
+    attempt cannot rank; they are never summed across attempts, which would re-inflate the
+    repeat-offender list with a loop no issue actually took.
 
     The reason breakdown always carries EVERY reason in the vocabulary, including the zeroes — a
     census that omits its empty rows reads as "not measured" exactly when an operator needs "0"
-    (AGENTS pre-flight item 8). Repeat offenders are the issues with >= 2 no-change rows in the
-    window, newest-loudest first; the list is UNCAPPED on purpose (it is already bounded by the
+    (AGENTS pre-flight item 8). Repeat offenders are the issues with >= 2 no-change RUNS in the
+    window, loudest first; the list is UNCAPPED on purpose (it is already bounded by the
     ledger's own retention ceiling, and a silent top-N would hide the worst loopers)."""
-    counted = 0
     by_reason = {reason: 0 for reason in NO_CHANGE_REASONS}
     per_issue = {}
     wanted = {rid for rid in (run_ids or ()) if isinstance(rid, str) and rid}
-    for record in records or ():
+    latest = {}   # base run id -> (attempt ordering key, that attempt's record)
+    for position, record in enumerate(records or ()):
         if not isinstance(record, dict) or record.get("exit_class") != "no_change":
             continue
         run_id = record.get("run_id")
-        if not isinstance(run_id, str) or run_id.split(".", 1)[0] not in wanted:
+        if not isinstance(run_id, str):
             continue
-        counted += 1
+        base, _, attempt = run_id.partition(".")
+        if base not in wanted:
+            continue
+        # A higher attempt is a LATER execution of the same run. A missing/non-numeric attempt
+        # ranks lowest so a well-formed row always wins the fold, and ledger position breaks the
+        # remaining ties (the later-read row wins) rather than leaving the pick order-dependent.
+        key = (int(attempt) if attempt.isdigit() else -1, position)
+        if base not in latest or key > latest[base][0]:
+            latest[base] = (key, record)
+    for _key, record in latest.values():
         # The absent -> `unspecified` fold is no_change_routing's, called on the single row so the
         # breakdown can never drift from the routing decision the same field drives (#701).
         for reason in no_change_routing.declared_reasons([record]):
@@ -210,7 +230,7 @@ def no_change_census(records, run_ids):
     repeats = sorted(((issue, n) for issue, n in per_issue.items() if n > 1),
                      key=lambda pair: (-pair[1], pair[0]))
     return {
-        "worker_no_change_1h": counted,
+        "worker_no_change_1h": len(latest),
         "worker_no_change_by_reason_1h": by_reason,
         "worker_no_change_repeat_issues_1h": [{"issue": issue, "count": n} for issue, n in repeats],
     }
@@ -1646,8 +1666,9 @@ def _test_no_change_census(chk):
     no_change is a run that SUCCEEDS as a run, so `worker_success_rate_1h` reads healthy straight
     through it. These assertions pin (a) which ledger rows are charged to a target, (b) that a
     breakdown separating `already_done` (close the issue) from `underspecified` (get a human) is
-    published, (c) that no-signal publishes NULL rather than a reassuring zero, and (d) that moving
-    the ceiling flips the alert.
+    published, (c) that no-signal publishes NULL rather than a reassuring zero, (d) that moving the
+    ceiling flips the alert, and (e) that a re-run's RETAINED attempts fold to one run, so the
+    numerator can never outgrow the run-object denominator it is divided by.
     """
     import contextlib
     import io
@@ -1689,6 +1710,37 @@ def _test_no_change_census(chk):
     chk("an unattributable row is charged to NOBODY (it is not simply the other-target filter)",
         (wide["worker_no_change_1h"],
          wide["worker_no_change_by_reason_1h"]["too_large"]), (6, 1))
+    # THE RE-RUN FOLD. A full re-run re-EXECUTES the producing job under the SAME GITHUB_RUN_ID with
+    # a fresh attempt, and the ledger RETAINS both outcomes (neither is a replay — model-health
+    # `_record_identity`). The Actions list, though, hands _orchestration_lane_runs ONE run object
+    # for run 117, so a per-ROW numerator charges 2 against a denominator of 1: a rate above 1 off a
+    # single re-run, which can hold `worker-no-change` firing on its own.
+    rerun = no_change_census([_health_row("117.1", issue=808, why="underspecified"),
+                              _health_row("117.2", issue=808, why="already_done")], {"117"})
+    chk("two RETAINED attempts of ONE run id are one no-change run, not two",
+        rerun["worker_no_change_1h"], 1)
+    chk("...the reason is the LATEST attempt's, and the superseded attempt casts no second vote",
+        rerun["worker_no_change_by_reason_1h"],
+        {"unspecified": 0, "underspecified": 0, "blocked_on_decision": 0, "too_large": 0,
+         "already_done": 1, "other": 0})
+    chk("...and a re-run issue is NOT a repeat offender — that loop never happened",
+        rerun["worker_no_change_repeat_issues_1h"], [])
+    # Hand-shaped ON PURPOSE (the one exception to the make_record rule above): a non-string run_id
+    # is outside make_record's grammar, so only a raw dict can reach the guard that keeps a poisoned
+    # row from crashing the census — telemetry riding alongside every other alert must not take the
+    # tick down over one row it cannot attribute.
+    chk("a row whose run_id is not a string is SKIPPED, not crashed on",
+        no_change_census([{"exit_class": "no_change", "run_id": 117, "issue": 808},
+                          _health_row("117.1", issue=808, why="other")],
+                         {"117"})["worker_no_change_1h"], 1)
+    chk("the latest attempt wins on ATTEMPT NUMBER, not on ledger position",
+        no_change_census([_health_row("117.2", issue=808, why="already_done"),
+                          _health_row("117.1", issue=808, why="underspecified")],
+                         {"117"})["worker_no_change_by_reason_1h"]["already_done"], 1)
+    rerun_rate = compute_target_metrics({**SPARQ_LIVE, "worker_attempts_1h": 1,
+                                         "worker_success_1h": 1, **rerun})
+    chk("...so the rate holds the documented no_change <= attempts invariant: 1.0, never 2.0",
+        rerun_rate["worker_no_change_rate_1h"], 1.0)
     # A tie on count is broken by issue number ASCENDING (a stable, reviewable order).
     tie = no_change_census([_health_row("111.1", issue=9), _health_row("112.1", issue=9),
                             _health_row("113.1", issue=4), _health_row("114.1", issue=4),
