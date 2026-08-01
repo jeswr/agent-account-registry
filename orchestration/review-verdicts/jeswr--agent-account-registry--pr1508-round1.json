@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1508,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "649905837bb590cc5a56465a9c236d32d23192ba",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly centralizes unknown-label reduction and post-reduction safety checks in scripts/triage.py, preserves retriage's fail-closed action gate through thin adapters, and adds the missing last-mile validation to triage.py --apply. Unsafe reduced plans are logged and become no-op successes, while safe reductions and complete-label plans still reach the existing fail-loud applier. The tests exercise real classifier output, both lane-invariant halves, premise reclassification, exception refusal, wrapper identity/action behavior, and end-to-end entry-point accept/refuse paths with literal expected values. I found no correctness, soundness, security, or test-vacuity issue in the diff.",
+  "verdict": "approve"
+ }
+}
