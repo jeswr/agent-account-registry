@@ -2621,8 +2621,8 @@ def _self_test():
     _alias.__dict__.update(globals())
     _alias.__name__ = "triage"
     sys.modules.setdefault("triage", _alias)
-    _step = load_sibling("retriage.py", "registry_retriage_for_seam").workflow_step_script(
-        open(_retriage_wf, encoding="utf-8").read(), "label-drift")
+    _seam = load_sibling("retriage.py", "registry_retriage_for_seam")
+    _step = _seam.workflow_step_script(open(_retriage_wf, encoding="utf-8").read(), "label-drift")
     chk("[#582] retriage.yml carries the label-drift step, and it runs under `set -e` with no "
         "`|| true` on the certification",
         (bool(_step.strip()), "set -euo pipefail" in _step,
@@ -2668,6 +2668,199 @@ print(os.environ["STUB_LABELS"])
         (len(_drift_argvs), sorted({token for argv in _drift_argvs for token in argv
                                     if token.startswith("--")} - declared_options(build_parser()))),
         (1, []))
+
+    # -----------------------------------------------------------------------------------------------
+    # [#999] THE QUARANTINE NOTICE IS IDEMPOTENT — AND ITS DE-DUPLICATION CANNOT COST A LABEL WRITE.
+    #
+    # The quarantine step's LABEL write has always been idempotent (`--add-label` of a label already
+    # present is a no-op); the courtesy COMMENT was not. Every `edited` event on an already
+    # quarantined third-party issue posted another identical notice, so an author editing their own
+    # body three times collected three copies. The notice is now gated on a PRE-mutation label read.
+    #
+    # The static rows below pin the SHAPE (the way [#595 f5] pins the absence of `|| true`), but the
+    # guard is SHELL, and AGENTS.md pre-flight 6 is explicit that a pattern-matched shell guard is
+    # not pinned at all: `if false`, an inverted case, or a hoisted-out comment all survive a
+    # substring check. So the step body is EXTRACTED FROM THE WORKFLOW AND RUN, against a stub that
+    # models the two properties that matter — `--add-label` is a set union, `gh issue comment`
+    # appends — and records every call IN ORDER. The call sequence is asserted as a whole list, so a
+    # reordered pre-read (it must precede the mutation or it reads the post-state and the notice
+    # never fires again), a dropped post-read, a second comment and a missing comment are each a
+    # distinct diff on the SAME row.
+    # -----------------------------------------------------------------------------------------------
+    _pre_case = re.search(r'case ",\$pre," in.*?\n *esac', quarantine_body, re.S)
+    _pre_arms = dict(re.findall(r"\n\s*(\*[^)\n]*)\)(.*?);;",
+                                _pre_case.group(0) if _pre_case else "", re.S))
+    chk("[#999] the notice sits inside the PRE-state case and nowhere else — exactly one post, and "
+        "it is the arm where `trust:untrusted` was ABSENT (an inverted case reds this row)",
+        (sorted(_pre_arms),
+         [("gh issue comment" in _pre_arms.get(arm, "")) for arm in ("*", '*",trust:untrusted,"*')],
+         quarantine_body.count("gh issue comment"),
+         bool(_pre_case) and _pre_case.start() < quarantine_body.find("gh issue comment")
+         < _pre_case.end()),
+        (["*", '*",trust:untrusted,"*'], [True, False], 1, True))
+    # The ONE fallback in this step, and its direction is the fail-closed argument: a failed
+    # courtesy read degrades to a possible DUPLICATE notice, never to a withheld label write. The
+    # [#595 f5] row above independently pins that no such fallback reaches the `gh issue edit`.
+    chk("[#999] the PRE-read goes through the shared bounded-retry reader, and cannot abort "
+        "the step",
+        bool(re.search(r'pre=\$\(python3 scripts/gh_retry\.py read issue view.*?\|\| pre=""',
+                       quarantine_body, re.S)), True)
+
+    # The stub GitHub. `gh issue edit --add-label` is a SET UNION over a label file (the real
+    # idempotence), `gh issue view` renders it exactly as the step's own
+    # `--jq '[.labels[].name]|join(",")'` does, and `gh issue comment` only appends to the call log
+    # — so "how many notices did this event post" is answerable by counting.
+    _QUARANTINE_GH_STUB = '''#!/usr/bin/env python3
+import os, sys
+args = sys.argv[1:]
+state = os.environ["STUB_LABELS_FILE"]
+with open(state, encoding="utf-8") as handle:
+    live = [name for name in handle.read().split(",") if name]
+if args[:2] == ["issue", "edit"]:
+    added = [args[index + 1] for index, token in enumerate(args) if token == "--add-label"]
+    call = "edit:" + ",".join(added)
+elif args[:2] == ["issue", "view"]:
+    call = "view"
+elif args[:2] == ["issue", "comment"]:
+    call = "comment"
+else:
+    sys.exit("stub gh saw an unexpected call: %r" % (args,))
+with open(os.environ["STUB_GH_LOG"], "a", encoding="utf-8") as handle:
+    handle.write(call + "\\n")
+if call.startswith("edit:"):
+    # STUB_EDIT_DROPS is the #595 f5 failure shape: the mutation REPORTS success and lands nothing.
+    if os.environ.get("STUB_EDIT_DROPS") != "1":
+        with open(state, "w", encoding="utf-8") as handle:
+            handle.write(",".join(live + [name for name in added if name not in live]))
+    sys.exit(0)
+if call == "view":
+    print(",".join(live))
+    sys.exit(0)
+sys.exit(int(os.environ.get("STUB_COMMENT_FAILS", "0")))
+'''
+    # The stub reader FORWARDS to the stub `gh`, so both reads land in the same ordered call log and
+    # the pre/post ordering is measured rather than asserted about the text. STUB_FAIL_READS names
+    # the 1-based read invocations that must fail — a bounded-retry exhaustion looks exactly like
+    # this to the caller.
+    _QUARANTINE_RETRY_STUB = '''import os, subprocess, sys
+args = sys.argv[1:]
+if args[:1] != ["read"]:
+    sys.exit("stub gh_retry refuses a non-read call: %r" % (args,))
+counter = os.environ["STUB_READ_COUNTER"]
+seen = 0
+if os.path.isfile(counter):
+    with open(counter, encoding="utf-8") as handle:
+        seen = sum(1 for line in handle if line.strip())
+with open(counter, "a", encoding="utf-8") as handle:
+    handle.write("read\\n")
+if str(seen + 1) in os.environ.get("STUB_FAIL_READS", "").split(","):
+    print("simulated transient read failure", file=sys.stderr)
+    sys.exit(1)
+sys.exit(subprocess.run(["gh", *args[1:]], check=False).returncode)
+'''
+    # Extracted by `id:`, through retriage.py's ONE step extractor (#958: no second copy). A step
+    # that cannot be resolved raises there; it is caught and reported as an empty body so a rename
+    # reds a NAMED row instead of aborting the suite and recording every row below it as a phantom
+    # kill (AGENTS.md pre-flight 4, "crash-after-partial-run").
+    _step_error = ""
+    try:
+        _quarantine_step = _seam.workflow_step_script(
+            open(triage_wf, encoding="utf-8").read(), "quarantine")
+    except Exception as exc:                       # noqa: BLE001 — reported as a row, never raised
+        _quarantine_step, _step_error = "", str(exc)
+    chk("[#999] the quarantine step body is resolvable BY ID and carries the mutation — the rows "
+        "below are running the real thing",
+        (bool(_quarantine_step.strip()), _step_error,
+         "--add-label trust:untrusted --add-label status:untriaged" in _quarantine_step),
+        (True, "", True))
+
+    def _run_quarantine_step(initial, fail_reads="", edit_drops=False, comment_fails=False):
+        """Execute the workflow's OWN quarantine step body against the stubbed GitHub above.
+
+        Returns (exit code, the ORDERED call log, the labels left on the issue, combined output)."""
+        with tempfile.TemporaryDirectory() as directory:
+            scripts = _os_vocab.path.join(directory, "scripts")
+            binaries = _os_vocab.path.join(directory, "bin")
+            _os_vocab.makedirs(scripts)
+            _os_vocab.makedirs(binaries)
+            with open(_os_vocab.path.join(scripts, "gh_retry.py"), "w",
+                      encoding="utf-8") as handle:
+                handle.write(_QUARANTINE_RETRY_STUB)
+            gh_path = _os_vocab.path.join(binaries, "gh")
+            with open(gh_path, "w", encoding="utf-8") as handle:
+                handle.write(_QUARANTINE_GH_STUB)
+            _os_vocab.chmod(gh_path, 0o755)
+            state = _os_vocab.path.join(directory, "labels")
+            with open(state, "w", encoding="utf-8") as handle:
+                handle.write(",".join(initial))
+            log = _os_vocab.path.join(directory, "calls.log")
+            environment = dict(
+                _os_vocab.environ, REPO="o/r", NUM="7",
+                PATH=binaries + _os_vocab.pathsep + _os_vocab.environ.get("PATH", ""),
+                STUB_LABELS_FILE=state, STUB_GH_LOG=log,
+                STUB_READ_COUNTER=_os_vocab.path.join(directory, "reads.log"),
+                STUB_FAIL_READS=fail_reads,
+                STUB_EDIT_DROPS="1" if edit_drops else "0",
+                STUB_COMMENT_FAILS="1" if comment_fails else "0")
+            proc = _subprocess_vocab.run(
+                ["bash", "-c", _quarantine_step], cwd=directory, env=environment,
+                capture_output=True, text=True, timeout=120, check=False)
+            calls = []
+            if _os_vocab.path.isfile(log):
+                with open(log, encoding="utf-8") as handle:
+                    calls = [line.strip() for line in handle if line.strip()]
+            with open(state, encoding="utf-8") as handle:
+                final = sorted(name for name in handle.read().split(",") if name)
+            return proc.returncode, calls, final, proc.stdout + proc.stderr
+
+    _WROTE = "edit:trust:untrusted,status:untriaged"
+    _GATED = ["status:untriaged", "trust:untrusted"]
+    # A FIRST quarantine: pre-read, write, verify, notify — once. The whole call list is the
+    # expectation, so a pre-read moved after the mutation (which would read the post-state and
+    # suppress the notice for ever) is a visible reordering rather than a silent behaviour change.
+    _fresh = _run_quarantine_step([])
+    chk("[#999] EXECUTED: a FIRST quarantine reads the pre-state BEFORE the write, writes both "
+        "labels, verifies them and posts the notice exactly once",
+        (_fresh[0], _fresh[1], _fresh[2]), (0, ["view", _WROTE, "view", "comment"], _GATED))
+    # THE REPORTED DEFECT. Same event on an already-quarantined issue: the labels are re-asserted
+    # (the write is unchanged and still runs) and NO second notice is posted.
+    _again = _run_quarantine_step(["trust:untrusted", "status:untriaged"])
+    chk("[#999] EXECUTED, THE DEFECT: a repeat content event on an ALREADY-quarantined issue "
+        "re-asserts the labels, posts NO second notice, and says so",
+        (_again[0], _again[1], _again[2], "::notice" in _again[3]),
+        (0, ["view", _WROTE, "view"], _GATED, True))
+    # The de-duplication keys on `trust:untrusted` ITSELF, not on "the issue has some label": a gate
+    # stripped by a triage-role actor (#998 f1's case) is restored AND announced.
+    _stripped = _run_quarantine_step(["status:untriaged"])
+    chk("[#999] EXECUTED: an issue whose `trust:untrusted` was STRIPPED gets it back and IS "
+        "notified — `status:untriaged` alone does not suppress the notice",
+        (_stripped[0], _stripped[1].count("comment"), _stripped[2]), (0, 1, _GATED))
+    # NEGATIVE CONTROL — the [#595 f5] posture is intact end-to-end, and the new pre-read did not
+    # move the verification: a write that reports success and lands nothing still reds the step,
+    # and nothing is announced to the author.
+    _dropped = _run_quarantine_step([], edit_drops=True)
+    chk("[#999] EXECUTED: a label write that reports success and lands NOTHING still reds the step "
+        "before any notice — the fail-loud verification is unchanged",
+        (_dropped[0] != 0, "refusing to report success" in _dropped[3],
+         _dropped[1].count("comment")), (True, True, 0))
+    # THE FALLBACK DIRECTION, measured. A failed PRE-read must cost a possible duplicate notice —
+    # never the quarantine itself. (Delete the `|| pre=""` and this row reds: `set -e` would kill
+    # the step before the mutation, leaving third-party content un-quarantined.)
+    _blip = _run_quarantine_step([], fail_reads="1")
+    chk("[#999] EXECUTED: a transient failure on the courtesy PRE-read still writes and verifies "
+        "both labels, and degrades to POSTING the notice",
+        (_blip[0], _blip[1], _blip[2]), (0, [_WROTE, "view", "comment"], _GATED))
+    # ...and the POST-read keeps NO fallback of its own: it is the verification, not a courtesy.
+    _unverified = _run_quarantine_step([], fail_reads="2")
+    chk("[#999] EXECUTED: a failed POST-read reds the step and posts nothing — only the PRE-read "
+        "is best-effort",
+        (_unverified[0] != 0, _unverified[1].count("comment")), (True, 0))
+    # The notice itself stays best-effort: a failed comment warns, it does not undo a verified
+    # quarantine.
+    _warned = _run_quarantine_step([], comment_fails=True)
+    chk("[#999] EXECUTED: a notice that fails to post warns and leaves the verified quarantine "
+        "standing",
+        (_warned[0], "::warning" in _warned[3], _warned[2]), (0, True, _GATED))
 
     print("triage self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

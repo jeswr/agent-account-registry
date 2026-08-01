@@ -138,9 +138,26 @@ jobs:
       # The rule itself is a single Python function so it is executable and testable; see
       # `quarantine_required()` in scripts/triage.py, pinned by its `--self-test` truth table.
       - name: Quarantine + notify (untrusted author)
+        # The `id:` is what `scripts/triage.py --self-test` extracts this step's body by so it can
+        # RUN it against a stubbed GitHub (#999) — a pattern-matched shell guard is not pinned
+        # (AGENTS.md pre-flight 6). Renaming it reds that section rather than silently skipping it.
+        id: quarantine
         if: steps.trust.outputs.quarantine == '1'
         run: |
           set -euo pipefail
+          # [#999] THE LABEL WRITE IS IDEMPOTENT; THE COURTESY COMMENT WAS NOT. `--add-label` of a
+          # label already present is a no-op, but `gh issue comment` appends unconditionally: every
+          # `edited` event on an ALREADY-quarantined third-party issue posted another identical
+          # notice, so an author editing their own body three times collected three copies. The
+          # de-duplication reads the PRE-mutation label set through the same bounded-retry reader
+          # the post-read below already uses, and only the NOTICE is conditional on it.
+          # THE FALLBACK DIRECTION IS DELIBERATE, and it is the whole fail-closed argument: this
+          # read is courtesy plumbing, so it must never be able to withhold or delay the quarantine
+          # write. A read that fails yields an EMPTY pre-state, which degrades to the historical
+          # behaviour (post the notice, possibly a duplicate) — never to a skipped label write.
+          # The write itself, its no-`|| true` posture and its post-read verification are untouched.
+          pre=$(python3 scripts/gh_retry.py read issue view "$NUM" -R "$REPO" --json labels \
+            --jq '[.labels[].name]|join(",")') || pre=""
           gh issue edit "$NUM" -R "$REPO" --add-label trust:untrusted --add-label status:untriaged
           post=$(python3 scripts/gh_retry.py read issue view "$NUM" -R "$REPO" --json labels \
             --jq '[.labels[].name]|join(",")')
@@ -150,9 +167,14 @@ jobs:
               *) echo "::error title=quarantine #$NUM::$required did NOT land (labels now: $post) — refusing to report success on an un-quarantined third-party issue"; exit 1 ;;
             esac
           done
-          gh issue comment "$NUM" -R "$REPO" \
-            --body "> 🤖 SPARQ agent — this issue is from a non-collaborator, so it is **quarantined** (\`trust:untrusted\`) and its content is not acted on. A maintainer can approve it by adding a 👍 reaction." \
-            || echo "::warning title=quarantine #$NUM::the quarantine notice comment failed to post; the quarantine LABELS are verified in place, so the issue is not acted on"
+          case ",$pre," in
+            *",trust:untrusted,"*)
+              echo "::notice title=quarantine #$NUM::already quarantined before this event — the labels are re-asserted above, the courtesy notice is NOT re-posted" ;;
+            *)
+              gh issue comment "$NUM" -R "$REPO" \
+                --body "> 🤖 SPARQ agent — this issue is from a non-collaborator, so it is **quarantined** (\`trust:untrusted\`) and its content is not acted on. A maintainer can approve it by adding a 👍 reaction." \
+                || echo "::warning title=quarantine #$NUM::the quarantine notice comment failed to post; the quarantine LABELS are verified in place, so the issue is not acted on" ;;
+          esac
 
       # `--apply` owns the whole read -> plan -> mutate sequence FAIL-CLOSED (registry #582).
       # It replaces the previous per-label `gh issue edit ... || true` loops, which applied the
