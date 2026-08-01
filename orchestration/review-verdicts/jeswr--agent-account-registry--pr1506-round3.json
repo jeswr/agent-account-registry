@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1506,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "77310aedf7259f28533df55d616432be32bbfda8",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_snapshot_violations` only searches for `leases` when `flow` is a dict. A snapshot like `{\"schema\":\"registry-observability/v1\",\"flow\":[{\"leases\":[{\"label\":\"ab12cd340a5f9e71\"}]}]}` is a top-level object, parses without duplicates, and returns no violations. It therefore parks the prohibited per-account array on the public ledger while `_obs_flow` in dashboard-gen returns `None` for the list and reports no error. The code's rationale for rejecting a non-object document applies equally at this nested schema boundary: malformed structure must not become a place to hide the bytes being refused.",
+    "file": "scripts/ledger-invariant.py",
+    "fix_hint": "Fail closed when a present `flow` member is not an object (while preserving the documented behavior for an absent flow, if that is valid), and add a self-test using a literal non-object flow that contains a nested `leases` array. Assert both `validate()` refusal and the real CLI nonzero exit so the guard and its delivery path remain load-bearing.",
+    "severity": "major",
+    "title": "Non-object flow bypasses the public-byte lease-row invariant"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe HEAD/worktree binding, duplicate-member rejection, CLI exit-path coverage, and presence-keyed refusal for an object-shaped `flow` remain sound. However, the ledger-side content invariant is still bypassable by a non-object `flow`: the validator rejects a non-object document but accepts an object such as `{\"flow\":[{\"leases\":[...]}]}`. Those public bytes carry the same per-account row array the change is intended to prohibit, while dashboard normalization silently treats the malformed flow as absent. This is a new major completeness finding relative to round 2's zero findings, so progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
