@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5409,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "88acdce97ace4863ebd2e7150c5f7232a4b4cc68",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`read_varint` uses `payload.checked_shl(7 * i)`, but `checked_shl` only validates the shift count; it does not reject value bits shifted past `u64`. At `i == 9`, only payload 0 or 1 fits. A terminal byte such as `0x02` is shifted by 63 and its overflowing bit is discarded, yet the decoder accepts it because the payload is nonzero. Consequently an overflowing ten-byte encoding can decode to the same value as another encoding, contrary to the public fail-closed and canonical-encoding contract. The current tests cover a redundant-zero encoding but not this overflow boundary.",
+    "file": "crates/sparq-vectors/src/external_key.rs",
+    "fix_hint": "Before combining the tenth group, reject `i == 9 && payload > 1` (or use checked multiplication/addition that detects value overflow). Add regression tests for terminal payload `0x02` and `0x7f` after nine continuation groups, and retain a positive test for the maximal canonical `u64` encoding ending in `0x01`.",
+    "severity": "major",
+    "title": "Ten-byte varints can overflow u64 and alias valid values"
+   }
+  ],
+  "progress": null,
+  "summary": "The external-key table codec is generally careful and the conformance tests exercise real parser paths, but the unsigned-varint decoder does not actually enforce its documented 64-bit overflow invariant. A ten-byte multihash varint with a terminal payload greater than 1 is accepted after high bits are silently discarded, allowing non-canonical/overflowing encodings to alias valid codes or lengths. This is a correctness and fail-closed security defect in the public parser and needs a focused regression test and overflow check before approval.",
+  "verdict": "request_changes"
+ }
+}
