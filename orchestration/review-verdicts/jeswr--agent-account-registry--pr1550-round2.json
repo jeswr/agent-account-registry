@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1550,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "991af7cac92236600a6418adc8348852f5f5e52d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 major finding is resolved consistently and non-vacuously: both PLAN and CLAIM now require a present `agent_from_role` value to be exactly boolean `true`, explicitly reject `false`, and exercise that inert-value case in their resolver self-tests and the cross-resolver malformed-table checks. The role-directed persona behavior preserves the security override's chain, escalation, and match-label audit surface while selecting the declared role persona; roleless and malformed/unknown-role cases remain fail-closed. The new mutating-worker seam is capability-gated against the resolved persona, with exact workflow wiring and live-table/brief tests covering both acceptance and refusal. I found no remaining correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
