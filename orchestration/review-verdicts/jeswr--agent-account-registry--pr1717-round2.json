@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1717,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d222437e1ea3747158c8fa3d88b80a3db038abcc",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe prior major finding is resolved soundly. Recovery for `worker-no-change` now requires every row in the hysteresis window to carry a numeric rate backed by at least `worker_min_samples`; null telemetry therefore leaves a live alert open. The added tests establish both sides non-vacuously: an all-null recovery window does not recover, while an otherwise identical measured-clear window does, and unrelated measured classes remain recoverable. I found no new correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
