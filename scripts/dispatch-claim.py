@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [GPT-5.6] REG-4 privileged dispatcher half. Target code never executes in this process: the
+# [SPARQ agent] REG-4 privileged dispatcher half. Target code never executes in this process: the
 # unprivileged PLAN artifact is treated as hostile data, revalidated against registry policy and
 # protected target routing, then fed to the CAS allocator before a workflow_dispatch is emitted.
 """Validate an unprivileged dispatch plan, claim leases, and launch live workers fail-closed."""

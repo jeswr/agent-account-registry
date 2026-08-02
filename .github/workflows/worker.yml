@@ -1,4 +1,4 @@
-# [GPT-5.6] Registry worker. Dry-run remains the default; REG-3's live path claims a CAS
+# [SPARQ agent] Registry worker. Dry-run remains the default; REG-3's live path claims a CAS
 # lease, revalidates trust, runs one routed model attempt, seals that work PRE-GATE as a
 # digest-bound bundle, gates it host-side, and a SEPARATE clean-runner `publish` job (no target
 # code) reconstructs the bundle and opens the DRAFT target PR (cross-provider review pending).

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [GPT-5.6] REG-1 pure resolver for the private per-repository worker policy. It performs no
+# [SPARQ agent] REG-1 pure resolver for the private per-repository worker policy. It performs no
 # network access, account claims, dispatches, secret reads, or token handling.
 """policy-resolve — combine registry policy with a target repository's routing table.
 

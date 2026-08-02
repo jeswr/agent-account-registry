@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [GPT-5.6] REG-5 fail-closed maintenance sweep for the registry orchestrator.
+# [SPARQ agent] REG-5 fail-closed maintenance sweep for the registry orchestrator.
 """Reclaim dead worker leases and conservatively repair target orchestration state.
 
 The live path uses deliberately separate credentials: ``REGISTRY_GH_TOKEN`` may only update the
