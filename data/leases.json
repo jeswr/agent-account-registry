@@ -1,3 +1,14 @@
 {
- "leases": []
+ "leases": [
+  {
+   "account": "51bde6688e140866",
+   "claim_id": "edc103ed610b49de91fc57353bb52ab7",
+   "holder": "sparq-org/sparq#2885@dispatch-30746784446.1",
+   "package": "zk-xpath",
+   "role": "soundness",
+   "model": "opus5",
+   "issued_at": 1785672091,
+   "expires_at": 1785678391
+  }
+ ]
 }
