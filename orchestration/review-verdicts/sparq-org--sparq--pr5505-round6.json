@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5505,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "465b637ef0c57a4e89795651ce9b5cda3a9ee6f1",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The blurb still claims a FILTER is proved over a live-store integer `without disclosing it`. Yet zk-prover.ts sends deterministic operand_enc as a public input and ships the complete four-value mapping for 24, 25, 30, and 42. A verifier can enumerate that tiny dictionary and identify the selected witness. Related zk-tool.tsx, README, and E2E wording continues to equate absence of the raw field element with hiding from the verifier; the E2E assertion only checks that 30 is not literally one of the five fields and does not address recovery through operand_enc. This is materially the same major finding as round 5.",
+    "file": "gui/app/src/components/workbench/zk-tool.meta.ts",
+    "fix_hint": "Replace the blurb and related panel/README/E2E claims with a precise disclosure statement: the decimal digits are private circuit inputs, but deterministic public operand_enc may reveal low-entropy values by dictionary enumeration. Make the E2E assertion claim only that the digits/value are not direct public inputs. If semantic value hiding is required, use a verifier-bound hiding commitment with randomness and test that disclosure model.",
+    "severity": "major",
+    "title": "Public operand_enc still reveals the low-entropy witness by enumeration"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 6 is stagnant: the same disclosure-model defect remains at major severity. The UI and documentation still say the selected store integer is hidden from or not disclosed to the verifier, but operand_enc is itself a deterministic public input and the shipped prover exposes a four-value candidate dictionary. A verifier can enumerate those commitments and recover which of 24, 25, 30, or 42 was selected. The browser test proves only that the integer field element 30 is not directly present; it does not establish semantic value hiding against dictionary recovery. The external-audit caveat does not make the specific nondisclosure claim accurate.",
+  "verdict": "request_changes"
+ }
+}
