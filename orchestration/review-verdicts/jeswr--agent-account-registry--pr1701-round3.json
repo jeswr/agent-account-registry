@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1701,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5e1ab7c3582ba6ac7d6b61e976582400f013c1be",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`source_bound_records()` treats any directory supplied through `--from-records` as authoritative. `derived_manifest()` only proves that it is not the same directory inode/resolved path as the audited corpus; copying a partial corpus (or using a stale/partial ledger checkout) into another directory passes that check. An operator can then provide a self-consistent short manifest matching that shortened tree, and the exact comparison succeeds, allowing `STATUS_SCOPED` and revocation candidates even though both artifacts omit the same PR. This is the prior blocker at a new layer: no evidence independent of the claimed record set establishes the source tree's completeness or ledger identity. The self-test covers disagreement with an intact `ledger_dir`, but has no negative case where manifest and source tree agree with each other while both are short of the authoritative set.",
+    "file": "scripts/grant-scope-audit.py",
+    "fix_hint": "Bind the source enumeration to independently verifiable authority and completeness, such as an authenticated/pinned ledger commit or a signed digest issued by the trusted generation step, or enumerate the authoritative merged worker PR set and compare it with the records. If that cannot be established offline, keep source-bound manifests advisory-only. Add an end-to-end negative test using a distinct copied/partial source directory plus a matching self-consistent short manifest and require that it cannot produce `STATUS_SCOPED` or any revocation candidate.",
+    "severity": "blocker",
+    "title": "Caller-controlled partial source trees remain arm-capable"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round adds a real two-way comparison and closes the narrow case where a short manifest is checked against an intact ledger tree. It still does not establish that the caller-supplied `--from-records` directory is authoritative or complete. A copied or stale partial tree is accepted as long as it is a different inode/path from the audited corpus; a self-consistent short manifest matching that tree therefore remains arm-capable. The code explicitly acknowledges that the tree is trusted as given. This moves the same completeness assertion from one caller-controlled artifact to two mutually consistent caller-controlled artifacts, so the prior trust-plane blocker remains and progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
