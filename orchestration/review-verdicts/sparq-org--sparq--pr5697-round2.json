@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5697,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6aa6eacb8e177a9e3175b2619b3d8389b4221c75",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new parenthetical says this is \"the same anonymous-class output-vocabulary gap as WebOnt-I5.5-005\", but the audited WebOnt-I5.5-005 entry in this file says its conclusion uses owl:unionOf, which is outside EL and is skipped; the engine also emits no union/rdf:List cells. Merely having an anonymous conclusion node does not make the mechanisms the same. This weakens the accuracy of the permanent-divergence audit.",
+    "file": "crates/sparq-conformance/tests/el_suite.rs",
+    "fix_hint": "Remove the comparison to WebOnt-I5.5-005, or explicitly contrast it: this hasSelf case is an in-profile anonymous-restriction reification/output gap, whereas WebOnt-I5.5-005 requires the outside-EL owl:unionOf/list vocabulary.",
+    "severity": "minor",
+    "title": "Incorrectly equates the hasSelf output gap with WebOnt-I5.5-005"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The revised explanation is mostly supported: the focused CRs3 converse test exercises the real realization path, Names::self_concept has no dictionary term, and realization emits the self-loop rather than an rdf:type assertion to the anonymous restriction. However, the new final comparison mischaracterizes WebOnt-I5.5-005 as the same anonymous-class output-vocabulary gap. Its adjacent audited entry and the wave-2 disposition describe that case as owl:unionOf being outside EL, with no union/list extraction or emission. Round 1 had no findings, so this new documentation error is a regression.",
+  "verdict": "request_changes"
+ }
+}
