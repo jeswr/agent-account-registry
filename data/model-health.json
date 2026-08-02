@@ -1,38 +1,6 @@
 {
  "records": [
   {
-   "ts": 1785610567,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30713576831.1"
-  },
-  {
-   "ts": 1785610632,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30713595175.1"
-  },
-  {
-   "ts": 1785610640,
-   "provider": "fleet",
-   "account": "5f5b2dc3fb8e231b",
-   "model_alias": "",
-   "exit_class": "success",
-   "run_id": "30713296999.1"
-  },
-  {
-   "ts": 1785610649,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30713633219.1"
-  },
-  {
    "ts": 1785610769,
    "provider": "openai",
    "account": "dc2d751954080e13",
@@ -1924,6 +1892,14 @@
    "model_alias": "sol",
    "exit_class": "success",
    "run_id": "30727857523.1"
+  },
+  {
+   "ts": 1785635871,
+   "provider": "openai",
+   "account": "dc2d751954080e13",
+   "model_alias": "sol",
+   "exit_class": "success",
+   "run_id": "30727914990.1"
   }
  ]
 }
