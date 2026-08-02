@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5618,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7d2e7fa1b2e76c8eed30d2846b5920ea61258be4",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "DeployOnlyInertnessTests still skips every '/'-suffixed entry, including deploy/, while its class docstring says every entry is proven not read by Rust-CI workflows and that later wiring cannot silently become unsound. ci_audit_inputs.py detects crate source reads and test_no_crate_lives_under_a_deploy_entry detects manifests, but neither detects a Rust workflow shell step that directly consumes a file beneath deploy/. The added explanation therefore does not close the prior round's coverage gap.",
+    "file": "scripts/tests/test_ci_select.py",
+    "fix_hint": "Add a structural check for direct deploy/ references in the enumerated Rust-CI workflows, with a narrow way to ignore comments/prose, or narrow the class/test claims to state explicitly that workflow-level directory references are convention-audited rather than live-enforced.",
+    "severity": "minor",
+    "title": "Directory-prefix inertness guard still does not inspect workflow references"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The deploy-only and inert-mixed classification remains fail-closed for any engine path, and the workflow wiring tests pin all three merge-group consumers to the classifier's exact inert-class set. The prior round's minor test-strength concern remains materially unchanged: the new comments explain why deploy/ directory entries are skipped, but the two cited checks cover crate membership and crate source reads, not direct shell/workflow consumption of a deploy/ file. No blocker or major correctness, soundness, or security issue was found.",
+  "verdict": "approve"
+ }
+}
