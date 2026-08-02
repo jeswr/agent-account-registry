@@ -61,10 +61,17 @@ jobs:
           done
           if [ -n "$BAD" ]; then
             echo "::error::INGESTION REJECTED —$BAD"
+            # The code fences are SINGLE-quoted, which is all that is ever needed here: a run: body
+            # is a YAML block scalar, not a nested shell string, so the quote-dance spelling this
+            # replaces bought nothing and cost correctness. Bash read ITS backticks as a command
+            # substitution, which swallowed the $BAD argument -- the list of rejected lanes, the one
+            # fact the alarm exists to report -- rendered a garbage token in its place and wrote a
+            # command-not-found line to stderr. shellcheck sees it (SC2288/SC2027/SC2006), and the
+            # required gate runs shellcheck through actionlint, so the mangling was gate-visible.
             printf '%s\n' \
               "> 🤖 SPARQ agent" "" \
               "**Ingestion rejection detected.** These lanes' most recent runs executed ZERO jobs:" "" \
-              '"'"'```'"'"' "$BAD" '"'"'```'"'"' "" \
+              '```' "$BAD" '```' "" \
               "\`action_required\` + \`jobs=0\` means GitHub created the run and ran nothing — the workflow FILE was refused. This is silent: no failing check, no red, just lanes not running." "" \
               "Mechanism is unexplained across 9+ instances (#1566); a 10-candidate elimination table is on #1706. groom is the ONLY crash-recovery path, so its rejection is never cosmetic." "" \
               "⚠️ Verify any fix by \`jobs > 0\`, never by colour." > /tmp/body.md

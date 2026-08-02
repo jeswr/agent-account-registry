@@ -1301,15 +1301,36 @@ def _run_log_counts(repo, run_id):
 
 
 def _fetch_dispatch_history(repo, count):
+    """`(history, status)` — the newest `count` dispatch runs AND the fetch's own outcome.
+
+    Issue #1106: both failure branches used to return a bare `[]`, which the page renders as
+    "No dispatch history is available." — byte-identical to a fleet that has genuinely never
+    dispatched — and which silently zeroes `fleet.last_sweep_at` as well. That is the #28 shape (an
+    infra failure wearing a quiet tick's clothes) one layer out, on the PUBLIC surface. The outcome
+    now travels with the rows exactly as the usage probe's does (#219/#612), so the consumer can
+    tell "we read the history and it was empty" from "we could not read the history".
+
+    `status` is the RAW claim; `_history_outcome` normalizes it fail-closed."""
     result = subprocess.run(
         ["gh", "api", f"repos/{repo}/actions/workflows/dispatch.yml/runs?per_page={count}"],
         capture_output=True, text=True, timeout=60, check=False)
     if result.returncode != 0:
-        return []
+        return [], {"outcome": "failed", "detail": "gh-exited-nonzero"}
     try:
-        runs = json.loads(result.stdout).get("workflow_runs") or []
-    except (AttributeError, json.JSONDecodeError):
-        return []
+        document = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return [], {"outcome": "failed", "detail": "run-listing-unparseable"}
+    # The SCHEMA is part of the read (#1748 review round 2). `gh` answers a throttled or errored
+    # call with a syntactically valid document that carries no runs at all — `{}`, `{"message":
+    # ...}`, `{"workflow_runs": null}` — and the old `.get(...) or []` collapsed every one of those
+    # into an empty list and an `ok` outcome, i.e. the exact "infra failure wearing a quiet tick's
+    # clothes" shape this issue exists to kill. A truthy non-list was worse still: a str was sliced
+    # into characters that were then dropped, and a dict raised TypeError out of the whole build.
+    # So: only an OBJECT whose `workflow_runs` is genuinely a list counts as read. The explicitly
+    # empty list stays the successful quiet-fleet case; everything else fails closed.
+    if not isinstance(document, dict) or not isinstance(document.get("workflow_runs"), list):
+        return [], {"outcome": "failed", "detail": "run-listing-schema-alien"}
+    runs = document["workflow_runs"]
     history = []
     for run in runs[:count]:
         if not isinstance(run, dict):
@@ -1328,7 +1349,27 @@ def _fetch_dispatch_history(repo, count):
             # only inside the model-health alert.
             "lanes": lanes,
         })
-    return history
+    return history, {"outcome": "ok", "detail": ""}
+
+
+def _history_outcome(status):
+    """Normalize the dispatch-history fetch outcome, FAIL-CLOSED (issue #1106).
+
+    `fetched` is True ONLY for an explicit `ok` claim from the fetcher. Every other shape — a
+    `failed` claim, an alien document, and `None` (no claim at all, which is the WEAKEST evidence
+    of the lot — #612 review finding 1, where a `None` default selecting the trusting branch was
+    the bug) — normalizes to "we did not read the history", so an empty `dispatch_outcomes` is
+    never published as though it had been observed. Pure — unit-tested by --self-test.
+
+    `detail` reaches the PUBLIC page, so it is held to the same bounded safe-token shape every
+    other externally-sourced label on this document uses; it is never published as free text."""
+    outcome, detail = "unknown", ""
+    if isinstance(status, dict):
+        raw = str(status.get("outcome") or "").strip().lower()
+        outcome = raw if raw in {"ok", "failed"} else "unknown"
+        text = str(status.get("detail") or "").strip()
+        detail = text if OBS_TOKEN_RE.fullmatch(text) else ""
+    return {"outcome": outcome, "detail": detail, "fetched": outcome == "ok"}
 
 
 def _health_status(value):
@@ -1877,7 +1918,7 @@ def _normalize_observability(document):
 
 
 def build_dashboard(issues, leases_document, usage, dispatch_history, model_health, now, salt,
-                    observability=None, probe_status=None, serviced=None):
+                    observability=None, probe_status=None, serviced=None, history_status=None):
     accounts, private_values = _catalog(issues)
     # Issue #78. `serviced=None` means "READ THE LIVE POLICY", never "no serviced repositories": an
     # empty seed would silently restore the vanishing census this closes, which is the #612 review
@@ -1956,6 +1997,12 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
     # (#612 review finding 1) — it used to be omitted on exactly the branch that also trusted the
     # usage map unconditionally, so the one state that most needed a warning carried none.
     document["usage_probe"] = probe
+    # Degradation marker (issue #1106), the same shape and for the same reason as `usage_probe`:
+    # `fleet.dispatch_outcomes == []` and `fleet.last_sweep_at == None` are what a failed `gh` read
+    # produces AND what a fleet that has never dispatched produces, so the page cannot tell them
+    # apart without this. ALWAYS present — an omitted-on-one-branch marker is exactly the #612
+    # finding-1 shape, where the one state that most needed the warning carried none.
+    document["dispatch_history"] = _history_outcome(history_status)
     observability = _normalize_observability(observability)
     if observability is not None:
         # Optional key (absent => the dashboard hides the Observability panels), placed INSIDE the
@@ -2350,9 +2397,9 @@ def _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measur
     saved_run = subprocess.run
     try:
         subprocess.run = fake_gh
-        fetched, fetch_error = _fetch_dispatch_history("owner/registry", 5), None
+        (fetched, fetch_status), fetch_error = _fetch_dispatch_history("owner/registry", 5), None
     except Exception as exc:                    # noqa: BLE001 - reported as a row, never swallowed
-        fetched, fetch_error = [], f"{type(exc).__name__}: {exc}"
+        fetched, fetch_status, fetch_error = [], None, f"{type(exc).__name__}: {exc}"
     finally:
         subprocess.run = saved_run
     check("[#323] the fetched history carries the per-lane rows for the run whose log was read, "
@@ -2368,7 +2415,7 @@ def _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measur
           [(2, 2, ["worker", "review", "fix", "disarm"]), (None, None, None), (None, None, None),
            (None, None, None), (None, None, None)])
     published = build_dashboard(issues, leases, usage, fetched, None, now, "fixture-salt",
-                                probe_status=measured_sidecar)
+                                probe_status=measured_sidecar, history_status=fetch_status)
     published_sweeps = published["fleet"]["dispatch_outcomes"]
     published_lanes = next((sweep.get("lanes") or [] for sweep in published_sweeps), [])
     # Stated as LITERALS, not as `fetched[0]["lanes"]`: comparing the payload against the object
@@ -2448,6 +2495,127 @@ def _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measur
     check("[#323] EXECUTED page script: a state token that is not one of the four known ones "
           "renders `unknown` — it never reaches the class attribute as written",
           chips("hostile", "dot"), ["lane-dot unknown", "lane-dot unknown"])
+
+
+def _self_test_history_fetch(check, issues, leases, usage, now, measured_sidecar):
+    """Issue #1106 — the dispatch-history FETCH OUTCOME, from the `gh` subprocess that decides it
+    to the document the page reads it out of.
+
+    Measured while implementing #323 with `python3 -m trace --count --missing`: the non-zero-exit
+    `return`, the `except (AttributeError, json.JSONDecodeError)` arm and the non-dict-run
+    `continue` were at ZERO executions across the whole suite, so a mutant in any of them was
+    unkillable — and the bug they were hiding is that all three published a bare `[]`, which the
+    page renders exactly like a fleet that has genuinely never dispatched. `gh` is stubbed per case
+    below, so all three execute."""
+    # --- the pure normalizer, BOTH directions. Only an explicit `ok` may license "we read it".
+    check("[#1106] the fetch-outcome normalizer trusts ONLY an explicit `ok` — a failed claim, an "
+          "alien one, a non-dict one and NO claim at all all refuse",
+          [_history_outcome(status)["fetched"] for status in (
+              {"outcome": "ok"}, {"outcome": "  OK "}, {"outcome": "failed"},
+              {"outcome": "probably-fine"}, {}, None, [], "ok")],
+          [True, True, False, False, False, False, False, False])
+    check("[#1106] ...and it carries the failure DETAIL to the page, bounded to the same safe-token "
+          "shape as every other externally-sourced label on this document",
+          (_history_outcome({"outcome": "failed", "detail": "gh-exited-nonzero"}),
+           _history_outcome({"outcome": "failed",
+                             "detail": "<img src=x onerror=alert(1)>"})["detail"]),
+          ({"outcome": "failed", "detail": "gh-exited-nonzero", "fetched": False}, ""))
+
+    # --- the three branches, EXECUTED against a stubbed `gh`.
+    class _Completed:
+        def __init__(self, returncode, stdout):
+            self.returncode, self.stdout = returncode, stdout
+
+    def fetch_with(listing):
+        """The real fetcher against a stubbed `gh`: `listing` answers the run-listing call and every
+        per-run log call fails, so only the LISTING branches are under test here. An exception is
+        turned into a named red row rather than aborting the suite (pre-flight item 4)."""
+        def fake_gh(command, **kwargs):
+            if "/workflows/dispatch.yml/runs" in command[-1]:
+                return listing
+            return _Completed(1, b"")
+
+        saved_run = subprocess.run
+        try:
+            subprocess.run = fake_gh
+            return _fetch_dispatch_history("owner/registry", 5)
+        except Exception as exc:                # noqa: BLE001 - reported as a row, never swallowed
+            return [], f"raised {type(exc).__name__}: {exc}"
+        finally:
+            subprocess.run = saved_run
+
+    nonzero = fetch_with(_Completed(1, ""))
+    check("[#1106] a run listing whose `gh` exits NON-ZERO reports the failure instead of an empty "
+          "history that reads as a quiet fleet",
+          nonzero, ([], {"outcome": "failed", "detail": "gh-exited-nonzero"}))
+    check("[#1106] ...so does a body that is not JSON at all (the JSONDecodeError arm)",
+          fetch_with(_Completed(0, "{not json")),
+          ([], {"outcome": "failed", "detail": "run-listing-unparseable"}))
+    check("[#1106] ...and one that parses to something that is not an object at all (a bare scalar "
+          "and a bare array both fail the SCHEMA check, not the JSON parse)",
+          (fetch_with(_Completed(0, "3")), fetch_with(_Completed(0, "[]"))),
+          (([], {"outcome": "failed", "detail": "run-listing-schema-alien"}),
+           ([], {"outcome": "failed", "detail": "run-listing-schema-alien"})))
+    # THE ROUND-2 SEAM: `gh` answers a throttled/errored call with a syntactically VALID document
+    # that carries no run list. `.get("workflow_runs") or []` turned every one of these into an
+    # empty history with an `ok` outcome — a quiet fleet on the public page — and the truthy
+    # non-lists were worse: a str was sliced into characters and dropped, a dict raised TypeError
+    # out of the build. Each row states the document as a LITERAL so a mutant that re-widens the
+    # check (e.g. back to `or []`, or to a truthiness test) goes red on a NAMED row rather than
+    # aborting the suite (pre-flight item 4).
+    alien = ([], {"outcome": "failed", "detail": "run-listing-schema-alien"})
+    for label, body in (("no `workflow_runs` field at all", {}),
+                        ("an ERROR document from a throttled call", {"message": "API rate limit"}),
+                        ("a null field", {"workflow_runs": None}),
+                        ("a truthy STRING (was sliced into characters)",
+                         {"workflow_runs": "not-a-list"}),
+                        ("a truthy OBJECT (slicing it raised TypeError)",
+                         {"workflow_runs": {"11": {"id": 11}}}),
+                        ("a truthy NUMBER", {"workflow_runs": 3})):
+        check(f"[#1106] a valid JSON run listing with {label} FAILS CLOSED — not a quiet fleet",
+              fetch_with(_Completed(0, json.dumps(body))), alien)
+    quiet = fetch_with(_Completed(0, json.dumps({"workflow_runs": []})))
+    check("[#1106] THE DISCRIMINATION: a fleet that has genuinely never dispatched returns the same "
+          "empty row set with an `ok` outcome — the rows alone cannot tell the two apart",
+          (quiet, quiet[0] == nonzero[0], quiet[1] == nonzero[1]),
+          (([], {"outcome": "ok", "detail": ""}), True, False))
+    mixed = fetch_with(_Completed(0, json.dumps({"workflow_runs": [
+        {"id": 21, "status": "queued"}, "not-a-run", None, {"id": 22, "status": "waiting"}]})))
+    check("[#1106] a run entry that is not an object is DROPPED, and the real entries either side "
+          "of it still land (the `continue` had never executed)",
+          (mixed[1], [entry["conclusion"] for entry in mixed[0]]),
+          ({"outcome": "ok", "detail": ""}, ["queued", "waiting"]))
+
+    # --- ...and the published document, where the ambiguity was actually visible. The `fleet`
+    # blocks are stated as LITERALS on both sides, so this row goes red if the marker starts
+    # tracking something other than the fetch (pre-flight item 2(b)).
+    empty_fleet = {"active_agents": 1, "capacity": {"anthropic": True},
+                   "last_sweep_at": None, "dispatch_outcomes": []}
+    quiet_document = build_dashboard(issues, leases, usage, [], None, now, "fixture-salt",
+                                     probe_status=measured_sidecar, serviced=("owner/repo",),
+                                     history_status={"outcome": "ok", "detail": ""})
+    lost_document = build_dashboard(issues, leases, usage, [], None, now, "fixture-salt",
+                                    probe_status=measured_sidecar, serviced=("owner/repo",),
+                                    history_status={"outcome": "failed",
+                                                    "detail": "gh-exited-nonzero"})
+    # `.get`, never `[...]`: a mutant that DROPS the marker must land as a named red row here, not
+    # as a KeyError that aborts the suite and records as a kill while every check below it never
+    # ran (AGENTS.md pre-flight item 4, crash-after-partial-run — measured on this very block).
+    check("[#1106] the two published documents are no longer BYTE-IDENTICAL: both zero the sweep "
+          "and the outcome list, and only the marker says which of the two it is",
+          (quiet_document["fleet"], lost_document["fleet"],
+           quiet_document.get("dispatch_history"), lost_document.get("dispatch_history"),
+           json.dumps(quiet_document, sort_keys=True)
+           == json.dumps(lost_document, sort_keys=True)),
+          (empty_fleet, empty_fleet,
+           {"outcome": "ok", "detail": "", "fetched": True},
+           {"outcome": "failed", "detail": "gh-exited-nonzero", "fetched": False},
+           False))
+    check("[#1106] the marker is on EVERY document, including a build that stated no fetch outcome "
+          "at all — which normalizes to NOT fetched rather than being omitted",
+          build_dashboard([], {"leases": []}, {}, [], None, now, "fixture-salt",
+                          serviced=("solo/target",)).get("dispatch_history"),
+          {"outcome": "unknown", "detail": "", "fetched": False})
 
 
 def _self_test():
@@ -2550,7 +2718,8 @@ def _self_test():
     # `serviced` is pinned to the fixture's own repository (#78) so this golden document stays
     # hermetic: the default reads the live policy, which is exercised on its own rows further down.
     got = build_dashboard(issues, leases, usage, history, None, now, "fixture-salt",
-                          probe_status=measured_sidecar, serviced=("owner/repo",))
+                          probe_status=measured_sidecar, serviced=("owner/repo",),
+                          history_status={"outcome": "ok", "detail": ""})
     expected = {
         "schema": SCHEMA,
         "generated_at": "2025-06-15T15:06:40Z",
@@ -2583,6 +2752,10 @@ def _self_test():
         # fixture carries it too — and a measured build must say `measured: True` rather than omit
         # the key, which is what let a sidecar-less build look indistinguishable from a healthy one.
         "usage_probe": measured_marker,
+        # Issue #1106: likewise ALWAYS present, so a build whose `gh` history read failed cannot
+        # publish the same empty `dispatch_outcomes` a quiet fleet publishes with nothing to say
+        # about which of the two it is.
+        "dispatch_history": {"outcome": "ok", "detail": "", "fetched": True},
     }
     check("fixture leases + limits -> expected JSON", got, expected)
     check("dispatch log counts", _parse_dispatch_log(
@@ -2590,6 +2763,7 @@ def _self_test():
         "2025-01-01Z defer owner/repo#2: busy\n"
         "2025-01-01Z dispatcher complete: 1 worker/review/fix run(s) launched\n"), (1, 1, None))
     _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measured_sidecar)
+    _self_test_history_fetch(check, issues, leases, usage, now, measured_sidecar)
     check("raw identity absent", handle not in json.dumps(got) and email not in json.dumps(got), True)
     leaky = copy.deepcopy(got)
     leaky["provider_quota"][0]["debug"] = handle
@@ -4258,7 +4432,12 @@ esac
                            "5h_reset": live_now + 3600, "7d_used": "80", "7d_util": "0.8",
                            "7d_reset": live_now + 86400}}
 
-    def main_document(sidecar):
+    # [#1106] The history stub is now a PAIR (rows, fetch outcome), and the published marker joins
+    # the tuple below: dropping `history_status=history_status` from main()'s build_dashboard call
+    # would publish `unknown` where the fetcher said `failed`, with every other row here green.
+    failed_history_marker = {"outcome": "failed", "detail": "gh-exited-nonzero", "fetched": False}
+
+    def main_document(sidecar, history_stub=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for name, payload in (("issues.json", issues), ("usage.json", live_usage),
@@ -4268,7 +4447,8 @@ esac
                 Path(root, name).write_text(json.dumps(payload), encoding="utf-8")
             saved_history = globals()["_fetch_dispatch_history"]
             saved_salt = os.environ.get("PROVENANCE_SALT")
-            globals()["_fetch_dispatch_history"] = lambda repo, count: []
+            globals()["_fetch_dispatch_history"] = history_stub or (
+                lambda repo, count: ([], {"outcome": "failed", "detail": "gh-exited-nonzero"}))
             os.environ["PROVENANCE_SALT"] = "fixture-salt"
             try:
                 main(["--issues-file", str(root / "issues.json"),
@@ -4291,16 +4471,29 @@ esac
                     # [#374] the END-TO-END statement: whatever else main() writes, the file that
                     # actually reaches Pages carries no composition key.
                     sorted(FLEET_COMPOSITION_KEYS
-                           & set(re.findall(r'"([^"]+)":', json.dumps(published)))))
+                           & set(re.findall(r'"([^"]+)":', json.dumps(published)))),
+                    # [#1106] ...and the fetch outcome the stubbed fetcher handed main().
+                    published.get("dispatch_history"))
 
     check("[#612] main() forwards a FRESH sidecar, so a healthy run still publishes capacity",
           main_document({"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
                          "attempted_at": live_now}),
-          (True, "available", {"anthropic": True}, []))
+          (True, "available", {"anthropic": True}, [], failed_history_marker))
     check("[#612] main() forwards a FAILED sidecar, so the same run publishes none",
           main_document({"schema": PROBE_SCHEMA, "outcome": "failed",
                          "detail": "probe-exited-nonzero", "attempted_at": live_now}),
-          (False, "unknown", {"anthropic": False}, []))
+          (False, "unknown", {"anthropic": False}, [], failed_history_marker))
+    # ...and the OTHER polarity through the same entrypoint, so the marker is shown to track the
+    # fetcher's answer rather than being pinned to one constant (pre-flight item 2(d)).
+    check("[#1106] main() publishes `fetched: True` when the history read SUCCEEDED — the marker "
+          "tracks the fetch outcome, it is not pinned to one value",
+          main_document({"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
+                         "attempted_at": live_now},
+                        history_stub=lambda repo, count: (
+                            [{"at": "2025-06-15T15:05:00Z", "conclusion": "success",
+                              "dispatched": 1, "deferred": 0, "lanes": None}],
+                            {"outcome": "ok", "detail": ""}))[-1],
+          {"outcome": "ok", "detail": "", "fetched": True})
 
     # --- #612 review round 2, finding 5 (MINOR), UI half: the page's call sites. Deleting
     # `summary.append(probe)` or the SECOND argument of `updateFreshness(...)` removes the promised
@@ -4399,9 +4592,15 @@ const degraded = (node) =>
     ids.warning = element("div#warning");
     ids.summary = element("div#summary");
     ids["provider-quota"] = element("div#provider-quota");
+    ids.outcomes = element("tbody#outcomes");
     scope.render(document_);
     warnings[name] = {
       hidden: ids.warning.hidden,
+      // [#1106] the dispatch-outcomes body as the page SHOWS it. render() is the one call site
+      // that wires `data.dispatch_history` into renderOutcomes, so dropping that second argument
+      // changes this text — it is not satisfiable by an occurrence elsewhere in app.js.
+      outcomes: text(ids.outcomes),
+      outcomesDegraded: (ids.outcomes.children || []).some(degraded),
       // [#374] the rendered quota + summary text, so the assertions below can state what the page
       // SHOWS rather than what app.js contains: a headroom word and a percentage, never a count of
       // accounts. `text()` walks children, which is where every one of those strings lives.
@@ -4446,6 +4645,19 @@ const degraded = (node) =>
         issues, leases, live_usage, history, None, now, "fixture-salt",
         probe_status={"schema": PROBE_SCHEMA, "outcome": "failed",
                       "detail": "secret-materialization-failed", "attempted_at": now})
+    # --- [#1106] the pair the issue is about: NO dispatch history, once because the fleet has
+    # genuinely never dispatched and once because the `gh` run listing failed. Everything the page
+    # had to go on — `dispatch_outcomes: []` and `last_sweep_at: null` — is identical between them.
+    quiet_history_document = build_dashboard(
+        issues, leases, live_usage, [], None, live_now, "fixture-salt",
+        probe_status={"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
+                      "attempted_at": live_now},
+        history_status={"outcome": "ok", "detail": ""})
+    lost_history_document = build_dashboard(
+        issues, leases, live_usage, [], None, live_now, "fixture-salt",
+        probe_status={"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
+                      "attempted_at": live_now},
+        history_status={"outcome": "failed", "detail": "gh-exited-nonzero"})
     # --- [#71] reset stamps, on BOTH sides of the wall clock the page renders against. A reset is
     # the only FORWARD-looking instant the page shows, and `relative()` renders any instant, so a
     # stamp that elapsed after the build printed "next reset 6 minutes ago" — a pending refill that
@@ -4470,7 +4682,9 @@ const degraded = (node) =>
                     "failed": failed_document["usage_probe"],
                     "absent": None},
          "documents": {"measured": measured_document, "failed": failed_document,
-                       "staleFailed": stale_failed_document},
+                       "staleFailed": stale_failed_document,
+                       "quietHistory": quiet_history_document,
+                       "lostHistory": lost_history_document},
          # -360 is the issue's own reading ("Resets 6 minutes ago"). `split` is the case a single
          # per-CARD staleness flag gets wrong: the first window has refilled while the last known
          # refill is still ahead, so the two stamps must be judged INDEPENDENTLY.
@@ -4509,6 +4723,37 @@ const degraded = (node) =>
            page["warnings"]["staleFailed"]["probeNotice"],
            page["warnings"]["staleFailed"]["capacityNote"]),
           (0, False, 1, False, True, False, 2, True, True, True))
+    # --- [#1106] ...and the same executed page on the two histories-that-are-not-there. Both rows
+    # below are red on the pre-#1106 page, where the two documents rendered the SAME string.
+    quiet_page = page["warnings"].get("quietHistory") or {}
+    lost_page = page["warnings"].get("lostHistory") or {}
+    check("[#1106] EXECUTED page script: a fleet that has genuinely never dispatched and one whose "
+          "history could not be READ no longer render the same empty-history row",
+          (quiet_page.get("outcomes", "").strip(), quiet_page.get("outcomesDegraded"),
+           "could not be read" in lost_page.get("outcomes", ""),
+           "gh-exited-nonzero" in lost_page.get("outcomes", ""),
+           lost_page.get("outcomesDegraded"),
+           quiet_page.get("outcomes") == lost_page.get("outcomes")),
+          ("No dispatch history is available.", False, True, True, True, False))
+    check("[#1106] EXECUTED page script: the zeroed Last-dispatch-sweep card says the history "
+          "could not be read, instead of the quiet fleet's `No completed sweep data`",
+          ("No completed sweep data" in quiet_page.get("capacityLines", ""),
+           quiet_page.get("summaryDegraded"),
+           "could not be read" in lost_page.get("capacityLines", ""),
+           "No completed sweep data" in lost_page.get("capacityLines", ""),
+           lost_page.get("summaryDegraded")),
+          (True, False, True, False, True))
+    # The marker is consulted ONLY where the absence of rows is the ambiguous signal: `measured`
+    # carries a real sweep and no fetch outcome at all, and must still read as a normal page rather
+    # than being relabelled unavailable by the fail-closed default.
+    check("[#1106] a document that HAS sweeps is untouched by the marker (the notice is scoped to "
+          "the empty case, not applied to every build that stated no fetch outcome)",
+          (measured_document.get("dispatch_history"),
+           "could not be read" in page["warnings"]["measured"]["capacityLines"],
+           "could not be read" in page["warnings"]["measured"]["outcomes"],
+           page["warnings"]["measured"]["outcomesDegraded"]),
+          ({"outcome": "unknown", "detail": "", "fetched": False}, False, False, False))
+
     # --- [#374] the SAME executed page, on what the fleet section now shows. The measured document
     # is the one-anthropic-account fixture: pre-#374 this section rendered "1 account · 1 free ·
     # 0 capped", a "single account" badge, "0.9 of 1 account-windows free" and a
@@ -5019,11 +5264,11 @@ def main(argv=None):
             probe_status = {}
     model_health = _read_json(args.model_health, default=None)
     observability = _read_json(args.observability, default=None)
-    history = _fetch_dispatch_history(repo, args.history)
+    history, history_status = _fetch_dispatch_history(repo, args.history)
     document = build_dashboard(
         issues, leases, usage, history, model_health, int(time.time()),
         os.environ.get("PROVENANCE_SALT", ""), observability=observability,
-        probe_status=probe_status)
+        probe_status=probe_status, history_status=history_status)
     _write_site(document, args.assets, args.site)
     # Public workflow log: never disclose the account count (issue #184; the codebase norm in
     # model-health.py — "the public workflow log never carries provider counts").
