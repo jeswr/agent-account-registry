@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5306,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "71a24b417af3d9090e72c424a6f703326aabad61",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The workflow change correctly extends the existing offline Lychee gate to Markdown under metrics/ and scripts/agent-telemetry/, while preserving fragment checking and failure behavior. The newly covered documents' relative targets referenced in the diff rationale and current Markdown links resolve in the PR checkout. The companion markdownlint comment is consistent with the workflow scope. No correctness, security, or test-validity issue was found.",
+  "verdict": "approve"
+ }
+}
