@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5467,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "df8c92576e8b27fccd4c535ef7d7113aa48b819e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In split_blocks, any line matching BEGIN_INJECT_RE sets in_inject=True, and EOF while in_inject is accepted. Every subsequent line is discarded, so adding `<!-- BEGIN-INJECT -->` without a matching end marker can hide arbitrary hand-copied content from the hard exact-duplication gate. The regex also accepts loose marker shapes rather than the documented `<!-- BEGIN-INJECT: \u2026 -->` form. The self-test covers only a well-balanced region, so it does not exercise the fail-closed invariant.",
+    "file": "scripts/check-doc-duplication.py",
+    "fix_hint": "Parse strict BEGIN/END marker lines, track the opening line, and report malformed, nested, unmatched-END, and unterminated-BEGIN regions as gating findings/errors. Add hermetic self-tests proving each malformed delimiter case returns failure, especially a planted duplicate after an unterminated BEGIN marker.",
+    "severity": "major",
+    "title": "Unterminated BEGIN-INJECT silently exempts the rest of a document"
+   }
+  ],
+  "progress": null,
+  "summary": "The two-tier duplication checker is well structured and its ordinary duplicate, link-normalization, fence, allowlist, and advisory behaviors have meaningful self-tests. However, the new gating checker can be bypassed by a malformed or unterminated BEGIN-INJECT marker: split_blocks enters injection mode and silently discards the rest of the file without validating that a matching END-INJECT exists. Because injected regions are an explicit exclusion from the scanned surface, malformed delimiters must fail closed before this becomes a hard CI gate.",
+  "verdict": "request_changes"
+ }
+}
