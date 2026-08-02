@@ -22403,16 +22403,24 @@ def _escalation_call_site(source):
 # [registry #1028] REACHABILITY, for the call-site seams below.
 #
 # `ast.walk` answers "does this node EXIST in the tree", which is a strictly weaker question than
-# "does this node RUN". Two shapes exploit the gap, and both leave a seam checker returning
+# "does this node RUN". Three shapes exploit the gap, and each leaves a seam checker returning
 # `"dispatch"` while the production behaviour it certifies is gone:
 #
 #   - the statement is parsed but never executed  -> `if False:` / `while False:` / the `else:`
 #     of a constant-true guard;
 #   - the statement is executed only if something CALLS it -> a nested `def` / `async def` /
 #     `lambda`, including a method in a class body, that nothing ever calls.
+#   - the expression is executed only if something CONSUMES it -> the element of a GENERATOR
+#     expression. `(park(...) for _ in (0,))` as a statement builds a generator and runs nothing.
+#     A list/set/dict COMPREHENSION is not this shape: it runs to completion where it is written,
+#     so it stays live.
 #
-# So the seams decide ancestry on the LIVE tree. This is deliberately a conservative predicate:
-# it prunes only what it can prove at parse time, and everything it cannot decide stays live.
+# So the seams decide ancestry on the LIVE tree, and every case it cannot decide at parse time
+# stays live — a mis-read must never prune real production code out from under a seam check.
+# The ONE place it prunes something a run could still reach is the generator-expression element:
+# whether the generator is ever consumed is not a parse-time fact, so the seam refuses that shape
+# outright. That direction is fail-closed (a refusal reds the seam and stops the tick from being
+# certified); accepting it would certify a park that may never happen.
 # --------------------------------------------------------------------------------------------
 _SCOPE_BOUNDARIES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 
@@ -22433,29 +22441,41 @@ def _constant_test_truth(test):
 
 
 def _live_children(node):
-    """`ast.iter_child_nodes(node)` with the branch a constant test can never take removed."""
+    """`ast.iter_child_nodes(node)` with the children a run of `node` alone cannot reach removed."""
     if isinstance(node, (ast.If, ast.While)):
         truth = _constant_test_truth(node.test)
         if truth is not None:
             # `if False:`/`while False:` never runs its body; the `else:` of a constant-true
             # guard never runs either. The test itself is kept: it is evaluated.
             return [node.test, *(node.body if truth else node.orelse)]
+    if isinstance(node, ast.GeneratorExp):
+        # Building a generator evaluates EXACTLY ONE thing: the outermost iterable, which is
+        # iterated eagerly. The element, the `if` filters and every later `for` clause run only
+        # once something consumes the generator — so they are deferred, exactly like a `lambda`
+        # body. The outermost iterable stays live because it genuinely does run here. It always
+        # exists: the grammar requires at least one `for` clause, so `ast.parse` cannot hand us a
+        # generator with an empty `generators` (an `if node.generators` guard here would be a
+        # line no run can ever execute).
+        return [node.generators[0].iter]
     return list(ast.iter_child_nodes(node))
 
 
 def _live_nodes(root):
     """[registry #1028] Yield `root` and every descendant reached by RUNNING `root`.
 
-    Two differences from `ast.walk`, and they are the whole point:
+    Three differences from `ast.walk`, and they are the whole point:
 
       - a branch under a constant-false test is pruned (see `_constant_test_truth`);
       - a nested `def`/`async def`/`lambda` is a DEFERRED scope: reaching the `def` statement
         binds a name, it does not run the body. The boundary node itself is yielded (it really
         does execute) but traversal stops there.
+      - a GENERATOR expression is deferred the same way: creating it runs only its outermost
+        iterable, so that is the one child kept (see `_live_children`).
 
     A `class` body is deliberately NOT a boundary — it executes in place when the `class`
     statement runs. Its methods are `FunctionDef`s, so they are still stopped at individually,
-    which is exactly the "moved into a class-body method nothing calls" shape.
+    which is exactly the "moved into a class-body method nothing calls" shape. A list/set/dict
+    COMPREHENSION is likewise not a boundary: it runs to completion where it is written.
     """
     yield root
     for child in _live_children(root):
@@ -22483,17 +22503,19 @@ def _park_call_site(source):
                                                        not a number retyped at the call site.
 
     [registry #1028] Every ACCEPTING scan runs over `_live_nodes`, never `ast.walk`: a loop, or a
-    park call, buried under `if False:` or moved into a nested `def`/`async def`/class-body method
-    that nothing calls restores the same 1-holder-per-tick defect while EXISTING in the tree. The
-    REFUSING scan over the iterable stays exhaustive (`ast.walk`) on purpose — a refusal must see
-    a `[:1]` wherever it hides, so pruning there could only ever weaken it.
+    park call, buried under `if False:`, moved into a nested `def`/`async def`/class-body method
+    that nothing calls, or left as the element of an unconsumed GENERATOR expression restores the
+    same 1-holder-per-tick defect while EXISTING in the tree. The REFUSING scan over the iterable
+    stays exhaustive (`ast.walk`) on purpose — a refusal must see a `[:1]` wherever it hides, so
+    pruning there could only ever weaken it.
 
     HONEST BOUNDARY: this proves the park call is reached from the loop body in the shipped tree,
     not that the loop runs on a given tick (an earlier statement can raise, and the production
     iterable is itself guarded by `bot_login and _target_token(repo)`). It also refuses a call
-    site that legitimately delegates the park to a helper function — that shape is indistinguish-
-    able from the dead one here, so a real refactor of that kind must re-point this checker rather
-    than route around it.
+    site that legitimately delegates the park to a helper function, and one that parks from a
+    generator expression the caller really does consume — both shapes are indistinguishable from
+    the dead one here, so a real refactor of either kind must re-point this checker rather than
+    route around it.
     """
     tree = ast.parse(source)
     for func in _live_nodes(tree):
@@ -22533,10 +22555,11 @@ def _park_call_site_reachability_self_test():
 
     The production assertion in `_starvation_sweep_self_test` can only ever say "the shipped tree
     still parks every target". It says nothing about what the checker would refuse, so before this
-    the refusals were unpinned — and two of them did not exist: `ast.walk` proves a node EXISTS,
+    the refusals were unpinned — and three of them did not exist: `ast.walk` proves a node EXISTS,
     never that it RUNS, so the park loop (or its park call) under `if False:` / `while False:` /
-    the `else:` of a constant-true guard, and the park call moved into an uncalled nested
-    `def`/`async def`/class-body method, each restored the exact 1-holder-per-tick defect #822
+    the `else:` of a constant-true guard, the park call moved into an uncalled nested
+    `def`/`async def`/class-body method, and the park call left as the element of a GENERATOR
+    expression nothing consumes, each restored the exact 1-holder-per-tick defect #822
     removed with `_park_call_site` still returning `"dispatch"` and the whole suite green.
 
     Every reachability mutant below is proved to be EXACTLY that shape and nothing else: the same
@@ -22579,6 +22602,22 @@ def _park_call_site_reachability_self_test():
             for target in targets:
                 class _Receipt:
                     park_starved_partition_holder(repo, target, starved)
+        """)),
+        # A COMPREHENSION is not a generator: it runs to completion where it is written, so its
+        # element really does park. This is the guard that stops the generator pruning below from
+        # being widened to every `comprehension`-bearing node.
+        ("park call in a list COMPREHENSION under the loop", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                _receipts = [park_starved_partition_holder(repo, target, starved)
+                             for _ in (0,)]
+        """)),
+        # ...and the ONE part of a generator expression that IS evaluated at creation: the
+        # outermost iterable is iterated eagerly. Pruning the whole generator node would red here.
+        ("park call in a generator's OUTERMOST iterable", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                _receipts = (row for row in park_starved_partition_holder(repo, target, starved))
         """)),
     ]
 
@@ -22643,6 +22682,30 @@ def _park_call_site_reachability_self_test():
                     def park(self):
                         park_starved_partition_holder(repo, target, starved)
         """)),
+        # The generator shapes. Building a generator runs NOTHING but its outermost iterable, so
+        # a park call in the ELEMENT, in an `if` filter, or under a second `for` clause never
+        # happens unless someone consumes it — and as a bare statement nobody ever does.
+        ("park call in the ELEMENT of an unconsumed generator expression", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                (park_starved_partition_holder(repo, target, starved) for _ in (0,))
+        """)),
+        ("park call in the `if` FILTER of an unconsumed generator expression", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                (_ for _ in (0,) if park_starved_partition_holder(repo, target, starved))
+        """)),
+        ("park call in a generator's SECOND `for` clause", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                (_b for _a in (0,)
+                 for _b in park_starved_partition_holder(repo, target, starved))
+        """)),
+        ("park call in a generator bound to a name and never consumed", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                _receipts = (park_starved_partition_holder(repo, target, starved) for _ in (0,))
+        """)),
         ("the targets ASSIGN under `if False:`", wrap("""
             if False:
                 targets = starvation_park_targets(items, starved, occupancy)
@@ -22684,7 +22747,8 @@ def _park_call_site_reachability_self_test():
             f"got {_park_call_site(source)!r}. A reachability predicate that drops live code "
             "turns every refusal in this battery into a pass for the wrong reason.")
     print(f"  ok   #1028 park seam ACCEPTS the {len(accepted)} shapes that really execute "
-          "(live call site, both live arms of a constant guard, a class body)")
+          "(live call site, both live arms of a constant guard, a class body, a comprehension, "
+          "a generator's outermost iterable)")
 
     for what, source in unreachable + rescalarised:
         assert _park_call_site(source) is None, (
