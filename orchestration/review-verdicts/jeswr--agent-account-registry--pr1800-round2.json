@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1800,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "adee1bf9cb7d432c0fe08ca357ad6f6f822a117b",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 diff remains correct, complete, and non-vacuous. The repository identity for each leg is extracted from that leg's real API endpoints with explicit refusal on zero or multiple repositories, while `${GITHUB_REPOSITORY}` is consistently normalized. The production assertion independently pins the complete three-source watch map, so deleting a watcher cannot make the collision check vacuously pass; separate fixtures prove positive collision detection, single-watcher exclusion, and repository-sensitive target identity. The claimed current topology matches the extracted workflow bodies, including metrics.yml's staleness-driven dashboard leg while correctly excluding its causal publish dispatch. No trust check, permission, secret handling, or workflow execution surface is weakened, and the diff contains no reviewer-directed instruction. Round 1 also had no findings, so there is no reduction or severity improvement to report.",
+  "verdict": "approve"
+ }
+}
