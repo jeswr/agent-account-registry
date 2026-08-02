@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 5733,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7a4fbe7842eaf5c77886ca608bcabd907a6269ff",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 10.2 claims `union Delta_j = diff(M...head_J)` and therefore exact equality of the affected sets. This fails when a later group reverts or otherwise cancels an earlier group's path change: that path remains in the union of per-group diffs but is absent from the endpoint diff. Full-run triggers can make the affected-set equality fail similarly. Because this equality is presented as the lemma carrying the corrected soundness argument, the proof is not valid as written, even though the conservative direction may still hold.",
+    "file": "research/change-based-test-selection.md",
+    "fix_hint": "Replace the equality with the direction actually needed, e.g. `affected(final endpoint diff) subseteq union_j A_j`, and prove it while accounting for cancellations, full-run triggers, unowned paths, reader mappings, and reverse-dependency closure. Remove all downstream claims of exact equality/no-larger replay unless separately proved. Add a small cancellation/revert example as a proof sanity check.",
+    "severity": "major",
+    "title": "The telescoping equality is false for path diffs"
+   },
+   {
+    "body": "Precondition 5 says `tree(G_J)` lands by fast-forwarding the group head onto `main`, which is load-bearing for transferring an earlier group's green verdict to the tree that merges. Section 10.5, however, describes landed history as `squash-merge => one commit per PR`. Those are materially different models: if members land as separate squash commits, intermediate main states need not equal the tested group tree, and the theorem must explain why every state that can land is covered. The diff provides no live payload or mechanism evidence resolving this contradiction and itself admits that stacked `base_sha` semantics were not re-verified.",
+    "file": "research/change-based-test-selection.md",
+    "fix_hint": "Verify and cite the actual merge-queue landing semantics for grouped PRs. State a single consistent commit/tree model. If PRs land individually, reformulate the theorem to cover each landable intermediate tree (including cancellation/revert cases); if the tested group head itself is what lands, remove or explain the one-squash-commit-per-PR claim. Until that load-bearing premise is evidenced, do not conclude that merge-group selection adds no soundness surface.",
+    "severity": "major",
+    "title": "The merge-tree premise conflicts with the documented per-PR squash history"
+   },
+   {
+    "body": "The new RESOLVED block elevates Section 10 to the doc of record and states that per-group affected sets union to exactly the union-diff set and that the conclusion holds under either base interpretation. That is stronger than the diff supports because cancellation invalidates exactness and the landing semantics remain unresolved.",
+    "file": "research/ci-mergequeue-speedup-2026-07.md",
+    "fix_hint": "After repairing the proof and verifying queue mechanics in the doc of record, rewrite this summary to state only the proven conservative relation and its explicit operational preconditions.",
+    "severity": "minor",
+    "title": "The resolved summary repeats the unproved exact-union conclusion"
+   }
+  ],
+  "progress": null,
+  "summary": "The docs-only change makes a central soundness argument, but two load-bearing statements are mathematically or operationally unsupported as written. In particular, path diffs do not telescope by equality when changes cancel, and the record simultaneously assumes that the group head fast-forwards onto main while describing one squash commit per PR. The safe conclusion may be recoverable with a monotone-superset proof and verified merge mechanics, but the current theorem does not establish it.",
+  "verdict": "request_changes"
+ }
+}
