@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5591,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9073ffea81071b7b86be8b34e3559d8fe69bb9ba",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains clean. The dedicated sparq-lws-core measurement lane is fail-closed when selection is unavailable, skips only when selected-mode output proves the crate unaffected, measures exactly the intended package, and feeds failures into both the aggregate coverage verdict and the post-merge demoted-lane filer. The partition declaration keeps per-commit ownership explicit, while the focused wiring tests exercise the load-bearing selection, aggregation, package-scope, ownership, and job-name matching paths. The documentation accurately distinguishes measurement from enforcement while the line-coverage floor remains unseeded. No correctness, security, soundness, or vacuous-test defect is evident in the supplied diff.",
+  "verdict": "approve"
+ }
+}
