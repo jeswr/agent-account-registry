@@ -22399,6 +22399,72 @@ def _escalation_call_site(source):
     return None
 
 
+# --------------------------------------------------------------------------------------------
+# [registry #1028] REACHABILITY, for the call-site seams below.
+#
+# `ast.walk` answers "does this node EXIST in the tree", which is a strictly weaker question than
+# "does this node RUN". Two shapes exploit the gap, and both leave a seam checker returning
+# `"dispatch"` while the production behaviour it certifies is gone:
+#
+#   - the statement is parsed but never executed  -> `if False:` / `while False:` / the `else:`
+#     of a constant-true guard;
+#   - the statement is executed only if something CALLS it -> a nested `def` / `async def` /
+#     `lambda`, including a method in a class body, that nothing ever calls.
+#
+# So the seams decide ancestry on the LIVE tree. This is deliberately a conservative predicate:
+# it prunes only what it can prove at parse time, and everything it cannot decide stays live.
+# --------------------------------------------------------------------------------------------
+_SCOPE_BOUNDARIES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
+def _constant_test_truth(test):
+    """`True`/`False` when `test` is decided by the literal alone; `None` when it is not.
+
+    Only literals and `not <literal>` are decided. Anything a run could change — a name, a call,
+    a comparison — returns `None` and its branches stay live, so a mis-read never PRUNES real
+    production code out from under a seam check.
+    """
+    if isinstance(test, ast.Constant):
+        return bool(test.value)
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        inner = _constant_test_truth(test.operand)
+        return None if inner is None else (not inner)
+    return None
+
+
+def _live_children(node):
+    """`ast.iter_child_nodes(node)` with the branch a constant test can never take removed."""
+    if isinstance(node, (ast.If, ast.While)):
+        truth = _constant_test_truth(node.test)
+        if truth is not None:
+            # `if False:`/`while False:` never runs its body; the `else:` of a constant-true
+            # guard never runs either. The test itself is kept: it is evaluated.
+            return [node.test, *(node.body if truth else node.orelse)]
+    return list(ast.iter_child_nodes(node))
+
+
+def _live_nodes(root):
+    """[registry #1028] Yield `root` and every descendant reached by RUNNING `root`.
+
+    Two differences from `ast.walk`, and they are the whole point:
+
+      - a branch under a constant-false test is pruned (see `_constant_test_truth`);
+      - a nested `def`/`async def`/`lambda` is a DEFERRED scope: reaching the `def` statement
+        binds a name, it does not run the body. The boundary node itself is yielded (it really
+        does execute) but traversal stops there.
+
+    A `class` body is deliberately NOT a boundary — it executes in place when the `class`
+    statement runs. Its methods are `FunctionDef`s, so they are still stopped at individually,
+    which is exactly the "moved into a class-body method nothing calls" shape.
+    """
+    yield root
+    for child in _live_children(root):
+        if isinstance(child, _SCOPE_BOUNDARIES):
+            yield child          # the `def` runs; its body does not
+            continue
+        yield from _live_nodes(child)
+
+
 def _park_call_site(source):
     """[registry #822] STRUCTURAL proof that some PRODUCTION function iterates EVERY target
     `starvation_park_targets(...)` returned and parks EACH one. Returns that function's name,
@@ -22415,14 +22481,26 @@ def _park_call_site(source):
       - any SLICE in the loop's iterable            -> `[:1]` is the defect wearing a loop;
       - a `cap=` keyword at the call site           -> the bound must be the DERIVED constant,
                                                        not a number retyped at the call site.
+
+    [registry #1028] Every ACCEPTING scan runs over `_live_nodes`, never `ast.walk`: a loop, or a
+    park call, buried under `if False:` or moved into a nested `def`/`async def`/class-body method
+    that nothing calls restores the same 1-holder-per-tick defect while EXISTING in the tree. The
+    REFUSING scan over the iterable stays exhaustive (`ast.walk`) on purpose — a refusal must see
+    a `[:1]` wherever it hides, so pruning there could only ever weaken it.
+
+    HONEST BOUNDARY: this proves the park call is reached from the loop body in the shipped tree,
+    not that the loop runs on a given tick (an earlier statement can raise, and the production
+    iterable is itself guarded by `bot_login and _target_token(repo)`). It also refuses a call
+    site that legitimately delegates the park to a helper function — that shape is indistinguish-
+    able from the dead one here, so a real refactor of that kind must re-point this checker rather
+    than route around it.
     """
-    import ast
     tree = ast.parse(source)
-    for func in ast.walk(tree):
+    for func in _live_nodes(tree):
         if not isinstance(func, ast.FunctionDef) or func.name.endswith("_self_test"):
             continue
         bound = set()
-        for node in ast.walk(func):
+        for node in _live_nodes(func):
             if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
                 continue
             if getattr(node.value.func, "id", None) != "starvation_park_targets":
@@ -22433,7 +22511,7 @@ def _park_call_site(source):
                          if isinstance(target, ast.Name))
         if not bound:
             continue
-        for loop in ast.walk(func):
+        for loop in _live_nodes(func):
             if not isinstance(loop, ast.For):
                 continue
             iter_names = {node.id for node in ast.walk(loop.iter)
@@ -22442,12 +22520,200 @@ def _park_call_site(source):
                 continue
             if any(isinstance(node, ast.Slice) for node in ast.walk(loop.iter)):
                 continue                  # `targets[:1]` is the per-tick cap of 1, re-typed
-            for stmt in ast.walk(loop):
+            for stmt in _live_nodes(loop):
                 if (isinstance(stmt, ast.Call)
                         and getattr(stmt.func, "id", None)
                         == "park_starved_partition_holder"):
                     return func.name
     return None
+
+
+def _park_call_site_reachability_self_test():
+    """[registry #1028] Pin what `_park_call_site` ACCEPTS and what it REFUSES, on synthetic source.
+
+    The production assertion in `_starvation_sweep_self_test` can only ever say "the shipped tree
+    still parks every target". It says nothing about what the checker would refuse, so before this
+    the refusals were unpinned — and two of them did not exist: `ast.walk` proves a node EXISTS,
+    never that it RUNS, so the park loop (or its park call) under `if False:` / `while False:` /
+    the `else:` of a constant-true guard, and the park call moved into an uncalled nested
+    `def`/`async def`/class-body method, each restored the exact 1-holder-per-tick defect #822
+    removed with `_park_call_site` still returning `"dispatch"` and the whole suite green.
+
+    Every reachability mutant below is proved to be EXACTLY that shape and nothing else: the same
+    source is re-run with `_live_nodes` swapped back to `ast.walk`, and each one must then be
+    ACCEPTED. Without that leg a mutant could red for an unrelated reason — a typo, a renamed
+    callee — and record as a kill while the hole stayed open (AGENTS.md pre-flight, *false kill*).
+    """
+    def wrap(body):
+        return "def dispatch():\n" + textwrap.indent(textwrap.dedent(body).strip("\n"), "    ")
+
+    live = wrap("""
+        targets = starvation_park_targets(items, starved, occupancy)
+        for target in targets:
+            park_starved_partition_holder(repo, target, starved)
+    """)
+
+    # ACCEPTED: the live shape, plus the branches a constant test really does take. These are the
+    # over-pruning guard — a `_live_nodes` that dropped a live branch would red here, and every
+    # refusal below would then be passing for the wrong reason.
+    accepted = [
+        ("live call site", live),
+        ("loop under a constant-TRUE guard", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            if True:
+                for target in targets:
+                    park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("loop in the `else:` of a constant-FALSE guard", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            if False:
+                pass
+            else:
+                for target in targets:
+                    park_starved_partition_holder(repo, target, starved)
+        """)),
+        # A class BODY executes in place when the `class` statement runs, so it is deliberately
+        # not a scope boundary. Only the methods inside it are deferred (see `class-body method`).
+        ("park call in a class BODY under the loop", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                class _Receipt:
+                    park_starved_partition_holder(repo, target, starved)
+        """)),
+    ]
+
+    # REFUSED, and every one of these is ACCEPTED by the pre-#1028 `ast.walk` checker.
+    unreachable = [
+        ("loop under `if False:`", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            if False:
+                for target in targets:
+                    park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("loop under `while False:`", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            while False:
+                for target in targets:
+                    park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("loop in the `else:` of a constant-TRUE guard", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            if True:
+                pass
+            else:
+                for target in targets:
+                    park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("park call under `if False:` inside the loop", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                if False:
+                    park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("park call in the `else:` of a constant-TRUE guard inside the loop", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                if True:
+                    pass
+                else:
+                    park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("park call under `if not True:` inside the loop", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                if not True:
+                    park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("park call in an uncalled nested `def` under the loop", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                def _park():
+                    park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("park call in an uncalled nested `async def` under the loop", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                async def _park():
+                    park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("park call in an uncalled class-body METHOD under the loop", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                class _Parker:
+                    def park(self):
+                        park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("the targets ASSIGN under `if False:`", wrap("""
+            if False:
+                targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("the whole production function under a module-level `if False:`",
+         "if False:\n" + textwrap.indent(live, "    ")),
+    ]
+
+    # REFUSED for the reasons #822 already stated. Re-pinned here because the rewrite above
+    # touches every scan point they are decided at, and none of them had a red test before.
+    rescalarised = [
+        ("no `for` at all — the batch is indexed", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            park_starved_partition_holder(repo, targets[0], starved)
+        """)),
+        ("`[:1]` in the loop's iterable", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets[:1]:
+                park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("a `cap=` keyword at the call site", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy, cap=1)
+            for target in targets:
+                park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("the park call OUTSIDE the loop", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                pass
+            park_starved_partition_holder(repo, targets[0], starved)
+        """)),
+    ]
+
+    for what, source in accepted:
+        assert _park_call_site(source) == "dispatch", (
+            f"#1028 over-pruned: `{what}` DOES run, so _park_call_site must certify it — "
+            f"got {_park_call_site(source)!r}. A reachability predicate that drops live code "
+            "turns every refusal in this battery into a pass for the wrong reason.")
+    print(f"  ok   #1028 park seam ACCEPTS the {len(accepted)} shapes that really execute "
+          "(live call site, both live arms of a constant guard, a class body)")
+
+    for what, source in unreachable + rescalarised:
+        assert _park_call_site(source) is None, (
+            f"#1028 park seam must REFUSE `{what}`: it certifies a park that never happens, "
+            "which is the 1-holder-per-tick defect #822 removed at ~10 min/holder, with every "
+            "other assertion in this file green.")
+    print(f"  ok   #1028 park seam REFUSES all {len(unreachable)} dead/deferred-scope shapes and "
+          f"all {len(rescalarised)} re-scalarised ones")
+
+    # The false-kill leg: each reachability mutant is well-formed source that the PREVIOUS
+    # (`ast.walk`) checker accepted, so the refusal above is caused by reachability and by
+    # nothing else. `_park_call_site` reads `_live_nodes` from the module globals, so the swap is
+    # the pre-#1028 checker exactly — and the assertion after the `finally` is what proves the
+    # swap was undone, since a leaked `ast.walk` would silently re-vacate every check above.
+    real_live_nodes = globals()["_live_nodes"]
+    try:
+        globals()["_live_nodes"] = ast.walk          # the pre-#1028 checker, exactly
+        stale = [what for what, source in unreachable if _park_call_site(source) != "dispatch"]
+    finally:
+        globals()["_live_nodes"] = real_live_nodes
+    assert not stale, (
+        f"#1028 mutants {stale} are refused even by the old `ast.walk` checker, so they prove "
+        "nothing about reachability — they are malformed, not dead. Rewrite each so its only "
+        "defect is that the park call never runs.")
+    assert _park_call_site(live) == "dispatch", (
+        "the `_live_nodes` swap-back must be restored — a leaked `ast.walk` global would leave "
+        "the production seam assertion measuring the pre-#1028 checker")
+    print(f"  ok   #1028 all {len(unreachable)} reachability mutants are accepted by the "
+          "pre-#1028 `ast.walk` checker — each refusal is reachability, not malformedness")
 
 
 def _starvation_park_batch_source():
@@ -23757,6 +24023,10 @@ def _starvation_sweep_self_test():
         f"— otherwise the 1-holder-per-tick defect is back at 10 min/holder (found {park_seam!r})")
     print("  ok   #822 park call-site seam (AST): the production tick PARKS EVERY selected "
           "holder — a re-scalarised call site, a `[:1]`, or a call-site cap= reds here")
+    # ...and the assertion above is a claim about the SHIPPED tree only. What the checker REFUSES
+    # is pinned separately, because `ast.walk` certified a park loop under `if False:` and a park
+    # call in an uncalled nested `def` — the same vacuity shapes, on this seam (registry #1028).
+    _park_call_site_reachability_self_test()
 
     # ---- [registry #822] THE PARK BATCH, EXECUTED on production source -----------------------
     _starvation_park_batch_seam_self_test()
