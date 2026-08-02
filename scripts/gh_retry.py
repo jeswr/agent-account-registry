@@ -136,6 +136,12 @@ _THROTTLE_403 = (
     "retry later",
 )
 _RETRY_AFTER_RE = re.compile(r"retry[-_ ]?after[\"'\s:=]+(\d+(?:\.\d+)?)", re.IGNORECASE)
+# The SAME numeric grammar, but for a caller that holds ONE COMPLETE header field value rather than
+# arbitrary diagnostic text — it is `fullmatch`ed, so trailing junk (`7junk`) and a value that
+# smuggles a second `Retry-After: 9999` token are REJECTED instead of yielding their numeric prefix
+# or their embedded number. `_RETRY_AFTER_RE.search` cannot make that distinction and must not be
+# pointed at a header value (registry #928 review): searching a field value is substring parsing.
+_RETRY_AFTER_VALUE_RE = re.compile(r"\d+(?:\.\d+)?")
 
 # Statusless failures that retrying CANNOT fix: gh usage/flag errors and "no credential configured".
 # Everything ELSE that is statusless is retried on a read (registry #748) — this table exists so a
@@ -198,9 +204,38 @@ def retry_after_seconds(text):
         seconds = float(match.group(1))
     except (TypeError, ValueError):  # pragma: no cover - the regex already constrains the shape
         return None
+    return _bounded_retry_after(seconds)
+
+
+def _bounded_retry_after(seconds):
+    """The shared NUMERIC policy both extractors end in: non-positive is ABSENT, everything else is
+    capped at RETRY_AFTER_CAP. One implementation, so the zero bound and the cap cannot drift
+    between the text extractor and the header one."""
     if seconds <= 0:
         return None
     return min(seconds, RETRY_AFTER_CAP)
+
+
+def retry_after_header_seconds(raw):
+    """The server's requested wait from ONE COMPLETE `Retry-After` HTTP header field value.
+
+    Same policy as `retry_after_seconds` — absent / unparseable / non-positive is None, positive is
+    capped — but the GRAMMAR is full-matched, because the witness here is a whole field value and
+    not the arbitrary `gh` diagnostic text the other extractor searches. That distinction is the
+    point of this function (registry #928 review): `7junk` and a value carrying an embedded
+    `Retry-After: 9999` token are MALFORMED, and a searching parser would honour their numeric
+    prefix / embedded number as a real wait. Both are rejected so the caller falls back to the
+    exponential schedule instead of trusting a number it mis-read.
+
+    HTTP-date forms (rare from GitHub) fail the grammar and so read as absent rather than being
+    mis-parsed into a wrong delay — e.g. `Wed, 21 Oct 2015 07:28:00 GMT` must NOT become 21 seconds.
+    """
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    if not _RETRY_AFTER_VALUE_RE.fullmatch(value):
+        return None
+    return _bounded_retry_after(float(value))
 
 # ---------------------------------------------------------------------------------------------------
 # Registry #748: STATUS RECOVERY off gh's debug channel, and the read-scoped classifier.
@@ -669,6 +704,49 @@ def _self_test():
     check("a genuine positive Retry-After is still honoured (control for the zero fix)",
           (retry_after_seconds("Retry-After: 0.5"),
            retry_after_seconds("HTTP 403: throttled; Retry-After: 30")), (0.5, 30.0))
+
+    # ---- the HEADER extractor: ONE COMPLETE field value, full-matched (registry #928 review) ----
+    # Same numeric policy as above (positive, capped, zero-is-absent), asserted here so a drift
+    # between the two entry points is caught by this suite and not by a caller.
+    check("Retry-After header value parsed, capped, and non-positive is absent",
+          (retry_after_header_seconds("30"), retry_after_header_seconds("0.5"),
+           retry_after_header_seconds(30), retry_after_header_seconds("  30  "),
+           retry_after_header_seconds("9999"), retry_after_header_seconds("0"),
+           retry_after_header_seconds("0.0"), retry_after_header_seconds("-5"),
+           retry_after_header_seconds(None), retry_after_header_seconds("")),
+          (30.0, 0.5, 30.0, 30.0, RETRY_AFTER_CAP, None, None, None, None, None))
+    # The REASON this is a separate entry point. A field value is malformed unless it is ENTIRELY
+    # numeric: trailing junk is not a wait, an HTTP-date is not its day-of-month, and a value
+    # carrying its own `Retry-After:` token is not that token's number. Swap the `fullmatch` for
+    # `_RETRY_AFTER_RE.search` (what the caller used to do by re-wrapping the value) and every row
+    # here goes red -- 7.0, 21.0, 60.0, 60.0 -- while the well-formed rows above stay green.
+    check("a malformed Retry-After header value is REJECTED, never substring-parsed",
+          (retry_after_header_seconds("7junk"), retry_after_header_seconds("7 seconds"),
+           retry_after_header_seconds("Wed, 21 Oct 2026 07:28:00 GMT"),
+           retry_after_header_seconds("junk Retry-After: 9999"),
+           retry_after_header_seconds("Retry-After: 30"),
+           retry_after_header_seconds("soon")),
+          (None, None, None, None, None, None))
+    # ...and the acceptance test is the GRAMMAR, not `float()`'s permissiveness. These five values
+    # are what separates the two: `float` returns inf/nan/exponential/sign-prefixed results for
+    # them, so the pre-#928 `float(str(raw).strip())` parser ACCEPTED all five. `nan` is the sharp
+    # one — it escapes the non-positive bound (`nan <= 0` is False) and `min(nan, CAP)` returns nan,
+    # so one confused header would reach `time.sleep` as nan. Weaken the `fullmatch` to a
+    # `try: float(value) / except ValueError` and this row goes red (60.0, nan, 60.0, 7.0, 60.0)
+    # while every malformed row above stays GREEN — which is exactly why that row alone does not
+    # pin the mechanism, and why this one exists.
+    check("a float()-parseable but NON-GRAMMATICAL header value is rejected (inf/nan/exp/sign)",
+          (retry_after_header_seconds("inf"), retry_after_header_seconds("nan"),
+           retry_after_header_seconds("1e3"), retry_after_header_seconds("+7"),
+           retry_after_header_seconds("Infinity")),
+          (None, None, None, None, None))
+    # CONTROL, in the other direction: the TEXT extractor must keep SEARCHING. Tightening it to a
+    # full match to "fix" the above would break every real caller, whose witness is a whole `gh`
+    # diagnostic with the token embedded in it -- so these two must stay behaviourally different.
+    check("the text extractor still searches embedded tokens (control for the full-match split)",
+          (retry_after_seconds("HTTP 403: throttled; Retry-After: 30"),
+           retry_after_header_seconds("HTTP 403: throttled; Retry-After: 30")),
+          (30.0, None))
 
     # [registry #772] The truncated-body class, verbatim from the six worker.yml runs that lost a
     # provenance record. It carries NO HTTP status, so it reaches the text table or nothing at all.
