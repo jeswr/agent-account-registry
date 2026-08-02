@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5765,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "35619879d0dcf14027c23a4397067fa2a20a7147",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior findings. The new audit now states prominently and repeatedly that the eight-package set is a substitute, defines condition (C), treats (C) as unestablished for every PR, and labels #13263/#13265 actual-row verdicts unresolved pending provenance; the three companion amendments propagate that scope. The #13264 analysis also no longer infers definite guard execution from source-level boolean conjunctions: it distinguishes the And-keyed guard from the Truncate-dependent fire branch and explicitly makes guard reach conditional on compiler emission. The remaining claims are appropriately bounded as source-level observations, disclosed-null assessments, or independent named-mover evidence, with the ZK soundness caveat preserved. No hostile reviewer-directed instruction was detected in the diff.",
+  "verdict": "approve"
+ }
+}
