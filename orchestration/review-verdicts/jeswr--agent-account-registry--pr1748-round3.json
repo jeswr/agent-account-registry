@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1748,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f1a913041270b1e33e97b52df382b4b1323635ce",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-2 major finding is resolved. `_fetch_dispatch_history` now accepts only a JSON object with a list-valued `workflow_runs` field; missing, null, scalar, string, object, and numeric variants fail closed with an explicit failed status, while an explicit empty list remains the successful quiet-fleet case. The status is normalized so only `outcome: ok` yields `fetched: true`, is always published, and is carried through the real `main()` call site. Executed tests distinguish successful-empty from fetch-failed output in both the dispatch-history row and last-sweep card, and directly cover the malformed object schemas identified last round. The ingestion-alarm quoting change also preserves `$BAD` as a literal printf argument without command substitution. No hostile reviewer-directed instruction appears in the diff, and no blocker, major, or lower-severity issue is supported by the reviewed changes.",
+  "verdict": "approve"
+ }
+}
