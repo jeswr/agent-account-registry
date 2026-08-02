@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1639,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ee5c6e03d8b53a01a140a4ab018bae066d42dcb6",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`COND_ATOMS` still accepts `!?inputs.<arbitrary-name>`, and `condition_is_live` proves only atom syntax plus distinct context paths. It never checks the input declarations or admitted values of the workflow being inspected. Thus replacing the worker upload condition with `${{ !inputs.target_repo && steps.bundle.outcome == 'success' }}` is certified even though `target_repo` is a required non-empty string for admitted runs, making the upload unreachable while the ordering verdict remains `ordered`. No added fixture exercises this schema-induced contradiction.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Restrict conditions to the exact known-live expressions shipped by these two upload steps, or make validation workflow-aware and prove each input atom and polarity satisfiable under the declared/admitted input contract. Add a named negative fixture for `!inputs.target_repo` and demonstrate that mutating the live worker condition to that expression makes the live ordering assertion fail.",
+    "severity": "blocker",
+    "title": "Negated required inputs are still accepted as proven-live conditions"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 5 leaves the round-4 blocker materially unchanged. `_upload_step_line` still treats any syntactically valid negated `inputs.<name>` atom as satisfiable without consulting either workflow's declared inputs or their admitted values. Both live workflows declare `target_repo` required, yet `${{ !inputs.target_repo && steps.bundle.outcome == 'success' }}` remains accepted and can make the upload unreachable while `_seal_before_target_code` reports `ordered`. The added negative fixtures cover language-level constants, duplicate paths, and wrapper syntax, but still omit this workflow-schema contradiction. Progress is therefore stagnant.",
+  "verdict": "request_changes"
+ }
+}
