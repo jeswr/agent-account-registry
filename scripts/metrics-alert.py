@@ -67,7 +67,8 @@
 # GET /repos request to a script whose `_test_gh_flows` pins the EXACT gh call list on a healthy
 # tick (`subs() == [("issue", "list")]`), which is the CEILING promise in this header.
 # `_test_alert_route_contract` below is the interim guard — it cannot merge the copies, but it reds
-# this file if a second copy appears in it or if its prose drifts back above what it enforces.
+# this file if a second copy appears in it, if the router's canonical contract paragraph is
+# rewritten, or if one of an enumerated list of write-capability phrasings reappears in its prose.
 import ast
 import json
 import os
@@ -138,8 +139,11 @@ def _alert_route(alert_repo, alert_token, registry_repo):
     the code has never enforced. The metrics-alert bodies are handle-free (job RESULT, run link,
     snapshot age), so the weaker contract is not a disclosure; it must still be stated honestly,
     because a future body change that read this as a verified private channel would inherit a route
-    that was never verified. `_test_alert_route_contract` reds this file if the stronger claim
-    reappears. usage-alert.py / pat-validity.py / plan-alert.py / groom-alert.py carry the
+    that was never verified. `_test_alert_route_contract` pins the two `PRESENCE IS THE WHOLE TEST`
+    sentences that open this paragraph VERBATIM, so any rewrite of them reds this file whatever
+    words it chooses, and separately tripwires an enumerated list of write-capability phrasings
+    elsewhere in this module.
+    usage-alert.py / pat-validity.py / plan-alert.py / groom-alert.py carry the
     #432/#436 hardened router that DOES positively verify privateness; this one deliberately does
     not, and must not be described as if it did."""
     if alert_repo and alert_token:
@@ -613,37 +617,73 @@ def _test_alert_route_contract(chk):
     single copy could drift back while the suite stayed green on the others — the #945
     mutually-masking-duplicate shape applied to prose.
 
-    The prose census scans this module with THIS FUNCTION'S OWN LINES REMOVED, so the banned
+    TWO guards, because prose can be worded in unboundedly many ways while a banned-phrase list is
+    only ever ENUMERATED. Review round 1 of the #1021 pull measured that directly: the first
+    version of this function checked five phrasings and advertised the semantic property, so an
+    equivalent claim — `ALERT_TOKEN has permission to write there`, or the same words with the
+    capability ahead of the token — would have re-landed on a green suite.
+
+      1. CANONICAL CONTRACT (phrasing-independent, load-bearing). The sentences in which the router
+         states what it ACTUALLY enforces are pinned VERBATIM below, so any rewrite of them reds
+         this file whatever words the rewrite chooses, including a phrasing no list anticipated.
+      2. ENUMERATED TRIPWIRE (phrasing-dependent, defence in depth). The rest of the module is
+         scanned for a fixed list of write-capability phrasings, scoped to ALERT_TOKEN on EITHER
+         side of the phrase, catching a stronger claim that lands in a comment or a rendered body
+         rather than in the pinned sentences. It is a tripwire, not a proof, and the row that
+         reports it says so rather than promising the semantic property.
+
+    The tripwire census scans this module with THIS FUNCTION'S OWN LINES REMOVED, so the banned
     phrases and the detector fixtures can be written literally below without the census matching
     itself; that exclusion is derived from the parsed AST, and its own row reds if it cannot find
-    this function. Every row below is independently killable: blunt the claim detector so it cannot
-    fire, widen it so it fires on unrelated prose, paste a second router into this file,
-    reintroduce the claim anywhere outside this function, add a real capability probe to the
+    this function. Every row below is independently killable: reword or delete the canonical
+    sentences, blunt the claim detector so it cannot fire, drop a phrasing or one scoping direction
+    from it, widen its scope so it fires on unrelated prose, paste a second router into this file,
+    reintroduce a listed claim anywhere outside this function, add a real capability probe to the
     router, or drop the token half of the router's guard."""
+    # GUARD 1 — quoted verbatim from the router's own docstring, and compared against a
+    # whitespace-flattened copy of it, so re-wrapping the source is free and rewording is not.
+    canonical_contract = (
+        "PRESENCE IS THE WHOLE TEST (#1021).",
+        "Nothing is requested under ALERT_TOKEN before the route is chosen, so this router proves "
+        "nothing about the destination's visibility and nothing about the token's write "
+        "capability there.")
+    # GUARD 2 — ENUMERATED, and kept inside this function so the census's own exclusion covers
+    # these literals. The list is deliberately identical in every alert script carrying this guard.
+    # `capable of writing` is NOT on it: the honest prose in these routers quotes that phrase in
+    # order to DISCLAIM it, and a lexical scan cannot tell a quotation from an assertion — guard 1
+    # is what covers the pinned sentences.
+    phrasings = ("can write there", "can write to", "write access", "able to write",
+                 "may write there", "permission to write", "write permission",
+                 "authorized to write", "authorised to write", "authorized to create",
+                 "authorised to create", "able to create", "can create issues",
+                 "allowed to write", "rights to write", "writable by")
+
     def claims_about_the_route(text):
-        """Every write-capability claim `text` makes ABOUT THE ALERT ROUTE, deduped and sorted.
+        """Every ENUMERATED write-capability phrasing `text` uses ABOUT THE ALERT ROUTE, deduped
+        and sorted. A tripwire over the list above — NOT a decision procedure for "does this text
+        claim write capability", which is why the canonical-contract row is the load-bearing guard.
 
         `text` is flattened to one whitespace-collapsed lowercase string first, so a claim broken
         across a wrapped comment or docstring line is still found; a hit then counts only when
-        ALERT_TOKEN is named within the preceding 160 characters (~two wrapped lines). BOTH
-        directions of that scoping were measured while writing this. Unscoped, the detector
-        flagged groom-mint-alert.py's unrelated "anyone with write access" note about
-        workflow_dispatch triggers — a false positive. Scoped, it still caught usage-alert.py's
-        rendered maintainer hint, which told the operator the private route needs a token that
-        could write to the destination — a true one, fixed in the same change."""
+        ALERT_TOKEN is named within 160 characters (~two wrapped lines) on EITHER side, since the
+        capability can be stated before the token names it as easily as after. BOTH directions of
+        that scoping were measured while writing this. Unscoped, the detector flagged
+        groom-mint-alert.py's unrelated "anyone with write access" note about workflow_dispatch
+        triggers — a false positive. Scoped, it still caught usage-alert.py's rendered maintainer
+        hint, which told the operator the private route needs a token that could write to the
+        destination — a true one, fixed in the same change."""
         flat = " ".join(text.lower().split())
         found = []
-        for claim in ("can write there", "can write to", "write access", "able to write",
-                      "may write there"):
+        for claim in phrasings:
             cursor = flat.find(claim)
             while cursor != -1:
-                if "alert_token" in flat[max(0, cursor - 160):cursor]:
+                if "alert_token" in flat[max(0, cursor - 160):cursor + len(claim) + 160]:
                     found.append(claim)
                 cursor = flat.find(claim, cursor + 1)
         return sorted(set(found))
 
     # VALIDATE THE DETECTOR BEFORE TRUSTING ITS SILENCE. On a clean tree every `find` returns -1,
-    # so without these two fixtures the whole scoping loop above never executes even once and the
+    # so without these fixtures the whole scoping loop above never executes even once and the
     # census below reports `[]` whatever it is pointed at — an instrument that cannot fire has
     # said nothing (AGENTS.md AUTHOR pre-flight #1, which is how this hole was found).
     chk("#1021: the claim detector FIRES on route prose that makes the claim, including when the "
@@ -652,16 +692,47 @@ def _test_alert_route_contract(chk):
                                "ONLY when ALERT_TOKEN\ncan write there; otherwise "
                                "the registry"),
         ["can write there"])
+    chk("#1021: ... and on the SYNONYMS of that claim, not just the one wording #1021 removed",
+        (claims_about_the_route("ALERT_TOKEN has permission to write there"),
+         claims_about_the_route("the route needs an ALERT_TOKEN authorized to create issues in "
+                                "the private repo")),
+        (["permission to write"], ["authorized to create"]))
+    chk("#1021: ... and when the capability is stated BEFORE ALERT_TOKEN names it (the scope "
+        "window reaches both ways)",
+        claims_about_the_route("the destination is private, so a credential able to write there "
+                               "is required; that credential is ALERT_TOKEN"),
+        ["able to write"])
     chk("#1021: ... and stays SILENT on a write-capability sentence about something that is not "
         "the route",
         claims_about_the_route("workflow_dispatch can be run from any ref by anyone with write "
                                "access, so it is excluded from the tick allowlist"), [])
+    chk("#1021: ... and on one where ALERT_TOKEN appears but is far out of scope (a widened "
+        "window would swallow this and make the census fire on unrelated prose)",
+        claims_about_the_route("ALERT_TOKEN names the private route. " + "Unrelated prose. " * 12
+                               + "The runner needs write access to the checkout."), [])
     source = open(__file__, encoding="utf-8").read()
     definitions = [node for node in ast.walk(ast.parse(source))
                    if isinstance(node, ast.FunctionDef)]
+    routers = [node for node in definitions if node.name == "_alert_route"]
     chk("#1021: exactly ONE _alert_route definition in this module (a second copy makes each "
-        "copy individually unkillable)",
-        len([node for node in definitions if node.name == "_alert_route"]), 1)
+        "copy individually unkillable)", len(routers), 1)
+    # Pinned THREE ways through ONE containment helper, because `[]` is also what an empty
+    # docstring returns: the clauses ARE in the router's docstring, the same helper reports both
+    # of them missing from a docstring that omits them, and it still reports both missing from an
+    # EMPTY one — which is what a router whose docstring was simply deleted presents. Without that
+    # last input, `if doc and claim not in doc` is a conditionally-inert mutant that survives
+    # (pre-flight #3; it did survive the first version of this row).
+    def clauses_missing_from(doc):
+        flat = " ".join(doc.split())
+        return [claim for claim in canonical_contract if claim not in flat]
+
+    chk("#1021: the router's docstring states the contract it ACTUALLY enforces, VERBATIM — and "
+        "the same check reports both clauses missing from a docstring that omits them, and from "
+        "an empty one",
+        (clauses_missing_from(ast.get_docstring(routers[0]) or ""),
+         len(clauses_missing_from("(repo, token) for the alert issue.")),
+         len(clauses_missing_from(""))),
+        ([], 2, 2))
     census = [node for node in definitions if node.name == "_test_alert_route_contract"]
     chk("#1021: the prose census can locate its own body to exclude it from the scan",
         len(census), 1)
@@ -675,8 +746,10 @@ def _test_alert_route_contract(chk):
     # survived the first version of this row). `def _alert_route(` proves the scan covered the
     # module; the ABSENCE of this function's own nested helper name proves the exclusion really
     # removed this function and not some other span.
-    chk("#1021: no write-CAPABILITY claim survives in this module's alert-route prose, measured "
-        "over a scan that demonstrably covers the router and excludes only this function",
+    chk("#1021: none of the ENUMERATED write-capability phrasings survives in this module's "
+        "alert-route prose — a tripwire over a fixed list, not a proof that no stronger claim can "
+        "be worded (the canonical-contract row above is that guard) — measured over a scan that "
+        "demonstrably covers the router and excludes only this function",
         (claims_about_the_route(scanned), "def _alert_route(" in scanned,
          "claims_about_the_route" in scanned),
         ([], True, False))
