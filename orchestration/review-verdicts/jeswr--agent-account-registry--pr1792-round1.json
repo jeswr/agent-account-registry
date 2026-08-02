@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1792,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1ba11268b92564e098237206846f2488707ede9b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change adds an independent cadence reference for the cross-repository keepalive and non-vacuously binds it to both the repository parsed from the actual workflow step and the exact watched workflow set. The new ceiling and floor checks include the previously exempt registry thresholds and the cross-repository threshold, while explicit refusal probes cover missing and ambiguous repository targets. I found no correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
