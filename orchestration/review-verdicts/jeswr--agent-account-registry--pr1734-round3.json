@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1734,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7102c7717f5b9f2494df335715f441f981a283b4",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The change remains correct and complete. `worker-prep.sh` rejects `claude-credentials-json` at initial format admission, before the source credential is spooled, while `worker-live.sh` independently rejects the format at the launcher delivery seam. The Codex pre-flight has no original-document fallback: both refresh and dry-run paths derive a minimal credential, and the materialized file is unconditionally checked for refresh-token material. The added tests are substantive and non-vacuous: they validate that the refused fixture contains the durable sentinel, require an actionable refusal, scan the whole prepared tree for the sentinel value, require no mount material, retain a positive opaque-token control, exercise the expired-token dry-run branch, and assert the launcher's exact non-dying format set. I found no correctness, fail-closed, security, or test-validity defect. Round 2 also had no findings, so progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
