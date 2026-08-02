@@ -1,0 +1,73 @@
+# [OPUS-5] INDEPENDENT ingestion-rejection alarm (registry #1706).
+#
+# WHY A SEPARATE FILE. `ci-latency-alert.py` already classifies this exact condition
+# (`rejected-zero-jobs`), but it is invoked from groom.yml among others — and on 2026-08-01
+# groom itself was ingestion-rejected, so the detector went down with the lane it watches.
+# A 9h dispatch outage and a 19h groom outage both passed unnoticed as a result. An alarm
+# whose availability correlates with the fault is worse than none, because auditing "do we
+# detect this?" returns yes.
+#
+# So this lane depends on NOTHING: no checkout of the registry scripts, no shared step, no
+# environment. Its only inputs are the runs API and `github.token`. A new file's own
+# rejection costs only itself, which is why this is a new file rather than a step added to
+# a healthy workflow.
+#
+# WHAT IT WATCHES. For each critical lane, the most recent run's `jobs.total_count`. Zero
+# jobs means GitHub created the run and executed nothing — the file was refused. That is
+# indistinguishable from a quiet repo unless something explicitly looks, which is the whole
+# point: this alarms on ABSENCE, not on a bad thing appearing.
+name: ingestion-alarm
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Offset from the other sweeps so ticks do not pile up.
+    - cron: '11,41 * * * *'
+
+permissions: {}
+
+concurrency:
+  group: ingestion-alarm
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: zero-jobs check across critical lanes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      issues: write
+    steps:
+      - name: Check each lane's latest run for jobs == 0
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          BAD=""
+          for wf in dispatch.yml groom.yml worker.yml review-fix.yml; do
+            id=$(gh api "repos/$REPO/actions/workflows/$wf/runs?per_page=1" \
+                   -q '.workflow_runs[0].id // empty' || true)
+            [ -z "$id" ] && continue
+            jobs=$(gh api "repos/$REPO/actions/runs/$id/jobs" -q '.total_count' || echo unknown)
+            concl=$(gh api "repos/$REPO/actions/runs/$id" -q '.conclusion // .status' || echo unknown)
+            echo "$wf: run=$id conclusion=$concl jobs=$jobs"
+            if [ "$jobs" = "0" ]; then BAD="$BAD $wf(run $id)"; fi
+          done
+          if [ -n "$BAD" ]; then
+            echo "::error::INGESTION REJECTED —$BAD"
+            printf '%s\n' \
+              "> 🤖 SPARQ agent" "" \
+              "**Ingestion rejection detected.** These lanes' most recent runs executed ZERO jobs:" "" \
+              "\`\`\`" "$BAD" "\`\`\`" "" \
+              "\`action_required\` + \`jobs=0\` means GitHub created the run and ran nothing — the workflow FILE was refused. This is silent: no failing check, no red, just lanes not running." "" \
+              "Mechanism is unexplained across 9+ instances (#1566); a 10-candidate elimination table is on #1706. groom is the ONLY crash-recovery path, so its rejection is never cosmetic." "" \
+              "⚠️ Verify any fix by \`jobs > 0\`, never by colour." > /tmp/body.md
+            gh issue create --repo "$REPO" \
+              --title "⚠️ ingestion rejection: lanes running ZERO jobs" \
+              --label "priority:P1,area:dispatch,role:impl,from:agent" \
+              --body-file /tmp/body.md || true
+            exit 1
+          fi
+          echo "all lanes ingesting (jobs > 0)"
