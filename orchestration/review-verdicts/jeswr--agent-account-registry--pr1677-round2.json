@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1677,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "565e1db1d81f9cd2a6875e7168b792e78d0f98ee",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe probe-controlled status and reset values are gated at both classify() interpolation sites with full-match, length-bounded vocabularies that exclude whitespace and Markdown/HTML metacharacters. Missing and malformed values remain fail-closed and diagnostically distinct, numeric reset epochs retain their supported rendering, and the capped/eligible decisions are unchanged. The self-tests exercise both capped-window branches, hostile full strings with conforming prefixes, the final rendered-body binding layer, accepted producer-shaped values, absent values, metacharacters, whitespace, booleans, and the 64-character boundary. The positive controls also prevent blanket redaction from passing vacuously. No correctness, soundness, security, or test-validity issue is evident. This matches round 1's clean result, so progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
