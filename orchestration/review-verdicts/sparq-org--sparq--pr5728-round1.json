@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5728,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d5fadab2e47f06df915e37c5caf4db6b36cde3e1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`evaluate()` expands every context but de-duplicates solely on the expanded `dedup_key`. Therefore a template such as `dedup_key = \"follow-up-{pr}\"`, `title = \"Follow up {crate}\"` produces only the first crate's issue, despite the new documented contract that a template naming `{crate}` is minted once per added crate. The new crate-agnostic test contains no `{crate}` in any field, while the per-crate test also puts `{crate}` in the key, so neither exposes this acceptance gap. This is silent incomplete fan-out and makes the behavior depend on an undocumented coupling between presentation fields and identity.",
+    "file": "scripts/flow-on.py",
+    "fix_hint": "Define and enforce a coherent identity rule. Prefer detecting whether any template field contains `{crate}` and ensuring its effective dedup key is per-crate (for example by incorporating the crate into the key), or reject templates that use `{crate}` outside the key without including it in `dedup_key`. Add a regression test with `{crate}` in title/body but not the configured key and update the TOML documentation to match the chosen contract.",
+    "severity": "major",
+    "title": "Per-crate templates are dropped when the dedup key is crate-agnostic"
+   }
+  ],
+  "progress": null,
+  "summary": "The fan-out works only when `{crate}` changes the dedup key, but the documented contract says any template naming `{crate}` is emitted once per added crate. A template that uses `{crate}` only in its title or body is silently collapsed to the first crate by `seen_keys`, so the implementation and tests do not cover the full promised behavior.",
+  "verdict": "request_changes"
+ }
+}
