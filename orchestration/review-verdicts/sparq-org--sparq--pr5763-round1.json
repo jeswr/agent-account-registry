@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5763,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9cfe1f3231ab1e984f4326a16d8d9b35823d1232",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly neutralizes every run of three or more backticks at both Markdown-fence emission points, while preserving ordinary one- and two-backtick content. The regression self-test exercises the real parser, issue-body builder, and artifact writer, checks both three- and four-backtick payloads, and is now run by the PR docs-quality workflow. The self-test passes at the PR head, and no correctness, soundness, test-validity, or security issue was found.",
+  "verdict": "approve"
+ }
+}
