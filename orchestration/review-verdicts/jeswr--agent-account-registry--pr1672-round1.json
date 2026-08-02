@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1672,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "51b3e2e8da923c8bb471affd86bca8329e0176ce",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Increment 1a says the allow-all proxy will record the host set, and section 8 requires that set to be recorded, but the CONNECT authority and DNS query name are model-controlled. A steered model can place the credential (or encoded chunks of it) in subdomain labels or an arbitrary CONNECT hostname. The proposed observer would then duplicate that secret into proxy/runner telemetry even if it records only destinations, conflicting with the record's existing rule that sensitive model output is withheld. The document does not specify log ownership, retention/publication, normalization, size bounds, redaction, or what happens when a destination is unsafe to record. This is a security-boundary design, so leaving those decisions to the implementation is not complete or fail-closed.",
+    "file": "research/249-model-container-egress.md",
+    "fix_hint": "Define a secret-safe telemetry contract for 1a: treat all destination fields as hostile; keep raw observations ephemeral and access-restricted; never publish or copy them into issues/comments/artifacts; bound and validate labels/authorities before logging; derive the candidate allowlist through a reviewed sanitization/aggregation step; and fail closed on malformed or over-limit values. Add a required live measurement showing that credential-shaped or deliberately encoded hostnames do not enter durable output. If exact raw FQDNs are operationally necessary, explicitly document the residual credential-retention risk and the protected storage/deletion procedure rather than claiming unqualified observability value.",
+    "severity": "major",
+    "title": "Observe-mode host logging can persist attacker-encoded credentials"
+   }
+  ],
+  "progress": null,
+  "summary": "The record identifies the two principal exfiltration channels and correctly treats an internal network, rather than proxy environment variables, as the proposed boundary. However, the recommended OBSERVE increment introduces an attacker-controlled telemetry surface without defining how that surface avoids retaining credentials. Because the model can choose arbitrary CONNECT authorities and DNS names, a steered model can encode the live credential into the hostname itself; a proxy that records the host set would then copy credential material into host-side logs. The document is explicit about withholding model logs and about token-bearing data, so this omission is material in a design intended to guide the implementation. The observe/enforce design needs a fail-closed, secret-safe logging contract before it is complete.",
+  "verdict": "request_changes"
+ }
+}
