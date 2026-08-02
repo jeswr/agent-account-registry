@@ -13448,6 +13448,17 @@ def _self_test():
         assert _enrol_states([_enrol_pull(labels=(), body=f"<!-- sparq-reviewed-sha:{sha_a} -->")],
                              {41: _orch}, status={41: _red_gate}) == []
         assert _enrol_states([_enrol_pull(labels=("review:changes",))], {41: _orch}) == []
+        # [registry #1523] ...and `review:changes` is therefore an ABSORBING state for this class:
+        # nothing autonomous exits it (the fix lane also refuses the class for not being an open
+        # draft), so the ONE exit is the author REPLACING the label with `review:needs`, which (1)
+        # above pins as reaching the review lane. worker-pr.SELF_ATTESTED_CHANGES_HANDOFF is the
+        # comment that tells them so, and it says "replace, don't add" because of exactly this
+        # line: `review:changes` is tested BEFORE `review:needs`, so a PR carrying BOTH is still
+        # refused — silently, and indistinguishably from having done nothing. Re-ordering the two
+        # label branches, or narrowing the review-only choke point to the label instead of the
+        # STATE, reds this and makes that instruction wrong.
+        assert _enrol_states([_enrol_pull(labels=("review:changes", "review:needs"))],
+                             {41: _orch}) == []
         _green = {"head_sha": sha_a, "conflicting": False, "armed": False, "gate": "success"}
         assert _enrol_states(
             [_enrol_pull(draft=True, labels=(), body=f"<!-- sparq-reviewed-sha:{sha_a} -->")],
