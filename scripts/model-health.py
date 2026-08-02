@@ -1676,10 +1676,18 @@ def classify_records(records, provider_accounts, now, open_alerts=()):
     for provider in sorted(providers):
         # Ordered by RECORD time so "later" is well defined for the per-account invalidation
         # rules below (prune() sorts, but classify_records must not rely on caller ordering).
+        #
+        # No emptiness guard (#1109): `providers` is derived from `records` immediately above and
+        # `prov_records` re-selected from that SAME list by equality on the provider, so every
+        # provider reaching this line contributes at least one record. The `if not prov_records:
+        # continue` that used to sit here was therefore unreachable BY CONSTRUCTION — an unkillable
+        # line that every mutation sweep over this function re-reported as a survivor. What it
+        # silently assumed is asserted instead in --self-test ("every provider in the window earns
+        # an action"), which is a row a re-introduced per-provider skip turns red. If `providers`
+        # ever becomes a caller-supplied argument, an absent provider needs a real decision
+        # (skip vs. emit a recovery like the orphan pass below), not a silent `continue`.
         prov_records = sorted((r for r in records if r.get("provider") == provider),
                               key=lambda r: r["ts"])
-        if not prov_records:
-            continue
 
         # ---- zero-dispatch (fleet pseudo-provider) --------------------------------------------
         # Consecutiveness is over the TICK SEQUENCE: dispatch.yml records a dispatch-SUCCESS
@@ -3302,6 +3310,22 @@ def _self_test():
     chk("a dispatch-success after an idle stretch still breaks the run",
         fires(classify_records(zd_idle + [zrec(SUCCESS, 460)], {}, now + 500),
               "zero-dispatch", "fleet"), False)
+
+    # ---- #1109: NO provider present in the window may be silently skipped ----------------------
+    # The complement of the orphan pass below (which handles providers ABSENT from the window):
+    # every provider that IS in the window must earn at least one action, including one that
+    # contributes a SINGLE healthy record. This is the invariant the deleted unreachable
+    # `if not prov_records: continue` assumed; asserting it directly means any re-introduced
+    # per-provider skip goes red here instead of silently dropping a provider's alerts.
+    # Exact SET EQUALITY against a literal — not a set derived from the fixture by the same
+    # comprehension classify_records uses — so a missing provider AND a fabricated one both fail.
+    mixed = [rec("anthropic", "acct01", CLASS_TRANSIENT, dt=0),
+             rec("anthropic", "acct02", CLASS_TRANSIENT, dt=30),
+             rec("openai", "codex01", SUCCESS, dt=60),
+             zrec(CLASS_ZERO_DISPATCH, 90)]
+    chk("every provider in the window earns an action, incl. one with a single record",
+        {a["provider"] for a in classify_records(mixed, {}, now + 200)},
+        {"anthropic", "fleet", "openai"})
 
     # ---- ORPHANED OPEN ALERTS (issue #205): a provider that aged out of the window still closes --
     def recovers(actions, condition, provider):
