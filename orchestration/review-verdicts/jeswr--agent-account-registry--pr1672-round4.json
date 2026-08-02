@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1672,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8b9c43f171acfadd8474dbb5e97e95b4d1ae99bb",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains sound and complete. The record accurately identifies the live credential, unrestricted-egress, and writable-publication channels; distinguishes topology enforcement from advisory proxy environment variables; keeps observe mode fail-closed on setup failure; and does not overclaim channel-1 closure as credential containment. The telemetry contract treats raw and derived destinations as hostile model-authored data, forbids observed hostnames from public or durable surfaces, requires independently sourced operator allowlist entries, and preserves only counts and host-side rule identifiers. The live-measurement gate includes the load-bearing valid, repeated credential-shaped registrable-domain probe and requires zero marker occurrences across every durable surface, including the candidate/review surface. The proposed sequence also correctly leaves enforcement dependent on measured CLI, DNS, endpoint, and publication behavior and makes no behavioral or trust-control change itself. I found no correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
