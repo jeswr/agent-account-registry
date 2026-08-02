@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1605,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "63830c1faa927b79ff9fb3850a08eff71c4887b1",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "For an unknown `if`, `_taint_block()` unions the ending taint sets of both arms, and `_record_printed_keys()` credits the post-join print if either arm leaves `repos` tainted. For example, a resolver with `if requested: repos = enabled` and `else: repos = [\"some-owner/some-name\"]` still reports `[\"repos\"]`: the manual arm donates policy taint while the scheduled arm silently sweeps a hand-copied subset. The newly added one-branch positive test requires precisely this existential join and does not prove the separate membership-validation control that the comments rely on. The overwrite/dead-code mutants only make the published name untainted on all live arms, so they do not exercise this prior-round bypass.",
+    "file": "scripts/backfill-provenance.py",
+    "fix_hint": "Make the analysis prove authorization/completeness on every executable path reaching the output, while explicitly recognizing the shipped manual path's `requested in enabled` validation rather than treating any one tainted arm as sufficient. Add a named non-crashing mutant of the live resolver whose scheduled arm publishes a copied subset while another live arm remains policy-derived; it must make `resolve_policy_derived_outputs` empty and preserve the pristine self-test row count.",
+    "severity": "major",
+    "title": "Union joins still certify a hardcoded live branch"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-4 major remains. The new ordered strong updates catch a hardcode that replaces the value on both incoming paths, but the unknown-branch join is still existential: one policy-derived arm taints the name after the join even when another live arm publishes a copied list. The new positive branch test deliberately pins that union behavior and still does not model or prove the manual arm's membership check. Thus `resolve_policy_derived_outputs` can remain `[\"repos\"]` while the scheduled arm is a hardcoded subset, provided the other arm assigns a policy-derived value; the scheduled sweep-completeness claim is then green after being severed. No cross-branch hardcode mutant was added. This is materially the same soundness gap at the same severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
