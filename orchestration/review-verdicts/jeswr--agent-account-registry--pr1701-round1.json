@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1701,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5703b9741bcc153401c65fd4155b5866a37d39eb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new generator is optional, while `expected_records()` continues to accept the old `{\"targets\": ...}` shape without any generator provenance or other distinction. Consequently an operator can still pass a manually transcribed manifest that omits PRs, have `audit()` set `complete = True`, and receive revocation candidates. The added `[#1027] the TYPED manifest omitting PR 9...` assertion proves this exact unsafe path remains live: it expects `STATUS_SCOPED` and `[redacted-account]` as a candidate. Updating comments/help to say manifests are derived does not prevent the dangerous input from arming the result.",
+    "file": "scripts/grant-scope-audit.py",
+    "fix_hint": "Make the arm-side reader reject legacy/hand-written completeness claims, or otherwise cryptographically/structurally bind accepted manifests to a validated generation path. Add an end-to-end negative test showing that the short typed manifest used in the current #1027 fixture cannot produce `STATUS_SCOPED` or any revocation candidate. If legacy manifests must remain readable, ensure they are advisory-only and cannot set `complete` until converted through the trusted generation workflow.",
+    "severity": "blocker",
+    "title": "Hand-written short manifests remain arm-capable"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe generator is carefully implemented and its CLI/source-directory checks are meaningfully exercised, but it does not close the fail-open path the change says it closes. The audit still accepts an arbitrary hand-written short manifest, and the new self-test explicitly demonstrates that such a manifest marks a partial corpus scoped and proposes a false revocation. Because this is the trust decision the feature is meant to make safe, the change is incomplete.",
+  "verdict": "request_changes"
+ }
+}
