@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1809,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4f3632dfa281e2c12562f5df42a0593ff0170637",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The live step invokes `scripts/ledger-identity-watch.py`, whose preflight requires the sibling `scripts/ledger-history-purge.py`, but that scanner does not exist anywhere in this PR-head checkout and is not added by this diff. Consequently every scheduled run at this head deterministically classifies the ledger as `unverified`; it can never inspect history or produce `clean`/`exposed`. The comment that the scanner lands in another PR does not make this change operationally complete, and merging in this order creates a permanently alarming detector rather than the standing measurement claimed by the PR.",
+    "file": ".github/workflows/ledger-identity-watch.yml",
+    "fix_hint": "Do not enable the scheduled workflow until the scanner is present on the same default-branch revision. Include the scanner in this change, establish the dependency first, or otherwise gate deployment so the first enabled run can execute the real scan; add an integration assertion against the actual scanner CLI rather than only a stand-in path.",
+    "severity": "major",
+    "title": "The scheduled workflow ships without the scanner it requires"
+   },
+   {
+    "body": "If `gh issue list` exits zero but yields malformed JSON or a non-array JSON value, `main()` prints a warning and returns 0 without creating or updating an alert. This is a loss of the alert transport/dedupe evidence, yet Actions records the detector as healthy. On a first exposed or unverified tick there may be no pre-existing issue to remain visible, so the failure produces neither an ops alert nor a failed workflow. The self-test explicitly cements this behavior with the `soft skip` expectations, making the gap intentional rather than incidental.",
+    "file": "scripts/ledger-identity-watch.py",
+    "fix_hint": "Treat unparseable or schema-invalid issue-list output as a failed tick (nonzero) so the workflow visibly fails and can be retried; do not report success when dedupe/recovery state is unavailable. Update both malformed-list self-test rows to require the fail-closed result while still asserting no mutation and no payload echo.",
+    "severity": "major",
+    "title": "Malformed issue-list data fails open as a successful, alertless tick"
+   }
+  ],
+  "progress": null,
+  "summary": "The watcher has a sound clean/exposed/unverified polarity in its core decision logic, but the shipped workflow cannot perform its advertised measurement from this checkout because its required scanner is absent. In addition, one transport-integrity failure is deliberately converted into a successful workflow run with no alert delivery. Both defects leave the standing detector unable to establish or communicate ledger health, so this is not complete or fail-closed enough to approve.",
+  "verdict": "request_changes"
+ }
+}
