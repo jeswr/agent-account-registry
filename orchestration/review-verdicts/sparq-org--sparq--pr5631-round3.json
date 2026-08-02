@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5631,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e9cd82f0a515c1c40a275039043b9da1ce5f17a9",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The re-export comment says the per-path descriptor is \"AXIS-2 only; AXIS-1 stays SemiHonest\" (around line 419), but equality_join_security now deliberately returns SecurityDescriptor::semi_honest_only(), which promotes no axis. The same stale claim appears in research/mpc-sparql-capability-matrix.md as \"Tier reported AXIS-2-only\". This contradicts the round-3 containment fix and continues to describe the externally unaudited path as carrying the output-guarantee promotion that the PR itself explains projects to active malicious security.",
+    "file": "crates/sparq-mpc/src/lib.rs",
+    "fix_hint": "Change both statements to say the reported descriptor is the SemiHonestOnly baseline with no axis promoted. Keep tamper-evident-with-abort strictly described as experimentally observed behavior, not a reported security tier, until sq-qhy4 closes.",
+    "severity": "major",
+    "title": "Public re-export commentary still claims an AXIS-2 security promotion"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 fixes the load-bearing code/API issue from round 2: equality_join_security now returns SemiHonestOnly, and the new guard test checks the adversary axis, legacy projection, and is_malicious_secure(). However, two public-facing source/documentation statements still say the path reports AXIS-2-only, directly contradicting the implementation and the repeated containment rationale that no axis may be promoted before sq-qhy4. Because this is the same active-security overclaim class at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
