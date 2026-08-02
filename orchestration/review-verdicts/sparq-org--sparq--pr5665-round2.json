@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5665,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5a5507bc3de5c4da3e999ae242159812a95594be",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains correct and complete. Each newly covered pull-request workflow also has a main-ref run that can seed the same rust-cache lane, while the pull-request-only mutants workflow is narrowly exempted and its exemption preconditions are structurally pinned. The widened discovery checks representative inclusions and exclusions, examines every discovered rust-cache step, preserves restore behavior, and keeps the earlier merge-group guarantee. The focused test suite passes (14 tests). No correctness, soundness, security, injection, or test-validity issue was found.",
+  "verdict": "approve"
+ }
+}
