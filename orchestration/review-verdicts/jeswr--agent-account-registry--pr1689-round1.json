@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1689,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f5d6fb4041df649d70163c28542e2de061f6df80",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_retry_after_seconds` wraps the raw header as `Retry-After: <raw>` and delegates to a regex that searches for a numeric prefix anywhere in text. Consequently malformed header values such as `7junk` are accepted as 7 seconds; a value containing another `Retry-After: 9999` token can also be accepted and capped at 60. The old `float(str(raw).strip())` implementation rejected both, and the new docstring still promises that unparseable values are rejected. This is a semantic mismatch between a parser designed for arbitrary `gh` diagnostic text and a parser for one complete HTTP header field.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Expose or add a shared parser that validates the entire header field value (for example, full-match the numeric grammar before applying the shared positive/cap policy), and have both consumers delegate to that shared numeric policy. Add rows for trailing junk and an embedded/duplicate `Retry-After:` token so the production adapter cannot regress to substring parsing.",
+    "severity": "major",
+    "title": "Blob parser accepts malformed Retry-After header values"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe delegation is not semantics-preserving for an HTTP header value. `gh_retry.retry_after_seconds` is a search parser for a larger stderr/body blob, while groom passes it a synthesized line and therefore accepts malformed header values that the replaced exact numeric parser rejected. The new tests cover common degenerate forms but omit this boundary, so they do not establish the documented unparseable-value behavior.",
+  "verdict": "request_changes"
+ }
+}
