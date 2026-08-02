@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1765,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5d5ebb4196f83c73e7506ab25402b41345e5b7d8",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "review_outcome first calls set_review_state(..., \"changes\"), which durably removes review:needs and lands review:changes, and only afterward calls _comment. If that API call raises, or the worker stops in the gap, the PR is already in the self-attested review:changes state that dispatch-claim intentionally refuses. The reviewed-SHA bind later in the workflow does not provide a retry path, and the enumerator will not dispatch this class from review:changes, so the promised hand-off can remain absent indefinitely. The self-test stubs _comment as infallible and asserts only the successful call order, so it cannot detect this failure mode. This violates the stated requirement that the human gesture be named when the machine-owned absorbing state is entered.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Make signpost delivery recoverable across partial execution. For example, use a durable idempotent receipt/marker and ensure the sweeper or another enumerated reconciliation path retries a missing signpost for self-attested review:changes PRs; alternatively compensate a failed comment by safely restoring an enumerable state. Add a test where comment publication raises after the label write, then assert the resulting durable state still has an autonomous retry/recovery path rather than an unannounced review:changes terminal.",
+    "severity": "major",
+    "title": "A comment failure leaves the PR silently trapped in the absorbing state"
+   }
+  ],
+  "progress": null,
+  "summary": "The class and return-value gates are sound, and the new tests cover the intended applied/non-applied discrimination. However, the change can still create the exact silent absorbing state it claims to eliminate: review:changes is committed before the hand-off comment, with no recovery if comment publication fails or the process stops between those operations. Because self-attested review:changes PRs are deliberately not enumerated again, an ordinary transient comment failure leaves no autonomous path that retries the signpost. The marquee liveness claim is therefore incomplete.",
+  "verdict": "request_changes"
+ }
+}
