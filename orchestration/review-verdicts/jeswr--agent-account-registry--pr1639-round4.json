@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1639,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ee5c6e03d8b53a01a140a4ab018bae066d42dcb6",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`COND_ATOMS` still accepts `!?inputs.<arbitrary-name>`, and `condition_is_live` checks only atom syntax and distinct paths. It does not consult either workflow's input declarations or admissible values. Consequently, changing the worker upload condition to `${{ !inputs.target_repo && steps.bundle.outcome == 'success' }}` is certified: both atoms match and their paths are distinct. But `target_repo` is a required non-empty string for admitted runs, so the upload is unreachable while the live ordering row still returns `ordered`. The added fixtures remain limited to language-level falsy values, duplicate paths, and wrapper syntax; none exercises a contradiction induced by the workflow input schema.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Restrict accepted conditions to the exact known-live expressions used by the two upload steps, or validate input atoms and polarity against the workflow declarations and admitted values. Add a named negative fixture using `!inputs.target_repo` and assert `upload-step-disabled`; also demonstrate that mutating the live worker upload condition to that form makes the live assertion fail.",
+    "severity": "blocker",
+    "title": "Negated required inputs are still accepted as proven-live conditions"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 leaves the round-3 blocker unchanged. `_upload_step_line` still accepts a negated arbitrary `inputs.<name>` solely because the path is syntactically distinct, without checking that the input can be falsy on an admitted run. Thus an upload can be made unreachable while `_seal_before_target_code` still reports `ordered`. No new negative fixture covers the workflow-input contract. The finding remains materially identical at blocker severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
