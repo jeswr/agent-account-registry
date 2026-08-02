@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1789,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c1f9a2ab263d68e7c6ac2c4105f7e1b668b787e6",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`matrix_repo_expr == '${{ fromJSON(needs.targets.outputs.repos) }}'` proves only that the matrix reads an output with that name. It does not prove that `jobs.targets` produces `repos` from `policy/repos.toml` enabled rows. Replacing the resolver with `echo 'repos=[\"one/hardcoded-repo\"]' >> \"$GITHUB_OUTPUT\"` leaves every new assertion green, recreating the hardcoded-target defect the comments say this test prevents. Separately, deleting `backfill.needs: targets` also leaves the parsed strategy and both job guards unchanged, so all added checks pass even though the `needs.targets.outputs.repos` expression is no longer backed by the dependency edge and the job cannot perform the intended sweep.",
+    "file": "scripts/backfill-provenance.py",
+    "fix_hint": "Extend the seam report and self-test to assert the producer/dependency path, not just the consumer expression: exact `backfill.needs` membership for `targets`, the `targets.outputs.repos` binding to the resolver step, and structural/content checks that the resolver reads `policy/repos.toml`, selects enabled rows, honors a nonempty requested target only when enabled, rejects an empty result, and emits the computed JSON as `repos`. Use assertions whose expected values are independent of constants or text read from the workflow under test. Include non-crashing mutants for a hardcoded output and a deleted `needs` edge and require the pristine and mutant runs to execute the same check count.",
+    "severity": "major",
+    "title": "Policy-derived target assertion stops before the producer and dependency edge"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe added seam checks materially improve coverage of the scheduled trigger, exact job guards, dispatch input, matrix consumer expression, and fail-fast behavior. However, the marquee policy-derived-target guarantee is asserted only at the consumer. The producer and dependency edge remain untested, so a workflow that hardcodes the targets output or disconnects the targets job can satisfy every added check while the machine-driven sweep is incomplete or nonfunctional. Because this is the trust-relevant behavior the tests claim to lock, the change is not complete.",
+  "verdict": "request_changes"
+ }
+}
