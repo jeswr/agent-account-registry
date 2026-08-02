@@ -1272,10 +1272,11 @@ _pr_gate_suite_loop() {
   ' "$file"
 }
 
-# [issue #1035] PURE (self-tested): print pr-gate.yml's yaml-parse SWEEP -- the `for f in .github/`
-# glob list through the `actionlint` invocation the step ends on -- normalised to stripped,
-# comment-free lines, so WHAT THE SWEEP COVERS can be pinned by exact whole-block match. Prints
-# nothing when the file or the sweep is absent, which fails closed against any expected block.
+# [issue #1035] PURE (self-tested): print pr-gate.yml's yaml-parse SWEEP STEP -- the step named
+# `actionlint + yaml-parse every workflow`, from its `- name:` line through the last line of that
+# step, normalised to stripped, comment-free lines, so WHAT THE SWEEP COVERS can be pinned by exact
+# whole-block match. Prints nothing when the file is absent, when no step carries that name, or when
+# MORE THAN ONE does, each of which fails closed against any expected block.
 #
 # The GLOB LIST is the payload. Every other pin in this file guards a command; this one guards a
 # SET, and a set silently shrinks: drop a glob from the `for` line and the step still parses
@@ -1286,20 +1287,35 @@ _pr_gate_suite_loop() {
 # the `done` and the lint therefore sits INSIDE this extraction on purpose, and deleting it is a
 # changed block, not a lost comment.
 #
-# Extraction runs `for` -> `actionlint` rather than `for` -> `done` for the same reason: it pins the
-# parse, the guards after it, and the lint that follows as ONE ordered block, so `|| true` on either
-# command, an `if false; then` wrapper (extra lines), and a lint hoisted above the loop (no
-# terminator until EOF) all fail the comparison. This is the #941/#956 YAML-seam shape -- a mutant
-# here is invisible to every python assertion in this repo.
+# Extraction is anchored to the NAMED STEP and takes the step WHOLE -- not `for` -> `actionlint`
+# wherever those tokens first appear. Content-anchored extraction is mutually-maskable (AGENTS.md
+# pre-flight item 4): the exact frozen block pasted anywhere earlier -- inside an uncalled shell
+# function, a `notes:` step, any inert context -- satisfies a content-anchored match on its own, so
+# the real step can then be deleted or weakened with the pin still green. Two copies of one guard
+# make each copy individually unkillable. Anchoring on the unique step name kills that: the
+# duplicate is never read, the real step must still match, a second step wearing the same name is
+# refused rather than resolved to the first, and because the capture starts at `- name:` and runs to
+# the step's end, a step-level `if: false` (an inserted line) and anything appended after the lint
+# both change the block too. This is the #941/#956 YAML-seam shape -- a mutant here is invisible to
+# every python assertion in this repo.
 _pr_gate_yaml_parse_sweep() {
   local file=$1
   [[ -f "$file" ]] || return 0
   awk '
-    { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+    { raw = $0; line = raw; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
     line ~ /^#/ || line == "" { next }
-    line ~ /^for f in \.github\// { on = 1 }
-    on { print line }
-    on && line ~ /^actionlint([ \t]|$)/ { exit }
+    { ind = match(raw, /[^ \t]/) - 1 }
+    line == "- name: actionlint + yaml-parse every workflow" {
+      seen += 1
+      if (seen == 1) { on = 1; base = ind; buf[++n] = line } else { on = 0 }
+      next
+    }
+    on && ind <= base { on = 0 }
+    on { buf[++n] = line }
+    END {
+      if (seen != 1) exit 0
+      for (i = 1; i <= n; i++) print buf[i]
+    }
   ' "$file"
 }
 
@@ -8045,57 +8061,100 @@ CHANNEL
   # step guards a SET of globs, and a set shrinks silently -- `shopt -s nullglob` means a glob that
   # matches nothing simply contributes nothing, so dropping one leaves a step that still parses
   # files, still prints rows and still exits 0 while an entire population goes unparsed forever.
-  # Pin the sweep by EXACT WHOLE-BLOCK match, `for` through the lint, so the glob list, the parse,
-  # anything guarding the loop's own vacuity, and the lint's ordering are all one comparable value.
-  # An absent file or a renamed loop yields an empty extraction, which fails closed.
+  # Pin the sweep by EXACT WHOLE-BLOCK match on the NAMED STEP -- `- name:` through the step's last
+  # line -- so the glob list, the parse, anything guarding the loop's own vacuity, the lint's
+  # ordering, and the step's own `if:`-lessness are all one comparable value. An absent file, a
+  # renamed step, or a SECOND step wearing the pinned name all yield an empty extraction, which
+  # fails closed.
   #
   # MEASURED before this pin existed: deleting the whole `actionlint + yaml-parse every workflow`
   # step from pr-gate.yml survived the entire 646-check suite with zero new FAIL rows, and so did
-  # dropping the `*.yaml` glob from it. With the six rows below, each mutant reds exactly one row --
-  # this one -- at an unchanged total check count (652), so neither is a crash-after-partial-run. The expected block below is typed here, NOT derived from
-  # pr-gate.yml, so it cannot compare the file against itself. It is deliberately a FROZEN literal:
-  # widening the sweep (#855 adds a `.github/ISSUE_TEMPLATE/` pass and an `[[ "$n" -gt 0 ]]`
-  # fail-closed guard, neither of which is on master yet) reds this row until the widened block is
-  # written here too -- that is the control working, not a conflict to route around. ----
+  # dropping the `*.yaml` glob from it. MEASURED again against the first, content-anchored form of
+  # this pin: parking an EXACT copy of the sweep in an uncalled shell function one step earlier and
+  # then weakening the real step survived 652/652 with zero new FAIL rows, and so did the same
+  # duplicate with the real step DELETED outright -- the mutually-masking-duplicate outcome. All six
+  # pr-gate.yml mutants (step deleted; `*.yaml` dropped; inert duplicate + weakened step; inert
+  # duplicate + deleted step; the named step duplicated; a step-level `if: false`) now red exactly
+  # one row -- this one -- at an unchanged total check count, so none is a crash-after-partial-run.
+  # The expected block below is typed here, NOT derived from pr-gate.yml, so it cannot compare the
+  # file against itself. It is deliberately a FROZEN literal: widening the sweep (#855 adds a
+  # `.github/ISSUE_TEMPLATE/` pass and an `[[ "$n" -gt 0 ]]` fail-closed guard, neither of which is
+  # on master yet) reds this row until the widened block is written here too -- that is the control
+  # working, not a conflict to route around. ----
+  local yaml_sweep_name='actionlint + yaml-parse every workflow'
+  local sw_set='set -euo pipefail'
+  local sw_nullglob='shopt -s nullglob'
+  local sw_for='for f in .github/workflows/*.yml .github/workflows/*.yaml; do'
+  local sw_echo='echo "== yaml-parse $f =="'
+  local sw_parse='python3 -c '"'"'import sys,yaml; yaml.safe_load(open(sys.argv[1]))'"'"' "$f"'
+  local sw_done='done'
+  local sw_lintecho='echo "== actionlint =="'
+  local sw_lint='actionlint -color'
+  local -a sw_body=("$sw_set" "$sw_nullglob" "$sw_for" "$sw_echo" "$sw_parse" "$sw_done" \
+    "$sw_lintecho" "$sw_lint")
   local expected_yaml_sweep
-  expected_yaml_sweep=$(cat <<'SWEEP' | paste -sd'|' -
-for f in .github/workflows/*.yml .github/workflows/*.yaml; do
-echo "== yaml-parse $f =="
-python3 -c 'import sys,yaml; yaml.safe_load(open(sys.argv[1]))' "$f"
-done
-echo "== actionlint =="
-actionlint -color
-SWEEP
-)
-  chk "pr-gate.yml yaml-parses every workflow glob and then lints (exact block)" \
+  expected_yaml_sweep=$(printf '%s\n' "- name: $yaml_sweep_name" 'run: |' "${sw_body[@]}" \
+    | paste -sd'|' -)
+  chk "pr-gate.yml yaml-parses every workflow glob and then lints (exact named step)" \
     "$(_pr_gate_yaml_parse_sweep "$SCRIPT_DIR/../.github/workflows/pr-gate.yml" | paste -sd'|' -)" \
     "$expected_yaml_sweep"
   # NON-VACUITY of the extractor: it must actually change under each mutant it claims to catch, or
   # the row above is a constant comparing itself. The DROPPED-GLOB row is the one issue #1035 is
   # about -- it is the mutant that leaves a green, plausible-looking step behind.
-  printf '%s\n' '      - name: x' '        run: |' \
-    '          for f in .github/workflows/*.yml; do' '            echo "== yaml-parse $f =="' \
-    '            python3 -c '"'"'import sys,yaml; yaml.safe_load(open(sys.argv[1]))'"'"' "$f"' \
-    '          done' '          echo "== actionlint =="' '          actionlint -color' \
-    > "$loopfix/yaml-glob-dropped.yml"
-  printf '%s\n' '      - name: x' '        run: |' \
-    '          for f in .github/workflows/*.yml .github/workflows/*.yaml; do' \
-    '            echo "== yaml-parse $f =="' \
-    '            python3 -c '"'"'import sys,yaml; yaml.safe_load(open(sys.argv[1]))'"'"' "$f" || true' \
-    '          done' '          echo "== actionlint =="' '          actionlint -color' \
-    > "$loopfix/yaml-parse-or-true.yml"
-  printf '%s\n' '      - name: x' '        run: |' \
-    '          for f in .github/workflows/*.yml .github/workflows/*.yaml; do' \
-    '            echo "== yaml-parse $f =="' '            if false; then' \
-    '              python3 -c '"'"'import sys,yaml; yaml.safe_load(open(sys.argv[1]))'"'"' "$f"' \
-    '            fi' '          done' '          echo "== actionlint =="' '          actionlint -color' \
+  #
+  # Every fixture is emitted through ONE writer from the SAME body lines the expected block is built
+  # from, so a mutant differs from `expected` in exactly its mutation and never records a FALSE KILL
+  # on an incidental indentation or quoting typo (pre-flight item 4). That makes the FAITHFUL
+  # positive control below load-bearing: if the step name typed here ever disagreed with the one the
+  # extractor anchors on, every "caught" row would pass vacuously on an empty extraction, and only a
+  # fixture that is supposed to MATCH can detect that.
+  _yaml_sweep_step() {  # $1 = step name; $2.. = run-body lines -> one YAML step on stdout
+    printf '%s\n' "      - name: $1" '        run: |'
+    shift
+    printf '          %s\n' "$@"
+  }
+  _yaml_sweep_step "$yaml_sweep_name" "${sw_body[@]}" > "$loopfix/yaml-faithful.yml"
+  _yaml_sweep_step "$yaml_sweep_name" "$sw_set" "$sw_nullglob" \
+    'for f in .github/workflows/*.yml; do' "$sw_echo" "$sw_parse" "$sw_done" "$sw_lintecho" \
+    "$sw_lint" > "$loopfix/yaml-glob-dropped.yml"
+  _yaml_sweep_step "$yaml_sweep_name" "$sw_set" "$sw_nullglob" "$sw_for" "$sw_echo" \
+    "$sw_parse || true" "$sw_done" "$sw_lintecho" "$sw_lint" > "$loopfix/yaml-parse-or-true.yml"
+  _yaml_sweep_step "$yaml_sweep_name" "$sw_set" "$sw_nullglob" "$sw_for" "$sw_echo" \
+    'if false; then' "$sw_parse" 'fi' "$sw_done" "$sw_lintecho" "$sw_lint" \
     > "$loopfix/yaml-parse-if-false.yml"
-  printf '%s\n' '      - name: x' '        run: |' \
-    '          for f in .github/workflows/*.yml .github/workflows/*.yaml; do' \
-    '            echo "== yaml-parse $f =="' \
-    '            python3 -c '"'"'import sys,yaml; yaml.safe_load(open(sys.argv[1]))'"'"' "$f"' \
-    '          done' '          echo "== actionlint =="' '          actionlint -color || true' \
-    > "$loopfix/yaml-lint-or-true.yml"
+  _yaml_sweep_step "$yaml_sweep_name" "$sw_set" "$sw_nullglob" "$sw_for" "$sw_echo" "$sw_parse" \
+    "$sw_done" "$sw_lintecho" "$sw_lint || true" > "$loopfix/yaml-lint-or-true.yml"
+  # THE MUTUALLY-MASKING DUPLICATE (pre-flight item 4). An EXACT copy of the sweep parked earlier in
+  # an inert context -- here an uncalled shell function inside an unrelated step -- is what a
+  # content-anchored extractor would lock onto, leaving the real guard free to be weakened or
+  # deleted underneath it. Both halves are one fixture because either alone is killable; together
+  # they are the outcome one-at-a-time mutation is structurally blind to.
+  local -a sw_inert_dup=('yaml_sweep_reference() {' "${sw_body[@]}" '}')
+  { _yaml_sweep_step 'notes on the workflow lint' "${sw_inert_dup[@]}"
+    _yaml_sweep_step "$yaml_sweep_name" "$sw_set" "$sw_nullglob" \
+      'for f in .github/workflows/*.yml; do' "$sw_echo" "$sw_parse" "$sw_done" "$sw_lintecho" \
+      "$sw_lint"; } > "$loopfix/yaml-dup-inert-weakened.yml"
+  _yaml_sweep_step 'notes on the workflow lint' "${sw_inert_dup[@]}" \
+    > "$loopfix/yaml-dup-inert-deleted.yml"
+  # A SECOND step wearing the pinned name is refused, not resolved to the first: with two copies the
+  # reader cannot tell which one Actions runs last, so an exact first copy would otherwise mask a
+  # weakened second.
+  { _yaml_sweep_step "$yaml_sweep_name" "${sw_body[@]}"
+    _yaml_sweep_step "$yaml_sweep_name" "$sw_set" "$sw_nullglob" \
+      'for f in .github/workflows/*.yml; do' "$sw_echo" "$sw_parse" "$sw_done" "$sw_lintecho" \
+      "$sw_lint"; } > "$loopfix/yaml-dup-named-step.yml"
+  chk "yaml-sweep fixtures are FAITHFUL: an unmutated copy of the step matches exactly" \
+    "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-faithful.yml" | paste -sd'|' -)" \
+    "$expected_yaml_sweep"
+  chk "yaml-sweep check is NON-VACUOUS: an inert earlier duplicate cannot mask a WEAKENED step" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-dup-inert-weakened.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "yaml-sweep check is NON-VACUOUS: an inert earlier duplicate cannot mask a DELETED step" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-dup-inert-deleted.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "yaml-sweep check is NON-VACUOUS: a DUPLICATED step name is refused, not read as the first" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-dup-named-step.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
   chk "yaml-sweep check is NON-VACUOUS: a DROPPED glob no longer matches" \
     "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-glob-dropped.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
        && printf missed || printf caught)" "caught"
