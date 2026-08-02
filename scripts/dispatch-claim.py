@@ -215,6 +215,10 @@ SAFE_PACKAGE = re.compile(
     r"(?:[A-Za-z0-9][A-Za-z0-9_.-]*(?:,[A-Za-z0-9][A-Za-z0-9_.-]*)*|__global__)")
 SAFE_LOGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*(?:\[bot\])?")
 SAFE_SHA = re.compile(r"[0-9a-f]{40}")
+# THE plan `generated_at` grammar, defined ONCE (#958 doctrine): validate_plan gates the artifact
+# on it and `review_service_order` derives the review lane's rotation from it, so a second
+# hand-copied regex could let the ordering derive from a value the validator never accepted.
+PLAN_GENERATED_AT = re.compile(r"20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 BUSY_OR_GATED = {
     "status:blocked",
@@ -762,14 +766,58 @@ def normalize_plan_order(document):
     return document
 
 
+def review_service_order(items, generated_at):
+    """[registry #1515] The review/fix lane's SERVICE order — deliberately NOT the plan's storage
+    order above.
+
+    `normalize_plan_order` gives the ARTIFACT a canonical `(repo, pr_number)` order so it is
+    diffable and so `validate_plan` can reject a mangled one. CLAIM then consumed that same order
+    as its service order, and `(repo, pr_number)` carries no fairness or urgency term at all: with
+    capacity below demand the same low-numbered rows are served on EVERY tick, so a higher-numbered
+    PR is not behind the queue, it is permanently behind it. Measured 2026-08-01: #1433 sat
+    `review:changes` for 9.5 h behind 27 lower-numbered registry PRs while the lane merged 10
+    others, and `review-fix` loses ~17 % of its runs to the shared installation budget (#1303) — a
+    fixed head plus a lossy server means the tail is never REACHED, not reached slowly.
+
+    So the head rotates. The list is served from a plan-derived offset and wraps, which keeps every
+    property the fixed order had except the starvation:
+
+      * DETERMINISTIC and reproducible — a function of the plan artifact alone. The same plan
+        replayed yields the same order, which is what made the old key worth keeping.
+      * ORDER-PRESERVING — the output is a pure rotation, so the ascending `pr_number` sequence
+        (the deterministic tie-break) is intact; only where it STARTS moves.
+      * TOTAL — no item is dropped, so this cannot become a silent per-tick cap. Every row still
+        reaches `_dispatch_review_items`, which re-validates it independently.
+
+    The offset is a hash of the plan's `generated_at` rather than the timestamp's own arithmetic:
+    a plain `epoch % len(items)` advances by a fixed stride per tick, and whenever that stride
+    shares a factor with the item count only `len/gcd` of the positions can ever be the head — a
+    quieter version of the same starvation. With `c` items served per tick out of `n`, the expected
+    wait becomes ~`n/c` ticks instead of unbounded.
+
+    `generated_at` reaches this from the HOSTILE plan artifact, so it is re-gated here on the same
+    single `PLAN_GENERATED_AT` grammar `validate_plan` enforces, and a malformed value REFUSES
+    rather than falling back to the identity order (a silent fallback restores starvation with
+    nothing red anywhere). Refusing is safe to do loudly: ordering confers no authority — every
+    item in `items` was already admitted, and CLAIM re-derives each one's admission live — so the
+    worst a chosen timestamp can do is pick which ADMISSIBLE row is looked at first."""
+    if not isinstance(generated_at, str) or not PLAN_GENERATED_AT.fullmatch(generated_at):
+        raise DispatchError("review service order requires the plan's validated generated_at")
+    ordered = list(items)
+    if len(ordered) < 2:
+        return ordered
+    offset = int.from_bytes(
+        hashlib.blake2s(generated_at.encode("utf-8"), digest_size=8).digest(), "big") % len(ordered)
+    return ordered[offset:] + ordered[:offset]
+
+
 def validate_plan(document):
     """Strictly validate the entire PLAN artifact before any network mutation."""
     _require_exact_fields(document, PLAN_FIELDS, "plan")
     if document["schema"] != SCHEMA:
         raise DispatchError("plan schema is unsupported")
     if (not isinstance(document["generated_at"], str)
-            or not re.fullmatch(r"20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
-                                document["generated_at"])):
+            or not PLAN_GENERATED_AT.fullmatch(document["generated_at"])):
         raise DispatchError("plan generated_at is malformed")
     repositories = document["repositories"]
     if not isinstance(repositories, list):
@@ -8896,9 +8944,16 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
             # Privacy (locked decision 22b): public workflow logs never carry account handles.
             print(f"dispatched {kind} {repo}#{number}: model={model}, claim={claim_id[:8]}")
 
-        repo_review_items = [
-            entry for entry in plan["review_items"] if entry["repo"] == repo
-        ]
+        # [#1515] Rotate the head of THIS repo's review queue. The filter preserves the plan's
+        # ascending `pr_number` order, which as a service order starves everything above the
+        # capacity cut-off forever; `review_service_order` re-anchors the start deterministically
+        # from the plan's own timestamp without dropping a row. Per-repo (not over the global
+        # list) because this loop already partitions by repo — rotating the global list and then
+        # filtering would split a repo's group across the wrap and yield no rotation at all for
+        # every repo but one.
+        repo_review_items = review_service_order(
+            [entry for entry in plan["review_items"] if entry["repo"] == repo],
+            plan["generated_at"])
         if repo_review_items:
             dispatched += _dispatch_review_items(
                 repo_review_items, repo, policy, routing, allocator, worker_pr,
@@ -10668,6 +10723,18 @@ def _self_test():
         }],
     }
     assert validate_plan(fixture) is fixture
+    # [#1515] The plan timestamp is gated on the SAME single `PLAN_GENERATED_AT` grammar the review
+    # rotation derives its offset from, so a malformed one is refused at the artifact boundary and
+    # can never reach an ordering decision. Red on both halves of that single-sourcing.
+    for _bad_stamp in ("2026-07-16 12:00:00Z", "1999-07-16T12:00:00Z", "2026-07-16T12:00:00",
+                       "2026-07-16T12:00:00Zx", 0):
+        _bad_plan = json.loads(json.dumps(fixture))
+        _bad_plan["generated_at"] = _bad_stamp
+        try:
+            validate_plan(_bad_plan)
+            raise AssertionError(f"validate_plan accepted generated_at {_bad_stamp!r}")
+        except DispatchError:
+            pass
     # issue #112: the multi-area conflict partition. plan_package reduces a collection of
     # area:* sections to the partition KEY a plan/lease row reserves — exactly one area is that
     # area, TWO OR MORE is the canonical key naming exactly those areas, and ZERO is the
@@ -10735,6 +10802,104 @@ def _self_test():
     validate_plan(normalize_plan_order(mixed))
     assert mixed["review_items"][0]["repo"] == "aaa/first-lexically"
     assert mixed["disarm_items"][0]["repo"] == "aaa/first-lexically"
+    # ---- [registry #1515] the review lane's SERVICE order rotates its head ---------------------
+    # The plan's STORAGE order stays `(repo, pr_number)` ascending (asserted immediately above);
+    # what changed is what CLAIM SERVES. Every assertion below flips if `review_service_order`
+    # regresses to returning its input unchanged, which is the whole defect.
+    _rota = list(range(10))
+    # (a) THE FAIRNESS PROPERTY, and the one that is red against the identity order: over a day of
+    #     5-minute plan timestamps EVERY item is served first at least once. Under `(repo,
+    #     pr_number)` alone this set is `{0}` for all 288 ticks — item 9 is not behind the queue,
+    #     it is permanently behind it.
+    _rota_ticks = [f"2026-08-01T{_h:02d}:{_m:02d}:00Z"
+                   for _h in range(24) for _m in range(0, 60, 5)]
+    _rota_heads = {review_service_order(_rota, _tick)[0] for _tick in _rota_ticks}
+    assert _rota_heads == set(_rota), (
+        "the review service order starves the tail: only "
+        f"{sorted(_rota_heads)} of {_rota} ever reached the head across {len(_rota_ticks)} ticks")
+    # (b) PINNED, so "it rotates" cannot be satisfied by an order nobody can predict. Two distinct
+    #     plan timestamps, two distinct heads, both exact — expected values written out here, not
+    #     recomputed from the function under test.
+    assert review_service_order(_rota, "2026-08-01T01:53:00Z") == [6, 7, 8, 9, 0, 1, 2, 3, 4, 5]
+    assert review_service_order(_rota, "2026-08-01T00:00:00Z") == [5, 6, 7, 8, 9, 0, 1, 2, 3, 4]
+    # (c) TOTAL and ROTATION-SHAPED on every tick: no row is dropped or duplicated (this must never
+    #     become a silent per-tick cap), and the deterministic ascending tie-break survives intact
+    #     — only where it STARTS moves. A shuffle would pass (a) and (b) and fail here.
+    for _tick in _rota_ticks:
+        _served = review_service_order(_rota, _tick)
+        _cut = _rota.index(_served[0])
+        assert _served == _rota[_cut:] + _rota[:_cut], (_tick, _served)
+        assert sorted(_served) == _rota, (_tick, _served)
+    # (d) Reproducible, and non-destructive to the caller's list.
+    assert (review_service_order(_rota, "2026-08-01T01:53:00Z")
+            == review_service_order(_rota, "2026-08-01T01:53:00Z"))
+    assert _rota == list(range(10)), "review_service_order mutated its input"
+    assert review_service_order([], "2026-08-01T01:53:00Z") == []
+    assert review_service_order(["only"], "2026-08-01T01:53:00Z") == ["only"]
+    # (e) The real plan rows, rotated: the fixture's ascending 41/44/46 is served 46-first here, so
+    #     a PR is reached on its merits and not on its number.
+    _rota_plan = review_service_order(fixture["review_items"], "2026-08-01T01:53:00Z")
+    assert [_item["pr_number"] for _item in _rota_plan] == [46, 41, 44], _rota_plan
+    # (f) FAIL-CLOSED on the hostile half. `generated_at` arrives from the plan artifact, so the
+    #     rotation is re-gated on the SAME grammar validate_plan enforces and REFUSES rather than
+    #     quietly falling back to the identity order — a silent fallback restores the starvation
+    #     with nothing red anywhere. The gate is unconditional: it fires before the length
+    #     short-circuit, so an empty queue cannot launder a malformed timestamp past it.
+    for _bad in ("", "2026-08-01 01:53:00Z", "2026-08-01T01:53:00", "1999-08-01T01:53:00Z",
+                 "2026-08-01T01:53:00Z\n", None, 1754011980, ["2026-08-01T01:53:00Z"]):
+        for _queue in ([], _rota):
+            try:
+                review_service_order(_queue, _bad)
+                raise AssertionError(
+                    f"review_service_order accepted the malformed generated_at {_bad!r}")
+            except DispatchError:
+                pass
+    # (g) THE CALL SITE. Every assertion above stays green while dispatch() keeps serving the bare
+    #     `(repo, pr_number)` comprehension, so the argument EXPRESSION is pinned on dispatch()'s
+    #     parsed AST: `repo_review_items` must be bound by a `review_service_order(...)` call whose
+    #     second argument is the plan's OWN validated timestamp. A literal or a substitute there
+    #     would freeze the head again with the whole rotation harness still passing.
+    def _service_order_violations(scope_body):
+        assigns = [node for node in ast.walk(ast.Module(body=scope_body, type_ignores=[]))
+                   if isinstance(node, ast.Assign)
+                   and [getattr(target, "id", "") for target in node.targets]
+                   == ["repo_review_items"]]
+        if len(assigns) != 1:
+            return [f"expected exactly one repo_review_items binding, got {len(assigns)}"]
+        value = assigns[0].value
+        if not (isinstance(value, ast.Call)
+                and _callee_name(value.func) == "review_service_order"):
+            return [f"repo_review_items is not served through review_service_order: "
+                    f"{ast.unparse(value)}"]
+        if len(value.args) != 2 or ast.unparse(value.args[1]) != "plan['generated_at']":
+            return [f"the rotation must derive from the validated plan timestamp: "
+                    f"{ast.unparse(value)}"]
+        return []
+    _service_scope = ast.parse(textwrap.dedent(inspect.getsource(dispatch))).body[0].body
+    assert _service_order_violations(_service_scope) == [], \
+        _service_order_violations(_service_scope)
+    # ...and that pin is itself mutation-tested against the three ways it could go permissive,
+    # applied to dispatch()'s REAL source — otherwise it is one more guard asserted to work.
+    for _probe, _replacement in {
+            "reverted to the bare (repo, pr_number) comprehension":
+                "repo_review_items = [e for e in plan['review_items'] if e['repo'] == repo]",
+            "rotation offset hard-coded off a constant timestamp":
+                "repo_review_items = review_service_order("
+                "[e for e in plan['review_items'] if e['repo'] == repo], '2026-01-01T00:00:00Z')",
+            "the helper called but its result thrown away":
+                "review_service_order([e for e in plan['review_items'] if e['repo'] == repo], "
+                "plan['generated_at'])\n"
+                "repo_review_items = [e for e in plan['review_items'] if e['repo'] == repo]",
+    }.items():
+        _probe_scope = ast.parse(textwrap.dedent(inspect.getsource(dispatch))).body[0].body
+        _probe_loop = next(node for node in _probe_scope if isinstance(node, ast.For)
+                           and ast.unparse(node.iter) == "plan['repositories']")
+        _probe_at = next(index for index, node in enumerate(_probe_loop.body)
+                         if isinstance(node, ast.Assign)
+                         and [getattr(t, "id", "") for t in node.targets] == ["repo_review_items"])
+        _probe_loop.body[_probe_at:_probe_at + 1] = ast.parse(_replacement).body
+        assert _service_order_violations(_probe_scope), (
+            f"the review service-order call-site pin is VACUOUS against the mutation {_probe!r}")
     # A skip-free plan is the common case and must validate too.
     empty_skips = json.loads(json.dumps(fixture))
     empty_skips["snapshot_skips"] = []
