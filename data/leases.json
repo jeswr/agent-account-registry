@@ -63,12 +63,12 @@
   {
    "account": "f79434c3ffba014f",
    "claim_id": "c03fd97aab1340a69debbd07e709b7ab",
-   "holder": "fix:jeswr/agent-account-registry#1777@dispatch-30764265862.1",
+   "holder": "fix:jeswr/agent-account-registry#1777@30764672526.1",
    "package": "groom",
    "role": "fix",
    "model": "opus5",
-   "issued_at": 1785700876,
-   "expires_at": 1785707176
+   "issued_at": 1785700913,
+   "expires_at": 1785707213
   }
  ]
 }
