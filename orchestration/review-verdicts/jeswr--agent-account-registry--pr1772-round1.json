@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1772,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "199992cd8e278e9f0047b406825b16c461a36d9e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 8 says all seventeen workflow bindings read `${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}`. The tree has 17 `ALERT_REPO:` bindings, but only 16 use that expression; `.github/workflows/groom.yml:607` uses `${{ secrets.ALERT_REPO }}` without the variable fallback. This does not undermine the document's main analysis, but it makes the deployment-configuration caveat imprecise.",
+    "file": "research/1021-alert-route-consolidation.md",
+    "fix_hint": "Say that 16 bindings use the secret/variable fallback expression and one is secret-only, or describe all 17 more generally as reading an `ALERT_REPO` workflow binding.",
+    "severity": "minor",
+    "title": "The claimed 17 identical ALERT_REPO bindings include one different binding"
+   }
+  ],
+  "progress": null,
+  "summary": "The research-only change is substantively correct and complete for its stated purpose. The checkout supports the central inventory (11 `_alert_route` definitions plus `model-health.py`'s split route), the five materially different shapes, the absent shared module, the two single-file sparse checkouts, and the missing route assertions in `park-stock-alert.py`. It changes no runtime or trust-plane behavior. One minor counting/wording error remains in the final caveats: there are 17 `ALERT_REPO` workflow bindings, but only 16 use the expression quoted there; the remaining binding is secret-only.",
+  "verdict": "approve"
+ }
+}
