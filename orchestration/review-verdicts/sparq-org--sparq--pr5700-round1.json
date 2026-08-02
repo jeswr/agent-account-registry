@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5700,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0a02fbc8ac493a3faf415b47b697ba48da87de25",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`unless_paths` vetoes a rule when any changed path matches `site/**` or `book/**`. That does not establish that the new crate was added to `surfaces.ts` or received a guide/SUMMARY entry. A PR adding a crate while making an unrelated site typo fix will therefore mint no site issue; the analogous book case loses the guide issue. This contradicts the claim that suppression means the PR already did the follow-on's work and makes the automation fail open.",
+    "file": "scripts/flow-on.py",
+    "fix_hint": "Use an evidence-specific predicate for these rules (for example, inspect the relevant canonical file/diff for the crate identifier and, for the guide, both the page and SUMMARY registration), or do not suppress the follow-on merely because the surface was touched. Add negative tests where unrelated site/book files change and the follow-ons must still fire.",
+    "severity": "major",
+    "title": "Unrelated site or book edits suppress required follow-ons"
+   },
+   {
+    "body": "`build_context` and `_new_public_crate_added` select one crate via `_first_segment_after`, while `evaluate` emits each rule only once. If a PR adds two public crate manifests, all three issues are created only for the first crate; the second crate receives no test-method, site, or guide follow-on. If the first added crate is a `publish = false` stub and the second is public, `_new_public_crate_added` returns false and no new-crate follow-ons are emitted at all.",
+    "file": "scripts/flow-on.py",
+    "fix_hint": "Evaluate the new-crate rules once per crate returned by `added_crates(added)`, filtering stubs per crate and building a crate-specific context. Add tests for two public crates and for a stub followed by a public crate, asserting three correctly keyed follow-ons per public crate.",
+    "severity": "major",
+    "title": "Only the first crate in a multi-crate PR receives follow-ons"
+   }
+  ],
+  "progress": null,
+  "summary": "The new follow-on rules can silently omit required work. Suppression treats any site/book edit as proof that the new crate was documented, and rule evaluation handles only the first newly added crate. The tests currently codify the broad suppression and do not cover multi-crate PRs, so they do not establish the claimed per-crate completeness.",
+  "verdict": "request_changes"
+ }
+}
