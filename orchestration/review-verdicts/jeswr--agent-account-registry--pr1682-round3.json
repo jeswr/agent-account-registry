@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1682,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c18c00c1c1b6d8bd52c73eb6d25a6b166994b8f9",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 approval remains supported. Standing-refusal evidence requires both the reason-specific marker and the exact, case-insensitively matched `github-actions[bot]` identity used by the workflow's `github.token`; missing, malformed, and foreign author metadata fails closed and cannot suppress a legitimate annotation or inflate the standing census. Every refusal is sealed into exactly one of five visibility dispositions, with standing counts broken down by reason and explicit zero emission in the operator-facing census. The orchestration tests cover trusted and forged markers end to end, reason separation in both directions, probes beyond the posting cap, silent refusals, comment-read failures, comment-post failures, and fresh versus standing refusals. The added exception-to-marker harness also prevents seal failures from masquerading as mutation kills by aborting the remaining checks. I found no correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
