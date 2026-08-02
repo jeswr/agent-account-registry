@@ -196,6 +196,28 @@ FLEET_COMPOSITION_KEYS = frozenset({
 _THRESHOLD_BOUND_EXEMPT = frozenset({"groom.yml", "retriage.yml"})
 
 
+# [#1084] The nominal cadence of every workflow the CROSS-REPO keepalive leg watches, keyed by
+# (repository, workflow-file). A registry leg's bound is READ out of the watched workflow's own
+# `on: schedule:` block (`_workflow_cadence_seconds`), so a re-timed cron and the threshold sized
+# against it cannot drift apart. The cross-repo leg watches a repository that is not checked out
+# beside this one, so there is nothing to read — and with nothing to read, the only reference point
+# its threshold had was ITSELF: every fixture age in the #559 rows is derived from the threshold
+# (`limit ± 600`), so widening `rearm-sweeper.yml:1200` to `:99999` in
+# .github/workflows/dashboard.yml turned that leg into a no-op with the whole suite green. This
+# table is the missing independent statement — two files that must agree, which is the one shape a
+# tautological assertion cannot take.
+#
+# DECLARED, NOT READ — so it can go stale, and nothing offline can detect that. Re-verify against
+# the target repository's `.github/workflows/<workflow>` `on: schedule:` block and update this
+# table whenever that cron is re-timed; a value here that is too LARGE is the dangerous direction,
+# because it is what lets a threshold widen without a row going red. `rearm-sweeper.yml` is the
+# 10-minute cron .github/workflows/dashboard.yml's own cross-repo step comment records (the merge-
+# queue closure backstop in sparq-org/sparq).
+_CROSS_REPO_KEEPALIVE_CADENCE_SECONDS = {
+    ("sparq-org/sparq", "rearm-sweeper.yml"): 600,
+}
+
+
 class DashboardError(RuntimeError):
     pass
 
@@ -3886,6 +3908,95 @@ def _self_test():
           "the set is pinned so a future re-size that drops one cannot quietly widen it",
           sorted(_THRESHOLD_BOUND_EXEMPT & set(keepalive_cadences)),
           ["groom.yml", "retriage.yml"])
+
+    # --- #1084: the WIDENING direction, on the three thresholds the row above cannot see. The
+    # strict bound covers three registry legs; the #1353 pair is excused from it ENTIRELY (so
+    # `groom.yml:1800` -> `:99999` is invisible), and the CROSS-REPO leg is not in that row's
+    # population at all because sparq-org/sparq is not checked out here for
+    # `_workflow_cadence_seconds` to read. With every fixture age below derived from the threshold
+    # itself, `rearm-sweeper.yml:1200` -> `:99999` left the whole suite green (#1084 measured 187
+    # rows) while that leg of the liveness mesh became a no-op. The two
+    # rows here bound EVERY run-anchored threshold in the mesh against a cadence that is not a
+    # restatement of it — read from the watched workflow for the registry legs, declared in
+    # `_CROSS_REPO_KEEPALIVE_CADENCE_SECONDS` for the cross-repo one. Ceiling and floor are stated
+    # SEPARATELY because a threshold that grows and one that shrinks are different failures with
+    # different consequences, and a single combined row cannot say which one it caught.
+    # ------------------------------------------------------------------------------------------
+    def _cross_repo_targets(script, specs, leg):
+        """{(repository, workflow-file): threshold-seconds} for a cross-repo keepalive leg.
+
+        The repository is read out of the leg's OWN `repos/<owner>/<name>/actions/…` endpoints
+        rather than restated here, so a leg re-pointed at another repository stops matching the
+        cadence declared for the old one instead of silently inheriting its bound. Anything other
+        than exactly one addressed repository is a REFUSAL: a leg whose target cannot be identified
+        must not be sized against a guess. Marker-anchored specs are excluded for the same reason
+        the registry side excludes dispatch.yml — their freshness is not a function of the watched
+        workflow's cron — and the membership row below reds if one ever appears here."""
+        repositories = sorted(set(re.findall(
+            r"repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/actions/", script)))
+        # Resolved BEFORE the refusal, and never by indexing the list under the guard: a guard that
+        # is the only thing standing between an empty list and `repositories[0]` cannot be measured
+        # — deleting it raises IndexError from the mutated line itself, which aborts the suite and
+        # records as a kill while every row below it never ran.
+        repository = repositories[0] if len(repositories) == 1 else None
+        if repository is None:
+            raise DashboardError(
+                f"{leg} addresses {len(repositories)} repositories, expected exactly 1 — refusing "
+                "to bound its thresholds against a cadence declared for some other repository")
+        return {(repository, name): limit
+                for name, (limit, marker) in specs.items() if not marker}
+
+    # The reader's own refusals, EXECUTED — a refusal nothing ever runs is a refusal nothing has
+    # checked, and both of these decide whether a threshold is measured against its own
+    # repository's cadence or another one's. `a-org/a` and `b-org/b` appear nowhere else in this
+    # suite, so the positive control cannot pass on a value the harness already had.
+    _cross_repo_probe_specs = {"probe.yml": (900, ""), "marked.yml": (300, "some-marker")}
+    check("[#1084] the repository a declared cadence is matched to is READ out of the leg's own "
+          "`repos/<owner>/<name>/actions/…` endpoints: a leg addressing none of them, or two "
+          "different ones, REFUSES rather than bounding its thresholds against a cadence declared "
+          "for some other repository — and a marker-anchored spec is not sized against a cron",
+          [_raises_dashboard(lambda: _cross_repo_targets(
+              "gh api -X POST dispatches", _cross_repo_probe_specs, "x")),
+           _raises_dashboard(
+               lambda: _cross_repo_targets(
+                   "repos/a-org/a/actions/workflows/probe.yml/runs?per_page=1\n"
+                   "repos/b-org/b/actions/workflows/probe.yml/dispatches",
+                   _cross_repo_probe_specs, "x")),
+           _cross_repo_targets("repos/a-org/a/actions/workflows/probe.yml/runs?per_page=1",
+                               _cross_repo_probe_specs, "x")],
+          [True, True, {("a-org/a", "probe.yml"): 900}])
+
+    cross_repo_thresholds = _cross_repo_targets(
+        sparq_script, sparq_specs, "the cross-repo cron-keepalive leg")
+    check("[#1084] every workflow the cross-repo leg watches has a DECLARED cadence, and the "
+          "declaration names nothing the leg has stopped watching — both sides pinned by equality, "
+          "so a target added to that leg without a declared cadence (a threshold with no reference "
+          "point at all) goes red here rather than joining the bounds below unmeasured",
+          (sorted(cross_repo_thresholds), sorted(_CROSS_REPO_KEEPALIVE_CADENCE_SECONDS)),
+          ([("sparq-org/sparq", "rearm-sweeper.yml")],
+           [("sparq-org/sparq", "rearm-sweeper.yml")]))
+    # `label -> (threshold, cadence)` for every run-anchored threshold in the mesh. An undeclared
+    # cross-repo target is DROPPED rather than raised on: the row above already names that failure,
+    # and aborting the suite here would stop every row below it from running at all (a mutant that
+    # crashes the harness records as a kill while nothing under it was measured).
+    anchored_thresholds = {name: (keepalive_specs[name][0], cadence)
+                           for name, cadence in keepalive_cadences.items()}
+    anchored_thresholds.update({
+        f"{repository} {name}": (limit, _CROSS_REPO_KEEPALIVE_CADENCE_SECONDS[(repository, name)])
+        for (repository, name), limit in cross_repo_thresholds.items()
+        if (repository, name) in _CROSS_REPO_KEEPALIVE_CADENCE_SECONDS})
+    check("[#1084] NO run-anchored threshold in the mesh exceeds TWO nominal cadences of what it "
+          "watches — the #1353 exempts and the cross-repo leg included (offenders listed as "
+          "label -> (threshold, cadence)): a threshold widened past two cadences costs a whole "
+          "extra cycle per dropped fire, and one widened to hours retires that leg of the mesh "
+          "while every fixture-driven row below it still passes",
+          {label: pair for label, pair in anchored_thresholds.items() if pair[0] > 2 * pair[1]},
+          {})
+    check("[#1084] ...and none sits at or under ONE cadence, where the keepalive kicks a punctual "
+          "cron behind its own fire — the #559 dup-dispatch storm, which on the cross-repo leg "
+          "shows up only in ANOTHER repository's telemetry",
+          {label: pair for label, pair in anchored_thresholds.items() if pair[0] <= pair[1]},
+          {})
 
     keepalive_gh_stub = r'''#!/usr/bin/env bash
 # Hermetic `gh` for dashboard.yml's cron-keepalive body. Every argv is recorded; the three reads
