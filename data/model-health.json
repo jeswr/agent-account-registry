@@ -1644,6 +1644,14 @@
    "model_alias": "opus5",
    "exit_class": "success",
    "run_id": "30757879522.1"
+  },
+  {
+   "ts": 1785690615,
+   "provider": "fleet",
+   "account": "5f5b2dc3fb8e231b",
+   "model_alias": "",
+   "exit_class": "success",
+   "run_id": "30758031255.1"
   }
  ]
 }
