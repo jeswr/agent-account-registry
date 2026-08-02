@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1665,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ec7588aa19e87d803b18c3f01c66dd4b82326adc",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`canonical_route_doc` closes `_alert_route`'s docstring and `canonical_workflow_comment` closes the dispatch workflow block, but this diff also rewrites the route contract in `render()` and in the comment immediately above `_alert_route()` in `main()`. Neither changed consumer is extracted or compared by exact equality. The module census does scan them, but its `phrasings` list is expressly finite and omits the round-2 counterexample. Appending `ALERT_TOKEN has issue-creation privileges at ALERT_REPO` to either block changes no canonical value and produces no tripwire hit, so every new assertion remains green. The current wording is accurate, but the claimed closed, phrasing-independent protection is still incomplete at the changed prose boundary.",
+    "file": "scripts/usage-alert.py",
+    "fix_hint": "Extract and normalize every changed route-contract consumer in this file\u2014at minimum the `render()` private-route guidance and `main()` route comment\u2014and pin each by exact equality to an independently specified canonical contract. Add an appended, deliberately unlisted capability-claim fixture for each extractor so each consumer demonstrably reds independently; retain the lexical scan only as defense in depth.",
+    "severity": "major",
+    "title": "Changed render and main route prose still escape the closed guard"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 closes the router docstrings and the changed workflow route-comment blocks with normalized exact-equality pins, but it still does not close all changed route-contract prose. In particular, `usage-alert.py` changes both the rendered operator guidance and `main()`'s route comment, while guard 1 covers only `_alert_route`'s docstring and dispatch.yml. Those two changed consumers remain protected solely by the explicitly finite lexical tripwire. Appending an unlisted capability assertion such as `ALERT_TOKEN has issue-creation privileges at ALERT_REPO` to either changed block still leaves the canonical pins unchanged and `claims_about_the_route(scanned) == []`. The prior round's major finding therefore remains materially unchanged, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
