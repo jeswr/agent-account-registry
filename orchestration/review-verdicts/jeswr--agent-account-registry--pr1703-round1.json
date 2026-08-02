@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1703,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ff38c5f824d843d65f05f24c37e8e2ecd84ef91b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe added phase 1b is a sound, non-vacuous regression test for the failed-primary/open-fallback state. It establishes the fallback copy through the real delivery path, keeps the primary token unusable, supplies the enumerated fallback marker, and independently asserts the surviving open route plus the absence of close/comment side effects. Those checks distinguish both an early best-effort supersede (whose later reopen would otherwise mask the defect) and an unconditional post-retry close. The recovered-primary assertion also directly preserves the intended one-open-route invariant. No production behavior or trust check is weakened, and no injection-directed text appears in the diff.",
+  "verdict": "approve"
+ }
+}
