@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5324,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "aa56e895b7e14f00b706071d0a46b49c3ecf720a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "merge_export still increments unkeyed and drops fresh records whose id is absent, while fresh_by_id[rid] still overwrites earlier records with the same ID. Thus an ID-less record can disappear and an arbitrary duplicate can win before the board is published. This contradicts the documented fail-closed safety posture for corrupt exports, and the new self-test/end-to-end test still exercises only malformed JSON rather than invalid record identity.",
+    "file": "scripts/bead-export-sync.sh",
+    "fix_hint": "Validate record identity before merging: require each fresh record to have a non-empty string ID and reject duplicate IDs with a nonzero exit; preferably validate duplicates and IDs in the committed input too, or narrowly document and test any necessary committed-input grandfathering. Add pure and end-to-end refusal tests proving that neither ID-less nor duplicate-ID exports push a branch.",
+    "severity": "major",
+    "title": "Malformed record identities are still silently normalized"
+   },
+   {
+    "body": "emit_json still inserts BRANCH and the gh-derived PR value directly between JSON quotes. Quotes, backslashes, or control characters in either value produce invalid JSON, so --json does not reliably satisfy its documented scheduler contract.",
+    "file": "scripts/bead-export-sync.sh",
+    "fix_hint": "Construct the entire result with a JSON encoder such as the already-required python3, passing values as arguments or environment data rather than interpolating JSON text. Add a test that parses output for a branch containing JSON-significant characters.",
+    "severity": "minor",
+    "title": "Machine-readable output is still not JSON-escaped"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 is stagnant: both prior findings remain materially unchanged. The merge still silently drops fresh records without IDs and collapses duplicate IDs with last-record-wins semantics, despite documenting fail-closed behavior for corrupt exports. The JSON output still interpolates branch and PR strings without JSON escaping. The added tests cover neither malformed record identity nor JSON-significant output values, so the source-of-record publication path remains unsafe for structurally corrupt exports and its machine-readable contract remains unreliable.",
+  "verdict": "request_changes"
+ }
+}
