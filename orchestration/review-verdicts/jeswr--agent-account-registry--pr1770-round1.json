@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1770,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ae2caaa499c53b30baceb03fb359a4219d2899a4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe added self-tests are diff-scoped, non-vacuous mutation guards for the existing enabled-fleet filter in the provider-capped scan. They independently assert firing state, exact enabled-account reset selection, absence of the rotated-out reset from the action, enabled-only churn count, and the non-firing path. The expected values are literal and distinct from the filtered fixture value, so removing or conditionally bypassing the filter for limit records makes the checks fail. The success-row portion does not create a separate observable effect because popping a never-inserted non-enabled account is a no-op, but the later non-enabled limit record still exercises and detects weakening of the shared filter. No trust check is weakened, no production behavior changes, and no injection-like instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
