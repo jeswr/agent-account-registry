@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1711,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "54f2519b7f6e37efbda947ce3431e02cf638e245",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`blake2s(generated_at) % len(items)` independently maps each tick to a head position. Nothing ensures that successive valid plan timestamps visit every residue, or even avoid repeating one residue indefinitely. The assertion over 288 timestamps for `len == 10` is only an empirical property of that fixture; it does not establish the advertised property for other queue lengths, time windows, tick schedules, or chosen valid timestamps. In particular, a deterministic sequence can omit a position for an arbitrarily long interval, so a row beyond the capacity cut-off can still starve. The docstring's claim that the change keeps every prior property except starvation, and that expected wait is about `n/c`, is therefore unsupported by the algorithm's actual invariant.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Derive the head from a monotonic plan tick/epoch and use a traversal whose step is guaranteed coprime to the current queue length, or persist a cursor, so every position is reached within a stated bound. Add tests across varied queue lengths and consecutive production tick sequences that assert each position is served within that bound; include lengths sharing factors with the tick interval and mutation probes that repeat or skip a residue. If only probabilistic fairness is intended, narrow the feature claim and explicitly justify why unbounded starvation risk satisfies the source requirement.",
+    "severity": "major",
+    "title": "Timestamp hashing does not guarantee starvation-free service"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 fixes the prior delivery-edge finding: `dispatch()` is structurally bound to `review_service_queue(plan, repo)`, and the helper-level tests pin the per-repository partition against empty, global, frozen-repository, and inverted-predicate mutations. However, the new ordering algorithm does not actually provide the claimed starvation freedom. Hashing each timestamp chooses a deterministic pseudo-random head, but it supplies no invariant that every position is reached within any bounded sequence of ticks; the test demonstrates coverage only for one queue length and one hand-picked day. Thus the fixed-head starvation defect has been changed into probabilistic service without a sound bounded-fairness guarantee. Because this is a new major finding, progress is regressing under the required rubric.",
+  "verdict": "request_changes"
+ }
+}
