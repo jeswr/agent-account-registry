@@ -5744,7 +5744,19 @@ def _test_firing_supersede(chk):
 
     Phase 6 pins the same-repository-distinct-token configuration, where the credential fallback is
     armed but there is only ONE issue to speak of: keying the dedup on the (repo, token) pair
-    instead of the repository name closes the live firing alert (round 1 of #1455)."""
+    instead of the repository name closes the live firing alert (round 1 of #1455).
+
+    Phase 1b and the `open_marker_routes` invariant close issue #1008's measured hole. The dedup
+    must fire ONLY after the primary write is CONFIRMED, and the phases above could not see an
+    early close: a mutant that ran `_close_superseded_alert` unconditionally — before the retry,
+    on a tick whose primary FAILED — survived all 519 checks, because phase 4 enters with the
+    fallback copy already CLOSED, so closing it again is a no-op and the #175 retry's REOPEN
+    restores the identical end state. Phase 1b runs the failed primary against an OPEN fallback
+    copy, which is the state #1008 describes (the alert lives on the fallback, the primary has no
+    marker), and pins both the surviving issue AND the absence of a close/comment against it —
+    retiring that copy would retire the only open alert. `open_marker_routes` states the operator-
+    visible invariant directly, per route rather than per repository state list: exactly ONE route
+    carries an open marker for one (condition, provider)."""
     import types
     global _gh
     real_gh = _gh
@@ -5791,6 +5803,14 @@ def _test_firing_supersede(chk):
     def states(repo):
         return [i["state"] for _, i in sorted(repos[repo].items())]
 
+    def open_marker_routes():
+        """Every route currently carrying an OPEN issue for this (condition, provider), read the
+        way an operator sees it — by the hidden marker, across BOTH repositories at once. The
+        #1008 invariant is that this list has exactly one entry."""
+        mk = _marker(fire["condition"], fire["provider"])
+        return sorted(repo for repo, issues in repos.items()
+                      if any(i["state"] == "open" and mk in i["body"] for i in issues.values()))
+
     fire = {"condition": "provider-outage", "provider": "anthropic", "fire": True, "reason": "r"}
     key = (fire["condition"], fire["provider"])
     try:
@@ -5805,6 +5825,21 @@ def _test_firing_supersede(chk):
         chk("supersede: the firing retry creates the fallback copy",
             (_deliver_alerts([fire], "m"), states(reg_repo)), ([], ["open"]))
 
+        # phase 1b (issue #1008): the alert now LIVES on the fallback, so the next tick enumerates
+        # its marker — while the primary is still unusable and its create FAILS. The dedup must not
+        # run before the primary write is CONFIRMED: this copy is the ONLY open alert, and closing
+        # it here would retire it. Phase 4 is structurally blind to this (its fallback copy is
+        # already closed, so an early close is a no-op the retry's reopen undoes), which is why an
+        # unconditional supersede survived the rest of the suite.
+        calls[:] = []
+        chk("supersede: a FAILED primary create leaves the fallback issue open",
+            (_deliver_alerts([fire], "m", {key}), states(priv_repo), states(reg_repo)),
+            ([], [], ["open"]))
+        chk("supersede: exactly one route carries an open marker while the primary is down",
+            open_marker_routes(), [reg_repo])
+        chk("supersede: a failing primary issues no close/comment against the fallback copy",
+            [c for c in calls if c[0] in ("close", "comment")], [])
+
         # phase 2: the primary recovers and takes the still-firing alert. Pre-fix this refreshed
         # the primary and left the fallback copy open with the body it was created with — two
         # divergent open issues for one condition until the eventual recovery closed both.
@@ -5815,6 +5850,8 @@ def _test_firing_supersede(chk):
             ([], ["open"], ["closed"]))
         chk("supersede: the closed copy is explained by exactly one comment, on the fallback",
             [c for c in calls if c[0] == "comment"], [("comment", reg_repo)])
+        chk("supersede: exactly one route carries an open marker once the primary recovers",
+            open_marker_routes(), [priv_repo])
 
         # phase 3: no fallback marker enumerated -> the fallback repo is never touched at all
         # (the snapshot is the whole trigger; nothing goes hunting cross-repo every tick).
