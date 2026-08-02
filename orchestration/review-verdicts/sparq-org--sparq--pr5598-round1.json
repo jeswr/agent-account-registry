@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5598,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e4aa49aadf9e263d3f474b2c8920dd046b170c83",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly closes the untracked-crate gap by comparing every scanned crate against the recorded floors, while preserving the existing checks for disappeared crates, test-count regressions, and lost integration-test directories. The new hermetic decision-table tests exercise the added failure direction, combined failures, and zero-test crates; the live tests independently verify full on-disk coverage and guard against vacuous scans. The targeted 13-test suite passes at the PR head, including the committed full-tree floor invariant. No correctness, soundness, test-validity, or security issue was found in the diff.",
+  "verdict": "approve"
+ }
+}
