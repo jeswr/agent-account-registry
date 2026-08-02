@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5746,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b8b4df6556e5e56074923bf37ce32a3df43863c9",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly aligns merge-group change classification with the ownership map's existing safe=true closure semantics. It preserves first-match behavior, prevents full-run triggers and crates/** paths from being rescued, and degrades missing or malformed map loads to the conservative engine class. The workflow consumers are updated consistently to recognize map-safe, and the focused tests exercise the real classifier and classify-only paths, composition with other classes, protected ZK anchors, trigger/crate carve-outs, malformed input, and workflow token wiring. The focused classifier tests passed locally (the wiring module itself could not run because PyYAML is unavailable in this checkout environment). No correctness, soundness, security, or vacuity issue was found.",
+  "verdict": "approve"
+ }
+}
