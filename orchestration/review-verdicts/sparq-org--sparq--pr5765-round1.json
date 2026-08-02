@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5765,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "cba7b8e4caf192732c6f56872a0f283b7ab59857",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 3 and 4.1 correctly say the PRs do not identify their package sets, that matching counts/extrema do not identify the remaining members, and that the audit actually greps \u00a75.2's documented eight packages. Nevertheless \u00a7\u00a74.2\u20134.5 and \u00a75 state unconditional verdicts about each PR's corpus. For #13263, the claimed evidential path is reached through filter_f64*, but the audit establishes only that filter_int_d1 and scan_k2_n64_r8 are in the 13-program set; neither fact places filter_f64* in it. For #13265, count equality alone does not prove its unnamed eight programs are the \u00a75.2 eight. Thus the central reachability conclusions are not supported by the stated evidence.",
+    "file": "research/noir-corpus-row-audit-13263-13266.md",
+    "fix_hint": "Either obtain and cite the actual package list/commit for each PR body and repeat the source-level closure check, or make every conclusion explicitly conditional on the PR corpus equaling the \u00a75.2 set. In the latter case, remove definitive per-PR labels such as '#13263 evidential' and '#13265 non-evidential' and state that actual-row verdicts remain unresolved pending provenance. Propagate the corrected scope to the three amended companion documents.",
+    "severity": "major",
+    "title": "Per-PR verdicts are drawn from an unproven substitute corpus"
+   },
+   {
+    "body": "Section 4.3 says the new arm 'does run and decline' merely because the closure contains boolean And instructions. The same section defines reachability as an And whose result feeds a Truncate, but it never shows that any listed boolean conjunction feeds one. Presence of unrelated And instructions is insufficient to establish that the truncate simplifier reaches the new pattern.",
+    "file": "research/noir-corpus-row-audit-13263-13266.md",
+    "fix_hint": "Trace the uses of the listed boolean And results and cite an actual downstream Truncate before claiming the guard executes. If none feeds a Truncate, change the conclusion to 'neither guard nor fire branch is reached' while retaining the disclosed-null assessment if otherwise justified.",
+    "severity": "minor",
+    "title": "Boolean And presence does not show the truncate rewrite's guard runs"
+   }
+  ],
+  "progress": null,
+  "summary": "The audit is careful about its source-only limits, but its headline per-PR reachability verdicts do not follow from the corpus provenance it establishes. The document proves only that the reported 13/11/8/39 corpora are unnamed, then substitutes the separately documented eight-package \u00a75.2 corpus. It explicitly concedes that the shared opcode extrema identify only two members and that a different set requires a re-take, yet still gives definitive verdicts for the actual PR corpora. This especially invalidates #13263's evidential conclusion, which relies on filter_f64 packages that have not been shown to belong to its 13-program set, and likewise prevents definitive claims about #13265's eight-program set. The result should be framed as a conditional audit of the \u00a75.2 corpus until the upstream package lists are obtained, or the actual corpora should be identified and audited.",
+  "verdict": "request_changes"
+ }
+}
