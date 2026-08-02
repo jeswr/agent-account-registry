@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5718,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ade784862462604fdfccec7cfd5be3ccd8cc1a68",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The registry, checker, CI wiring, scope annotations, regenerated security-workflow golden, and hermetic/live-repository tests form a coherent and fail-closed change. C1 validates required metadata and resolvable paths/recipes, C2 checks every expanded anchor for both the scope marker and exact companion path, and C3 ratchets the declared golden-file surface. The mutation table and unit tests exercise the load-bearing failure modes, including newly added unannotated glob members and missing registry entries. No correctness, soundness, test-validity, or security defect requiring changes was found in the supplied diff.",
+  "verdict": "approve"
+ }
+}
