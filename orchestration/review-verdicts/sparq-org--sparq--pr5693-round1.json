@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5693,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "15a9d8ea9dc5e1cdbbd8cc9db66358a8c488cdbf",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is documentation-only and accurately retires the stale deferral language. The new comments match the implemented fully-hidden circuit and verifier path: the verifier derives the accepted-set root and version floor from its own policy, rebuilds the proof public inputs, cross-binds the issuer-signed reference and index commitments, and records their pair in the shared single-use store. The relevant end-to-end linkage-reuse test exercises two presentations under distinct verifier nonces and expects the second to fail, rather than merely testing a helper. The research-grade and external-audit caveats are explicit, including the operational requirement that the issuer re-blind and re-sign for each presentation. No hostile instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
