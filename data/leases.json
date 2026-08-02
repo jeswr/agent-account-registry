@@ -81,16 +81,6 @@
    "expires_at": 1785697682
   },
   {
-   "account": "dc2d751954080e13",
-   "claim_id": "926a00b0372d4e35a582293b45cecc3c",
-   "holder": "review:sparq-org/sparq#5765@30760027466.1",
-   "package": "sparq-zk",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785693498,
-   "expires_at": 1785697698
-  },
-  {
    "account": "58b7c92faa5b5ca5",
    "claim_id": "67b633caccf64bc7b1d1b7f52b035fb4",
    "holder": "jeswr/agent-account-registry#1523@30760064293.1",
