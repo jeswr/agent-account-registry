@@ -1173,6 +1173,10 @@ def backfill_workflow_seam_report():
     # `.get`, not an index: a DELETED targets job must surface as a named FAIL below, not as a
     # KeyError that aborts the suite and leaves every check after this one unrun.
     targets_job = workflow["jobs"].get("targets") or {}
+    resolve_step = next((s for s in (targets_job.get("steps") or [])
+                         if isinstance(s, dict) and s.get("id") == "resolve"), None)
+    resolve_run = str((resolve_step or {}).get("run") or "")
+    needs = job.get("needs")
     strategy = job.get("strategy") or {}
     steps = job["steps"]
     step = next((s for s in steps if "backfill-provenance.py" in str(s.get("run") or "")), None)
@@ -1217,7 +1221,61 @@ def backfill_workflow_seam_report():
         # as a hardened ref check (AGENTS.md pre-flight 6; sparq #4743 shipped that mutant).
         "job_if": guard,
         "targets_job_if": str(targets_job.get("if") or ""),
+        # The PRODUCER half of the same claim. `matrix_repo_expr` proves only that the CONSUMER
+        # reads an output of that name; it holds just as well when the resolver is replaced by
+        # `echo 'repos=["one/hardcoded-repo"]'`, which is the hardcoded-target defect itself. And
+        # deleting `needs: targets` leaves the strategy and both guards byte-identical while the
+        # `needs.targets.outputs.repos` expression no longer resolves to anything. So pin the whole
+        # path: the dependency EDGE, the output BINDING, and the step that step id names.
+        "backfill_needs": sorted([needs] if isinstance(needs, str) else list(needs or [])),
+        "targets_repos_output": str((targets_job.get("outputs") or {}).get("repos")),
+        "targets_step_ids": [str(s.get("id")) for s in (targets_job.get("steps") or [])
+                             if isinstance(s, dict) and s.get("id")],
+        "resolver_requested_binding": str(((resolve_step or {}).get("env") or {})
+                                          .get("REQUESTED")),
+        "resolver_step_unconditional": (resolve_step is not None and "if" not in resolve_step
+                                        and not resolve_step.get("continue-on-error")),
+        "resolver_errexit": "set -euo pipefail" in resolve_run,
+        # Without the `| tee -a "$GITHUB_OUTPUT"` the resolver computes the right answer and
+        # discards it: `steps.resolve.outputs.repos` renders empty and the matrix sweeps nothing,
+        # with every text assertion above still green.
+        "resolver_emits_to_step_output": bool(
+            re.search(r"""^python3 - <<'EOF' \| tee -a "\$GITHUB_OUTPUT"$""", resolve_run, re.M)),
     }
+
+
+def backfill_targets_resolver_source():
+    """The python heredoc the `targets` job's `resolve` step runs — extracted and COMPILED.
+
+    Returns `(source, None)`, or `(None, reason)` when there is no resolver to extract. Every
+    seam assertion above reads workflow TEXT, and text cannot tell a policy-derived resolver from
+    `echo 'repos=["one/hardcoded-repo"]'` — which is exactly the defect #1544 exists to kill. So
+    the self-test EXECUTES this source against synthetic policy fixtures and asserts the row it
+    emits.
+
+    It returns a reason rather than raising ON PURPOSE: the headline mutant here (a hardcoded
+    `echo` in place of the resolver) carries no heredoc at all, and raising would abort the suite
+    part-way — recording as a crash, not a kill, with every check below it unrun (AGENTS.md
+    pre-flight 4). A reason reds each behavioural row BY NAME at an unchanged check count."""
+    steps = (_workflow("backfill-provenance.yml")["jobs"].get("targets") or {}).get("steps") or []
+    found = [s for s in steps if isinstance(s, dict) and s.get("id") == "resolve"]
+    if len(found) != 1:
+        return None, f"expected exactly one `id: resolve` step in `targets`, found {len(found)}"
+    lines = str(found[0].get("run") or "").split("\n")
+    # Containment, not `endswith`: the shipped opener pipes (`<<'EOF' | tee -a "$GITHUB_OUTPUT"`).
+    opens = [i for i, line in enumerate(lines) if "<<'EOF'" in line]
+    if len(opens) != 1:
+        return None, f"the resolver must run exactly one `<<'EOF'` heredoc, found {len(opens)}"
+    body = lines[opens[0] + 1:]
+    closes = [i for i, line in enumerate(body) if line.strip() == "EOF"]
+    if not closes:
+        return None, "the resolver's heredoc is unterminated"
+    source = textwrap.dedent("\n".join(body[:closes[0]]))
+    try:
+        compile(source, "<targets.resolve>", "exec")
+    except SyntaxError as exc:
+        return None, f"the resolver's heredoc does not compile: {exc}"
+    return source, None
 
 
 def _self_test():
@@ -1602,6 +1660,105 @@ def _self_test():
           seam["job_if"], _REF_GUARD)
     check("the targets job's guard is EXACTLY the default-branch check (no appended `&& false`)",
           seam["targets_job_if"], _REF_GUARD)
+    # --- the PRODUCER side of the same claim [#1544, round-1 review] ----------------------------
+    # Everything above this point pins the CONSUMER: it proves `backfill` reads a matrix from an
+    # output named `repos`. It does NOT reach the job that computes that output, so both of the
+    # mutants that recreate the shipped defect stay green — swapping the resolver for
+    # `echo 'repos=["one/hardcoded-repo"]'`, and deleting `needs: targets` (which leaves the
+    # strategy and both guards byte-identical while the expression it names resolves to nothing).
+    check("the backfill job DEPENDS on targets (no edge => the matrix expression is unbacked)",
+          seam["backfill_needs"], ["targets"])
+    check("the targets job PUBLISHES the resolver step's output as `repos`",
+          seam["targets_repos_output"], "${{ steps.resolve.outputs.repos }}")
+    check("...and `resolve` is the only id'd step there, so that binding names a step that exists",
+          seam["targets_step_ids"], ["resolve"])
+    check("the resolver reads the requested target from the workflow_dispatch input",
+          seam["resolver_requested_binding"], "${{ inputs.target_repo }}")
+    check("the resolver step is UNCONDITIONAL (an `if:`/`continue-on-error` here fails it green)",
+          seam["resolver_step_unconditional"], True)
+    check("the resolver keeps `set -euo pipefail` (without pipefail `| tee` masks its refusal)",
+          seam["resolver_errexit"], True)
+    check("the resolver's stdout is APPENDED to $GITHUB_OUTPUT (else `repos` publishes nothing)",
+          seam["resolver_emits_to_step_output"], True)
+
+    # ...and the resolver's BEHAVIOUR, by executing the shipped heredoc. Text assertions cannot
+    # distinguish "derived from policy" from "a literal that happens to look derived", so the step
+    # is run against synthetic policy trees and asserted on what it emits.
+    _resolver_src, _resolver_why = backfill_targets_resolver_source()
+
+    def _resolve_targets(policy_toml, requested=None):
+        """`(output_name, parsed_value)` the SHIPPED resolver emits for this policy tree.
+
+        Any non-emitting outcome is returned as a NAMED string instead of propagating, so a
+        mutant reds this row and the rows below it still run (AGENTS.md pre-flight 4)."""
+        if _resolver_src is None:
+            return f"NO-RESOLVER: {_resolver_why}"
+        saved_cwd, saved_requested = os.getcwd(), os.environ.get("REQUESTED")
+        with tempfile.TemporaryDirectory() as workdir:
+            try:
+                os.makedirs(os.path.join(workdir, "policy"))
+                with open(os.path.join(workdir, "policy", "repos.toml"), "w",
+                          encoding="utf-8") as handle:
+                    handle.write(policy_toml)
+                os.chdir(workdir)
+                if requested is None:
+                    os.environ.pop("REQUESTED", None)
+                else:
+                    os.environ["REQUESTED"] = requested
+                buffer = io.StringIO()
+                try:
+                    with contextlib.redirect_stdout(buffer):
+                        exec(_resolver_src, {"__name__": "__main__"})  # noqa: S102 — the step
+                except SystemExit as exc:
+                    # A refusal is a NONZERO exit: `raise SystemExit("...")` exits with the
+                    # message. `SystemExit(0)` is a silent success emitting nothing, which is a
+                    # different (and equally wrong) outcome, so it is named separately.
+                    return "REFUSED" if exc.code not in (0, None) else "EXITED-CLEAN"
+                except BaseException as exc:       # noqa: BLE001 — a mutant must red, not abort
+                    return f"ABORTED: {type(exc).__name__}"
+                printed = [line for line in buffer.getvalue().split("\n") if line.strip()]
+                if len(printed) != 1 or "=" not in printed[0]:
+                    return f"UNPARSED: {printed}"
+                name, _, value = printed[0].partition("=")
+                try:
+                    return (name, json.loads(value))
+                except ValueError:
+                    return f"NOT-JSON: {value!r}"
+            finally:
+                os.chdir(saved_cwd)
+                if saved_requested is None:
+                    os.environ.pop("REQUESTED", None)
+                else:
+                    os.environ["REQUESTED"] = saved_requested
+
+    # Fixture repositories named so they appear NOWHERE in the workflow, in policy/repos.toml, or
+    # in this harness (pre-flight 2b/2c): the expected values below cannot be satisfied by any
+    # constant the resolver could read, and no mutant's substituted value collides with them.
+    # `stray` is deliberately not a table, to exercise the `isinstance(r, dict)` filter.
+    _POLICY = ('[repos]\n'
+               'stray = "not-a-row"\n'
+               '[repos."zzz-fixture/beta"]\n'
+               'enabled = true\n'
+               '[repos."zzz-fixture/alpha"]\n'
+               'enabled = true\n'
+               '[repos."zzz-fixture/gamma"]\n'
+               'enabled = false\n')
+    _POLICY_NONE_ENABLED = '[repos."zzz-fixture/gamma"]\nenabled = false\n'
+    _SWEEP = ("repos", ["zzz-fixture/alpha", "zzz-fixture/beta"])
+    check("the resolver emits EVERY enabled policy row (sorted) as JSON under the name `repos`",
+          _resolve_targets(_POLICY), _SWEEP)
+    check("...and an all-whitespace target_repo is still that full sweep (the input is stripped)",
+          _resolve_targets(_POLICY, "   "), _SWEEP)
+    check("a requested ENABLED target narrows the matrix to exactly that one repo",
+          _resolve_targets(_POLICY, "zzz-fixture/beta"), ("repos", ["zzz-fixture/beta"]))
+    # Fail LOUD, both ways: the manual path must never admit a non-policy target (the sol r1
+    # arbitrary-repo class), and must never silently widen to the whole sweep instead.
+    check("a requested DISABLED target is REFUSED, not admitted and not silently swept",
+          _resolve_targets(_POLICY, "zzz-fixture/gamma"), "REFUSED")
+    check("a requested UNKNOWN target is REFUSED the same way",
+          _resolve_targets(_POLICY, "zzz-fixture/delta"), "REFUSED")
+    check("policy enabling NOTHING is REFUSED — never an empty matrix that reports success",
+          _resolve_targets(_POLICY_NONE_ENABLED), "REFUSED")
     check("two-page slurped listing flattens (sol r5)",
           flatten_pull_pages([[{"number": 1}], [{"number": 2}, {"number": 3}]]),
           [{"number": 1}, {"number": 2}, {"number": 3}])
