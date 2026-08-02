@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5520,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "309dd52ce119f0e097679ae0349baf998c6e38b3",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "is_status_evaluator_artifact() authenticates only the check name, and run_gate() applies that exclusion to every sibling check rather than only SELF_RUN_ID or checks proven to originate from the trusted evaluator workflow. A same-repository PR can add a failing or pending job named exactly `ci-summary status`; the currently required `ci-summary / gate` will silently remove that real leg. The new test explicitly preserves the unsafe name-only classification and does not test adversarial workflow provenance.",
+    "file": "scripts/ci_summary_gate.py",
+    "fix_hint": "Exclude only the current evaluator run via the anchored run ID, or authenticate candidate artifacts using trusted workflow/run provenance before excluding them. Add an adversarial test where a pull-request workflow emits an exact-name failing check and prove it remains gating while the genuine evaluator artifact is excluded.",
+    "severity": "blocker",
+    "title": "Name-only evaluator exclusion still permits a required-gate bypass"
+   },
+   {
+    "body": "The trigger still omits `workflow_run.workflows`, and the workflow and documentation explicitly acknowledge that it may silently never dispatch. The wiring tests only inspect YAML text; they do not establish that GitHub accepts this subscribe-to-all form or emits requested/completed events for it. Therefore the stage-1 transport may publish no parity evidence at all, leaving the claimed observational implementation incomplete.",
+    "file": ".github/workflows/ci-summary-status.yml",
+    "fix_hint": "Use a GitHub-supported, validated workflow_run configuration with established upstream selection semantics and provide schema or live dispatch evidence. If an explicit workflows list is required and enumeration is unacceptable, redesign the event transport before merging instead of shipping a configuration whose core delivery path is knowingly unverified.",
+    "severity": "major",
+    "title": "workflow_run event source remains knowingly unverified"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 is stagnant: both round-2 defects remain materially unchanged. The required legacy gate still removes every check whose name is `ci-summary status` without establishing that the check belongs to the trusted evaluator workflow, so a PR-controlled same-repository workflow can hide a failing or pending leg behind that name. The new workflow also still omits the `workflow_run.workflows` selector while conceding that dispatch is unverified and may silently never occur. The added tests preserve these assumptions instead of exercising adversarial provenance or validated event delivery.",
+  "verdict": "request_changes"
+ }
+}
