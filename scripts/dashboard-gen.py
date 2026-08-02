@@ -2064,22 +2064,28 @@ def _optional_usage_path(cli_path):
     return next((path for path in candidates if path and Path(path).is_file()), None)
 
 
-# Issue #78. The per-repository census is only observability if the PAGE renders it, and the #612
-# round-4 lesson is that a lexical assertion about `renderRepositoryAgents` is satisfiable by a
-# comment or a neighbouring occurrence. So the real function is EXECUTED against a stub DOM and the
-# rendered header/rows are compared cell by cell — including the quiet tick, where every count is
-# zero and the pre-#78 page named no repository at all.
-_REPO_AGENTS_PAGE_HARNESS = r"""
+# Issue #1107. ONE DOM shim, not one per harness. The three page-script harnesses below each
+# carried a hand-written copy of `element()`/`document`, and they had already drifted: two of them
+# stubbed `classList` to a no-op whose `contains()` answered `false` unconditionally, so a renderer
+# that degrades a cell BY CLASS was EXECUTED against a DOM physically unable to record the
+# degradation. That reads like a page-level assertion while being blind to the thing it names —
+# which is the same false pass #612 round 4 found in the lexical form, in a costume. The shim kept
+# here is the highest-fidelity of the three (real `classList`, `setAttribute`, `style`); a harness
+# supplies only its export list and its body. `_self_test_page_shim` holds it to both properties:
+# the shim behaves like the DOM, and it is defined exactly once.
+_PAGE_HARNESS = r"""
 const fs = require("fs");
 const source = fs.readFileSync(__APP_JS__, "utf8");
 const input = JSON.parse(fs.readFileSync(0, "utf8"));
 function element(tag) {
   const self = {
-    tagName: tag, children: [], hidden: false, textContent: "", className: "",
+    tagName: tag, children: [], attributes: {}, style: {}, hidden: false, textContent: "",
+    className: "", classes: new Set(),
     append: (...kids) => { for (const kid of kids) self.children.push(kid); },
     replaceChildren: (...kids) => { self.children = [...kids]; },
-    setAttribute: () => {},
-    classList: { add: () => {}, remove: () => {}, contains: () => false },
+    setAttribute: (name, value) => { self.attributes[name] = value; },
+    classList: { add: (name) => self.classes.add(name), remove: (name) => self.classes.delete(name),
+                 contains: (name) => self.classes.has(name) },
   };
   return self;
 }
@@ -2092,9 +2098,41 @@ globalThis.document = {
 };
 globalThis.fetch = () => Promise.reject(new Error("network is not under test"));
 globalThis.setInterval = () => 0;
+const flat = (node) => [node.textContent || "", ...(node.children || []).flatMap(flat)];
+const text = (node) => flat(node).join(" ");
+const degraded = (node) =>
+  (node.classes && node.classes.has("degraded")) ||
+  (node.children || []).some(degraded);
 (async () => {
-  const scope = new Function(source + "; return { renderRepositoryAgents };")();
+  // Loading the page runs its own `refresh()`, whose stubbed fetch rejects into the page's catch
+  // and writes to #warning; the tick below lets that settle so it cannot be mistaken for a notice
+  // under test, and every render below starts from a fresh element.
+  const scope = new Function(source + "; return { __EXPORTS__ };")();
   await new Promise((resolve) => setImmediate(resolve));
+__BODY__
+})().catch((error) => { console.error(error && error.stack || error); process.exit(1); });
+"""
+
+
+def _page_harness(exports, body):
+    """A page-script harness for `_node_json`: the shared DOM shim, then `body`.
+
+    `exports` is the comma-separated list of `dashboard/app.js` names the body reaches through
+    `scope` — the ONLY thing that varies besides the body itself. `body` is JavaScript indented two
+    spaces (it runs inside the harness's async IIFE) and must write its result to stdout as JSON."""
+    app_js = Path(__file__).resolve().parent.parent / "dashboard" / "app.js"
+    return (_PAGE_HARNESS
+            .replace("__EXPORTS__", exports)
+            .replace("__BODY__", body.strip("\n"))
+            .replace("__APP_JS__", json.dumps(str(app_js))))
+
+
+# Issue #78. The per-repository census is only observability if the PAGE renders it, and the #612
+# round-4 lesson is that a lexical assertion about `renderRepositoryAgents` is satisfiable by a
+# comment or a neighbouring occurrence. So the real function is EXECUTED against a stub DOM and the
+# rendered header/rows are compared cell by cell — including the quiet tick, where every count is
+# zero and the pre-#78 page named no repository at all.
+_REPO_AGENTS_PAGE_BODY = r"""
   const out = {};
   for (const [name, spec] of Object.entries(input.cases)) {
     for (const id of ["repo-agents-empty", "repo-agents-table", "repo-agents-head",
@@ -2119,37 +2157,10 @@ globalThis.setInterval = () => 0;
     };
   }
   process.stdout.write(JSON.stringify(out));
-})().catch((error) => { console.error(error && error.stack || error); process.exit(1); });
 """
 
 
-_LANE_PAGE_HARNESS = r"""
-const fs = require("fs");
-const source = fs.readFileSync(__APP_JS__, "utf8");
-const input = JSON.parse(fs.readFileSync(0, "utf8"));
-function element(tag) {
-  const self = {
-    tagName: tag, children: [], hidden: false, textContent: "", className: "",
-    append: (...kids) => { for (const kid of kids) self.children.push(kid); },
-    replaceChildren: (...kids) => { self.children = [...kids]; },
-    setAttribute: () => {},
-    classList: { add: () => {}, remove: () => {}, contains: () => false },
-  };
-  return self;
-}
-const ids = {};
-globalThis.document = {
-  getElementById: (id) => (ids[id] = ids[id] || element("div#" + id)),
-  createElement: element,
-  createElementNS: (_ns, tag) => element(tag),
-  createTextNode: (text) => ({ textContent: text, children: [] }),
-};
-globalThis.fetch = () => Promise.reject(new Error("network is not under test"));
-globalThis.setInterval = () => 0;
-const flat = (node) => [node.textContent || "", ...(node.children || []).flatMap(flat)];
-(async () => {
-  const scope = new Function(source + "; return { renderOutcomes };")();
-  await new Promise((resolve) => setImmediate(resolve));
+_LANE_PAGE_BODY = r"""
   const out = {};
   for (const [name, outcomes] of Object.entries(input.outcomes)) {
     ids.outcomes = element("tbody#outcomes");
@@ -2168,8 +2179,75 @@ const flat = (node) => [node.textContent || "", ...(node.children || []).flatMap
     });
   }
   process.stdout.write(JSON.stringify(out));
-})().catch((error) => { console.error(error && error.stack || error); process.exit(1); });
 """
+
+
+def _self_test_page_shim(check):
+    """Issue #1107 — the ONE DOM shim every page-script harness is built on.
+
+    Scaffolding rather than a guard, so no trust surface rides on it; but a shim that silently
+    swallows what the page does to it makes an EXECUTED assertion quietly weaker than it reads,
+    which is the #612-round-4 false pass wearing a different costume. Two properties, and the
+    pre-#1107 `classList: {add: () => {}, contains: () => false}` copies failed the first: the shim
+    RECORDS what the page does to an element, and there is exactly one of it."""
+    # Composed through `_page_harness` exactly as the real harnesses are, so `loaded` below also
+    # witnesses that the export list substituted and that the app.js path resolved to a real file.
+    probe_body = r"""
+  const el = document.getElementById("cell");
+  el.classList.add("degraded");
+  el.setAttribute("data-lane", "worker");
+  el.append(document.createTextNode("dropped"), document.createElement("span"));
+  const kept = document.createElement("b");
+  kept.textContent = "kept";
+  el.replaceChildren(kept);
+  const parent = document.createElement("td");
+  const child = document.createElement("span");
+  child.classList.add("degraded");
+  parent.append(child);
+  const before = { degraded: degraded(el), contains: el.classList.contains("degraded") };
+  el.classList.remove("degraded");
+  process.stdout.write(JSON.stringify({
+    before,
+    after: { degraded: degraded(el), contains: el.classList.contains("degraded") },
+    attribute: el.attributes["data-lane"] === undefined ? null : el.attributes["data-lane"],
+    replaced: el.children.map((kid) => kid.textContent),
+    inherited: degraded(parent),
+    memoized: document.getElementById("cell") === el,
+    namespaced: document.createElementNS("http://www.w3.org/2000/svg", "svg").tagName,
+    text: text(el).trim(),
+    loaded: typeof scope.render,
+  }));
+"""
+    try:
+        shim = _node_json(_page_harness("render", probe_body), {})
+    except DashboardError as exc:
+        # Same convention as the harnesses below: report the raise as the row's value, so the row
+        # goes red by name instead of aborting the suite with every later check unrun.
+        shim = {"page script raised": str(exc)[:200]}
+    check("[#1107] EXECUTED: the shared DOM shim RECORDS what the page does to an element — a "
+          "class added and removed, an attribute, a child REPLACED rather than appended, and id "
+          "identity all read back, and a class added to a child reaches an ancestor's walk",
+          shim,
+          {"before": {"degraded": True, "contains": True},
+           "after": {"degraded": False, "contains": False},
+           "attribute": "worker", "replaced": ["kept"], "inherited": True, "memoized": True,
+           "namespaced": "svg", "text": "kept", "loaded": "function"})
+    # AGENTS.md pre-flight item 4, *mutually-masking duplicates*: two copies of one thing make each
+    # copy individually unkillable, so the invariant has to be on the COUNT. The needles are
+    # regexes on purpose — a plain-substring needle for a shim line would occur in this assertion
+    # too and could never read 1 — and the `\(`/`\{` escapes mean none of them matches its own
+    # source text here.
+    module_source = _repo_file("scripts", "dashboard-gen.py")
+    check("[#1107] ...and it is defined exactly ONCE. Three harnesses each hand-rolled a copy and "
+          "two had already drifted from the third; a fresh copy is that defect returning",
+          (len(re.findall(r"^function element\(tag\) \{$", module_source, re.M)),
+           len(re.findall(r"^globalThis\.document = \{$", module_source, re.M)),
+           len(re.findall(r"^const ids = \{\};$", module_source, re.M)),
+           # The app.js read, so a second PRELUDE is caught even if its `element()` were reformatted
+           # past the first needle — every harness reaches the page through the one builder.
+           len(re.findall(r'^const source = fs\.readFileSync\(__APP_JS__, "utf8"\);$',
+                          module_source, re.M))),
+          (1, 1, 1, 1))
 
 
 def _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measured_sidecar):
@@ -2468,8 +2546,7 @@ def _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measur
           _js_code_count(
               lane_body,
               'const state = LANE_STATES.has(lane.state) ? lane.state : "unknown";'), 1)
-    harness = _LANE_PAGE_HARNESS.replace("__APP_JS__", json.dumps(
-        str(Path(__file__).resolve().parent.parent / "dashboard" / "app.js")))
+    harness = _page_harness("renderOutcomes", _LANE_PAGE_BODY)
     fixtures = {
         "lanes": published_sweeps[:1],
         "absent": [dict(history[0], lanes=None)],
@@ -2784,6 +2861,7 @@ def _self_test():
         "2025-01-01Z dispatched worker owner/repo#1\n"
         "2025-01-01Z defer owner/repo#2: busy\n"
         "2025-01-01Z dispatcher complete: 1 worker/review/fix run(s) launched\n"), (1, 1, None))
+    _self_test_page_shim(check)
     _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measured_sidecar)
     _self_test_history_fetch(check, issues, leases, usage, now, measured_sidecar)
     check("raw identity absent", handle not in json.dumps(got) and email not in json.dumps(got), True)
@@ -3197,8 +3275,7 @@ def _self_test():
           _js_code_count(_js_function_body(_repo_file("dashboard", "app.js"), "render"),
                          "renderRepositoryAgents(data.active_by_repository, "
                          "data.fleet.active_agents);"), 1)
-    repo_agents_page = _REPO_AGENTS_PAGE_HARNESS.replace("__APP_JS__", json.dumps(
-        str(Path(__file__).resolve().parent.parent / "dashboard" / "app.js")))
+    repo_agents_page = _page_harness("renderRepositoryAgents", _REPO_AGENTS_PAGE_BODY)
     try:
         rendered_agents = _node_json(repo_agents_page, {"cases": {
             # A fully quiet fleet: no model is live anywhere, so there are no per-model columns and
@@ -4650,49 +4727,13 @@ esac
            _js_code_count("/* summary.append(probe) */\nsummary.append(probe);\n",
                           "summary.append(probe)")),
           (0, 0, 1))
-    # --- ...and the two call sites EXECUTED. The page is loaded into a minimal DOM shim under node
-    # and handed the real generated document, so `if (!measured)` -> `if (measured)`, dropping
-    # `summary.append(probe)`, or dropping updateFreshness's second argument each change an OUTCOME
-    # rather than a substring. `fetch` is stubbed to reject (the page's own load path is not under
-    # test) and `setInterval` to a no-op so node exits.
+    # --- ...and the two call sites EXECUTED. The page is loaded into the shared DOM shim under node
+    # (`_PAGE_HARNESS`, which also stubs `fetch` to reject — the page's own load path is not under
+    # test — and `setInterval` to a no-op so node exits) and handed the real generated document, so
+    # `if (!measured)` -> `if (measured)`, dropping `summary.append(probe)`, or dropping
+    # updateFreshness's second argument each change an OUTCOME rather than a substring.
     # ------------------------------------------------------------------------------------------
-    page_harness = r"""
-const fs = require("fs");
-const source = fs.readFileSync(__APP_JS__, "utf8");
-const input = JSON.parse(fs.readFileSync(0, "utf8"));
-function element(tag) {
-  const self = {
-    tagName: tag, children: [], attributes: {}, style: {}, hidden: false, textContent: "",
-    className: "", classes: new Set(),
-    append: (...kids) => { for (const kid of kids) self.children.push(kid); },
-    replaceChildren: (...kids) => { self.children = [...kids]; },
-    setAttribute: (name, value) => { self.attributes[name] = value; },
-    classList: { add: (name) => self.classes.add(name), remove: (name) => self.classes.delete(name),
-                 contains: (name) => self.classes.has(name) },
-  };
-  return self;
-}
-const ids = {};
-globalThis.document = {
-  getElementById: (id) => (ids[id] = ids[id] || element("div#" + id)),
-  createElement: element,
-  createElementNS: (_ns, tag) => element(tag),
-  createTextNode: (text) => ({ textContent: text, children: [] }),
-};
-globalThis.fetch = () => Promise.reject(new Error("network is not under test"));
-globalThis.setInterval = () => 0;
-const flat = (node) => [node.textContent || "", ...(node.children || []).flatMap(flat)];
-const text = (node) => flat(node).join(" ");
-const degraded = (node) =>
-  (node.classes && node.classes.has("degraded")) ||
-  (node.children || []).some(degraded);
-(async () => {
-  // Loading the page runs its own `refresh()`, whose stubbed fetch rejects into the page's catch
-  // and writes to #warning; the tick below lets that settle so it cannot be mistaken for the
-  // probe notice under test, and every render below starts from a fresh #warning element.
-  const scope = new Function(
-    source + "; return { usageProbeCard, updateFreshness, render, providerQuotaCard };")();
-  await new Promise((resolve) => setImmediate(resolve));
+    page_body = r"""
   const cards = {};
   for (const [name, probe] of Object.entries(input.probes)) {
     const card = scope.usageProbeCard(probe);
@@ -4738,7 +4779,6 @@ const degraded = (node) =>
     resets[name] = text(scope.providerQuotaCard(row));
   }
   process.stdout.write(JSON.stringify({ cards, warnings, resets }));
-})().catch((error) => { console.error(error && error.stack || error); process.exit(1); });
 """
     # A LIVE `now`: the page's own staleness notice fires on a year-old fixture stamp, and that
     # notice would then mask the probe notice this block is about.
@@ -4786,9 +4826,7 @@ const degraded = (node) =>
                 "soonest_reset": soonest, "oldest_reset": oldest}
 
     page = _node_json(
-        page_harness.replace("__APP_JS__",
-                             json.dumps(str(Path(__file__).resolve().parent.parent
-                                            / "dashboard" / "app.js"))),
+        _page_harness("usageProbeCard, updateFreshness, render, providerQuotaCard", page_body),
         {"probes": {"measured": measured_document["usage_probe"],
                     "failed": failed_document["usage_probe"],
                     "absent": None},
