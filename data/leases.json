@@ -12,16 +12,6 @@
   },
   {
    "account": "51bde6688e140866",
-   "claim_id": "86f9f3c15dde4e2e96c6446cfc9cf7b5",
-   "holder": "sparq-org/sparq#5668@30746973956.1",
-   "package": "sparq-zk",
-   "role": "soundness",
-   "model": "opus5",
-   "issued_at": 1785672154,
-   "expires_at": 1785678454
-  },
-  {
-   "account": "51bde6688e140866",
    "claim_id": "73ac5d0fa0e041a1b04e22410194b16e",
    "holder": "fix:sparq-org/sparq#5697@30747196750.1",
    "package": "sparq-conformance",
