@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1748,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3cdbf6d3171b57045c071d769dda0259f9ec1e97",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The prior finding is unchanged at `runs = json.loads(result.stdout).get(\"workflow_runs\") or []`. A syntactically valid object such as `{}`, `{\"message\": \"error\"}`, or `{\"workflow_runs\": null}` still becomes an empty list and returns `{\"outcome\": \"ok\"}`, causing `_history_outcome` to publish `fetched: true` and the UI to describe a quiet fleet. A truthy non-list is also not rejected: a dict is sliced and raises `TypeError`, while a string is sliced and its characters are dropped before the fetch is marked successful. The new tests do not cover these response-schema cases, so they do not make the identified seam fail closed.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Parse the root, require it to be an object with a present `workflow_runs` field whose value is a list, and return the failed/unparseable status for every other schema. Add self-test rows for at least `{}`, `{\"workflow_runs\": null}`, and a truthy non-list value; retain the explicit empty list as the successful quiet-fleet case.",
+    "severity": "major",
+    "title": "Malformed run-listing schemas are still marked fetched successfully"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-1 response-schema finding remains unresolved. The fetcher still converts a missing or null workflow_runs field into a successful empty history, and can still crash or silently mis-handle other non-list values. The added self-tests exercise invalid JSON, a non-object root, an explicit empty list, and malformed list entries, but do not exercise the malformed object schemas identified previously. Because the same major fail-open ambiguity remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
