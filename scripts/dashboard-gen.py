@@ -1317,9 +1317,20 @@ def _fetch_dispatch_history(repo, count):
     if result.returncode != 0:
         return [], {"outcome": "failed", "detail": "gh-exited-nonzero"}
     try:
-        runs = json.loads(result.stdout).get("workflow_runs") or []
-    except (AttributeError, json.JSONDecodeError):
+        document = json.loads(result.stdout)
+    except json.JSONDecodeError:
         return [], {"outcome": "failed", "detail": "run-listing-unparseable"}
+    # The SCHEMA is part of the read (#1748 review round 2). `gh` answers a throttled or errored
+    # call with a syntactically valid document that carries no runs at all — `{}`, `{"message":
+    # ...}`, `{"workflow_runs": null}` — and the old `.get(...) or []` collapsed every one of those
+    # into an empty list and an `ok` outcome, i.e. the exact "infra failure wearing a quiet tick's
+    # clothes" shape this issue exists to kill. A truthy non-list was worse still: a str was sliced
+    # into characters that were then dropped, and a dict raised TypeError out of the whole build.
+    # So: only an OBJECT whose `workflow_runs` is genuinely a list counts as read. The explicitly
+    # empty list stays the successful quiet-fleet case; everything else fails closed.
+    if not isinstance(document, dict) or not isinstance(document.get("workflow_runs"), list):
+        return [], {"outcome": "failed", "detail": "run-listing-schema-alien"}
+    runs = document["workflow_runs"]
     history = []
     for run in runs[:count]:
         if not isinstance(run, dict):
@@ -2540,10 +2551,29 @@ def _self_test_history_fetch(check, issues, leases, usage, now, measured_sidecar
     check("[#1106] ...so does a body that is not JSON at all (the JSONDecodeError arm)",
           fetch_with(_Completed(0, "{not json")),
           ([], {"outcome": "failed", "detail": "run-listing-unparseable"}))
-    check("[#1106] ...and one that parses to something with no `.get` (the AttributeError arm of "
-          "the same except clause — a different exception, same branch)",
-          fetch_with(_Completed(0, "3")),
-          ([], {"outcome": "failed", "detail": "run-listing-unparseable"}))
+    check("[#1106] ...and one that parses to something that is not an object at all (a bare scalar "
+          "and a bare array both fail the SCHEMA check, not the JSON parse)",
+          (fetch_with(_Completed(0, "3")), fetch_with(_Completed(0, "[]"))),
+          (([], {"outcome": "failed", "detail": "run-listing-schema-alien"}),
+           ([], {"outcome": "failed", "detail": "run-listing-schema-alien"})))
+    # THE ROUND-2 SEAM: `gh` answers a throttled/errored call with a syntactically VALID document
+    # that carries no run list. `.get("workflow_runs") or []` turned every one of these into an
+    # empty history with an `ok` outcome — a quiet fleet on the public page — and the truthy
+    # non-lists were worse: a str was sliced into characters and dropped, a dict raised TypeError
+    # out of the build. Each row states the document as a LITERAL so a mutant that re-widens the
+    # check (e.g. back to `or []`, or to a truthiness test) goes red on a NAMED row rather than
+    # aborting the suite (pre-flight item 4).
+    alien = ([], {"outcome": "failed", "detail": "run-listing-schema-alien"})
+    for label, body in (("no `workflow_runs` field at all", {}),
+                        ("an ERROR document from a throttled call", {"message": "API rate limit"}),
+                        ("a null field", {"workflow_runs": None}),
+                        ("a truthy STRING (was sliced into characters)",
+                         {"workflow_runs": "not-a-list"}),
+                        ("a truthy OBJECT (slicing it raised TypeError)",
+                         {"workflow_runs": {"11": {"id": 11}}}),
+                        ("a truthy NUMBER", {"workflow_runs": 3})):
+        check(f"[#1106] a valid JSON run listing with {label} FAILS CLOSED — not a quiet fleet",
+              fetch_with(_Completed(0, json.dumps(body))), alien)
     quiet = fetch_with(_Completed(0, json.dumps({"workflow_runs": []})))
     check("[#1106] THE DISCRIMINATION: a fleet that has genuinely never dispatched returns the same "
           "empty row set with an `ok` outcome — the rows alone cannot tell the two apart",
