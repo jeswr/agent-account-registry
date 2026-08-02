@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1734,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7102c7717f5b9f2494df335715f441f981a283b4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly closes the durable Anthropic refresh-token exposure by refusing claude-credentials-json before worker-prep spools or materializes the credential, and independently refusing it at the launcher delivery seam. The codex pre-flight is tightened so every admitted path derives the mounted document and unconditionally checks the materialized file for the original refresh-token value. The added coverage is substantive: it checks refusal, operator-visible classification, absence of the sentinel across the entire prepared tree, absence of mount material, continued acceptance of the supported opaque Claude format, the dry-run strip-without-exchange path, and the launcher's exact non-dying format set. I found no correctness, fail-closed, test-vacuity, or security defect in the diff.",
+  "verdict": "approve"
+ }
+}
