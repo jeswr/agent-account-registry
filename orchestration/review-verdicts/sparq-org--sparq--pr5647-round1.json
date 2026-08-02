@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5647,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1fcc7b7542ccf390a88b19189ee0ff7421bcd2fc",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`workflows_defining_push_skip_job()` scans only `WORKFLOWS.glob(\"*.yml\")`, while GitHub Actions supports both `.yml` and `.yaml`. A future `queue-validated` job added in a `.yaml` file would leave `defining` empty, so `status=blocked` would continue to pass despite the precondition having landed. This contradicts the new documentation's claim that the test checks the live contents of `.github/workflows/` and reds when such a job appears.",
+    "file": "scripts/tests/test_mergequeue_throughput_posture.py",
+    "fix_hint": "Scan both supported extensions (for example, iterate `*.yml` and `*.yaml`) and add a non-vacuity unit fixture/test proving a `.yaml` workflow containing the target job is detected. Prefer testing the scanner against temporary controlled fixtures so the positive path is exercised directly.",
+    "severity": "major",
+    "title": "Push-skip detection ignores valid .yaml workflow files"
+   },
+   {
+    "body": "For `status == \"applied\"`, the test checks only `value > BASELINE`. The file and documentation repeatedly define the authorized edit as exactly `3 -> 5` and `nothing else touched`, but values such as 4, 6, or 999 pass. That makes the coupling pin unable to detect an incorrectly documented applied configuration.",
+    "file": "scripts/tests/test_mergequeue_throughput_posture.py",
+    "fix_hint": "Require `value == APPROVED_TARGET` when status is `applied`, and add explicit tests for the accepted target and rejected non-target values (or factor the state/value validation into a helper that can be tested without rewriting repository files).",
+    "severity": "major",
+    "title": "Applied status does not enforce the approved target value"
+   }
+  ],
+  "progress": null,
+  "summary": "The intent is sound, but the new posture gate is not complete enough to support its documented claims. Its workflow scan excludes valid `.yaml` workflow files even though the documentation says it checks all of `.github/workflows/`, and its applied-state check accepts any value above 3 instead of the specifically approved target of 5. Both gaps can let the pin stay green while the repository or documented ruleset posture is wrong.",
+  "verdict": "request_changes"
+ }
+}
