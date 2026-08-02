@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5370,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d985f553948cce1d934b678b3e7a4b0ed05eca13",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The T0 declaration regex now requires a structural field-slot boundary (line start/list prefix, pipe separator, or sentence break), so both ordinary mid-sentence `surface:` prose and `foo::surface:` decline T0. The focused tests cover those exact prior counterexamples and include positive anti-vacuity cases for every supported layout; the full targeted unittest module passes (20 tests). The same change also adds sound non-vacuity checks to the title/text scope tests. No correctness, soundness, test-validity, or security issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
