@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1744,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1cc3e7f8f166421b7f7f4395c20732948718a60d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The added sweep-level regression test reaches the real run_sweep terminal-reap path and isolates the load-bearing mutation boundary: all three cases begin with the same empty open-issue snapshot and lease, while only the direct per-issue response changes. Its assertions distinguish retention for a freshly confirmed open, non-terminal issue from release after a true absence or closed response, and they verify both the reported reap count and the exact released claim set. Capturing exceptions as values prevents a crash from masquerading as a successful detection. The accompanying rationale accurately describes the existing fresh-read confirmation flow. No correctness, soundness, security, or test-vacuity defect is evident. Round 2 is materially unchanged from the prior approved round, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
