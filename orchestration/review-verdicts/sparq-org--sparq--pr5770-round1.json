@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5770,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1ee46b27643fb103af20f886b6619446b6be18a2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The workflow conversions consistently replace source compilation with the SHA-pinned jetli action and an exact wasm-pack version. The release matrix correctly retains an explicitly architecture-guarded source fallback for non-X64 runners. The replacement inspection test scans all workflow files for unguarded source installs, validates every prebuilt action pin/version, registers the sole fallback, preserves known-lane coverage, and retains the load-bearing js.yml ordering check. The test passes against the PR head, and no correctness, soundness, test-validity, or security defect was found in the diff.",
+  "verdict": "approve"
+ }
+}
