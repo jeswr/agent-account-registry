@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5643,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3266db5cd4de74f06a1226441ae262425c5e271d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly preserves all claimants long enough to detect ambiguous bd-id ownership, excludes ambiguous ids from both resume maps, and fails closed before label creation or issue creation when an ambiguous id is in the actual limited plan. The authenticated-owner shadow rule remains consistent with the existing provenance policy. The added self-tests cover trusted duplicates, marker-only duplicates, mixed claimants, the canonical labelled-owner case, and the real apply path; `python3 scripts/bd-to-issues.py --self-test` passes.",
+  "verdict": "approve"
+ }
+}
