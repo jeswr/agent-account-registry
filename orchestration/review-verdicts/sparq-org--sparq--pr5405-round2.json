@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5405,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "379dd62352cb4c4a3526da242fe80e0776c4051d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's production-window mismatch is fixed. run() now invokes M4 without threading through the M1-only --window-hours override, so M4 retains its validated fixed 24-hour window. Coverage/truncation is also evaluated relative to each detector's own start time via sample_truncated(), while fetch_lanes supplies scheduled-run history for M4's full lane population. The focused call-path test uses a fixture whose six-hour and 24-hour classifications differ, verifies that M1 still honors the CLI override, and verifies that M4 reaches the 24-hour declaration-honoured state through the real main/run state-file path; it is therefore non-vacuous. No new correctness, soundness, security, or hostile-instruction issue was found in the diff. The focused test could not execute in this checkout because PyYAML is unavailable, but the diff-scoped test and call path are coherent.",
+  "verdict": "approve"
+ }
+}
