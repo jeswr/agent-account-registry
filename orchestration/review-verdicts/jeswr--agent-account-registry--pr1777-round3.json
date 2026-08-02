@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1777,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1dfa7d83c39bd405cc0b17d24221da162db91332",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The documentation-only decision remains correct and complete under the adversarial trust-plane lens. It makes acceptance conditional on proving repository publicity fail-closed, using one boolean credential-shape predicate over the complete stored representation, refusing whole writes on a match, and pinning rotating cache reachability and restore fallback behavior at the YAML seam with exact-match tests. It explicitly distinguishes reachability from physical storage retention, requires a separate maintainer choice for platform retention versus authenticated cleanup, preserves least-privilege concerns, and includes non-vacuous bidirectional and mutation-test requirements. Unverified platform claims are labelled and the decision is deliberately not dependent on them. No blocker, major, or other diff-supported issue remains. With no prior-round findings and no new findings, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
