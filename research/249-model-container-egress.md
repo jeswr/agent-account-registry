@@ -232,6 +232,19 @@ format before routing anything onto it.
 
 **Verdict: increment 2, and the feasibility question is filed separately from the hardening.**
 
+📄 **ANSWERED — [`research/1676-anthropic-short-lived-credential-feasibility.md`](1676-anthropic-short-lived-credential-feasibility.md)
+(2026-08-02), and it corrects two claims above.** In short: **not today, and not with a code-only
+change.** (i) "the pure core already implements both providers" holds only for the **read** side —
+all five *deriving* entry points (`minimal_worker_credential`, `merge_refreshed`, `token_endpoint`,
+`refresh_access_token`, `refresh_credential_host_side`) are openai-only; (ii) re-recording an
+account is a **fresh enrolment on a burned slot**, not a re-record — `set-up-account.yml`'s #211
+resume skips login by design — and the routing flip and the re-enrolment cannot move independently,
+because `worker.yml`'s exact-equality gate and `set-up-account.yml`'s pre-store format gate bind the
+two sides together. Increment 2 is gated on two **measurements**, not a PR: whether a
+registry-dedicated *refreshable* anthropic authorization can be minted at all (`README.md`'s
+enrolment runbook forbids the one refreshable format this repo records), and whether the access-token
+TTL exceeds the 90-minute `worker_timeout_minutes` ceiling.
+
 ## 6. The recommended increment
 
 **1a — OBSERVE (the recommended first increment).** Move the model container onto a per-run
@@ -389,6 +402,9 @@ must be recorded (as a comment at the implementation site or an appendix here) r
    be fixed while it is cheap.
 4. **Feasibility: can the anthropic lane carry a short-lived credential at all?** (§5.E) — the
    provisioning question that gates increment 2. Filed as research, not implementation.
+   **ANSWERED (#1676):** [`research/1676-anthropic-short-lived-credential-feasibility.md`](1676-anthropic-short-lived-credential-feasibility.md).
+   No impl issue follows from it — both of increment 2's preconditions are unmeasured and one may be
+   unsatisfiable, which is this record's own §5.B reason for not filing option B.
 
 Option B is deliberately **not** filed (§5.B): its preconditions are unmeasured, and 1a measures
 them.
