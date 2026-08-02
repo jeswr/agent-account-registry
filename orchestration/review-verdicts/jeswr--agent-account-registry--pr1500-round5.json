@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1500,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "118defb2caa2e57844802d540fa7a3cf61a42302",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "find_ingestion_rejections() still clears the primary newest action_required run with `if isinstance(jobs, int) and jobs > 0`. In Python, True satisfies that predicate. The --state-file route preserves JSON booleans, so a job_counts entry of true for the rejected run is classified as approval-gated-with-jobs and emits no finding despite lacking a measured positive job count. The new boolean tests cover created_jobs() and cancelled_above; they do not exercise this primary mute branch or its JSON state-file seam.",
+    "file": "scripts/ci-latency-alert.py",
+    "fix_hint": "Use created_jobs(jobs) for the primary positive-job predicate as well. Add a detector test whose newest action_required run has its own count set to True and an end-to-end --state-file test with JSON true; both must keep the alert open and classify the count as unreadable.",
+    "severity": "major",
+    "title": "Boolean job count still clears the primary rejection path"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-4 major remains materially unchanged. The new created_jobs() helper correctly excludes booleans and is used for cancelled-run recovery evidence, but the primary newest action_required branch still uses `isinstance(jobs, int) and jobs > 0`. Because bool is a subclass of int, a JSON state-file value of true still suppresses a live ingestion-rejection finding as approval-gated-with-jobs. The added boolean coverage exercises created_jobs() and cancelled_above only; there is still no detector or end-to-end state-file regression row for a boolean count on the rejected run itself. Progress is therefore stagnant.",
+  "verdict": "request_changes"
+ }
+}
