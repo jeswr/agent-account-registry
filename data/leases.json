@@ -42,16 +42,6 @@
   },
   {
    "account": "51bde6688e140866",
-   "claim_id": "aea055d988cd4393a36a26e96f0eb5da",
-   "holder": "fix:sparq-org/sparq#5737@30753750379.1",
-   "package": "gui",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785683452,
-   "expires_at": 1785689752
-  },
-  {
-   "account": "51bde6688e140866",
    "claim_id": "f97259326e34460288c8ade8117a1b1c",
    "holder": "jeswr/agent-account-registry#1121@30753805308.1",
    "package": "groom",
