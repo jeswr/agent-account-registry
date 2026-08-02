@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1754,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2b056a5bfc61c1fe794f35f56a5a3d87ce754238",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`guard_prefix` appends every preceding non-comment line whose indentation is lower than the current threshold; it never checks whether that line opens a block or encloses the matched copy. For example, for a predicate at indentation 8, an unrelated assignment at indentation 4 earlier in the function is recorded as the guard even when it is a sibling preceding the real `if`. The claimed noise-floor test only places sibling statements at the same indentation as the copy, so it cannot catch this case. This makes signatures depend on unrelated source and permits a false green: a left-behind copy can remain governed identically while an unrelated lower-indented statement makes its signature differ from the other cell. It also creates false failures on unrelated edits, contrary to the stated hard-gate contract.",
+    "file": "scripts/predicate-census.py",
+    "fix_hint": "Derive actual enclosing blocks with language-aware parsing (AST for Python and structural parsing for shell/YAML embedded code), or use a deliberately narrower representation whose enclosure relationship is proven. Add red tests with an unrelated lower-indented sibling before a nested copy, and a reconstructed left-behind narrowing where only such unrelated text differs; the latter must still be detected. Also test that adding/removing that unrelated statement alone leaves the signature and census verdict unchanged.",
+    "severity": "major",
+    "title": "Guard derivation treats arbitrary lower-indented statements as block openers"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe proposed census is not a sound guard-signature analysis. Its central derivation mistakes arbitrary earlier, less-indented statements for enclosing block openers. The self-test only exercises same-indentation sibling noise, so it does not expose that false dependency. Consequently unrelated edits can change signatures, and an incomplete narrowing can be made to look distinct without changing the governed predicate. Because this is introduced as a hard trust-plane gate and its marquee completeness claim depends on that derivation, the change needs correction before approval.",
+  "verdict": "request_changes"
+ }
+}
