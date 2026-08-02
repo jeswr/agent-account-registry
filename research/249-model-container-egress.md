@@ -137,7 +137,8 @@ channel 1 through the front door. That rule belongs in the config file's header,
 comment.
 
 **Liveness / ops cost — the real objection.** Provider endpoint churn turns into worker failures.
-Mitigations, all cheap: derive the allowlist **empirically** rather than by guesswork (§6); give a
+Mitigations, all cheap: derive the allowlist **empirically** rather than by guesswork (§6, bounded
+by §6.1 item 5 — observations rank the question, a trusted operator enters the answer); give a
 denied connection a **named exit class** (`egress-denied`) so churn is an operator-actionable stop
 rather than the `unknown` bucket, and so `model-health.py` never books it as a provider outage;
 keep the allowlist in one reviewed file with a documented one-line edit path. Note what this option
@@ -245,8 +246,9 @@ Why this first, and why it is the right size:
   so the single biggest unknown (*do the pinned CLIs work through a proxy at all?*) is answered at
   zero security cost. If the codex CLI ignores proxy env vars, option A is dead for that lane and we
   learn it here rather than in a fleet-wide outage.
-- It produces the allowlist **empirically** instead of from a guessed hostname list, which is the
-  direct answer to the endpoint-churn objection.
+- It drives the allowlist **empirically** instead of from a guessed hostname list, which is the
+  direct answer to the endpoint-churn objection — the observation establishes *that* an endpoint is
+  missing and how often, and §6.1 item 5 governs how a line actually enters the config.
 - It delivers the observability from §5.D immediately: the first record anywhere of what the model
   container talks to.
 
@@ -292,19 +294,35 @@ The contract, binding on any implementation of 1a and 1b:
    over 63, more than a stated label count, any non-LDH character, or any authority that is not
    `host:port`. A value that fails validation increments a `malformed` counter carrying its
    **length and the reason — never the value**. That is fail-closed in the telemetry sense: the
-   unrecordable case loses the datum, not the boundary.
-5. **The allowlist is derived by reviewed aggregation, not by transcription.** §6's "derive the
-   allowlist empirically" means: collapse to **registrable domain + port**, drop anything not seen
-   across at least two independent runs, and have a **human read the resulting short list** before a
-   line enters the allowlist config. High-cardinality subdomains under one parent are the exfil
-   signature and are reported as a **count, not enumerated**. No path from an observation to a
-   committed config file may skip that review.
-6. **The operational datum is the anomaly, not the address.** `allowed`/`refused`, a count, and the
-   registrable domain answer every question §8 actually poses for running 1b; full FQDNs are needed
-   only while deriving the first allowlist. An implementation that concludes it needs exact raw
-   FQDNs **durably** must say so in its diff and record the residual in these terms — *this store
-   now retains attacker-chosen bytes that may be a credential* — naming its access restriction and
-   deletion procedure, rather than claiming unqualified observability value.
+   unrecordable case loses the datum, not the boundary. ⚠️ **Validation is a bounds check, not
+   redaction.** It keeps malformed telemetry from breaking the recorder; it cannot make an
+   attacker-chosen value safe to publish. A name that passes every bound here may still be a
+   credential encoding — items 5 and 6, not this one, are what keep it out of durable output.
+5. **The allowlist is entered by a trusted operator; no observed byte is ever transcribed into it.**
+   Collapsing to **registrable domain + port** discards subdomains but sanitizes nothing: a label
+   under a public suffix may be 63 LDH bytes, so `<b64-chunk>.example` is a *syntactically valid,
+   within-bounds* registrable domain that carries a credential chunk. Neither aggregation filter is
+   a boundary either — a "seen across N independent runs" threshold is trivially met by a steered
+   model emitting the **same** name every run (the steering lives in the target content, which is
+   constant across those runs), and that same low cardinality is what evades the high-cardinality
+   signal; and a human reading a short list makes a *relevance* judgement, not a secret-redaction
+   one, because no reader can tell an encoded credential from a vendor's CDN label. So: **candidate
+   domains carry the same handling class and live in the same store as raw observations**
+   (items 1–3) — ephemeral on the runner or in the private sink, never durable, never public, never
+   in the tree. What enters the reviewed allowlist config is typed in by a **trusted operator from
+   provider documentation**; the candidate list may only tell that operator *that* an endpoint is
+   missing and how often. High-cardinality subdomains under one parent remain the exfil signature
+   and are reported as a **count, not enumerated**.
+6. **The operational datum is the anomaly, not the address.** Durable and public telemetry carries
+   `allowed`/`refused`, counts, and **host-side identifiers only** — the identifier of the reviewed
+   allowlist rule that matched, with everything unmatched aggregated into a single `unlisted` bucket
+   with a count. **No observed or derived hostname — full FQDN *or* registrable domain — appears
+   there**, which is what makes the durable surface independent of what the model chose to name.
+   That answers every question §8 actually poses for running 1b. An implementation that concludes it
+   needs an observed name **durably** — at any granularity — must say so in its diff and record the
+   residual in these terms — *this store now retains attacker-chosen bytes that may be a
+   credential* — naming its access restriction and deletion procedure, rather than claiming
+   unqualified observability value.
 
 **2 — anthropic credential parity** (§5.E), after the latent `claude-credentials-json` hole is
 closed.
@@ -342,13 +360,21 @@ must be recorded (as a comment at the implementation site or an appendix here) r
    though the CLI touches them?
 5. Does anything in a normal run need a package registry from *inside* the container?
 6. **Does a credential-shaped destination reach any durable output?** Required before 1a is called
-   done, and adversarial rather than observational: drive a run that issues a `CONNECT` to — and a
-   DNS query for — a marker host of the shape `sk-ant-<40 chars>.<base64 chunk>.example.invalid:443`,
-   then search **every durable surface that run produces** for the marker: PR body, issue comments,
-   workflow logs, run artifacts, committed files, and the aggregated allowlist candidate. Record the
-   exact surface list that was checked. **Any hit means 1a is not fail-closed and must not land**;
-   the same probe run against §6.1's validation bounds must land in the `malformed` counter with a
-   length and a reason and no value.
+   done, and adversarial rather than observational. Two probes, and **(a) is the load-bearing one
+   because its input is valid** — a probe that only exercises malformed input measures the bounds
+   check and calls it redaction (§6.1 item 4):
+   - **(a) valid, within-bounds, and repeated to the threshold.** Drive the aggregation threshold
+     number of runs, each issuing a `CONNECT` to — and a DNS query for — the **same** marker host
+     `sk-ant-<40 chars>.example:443`: one 47-byte LDH label under a reserved TLD, so it passes every
+     §6.1 item 4 bound, clears the repeat threshold, stays low-cardinality, and — whatever
+     public-suffix rule the aggregator uses — **the marker IS the registrable label** and cannot be
+     collapsed away. Then search **every durable surface those runs produce** for the marker: PR
+     body, issue comments, workflow logs, run artifacts, committed files, and the aggregated
+     candidate/review surface itself. Record the exact surface list that was checked. **Zero
+     occurrences on every surface is the only pass; any hit means 1a is not fail-closed and must not
+     land.**
+   - **(b) malformed.** The same marker made overlong or non-LDH must land in the `malformed`
+     counter with a length and a reason and no value.
 
 ## 9. Follow-on issues filed from this record
 
