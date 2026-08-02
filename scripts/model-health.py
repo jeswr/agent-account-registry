@@ -4424,6 +4424,9 @@ def _self_test():
     # ---- #344: a firing alert on a recovered primary closes its superseded fallback copy ------
     ok = _test_firing_supersede(chk) and ok
 
+    # ---- #1007: the FIRE+open-marker REFRESH arm + the unreadable-CLOSED-tracker refusal ------
+    ok = _test_alert_refresh(chk) and ok
+
     # ---- provider fleet resolution (account catalog -> salted provider map) ------------------
     chk("provider parsed from YAML body",
         _provider_of("harness: claude\nprovider: anthropic\nmodels: [fable]"), "anthropic")
@@ -5855,6 +5858,168 @@ def _test_firing_supersede(chk):
             (_deliver_alerts([fire], "m", {key}), states(reg_repo)), ([], ["open"]))
         chk("supersede: and no close/comment is issued against the primary's own repository",
             [c for c in calls if c[0] in ("close", "comment")], [])
+    finally:
+        _gh = real_gh
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return True
+
+
+def _test_alert_refresh(chk):
+    """Issue #1007: the FIRE + already-open-marker REFRESH arm of _upsert_alert, and the
+    unreadable-CLOSED-tracker arm, against the same stateful two-repo gh fake.
+
+    Line coverage (`python3 -m trace --count --missing`) had the FAILED-refresh arm and the whole
+    closed-tracker `except HealthError` arm at zero executions, and the CONFIRMED refresh arm
+    executing with nothing asserting what it wrote. Three mutants survived the rest of the suite:
+      * a refresh that reports success WITHOUT editing — the open issue keeps the body it was
+        created with while every later tick prints "refreshed" and decide stays green;
+      * a refresh that returns True on a FAILED `gh issue edit` — the #175 fallback retry never
+        runs and an undeliverable alert exits 0;
+      * an unreadable CLOSED tracker read as "not found" — a blind create mints exactly the
+        duplicate alert issue #203 exists to prevent.
+
+    The route is the VERIFIED PRIVATE one on purpose: the public-registry body is redacted to a
+    generic signal (#204), so only the private body carries the `reason` string that makes a
+    STALE body visible at all. The reason literals are fixture-local and appear nowhere else in
+    the harness, so neither the input nor the expectation is derived from the code under test."""
+    import argparse as _ap
+    import types
+    global _gh, GitHubAPI, _enabled_provider_accounts, annotate_provider_status
+    global prune, read_ledger, classify_records
+    real_gh = _gh
+    saved = {k: os.environ.get(k) for k in
+             ("REGISTRY_REPO", "ALERT_REPO", "ALERT_TOKEN", "REGISTRY_ALERT_TOKEN", "GH_TOKEN")}
+    priv_repo, reg_repo = "jeswr/agent-account-data", "jeswr/agent-account-registry"
+    repos = {priv_repo: {}, reg_repo: {}}
+    seq = {"n": 300}
+    bad_tokens = set()
+    fail_edit = {"repos": set()}    # repos whose `issue edit` fails (the refresh mutation)
+    fail_list = {"states": set()}   # issue-list STATES that fail to read (unreadable tracker)
+    calls = []
+
+    def state_gh(args, token, capture=False):
+        repo = args[args.index("-R") + 1] if "-R" in args else None
+        calls.append((args[1] if args[0] == "issue" else args[0], repo))
+        if args[0] == "label":
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        if token in bad_tokens:
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+        if args[0] == "api":
+            # #432 round 1: the private route reads back PRIVATE, so the body is UNREDACTED.
+            return types.SimpleNamespace(returncode=0,
+                                         stdout=json.dumps({"private": True}), stderr="")
+        verb, issues = args[1], repos[repo]
+        if verb == "list":
+            state = args[args.index("--state") + 1]
+            if state in fail_list["states"]:
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="boom")
+            out = [{"number": n, "body": i["body"]}
+                   for n, i in sorted(issues.items()) if i["state"] == state]
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(out), stderr="")
+        if verb == "create":
+            seq["n"] += 1
+            issues[seq["n"]] = {"body": args[args.index("--body") + 1], "state": "open"}
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        num = int(args[2])
+        if verb == "edit":
+            if repo in fail_edit["repos"]:
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+            issues[num]["body"] = args[args.index("--body") + 1]
+        elif verb == "close":
+            issues[num]["state"] = "closed"
+        elif verb == "reopen":
+            issues[num]["state"] = "open"
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def states(repo):
+        return [i["state"] for _, i in sorted(repos[repo].items())]
+
+    def carries(repo, *reasons):
+        """Per issue on `repo`, which of `reasons` its CURRENT body carries."""
+        return [tuple(r in i["body"] for r in reasons)
+                for _, i in sorted(repos[repo].items())]
+
+    def verbs(repo):
+        return [v for v, r in calls if r == repo]
+
+    def fire(reason):
+        return {"condition": "provider-outage", "provider": "anthropic", "fire": True,
+                "reason": reason}
+
+    try:
+        os.environ.update(REGISTRY_REPO=reg_repo, ALERT_REPO=priv_repo, ALERT_TOKEN="priv",
+                          REGISTRY_ALERT_TOKEN="amb")
+        os.environ.pop("GH_TOKEN", None)
+        _gh = state_gh
+
+        # phase 1: the first firing tick CREATES the alert on the verified private route, with
+        # the first tick's reason in the body.
+        chk("refresh: the first firing tick creates the private alert",
+            (_deliver_alerts([fire("burst-ALPHA")], "m"), states(priv_repo)), ([], ["open"]))
+        chk("refresh: the created body carries the FIRST tick's reason",
+            carries(priv_repo, "burst-ALPHA", "burst-BRAVO"), [(True, False)])
+
+        # phase 2: a second firing tick against the ALREADY-OPEN marker must REFRESH that issue
+        # IN PLACE — one issue, edited, and the body now carries the SECOND tick's reason. A
+        # refresh that skips the edit and reports success leaves (ALPHA, not BRAVO) here while
+        # _deliver_alerts still returns [] and the issue count is unchanged: green everywhere
+        # else in the suite, and the alert body goes stale forever.
+        calls[:] = []
+        chk("refresh: the second firing tick mints no duplicate",
+            (_deliver_alerts([fire("burst-BRAVO")], "m"), states(priv_repo)), ([], ["open"]))
+        chk("refresh: the open alert body is REFRESHED to the SECOND tick's reason",
+            carries(priv_repo, "burst-ALPHA", "burst-BRAVO"), [(False, True)])
+        chk("refresh: the refresh edits the open issue and creates nothing",
+            (verbs(priv_repo).count("edit"), verbs(priv_repo).count("create")), (1, 0))
+
+        # phase 3: the refresh MUTATION fails. The desired state is NOT confirmed, so the #175
+        # retry must run and land the alert on the registry fallback — while the private body
+        # stays stale, proving nothing pretended the edit landed. A refresh arm that returns True
+        # on a failed edit leaves the fallback empty here.
+        fail_edit["repos"] = {priv_repo}
+        calls[:] = []
+        chk("refresh: a FAILED refresh retries on the registry fallback (#175)",
+            (_deliver_alerts([fire("burst-CHARLIE")], "m"), states(reg_repo)), ([], ["open"]))
+        chk("refresh: the FAILED refresh left the private body STALE, not silently updated",
+            carries(priv_repo, "burst-BRAVO", "burst-CHARLIE"), [(True, False)])
+
+        # phase 4: the refresh fails AND the fallback route is unusable -> the action is reported
+        # UNDELIVERED and `decide` exits NONZERO. An unusable route must fail the run, never drop
+        # the alert; with the refresh arm confirming a failed edit this reads 0 (silently green).
+        bad_tokens.add("amb")
+        real = (GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune,
+                read_ledger, classify_records)
+        try:
+            GitHubAPI = lambda token: object()
+            read_ledger = lambda api, repo: ([], None)
+            prune = lambda records, now: []
+            _enabled_provider_accounts = lambda api, repo, policy, salt: {}
+            annotate_provider_status = lambda actions, **kw: None  # no-op (probe-free)
+            classify_records = (lambda records, fleet, now, open_alerts=():
+                                [fire("burst-DELTA")])
+            chk("refresh: a FAILED refresh with no usable fallback exits decide NONZERO",
+                (_cmd_decide(_ap.Namespace(policy_file="policy/repos.toml")), states(priv_repo)),
+                (1, ["open"]))
+        finally:
+            (GitHubAPI, _enabled_provider_accounts, annotate_provider_status, prune,
+             read_ledger, classify_records) = real
+        fail_edit["repos"] = set()
+
+        # phase 5 (#203): FIRING with NO open marker and an UNREADABLE CLOSED tracker. A failed
+        # closed-state read is not "no closed issue" — treating it as one mints a SECOND alert
+        # issue over an existing closed tracker. Fail closed: undelivered, and no create on the
+        # route whose tracker could not be read. (The fallback stays unusable so the assertion is
+        # about this route's own refusal, not about who else took the alert.)
+        repos[priv_repo], repos[reg_repo] = {}, {}
+        fail_list["states"] = {"closed"}
+        calls[:] = []
+        chk("refresh: an UNREADABLE closed tracker is undelivered, never a blind create (#203)",
+            (len(_deliver_alerts([fire("burst-ECHO")], "m")),
+             verbs(priv_repo).count("create"), repos[priv_repo]), (1, 0, {}))
     finally:
         _gh = real_gh
         for k, v in saved.items():
