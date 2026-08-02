@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1599,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "879b903c029e128e70ccec34d9a9ec12aff4e464",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_index_scopes` still publishes every syntactic `global` or `nonlocal` assignment from a nested function into its receiver, independent of whether that function is ever called or whether it is called before the relevant `def` executes. `_publish_into` then pins the invented value so ordered inert rebinding cannot clear it. Separately, `_scan_scope` still recurses into every payload with the enclosing scope's `nested_view`; for a `ClassDef`, that view includes class-body bindings and is then inherited by method bodies, although a method body does not lexically close over its class namespace. Therefore the executable negative examples from round 3\u2014an uncalled global publisher, a publisher called only after a default is created, and a method-local nested default sharing a class attribute name\u2014are still falsely reported. The self-test contains positive called-publication fixtures but none of those required negative cases.",
+    "file": "scripts/launcher-default-sweep.py",
+    "fix_hint": "Model publication at executable call/statement sites instead of hoisting declarations from arbitrary function bodies. Resolve `nonlocal` to the nearest actual enclosing function binding. When entering a class, use class locals for defaults evaluated in the class body, but scan method bodies against their true lexical enclosing scope rather than the class table. Add independent executable negative fixtures for the uncalled global publisher, the publisher called after default creation, and the nested method default with a same-named class attribute, and assert both an empty finding set and the runtime-captured inert value.",
+    "severity": "major",
+    "title": "Scope resolution still invents launcher bindings that defaults cannot observe"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 binding-semantics defect remains. The implementation still hoists syntactic `global`/`nonlocal` writes from nested function bodies without establishing that those functions execute before the examined default, and it still supplies a class-derived `nested_view` while scanning method bodies even though methods do not close over the class namespace. The self-test still has only positive publisher fixtures and has not added the three independent negative fixtures requested in round 3, so these false positives remain unconstrained. This is materially the same major finding at the same severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
