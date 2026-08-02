@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5741,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "94007d9eb3c35833eee74bbcb4527052c43a64b0",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "added_npm_package() returns the first matching manifest, build_context() creates one package context, and _new_public_package_added() checks only that same package. A PR adding two public packages therefore creates follow-ons for just one and silently omits the other; if the first manifest is private and a later one is public, all three rules are suppressed. The test named test_private_marker_only_exempts_the_added_package explicitly limits itself to public-first ordering and does not establish the claimed coverage for every new public package.",
+    "file": "scripts/flow-on.py",
+    "fix_hint": "Evaluate matching manifests per package and emit templates once for each newly added public package, with package-specific context and dedup keys. Add tests for two public packages and for private-first/public-second ordering.",
+    "severity": "major",
+    "title": "Only the first newly added npm package receives follow-ons"
+   },
+   {
+    "body": "unless_paths = [\"site/**\"] and [\"book/**\"] veto the whole rule on any change in those trees. A PR can add a public package while merely fixing an unrelated site component or guide typo, and no advertisement/guide issue will be filed even though the new package remains undocumented. This contradicts the descriptions that suppression means the PR already did the follow-on's work.",
+    "file": "scripts/flow-on-rules.toml",
+    "fix_hint": "Use a package-specific proof of coverage (for example, inspect the canonical surface registry and SUMMARY/guide entry for the resolved package) or avoid suppression unless the exact expected files/content are present. Add negative tests where unrelated site/** and book/** changes must not suppress follow-ons.",
+    "severity": "major",
+    "title": "Any unrelated site or book change suppresses the package documentation follow-on"
+   }
+  ],
+  "progress": null,
+  "summary": "The new follow-on mechanism misses required work in two ordinary PR shapes: it evaluates only the first added npm manifest, and it suppresses documentation follow-ons when any file in the corresponding tree changes, even if that change is unrelated to the new package. The tests encode these behaviors rather than covering the intended per-package and package-specific obligations.",
+  "verdict": "request_changes"
+ }
+}
