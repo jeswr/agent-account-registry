@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3916,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e2d58fa243319420299562df7aa8e78315f25c75",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "evaluate() uses one `seen` set for both newly added suite directories and newly added ids. When a PR adds `bench/foo/...` and also adds id `foo` to `bench/benchmarks.toml`, the T2 suite check runs first and records label `foo` without a `new_id`; the later T1 check calls `check(..., new_id=\"foo\")` but returns immediately because `foo` is already in `seen`. Consequently the `new_id in trunk_ids` violation is never emitted. This defeats rule (c) for the most common new-benchmark change and allows continued edits to the shared append point.",
+    "file": "scripts/check-new-bench-registered.py",
+    "fix_hint": "Evaluate fragment placement independently of label de-duplication, or associate each added suite with its matching new id and pass that id during the first check. Add a regression test supplying both `added=[\"bench/beta/run.sh\"]` and a new trunk id `beta`, asserting that exactly one violation is returned and that it contains the fragment-placement reason.",
+    "severity": "major",
+    "title": "Suite de-duplication skips the trunk-append enforcement for normal new suites"
+   }
+  ],
+  "progress": null,
+  "summary": "The assembler and its validation tests are generally well scoped, but the new G3 fragment-placement rule is bypassed in the ordinary case where a PR adds both a new bench directory and its matching benchmark id. The de-duplication happens before the new-id-specific placement check, so an entry appended to the shared trunk can pass despite the stated hard invariant. The tests cover a new id in isolation but not the combined T1+T2 path.",
+  "verdict": "request_changes"
+ }
+}
