@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1658,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "868da1acae62028bbad6b615bce336e68b7ccf1f",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 remains sound. The generalized step-mapping reader preserves the existing fail-closed extraction behavior, while the new top-level scalar reader is bounded to the selected step and rejects duplicate keys. The seam assertion independently binds the consumer gate and GH_TOKEN expression to the named producer, then verifies that producer is the exact SHA-pinned App-token action with both secret inputs and the required sparq-org/sparq actions:write scope. Its synthetic fixtures exercise same-ID non-mints, altered scope, nesting, absence, first-key parsing, and duplicate refusal without turning expected misses into suite-aborting false kills. I found no blocker, major, or other diff-scoped correctness, test-validity, or security issue.",
+  "verdict": "approve"
+ }
+}
