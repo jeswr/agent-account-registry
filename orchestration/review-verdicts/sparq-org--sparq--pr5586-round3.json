@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5586,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e88f1042e4f5a5a6ae55a4cb7fff32f4cd3881b4",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "No correctness, soundness, test-validity, or security defect was found in round 3. The round-2 fix remains intact: registry-named crates are enumerated even with no feature-matrix leg, their manifests and declared features are validated, workspace-default execution is credited consistently, and stale entries cannot disappear merely by deleting a crate's last fragment. The focused zero-leg, stale-entry, live-gap, default-on, implied-feature, malformed-registry, and fail-closed manifest tests exercise the real enforcement path; all 72 scanner tests pass. The live --enforce invocation could not run in this checkout because PyYAML is absent, which is an environment dependency installed by the workflow and not a change defect. With no prior or current findings, progress is stagnant under the mandated comparison scale.",
+  "verdict": "approve"
+ }
+}
