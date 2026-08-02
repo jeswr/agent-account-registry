@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5714,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b33e375126eb029b15d931130b377275d58b7996",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The documentation-only change is internally consistent and appropriately conservative for a ZK soundness-sensitive surface. It clearly states that no toolchain execution occurred, does not claim the capacity guard is proven or externally audited, distinguishes a serialization-compatibility risk from a verified incompatibility, and preserves the existing non-vacuity matrix. The repository context supports the concrete local claims about the pinned nargo/bb versions, the ignored-test CI command, and the currently locked dependency majors. The proposed round-trip pre-flight is a reasonable prerequisite to prevent serialization failure from masquerading as a meaningful forged-witness rejection. No executable behavior or test is added, so there is no new test-path validity defect to block this record update.",
+  "verdict": "approve"
+ }
+}
