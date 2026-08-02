@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5439,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6565d806547edb776ee2334af42a1f245128c75c",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The token tuple at 1764-1766 now pins the snapshot date, the holder counts, and the four rates. It does not pin the middle of the derivation: the nCr pair counts (435 / 630 / 21) or the numerators (40 / 30 / 21). An edit that changed '435' to any other value, or '40' to '400', leaves the test green while making the table internally inconsistent with the holder counts it does pin.\n\nThis is mild rather than material, because a reader who has 30/36/7 and 9.2%/4.8%/100% can re-derive the pair counts and numerators themselves \u2014 which is exactly what the docstring's 'RE-DERIVE the decision rather than guess at it' asks for. Raising it only because the table's own cells are the thing a future editor would touch, and the current pin set catches a change to two of the three columns.",
+    "file": "scripts/tests/test_readiness_visibility.py",
+    "fix_hint": "Optionally add the pair counts to the tuple, e.g. '435', '630', '21' (or the fuller cells '435         40' / '630         30' if you want the numerators pinned alongside). Alternatively \u2014 and stronger \u2014 replace the substring assertions for the numeric columns with a small parse of the four table rows plus an arithmetic check that pairs == C(holders, 2) and that the printed percentage matches round(shared / pairs * 100, 1). That makes the guard verify the derivation rather than the literals, so it cannot go stale in the way rounds 2 and 3 both found.",
+    "severity": "nit",
+    "title": "The guard pins holder counts and rates but not the pair counts or numerators (435/630/21, 40/30)"
+   },
+   {
+    "body": "Lines 1622-1624 restate 9.2% / 4.8% / 100% / 57.1% and the 2026-07-31 date. This is the correct fix for the round-3 nit, but it recreates the second-site duplication that produced the round-2 and round-3 findings in the first place: the copy in ready-issues.py is guarded by test_the_declaration_records_its_measured_basis, and this copy is guarded by nothing. The next re-measurement will update the table, the guard will force the tuple to follow, and this docstring can silently keep the old numbers.\n\nSeparately, the sentence opens 'on the 2026-07-31 snapshot' and then runs through to '57.1% for crate areas', but 57.1% is not from that snapshot \u2014 it comes from research/crate-region-parallelism.md \u00a74, as line 1670 correctly attributes it. A reader could take the date as scoping all four figures.",
+    "file": "scripts/tests/test_readiness_visibility.py",
+    "fix_hint": "Either drop the numbers from the docstring and defer wholly to 'the dated table in NON_RESERVING_PARTITIONS' (the pointer cannot rot; the numbers can), or keep them and add the docstring to the guard's coverage \u2014 e.g. have test_the_declaration_records_its_measured_basis assert the same token set against this class's __doc__ as well as against the ready-issues.py block, so the two sites cannot diverge. For the attribution, move 57.1% out of the dated clause: '... against 100% for `area:deps` (all `Cargo.lock`) on that same snapshot, and 57.1% for crate areas (research/crate-region-parallelism.md \u00a74).'",
+    "severity": "nit",
+    "title": "The class docstring re-duplicates the canonical figures, and that copy is pinned by nothing"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Comment/docstring-only change plus one token-tuple change in a source-inspecting guard. No runtime behaviour changes and no behavioural assertion is weakened. I ran the suites at the PR head: TestNonReservingCrossCuttingPartitions 15/15 OK (via a yaml stub, since pyyaml is absent in this sandbox and only unrelated workflow tests need it), and `ready-issues.py --self-test` PASSED.\n\nThe round-3 major is genuinely fixed. test_the_declaration_records_its_measured_basis:1764 now pins ('2026-07-31', '30 ci / 36 docs / 7 deps', '9.2%', '4.8%', ...) instead of the retracted '5%'/'3%'. I reproduced the test's own extraction against the head revision: every asserted token occurs exactly once, and '9.2%'/'4.8%' occur only in the table (not in the HONESTY NOTE), so they are load-bearing. Mutation check: I copied the tree to /tmp, changed the table cell '( 9.2%)' to '( 5.0%)', and the guard went RED with \"the measured basis for the exemption no longer states 9.2%\". The guard is no longer vacuous, and it no longer passes on prose about withdrawn numbers. The round-3 nit is also fixed: the class docstring at 1622 now restates the live rates dated to the 2026-07-31 snapshot rather than the unfalsifiable 'few ... holder pairs'.\n\nArithmetic re-verified: C(30,2)=435, C(36,2)=630, C(7,2)=21; 40/435=9.2%, 30/630=4.8%, 21/21=100%. The HONESTY NOTE's retracted holder sets are self-consistent too: C(16,2)=120, C(12,2)=66, C(3,2)=3, matching the prior table, with 6/120=5% and 2/66=3%. The counterfactual paragraph is now correctly dated to 2026-07-28, matching the frontier 1->3 figures in the class docstring. 'single-digit-percent' and 'most of a partition-starved frontier' are both supported (9.2%/4.8%; 99.7% partition-deferred). I grepped the tree for surviving stale copies of '5% of open', '3 of 3', '14 open PRs', '120 6' and found none.\n\nOnly two nits remain, both about what the guard does NOT pin. No blocker or major.",
+  "verdict": "approve"
+ }
+}
