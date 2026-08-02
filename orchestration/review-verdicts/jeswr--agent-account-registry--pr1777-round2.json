@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1777,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1dfa7d83c39bd405cc0b17d24221da162db91332",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The two round-1 major findings are substantively resolved. The record now distinguishes restore reachability from physical storage retention, refuses to claim that key rotation deletes data, and requires the maintainer either to accept platform-controlled retention explicitly or require authenticated, fail-closed cleanup with a seam test. It also replaces the lossy `_masked_detail` prescription with a single boolean predicate over the complete representation, preserves bytes for safe payloads, refuses the whole write for credential-shaped input, and names non-vacuous bidirectional and mutation checks. The remaining unverified platform statements are clearly labelled, and the decision is deliberately constructed not to depend on them. No blocking correctness, soundness, test-validity, or security issue is supported by this documentation-only diff.",
+  "verdict": "approve"
+ }
+}
