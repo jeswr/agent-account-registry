@@ -1,14 +1,14 @@
 {
-  "generated_at": "2026-08-02T12:37:07Z",
+  "generated_at": "2026-08-02T12:44:50Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
       "issues_open": 2036,
-      "issues_ready": 277,
+      "issues_ready": 276,
       "issues_closed_1h": 0,
       "issues_closed_24h": 38,
       "prs_open": 104,
-      "prs_draft": 88,
+      "prs_draft": 87,
       "prs_opened_1h": 2,
       "prs_closed_1h": 2,
       "prs_merged_1h": 0,
@@ -16,9 +16,9 @@
       "review_changes_backlog": 12,
       "needs_user_parked": 16,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 16,
-      "worker_attempts_1h": 5,
-      "worker_success_rate_1h": 0.6,
+      "review_lane_runs_1h": 17,
+      "worker_attempts_1h": 6,
+      "worker_success_rate_1h": 0.6667,
       "pr_open_rate": 2.0,
       "pr_close_rate": 2.0,
       "net_pr_flow": 0.0
@@ -28,21 +28,21 @@
       "issues_ready": 424,
       "issues_closed_1h": 2,
       "issues_closed_24h": 33,
-      "prs_open": 50,
-      "prs_draft": 34,
-      "prs_opened_1h": 5,
-      "prs_closed_1h": 0,
-      "prs_merged_1h": 4,
-      "prs_merged_24h": 34,
-      "review_changes_backlog": 7,
+      "prs_open": 49,
+      "prs_draft": 32,
+      "prs_opened_1h": 6,
+      "prs_closed_1h": 1,
+      "prs_merged_1h": 5,
+      "prs_merged_24h": 35,
+      "review_changes_backlog": 8,
       "needs_user_parked": 8,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 7,
+      "review_lane_runs_1h": 14,
       "worker_attempts_1h": 3,
       "worker_success_rate_1h": 1.0,
-      "pr_open_rate": 5.0,
-      "pr_close_rate": 4.0,
-      "net_pr_flow": 1.0
+      "pr_open_rate": 6.0,
+      "pr_close_rate": 6.0,
+      "net_pr_flow": 0.0
     }
   },
   "alerts": [
@@ -50,9 +50,9 @@
       "target": "sparq-org/sparq",
       "classification": "ready-starved",
       "fire": true,
-      "summary": "ready frontier 277 > 60 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
+      "summary": "ready frontier 276 > 60 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
       "metrics": {
-        "issues_ready": 277,
+        "issues_ready": 276,
         "issues_closed_1h": 0
       }
     }
