@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1800,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "adee1bf9cb7d432c0fe08ca357ad6f6f822a117b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe added self-test support is sound and non-vacuous. It reads each real keepalive leg's repository and watch-list from the extracted workflow step, refuses missing or ambiguous repository identities, normalizes the self-repository consistently, pins the complete current source-to-target map independently of the collision assertion, and separately proves the collision detector with positive, negative, and cross-repository controls. The production assertion therefore fails both when a second watcher appears and when an expected watcher silently disappears. The checkout-wide workflow search supports the claimed three staleness-driven sources; the separately documented causal metrics publish dispatch is correctly excluded because it is not an independent stale-anchor reader. No trust check is weakened, no secret or workflow permission surface is expanded, and no reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
