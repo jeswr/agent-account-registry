@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5591,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9073ffea81071b7b86be8b34e3559d8fe69bb9ba",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The dedicated sparq-lws-core coverage lane is wired consistently: selection is fail-closed outside selected mode, the explicit crate subset is registered in the per-commit/dedicated partition, failures feed the existing aggregate verdict and post-merge demoted-lane filer, and the new behavioral tests cover the load-bearing selection, aggregation, ownership, and job-name matching invariants. The unseeded line-coverage floor is disclosed accurately; the lane measures and uploads the result without claiming to enforce a floor that does not yet exist. No correctness, security, or vacuous-test issue was found in the diff.",
+  "verdict": "approve"
+ }
+}
