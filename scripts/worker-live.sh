@@ -780,10 +780,73 @@ for p in paths:
 '
 }
 
+# ---- issue #248: post-gate target-tree integrity ------------------------------------------------
+# The gate necessarily has WRITE access to the target worktree — it executes the target's own build
+# scripts and tests as the runner user. #575 already made that harmless for the PUBLISHED CONTENT:
+# the publisher reconstructs the model's work on a clean runner from the digest-bound bundle sealed
+# BEFORE the gate, so a file the gate rewrites is never pushed. What #575 did NOT bind is the GATE
+# VERDICT. Target-controlled gate code could edit the tree mid-gate — delete a failing test, patch
+# the source a later suite step reads — and the run would publish the pre-gate content under a
+# `gate_outcome == 'success'` that describes a DIFFERENT tree. Publication is keyed on that verdict
+# and the PR body states "Result: passed before push", so the attestation would be false.
+#
+# So the verdict is bound to the seal: the gate recomputes the sealed snapshot when its profile body
+# returns and REFUSES if it moved. Refusing is the fail-closed direction — the gate dies, the
+# publish job's `gate_outcome == 'success'` condition is unmet, no target-write token is minted, and
+# `final_state` converges the issue to status:deferred.
+#
+# ⚠️ WHAT THIS IS NOT. It is DETECTION, not containment, and it is layered BEHIND #575's guarantee,
+# never in front of it. Gate code runs as the same runner user and could restore the tree before the
+# step ends; nothing a workflow does prevents a same-uid write (the same honest register as the
+# $GITHUB_ENV quarantine note in worker.yml). The property that holds unconditionally is still
+# #575's: the pushed branch is reconstructed from the pre-gate seal on a runner where no target code
+# has ever executed.
+
+# PURE (self-tested): sha256 of the patch that WOULD be published from the current worktree — the
+# exact `git add -A` snapshot bundle_work seals, computed through a THROWAWAY index so neither the
+# real index nor the worktree is touched. That is load-bearing twice over: run_gate calls this
+# BETWEEN the gate's profile body and its verdict, where staging on the real index would empty the
+# very changed-path selectors the gate is built from, and stage_fix's conflict-repair kind
+# deliberately leaves work staged. Ignored paths are invisible to `git add -A`, so build artifacts
+# under gitignored paths (cargo's `target/`, `__pycache__/`) cannot move this value. Fails (rc 1,
+# nothing on stdout) rather than printing a partial digest, so every caller can `|| die`.
+_worktree_seal_digest() {
+  local idx digest=''
+  idx=$(mktemp "${TMPDIR:-/tmp}/worker-seal-index.XXXXXX") || return 1
+  if GIT_INDEX_FILE="$idx" git read-tree HEAD 2>/dev/null &&
+      GIT_INDEX_FILE="$idx" git add -A -- . 2>/dev/null; then
+    digest=$(GIT_INDEX_FILE="$idx" git diff --cached --binary | sha256sum | cut -d' ' -f1) || digest=''
+  fi
+  rm -f -- "$idx"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$digest"
+}
+
+# The REFUSAL (issue #248). `expected` is the digest the PRE-GATE seal recorded as a step output —
+# captured by the runner while the runner was still clean, so no later step, the gate included, can
+# rewrite it. An unreadable post-gate tree refuses exactly as a changed one does.
+_assert_worktree_unchanged_by_gate() {
+  local expected=$1 actual
+  actual=$(_worktree_seal_digest) ||
+    die 'post-gate worktree integrity: the sealed snapshot could not be recomputed (fail closed)'
+  [[ "$actual" == "$expected" ]] ||
+    die "post-gate worktree integrity: the target tree CHANGED while the gate ran (pre-gate ${expected:0:12}…, post-gate ${actual:0:12}…) — target-controlled gate code rewrote the sealed tree, so this verdict does not describe the content the publisher would push. Refusing."
+  printf 'worker-live: post-gate worktree integrity verified against the pre-gate seal (%s)\n' \
+    "${expected:0:12}"
+}
+
 run_gate() {
   require_target
   local profile=${GATE_PROFILE:-}
   local packages=${WORKER_PACKAGES:-}
+  # [issue #248] MANDATORY, and read BEFORE the profile body so a missing recording refuses without
+  # having executed a line of target-controlled code. An empty value means the pre-gate seal step
+  # never ran or never emitted its output — that is the missing-expectation case, not a free pass,
+  # and both live lanes skip the gate outright when their seal step fails (the gate's `if:` carries
+  # an implicit `success()`), so there is no legitimate way to reach the gate without one.
+  local pregate_digest=${WORKER_PREGATE_TREE_DIGEST:-}
+  [[ "$pregate_digest" =~ ^[0-9a-f]{64}$ ]] ||
+    die 'post-gate worktree integrity: no pre-gate seal digest was recorded (fail closed — a gate verdict that is not bound to the sealed tree cannot authorize a publish)'
   git diff --check
   case "$profile" in
     none)
@@ -879,6 +942,10 @@ run_gate() {
       ;;
     *) die "unsupported gate profile $profile" ;;
   esac
+  # [issue #248] LAST, after every profile body — this is the whole point: the tree the gate just
+  # validated must still be the tree that was sealed for publication. Placed outside the `case` so a
+  # future profile inherits it instead of having to remember it.
+  _assert_worktree_unchanged_by_gate "$pregate_digest"
 }
 
 # The registry-selftest gate body is extracted so the host self-test can exercise its PURE
@@ -2669,8 +2736,22 @@ PY
     die "publish bundle is oversized ($total > $max_bytes bytes)"
   digest=$(_bundle_digest "$bundle_dir") || die 'publish bundle digest could not be computed'
 
+  # [issue #248] The digest of the SEALED PATCH, recorded as its own pre-gate step output so the
+  # gate that runs next can prove the worktree it validates is still the one published from. It is
+  # derived two independent ways and both must agree: from the patch bytes actually written to the
+  # bundle, and by re-deriving the snapshot with _worktree_seal_digest (which the gate will use).
+  # A divergence means the two constructions have drifted apart, which would make the gate's
+  # comparison fire on every run — refuse here rather than ship a check that must then be relaxed.
+  local sealed_patch_digest tree_digest
+  sealed_patch_digest=$(sha256sum < "$bundle_dir/patch.diff" | cut -d' ' -f1) ||
+    die 'sealed patch digest could not be computed'
+  tree_digest=$(_worktree_seal_digest) || die 'pre-gate worktree seal digest could not be computed'
+  [[ "$tree_digest" == "$sealed_patch_digest" ]] ||
+    die 'pre-gate worktree seal digest does not match the sealed patch (constructions have drifted)'
+
   write_output bundle_dir "$bundle_dir"
   write_output bundle_digest "$digest"
+  write_output bundle_tree_digest "$tree_digest"
   write_output bundle_base_sha "$base_sha"
   write_output bundle_branch "$branch"
   write_output bundle_bytes "$total"
@@ -3373,7 +3454,14 @@ stage_fix() {
   total=$(_bundle_total_bytes "$bundle_dir")
   [[ "$total" -le "$max_bytes" ]] || die "staged fix bundle is oversized ($total > $max_bytes bytes)"
 
+  # [issue #248] Recorded AFTER the index/head restore, so it describes exactly the worktree the
+  # gate is about to run against — the same snapshot the sealed commit carries. The gate re-derives
+  # it when its profile body returns and refuses a tree that moved underneath it.
+  local tree_digest
+  tree_digest=$(_worktree_seal_digest) || die 'pre-gate worktree seal digest could not be computed'
+
   write_output staged_sha "$staged_sha"
+  write_output staged_tree_digest "$tree_digest"
   write_output staged_base_sha "$base_sha"
   write_output staged_merge_head "$merge_head"
   write_output staged_bytes "$total"
@@ -7190,6 +7278,15 @@ print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcaplive/
   chk "(#91 r2) ...and RESTORES the pre-gate head plus the model's uncommitted tree (gate stays live)" \
     "$(git -C "$sf_work" rev-parse HEAD):$(git -C "$sf_work" status --porcelain=v1 --untracked-files=all | tr -d ' ' | sort | tr '\n' '|')" \
     "$sf_head:??added.txt|Msrc.txt|"
+  # [issue #248] ...and it records the SEAL DIGEST of that restored tree, which is what review-fix's
+  # gate step binds its verdict to. The expected value is recomputed from the fixture worktree by the
+  # SAME helper run_gate will call, so this row goes red if the seal stops emitting it, emits a stale
+  # one, or emits one the gate side cannot reproduce.
+  local sf_tree
+  sf_tree=$(grep -E '^staged_tree_digest=' "$sf_out" | cut -d= -f2- || true)
+  chk "(#248) stage_fix records the pre-gate SEAL digest of the restored tree as a step output" \
+    "$([[ "$sf_tree" =~ ^[0-9a-f]{64}$ ]] && printf hex || printf "bad[$sf_tree]"):$sf_tree" \
+    "hex:$( cd "$sf_work" && _worktree_seal_digest )"
   # It must also refuse to run at all where a token is in scope: this phase shares a runner with
   # the hostile gate, so a token here means the workflow regressed.
   local sf_tok_rc=0
@@ -7859,6 +7956,174 @@ PY
     "refused:$wbase"
   chk "#97 publish: the refusal is the NAMING one, not the digest (the re-digest verified)" \
     "$(grep -c 'no commit provenance for the routed model alias' "$tmp/pub3.log" || true)" "1"
+
+  # ================================================================================================
+  # ISSUE #248 — POST-GATE TARGET-TREE INTEGRITY. #575 (above) stops gate code REACHING the
+  # publisher; these rows bind the gate's own VERDICT to the tree that was sealed. The gate rows are
+  # driven end to end through `run_gate` with a `cargo` STUB standing in for target-controlled build
+  # code, so the mutation happens where the real one would — inside the profile body — and a check
+  # placed before that body (or deleted) cannot satisfy them.
+  # ================================================================================================
+  local g248="$tmp/gate-integrity" g248bin="$tmp/gate-integrity-bin"
+  local g248_canary="$tmp/gate-integrity-cargo-ran"
+  local g248_model_line='pub fn f() { assert!(true); }'
+  git init -q -b main "$g248"
+  printf 'build-out/\n' > "$g248/.gitignore"
+  printf '[package]\nname = "fixture"\n' > "$g248/Cargo.toml"
+  mkdir -p "$g248/src"
+  printf 'pub fn f() {}\n' > "$g248/src/lib.rs"
+  git -C "$g248" -c user.name=t -c user.email=t@example.invalid add -A
+  git -C "$g248" -c user.name=t -c user.email=t@example.invalid commit -qm base
+  local g248_base
+  g248_base=$(git -C "$g248" rev-parse HEAD)
+  # the "model" leaves a modified tracked file plus a new untracked one — the tree the seal covers
+  printf '%s\n' "$g248_model_line" > "$g248/src/lib.rs"
+  printf 'notes\n' > "$g248/notes.md"
+
+  local g248_seal
+  g248_seal=$( cd "$g248" && _worktree_seal_digest ) || g248_seal=''
+  chk "#248 seal: the pre-gate snapshot digest is 64-hex" \
+    "$([[ "$g248_seal" =~ ^[0-9a-f]{64}$ ]] && printf hex || printf "bad[$g248_seal]")" "hex"
+  # It has to be a PURE READ. run_gate calls it BETWEEN the profile body and the verdict, where
+  # staging on the real index would empty the gate's own `git status` selectors — the exact vacuity
+  # trap bundle_work documents. So: HEAD unmoved, real index still empty, worktree status unchanged.
+  chk "#248 seal: computing it moves neither HEAD nor the real index nor the worktree (pure read)" \
+    "$(git -C "$g248" rev-parse HEAD):$(git -C "$g248" diff --cached --name-only | wc -l | tr -d ' '):$(git -C "$g248" status --porcelain=v1 --untracked-files=all | tr -d ' ' | sort | tr '\n' '|')" \
+    "$g248_base:0:??notes.md|Msrc/lib.rs|"
+  chk "#248 seal: it is STABLE when nothing changed (a noisy digest would refuse every honest run)" \
+    "$( cd "$g248" && _worktree_seal_digest )" "$g248_seal"
+  # ...and it MOVES on a one-line edit to a tracked file. Without this the stability row above is
+  # satisfied by a constant, and every refusal row below would be measuring nothing.
+  printf '%s\n// gate injected\n' "$g248_model_line" > "$g248/src/lib.rs"
+  chk "#248 seal: a one-line edit to a TRACKED file moves the digest (it can go red)" \
+    "$([[ "$( cd "$g248" && _worktree_seal_digest )" == "$g248_seal" ]] && printf same || printf differs)" \
+    "differs"
+  printf '%s\n' "$g248_model_line" > "$g248/src/lib.rs"
+  chk "#248 seal: restoring the byte-identical content restores the digest (content, not timestamps)" \
+    "$( cd "$g248" && _worktree_seal_digest )" "$g248_seal"
+  # A GITIGNORED build artifact must NOT move it. A check that fires on cargo's own `target/` output
+  # would red every legitimate run and be relaxed away, which is how a trust check dies.
+  mkdir -p "$g248/build-out"
+  printf 'obj\n' > "$g248/build-out/fixture.o"
+  chk "#248 seal: a gitignored build artifact does NOT move the digest (build output stays irrelevant)" \
+    "$([[ -f "$g248/build-out/fixture.o" ]] && printf wrote || printf missing):$( cd "$g248" && _worktree_seal_digest )" \
+    "wrote:$g248_seal"
+
+  # ---- end to end through run_gate. `_g248_cargo <body>` installs a stub cargo that runs <body>;
+  # `_g248_gate <digest> <logfile>` runs the lint-only gate (Cargo.toml present, so the profile body
+  # really does invoke cargo) and prints "<rc>:<did the stub run>". ----
+  mkdir -p "$g248bin"
+  _g248_cargo() {
+    rm -f -- "$g248_canary"
+    { printf '#!/bin/sh\n'
+      printf 'printf ran > %s\n' "$g248_canary"
+      printf '%s\n' "$1"
+      printf 'exit 0\n'
+    } > "$g248bin/cargo"
+    chmod 755 "$g248bin/cargo"
+  }
+  _g248_gate() {
+    local rc=0
+    (
+      export TARGET_DIR="$g248" GATE_PROFILE=lint-only WORKER_PACKAGES='' \
+             WORKER_PREGATE_TREE_DIGEST="$1" PATH="$g248bin:$PATH"
+      run_gate
+    ) > "$2" 2>&1 || rc=$?
+    printf '%s:%s\n' "$rc" "$(cat "$g248_canary" 2>/dev/null || printf none)"
+  }
+
+  # CONTROL. A gate whose build code touches nothing passes, and the stub really executed — so the
+  # refusal rows below are about the mutation, not about a gate that never ran.
+  _g248_cargo 'true'
+  chk "#248 gate: a gate that leaves the tree alone PASSES, and the profile body really ran" \
+    "$(_g248_gate "$g248_seal" "$tmp/g248-clean.log")" "0:ran"
+  chk "#248 gate: ...and it says so, naming the seal it verified against" \
+    "$(grep -c "post-gate worktree integrity verified against the pre-gate seal (${g248_seal:0:12})" \
+        "$tmp/g248-clean.log" || true)" "1"
+  # THE ATTACK. Target-controlled build code rewrites a source file MID-GATE and exits 0. The gate
+  # must die: its verdict would otherwise describe a tree that is not the one the publisher pushes.
+  _g248_cargo "printf 'pub fn f() { /* rewritten by the gate */ }\n' > '$g248/src/lib.rs'"
+  chk "#248 gate: build code that REWRITES a source file mid-gate is REFUSED (fail closed)" \
+    "$(_g248_gate "$g248_seal" "$tmp/g248-tamper.log")" "1:ran"
+  chk "#248 gate: ...and the refusal is the integrity one, naming both digests" \
+    "$(grep -c 'the target tree CHANGED while the gate ran' "$tmp/g248-tamper.log" || true)" "1"
+  printf '%s\n' "$g248_model_line" > "$g248/src/lib.rs"
+  chk "#248 gate: (fixture restored to the sealed content before the rows below)" \
+    "$( cd "$g248" && _worktree_seal_digest )" "$g248_seal"
+  # DELETION is the other half, and it is the likelier attack: dropping the file a failing suite step
+  # reads is how gate code buys itself a green verdict. A snapshot that only noticed MODIFICATIONS
+  # would wave it through, so it is measured separately rather than assumed from the row above.
+  _g248_cargo "rm -f '$g248/notes.md'"
+  chk "#248 gate: build code that DELETES a sealed file mid-gate is REFUSED too" \
+    "$(_g248_gate "$g248_seal" "$tmp/g248-delete.log"):$(grep -c 'the target tree CHANGED while the gate ran' "$tmp/g248-delete.log" || true)" \
+    "1:ran:1"
+  printf 'notes\n' > "$g248/notes.md"
+  chk "#248 gate: (fixture restored again — the deletion row really did move the tree)" \
+    "$( cd "$g248" && _worktree_seal_digest )" "$g248_seal"
+  # A gate that only writes GITIGNORED build output still passes — the same non-relaxable point as
+  # the seal row above, now measured through the real gate path.
+  _g248_cargo "mkdir -p '$g248/build-out' && printf 'fresh\n' > '$g248/build-out/late.o'"
+  chk "#248 gate: build code writing only GITIGNORED output still PASSES (no spurious refusal)" \
+    "$(_g248_gate "$g248_seal" "$tmp/g248-ignored.log"):$([[ -f "$g248/build-out/late.o" ]] && printf wrote || printf missing)" \
+    "0:ran:wrote"
+  # THE MISSING EXPECTATION IS A REFUSAL, and it happens BEFORE a line of target-controlled code
+  # runs — `none` is the canary saying the stub was never reached. An absent recording cannot
+  # authorize a verdict, exactly as an absent bundle digest cannot authorize a publish.
+  _g248_cargo 'true'
+  chk "#248 gate: an UNRECORDED pre-gate seal digest REFUSES before any target code runs" \
+    "$(_g248_gate "" "$tmp/g248-nodigest.log")" "1:none"
+  chk "#248 gate: a MALFORMED (non-64-hex) digest refuses the same way, never falls through" \
+    "$(_g248_gate "not-a-digest" "$tmp/g248-baddigest.log")" "1:none"
+  chk "#248 gate: ...both name the missing recording, not some later failure" \
+    "$(grep -c 'no pre-gate seal digest was recorded' "$tmp/g248-nodigest.log" || true):$(grep -c 'no pre-gate seal digest was recorded' "$tmp/g248-baddigest.log" || true)" \
+    "1:1"
+  # THE UNREADABLE-TREE ARM, which no gate row above reaches: a snapshot that cannot be RECOMPUTED
+  # must refuse exactly as a changed one does. A helper that returned rc 1 with an empty digest and
+  # an assertion that compared it as a value would silently pass whenever the expectation was also
+  # empty — so both halves are pinned: the helper refuses (rc 1, NOTHING on stdout), and the
+  # assertion built on it dies with its own named reason rather than the drift one.
+  local g248_nogit="$tmp/gate-integrity-nogit" g248_nogit_rc=0 g248_nogit_out
+  mkdir -p "$g248_nogit"
+  g248_nogit_out=$( cd "$g248_nogit" && _worktree_seal_digest 2>/dev/null ) || g248_nogit_rc=$?
+  chk "#248 seal: an unreadable tree returns rc 1 with NOTHING on stdout (never a partial digest)" \
+    "$g248_nogit_rc:${g248_nogit_out:-<empty>}" "1:<empty>"
+  chk "#248 gate: a snapshot that cannot be RECOMPUTED refuses, under its own name" \
+    "$( ( cd "$g248_nogit" && _assert_worktree_unchanged_by_gate "$g248_seal" ) 2>&1 \
+        | grep -c 'the sealed snapshot could not be recomputed' || true)" "1"
+
+  # ---- the SEAL side of the worker lane: bundle_work must record the digest the gate re-derives.
+  # The expected value is recomputed from the sealed worktree by the helper run_gate calls, so a
+  # seal that recorded nothing, recorded a stale value, or drifted from the gate-side construction
+  # is red here rather than at 3am on a live run. ----
+  local btree
+  btree=$(grep -oE '^bundle_tree_digest=[0-9a-f]{64}$' "$bout" | tail -n1 | cut -d= -f2 || true)
+  chk "#248 bundle: the pre-gate SEAL digest is recorded as its own step output" \
+    "$([[ "$btree" =~ ^[0-9a-f]{64}$ ]] && printf hex || printf missing)" "hex"
+  chk "#248 bundle: ...and it is exactly what the GATE recomputes from the same worktree" \
+    "$btree" "$( cd "$wsrc" && _worktree_seal_digest )"
+  chk "#248 bundle: ...which is also the sha256 of the patch the publisher applies (verdict bound to CONTENT)" \
+    "$btree" "$(sha256sum < "$bdir/patch.diff" | cut -d' ' -f1)"
+
+  # ---- the YAML seam, where the vacuity lives. Both live lanes must hand their gate step the
+  # digest their OWN pre-gate seal emitted; exact whole-line match, so a renamed/dropped output key
+  # (`…_tree_digest_DROPPED`) cannot satisfy a substring. Then the same read against a copy with the
+  # line deleted, so the extractor is proven able to report the wiring gone. ----
+  local g248_wf_line='          WORKER_PREGATE_TREE_DIGEST: ${{ steps.bundle.outputs.bundle_tree_digest }}'
+  local g248_rf_line='          WORKER_PREGATE_TREE_DIGEST: ${{ steps.stage.outputs.staged_tree_digest }}'
+  chk "#248 (LIVE): each lane's gate step is wired to its OWN pre-gate seal output (exact line)" \
+    "$(_workflow_step_body "$wf" gate | grep -cFx "$g248_wf_line" || true):$(_workflow_step_body "$rf_wf" gate | grep -cFx "$g248_rf_line" || true)" \
+    "1:1"
+  local g248_wf_gone="$tmp/worker-no-tree-digest.yml" g248_rf_gone="$tmp/review-fix-no-tree-digest.yml"
+  grep -Fvx "$g248_wf_line" "$wf" > "$g248_wf_gone"
+  grep -Fvx "$g248_rf_line" "$rf_wf" > "$g248_rf_gone"
+  chk "#248 (LIVE): a gate step with the wiring REMOVED is reported as unwired (non-vacuous)" \
+    "$(_workflow_step_body "$g248_wf_gone" gate | grep -cFx "$g248_wf_line" || true):$(_workflow_step_body "$g248_rf_gone" gate | grep -cFx "$g248_rf_line" || true)" \
+    "0:0"
+  # THE NAME SEAM. The workflow expressions above name output KEYS; these are the keys the two seal
+  # phases actually emitted into their $GITHUB_OUTPUT fixtures. Renaming either end alone reds this.
+  chk "#248: the workflows read the EXACT output keys bundle_work / stage_fix emit (name seam)" \
+    "$(grep -cE '^bundle_tree_digest=[0-9a-f]{64}$' "$bout" || true):$(grep -cE '^staged_tree_digest=[0-9a-f]{64}$' "$sf_out" || true)" \
+    "1:1"
 
   # ================================================================================================
   # SELF-TEST SANDBOX — no enrolled self-test may reach the real `gh`.

@@ -1964,6 +1964,14 @@ jobs:
           TARGET_DIR: ${{ github.workspace }}/target
           GATE_PROFILE: ${{ needs.resolve.outputs.gate_profile }}
           WORKER_PACKAGES: ${{ needs.resolve.outputs.packages }}
+          # [issue #248] POST-GATE TARGET-TREE INTEGRITY, the same binding worker.yml's gate step
+          # carries. This is a step output of the PRE-GATE `stage` step, captured while the runner
+          # was still clean; worker-live.sh `gate` recomputes the sealed snapshot after its profile
+          # body returns and DIES on any drift, so gate code that rewrote a source file mid-gate
+          # cannot leave a green verdict describing a tree the publisher would not push. An empty
+          # value refuses the gate (a failed `stage` step already skips this one via the implicit
+          # `success()`).
+          WORKER_PREGATE_TREE_DIGEST: ${{ steps.stage.outputs.staged_tree_digest }}
           # [issue #91] Same quarantine as worker.yml's gate step, which this lane had not
           # inherited. The fix lane runs the SAME `worker-live.sh gate` on the SAME target
           # checkout, so it executes the same target-controlled build scripts and tests as the
