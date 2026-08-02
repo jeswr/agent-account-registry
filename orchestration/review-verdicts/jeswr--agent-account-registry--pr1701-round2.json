@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1701,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "573145f96502b10a2b126a1e0b4e1827daa11fd9",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`generation_provenance()` authenticates only a public literal, a window, and `source_records`; `expected_records()` then compares that count solely with the entries in the same untrusted document. An operator can still hand-write `generated.basis = \"ledger-provenance-records\"`, choose any window, omit PR 9, and set `source_records` to the shortened list length. That document passes every new guard, marks the partial corpus `scoped`, and proposes [redacted-account]. This is not limited to a deliberate forgery: retyping a manifest and counting the rows actually transcribed produces exactly this internally consistent omission. The self-test explicitly confirms the residue by asserting that an internally consistent short manifest is accepted and yields the false candidate. Therefore the new block distinguishes only the legacy JSON shape, not generated provenance, and the prior fail-open completeness path remains.",
+    "file": "scripts/grant-scope-audit.py",
+    "fix_hint": "Do not let self-attested fields in the manifest prove its derivation. Bind completeness to evidence independent of the claimed entries: for example, have the audit enumerate the authoritative source itself and compare the accepted artifact/corpus against that enumeration, or verify a signature/digest issued by a separately trusted generation step over the authoritative record set. Add an end-to-end negative test using a syntactically valid `generated` block with a matching shortened count and require that it cannot produce `STATUS_SCOPED` or any revocation candidate. If no independent binding is available offline, keep such manifests advisory-only rather than arm-capable.",
+    "severity": "blocker",
+    "title": "Self-consistent hand-written short manifests remain arm-capable"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round adds a syntactic provenance gate and good coverage around malformed or inconsistently edited artifacts, but it does not establish that an accepted manifest came from the generator or from an authoritative enumeration. The same unsafe completeness claim remains arm-capable once a hand-written manifest includes the public basis string and a count matching its own shortened entries. The code itself acknowledges that an internally consistent short claim is still believed. Because that is the prior round's trust-plane blocker, the verdict remains request_changes.",
+  "verdict": "request_changes"
+ }
+}
