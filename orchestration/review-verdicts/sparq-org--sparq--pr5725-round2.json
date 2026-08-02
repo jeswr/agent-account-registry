@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5725,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3accee5ce40754023b6749bead65219c53627b24",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major fail-open finding. Admission now requires a structurally valid, non-empty annotation block, rejects parser-discarded assertions and assumption-less assertions, and requires explicit positive support for every assertion while also checking disqualifiers. Because the current vocabulary has no positive malicious-security or dishonest-majority terms, both support tables are empty and both requirements are denied rather than inferred from absence. The focused tests cover the prior counterexamples: empty blocks, missing assumptions, missing assurance/parser discard, and absence of SemiHonest; they also include a valid structural control, so the checks are not vacuous. The shipped graph remains candidly Claimed and ExternalSignOffPending, with no detected instruction injection.",
+  "verdict": "approve"
+ }
+}
