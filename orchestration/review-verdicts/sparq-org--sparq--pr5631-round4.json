@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5631,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e9cd82f0a515c1c40a275039043b9da1ce5f17a9",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The auth_join re-export comment still says the per-path descriptor is \"AXIS-2 only; AXIS-1 stays SemiHonest until sq-qhy4\". That is false after the containment fix: equality_join_security returns SecurityDescriptor::semi_honest_only(), so neither AXIS-1 nor AXIS-2 is promoted. This public-facing comment recreates the unaudited active-security overclaim that the round-3 finding requested be removed.",
+    "file": "crates/sparq-mpc/src/lib.rs",
+    "fix_hint": "Replace the AXIS-2-only wording with an explicit statement that the reported descriptor is the SemiHonestOnly baseline with no axis promoted until sq-qhy4 closes. Keep tamper-evident-with-abort described only as experimentally observed behavior.",
+    "severity": "major",
+    "title": "Public re-export commentary still claims an AXIS-2-only promotion"
+   },
+   {
+    "body": "The Mal/HM/N=3 hidden-join row still says \"Tier reported AXIS-2-only (see the equality row)\". The equality row now correctly says the SemiHonestOnly baseline with no axis promoted, and equality_join_security implements that baseline. The hidden-join row therefore contradicts both the adjacent authoritative row and the code, continuing the same externally unaudited security-tier overclaim from round 3.",
+    "file": "research/mpc-sparql-capability-matrix.md",
+    "fix_hint": "Change the row to state that the reported tier is the SemiHonestOnly baseline with no axis promoted while sq-qhy4 is pending; describe abort-on-tamper only as experimental behavior.",
+    "severity": "major",
+    "title": "Hidden-join capability row still reports AXIS-2-only security"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 fixes most of the round-3 reporting language, including the implementation docs, security descriptor docs, skill, and the equality capability row. However, the two stale AXIS-2-only claims identified in round 3 remain in the public re-export commentary and the hidden-join capability row. Both still contradict equality_join_security, which reports the SemiHonestOnly baseline with no axis promoted while sq-qhy4 is open. The same major honesty issue therefore remains, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
