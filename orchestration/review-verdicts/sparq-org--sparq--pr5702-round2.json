@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5702,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ed37a56f45133fb618eab1b15e51e368c4f6a59d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 3 infers that the pinned verifier already performs asynchronous, SSRF-guarded DNS resolution solely because Cargo.lock lists hickory-resolver, and calls dependency presence \"exactly the property the repin existed to produce.\" A dependency can be unused on the relevant path, used only under another configuration, or wrapped without the claimed SSRF policy. The cargo-vet note is also explicitly acknowledged as an unverified pre-existing assertion, so it cannot independently close this evidence gap. This leaves the NO PORT capability verdict for chore/repin-async-dns-verifier unsupported.",
+    "file": "research/lws-branch-port-triage.md",
+    "fix_hint": "Inspect the pinned solid-oidc-verifier revision and cite the concrete WebID/issuer resolution call path showing that the network feature invokes the async hickory resolver with the claimed SSRF protections, plus a relevant test if one exists. If that source/path cannot be inspected, defer this capability-level verdict alongside the branch-level verdict instead of treating Cargo.lock membership as proof.",
+    "severity": "major",
+    "title": "Dependency presence does not establish the verifier repin capability"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-1 branch-level DROP overclaim has been corrected: the record now consistently defers branch deletion and limits its conclusion to capability-level subsumption. However, the verifier-repin capability conclusion is still not established by the evidence cited. Cargo.lock proves only that hickory-resolver is in the pinned package's dependency graph; it does not prove that the verifier actually uses it for WebID/issuer resolution, that this path is asynchronous, or that the relevant resolver path is SSRF-guarded. Because that unsupported inference is the sole basis for declaring the repin capability subsumed and doing no port, the record is not yet complete.",
+  "verdict": "request_changes"
+ }
+}
