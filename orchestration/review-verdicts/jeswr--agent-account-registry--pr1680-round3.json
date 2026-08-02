@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1680,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c1797c084a2cd3f39cecf43ae45cd62cf79aff45",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe prior major finding is resolved. `_pr_gate_yaml_parse_sweep` now parses the workflow with a safe, strict loader and searches only actual mapping objects in `jobs.*.steps`, so a verbatim named-step block embedded in another step's shell block scalar is no longer eligible to satisfy the pin. It fails closed on parse errors, missing or malformed workflow structure, aliases, duplicate mapping keys, non-mapping steps, and zero or multiple matching steps. The frozen expected value remains independently constructed and compares the complete normalized step object, including extra step-level controls such as `if`, while the added faithful positive controls and weakened/deleted name-spoof fixtures make the regression checks non-vacuous. I found no blocker, major, or other actionable diff-scoped issue.",
+  "verdict": "approve"
+ }
+}
