@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5702,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b6b17a2754676610cf291d966eabfdfec52545b8",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2's major evidence gap is closed. Section 3 no longer treats Cargo.lock membership or the cargo-vet exemption note as proof: it identifies the pinned verifier revision and traces both WebID and issuer fetching through SafeFetcher::system, SystemResolver, hickory lookup_ip, per-record address classification, address pinning, and redirect revalidation, while explicitly distinguishing call-path verification from a security audit. The record also cites focused upstream SSRF tests and preserves honest residuals around exemption-vs-audit status and the unchecked advisory claim. The new branch-tip ancestry evidence directly establishes that none of the three branches contains commits absent from the import revision, which is sufficient for the no-port decisions. The in-tree pin and cited load-bearing symbols/tests are present, and no correctness, soundness, test-validity, or security defect remains in the diff.",
+  "verdict": "approve"
+ }
+}
