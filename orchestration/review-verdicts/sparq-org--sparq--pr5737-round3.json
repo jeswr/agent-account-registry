@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5737,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3f6bb762aad6f967d49db6bc9011c606925cd6bf",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves both prior findings. The real prove/verify/mutation integration test is now a required step in the GUI workflow, whose path filters cover the prover, committed ACIR, dependency lockfile, and workflow itself. The challenge is now consistently documented and tested as a fixed domain-separation input with no freshness or replay protection, rather than as a verifier nonce. The ZK claim remains narrowly scoped to knowledge of digits matching a published term anchor and a comparison, explicitly disclaims store/row/credential provenance, and carries the required research-grade/external-audit caveat. The integration test exercises the shipped ACIR through proveFilter and verifyProofBundle and rejects a mutated public claim, so it is non-vacuous. No blocker, correctness, security, or test-validity issue remains in the reviewed diff.",
+  "verdict": "approve"
+ }
+}
