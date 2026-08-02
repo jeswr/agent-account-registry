@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5397,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "07cd27f14c997fc5462e7faa1ca24e09ffcb5810",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change consistently adds a third, bounded requeue route for queue/runner-owned dequeues while retaining fail-closed demotion for author-owned reasons, stale verdicts, unreadable attempt counts, exhausted budgets, and non-green or unreadable head gates. The workflow guards are mutually exclusive and preserve failed-classifier demotion. The tests exercise the real classifier, timeline-derived attempt count, exact PR-head gate lookup, malformed API responses, route ownership controls, cap exhaustion, workflow wiring, and execution of the shell re-arm path, so they are not merely string or mock-vacuous checks. No security issue or prompt-injection content was found in the diff.",
+  "verdict": "approve"
+ }
+}
