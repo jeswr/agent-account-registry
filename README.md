@@ -91,7 +91,7 @@ code branch never rejects the bot's contents-API writes, and a token that can on
 `ledger` can never push code (issue #28; `data/README.md` on master is the tombstone):
 
 ```json
-{"leases": [{"account": "acct01", "claim_id": "<uuid>", "holder": "<owner/repo@run>",
+{"leases": [{"account": "0123456789abcdef", "claim_id": "<uuid>", "holder": "<owner/repo@run>",
              "package": "sparq-core", "role": "impl", "model": "sol",
              "issued_at": 0, "expires_at": 0}]}
 ```
