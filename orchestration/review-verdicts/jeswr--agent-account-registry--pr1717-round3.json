@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1717,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d222437e1ea3747158c8fa3d88b80a3db038abcc",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`summarize_no_change` filters on `exit_class == NO_CHANGE_CLASS` before deduplicating by `_health_run_key`, which deliberately removes the attempt suffix. A GitHub Actions rerun keeps the same workflow run ID, so if attempt 1 records `no_change` and a newer attempt 2 records `success` (or any other class), the newer row is ignored and attempt 1 is counted as the current run's no-change outcome. This can publish a false wasted-run rate and fire a false alert. `_test_no_change_telemetry` demonstrates the blind spot: its newer `limit` row for `9001.1` is ignored while the test still expects run 9001 to count as no-change.",
+    "file": "scripts/metrics.py",
+    "fix_hint": "Choose the newest validated ledger record for each attributed base run ID across all exit classes first, then count it only if that winning record is `no_change`. Add a non-vacuous test with an older `9001.1` no-change record and a newer `9001.2` success/non-no-change record asserting that run 9001 is not counted; also retain coverage for a newer no-change attempt replacing an older outcome.",
+    "severity": "major",
+    "title": "Older no-change attempts survive newer non-no-change reruns"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe prior recovery finding remains resolved, but the new run-level join can attribute a stale no-change outcome to a later successful retry of the same GitHub Actions run. GitHub reruns retain the run ID and change the attempt suffix; `summarize_no_change` discards every non-`no_change` record before selecting the newest record by base run ID. Thus an older `9001.1` no-change row still counts even when a newer `9001.2` success/limit row is present, falsely inflating the wasted-run rate and potentially firing the new alert. The added telemetry test actually encodes this behavior by placing a newer limit record for run 9001 while still expecting three no-change runs.",
+  "verdict": "request_changes"
+ }
+}
