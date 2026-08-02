@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1605,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "63830c1faa927b79ff9fb3850a08eff71c4887b1",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "For an unknown `if`, `_taint_block()` unions the ending taint sets of both arms. `_record_printed_keys()` then credits a print after the join whenever either arm leaves the printed name tainted. A resolver can load policy into `enabled`, assign `repos = [os.environ[\"REQUESTED\"]]` (or another policy-validated manual value) on one arm, assign `repos = [\"some-owner/some-name\"]` on the scheduled arm, and print after the join; the report still returns `[\"repos\"]`. The added test requiring a policy read on ONE branch to count as sourced preserves this exact false positive, yet the analyzer does not prove that the non-derived branch is guarded by membership in the enabled policy set. The new hardcode, overwrite, and dead-code mutants do not exercise a hardcode confined to one live runtime branch, so they do not close the prior finding.",
+    "file": "scripts/backfill-provenance.py",
+    "fix_hint": "Prove that every executable path reaching the output is policy-authorized, while distinguishing direct policy derivation from a manual input whose membership in the policy-derived enabled set is actually validated. Add a named non-crashing mutant of the shipped resolver that hardcodes only the scheduled `else` arm while retaining the existing manual arm and policy load; it must make `resolve_policy_derived_outputs` empty without changing or aborting the self-test row count. A plain union of per-branch taint cannot establish this property.",
+    "severity": "major",
+    "title": "Union joins still bless a hardcoded scheduled-path output"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 major remains unresolved. The analyzer still unions taint across an unknown runtime branch, and the new positive branch test explicitly requires that existential behavior. Consequently, a policy-derived value on one branch still blesses the output key even when the other executable branch publishes a hardcoded repository list. In the live resolver shape, replacing the scheduled `else` arm with a copied list while retaining the manual arm leaves `resolve_policy_derived_outputs` equal to `[\"repos\"]`, so the marquee scheduled-recovery guarantee can remain green after being severed from policy. The diff adds overwrite and dead-branch mutants, but it does not add or pass the named cross-branch mutant requested in round 3. Progress is therefore stagnant.",
+  "verdict": "request_changes"
+ }
+}
