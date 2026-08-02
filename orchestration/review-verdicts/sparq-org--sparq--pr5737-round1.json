@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 5737,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b1bf6e0ae6cd93af6cc01ef6e8a05c6032ecddc2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "candidatesFromResults passes only term.value to canonicalDigits. Consequently an xsd:string, language-tagged literal, or other datatype with lexical form \"30\" is classified as provable using the hard-coded anchor for the canonical xsd:integer token. The resulting UI claim is therefore about a different RDF term than the row returned by the live store. The new test helper creates a literal without a datatype and nevertheless asserts it is provable, so the test codifies rather than catches the mismatch.",
+    "file": "gui/app/src/lib/zk-filter.ts",
+    "fix_hint": "Require and validate the exact RDF term kind/datatype expected by the circuit (including canonical lexical-form rules) before selecting the xsd:integer anchor. Add negative tests for plain/string, language-tagged, and non-integer typed literals sharing the same lexical form, plus a positive xsd:integer case using the actual SparqlResults binding shape.",
+    "severity": "blocker",
+    "title": "Provability classification ignores the RDF term datatype"
+   },
+   {
+    "body": "The public inputs listed here are challenge, operand_enc, op, bound, and expected. There is no dataset commitment, query-result commitment, subject identifier, or authenticated credential root. Thus the proof can establish only that private digits hash to one of the hard-coded public anchors and satisfy the comparison; it cannot establish that those digits were returned by the selected SPARQL row. Comments and UI copy repeatedly describe the operand as the store value and the anchor as binding it to a committed credential, which is stronger than the implemented statement.",
+    "file": "gui/app/src/lib/zk-prover.ts",
+    "fix_hint": "Either add a verified commitment/membership binding that authenticates the selected RDF term (and, if claimed, its subject/store provenance), or narrow all claims and report text to state explicitly that the query merely supplies a local witness and the proof does not attest membership in or provenance from the live store.",
+    "severity": "blocker",
+    "title": "Proof is not cryptographically bound to the selected live-store row"
+   },
+   {
+    "body": "The tests cover only local parsing, hard-coded anchors, and a duplicate JavaScript comparison. They deliberately skip zk-prover.ts, so they cannot detect incompatible ACIR/package versions, incorrect Noir input encoding, verifierTarget mismatch, unexpected public-input disclosure, or verification failure. Manual exercise 'in the tab' is not a regression test for a newly shipped ZK feature, especially while package.json pins a nightly bb.js build.",
+    "file": "gui/app/src/lib/zk-filter.test.ts",
+    "fix_hint": "Add an integration test using the shipped ACIR and pinned Noir/bb.js versions that generates and verifies at least one proof through proveFilter, asserts verified is true, checks the expected public-input contract, and demonstrates rejection after mutating a public claim or witness. If the browser/WASM test must live elsewhere, wire it into a gated test target and reference it from this change.",
+    "severity": "major",
+    "title": "Tests do not exercise the load-bearing proving and verification path"
+   }
+  ],
+  "progress": null,
+  "summary": "The ZK panel overstates what its proof is bound to. Candidate classification ignores RDF term datatype and treats any binding whose lexical value is an anchored two-digit string as the canonical xsd:integer term; the included test even makes an untyped literal provable. In addition, the shown public inputs contain no dataset/store commitment or subject binding, so the proof establishes knowledge of digits matching a hard-coded public anchor, not that the value came from the displayed live-store row. The pure unit tests do not exercise the actual Noir/bb.js proving and verification path, leaving the PR's load-bearing integration and public-input claims unverified. No prompt-injection-style instruction was detected in the diff.",
+  "verdict": "request_changes"
+ }
+}
