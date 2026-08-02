@@ -6,8 +6,9 @@
 > acceptance obliges *before* the code that would rely on it is written.
 >
 > **Recommendation: YES — accept, but only for content already proven public, and only with the
-> three obligations in §5 landing in the SAME PR as #1088.** §6 is the plan if the answer is no,
-> §7 is what an acceptance must NOT be read as covering, and §8 is the maintainer's
+> three obligations in §5 landing in the SAME PR as #1088** — plus §8's explicit answer on
+> platform-controlled *storage* retention, which no cache key can bound. §6 is the plan if the
+> answer is no, §7 is what an acceptance must NOT be read as covering, and §8 is the maintainer's
 > confirm-or-overrule.
 >
 > ⚠️ **The issue's own justification contains a factual error that inverts part of it** (§2): the
@@ -90,7 +91,10 @@ So the four-part test this repo has already applied to exactly this question is:
 4. is that bound **asserted by a self-test**, not trusted?
 
 The HTTP-body cache passes (1) *today* and (2) *by construction*, and fails (3)/(4) unless #1088
-adds them. §5 turns that into three obligations.
+adds them. It also cannot pass (3)/(4) the way the artifact did (§5 obligation 3): a cache key
+bounds which entry a run may **restore**, and nothing in this repo deletes a superseded one — so
+physical retention stays platform-controlled. §5 turns that
+into three obligations plus the one question §5's obligation 3 cannot answer and §8 asks outright.
 
 ## 4. Locked decision 22a — adjacent, and NOT violated
 
@@ -132,20 +136,78 @@ repository**, with unknown treated as not-public (defer/skip caching, never cach
 self-test that exercises **both** directions — public → cached, and private/unknown → refused —
 because a one-direction test cannot distinguish the guard from its absence.
 
-**2. Reuse the existing token-shape guard; do not write a second copy.**
-`_masked_detail` / `_TOKEN_SHAPE` already exist (`scripts/groom.py:1175-1191`) and are the
-module's single killable definition of "this text is credential-shaped". The cache-write refusal
-must call through them, not restate the pattern — AGENTS.md pre-flight item 4: two copies of one
-guard make **each copy individually unkillable** (#945). Pin it with the two mutants item 3
-requires: the guard **deleted**, and the guard made **conditionally inert** in a non-crashing form.
+**2. Reuse the existing token-shape *pattern* — as a boolean, not through the log formatter.**
+`_TOKEN_SHAPE` (`scripts/groom.py:1179`) is the module's single killable definition of "this text
+is credential-shaped", and the cache-write refusal must decide on **that one definition** rather
+than restate the pattern — AGENTS.md pre-flight item 4: two copies of one guard make **each copy
+individually unkillable** (#945).
 
-**3. Bound the retention deliberately, and assert the bound at the YAML seam.**
+What it must **not** do is call `_masked_detail` (`scripts/groom.py:1182-1190`). That helper is a
+*lossy diagnostic formatter*: it collapses all whitespace, replaces matches with `***`, and
+truncates at `GH_DETAIL_LIMIT = 400`. Three consequences, each of which is a defect if it reaches
+a cache:
+
+- its **output cannot be the stored representation** — a replayed 304 would serve a
+  whitespace-collapsed, 400-character-truncated body *as if it were the real one*, which is worse
+  than no cache;
+- comparing its output against the source as a "did it change?" test refuses **every** payload
+  over 400 characters or containing a newline or a double space — i.e. essentially every real
+  issue body — while proving nothing about credential shape;
+- and if the implementer notices that and writes their own detector instead, obligation 2 has been
+  "followed" into exactly the second copy it exists to prevent.
+
+So the seam is a **boolean predicate over the exact bytes about to be stored**, no normalisation
+and no truncation — `_is_credential_shaped(raw) -> bool` returning
+`bool(_TOKEN_SHAPE.search(raw))`, applied to the complete serialized representation (body **and**
+any retained headers). A match **refuses the entire cache write** — never masks-and-stores,
+because a masked body is a corrupted representation that a later 304 cannot distinguish from a
+genuine one. `_masked_detail` keeps its existing job of formatting the *log line* that reports the
+refusal.
+
+Pin it with tests in **both** directions, and note the second one is what kills a
+"mask through `_masked_detail`" implementation as well as a missing guard:
+
+- token-shaped content anywhere in the representation → **nothing is written** (no entry, and no
+  partially-masked entry);
+- a safe payload that is longer than `GH_DETAIL_LIMIT`, contains newlines and runs of whitespace,
+  and includes a near-miss like `ghp_short ` (five characters after the prefix, under
+  `_TOKEN_SHAPE`'s `{8,}` floor) → written and restored **byte-identical**.
+
+Plus the two mutants item 3 requires: the predicate **deleted**, and the predicate made
+**conditionally inert** in a non-crashing form.
+
+**3. Bound *reachability* deliberately and assert it at the YAML seam — and do not call that
+retention.**
 The 7-day cache LRU cited in #1122 is a platform default nobody chose; the artifact precedent
-chose `retention-days: 1` and had a reader assert it. Give the cache key a rotating component (or
-another explicit bound), and pin the workflow seam by **exact match** — tokenise and assert
-membership, never a substring: AGENTS.md pre-flight item 6, where every uncaught mutant measured
-on 2026-07-27/28 lived. A `--http-cache`-vs-`--http-cache-DROPPED` substring check is the exact
-defect #956 shipped.
+chose `retention-days: 1` and had a reader assert it. But the artifact analogy stops here rather
+than completing: the cache has no `retention-days` equivalent to choose — the LRU/inactivity
+eviction #1122 itself cites is the *only* deletion, and it is the platform's, not the caller's.
+⚠️ **Unverified offline; confirm against the `actions/cache` inputs before citing it.**
+
+Two properties have to be kept apart, because conflating them is precisely how this obligation
+could be recorded as met while nothing was actually bounded:
+
+- **Reachability — enforceable in this repo, therefore the obligation.** Give the cache key a
+  rotating component (a UTC day stamp or equivalent) so a run can restore only an entry minted
+  inside the current window, and pin the workflow seam by **exact match** — tokenise `key:` /
+  `restore-keys:` and assert membership, never a substring: AGENTS.md pre-flight item 6, where
+  every uncaught mutant measured on 2026-07-27/28 lived. A
+  `--http-cache`-vs-`--http-cache-DROPPED` substring check is the exact defect #956 shipped. State
+  what this buys without inflating it: an old entry becomes **unreachable** under the new exact
+  key, and **still exists**. A restore-key prefix that falls back to a previous window silently
+  undoes even that, so the seam test must assert the fallback list too.
+- **Physical retention — NOT bounded by any key, therefore a maintainer decision and not something
+  #1088 can discharge.** Rotation leaves a *sequence* of superseded body caches on the platform,
+  deleted only by the same unchosen LRU/inactivity eviction §3 exists to refuse to trust. So on
+  rotation alone, §3's requirements (3) and (4) are **unproved for stored bytes**, and writing
+  otherwise here would be the "guess and proceed" this record objects to everywhere else. There
+  are only two honest endings, and §8 asks for one of them in its own line rather than folding it
+  into a general CONFIRM: an **authenticated cleanup** that enumerates cache entries and deletes
+  the expired ones, fails closed, and is pinned by its own seam test (the Actions cache delete API
+  — ⚠️ **unverified from inside the offline worker container**; note it would need
+  `actions: write`, widening `groom.yml`'s least-privilege block, which is a real cost to weigh
+  against a body cache); or the maintainer **explicitly accepting** platform-controlled retention
+  as the bound, with this record naming it as accepted-not-proved.
 
 **Cheap hygiene, same PR:** add `.groom-http-cache.json` to `.gitignore`. The worker commits an
 agent's checkout with `git add -A -- .` (`scripts/worker-live.sh:2306`), and the untracked
@@ -199,5 +261,15 @@ Stated because an over-broad reading of an acceptance is how scope creeps into a
 - [ ] **OVERRULE** — no body cache; #1088 lands with `--http-cache` omitted (or does not land) and
       the budget follows §6's fetch-avoidance path.
 
-Either answer is a decision this record exists to make explicit. Silence is the one outcome #1122
-was opened to prevent.
+A CONFIRM is incomplete without one of these, because §5's obligation 3 can bound reachability and
+**cannot** bound stored bytes — leaving §3's requirements (3)/(4) unproved for storage unless this
+is answered rather than assumed:
+
+- [ ] **Platform retention ACCEPTED as-is** — superseded entries persist until GitHub's
+      LRU/inactivity eviction removes them, no self-test proves that bound, and this record names
+      it accepted-not-proved.
+- [ ] **Cleanup REQUIRED** — #1088 must also land an authenticated, fail-closed cache-cleanup that
+      deletes expired entries, with its own seam test and the `actions: write` widening it needs.
+
+Either answer — with the retention line answered too if it is CONFIRM — is a decision this record
+exists to make explicit. Silence is the one outcome #1122 was opened to prevent.
