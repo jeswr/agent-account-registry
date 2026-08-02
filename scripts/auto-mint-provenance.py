@@ -72,8 +72,9 @@ were a `+1` on the same `refusals[<reason>]` counter and nothing else. #1603 the
 measure the stuck population BY HAND across every open pull request to learn that most of the
 enrolled class had been outside the review lane for its whole life. `refused_standing` and
 `standing_refusals[<reason>]` are that measurement, taken every tick from the annotation the sweep
-already reads, and SEALED against `refused` so an under-count stops the tick instead of reading as
-a draining backlog.
+already reads — and only from an annotation the sweep ITSELF wrote (`ANNOTATOR_LOGIN`), since the
+marker is public and a measurement its own subject can forge is not one — and SEALED against
+`refused` so an under-count stops the tick instead of reading as a draining backlog.
 
 It measures the stuck population; it does not mint any more of it. The three dispositions #1603
 names — a pull request cut with no source issue at all, a source issue that closed under a
@@ -434,6 +435,21 @@ REASON_HINTS = {
 
 COMMENT_MARKER_PREFIX = "<!-- auto-mint-provenance:refusal:"
 SELF_ID = "> 🤖 **SPARQ agent** — auto-mint (registry #929)"
+# WHO IS ALLOWED TO HAVE WRITTEN A REFUSAL COMMENT. The marker above is PUBLIC — it ships in every
+# comment this sweep posts — so anyone who can comment on an enrolled PR can paste it, including the
+# PR's own author. Without this, the marker alone decides two things it must not: whether the
+# annotation is SUPPRESSED (the author silences their own refusal) and, since #1603, whether the
+# refusal is counted STANDING — i.e. the stuck-population census would be reporting a number the
+# measured population itself controls. The marker is the idempotence key; the AUTHOR is evidence.
+#
+# It is `github-actions[bot]` because that is the identity `post_comment` writes as: the workflow
+# runs with `GH_TOKEN: github.token`, and --annotate-repo is pinned to the registry for exactly that
+# reason (see auto-mint-provenance.yml — widening it needs the target-scoped App token plumbing,
+# which would ALSO have to update this constant). Matched by EXACT login, never a `[bot]` suffix
+# test, which is the defect retriage #487 records. A login this file does not recognise is NOT
+# ours: the refusal is treated as un-announced and gets a real annotation, so the failure mode of
+# an identity change is a duplicate comment, never a suppressed or forgeable one.
+ANNOTATOR_LOGIN = "github-actions[bot]"
 
 
 class DerivedIssue(NamedTuple):
@@ -1071,10 +1087,22 @@ def refusal_marker(reason):
 
 
 def already_refused(comments, reason):
-    """True when this PR already carries the refusal comment for `reason`."""
+    """True when THIS SWEEP already posted the refusal comment for `reason` on this PR.
+
+    Both halves are load-bearing. The marker says WHICH refusal; the author says the sweep is
+    reading its own evidence rather than a string an untrusted commenter pasted (`ANNOTATOR_LOGIN`).
+    A comment carrying the marker under any other login — or under no readable login at all — is
+    somebody else's text: it neither suppresses the annotation nor counts toward the standing set.
+    """
     marker = refusal_marker(reason)
     for comment in comments if isinstance(comments, list) else []:
-        if isinstance(comment, dict) and marker in str(comment.get("body") or ""):
+        if not isinstance(comment, dict) or marker not in str(comment.get("body") or ""):
+            continue
+        user = comment.get("user")
+        login = user.get("login") if isinstance(user, dict) else None
+        # GitHub logins are case-insensitive, so a differently-cased spelling is the SAME account
+        # and cannot be registered by anyone else; folding matches this file's enrolled-author test.
+        if isinstance(login, str) and login.casefold() == ANNOTATOR_LOGIN.casefold():
             return True
     return False
 
@@ -1180,9 +1208,10 @@ def new_counters(*, mint_cap, comment_cap, apply_changes):
         #
         #   refused_silent       the reason never comments (SILENT_REASONS) — a fact about the
         #                        registry or the platform, not about the PR;
-        #   refused_standing     the PR ALREADY carries this reason's comment, so it was refused for
-        #                        the same reason on an earlier tick and nothing has changed since.
-        #                        THIS IS THE STANDING SET;
+        #   refused_standing     the PR ALREADY carries THIS SWEEP'S comment for this reason (the
+        #                        marker under `ANNOTATOR_LOGIN`, never a commenter's paste of it),
+        #                        so it was refused for the same reason on an earlier tick and
+        #                        nothing has changed since. THIS IS THE STANDING SET;
         #   commented            first announcement of this reason on this PR (in a dry run, the
         #                        announcement that WOULD have been made);
         #   comment_deferred_cap not announced because the per-tick comment cap is spent;
@@ -2676,13 +2705,50 @@ def _self_test():                                                       # noqa: 
     check("...which the hostile control proves is not vacuous: the payload DOES bind on its own",
           cand("", hostile), [657, 916, 929])
 
+    def annotation(reason, message="x", login=ANNOTATOR_LOGIN):
+        """One comment AS THE API RETURNS IT: a body and an author. Fixtures that carry only a body
+        cannot tell a forged marker from this sweep's own, which is the whole of the check below."""
+        comment = {"body": refusal_comment_body(reason, message)}
+        return comment if login is None else {**comment, "user": {"login": login}}
+
     check("an existing comment for THIS reason dedupes",
-          already_refused([{"body": body}], REASON_AMBIGUOUS), True)
+          already_refused([annotation(REASON_AMBIGUOUS)], REASON_AMBIGUOUS), True)
     check("...and a comment for a DIFFERENT reason does not",
-          already_refused([{"body": body}], REASON_NO_REFERENCE), False)
+          already_refused([annotation(REASON_AMBIGUOUS)], REASON_NO_REFERENCE), False)
     for bad in (None, "x", [None], [{"body": None}], [{}]):
         check(f"a malformed comment list {bad!r} never dedupes",
               already_refused(bad, REASON_AMBIGUOUS), False)
+    # THE MARKER IS PUBLIC; THE AUTHOR IS THE EVIDENCE. It ships in every comment this sweep posts,
+    # so the PR author — or any drive-by commenter — can paste it back. If the body alone decided,
+    # that paste would both silence the author's own refusal and, since #1603, count as a STANDING
+    # refusal: the stuck-population census would be reporting a number its own subject controls.
+    # Each spelling below is a distinct way to be not-us, including the two near-misses #487
+    # records (a bare `[bot]` suffix test, and a substring/prefix test on the real login).
+    for forger in ("mallory", "jeswr", "github-actions", "sparq-orchestrator[bot]",
+                   "evil-github-actions[bot]", "github-actions[bot]-evil", "", None):
+        check(f"...and the identical marker from {forger!r} is NOT this sweep's evidence",
+              already_refused([annotation(REASON_AMBIGUOUS, login=forger)], REASON_AMBIGUOUS),
+              False)
+    for shape in ({"user": None}, {"user": "github-actions[bot]"}, {"user": {}},
+                  {"user": {"login": None}}):
+        check(f"...nor is a marker whose author metadata is {shape!r} — unreadable is not trusted",
+              already_refused([{"body": refusal_comment_body(REASON_AMBIGUOUS, "x"), **shape}],
+                              REASON_AMBIGUOUS), False)
+    check("...while the sweep's OWN comment still dedupes under any casing of its login, which "
+          "GitHub treats as the same account — so this is a trust test, not a spelling test",
+          [login for login in (ANNOTATOR_LOGIN, ANNOTATOR_LOGIN.upper(), "GitHub-Actions[bot]")
+           if not already_refused([annotation(REASON_AMBIGUOUS, login=login)], REASON_AMBIGUOUS)],
+          [])
+    # The identity is PINNED to a literal here, not read back from the constant, so changing it is
+    # a deliberate edit that reds this row by name: it must track the identity the annotate step
+    # actually posts as (auto-mint-provenance.yml runs `post_comment` under `GH_TOKEN:
+    # ${{ github.token }}`), and a constant that silently drifts off that seam trusts nobody or,
+    # worse, somebody else.
+    check("the annotator identity is the login the workflow's own token posts as",
+          ANNOTATOR_LOGIN, "github-actions[bot]")
+    check("...and a forged marker does not hide a real one sitting beside it",
+          already_refused([annotation(REASON_AMBIGUOUS, login="mallory"),
+                           annotation(REASON_AMBIGUOUS)], REASON_AMBIGUOUS), True)
 
     # ---- the target gate -----------------------------------------------------------------------
     check("the registry sweeps itself", target_sweep_refusal("o/r", "o/r"), None)
@@ -3095,7 +3161,7 @@ def _self_test():                                                       # noqa: 
 
     # The comment is deduped by reason, so a refusal is never a per-tick comment loop.
     dedupe = _Recorder([pull(number=41, body="no reference")],
-                       comments={41: [{"body": refusal_comment_body(REASON_NO_REFERENCE, "x")}]})
+                       comments={41: [annotation(REASON_NO_REFERENCE)]})
     row = run_row(dedupe)
     check("an already-commented refusal is censused again but NOT re-commented",
           (row["refused"], row["commented"], dedupe.posted), (1, 0, []))
@@ -3124,7 +3190,7 @@ def _self_test():                                                       # noqa: 
     other_reason = _Recorder(
         [pull(number=41, body="Closes #7")],
         issues={7: issue(number=7, state="closed")},
-        comments={41: [{"body": refusal_comment_body(REASON_NO_REFERENCE, "x")}]})
+        comments={41: [annotation(REASON_NO_REFERENCE)]})
     row = run_row(other_reason)
     check("...and a comment for a DIFFERENT reason does not make this refusal standing",
           (row["refusals"], row["refused_standing"], row["commented"],
@@ -3132,12 +3198,34 @@ def _self_test():                                                       # noqa: 
           ({REASON_REFERENCE_CLOSED: 1}, 0, 1, [41]))
     reverse = _Recorder(
         [pull(number=41, body="no reference")],
-        comments={41: [{"body": refusal_comment_body(REASON_REFERENCE_CLOSED, "x")}]})
+        comments={41: [annotation(REASON_REFERENCE_CLOSED)]})
     row = run_row(reverse)
     check("...in the other direction too: a stale CLOSED-reference comment does not suppress the "
           "no-reference annotation",
           (row["refusals"], row["refused_standing"], row["commented"]),
           ({REASON_NO_REFERENCE: 1}, 0, 1))
+    # THE STANDING CENSUS IS NOT AUTHOR-CONTROLLED, end to end. The marker ships in every comment
+    # this sweep posts, so the PR's own author can paste it back; if the sweep believed it, that
+    # author could both silence their refusal and inflate `refused_standing` — a stuck-population
+    # measurement its own subject writes. Asserted through the SWEEP, not only through
+    # `already_refused`, because the census fields and the posted annotation are what #1603 reads.
+    for forger in ("jeswr", "mallory[bot]", "github-actions"):
+        forged = _Recorder([pull(number=41, body="no reference")],
+                           comments={41: [annotation(REASON_NO_REFERENCE, login=forger)]})
+        row = run_row(forged)
+        check(f"a refusal marker pasted by {forger!r} is not evidence: it neither counts STANDING "
+              "nor suppresses the real annotation",
+              (row["refused"], row["refused_standing"], row["standing_refusals"],
+               row["commented"], [n for n, _b in forged.posted]),
+              (1, 0, {}, 1, [41]))
+    trusted = _Recorder([pull(number=41, body="no reference")],
+                        comments={41: [annotation(REASON_NO_REFERENCE, login="jeswr"),
+                                       annotation(REASON_NO_REFERENCE)]})
+    row = run_row(trusted)
+    check("...while the SAME marker from the annotator identity beside it still counts standing, "
+          "so the trust check is not just a blanket refusal to ever be standing",
+          (row["refused_standing"], row["standing_refusals"], row["commented"], trusted.posted),
+          (1, {REASON_NO_REFERENCE: 1}, 0, []))
 
     comment_capped = _Recorder([pull(number=n, body="no reference") for n in (41, 42, 43)])
     row = run_row(comment_capped, max_comments=2)
@@ -3155,7 +3243,7 @@ def _self_test():                                                       # noqa: 
     # probe back behind the cap check reds this by name in every field.
     capped_standing = _Recorder(
         [pull(number=n, body="no reference") for n in (41, 42, 43)],
-        comments={42: [{"body": refusal_comment_body(REASON_NO_REFERENCE, "x")}]})
+        comments={42: [annotation(REASON_NO_REFERENCE)]})
     row = run_row(capped_standing, max_comments=1)
     check("...and the cap bounds the POSTING only: a refusal already annotated is counted STANDING "
           "even beyond the cap, never as un-delivered work",
