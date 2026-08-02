@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1687,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d1084aa7c15affe03b67ea8700b81abe67d3ba0a",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "AGENTS.md:7 lands the rule: \"Model-qualified header markers such as `[OPUS-5]`, `[FABLE-5]`, and `[HAIKU-\u2026]` are legacy and migrate when touched.\"\n\nRead as \"when the FILE is touched\", this PR is non-compliant with the rule it introduces: it edits scripts/policy-resolve.py while leaving 8 legacy markers in that file, and edits policy/repos.toml while leaving 6. Read as \"when that HEADER line is rewritten\" \u2014 which is what the diff actually does \u2014 the PR is compliant and the residual markers are documented backlog.\n\nI re-measured the blast radius this round: 178 legacy `[OPUS-5]`/`[FABLE-5]`/`[HAIKU-\u2026]` markers across 43 files. Under the file reading, any future edit to scripts/dispatch-claim.py (35 markers) or select-and-claim.py (15) drags a large incidental header churn into an unrelated diff; under the header-line reading it drags none. A future reviewer citing this sentence has no text to settle which one they are enforcing.\n\nComment/prose only, nothing parses it, no trust check depends on it \u2014 not blocking, and it did not block in round 2 either. Re-raised only because the head is unchanged and the finding therefore still stands.",
+    "file": "AGENTS.md",
+    "fix_hint": "Three words at AGENTS.md:7 make the unit explicit, e.g. \"\u2026 are legacy; convert one when you edit that header line, not merely when you edit the file.\" Nothing else needs to change \u2014 the rest of the paragraph is accurate and mirrors .claude/agents/registry-docs.md:20, so the two will not drift.",
+    "severity": "nit",
+    "title": "\"migrate when touched\" still does not say whether the unit of touch is the header line or the file (unchanged since round 2)"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 head is unchanged from round 2 (no commit addressing round 2's nit), so my independent re-review reaches the same place: the change is correct and complete, and the single nit from round 2 survives verbatim.\n\nWhat the diff is: ten one-line source-header swaps of the model-qualified marker `[GPT-5.6]` to the model-agnostic `[SPARQ agent]`, plus a 3-line paragraph in AGENTS.md that defines the convention. Every changed line is 1:1 (identical text after the marker) and sits ahead of `FROM`, the shebang/module docstring, or `set -euo pipefail`.\n\nChecks I ran myself on the head tree (Read/Glob/Grep; Bash was denied by policy, so I could not run `git diff` and the FILE LIST rests on the harness-supplied diff \u2014 the CONTENT of each listed file I verified directly):\n- Sweep complete: a tree-wide grep for the literal `[GPT-5.6]` returns ZERO matches, and exactly 11 `[SPARQ agent]` markers exist, matching the 10 header swaps plus AGENTS.md:6.\n- Surviving plain-prose `GPT-5.6` mentions (README 84/250/262, orchestration/routing.toml 254/268, policy/repos.toml 5/10/16/23, triage.py:186, plan-alert.py:8, worker-live.sh model_display_name + its #97 literals) are the issue-#97 variant-qualified taxonomy and are correctly untouched; genericizing them would re-assert the mislabelling #97 exists to stop.\n- No vacuous-test question arises: nothing executable changed, so no self-test is owed. I checked the seams that DO read these files and all are content/structure-addressed, not line-addressed: groom.py:10866 locates `  groom:` by `.index()`; worker-issue.py:2635 parses worker.yml through `worker_refusal_seam`; policy-resolve.py:1030 loads repos.toml via `tomllib` (a leading comment is inert); worker-live.sh's `_assert_dockerfile_pinned` reads `FROM ...@sha256:` which is unchanged. No consumer reads a `#` header line, and each header sentence occurs exactly once tree-wide, so no doc copy can diverge.\n- No trust check is deleted, relaxed or skipped; no def\u2026 [truncated 429 chars]",
+  "verdict": "approve"
+ }
+}
