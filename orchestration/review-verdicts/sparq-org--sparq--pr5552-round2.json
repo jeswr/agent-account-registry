@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5552,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "72088e63ba5617c9b27731e288a11ed77d9a0b1d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's cache-poisoning defect is resolved. On corrupt or foreign restored state, run() now completes the live sweep, replaces the unusable file with validated current observations before raising the fail-loud error, and the workflow's always() save therefore caches recoverable state. The new two-tick end-to-end test checks both that the first tick remains exit 2 and that the following tick reaches the normal alarm verdict instead of re-failing. The workflow seam also pins the shared restore/save path, rolling key family, always() guard, and main-only save. No new correctness, soundness, test-validity, or security issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
