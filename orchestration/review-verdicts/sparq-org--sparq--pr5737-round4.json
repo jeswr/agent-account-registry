@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5737,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d134e256a6e5688555a2273cd85150761f41549d",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The blurb says the tool proves a comparison about an integer \"without disclosing it\". In this same diff, COMMITTED_TERM_ANCHORS publishes only four value-to-anchor mappings, operand_enc is public, and the integration test requires that public disclosure; zk-tool.ts correctly states that a verifier holding the table can read off the committed value. Thus the prominent registry/palette copy makes an unqualified value-hiding claim that the shipped construction does not satisfy. The external-audit caveat does not cure this concrete disclosure contradiction.",
+    "file": "gui/app/src/components/workbench/zk-tool.meta.ts",
+    "fix_hint": "Replace the value-hiding claim with narrowly accurate copy, for example: \"Prove a comparison about an integer using an in-tab UltraHonk proof; the public anchor identifies which of this build's four committed values was used. Research-grade; NOT externally audited.\" Keep the detailed panel disclosure text and add/adjust a metadata test that rejects a future \"without disclosing the value\" claim while the anchor table is enumerable.",
+    "severity": "major",
+    "title": "Tool blurb falsely claims the operand is not disclosed"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 4 finds a privacy-claim contradiction that the prior round missed. The implementation and detailed report correctly disclose that the public operand_enc is drawn from a four-entry published table and therefore identifies the value to a verifier holding the client code, but the eager tool metadata advertises proving about an integer \"without disclosing it\". That unqualified user-facing claim is not true for this shipped construction and violates the repository's ZK honesty posture. The real prove/verify/mutation integration test remains non-vacuous and CI-gated, and the detailed scope/replay/audit caveats are otherwise careful.",
+  "verdict": "request_changes"
+ }
+}
