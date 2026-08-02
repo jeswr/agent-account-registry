@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1777,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "14157d6ed2caad15495f76b690684f938b0dce95",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 5 obligation 3 accepts a rotating key as an explicit retention bound. Rotation only makes an old entry unreachable under the new exact key; it does not delete the old entry or control how long GitHub retains it. The document itself says the platform's inactivity eviction is an unchosen default, but rotation still relies on exactly that eviction for physical deletion. Thus #1088 could satisfy the stated obligation while retaining a sequence of old body caches for a platform-controlled period, so requirements (3) and (4) from section 3 remain unproved.",
+    "file": "research/1122-groom-http-cache-retention.md",
+    "fix_hint": "Specify an enforceable deletion/retention mechanism and a seam test for it (for example, an authenticated cleanup that enumerates and deletes expired cache entries and fails closed, if that is the chosen design). If only restore reachability is intended, rename the property honestly and make platform retention an explicit maintainer-accepted bound rather than claiming key rotation bounds retention.",
+    "severity": "major",
+    "title": "Rotating a cache key does not bound stored-data retention"
+   },
+   {
+    "body": "Obligation 2 says the cache-write refusal must call through `_masked_detail` / `_TOKEN_SHAPE`, but `_masked_detail` is a lossy log formatter: it collapses whitespace, truncates at 400 characters, and substitutes token-shaped substrings. It cannot safely produce the representation retained for a later 304, and comparing its output with the source would refuse essentially every ordinary payload longer than 400 characters or containing formatting, not specifically credential-shaped content. The record does not state the actual boolean seam or exact assertion that distinguishes safe content from unsafe content, so a later implementation can either corrupt cached representations or add a second ad hoc detector while plausibly claiming to follow this text.",
+    "file": "research/1122-groom-http-cache-retention.md",
+    "fix_hint": "Require a shared boolean credential-shape predicate (or direct use of the single `_TOKEN_SHAPE` definition) that inspects the complete serialized representation without normalization or truncation, and require refusal of the entire write when it matches. Keep `_masked_detail` only for diagnostics, and specify tests proving that safe payload bytes round-trip unchanged while token-shaped input is not written.",
+    "severity": "major",
+    "title": "The prescribed diagnostic masker is not a valid cache-body guard"
+   }
+  ],
+  "progress": null,
+  "summary": "The record has a sound fail-closed publicity requirement, but one of its three load-bearing acceptance obligations does not actually bound retention, and the prescribed reuse of the diagnostic masker is not a sound cache-content seam. Because this document is intended to bind the later implementation, those ambiguities would permit an implementation to claim compliance without establishing the properties the record says are mandatory.",
+  "verdict": "request_changes"
+ }
+}
