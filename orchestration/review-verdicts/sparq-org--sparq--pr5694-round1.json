@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5694,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "31ba4bbdb1c28581a76d56ac03888480c71417a6",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly threads the same QueryBudget through both variable-graph authorization resolution and update application, preserves the existing unlimited entry points, and keeps budget exhaustion distinct from authorization denial. The tests include real-path positive controls, mutation guards, authorization-stage and apply-stage coverage, WAC/ACP parity, and the documented WHERE-less boundary. Public API documentation and the matching skills are updated. No correctness, soundness, security, or vacuous-test issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
