@@ -364,7 +364,24 @@ INGESTION_REJECTED_CONCLUSION = "action_required"
 # `ingesting` and MASKS a rejection sitting under it, and any widening of the conclusion test
 # would report a healthy lane as rejected. So it is skipped and the verdict is taken from the
 # newest run that actually is one.
+#
+# BUT `cancelled` IS NOT A NON-VERDICT ON ITS CONCLUSION ALONE. The same concurrency group also
+# kills runs that are ALREADY EXECUTING, and such a run created jobs — it PROVES GitHub ingested
+# the file, exactly as a `success` does. Looking through it would republish an OLDER
+# `action_required` sitting underneath as the lane's CURRENT condition: a rejection alarm on a
+# lane that has already recovered, from the detector whose whole value is being believed. So the
+# conclusion only makes a run a CANDIDATE non-verdict; the JOB COUNT decides, exactly as it does
+# on the `action_required` side, and `newest_concluded_run` confirms it through `jobs_for`.
 NON_VERDICT_CONCLUSIONS = frozenset({"cancelled"})
+# How many candidate non-verdict rows above a verdict are confirmed with a job read before the
+# walk stops asking and looks through the rest unconfirmed. The confirmation is only ever reached
+# for a lane whose fall-through verdict is a REJECTION (or nothing at all) — under a
+# `success`/`failure` both readings say `ingesting`, so a healthy lane still pays zero — but a
+# lane caught in a cancel storm must not turn one tick into a request per sampled run against a
+# repo that has measured a 403 at ~7969 requests/h. Past the cap the walk degrades to the LOUD
+# side (unconfirmed rows are looked through, so the rejection under them is published), never to
+# a silent all-clear.
+NON_VERDICT_PROBE_CAP = 10
 # Every state a lane can exit M4 through, seeded at zero so the census emits a row for each
 # on EVERY tick — including the all-clear. A census that only prints what it saw cannot
 # answer "would this alarm fire if this branch took 100% of the population?".
@@ -1000,29 +1017,58 @@ def fetch_baseline(repo, workflow_path, event):
     return {"p90": percentile(durations, 0.90), "n": len(durations)}
 
 
-def newest_concluded_run(runs):
-    """M4. -> {id, conclusion, created_at} for the newest run in `runs` that has CONCLUDED,
-    or None. Pure, so the ordering rule is testable without the network.
+def newest_concluded_run(runs, jobs_for=None):
+    """M4. -> {id, conclusion, created_at} for the newest run in `runs` that has CONCLUDED
+    with a VERDICT on ingestion, or None. Pure given `jobs_for`, so the ordering rule is
+    testable without the network.
 
     The listing arrives newest-first, but that is GitHub's promise rather than this file's,
-    and reading position 0 would key on a promise: `max` over the parsed timestamp costs
+    and reading position 0 would key on a promise: ordering by the parsed timestamp costs
     nothing and cannot be wrong. Runs missing a `created_at` are unorderable and dropped.
 
-    A run that concluded WITHOUT adjudicating the workflow file is not a verdict and is
-    skipped, so a concurrency-cancelled row sitting above a real one cannot mask it — see
-    NON_VERDICT_CONCLUSIONS.
+    A `cancelled` row is only a CANDIDATE non-verdict (NON_VERDICT_CONCLUSIONS): killed before
+    job creation it adjudicated nothing, killed while executing it PROVES ingestion. So the
+    walk collects the cancelled rows above the first real verdict and `jobs_for(run_id) ->
+    jobs.total_count | None` decides — but ONLY when the answer can differ, which is when
+    looking through them would publish a REJECTION (or nothing at all) as the lane's condition.
+    Under a `success`/`failure` both readings say `ingesting`, so a healthy lane pays no
+    request. With no `jobs_for`, an unreadable count, or past NON_VERDICT_PROBE_CAP, the row
+    stays a non-verdict and the walk continues underneath it — the loud direction.
     """
+    def _verdict(run):
+        # The id is stringified HERE, once, so both the job-count map and the hermetic
+        # --state-file route key it the same way (JSON object keys are always strings).
+        return {"id": str(run.get("id")), "conclusion": run.get("conclusion"),
+                "created_at": run.get("created_at")}
+
     concluded = [r for r in runs
                  if r.get("status") == "completed" and r.get("conclusion")
-                 and r.get("conclusion") not in NON_VERDICT_CONCLUSIONS
                  and r.get("created_at")]
     if not concluded:
         return None
-    newest = max(concluded, key=lambda r: _ts(r["created_at"]))
-    # The id is stringified HERE, once, so both the job-count map and the hermetic
-    # --state-file route key it the same way (JSON object keys are always strings).
-    return {"id": str(newest.get("id")), "conclusion": newest.get("conclusion"),
-            "created_at": newest.get("created_at")}
+    ordered = sorted(concluded, key=lambda r: _ts(r["created_at"]), reverse=True)
+    unconfirmed = []  # candidate non-verdicts above the first real verdict, newest-first
+    newest = None
+    for run in ordered:
+        if run.get("conclusion") in NON_VERDICT_CONCLUSIONS:
+            unconfirmed.append(run)
+            continue
+        newest = run
+        break
+    if (unconfirmed and jobs_for is not None
+            and (newest is None
+                 or newest.get("conclusion") == INGESTION_REJECTED_CONCLUSION)):
+        for run in unconfirmed[:NON_VERDICT_PROBE_CAP]:
+            jobs = jobs_for(run.get("id"))
+            # `isinstance(True, int)` is True and `True > 0`, so a malformed count would
+            # clear the lane here — the same refusal `fetch_job_count` makes on its own read.
+            if isinstance(jobs, bool) or not isinstance(jobs, int) or jobs <= 0:
+                continue
+            # It RAN a job, and it is newer than the rejection under it: that is the lane's
+            # current condition, and the conclusion travels with it so the census reads it as
+            # ingesting rather than as a second rejection fingerprint.
+            return _verdict(run)
+    return _verdict(newest) if newest else None
 
 
 def fetch_job_count(repo, run_id):
@@ -1081,7 +1127,11 @@ def fetch_lanes(repo, root, window_hours, now):
             if runs is None:
                 raise AlarmError(f"{path.name}: schedule-run response carries no runs")
             lane["runs_sampled"] = True
-            lane["newest_concluded"] = newest_concluded_run(runs)
+            # `jobs_for` is what keeps a cancelled row from being classified on its conclusion
+            # alone; it is consulted only for a lane whose verdict would otherwise be a
+            # rejection, so the healthy repo still makes no job request at all.
+            lane["newest_concluded"] = newest_concluded_run(
+                runs, jobs_for=lambda run_id: fetch_job_count(repo, run_id))
             times = [_ts(r["created_at"]) for r in runs if r.get("created_at")]
             # COVERAGE GUARD: the sample is the newest 100 runs. If the OLDEST sampled run
             # is NEWER than the window start the count is TRUNCATED and would manufacture a
@@ -1711,7 +1761,8 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     # DANGEROUS direction too: adding `action_required` here would take M4's whole population
     # away and leave the mode permanently, silently quiet, and adding `success` would make
     # every healthy lane fall through to whatever stale verdict sits under it.
-    chk("`cancelled` is the measured non-verdict conclusion (jobs 0 from a concurrency kill)",
+    chk("`cancelled` is the measured CANDIDATE non-verdict conclusion (jobs 0 from a "
+        "concurrency kill; the count, not the conclusion, decides)",
         NON_VERDICT_CONCLUSIONS == frozenset({"cancelled"}))
     chk("the rejection fingerprint is NEVER a non-verdict — skipping it would silence M4",
         INGESTION_REJECTED_CONCLUSION not in NON_VERDICT_CONCLUSIONS
@@ -1753,8 +1804,8 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     # values that appear nowhere else here, so a mutant returning the cancelled row is named.
     _cancelled_over_bad = [_sched_run(41, "action_required", "2026-07-28T10:00:00Z"),
                            _sched_run(42, "cancelled", "2026-07-28T11:00:00Z")]
-    chk("M4 looks THROUGH a newer `cancelled` run to the rejection underneath it — a run the "
-        "concurrency group killed before job creation adjudicated nothing",
+    chk("M4 looks THROUGH a newer `cancelled` run to the rejection underneath it when no count "
+        "is available to confirm the row — a kill before job creation adjudicated nothing",
         (newest_concluded_run(_cancelled_over_bad) or {}).get("id") == "41")
     _cancelled_over_good = [_sched_run(43, "success", "2026-07-28T10:00:00Z"),
                             _sched_run(44, "cancelled", "2026-07-28T11:00:00Z")]
@@ -1767,6 +1818,70 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     chk("a `failure` IS a verdict — the workflow ingested and executed; only the work failed",
         (newest_concluded_run([_sched_run(46, "failure", "2026-07-28T11:00:00Z")])
          or {}).get("id") == "46")
+
+    # #1457, THE OTHER DIRECTION, and the one a conclusion-only skip gets WRONG. The same
+    # concurrency group kills runs that are ALREADY EXECUTING, and such a run CREATED JOBS: it
+    # is ingestion evidence, and it is NEWER than the rejection under it, so looking through it
+    # republishes a rejection the lane has already recovered from. Every row below drives the
+    # SAME fixture and moves only the count, so nothing here can pass by reading a conclusion;
+    # the ids are values that appear nowhere else, so a mutant returning the wrong row is named.
+    _probe_log = []
+
+    def _jobs_for(counts):
+        def _probe(run_id):
+            _probe_log.append(run_id)
+            return counts.get(run_id)
+        return _probe
+
+    _cancelled_with_jobs = [_sched_run(51, "action_required", "2026-07-28T10:00:00Z"),
+                            _sched_run(52, "cancelled", "2026-07-28T11:00:00Z")]
+    _probe_log.clear()
+    chk("a `cancelled` run that RAN JOBS is a verdict — M4 does NOT resurrect the older "
+        "rejection under it, and carries the conclusion so the census reads it as ingesting",
+        newest_concluded_run(_cancelled_with_jobs, jobs_for=_jobs_for({52: 3}))
+        == {"id": "52", "conclusion": "cancelled", "created_at": "2026-07-28T11:00:00Z"})
+    chk("...and it got there by CONFIRMING the count for that run, not by reading `cancelled`",
+        _probe_log == [52])
+    chk("a `cancelled` run confirmed at ZERO jobs is still a non-verdict — the pre-job kill, "
+        "and the rejection underneath it is still the lane's condition",
+        (newest_concluded_run(_cancelled_with_jobs, jobs_for=_jobs_for({52: 0}))
+         or {}).get("id") == "51")
+    chk("an UNREADABLE count does not clear the lane — the loud side, as everywhere else in M4",
+        (newest_concluded_run(_cancelled_with_jobs, jobs_for=_jobs_for({}))
+         or {}).get("id") == "51")
+    # `isinstance(True, int)` and `True > 0`: without the bool refusal a malformed payload
+    # would clear a rejection, which is the fail-open this whole mode exists against.
+    chk("a BOOLEAN is not a job count — a malformed payload cannot clear the rejection",
+        (newest_concluded_run(_cancelled_with_jobs, jobs_for=_jobs_for({52: True}))
+         or {}).get("id") == "51")
+    # THE COST GATE, asserted rather than written down. Under a `success` both readings say
+    # `ingesting`, so asking would be a request per cancel on every healthy tick.
+    _probe_log.clear()
+    chk("no count is read when the verdict underneath is NOT a rejection — the answer cannot "
+        "differ, so a healthy lane pays nothing",
+        (newest_concluded_run(_cancelled_over_good, jobs_for=_jobs_for({44: 5}))
+         or {}).get("id") == "43"
+        and _probe_log == [])
+    chk("a lane whose ONLY concluded run is cancelled is READ when that run ran jobs — "
+        "indeterminate is for a lane nothing was measured on",
+        (newest_concluded_run([_sched_run(53, "cancelled", "2026-07-28T11:00:00Z")],
+                              jobs_for=_jobs_for({53: 2})) or {}).get("id") == "53")
+    chk("...and stays indeterminate when that run ran none",
+        newest_concluded_run([_sched_run(54, "cancelled", "2026-07-28T11:00:00Z")],
+                             jobs_for=_jobs_for({54: 0})) is None)
+    # THE BOUND. Twelve cancelled rows over a rejection, and the only one carrying jobs is the
+    # OLDEST — past the cap. So this row states both halves at once: the walk stops asking after
+    # NON_VERDICT_PROBE_CAP reads, and what it does past the cap is publish the rejection.
+    _probe_log.clear()
+    _cancel_storm = ([_sched_run(60, "action_required", "2026-07-28T00:00:00Z")]
+                     + [_sched_run(100 + i, "cancelled", f"2026-07-28T{i:02d}:30:00Z")
+                        for i in range(1, 13)])
+    chk("the confirmation is BOUNDED and degrades LOUD — a cancel storm above a rejection "
+        "cannot turn one tick into a request per sampled run",
+        (newest_concluded_run(_cancel_storm, jobs_for=_jobs_for({101: 4}))
+         or {}).get("id") == "60"
+        and len(_probe_log) == NON_VERDICT_PROBE_CAP
+        and 101 not in _probe_log)
 
     # --- #1457: WHOSE RUN AM I? -------------------------------------------------------
     # Every expected value below is a literal written here, never read back out of the env
@@ -1852,6 +1967,18 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     _f, _c = _m4({"workflow": "fresh.yml", "newest_conclusion": None}, {})
     chk("M4 counts a lane with no concluded run as such — never as healthy",
         _f == [] and _c == {**_M4_CLEAN, "no-concluded-run": 1})
+    # #1457 END TO END for the cancelled-with-jobs row above: the selection and the census are
+    # two different functions, and the false alarm needs only ONE of them to be wrong. So the
+    # lane is assembled the way fetch_lanes assembles it — through newest_concluded_run, with
+    # the confirmation wired — and then run through the mode itself. The job-count map still
+    # carries the older rejection's zero, so a selection that resurrects run 51 alarms here.
+    _recovered = _lane(now=NOW, workflow="recovered.yml")
+    _recovered["newest_concluded"] = newest_concluded_run(_cancelled_with_jobs,
+                                                          jobs_for=_jobs_for({52: 3}))
+    _f, _c = find_ingestion_rejections([_recovered], {"51": 0, "52": 3})
+    chk("#1457 a lane that recovered under a cancelled run which RAN JOBS emits no finding, "
+        "and is censused as ingesting — no stale rejection is republished",
+        _f == [] and _c == {**_M4_CLEAN, "ingesting": 1})
 
     # --- #1457: THE EVALUATING RUN'S OWN LANE ----------------------------------------
     # THE DEFECT, stated as its live shape: the lane's newest CONCLUDED scheduled run is the
@@ -2222,7 +2349,11 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     _real_lanes_api = globals()["_api"]
     _GROOM_FILE = GROOM_WORKFLOW.split("/")[-1]
 
-    def _lanes_api_for(conclusion, asked):
+    def _lanes_api_for(conclusion, asked, extra_runs=(), jobs_by_run=None):
+        # `extra_runs`/`jobs_by_run` exist for the #1457 cancelled-row wiring below: everything
+        # else drives the one-run listing and a zero job count, exactly as before.
+        counts = jobs_by_run or {}
+
         def _stub(repo, path):
             asked.append(path)
             if path.startswith("actions/workflows?"):
@@ -2231,9 +2362,10 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
             if path.startswith(f"actions/workflows/{_GROOM_FILE}/runs"):
                 return {"workflow_runs": [
                     {"id": 77, "status": "completed", "conclusion": conclusion,
-                     "created_at": "2026-07-28T11:50:00Z", "event": "schedule"}]}
+                     "created_at": "2026-07-28T11:50:00Z", "event": "schedule"}
+                ] + list(extra_runs)}
             if "/jobs?" in path:
-                return {"total_count": 0}
+                return {"total_count": counts.get(path.split("/")[2], 0)}
             return {"workflow_runs": []}
         return _stub
 
@@ -2298,6 +2430,39 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
             main(["--repo", "o/r", "--dry-run"])
         chk("a HEALTHY repo pays NOTHING for M4 — no job-count request is made at all",
             _asked_healthy and not [p for p in _asked_healthy if "/jobs?" in p])
+        # #1457 THE CONFIRMATION WIRING, and it needs the LIVE path: the rule is proved pure
+        # above, but no pure row can see whether `fetch_lanes` HANDS it the job read. Drop
+        # `jobs_for=` at that one call site and every pure row stays green while production goes
+        # back to classifying `cancelled` on its conclusion alone — republishing run 77's
+        # rejection under a newer run that RAN JOBS, which is the false alarm this branch fixes.
+        _asked_recovered = []
+        globals()["_api"] = _lanes_api_for(
+            "action_required", _asked_recovered,
+            extra_runs=[{"id": 78, "status": "completed", "conclusion": "cancelled",
+                         "created_at": "2026-07-28T11:55:00Z", "event": "schedule"}],
+            jobs_by_run={"78": 4})
+        _recovered = {lane["workflow"]: lane for lane
+                      in fetch_lanes("o/r", Path(__file__).resolve().parents[1],
+                                     CRON_WINDOW_HOURS, NOW)}
+        chk("fetch_lanes CONFIRMS a newer cancelled run with a real job read and takes it as "
+            "the verdict — the older rejection is not resurrected",
+            _recovered.get(GROOM_WORKFLOW, {}).get("newest_concluded")
+            == {"id": "78", "conclusion": "cancelled", "created_at": "2026-07-28T11:55:00Z"}
+            and [p for p in _asked_recovered if p.startswith("actions/runs/78/jobs")])
+        _recovered_out = io.StringIO()
+        with contextlib.redirect_stdout(_recovered_out):
+            _recovered_rc = main(["--repo", "o/r", "--dry-run"])
+        # M4's OWN rows, not the whole tick's: M1 breaches on this stub (it answers every other
+        # lane with an empty run list) and asserting on that would pass for the wrong reason.
+        # The rejected tick above published `jobs.total_count = 0` into an alert body; this one
+        # must publish no M4 finding at all.
+        chk("...and the tick publishes NO rejection for that lane: censused ingesting, with "
+            "both rejected rows at zero and no M4 body naming a job count",
+            _recovered_rc == 0
+            and "ingesting: 1" in _recovered_out.getvalue()
+            and "rejected-zero-jobs: 0" in _recovered_out.getvalue()
+            and "rejected-jobs-unreadable: 0" in _recovered_out.getvalue()
+            and "jobs.total_count" not in _recovered_out.getvalue())
     finally:
         globals()["_api"] = _real_lanes_api
 
