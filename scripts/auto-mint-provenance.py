@@ -64,6 +64,21 @@ comment per PR per distinct reason, ever (marker-deduped) — never a per-tick r
 
 AND EVERY TICK EMITS A CENSUS, whatever happens. A silent auto-minter is worse than a manual one,
 because nobody notices when it stops.
+
+...AND THE CENSUS SAYS WHICH OF THOSE REFUSALS ARE STANDING (#1603). Because a refusal comment is
+posted once per PR per reason EVER, from the second tick onward a permanently-unmintable pull
+request was indistinguishable in the census from one refused for the first time this minute: both
+were a `+1` on the same `refusals[<reason>]` counter and nothing else. #1603 therefore had to
+measure the stuck population BY HAND across every open pull request to learn that most of the
+enrolled class had been outside the review lane for its whole life. `refused_standing` and
+`standing_refusals[<reason>]` are that measurement, taken every tick from the annotation the sweep
+already reads, and SEALED against `refused` so an under-count stops the tick instead of reading as
+a draining backlog.
+
+It measures the stuck population; it does not mint any more of it. The three dispositions #1603
+names — a pull request cut with no source issue at all, a source issue that closed under a
+long-lived pull request, a reference that never bound — each need their own reviewed change at the
+provenance trust boundary, and none of them is here.
 """
 
 import argparse
@@ -1103,6 +1118,20 @@ def census_row(counters):
             f"enrolled-class PR(s) but {accounted} accounted for "
             f"(with_record={row['with_record']} minted={row['minted']} "
             f"refused={row['refused']} deferred_cap={row['deferred_cap']})")
+    # ...and the SECOND seal, over the visibility of those refusals (#1603). Every refusal lands in
+    # exactly one of the five buckets `refuse()` maintains. Sealing it is what stops
+    # `refused_standing` from being a number that merely happens to be small: an under-count would
+    # otherwise read as "the stuck population is draining", which is the exact wrong conclusion to
+    # draw silently about a set of pull requests the review lane cannot see.
+    visible = (row["refused_silent"] + row["refused_standing"] + row["commented"]
+               + row["comment_deferred_cap"] + row["refused_unannounced"])
+    if visible != row["refused"]:
+        raise SweepError(
+            f"auto-mint census does not account for its refusals: {row['refused']} refusal(s) but "
+            f"{visible} dispositions (silent={row['refused_silent']} "
+            f"standing={row['refused_standing']} commented={row['commented']} "
+            f"comment_deferred_cap={row['comment_deferred_cap']} "
+            f"unannounced={row['refused_unannounced']})")
     row["lacking_record"] = row["enrolled_pulls"] - row["with_record"]
     row["refusal_causes"] = {reason: sorted(causes)
                              for reason, causes in (row.get("refusal_causes") or {}).items()}
@@ -1114,11 +1143,20 @@ def format_census(row):
     never has to parse this sentence."""
     refusals = ", ".join(f"{reason}={count}"
                          for reason, count in sorted((row.get("refusals") or {}).items())) or "none"
+    # The standing breakdown is printed even when it is EMPTY, and the scalar even when it is ZERO.
+    # A stuck-population line that disappears once the population is stuck reads, to an operator
+    # scanning ticks, exactly like a population that drained.
+    standing = ", ".join(
+        f"{reason}={count}"
+        for reason, count in sorted((row.get("standing_refusals") or {}).items())) or "none"
     return (f"auto-mint census: targets={row['targets']} enrolled_pulls={row['enrolled_pulls']} "
             f"with_record={row['with_record']} lacking_record={row['lacking_record']} "
             f"minted={row['minted']}/{row['mint_cap']} refused={row['refused']} "
+            f"refused_standing={row['refused_standing']} "
+            f"refused_unannounced={row['refused_unannounced']} "
             f"deferred_cap={row['deferred_cap']} commented={row['commented']}/"
-            f"{row['comment_cap']} apply={row['apply']} refusals[{refusals}]")
+            f"{row['comment_cap']} apply={row['apply']} refusals[{refusals}] "
+            f"standing[{standing}]")
 
 
 def new_counters(*, mint_cap, comment_cap, apply_changes):
@@ -1131,7 +1169,37 @@ def new_counters(*, mint_cap, comment_cap, apply_changes):
         "deferred_cap": 0,
         "commented": 0,
         "comment_deferred_cap": 0,
+        # WHAT HAPPENED TO EACH REFUSAL'S VISIBILITY — the partition of `refused` that registry
+        # issue #1603 needed and could not get. A refusal comment is posted ONCE per PR per reason,
+        # EVER (`refusal_marker`), so from the second tick onward a permanently-stuck PR is
+        # indistinguishable in the census from one refused for the first time this minute: both are
+        # a `+1` on the same `refusals[<reason>]` counter and nothing else. #1603 had to measure the
+        # standing set BY HAND across all 45 open pulls to learn that 15 of them had been outside
+        # the review lane for their whole life. These four buckets are that measurement, taken every
+        # tick from state the sweep already reads:
+        #
+        #   refused_silent       the reason never comments (SILENT_REASONS) — a fact about the
+        #                        registry or the platform, not about the PR;
+        #   refused_standing     the PR ALREADY carries this reason's comment, so it was refused for
+        #                        the same reason on an earlier tick and nothing has changed since.
+        #                        THIS IS THE STANDING SET;
+        #   commented            first announcement of this reason on this PR (in a dry run, the
+        #                        announcement that WOULD have been made);
+        #   comment_deferred_cap not announced because the per-tick comment cap is spent;
+        #   refused_unannounced  the comment probe or the post failed, so this run can say neither
+        #                        that the refusal is standing nor that it made it visible.
+        #
+        # census_row seals the five against `refused`, so a refusal that reaches none of them — or
+        # two of them — stops the tick instead of quietly under-counting the stuck population.
+        "refused_silent": 0,
+        "refused_standing": 0,
+        "refused_unannounced": 0,
         "refusals": {},
+        # ...and the standing count BY REASON, which is the shape #1603's hand census had: the three
+        # classes it names (no source issue at all, a source issue that closed under a long-lived
+        # PR, a reference that never bound) are distinct reason codes with distinct dispositions, so
+        # a single scalar cannot say which disposition is failing to drain.
+        "standing_refusals": {},
         # WHY each reason fired, bounded. `refusals` counts reason CODES, and one code —
         # `mint-refused` — carries two operationally opposite situations: the shared gate
         # declining one pull request (the lane is working) and the lane unable to run at all (an
@@ -1166,17 +1234,39 @@ def sweep(targets, *, annotate_repo, read_routing, read_pulls, read_issue, read_
             causes.append(cause)
         log(f"REFUSE {repo}#{pull['number']} [{reason}]: {message}")
         if reason in SILENT_REASONS:
+            counters["refused_silent"] += 1
+            return
+        # THE STANDING PROBE RUNS BEFORE THE COMMENT CAP, and the ordering is the change (#1603).
+        # It used to run after, inside the posting attempt, which made the census wrong in both
+        # directions once a backlog existed: a PR that needed no comment because it was already
+        # annotated was counted as `comment_deferred_cap` — i.e. as un-delivered work — and the
+        # standing signal was only ever computed for the first `max_comments` refusals of a tick, so
+        # a population larger than the cap could never be counted at all. Bounding the POSTING is
+        # the point of the cap; bounding the MEASUREMENT was an accident of where the probe sat.
+        # The cost is explicit: one extra comment listing per refusal beyond the cap. It is an
+        # idempotent read against the host and credential this tick already uses, and it is what
+        # makes `refused_standing` a count of the whole population rather than of a prefix of it.
+        try:
+            standing = already_refused(read_comments(repo, pull["number"]), reason)
+        except Exception as exc:                      # noqa: BLE001 — annotation is best-effort
+            counters["refused_unannounced"] += 1
+            log(f"WARN {repo}#{pull['number']}: could not read the refusal comments already on "
+                f"this PR, so neither its standing nor a new annotation is decidable ({exc})")
+            return
+        if standing:
+            counters["refused_standing"] += 1
+            counters["standing_refusals"][reason] = (
+                counters["standing_refusals"].get(reason, 0) + 1)
             return
         if counters["commented"] >= max_comments:
             counters["comment_deferred_cap"] += 1
             return
         try:
-            if already_refused(read_comments(repo, pull["number"]), reason):
-                return
             if apply_changes:
                 post_comment(repo, pull["number"], refusal_comment_body(reason, message))
             counters["commented"] += 1
         except Exception as exc:                      # noqa: BLE001 — annotation is best-effort
+            counters["refused_unannounced"] += 1
             log(f"WARN {repo}#{pull['number']}: could not annotate the refusal ({exc})")
 
     for target_repo, authors in targets:
@@ -2661,9 +2751,39 @@ def _self_test():                                                       # noqa: 
               enrolled_class_pulls(bad, ("jeswr",)), [])
 
     # ---- the census ----------------------------------------------------------------------------
+    class _NoCensus(dict):
+        """A census row that was never emitted, whose every field reads back as a NAMED marker.
+
+        Production code in this file is allowed to raise in exactly one place — `census_row`'s
+        seals, which STOP a tick whose counters do not account for the population or for the
+        disposition of its refusals. That is correct behaviour, but in the harness a raise out of
+        `sweep()` aborted the run with a traceback belonging to no branch: MEASURED, an
+        `enrolled_pulls += 0` mutant killed the suite with `0 FAIL` rows at check 183 of 311, and a
+        `declared`/`all_refs` swap reded one named check then abandoned the remaining 106. Both are
+        now named failures instead.
+
+        [#1603] It is declared HERE, above the census fixtures, rather than beside `run_row` below,
+        because the fixtures are seal-sensitive too: dropping a single term from the disposition
+        seal reded NO named check and abandoned 159 of 502 rows until `census_or_marker` wrapped
+        them. A mutant that truncates the suite records as a kill while every check below it never
+        ran (AGENTS.md item 4)."""
+
+        def __init__(self, why):
+            super().__init__()
+            self.why = why
+
+        def __missing__(self, _key):
+            return ("NO CENSUS EMITTED", self.why)
+
+    def census_or_marker(counters):
+        """`census_row(counters)`, or a row whose every field names the raise."""
+        row = total(lambda: census_row(counters))
+        return row if isinstance(row, dict) else _NoCensus(row)
+
     counters = new_counters(mint_cap=3, comment_cap=5, apply_changes=True)
-    counters.update(enrolled_pulls=6, with_record=2, minted=1, refused=2, deferred_cap=1)
-    row = census_row(counters)
+    counters.update(enrolled_pulls=6, with_record=2, minted=1, refused=2, deferred_cap=1,
+                    refused_standing=1, commented=1, standing_refusals={REASON_NO_REFERENCE: 1})
+    row = census_or_marker(counters)
     check("the census derives the #929 population (PRs lacking a record)", row["lacking_record"],
           4)
     check("...and states the cap it enforced", (row["mint_cap"], row["comment_cap"]), (3, 5))
@@ -2671,6 +2791,22 @@ def _self_test():                                                       # noqa: 
           all(token in format_census(row) for token in
               ("enrolled_pulls=6", "with_record=2", "lacking_record=4", "minted=1/3", "refused=2",
                "deferred_cap=1")), True)
+    # [#1603] ...INCLUDING the stuck-population buckets. Asserted on the ONE-LINE form as well as
+    # the JSON because the one-line form is what an operator scans across ticks, and a scalar that
+    # is only in the JSON is a scalar nobody watches. Exact tokens, not containment: `refused=2`
+    # is a substring of neither `refused_standing=` nor `refused_unannounced=`, but the reverse
+    # containment is exactly the trap AGENTS.md item 6 names, so each is pinned with its own value.
+    check("...and so does the standing set the review lane cannot see",
+          [token for token in ("refused_standing=1", "refused_unannounced=0",
+                               f"standing[{REASON_NO_REFERENCE}=1]")
+           if token not in format_census(row)], [])
+    zero = new_counters(mint_cap=3, comment_cap=5, apply_changes=True)
+    zero.update(enrolled_pulls=1, with_record=1)
+    check("...and a tick with NO refusal still emits both, as an explicit zero and an explicit "
+          "'none' — a stuck-population line that vanishes reads like a drained population",
+          [token for token in ("refused_standing=0", "refused_unannounced=0", "standing[none]",
+                               "refusals[none]")
+           if token not in format_census(census_or_marker(zero))], [])
     unaccounted = new_counters(mint_cap=3, comment_cap=5, apply_changes=True)
     unaccounted.update(enrolled_pulls=6, with_record=2, minted=1, refused=1, deferred_cap=1)
     raised = False
@@ -2679,6 +2815,28 @@ def _self_test():                                                       # noqa: 
     except SweepError:
         raised = True
     check("a census that does not account for the population STOPS the tick", raised, True)
+    # [#1603] The SECOND seal, in both directions. An under-counted disposition would make the
+    # standing set look smaller than it is, which is the one wrong conclusion this row exists to
+    # prevent; an over-counted one would double-count a stuck PR. Both stop the tick.
+    for label, dispositions in (
+            ("under-counts", {"refused_standing": 1}),
+            ("over-counts", {"refused_standing": 2, "commented": 2})):
+        unsealed = new_counters(mint_cap=3, comment_cap=5, apply_changes=True)
+        unsealed.update(enrolled_pulls=3, with_record=0, minted=0, refused=3, deferred_cap=0,
+                        **dispositions)
+        stopped = False
+        try:
+            census_row(unsealed)
+        except SweepError:
+            stopped = True
+        check(f"a census that {label} the DISPOSITION of its refusals STOPS the tick too",
+              stopped, True)
+    sealed = new_counters(mint_cap=3, comment_cap=5, apply_changes=True)
+    sealed.update(enrolled_pulls=5, with_record=0, minted=0, refused=5, deferred_cap=0,
+                  refused_silent=1, refused_standing=1, commented=1, comment_deferred_cap=1,
+                  refused_unannounced=1)
+    check("...and all FIVE dispositions are summed, so no bucket is decorative",
+          total(lambda: census_row(sealed)["refused"]), 5)
 
     # ---- the sweep ORCHESTRATION: its own call sites -------------------------------------------
     class _Recorder:
@@ -2687,6 +2845,10 @@ def _self_test():                                                       # noqa: 
             self.issues, self.comments = issues or {}, comments or {}
             self.actions = actions or {}
             self.written, self.posted, self.rendered = [], [], []
+            # WHICH PULLS THE STANDING PROBE ACTUALLY READ. The census cannot distinguish "this PR
+            # is not standing" from "this PR was never probed", so the count alone cannot prove the
+            # probe covers the whole population rather than the pre-cap prefix of it (#1603).
+            self.comment_reads = []
             # WHAT THE WRITER WAS HANDED, recorded verbatim. A fixture that only looks at the
             # RESULT cannot tell a dropped argument from a kept one, which is how a call site
             # becomes an untested seam while its callee is exhaustively unit-tested.
@@ -2696,7 +2858,7 @@ def _self_test():                                                       # noqa: 
                 max_comments=DEFAULT_MAX_COMMENTS, annotate_repo="o/r",
                 targets=(("o/r", ("jeswr",)),), record_boom=False, pulls_boom=False,
                 mint_boom=False, routing_boom=False, comments_boom=False, render=None,
-                render_boom=False):
+                render_boom=False, post_boom=False):
             def mint_pr(repo, number, issue_number, routing, authors, pl, iss):
                 self.handed.append({"repo": repo, "number": number, "issue_number": issue_number,
                                     "routing": routing, "authors": authors, "issue": iss})
@@ -2724,9 +2886,15 @@ def _self_test():                                                       # noqa: 
                 return {"models": {AUTO_IMPL_ALIAS: {"provider": "anthropic"}}}
 
             def read_comments(repo, number):
+                self.comment_reads.append(number)
                 if comments_boom:
                     raise RuntimeError("comment listing failed: HTTP 502")
                 return self.comments.get(number, [])
+
+            def post_comment(repo, number, body):
+                if post_boom:
+                    raise RuntimeError("comment POST failed: HTTP 502")
+                self.posted.append((number, body))
 
             def render_markdown(repo, text):
                 self.rendered.append((repo, text))
@@ -2741,27 +2909,10 @@ def _self_test():                                                       # noqa: 
                     self.issues.get(n, issue(number=n)),
                 read_record=read_record, mint_pr=mint_pr,
                 read_comments=read_comments,
-                post_comment=lambda repo, n, b: self.posted.append((n, b)),
+                post_comment=post_comment,
                 render_markdown=render_markdown,
                 apply_changes=apply_changes, max_mints=max_mints, max_comments=max_comments,
                 log=lambda *_a, **_k: None)
-
-    class _NoCensus(dict):
-        """A census row that was never emitted, whose every field reads back as a NAMED marker.
-
-        Production code in this file is allowed to raise in exactly one place — `census_row`'s seal,
-        which STOPS a tick whose counters do not account for the population. That is correct
-        behaviour, but in the harness a raise out of `sweep()` aborted the run with a traceback
-        belonging to no branch: MEASURED, an `enrolled_pulls += 0` mutant killed the suite with
-        `0 FAIL` rows at check 183 of 311, and a `declared`/`all_refs` swap reded one named check
-        then abandoned the remaining 106. Both are now named failures instead."""
-
-        def __init__(self, why):
-            super().__init__()
-            self.why = why
-
-        def __missing__(self, _key):
-            return ("NO CENSUS EMITTED", self.why)
 
     def run_row(recorder, **kwargs):
         """`recorder.run(**kwargs)`'s census row, or a row whose every field names the raise."""
@@ -2948,6 +3099,45 @@ def _self_test():                                                       # noqa: 
     row = run_row(dedupe)
     check("an already-commented refusal is censused again but NOT re-commented",
           (row["refused"], row["commented"], dedupe.posted), (1, 0, []))
+    # [#1603] ...and it is counted as STANDING, by reason. Before this the tick recorded nothing at
+    # all for such a PR beyond `refusals[<reason>] += 1`, which a first-ever refusal produces
+    # identically — so the census could not say that 15 of 20 enrolled pulls had been outside the
+    # review lane since long before this tick, and the population had to be measured by hand.
+    check("...and it is counted as a STANDING refusal, named by reason, so a PR stuck outside the "
+          "review lane for its whole life is distinguishable from one refused just now",
+          (row["refused_standing"], row["standing_refusals"], row["refused_unannounced"]),
+          (1, {REASON_NO_REFERENCE: 1}, 0))
+    fresh = run_row(_Recorder([pull(number=41, body="no reference")]))
+    check("...and a FIRST-EVER refusal is NOT standing, so the two are told apart by the comment "
+          "that is there rather than by the reason code they share",
+          (fresh["refused"], fresh["refusals"], fresh["refused_standing"],
+           fresh["standing_refusals"], fresh["commented"]),
+          (1, {REASON_NO_REFERENCE: 1}, 0, {}, 1))
+    # ...and the standing marker is read per REASON, not per PR: a PR carrying some OTHER reason's
+    # comment is a NEW refusal for this one. `already_refused` keys on the marker and is unit-tested
+    # above; this pins that the SWEEP passes it the reason it is refusing under, not a constant.
+    # BOTH DIRECTIONS, because one is blind to the mutant. The pull below refuses
+    # `reference-is-closed` (its source issue closed under it — #1603's class 2) while carrying
+    # only a `no-issue-reference` comment: reading the marker under a pinned `REASON_NO_REFERENCE`
+    # instead of the live `reason` would call this refusal STANDING and suppress the annotation the
+    # author needs, and the reverse pairing cannot see that substitution at all.
+    other_reason = _Recorder(
+        [pull(number=41, body="Closes #7")],
+        issues={7: issue(number=7, state="closed")},
+        comments={41: [{"body": refusal_comment_body(REASON_NO_REFERENCE, "x")}]})
+    row = run_row(other_reason)
+    check("...and a comment for a DIFFERENT reason does not make this refusal standing",
+          (row["refusals"], row["refused_standing"], row["commented"],
+           [n for n, _b in other_reason.posted]),
+          ({REASON_REFERENCE_CLOSED: 1}, 0, 1, [41]))
+    reverse = _Recorder(
+        [pull(number=41, body="no reference")],
+        comments={41: [{"body": refusal_comment_body(REASON_REFERENCE_CLOSED, "x")}]})
+    row = run_row(reverse)
+    check("...in the other direction too: a stale CLOSED-reference comment does not suppress the "
+          "no-reference annotation",
+          (row["refusals"], row["refused_standing"], row["commented"]),
+          ({REASON_NO_REFERENCE: 1}, 0, 1))
 
     comment_capped = _Recorder([pull(number=n, body="no reference") for n in (41, 42, 43)])
     row = run_row(comment_capped, max_comments=2)
@@ -2955,6 +3145,25 @@ def _self_test():                                                       # noqa: 
           (row["refused"], row["commented"], len(comment_capped.posted)), (3, 2, 2))
     check("...and the un-commented refusals are censused as cap-deferred",
           row["comment_deferred_cap"], 1)
+    # [#1603] THE CAP BOUNDS THE POSTING, NOT THE MEASUREMENT. The standing probe used to sit
+    # INSIDE the posting attempt, after the cap check, with two consequences that only appear once
+    # a backlog exists — which is precisely the state #1603 reports. #42 below is already
+    # annotated and needs no comment, yet the cap is spent by the time the tick reaches it: the old
+    # ordering counted it as `comment_deferred_cap`, i.e. as un-delivered work, and never probed
+    # it at all, so the standing set could never exceed the cap however large it really was.
+    # Ordered 41 (new) -> 42 (already annotated) -> 43 (new), with a cap of ONE, so moving the
+    # probe back behind the cap check reds this by name in every field.
+    capped_standing = _Recorder(
+        [pull(number=n, body="no reference") for n in (41, 42, 43)],
+        comments={42: [{"body": refusal_comment_body(REASON_NO_REFERENCE, "x")}]})
+    row = run_row(capped_standing, max_comments=1)
+    check("...and the cap bounds the POSTING only: a refusal already annotated is counted STANDING "
+          "even beyond the cap, never as un-delivered work",
+          (row["refused"], row["commented"], row["refused_standing"],
+           row["comment_deferred_cap"], [n for n, _b in capped_standing.posted]),
+          (3, 1, 1, 1, [41]))
+    check("...because the probe runs for EVERY refusal, not for the pre-cap prefix of them",
+          capped_standing.comment_reads, [41, 42, 43])
 
     dry = _Recorder(clean + [pull(number=42, body="no reference")])
     row = run_row(dry, apply_changes=False)
@@ -2969,6 +3178,13 @@ def _self_test():                                                       # noqa: 
           (0, {REASON_RECORD_PROBE_FAILED: 1}, []))
     check("...and does NOT put a registry-side outage on someone else's PR",
           probe_failed.posted, [])
+    # [#1603] ...and it is dispositioned SILENT, not standing and not unannounced. A reason that
+    # never comments can never become standing, so folding it into either of the other buckets
+    # would make a platform outage read as a stuck pull request — the two need opposite responses.
+    check("...and the census disposes of it as SILENT, so a platform outage never reads as a PR "
+          "stuck outside the review lane",
+          (row["refused_silent"], row["refused_standing"], row["refused_unannounced"],
+           row["commented"]), (1, 0, 0, 0))
 
     foreign = _Recorder(clean)
     row = run_row(foreign, targets=(("other/repo", ("jeswr",)),))
@@ -3127,9 +3343,13 @@ def _self_test():                                                       # noqa: 
               "writes NOTHING",
               (row["minted"], row["refusals"], writes),
               (0, {REASON_BODY_NOT_UNDERSTOOD: 1}, []))
+        # `total(...)` because a `_NoCensus` row hands back a marker TUPLE for every field, and
+        # `.get` on it raised out of the suite — a census-seal defect abandoned 71 rows here
+        # rather than reding one by name (AGENTS.md item 4's crash-after-partial-run).
         check("...and the census carries WHICH element, so it is actionable rather than a count",
-              any("weird-thing" in cause
-                  for cause in row["refusal_causes"].get(REASON_BODY_NOT_UNDERSTOOD, [])), True)
+              total(lambda: any(
+                  "weird-thing" in cause
+                  for cause in row["refusal_causes"].get(REASON_BODY_NOT_UNDERSTOOD, []))), True)
         check("...and it is commented on the PR, because its author can act on it", posts, [41])
         # THE ROUND-7 CLASS, END TO END. `Closes #929abc` minted at the previous head through this
         # exact composition with the LIVE renderer; it must now stop at the census.
@@ -3542,6 +3762,18 @@ def _self_test():                                                       # noqa: 
     check("a refusal whose ANNOTATION fails is still censused, and the tick continues",
           (row["refused"], row["refusals"], annotate_boom.written),
           (1, {REASON_NO_REFERENCE: 1}, []))
+    # [#1603] ...and it is UNANNOUNCED, not standing and not commented. An unreadable comment list
+    # says nothing about whether the refusal was already announced, so counting it either way would
+    # be a guess: as standing it would inflate the stuck population, as commented it would claim a
+    # visibility this run did not deliver. The third bucket is the honest one.
+    check("...as UNANNOUNCED — an unreadable comment list decides neither standing nor delivery",
+          (row["refused_standing"], row["commented"], row["refused_unannounced"],
+           row["standing_refusals"]), (0, 0, 1, {}))
+    post_failed = _Recorder([pull(number=41, body="no reference")])
+    row = run_row(post_failed, post_boom=True)
+    check("...and a refusal whose comment POST fails is unannounced too, never counted delivered",
+          (row["refused"], row["commented"], row["refused_unannounced"], post_failed.posted),
+          (1, 0, 1, []))
 
     # ---- THE CAPS: the VALUES, not only the mechanism -------------------------------------------
     # `M13`/`M26` taught this the hard way twice over: deleting each cap CHECK reds by name, but
