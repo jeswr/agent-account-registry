@@ -1897,6 +1897,22 @@ def report_orphan_claims(args: argparse.Namespace) -> int:
 # moves. The remaining shift — a row REMOVED mid-walk pulls later rows forward — costs at most a
 # SKIP, which the next tick picks up, and it is not the direction creation pushes.
 #
+# [#1121] The MISS direction of that trade, decided here rather than left implicit, because a
+# missed row is silent where the duplicate was loud. Under `asc` a CREATION cannot displace an
+# unread row at all — it appends past the cursor, and `paginate` stops only on a SHORT page, so the
+# newcomer is either still fetched or genuinely outside the snapshot window. A REMOVAL can skip one
+# still-open row at a page boundary, but that exposure is symmetric under `desc` (a removal
+# displaces there too), so it is not something this ordering introduced.
+#
+# A skipped row costs one tick of grooming everywhere except the ONE place absence is load-bearing:
+# `_terminal_non_pr_claims` reads an issue absent from this listing as ORPHANED, and a wrongly
+# reaped lease would be strictly worse than the abort this ordering replaced. What makes that safe
+# is that NO release is ever confirmed off this listing — #509's mutation boundary re-reads each
+# candidate issue DIRECTLY (`_fresh_issue`) and only that read can confirm the reap. The self-test
+# pins the accept/reject pair on exactly that seam (one lease, one empty listing, only the fresh
+# read differs), so the day a fresh read is short-circuited for an issue the snapshot already
+# called absent, this ordering stops being safe and the suite says so.
+#
 # The duplicate guard stays. Under this ordering a duplicate is no longer a race, so it is evidence
 # of a genuinely inconsistent snapshot; groom mutates labels and state off this snapshot, and
 # silently collapsing two differing copies of one issue risks double-processing it.
@@ -7790,6 +7806,54 @@ def _self_test() -> int:
             "MUTATION #509 release guard: a freshly UNPARKED issue retains its claim",
             (race_summary[0], terminal_sweep_releases),
             (0, [set()]),
+        )
+
+        # ---- #1121: listing ABSENCE alone never confirms a reap ------------------------------
+        #
+        # STABLE_LISTING_ORDER's residual: a row removed mid-walk pulls later rows forward, so the
+        # oldest-first page walk can SKIP one still-open issue at a page boundary.
+        # `_terminal_non_pr_claims` reads absent as ORPHANED, which makes that skip the one paging
+        # artifact able to release a claim whose artifact is alive — strictly worse than the abort
+        # the ordering replaced. It is safe only because #509's boundary confirms off a DIRECT
+        # per-issue read, and this is the check that says so.
+        #
+        # The three legs share ONE lease and ONE empty listing and differ ONLY in what the fresh
+        # read returns, so each kills its own mutant. (a) skipped-but-open must RETAIN: a mutant
+        # that short-circuits the fresh read for an issue the snapshot already called absent — or
+        # seeds `fresh_reap_issues` from the snapshot — leaves the reap-cap check below and every
+        # other reap check in this file green, and reds only this leg. (b) genuinely gone must
+        # still RELEASE, so the retention is not universal and (a) cannot be satisfied by simply
+        # never reaping. (c) a CLOSED payload releases too, which is what stops the boundary's
+        # `state == "open"` test from being satisfiable by any payload at all.
+        skipped_lease = {
+            **base, "claim_id": race_claim, "holder": "owner/repo#7@777.1",
+            "issued_at": 1, "expires_at": 2,
+        }
+        live_issue = {
+            **parked_issue,
+            "labels": [{"name": "area:crate-a"}, {"name": "status:in-progress"}],
+        }
+
+        def _skipped_by_page_walk(fresh: dict[int, Any]) -> tuple[int, list[set[str]]]:
+            terminal_sweep_leases[:] = [dict(skipped_lease)]
+            terminal_sweep_env.update(planned_issues=[], fresh_issues=fresh, writes=[])
+            terminal_sweep_releases.clear()
+            # TOTAL: any exception is reported as a value, so a mutant that makes the sweep blow
+            # up cannot abort the suite and score itself a kill (AGENTS.md item 4).
+            try:
+                summary = _terminal_sweep()
+            except Exception as exc:  # noqa: BLE001
+                return f"raised {type(exc).__name__}", list(terminal_sweep_releases)
+            return summary[0], list(terminal_sweep_releases)
+
+        check(
+            "#1121: an issue the page walk SKIPPED — absent from the listing but OPEN and "
+            "non-terminal on the fresh per-issue read — RETAINS its claim, while an issue that is "
+            "genuinely gone, and one the fresh read returns CLOSED, are both still reaped",
+            (_skipped_by_page_walk({7: live_issue}),
+             _skipped_by_page_walk({}),
+             _skipped_by_page_walk({7: {**live_issue, "state": "closed"}})),
+            ((0, [set()]), (1, [{race_claim}]), (1, [{race_claim}])),
         )
 
         terminal_sweep_leases[:] = [
