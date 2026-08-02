@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1682,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e200b5212ba4e4236952477946c0c72bb6cfa5fb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`already_refused` accepts the marker from any comment body, and `read_comments` returns comments without enforcing an author identity. The new `refuse` path now promotes that unauthenticated marker into census evidence: a PR author or drive-by commenter can paste `<!-- auto-mint-provenance:refusal:<reason> -->`, causing `refused_standing`/`standing_refusals` to increase and suppressing the real annotation. Thus the claimed stuck-population measurement is author-controlled rather than evidence written by the auto-minter. The new tests only provide body-only comment fixtures, so none would fail when an untrusted author forges the marker.",
+    "file": "scripts/auto-mint-provenance.py",
+    "fix_hint": "Preserve and validate comment authorship in the evidence path. Count a marker as standing only when the comment was authored by the known bot/App identity that posts auto-mint annotations; treat missing or unexpected author metadata as non-standing or fail closed. Add adversarial tests where the identical marker is supplied by the PR author/another user and prove it neither increments the standing census nor suppresses the legitimate annotation, plus a positive trusted-author case.",
+    "severity": "blocker",
+    "title": "Standing-refusal evidence is forgeable by any commenter"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe refusal partition and pre-cap probing are arithmetically coherent, but the new standing-population evidence is not authenticated. Any commenter can forge the marker that `already_refused` treats as proof of a prior auto-minter annotation, so the census can suppress a needed annotation and report a fresh refusal as standing. Because this is the trust-plane evidence path underlying the change's marquee claim, it requires changes.",
+  "verdict": "request_changes"
+ }
+}
