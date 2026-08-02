@@ -50,8 +50,8 @@ evaluates false in the sink — for any reason, including the trigger question i
 degrades to exactly the state #370 was opened to fix, and does it invisibly. **Any sink must assert
 its own privacy positively and fail loudly, not skip quietly.**
 
-Note the repo already holds the stronger pattern one layer up. `scripts/pat-validity.py:534`
-`_confirmed_private()` refuses to trust configuration and requires a live
+Note the repo already holds the stronger pattern one layer up. `_confirmed_private()` in
+`scripts/pat-validity.py` refuses to trust configuration and requires a live
 `GET /repos/{repo}` returning a literal boolean `true`:
 
 > True ONLY on a definitive `"private": true` … anything but a literal boolean true reads as NOT
@@ -169,7 +169,7 @@ there. The guard evaluates true and the logs are private.
 The probe job stays in this repo, keeps reading tokens from `dispatch-secrets`, prints **nothing**
 identity-bearing to the log, and POSTs the result to a positively-verified private repo — the
 `ALERT_REPO` + `ALERT_TOKEN` mechanism this repo already runs under locked decision 22c, with
-`pat-validity.py`'s `_confirmed_private()` (`:534`) as the gate.
+`_confirmed_private()` in `scripts/pat-validity.py` as the gate.
 
 This is not speculative plumbing: it is the repo's established pattern for exactly this class of
 payload. `pat-validity.yml:82-89` already routes "diagnostic detail + calendar expiry" this way,
