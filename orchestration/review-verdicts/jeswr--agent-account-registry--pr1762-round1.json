@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1762,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "16a7c6edee3e0bbadd16404717b5202267dec74b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The file still begins with `[OPUS-4.8]`. AGENTS.md explicitly says model-qualified source provenance markers are legacy and must migrate when touched, and the routed provenance rule requires model-agnostic SPARQ identity. This PR changes the workflow but leaves that legacy model identity embedded in the source, so the change is not complete under the repository's authoring rules.",
+    "file": ".github/workflows/groom-leases.yml",
+    "fix_hint": "Replace the legacy `[OPUS-4.8]` source provenance marker with the model-agnostic `[SPARQ agent]` marker; do not add a model name or Co-Authored-By line.",
+    "severity": "major",
+    "title": "Touched source retains a legacy model-qualified provenance header"
+   }
+  ],
+  "progress": null,
+  "summary": "The schedule change and its enforcement are technically sound: the live map is independently coverage-checked before collision analysis, absence fails closed, cadence is checked cyclically, forbidden-minute and collision behavior are tested with red fixtures, and the live seam binds the property to groom-leases.yml. However, the touched workflow retains a legacy model-qualified provenance marker, contrary to the repository's explicit touched-file migration rule and the model-agnostic identity requirement. Migrate that header before approval.",
+  "verdict": "request_changes"
+ }
+}
