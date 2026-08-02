@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5778,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "65561d83d6f632d289ccf8bbd64acf6ed80d611d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Every slot is passed to the general engine `run` method before its outcome kind is checked. The model/parser only records the expected form as UI metadata and accepts arbitrary strings, so a pasted shared lens can put an UPDATE in `start`, `expand`, `nodeStyle`, `edgeStyle`, or `nodeDetail`. Invoking Draw lens or clicking a node then mutates the live store; rejecting the resulting non-SELECT/non-graph outcome happens only after the mutation. This violates the documented SELECT/CONSTRUCT lens contract and turns supposedly shareable rendering configuration into a data-modification path. The current tests exercise helpers and UI presence but never prove fail-closed behavior for a mutating slot.",
+    "file": "gui/app/src/components/workbench/graph-view-tool.tsx",
+    "fix_hint": "Validate each slot as the required query form before calling `run`, using a parser/form classifier that cannot be bypassed by prefixes or comments; reject UPDATE and all mismatched forms without engine execution. Add a real runtime test with a mutating imported slot that verifies the workspace data remains unchanged, plus accepted SELECT/CONSTRUCT controls. Ideally enforce the slot/form contract during import/save as well, while retaining the runtime guard for persisted hand-edited records.",
+    "severity": "major",
+    "title": "Lens slots can execute mutating SPARQL Update operations"
+   },
+   {
+    "body": "`onFocusNode` is attached only in the non-literal circle branch. Literal nodes are still laid out and are valid `RdfTerm` values, and neither `GraphLens` nor the start-slot contract restricts `?node` to resources. A lens whose start or expansion yields literal nodes therefore draws them but provides no click/keyboard path to run `expand` or `nodeDetail`, despite the feature promising node-click expansion generally.",
+    "file": "gui/app/src/components/workbench/graph-view.tsx",
+    "fix_hint": "Give literal-node groups the same focus handlers, keyboard semantics, focus indication, tooltip, and hit target as resource nodes, or explicitly validate and document that lens focus nodes must be IRIs/blank nodes and filter unsupported seeds before drawing. Add a component/e2e test exercising the chosen behavior.",
+    "severity": "minor",
+    "title": "Literal nodes cannot be focused or expanded"
+   }
+  ],
+  "progress": null,
+  "summary": "The lens model and annotation-folding tests are substantial, but the runtime does not enforce the documented SELECT/CONSTRUCT-only contract. Imported or hand-edited lens JSON can therefore execute SPARQL Update operations against the live workspace merely by drawing the lens or focusing a node. Literal graph nodes also cannot be focused even though the public lens model accepts arbitrary ?node terms. These correctness and data-integrity gaps make the feature incomplete as scoped.",
+  "verdict": "request_changes"
+ }
+}
