@@ -101,6 +101,38 @@ def probe_outcome(document, now):
     return True, "probe-succeeded"
 
 
+# --- [#997] PROBE-SUPPLIED STRINGS THAT REACH THE ISSUE BODY. The usage map is DATA: under normal
+# operation `status` and the `*_reset` stamps are copied out of provider response headers, but a
+# forged/corrupted map is the SAME threat model classify() already fails closed against (#421) — and
+# on the verified-private route these two values were interpolated into the alert body VERBATIM.
+# #639 set the precedent for exactly this class of value (see probe_outcome): a probe-supplied string
+# is rendered ONLY when it matches the producer's fixed vocabulary shape, so "a file that somehow
+# carried markup or a handle can never reach the alert". The vocabularies below are the shapes the
+# producer actually emits — `anthropic-ratelimit-unified-status` is a bare word (`allowed`,
+# `rejected`, `allowed_warning`), `*-reset` is an epoch or an ISO-8601 stamp — widened only by the
+# punctuation those shapes need. Both EXCLUDE every markdown/HTML metacharacter and all whitespace,
+# so no probe value can close the backticks it sits in, open a tag, or smuggle a handle next to
+# prose. Matching is FULL, never a prefix: `throttled<img src=x>` must not render its conforming head.
+SAFE_STATUS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+SAFE_RESET_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:.+_-]{0,63}")
+UNRENDERABLE = "unrenderable"     # present but out-of-vocabulary
+UNSTATED = "unstated"             # absent/blank — a different diagnosis, and never the bare `None`
+
+
+def _safe_probe_text(value, pattern):
+    """Render one probe-supplied string into the alert body, or a fixed placeholder (#997). A
+    non-conforming value is REPLACED, never dropped: the surrounding row still has to report the
+    account unusable, and a maintainer reading `unrenderable` learns the snapshot is malformed.
+    Absent/blank reads as `unstated` so an unreported reset is not mislabelled as forged (and never
+    renders as the bare `None` the old f-string emitted). Numeric stamps (the producer writes the
+    reset epoch as a JSON int) are stringified first; a bool is not a stamp. Pure — unit-tested."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return UNSTATED
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        value = str(value)
+    return value if isinstance(value, str) and pattern.fullmatch(value) else UNRENDERABLE
+
+
 def _policy_pool_margin(policy_path):
     """(pool, margin) from policy/repos.toml: the union of enabled repos' account_pool and the MAX
     usage_safety_margin. (None, None) when the file is absent/unreadable — the caller falls back to
@@ -237,9 +269,13 @@ def classify(pool, usage, margin, now=None):
         # account eligible on the monitoring surface while dispatch refused it (a monitoring split).
         if str(u.get("status", "")).strip().lower() != "allowed":
             stated = u.get("status")
+            # [#997] `stated` is probe-supplied and lands in an issue body: render it through the
+            # restricted vocabulary (never verbatim), exactly as #639 does for the sidecar detail.
             rows.append((h, "UNAVAILABLE — provider status not stated by the probe (fail-closed)"
                             if stated is None or not str(stated).strip()
-                            else f"UNAVAILABLE — provider status `{stated}` (throttled/rejected)",
+                            else "UNAVAILABLE — provider status "
+                                 f"`{_safe_probe_text(stated, SAFE_STATUS_RE)}` "
+                                 "(throttled/rejected)",
                          False))
             continue
         u5 = _util(u.get("5h_util"))
@@ -258,7 +294,9 @@ def classify(pool, usage, margin, now=None):
         cap = 1.0 - margin
         if u5 >= cap or u7 >= cap:
             win, util, reset = ("5h", u5, u.get("5h_reset")) if u5 >= cap else ("7d", u7, u.get("7d_reset"))
-            rows.append((h, f"CAPPED — {win} window {util:.0%} used, resets {reset}", False))
+            # [#997] The reset stamp is probe-supplied too — same restricted-vocabulary render.
+            rows.append((h, f"CAPPED — {win} window {util:.0%} used, "
+                            f"resets {_safe_probe_text(reset, SAFE_RESET_RE)}", False))
         else:
             eligible += 1
             rows.append((h, f"ok — 5h {u5:.0%}, 7d {u7:.0%}", True))
@@ -606,6 +644,77 @@ def _self_test():
                             now=1_700_000_000)
     chk("[#421] an epoch backoff stamp still backs the account off (range gate is windows-only)",
         (_e_bo, "BACKED OFF" in _r_bo[0][1]), (0, True))
+
+    # ---- [registry #997] PROBE-SUPPLIED STRINGS ARE VOCABULARY-GATED BEFORE THEY REACH THE BODY.
+    # `status` and the `*_reset` stamps were interpolated VERBATIM into the row that becomes the
+    # private alert issue's body, while #639 already refuses to render the sidecar `detail` unless it
+    # matches the producer's fixed shape — so a forged/corrupted usage map could inject markdown/HTML
+    # (or an unrelated account handle) into the alert. Mirrors "[#639] a markup/handle-bearing detail
+    # is not rendered verbatim". Every sentinel below appears NOWHERE else in this harness (pre-flight
+    # item 4: value-identical survivors), and every group checks BOTH directions — a well-formed value
+    # must still render, so a filter that placeholders everything goes RED here too.
+    _STATUS_ATTACK = "throttled<img src=x onerror=alert(1)> acct-secret-h9"
+    _RESET_ATTACK = "[t](https://evil.example) acct-secret-h9"
+    _e_st, _r_st = classify(["x"], {"x": {"status": _STATUS_ATTACK, "5h_util": "0.1",
+                                          "7d_util": "0.1"}}, 0.10)
+    # The attack's HEAD (`throttled`) conforms on its own, so a filter relaxed from fullmatch to
+    # match/search would return the whole string and go red here — not just an over-wide vocabulary.
+    chk("[#997] a markup/handle-bearing STATUS is not rendered verbatim",
+        (_e_st, "<img" in _r_st[0][1], "acct-secret-h9" in _r_st[0][1],
+         "unrenderable" in _r_st[0][1], "UNAVAILABLE" in _r_st[0][1]),
+        (0, False, False, True, True))
+    _e_r5, _r_r5 = classify(["y"], {"y": {"status": "allowed", "5h_util": "0.95", "7d_util": "0.1",
+                                          "5h_reset": _RESET_ATTACK}}, 0.10)
+    chk("[#997] a markup/handle-bearing 5h_reset is not rendered verbatim",
+        (_e_r5, "evil.example" in _r_r5[0][1], "acct-secret-h9" in _r_r5[0][1],
+         "unrenderable" in _r_r5[0][1], "CAPPED" in _r_r5[0][1], "95%" in _r_r5[0][1]),
+        (0, False, False, True, True, True))
+    _e_r7, _r_r7 = classify(["y"], {"y": {"status": "allowed", "5h_util": "0.1", "7d_util": "0.99",
+                                          "7d_reset": _RESET_ATTACK}}, 0.10)
+    chk("[#997] the 7d CAPPED arm gates its reset stamp too (both branches, not just the first)",
+        (_e_r7, "evil.example" in _r_r7[0][1], "unrenderable" in _r_r7[0][1],
+         "CAPPED" in _r_r7[0][1]), (0, False, True, True))
+    # BINDING LAYER (pre-flight item 11): the gate is only worth anything if the value cannot reach
+    # the body render() hands to `gh issue create` on the verified-private route.
+    _body997 = render(0, _r_st + _r_r5, ["x", "y"], 2, "m")
+    chk("[#997] neither injected value reaches the RENDERED private-route body",
+        ("<img" in _body997, "evil.example" in _body997, "acct-secret-h9" in _body997,
+         "unrenderable" in _body997), (False, False, False, True))
+    # The other direction: a WELL-FORMED status/reset must still reach the maintainer, or the gate
+    # has just deleted the diagnosis it exists to protect.
+    _e_ok, _r_ok = classify(["x"], {"x": {"status": "rejected", "5h_util": "0.1", "7d_util": "0.1"}},
+                            0.10)
+    chk("[#997] a well-formed status still renders verbatim (the gate is not a blanket redaction)",
+        (_e_ok, "`rejected`" in _r_ok[0][1], "unrenderable" in _r_ok[0][1]), (0, True, False))
+    _e_ep, _r_ep = classify(["x"], {"x": {"status": "allowed", "5h_util": "0.99", "7d_util": "0.1",
+                                          "5h_reset": 1737072000}}, 0.10)
+    chk("[#997] a well-formed epoch reset (the producer writes it as a JSON int) still renders",
+        ("resets 1737072000" in _r_ep[0][1], "unrenderable" in _r_ep[0][1]), (True, False))
+    _e_nr, _r_nr = classify(["x"], {"x": {"status": "allowed", "5h_util": "0.99",
+                                          "7d_util": "0.1"}}, 0.10)
+    chk("[#997] an ABSENT reset renders `unstated`, never the bare `None` of the old f-string",
+        ("resets unstated" in _r_nr[0][1], "None" in _r_nr[0][1], "unrenderable" in _r_nr[0][1]),
+        (True, False, False))
+    # The vocabularies themselves, asserted against the exclusions their comment CLAIMS. #639's own
+    # lowercase-hyphen token shape must survive both filters (one filter family, not two that drift),
+    # and every markdown/HTML metacharacter, whitespace and over-long value must not.
+    for _val, _want in (("allowed", "allowed"),
+                        ("allowed_warning", "allowed_warning"),
+                        ("secret-subset-empty", "secret-subset-empty"),   # a #639-shaped token
+                        ("throttled<img src=x>", "unrenderable"),
+                        ("throttled`\n@jeswr", "unrenderable"),
+                        ("[a](http://x)", "unrenderable"),
+                        ("**bold**", "unrenderable"),
+                        ("two words", "unrenderable"),
+                        ("x" * 64, "x" * 64), ("x" * 65, "unrenderable"),
+                        (True, "unrenderable"), ({"a": 1}, "unrenderable"),
+                        ("", "unstated"), ("   ", "unstated"), (None, "unstated")):
+        chk(f"[#997] status vocabulary {_val!r}", _safe_probe_text(_val, SAFE_STATUS_RE), _want)
+    for _val, _want in (("1737072000", "1737072000"), (1737072000, "1737072000"),
+                        ("2026-08-01T14:00:00Z", "2026-08-01T14:00:00Z"), ("14:00", "14:00"),
+                        ("14:00 <b>x</b>", "unrenderable"), ("in 5 hours", "unrenderable"),
+                        ("<script>", "unrenderable"), (None, "unstated")):
+        chk(f"[#997] reset vocabulary {_val!r}", _safe_probe_text(_val, SAFE_RESET_RE), _want)
 
     # ---- [registry #639] the PROBE-OUTCOME SIDECAR: `probe_empty = not usage` cannot tell an idle
     # fleet from an unmeasured one, and misses a partial failure entirely. Read fail-closed. --------
