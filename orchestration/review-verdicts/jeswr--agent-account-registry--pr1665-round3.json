@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1665,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ec7588aa19e87d803b18c3f01c66dd4b82326adc",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The exact-equality guard covers `_alert_route`'s docstring and the dispatch workflow comment, but this diff also rewrites the operator-facing text in `render()` and the route contract comment in `main()`. Neither is included in `canonical_route_doc` or `canonical_workflow_comment`; the module census applies only the finite `phrasings` list. Appending, for example, `ALERT_TOKEN has issue-creation privileges at ALERT_REPO` to the changed rendered guidance or `main()` comment is outside that list, leaves both exact pins unchanged, and makes `claims_about_the_route(scanned)` remain `[]`. The same boundary problem applies to changed header prose in other scripts. Thus round 2's requirement to close every changed prose consumer is only partially implemented.",
+    "file": "scripts/usage-alert.py",
+    "fix_hint": "Include every changed route-contract consumer in a closed, normalized exact contract check (at minimum the changed `render()` guidance and `main()` comment here, plus the changed module-header statements elsewhere), preferably derived from one canonical definition. Keep the lexical scan only as defense in depth. Add an appended, deliberately unlisted capability-claim fixture against each extractor so every changed consumer demonstrably reds independently.",
+    "severity": "major",
+    "title": "Changed route prose still escapes the closed canonical guard"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 closes the router docstrings and the four workflow route-comment blocks by exact normalized equality, so the concrete containment hole from round 2 is fixed for those consumers. However, the diff also changes route-contract prose in module headers, `usage-alert.py`'s rendered operator guidance, and its `main()` route comment. Those changed consumers remain outside every exact pin and are protected only by the acknowledged finite lexical tripwire. An unlisted stronger capability claim can therefore be appended to one of them while all new assertions remain green. Because the same major semantic soundness defect remains on changed prose, the verdict is request_changes and progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
