@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5685,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b66fa3989a0a018806560206e9012f16c93f3d09",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is a documentation-only audit amendment that consistently preserves the existing held/research-grade status. Its arithmetic check is correct (2867 / 22312 = 12.8496%, which rounds to 12.8% at one decimal), it carefully distinguishes quoted historical measurements from checks performed without the Noir toolchain, and it does not present the vacuous corpus result as evidence. The fixture discussion also correctly limits the execution claim to witnesses that exercise push. The companion program record is updated consistently, and no uncaveated privacy or soundness claim is introduced.",
+  "verdict": "approve"
+ }
+}
