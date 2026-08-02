@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5467,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "08a998297a233323f4276b21336355d1b4ef1f7f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's fail-open BEGIN-INJECT defect is resolved. The parser now accepts only the documented standalone marker forms, skips a region only after a valid matching END marker, retains malformed or unterminated regions in the comparison surface, and reports malformed, nested, unmatched, and unterminated delimiters as gating errors. The added hermetic cases exercise each malformed-delimiter path with a planted duplicate and pass, as does the live exact-tier check. The implementation is consistent with the relevant design record sections 4-5, and no new correctness, soundness, test-validity, or security issue was found in the diff-scoped review.",
+  "verdict": "approve"
+ }
+}
