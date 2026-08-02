@@ -47,9 +47,13 @@ jobs:
           set -euo pipefail
           BAD=""
           for wf in dispatch.yml groom.yml worker.yml review-fix.yml; do
-            id=$(gh api "repos/$REPO/actions/workflows/$wf/runs?per_page=1" \
+            # ONLY the latest COMPLETED run. A queued/in-progress run legitimately has no
+            # jobs yet, and treating "no jobs YET" as "no jobs EVER" is the exact conflation
+            # this alarm exists to detect — the first version made that mistake and flagged a
+            # pending dispatch run as rejected.
+            id=$(gh api "repos/$REPO/actions/workflows/$wf/runs?per_page=1&status=completed" \
                    -q '.workflow_runs[0].id // empty' || true)
-            [ -z "$id" ] && continue
+            [ -z "$id" ] && { echo "$wf: no completed run"; continue; }
             jobs=$(gh api "repos/$REPO/actions/runs/$id/jobs" -q '.total_count' || echo unknown)
             concl=$(gh api "repos/$REPO/actions/runs/$id" -q '.conclusion // .status' || echo unknown)
             echo "$wf: run=$id conclusion=$concl jobs=$jobs"
@@ -60,10 +64,22 @@ jobs:
             printf '%s\n' \
               "> 🤖 SPARQ agent" "" \
               "**Ingestion rejection detected.** These lanes' most recent runs executed ZERO jobs:" "" \
-              "\`\`\`" "$BAD" "\`\`\`" "" \
+              '"'"'```'"'"' "$BAD" '"'"'```'"'"' "" \
               "\`action_required\` + \`jobs=0\` means GitHub created the run and ran nothing — the workflow FILE was refused. This is silent: no failing check, no red, just lanes not running." "" \
               "Mechanism is unexplained across 9+ instances (#1566); a 10-candidate elimination table is on #1706. groom is the ONLY crash-recovery path, so its rejection is never cosmetic." "" \
               "⚠️ Verify any fix by \`jobs > 0\`, never by colour." > /tmp/body.md
+            # UPSERT, never blind-create. This lane ticks every 30 min; an unconditional
+            # `issue create` would file a duplicate EVERY tick for as long as the outage
+            # lasts, and each issue event fans out into workflow runs that spend the shared
+            # API budget. A recurring alarm that floods the tracker is a second outage.
+            EXISTING=$(gh issue list --repo "$REPO" --state open --limit 20 \
+                         --search "ingestion rejection in:title" \
+                         --json number -q '.[0].number // empty' || true)
+            if [ -n "$EXISTING" ]; then
+              echo "alarm already open as #$EXISTING — commenting instead of duplicating"
+              gh issue comment "$EXISTING" --repo "$REPO" --body-file /tmp/body.md || true
+              exit 1
+            fi
             gh issue create --repo "$REPO" \
               --title "⚠️ ingestion rejection: lanes running ZERO jobs" \
               --label "priority:P1,area:dispatch,role:impl,from:agent" \
