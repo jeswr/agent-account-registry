@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5439,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3a8b1665547bab0417c8d71aeb70b345e4747270",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "test_the_declaration_records_its_measured_basis (line 1756) partitions ready-issues.py at `NON_RESERVING_PARTITIONS = `, takes the trailing comment block, and asserts it contains each of ('area:ci', 'area:docs', 'area:deps', 'Cargo.lock', '5%', '3%', '100%', '57.1%', 'crate-region-parallelism.md'). Its docstring states the intent: 'the next reader must be able to RE-DERIVE the decision rather than guess at it. Asserted on the numbers, not on prose.'\n\nThis PR changes the ci/docs rates to 9.2% and 4.8% and explicitly labels 5%/3% as superseded, but leaves the token list untouched. I executed the test's extraction against the head revision: '5%' and '3%' are still present, but their ONLY occurrences in the block are inside the HONESTY NOTE sentence 'an earlier 2026-07-28 snapshot reported 5% for `ci` and 3% for `docs`'. Note that '57.1%' does not contain '5%', and '100%'/'9.2%'/'4.8%' contain neither token \u2014 the retraction sentence is load-bearing for the assertion.\n\nTwo consequences. First, the guard is now green because of prose describing numbers the PR withdraws, which inverts the docstring's stated contract. Second, the two figures this PR exists to correct are pinned by no assertion at all: the 9.2% and 4.8% cells could be edited to any value, or reverted to 5%/3%, and this test stays green. A guard that a change to its subject matter cannot perturb is not guarding it.\n\nCorollary: deleting the HONESTY NOTE (a plausible future tidy-up, since it documents a retraction) would break the test for a reason unrelated to the measured basis \u2014 a confusing failure mode for the next reader.",
+    "file": "scripts/tests/test_readiness_visibility.py",
+    "fix_hint": "Update the token tuple at scripts/tests/test_readiness_visibility.py:1763-1764 to the live figures \u2014 replace '5%' and '3%' with '9.2%' and '4.8%'. Consider also pinning the holder counts ('30 ci / 36 docs / 7 deps') and the snapshot date ('2026-07-31'), which are the parts a future reader needs in order to re-derive 435/630/21; those are the values that make the table falsifiable. If the intent is that the note's history must also survive, assert the retracted figures via a separate, clearly-named token group (e.g. a HISTORICAL tuple checked with its own message) so a failure tells you which of the two claims moved.",
+    "severity": "major",
+    "title": "The measured-basis guard still pins the retracted 5% / 3%; the live 9.2% / 4.8% are unpinned"
+   },
+   {
+    "body": "Line 1621-1623 still opens 'The justification is a MEASURED conflict rate, not an argument', but the rate has been replaced with 'few open `area:ci` and `area:docs` holder pairs share a changed file' while the neighbouring comparisons keep their numbers (100% for deps, 57.1% for crate areas). The asymmetry reads oddly, and 'few' is not falsifiable.\n\nThis is defensible as single-sourcing \u2014 the pointer to 'the dated table' is now unambiguous and cannot rot, which is a real improvement over the previous contradiction. Raising it only because the sentence advertises a number it no longer gives.",
+    "file": "scripts/tests/test_readiness_visibility.py",
+    "fix_hint": "Either restate the current rates ('9.2% of open `area:ci` holder pairs and 4.8% of `area:docs` pairs, on the 2026-07-31 snapshot'), or drop the two numbers that remain (100% / 57.1%) as well so the docstring is uniformly qualitative and defers wholly to the dated table.",
+    "severity": "nit",
+    "title": "Docstring now says 'few ... holder pairs' where its own sentence promises a measured rate"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Comment-only change; no runtime behaviour changes and no behavioural assertion is weakened. All four round-2 findings are genuinely addressed. (1) The HONESTY NOTE no longer misattributes the numerator growth to the empty-list counter fix: it now says the larger counts 'principally reflect re-measurement on the later, larger snapshot' and that retaining empty PRs is 'a correctness fix to the denominator, not an explanation for the larger numerators' \u2014 which is exactly right, and it resolves the deps 3->21-at-100% contradiction. (2) The three stale copies are gone: I grepped the tree and found no surviving '3 of 3', '5% of open', or '14 open PRs' (ready-issues.py:1328 and test_readiness_visibility.py:1622,1660 all updated). (3) The '14/10 co-hold' prose is now qualitative and the counterfactual is explicitly dated to the 2026-07-28 snapshot. (4) The table now carries a date and a reproduction recipe, and honestly discloses that the 2026-07-31 record 'did not preserve any failed-read numbers'. Internal arithmetic re-checked: 435=C(30,2), 630=C(36,2), 21=C(7,2); 40/435=9.2%, 30/630=4.8%.\n\nOne major issue remains, in the same superseded-figures class as round-2 finding #2 \u2014 a fourth site that round missed. test_readiness_visibility.py:1756 (test_the_declaration_records_its_measured_basis) extracts the measured-basis block and asserts it contains the tokens '5%' and '3%'. Those are now the RETRACTED figures. I ran the test's own extraction against the head revision: the only occurrences of '5%' and '3%' in the block are inside the sentence 'an earlier 2026-07-28 snapshot reported 5% for `ci` and 3% for `docs`'. So the guard whose docstring says it asserts 'on the numbers, not on prose' now passes solely on prose about withdrawn numbers, and the live 9.2%/4.8% are pinned by nothing. (This mis-pinning predates round 2 rather than being introduced by it \u2014 hence 'improving', not 'regressing'.)",
+  "verdict": "request_changes"
+ }
+}
