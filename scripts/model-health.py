@@ -3237,6 +3237,41 @@ def _self_test():
     chk("capped absent without fleet map",
         any(a["condition"] == "provider-capped" for a in classify_records(all_capped, {}, now + 100)),
         False)
+    # NON-ENABLED accounts are filtered OUT of the cap scan (#1761). A rotated-out / disabled /
+    # newly-unenrolled account can still have limit records inside the window, and the number this
+    # guard protects is the RESET HINT — the capacity-restore time the maintainer reads to decide
+    # when to resume dispatch. Without these rows, neutering the filter surfaces a reset sourced
+    # from an account that is not in the fleet at all and the whole suite stays green.
+    # The literals below appear nowhere else in the harness (value-identical-survivor guard) and
+    # the expectations are written out, not re-derived from the fixture by the code's own logic.
+    rotated_reset = "03:19 rotated-out"          # sorts BEFORE every enabled hint here
+    capped_rot = [rec("anthropic", "acct01", CLASS_LIMIT, dt=0, reset="09:07 enabled-restore"),
+                  rec("anthropic", "acct91", CLASS_LIMIT, dt=30, reset=rotated_reset),
+                  rec("anthropic", "acct02", CLASS_LIMIT, dt=60, reset="11:23 enabled-restore")]
+    rot_act = _action(classify_records(capped_rot, fleet, now + 200),
+                      "provider-capped", "anthropic")
+    chk("capped ACT (all ENABLED capped; a rotated-out account in the window is not fleet)",
+        rot_act["fire"], True)
+    chk("capped surfaces the earliest ENABLED reset, not a non-enabled account's earlier one",
+        rot_act["reset_hint"], "09:07 enabled-restore")
+    chk("capped never surfaces a non-enabled account's reset anywhere in the action",
+        rotated_reset in repr(rot_act), False)
+    # ...and the same filter guards the loop's SUCCESS arm: a non-enabled account's success is
+    # skipped before `capped.pop`. (The pop itself is a no-op for a non-enabled account — nothing
+    # non-enabled is ever inserted — so the kill here comes from the LATER limit record this row
+    # places after it, plus the CHURN COUNT, which is the reason an operator reads when the alert
+    # does NOT fire.)
+    churn_rot = [rec("anthropic", "acct91", SUCCESS, dt=0),
+                 rec("anthropic", "acct01", CLASS_LIMIT, dt=30, reset="09:07 enabled-restore"),
+                 rec("anthropic", "acct91", CLASS_LIMIT, dt=60, reset=rotated_reset)]
+    churn_act = _action(classify_records(churn_rot, fleet, now + 200),
+                        "provider-capped", "anthropic")
+    chk("capped DO-NOTHING (1/2 enabled capped; a non-enabled cap is not fleet churn)",
+        churn_act["fire"], False)
+    chk("capped churn count counts ENABLED accounts only",
+        churn_act["reason"], "1/2 accounts capped (normal churn)")
+    chk("capped churn reset is the ENABLED account's, not the non-enabled account's",
+        churn_act["reset_hint"], "09:07 enabled-restore")
 
     # ---- ZERO-DISPATCH: ACT (3 consecutive) / DO-NOTHING (2) / flip -------------------------
     zd = [make_record("fleet", account_hash("z", salt), "", CLASS_ZERO_DISPATCH, str(i), now + i * 60)
