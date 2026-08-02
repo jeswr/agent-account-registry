@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1711,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "fb483b14561f54bae4b5b03b7d67b3f79b877f1b",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 resolves the prior major finding. The change no longer claims bounded or starvation-free traversal: it states that timestamp hashing provides probabilistic fairness, explicitly documents the nonzero residual tail and absence of a per-row deadline, and explains why replacing deterministic zero service beyond the fixed capacity cut-off with an approximately uniform chance per tick is sufficient for the scoped defect. The implementation preserves every admitted row as a pure rotation, partitions by exact repository match before ordering, validates the hostile timestamp against the same shared grammar at both artifact and service-order boundaries, and binds dispatch() to the tested queue helper. The self-tests pin exact offsets, totality, rotation shape, reproducibility, malformed-input refusal, per-repository delivery, the live call-site arguments, and non-vacuity against representative permissive mutations. I found no correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
