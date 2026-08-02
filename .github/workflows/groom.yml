@@ -1,4 +1,4 @@
-# [SPARQ agent] REG-5 grooming sweep: repairs dead-lease in-progress issues, closed-unmerged-PR
+# [GPT-5.6] REG-5 grooming sweep: repairs dead-lease in-progress issues, closed-unmerged-PR
 # orphans, exhausted attempt budgets, and stale worker PRs. The cron was enabled after the REG-4
 # staged pilot proved target writes end-to-end (issues #2407–#2416 flowed; PRs #2417–#2421
 # merged) — groom is the ONLY crash-recovery path, so scheduled runs are load-bearing for
