@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1677,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "565e1db1d81f9cd2a6875e7168b792e78d0f98ee",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change consistently replaces probe-controlled status and reset text with fixed placeholders unless the complete value matches a narrow, length-bounded vocabulary. It preserves fail-closed classification and diagnostic rows, covers both capped-window branches and the final rendered-body binding layer, and includes non-vacuous positive and negative assertions for full matching, metacharacters, whitespace, length limits, missing values, numeric epochs, and blanket-redaction regressions. No correctness, soundness, test-validity, or security issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
