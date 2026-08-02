@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1726,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "493affa13a19a7b79ea3d5d51cc5477120eabccb",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Line 60 of the same file still reads: \"with the reasoning at `pat-validity.py:67-68`: 'configuration alone' is not enough\". Re-verified in the checkout at PR head: pat-validity.py:67-68 is the blank comment line plus the `# Alerting mirrors usage-alert.py: ONE rolling from:agent issue ...` line; the quoted phrase 'configuration alone' actually appears at pat-validity.py:73, inside the ROUTING comment block ('... CONFIRMED `\"private\": true` via GET /repos/{ALERT_REPO} under ALERT_TOKEN \u2014 configuration alone (two non-empty strings) is NOT verification'). That is the same ~5-line drift as the pin this PR fixes, left unfixed by the same edit. Purely cosmetic: a stale prose citation in a design record that itself changes no behaviour. Not blocking, and unchanged in severity from round 1.",
+    "file": "research/370-private-diagnostic-sink.md",
+    "fix_hint": "Apply the same treatment already applied to the two other citations: replace \"with the reasoning at `pat-validity.py:67-68`\" with a name-anchored reference \u2014 e.g. \"with the reasoning in `pat-validity.py`'s ROUTING comment\" \u2014 or quote the anchor phrase (\"configuration alone (two non-empty strings) is NOT verification\") without any line number, so the citation survives future line drift.",
+    "severity": "nit",
+    "title": "Unchanged from round 1: a third stale line-pin to pat-validity.py survives the cleanup (line 60: `pat-validity.py:67-68`)"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2. The diff is byte-for-byte the same 3-line docs-only change to research/370-private-diagnostic-sink.md that round 1 reviewed (git diff --stat for the head commit: 1 file, 3 insertions, 3 deletions). It de-pins two citations of `_confirmed_private()` from the brittle `scripts/pat-validity.py:534` form to a name-anchored reference. Re-verified against the checkout at PR head: `_confirmed_private` is defined at scripts/pat-validity.py:539, so `:534` was genuinely stale (534 sits inside an unrelated failure-message string), and the symbol name is unique and greppable in that file \u2014 dropping the line pin is the correct remedy, not a papering-over. The blockquote at lines 57-58 still matches the real docstring at pat-validity.py:540-544 in substance verbatim ('True ONLY on a definitive `\"private\": true` ... anything but a literal boolean true reads as NOT private \u2014 the caller then redacts'), and the fail-closed behaviour it describes is what the body at 545-552 actually implements (rc!=0 -> False, unparseable -> False, `payload.get(\"private\") is True`). No behaviour, workflow, policy, permission, action pin, routing rule, gate or self-test is touched, so there is no trust-surface change, no fail-open path, and no vacuous-test concern (no test added or modified \u2014 appropriate for prose). Nothing token-shaped or PII-bearing is introduced. Nothing in the diff reads as an instruction directed at the reviewer. Round-1 delta: the single nit from round 1 (a third stale pin, `pat-validity.py:67-68` at line 60, where the quoted phrase 'configuration alone' actually lives at pat-validity.py:73) is UNCHANGED in this round \u2014 re-confirmed in the checkout. Same finding, same severity, nothing new and nothing worse, hence progress='stagnant'. It remains a cosmetic prose citation in a design record that changes no behaviour, so it does not block approval.",
+  "verdict": "approve"
+ }
+}
