@@ -1272,6 +1272,122 @@ _pr_gate_suite_loop() {
   ' "$file"
 }
 
+# [issue #1035] PURE (self-tested): print pr-gate.yml's yaml-parse SWEEP STEP -- the step named
+# `actionlint + yaml-parse every workflow`, from its `- name:` line through the last line of that
+# step, normalised to stripped, comment-free lines, so WHAT THE SWEEP COVERS can be pinned by exact
+# whole-block match. Prints nothing when the file is absent, when no step carries that name, or when
+# MORE THAN ONE does, each of which fails closed against any expected block.
+#
+# The GLOB LIST is the payload. Every other pin in this file guards a command; this one guards a
+# SET, and a set silently shrinks: drop a glob from the `for` line and the step still parses
+# something, still prints its `== yaml-parse ... ==` rows, still exits 0 -- the removed population
+# is simply never looked at again, and every PR merges green over it. `shopt -s nullglob` is what
+# makes that quiet (a glob matching nothing expands to nothing rather than erroring), so the loop
+# is CAPABLE of running over zero files; any `[[ "$n" -gt 0 ]]`-style vacuity guard placed between
+# the `done` and the lint therefore sits INSIDE this extraction on purpose, and deleting it is a
+# changed block, not a lost comment.
+#
+# Extraction is anchored to the NAMED STEP as a PARSED YAML OBJECT -- not to a line of TEXT that
+# reads like one. Content-anchored extraction is mutually-maskable (AGENTS.md pre-flight item 4):
+# the exact frozen block pasted anywhere earlier -- inside an uncalled shell function, a `notes:`
+# step, any inert context -- satisfies a content-anchored match on its own, so the real step can
+# then be deleted or weakened with the pin still green. Two copies of one guard make each copy
+# individually unkillable.
+#
+# [PR #1680 r2] Anchoring on the step NAME as a stripped line is NOT enough, and this was MEASURED,
+# not reasoned about: a `run: |` block scalar is arbitrary TEXT to Actions, so an uncalled shell
+# function in an EARLIER step can contain a verbatim `- name: <the pinned name>` line followed by
+# `run: |` and the whole sweep body. Line-wise, that text strips to exactly the frozen block; the
+# real step could then be deleted outright and the line-anchored extractor still printed a perfect
+# match. Parsing the file and walking `jobs.*.steps` is what tells the two apart: block-scalar text
+# is the VALUE of a step, never a step, so the spoof is simply not in the step list.
+#
+# FAIL CLOSED means printing NOTHING (which matches no expected block) on every input this cannot
+# read UNAMBIGUOUSLY: an absent/unreadable file, YAML that does not parse, a doc/job/step that is
+# not the mapping the schema requires, `steps:` that is not a list, and -- because the question this
+# answers is "which node runs?" -- any ALIAS or any DUPLICATE MAPPING KEY anywhere in the file, both
+# of which let one node be written twice and only one of them be the one Actions honours. Zero
+# matching steps and TWO matching steps are refusals for the same reason: with two, the reader
+# cannot say which the runner takes last, so an exact first copy must not launder a weakened second.
+#
+# The printed form is the step's OWN keys, so it stays a whole-object comparison: `- name: <name>`,
+# then every other key (json-encoded, sorted) -- which is how an inserted step-level `if: false`
+# shows up -- then `run: |` and the run body normalised to stripped, comment-free lines. This is the
+# #941/#956 YAML-seam shape: a mutant here is invisible to every python assertion in this repo.
+_pr_gate_yaml_parse_sweep() {
+  local file=$1
+  [[ -f "$file" ]] || return 0
+  # stderr is dropped on purpose: EVERY failure path (missing PyYAML included) must reduce to the
+  # one observable this function has -- an empty stdout -- rather than to a half-printed block.
+  python3 - "$file" <<'PY' 2>/dev/null
+import json
+import sys
+
+import yaml
+
+NAME = "actionlint + yaml-parse every workflow"
+
+
+class Strict(yaml.SafeLoader):
+    """SafeLoader that refuses the two constructs which make "which node is this?" ambiguous."""
+
+    def compose_node(self, parent, index):
+        if self.check_event(yaml.AliasEvent):
+            raise yaml.YAMLError("aliases are not permitted in a pinned workflow")
+        return super().compose_node(parent, index)
+
+    def construct_mapping(self, node, deep=False):
+        seen = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=True)
+            if key in seen:
+                raise yaml.YAMLError(f"duplicate mapping key: {key!r}")
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+
+def refuse():
+    raise SystemExit(0)  # nothing on stdout: matches no expected block
+
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    doc = yaml.load(handle, Loader=Strict)
+
+if not isinstance(doc, dict) or not isinstance(doc.get("jobs"), dict):
+    refuse()
+
+matches = []
+for job in doc["jobs"].values():
+    if not isinstance(job, dict):
+        refuse()
+    steps = job.get("steps")
+    if steps is None:
+        continue
+    if not isinstance(steps, list):
+        refuse()
+    for step in steps:
+        if not isinstance(step, dict):
+            refuse()
+        if step.get("name") == NAME:
+            matches.append(step)
+
+if len(matches) != 1:
+    refuse()
+step = matches[0]
+
+out = [f"- name: {NAME}"]
+for key in sorted(k for k in step if k not in ("name", "run")):
+    out.append(f"{key}: {json.dumps(step[key], sort_keys=True, default=str)}")
+if "run" in step:
+    # A non-string `run` raises here rather than being rendered: an unreadable body is a refusal,
+    # and the refusal is the empty stdout every other failure path already reduces to.
+    out.append("run: |")
+    out.extend(l.strip() for l in step["run"].splitlines()
+               if l.strip() and not l.strip().startswith("#"))
+print("\n".join(out))
+PY
+}
+
 # [issue #1371] PURE (self-tested): pr-gate.yml's suite DERIVATION line together with the line that
 # immediately follows it -- the #824 dependency preflight -- normalised to stripped, comment-free
 # lines, so the preflight can be pinned by exact ADJACENT-PAIR match.
@@ -8006,6 +8122,266 @@ CHANNEL
        && printf missed || printf caught)" "caught"
   chk "pr-gate loop check fails CLOSED on an unreadable workflow" \
     "$([[ "$(_pr_gate_suite_loop "$loopfix/absent.yml" 2>/dev/null | paste -sd'|' -)" == "$expected_loop" ]] \
+       && printf missed || printf caught)" "caught"
+
+  # ---- [issue #1035] THE OTHER LOOP AT THE SAME SEAM. The suite loop above is pinned because a
+  # mutation there greens the gate with the control gone; the yaml-parse + actionlint step is the
+  # SAME shape and had no pin at all. Its failure mode is quieter than a suppressed command: the
+  # step guards a SET of globs, and a set shrinks silently -- `shopt -s nullglob` means a glob that
+  # matches nothing simply contributes nothing, so dropping one leaves a step that still parses
+  # files, still prints rows and still exits 0 while an entire population goes unparsed forever.
+  # Pin the sweep by EXACT WHOLE-OBJECT match on the NAMED STEP as PARSED from `jobs.*.steps` -- its
+  # keys plus its `run` body -- so the glob list, the parse, anything guarding the loop's own
+  # vacuity, the lint's ordering, and the step's own `if:`-lessness are all one comparable value. An
+  # absent file, a workflow that does not parse, a SECOND step wearing the pinned name, and every
+  # node this cannot read unambiguously all yield an empty extraction, which fails closed.
+  #
+  # MEASURED before this pin existed: deleting the whole `actionlint + yaml-parse every workflow`
+  # step from pr-gate.yml survived the entire 646-check suite with zero new FAIL rows, and so did
+  # dropping the `*.yaml` glob from it. MEASURED again against the first, content-anchored form of
+  # this pin: parking an EXACT copy of the sweep in an uncalled shell function one step earlier and
+  # then weakening the real step survived 652/652 with zero new FAIL rows, and so did the same
+  # duplicate with the real step DELETED outright -- the mutually-masking-duplicate outcome.
+  # MEASURED a THIRD time (PR #1680 r2) against the LINE-anchored form that replaced it: the same
+  # uncalled function carrying the step's own `- name:` line as well printed the frozen block
+  # VERBATIM with the real step deleted, because a `run: |` block scalar is text to Actions and a
+  # step to a line reader. Reading `jobs.*.steps` closes that: all six pr-gate.yml mutants (step
+  # deleted; `*.yaml` dropped; block-scalar name-spoof + weakened step; block-scalar name-spoof +
+  # deleted step; the named step duplicated; a step-level `if: false`) red exactly one row -- this
+  # one -- at an unchanged 670-check total, so none is a crash-after-partial-run.
+  #
+  # COST, stated: the extraction now needs PyYAML, which pr-gate.yml installs version+hash-locked
+  # but the model container does not ship (#824). Where it is absent this pin's POSITIVE controls
+  # go red and nothing goes falsely green -- the same ENV-BLOCKED class the preflight below refuses
+  # under, not a new failure mode.
+  # The expected block below is typed here, NOT derived from pr-gate.yml, so it cannot compare the
+  # file against itself. It is deliberately a FROZEN literal: widening the sweep (#855 adds a
+  # `.github/ISSUE_TEMPLATE/` pass and an `[[ "$n" -gt 0 ]]` fail-closed guard, neither of which is
+  # on master yet) reds this row until the widened block is written here too -- that is the control
+  # working, not a conflict to route around. ----
+  local yaml_sweep_name='actionlint + yaml-parse every workflow'
+  local sw_set='set -euo pipefail'
+  local sw_nullglob='shopt -s nullglob'
+  local sw_for='for f in .github/workflows/*.yml .github/workflows/*.yaml; do'
+  local sw_echo='echo "== yaml-parse $f =="'
+  local sw_parse='python3 -c '"'"'import sys,yaml; yaml.safe_load(open(sys.argv[1]))'"'"' "$f"'
+  local sw_done='done'
+  local sw_lintecho='echo "== actionlint =="'
+  local sw_lint='actionlint -color'
+  local -a sw_body=("$sw_set" "$sw_nullglob" "$sw_for" "$sw_echo" "$sw_parse" "$sw_done" \
+    "$sw_lintecho" "$sw_lint")
+  local expected_yaml_sweep
+  expected_yaml_sweep=$(printf '%s\n' "- name: $yaml_sweep_name" 'run: |' "${sw_body[@]}" \
+    | paste -sd'|' -)
+  chk "pr-gate.yml yaml-parses every workflow glob and then lints (exact named step)" \
+    "$(_pr_gate_yaml_parse_sweep "$SCRIPT_DIR/../.github/workflows/pr-gate.yml" | paste -sd'|' -)" \
+    "$expected_yaml_sweep"
+  # NON-VACUITY of the extractor: it must actually change under each mutant it claims to catch, or
+  # the row above is a constant comparing itself. The DROPPED-GLOB row is the one issue #1035 is
+  # about -- it is the mutant that leaves a green, plausible-looking step behind.
+  #
+  # Every fixture is emitted through ONE step writer from the SAME body lines the expected block is
+  # built from, and through ONE workflow wrapper, so a mutant differs from `expected` in exactly its
+  # mutation and never records a FALSE KILL on an incidental indentation or quoting typo (pre-flight
+  # item 4). The wrapper is not decoration: the extractor reads `jobs.*.steps`, so a fixture that is
+  # not a PARSEABLE WORKFLOW would be refused for the wrong reason and every "caught" row below
+  # would be measuring the wrapper instead of the mutation. That is also what makes the two FAITHFUL
+  # positive controls load-bearing -- if the step name typed here ever disagreed with the one the
+  # extractor anchors on, every "caught" row would pass vacuously on an empty extraction, and only a
+  # fixture that is supposed to MATCH can detect that.
+  _yaml_sweep_step() {  # $1 = step name; $2.. = run-body lines -> one YAML step on stdout
+    printf '%s\n' "      - name: $1" '        run: |'
+    shift
+    printf '          %s\n' "$@"
+  }
+  _yaml_sweep_wf() {  # $1 = destination; stdin = step text -> a minimal, PARSEABLE workflow
+    { printf '%s\n' 'on: push' 'jobs:' '  gate:' '    runs-on: ubuntu-latest' '    steps:'
+      cat; } > "$1"
+  }
+  # The one weakening every masking fixture below carries, named once: the `*.yaml` glob dropped --
+  # #1035's own mutant, a step that still parses files, still prints rows and still exits 0.
+  local -a sw_body_weak=("$sw_set" "$sw_nullglob" 'for f in .github/workflows/*.yml; do' \
+    "$sw_echo" "$sw_parse" "$sw_done" "$sw_lintecho" "$sw_lint")
+  _yaml_sweep_step "$yaml_sweep_name" "${sw_body[@]}" | _yaml_sweep_wf "$loopfix/yaml-faithful.yml"
+  _yaml_sweep_step "$yaml_sweep_name" "${sw_body_weak[@]}" \
+    | _yaml_sweep_wf "$loopfix/yaml-glob-dropped.yml"
+  _yaml_sweep_step "$yaml_sweep_name" "$sw_set" "$sw_nullglob" "$sw_for" "$sw_echo" \
+    "$sw_parse || true" "$sw_done" "$sw_lintecho" "$sw_lint" \
+    | _yaml_sweep_wf "$loopfix/yaml-parse-or-true.yml"
+  _yaml_sweep_step "$yaml_sweep_name" "$sw_set" "$sw_nullglob" "$sw_for" "$sw_echo" \
+    'if false; then' "$sw_parse" 'fi' "$sw_done" "$sw_lintecho" "$sw_lint" \
+    | _yaml_sweep_wf "$loopfix/yaml-parse-if-false.yml"
+  _yaml_sweep_step "$yaml_sweep_name" "$sw_set" "$sw_nullglob" "$sw_for" "$sw_echo" "$sw_parse" \
+    "$sw_done" "$sw_lintecho" "$sw_lint || true" | _yaml_sweep_wf "$loopfix/yaml-lint-or-true.yml"
+  # THE MUTUALLY-MASKING DUPLICATE (pre-flight item 4). An EXACT copy of the sweep parked earlier in
+  # an inert context -- here an uncalled shell function inside an unrelated step -- is what a
+  # content-anchored extractor would lock onto, leaving the real guard free to be weakened or
+  # deleted underneath it. Both halves are one fixture because either alone is killable; together
+  # they are the outcome one-at-a-time mutation is structurally blind to.
+  local -a sw_inert_dup=('yaml_sweep_reference() {' "${sw_body[@]}" '}')
+  { _yaml_sweep_step 'notes on the workflow lint' "${sw_inert_dup[@]}"
+    _yaml_sweep_step "$yaml_sweep_name" "${sw_body_weak[@]}"; } \
+    | _yaml_sweep_wf "$loopfix/yaml-dup-inert-weakened.yml"
+  _yaml_sweep_step 'notes on the workflow lint' "${sw_inert_dup[@]}" \
+    | _yaml_sweep_wf "$loopfix/yaml-dup-inert-deleted.yml"
+  # [PR #1680 r2] THE SAME DUPLICATE WEARING THE STEP'S NAME. The fixture above reproduces only the
+  # sweep BODY, so a name-anchored reader is blind to it; this one reproduces the COMPLETE named
+  # step -- `- name:`, `run: |`, body -- inside the uncalled function, where Actions sees shell text
+  # and a LINE-ANCHORED reader sees a step. MEASURED against the line-anchored form of this pin: the
+  # real step DELETED and only this spoof left still printed the frozen block exactly. The INTACT
+  # variant is the control that makes the two kills attributable: same spoof, real step unmutated,
+  # must MATCH -- so the kills below come from the real step being gone or weakened, not from the
+  # fixture failing to parse (a crash and a catch are the same empty string).
+  local -a sw_spoof_dup=('yaml_sweep_spoof() {' "- name: $yaml_sweep_name" '  run: |')
+  local sw_line
+  for sw_line in "${sw_body[@]}"; do sw_spoof_dup+=("    $sw_line"); done
+  sw_spoof_dup+=('}')
+  { _yaml_sweep_step 'notes on the workflow lint' "${sw_spoof_dup[@]}"
+    _yaml_sweep_step "$yaml_sweep_name" "${sw_body[@]}"; } \
+    | _yaml_sweep_wf "$loopfix/yaml-spoof-name-intact.yml"
+  { _yaml_sweep_step 'notes on the workflow lint' "${sw_spoof_dup[@]}"
+    _yaml_sweep_step "$yaml_sweep_name" "${sw_body_weak[@]}"; } \
+    | _yaml_sweep_wf "$loopfix/yaml-spoof-name-weakened.yml"
+  _yaml_sweep_step 'notes on the workflow lint' "${sw_spoof_dup[@]}" \
+    | _yaml_sweep_wf "$loopfix/yaml-spoof-name-deleted.yml"
+  # The spoof is only a threat if Actions would RUN the step carrying it, so the dedented block
+  # scalar must be shell a real workflow could execute -- otherwise this is a strawman that the
+  # workflow's own `bash` would have rejected anyway.
+  printf '%s\n' "${sw_spoof_dup[@]}" 'echo "notes step ran"' > "$loopfix/spoof-body.sh"
+  # A SECOND step wearing the pinned name is refused, not resolved to the first: with two copies the
+  # reader cannot tell which one Actions runs last, so an exact first copy would otherwise mask a
+  # weakened second.
+  { _yaml_sweep_step "$yaml_sweep_name" "${sw_body[@]}"
+    _yaml_sweep_step "$yaml_sweep_name" "${sw_body_weak[@]}"; } \
+    | _yaml_sweep_wf "$loopfix/yaml-dup-named-step.yml"
+  # [PR #1680 r2] The refusals the PARSED reader owes: a step-level `if: false` (the step is still
+  # there and still exact, and never runs), a step that is not a mapping at all, an ALIAS and a
+  # DUPLICATE MAPPING KEY (both write one node twice, and yaml resolves them silently -- the dup-key
+  # fixture is a WEAKENED `run:` followed by an EXACT one, which last-wins parsing would report as a
+  # perfect match), and a workflow that does not parse.
+  { printf '%s\n' "      - name: $yaml_sweep_name" '        if: false' '        run: |'
+    printf '          %s\n' "${sw_body[@]}"; } | _yaml_sweep_wf "$loopfix/yaml-step-if-false.yml"
+  { _yaml_sweep_step "$yaml_sweep_name" "${sw_body[@]}"
+    printf '%s\n' '      - a bare scalar where a step mapping belongs'; } \
+    | _yaml_sweep_wf "$loopfix/yaml-step-scalar.yml"
+  { _yaml_sweep_step "$yaml_sweep_name" "${sw_body[@]}"
+    printf '%s\n' '      - &anchored' '          name: anchored helper' \
+      '          run: echo helper' '      - *anchored'; } | _yaml_sweep_wf "$loopfix/yaml-alias.yml"
+  { printf '%s\n' "      - name: $yaml_sweep_name" '        run: |'
+    printf '          %s\n' "${sw_body_weak[@]}"
+    printf '%s\n' '        run: |'
+    printf '          %s\n' "${sw_body[@]}"; } | _yaml_sweep_wf "$loopfix/yaml-dup-key.yml"
+  { _yaml_sweep_step "$yaml_sweep_name" "${sw_body[@]}"
+    printf '%s\n' '      - name: [unclosed'; } | _yaml_sweep_wf "$loopfix/yaml-unparseable.yml"
+  # The reader's remaining paths, none of which any fixture above reaches. Two are POSITIVE (the
+  # pin must survive them or a legitimate edit reds a required gate for no reason): comments and
+  # blank lines inside the run body are normalised away, and a job that carries no `steps:` at all
+  # -- a `uses:` reusable-workflow job -- is skipped rather than refused. The rest are shape
+  # refusals: a doc, a job or a `steps:` that is not what the schema requires cannot be read as
+  # "no sweep step was weakened".
+  _yaml_sweep_step "$yaml_sweep_name" "$sw_set" '# a comment the pin normalises away' \
+    "$sw_nullglob" "$sw_for" "$sw_echo" "$sw_parse" "$sw_done" '' "$sw_lintecho" "$sw_lint" \
+    | _yaml_sweep_wf "$loopfix/yaml-commented.yml"
+  { _yaml_sweep_step "$yaml_sweep_name" "${sw_body[@]}"
+    printf '%s\n' '  reusable:' '    uses: ./.github/workflows/other.yml'; } \
+    | _yaml_sweep_wf "$loopfix/yaml-stepless-job.yml"
+  printf '%s\n' "      - name: $yaml_sweep_name" '        uses: ./.github/actions/sweep' \
+    | _yaml_sweep_wf "$loopfix/yaml-run-replaced.yml"
+  # The last two carry an INTACT sweep step beside the malformed job, which is what makes the row
+  # below load-bearing rather than a restatement of "an empty file extracts nothing": a reader that
+  # SKIPPED the shape it could not read would find that step and print the frozen block. MEASURED:
+  # turning either refusal into a skip reds that row, and only it, at an unchanged total. DECLARED
+  # equivalent survivor: the FIRST fixture holds no step at all, so deleting the doc/jobs shape
+  # guard is masked by the AttributeError that then refuses in its place -- that token asserts the
+  # fail-closed OUTCOME, and the explicit guard is there so the refusal stays intentional.
+  printf '%s\n' 'on: push' 'jobs: not-a-mapping' > "$loopfix/yaml-jobs-scalar.yml"
+  { _yaml_sweep_step "$yaml_sweep_name" "${sw_body[@]}"
+    printf '%s\n' '  broken: not-a-mapping'; } | _yaml_sweep_wf "$loopfix/yaml-job-scalar.yml"
+  { _yaml_sweep_step "$yaml_sweep_name" "${sw_body[@]}"
+    printf '%s\n' '  broken:' '    steps: not-a-list'; } \
+    | _yaml_sweep_wf "$loopfix/yaml-steps-scalar.yml"
+  chk "yaml-sweep fixtures are FAITHFUL: an unmutated copy of the step matches exactly" \
+    "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-faithful.yml" | paste -sd'|' -)" \
+    "$expected_yaml_sweep"
+  chk "yaml-sweep fixtures are FAITHFUL: an inert NAME-spoof beside an intact step still matches" \
+    "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-spoof-name-intact.yml" | paste -sd'|' -)" \
+    "$expected_yaml_sweep"
+  chk "the NAME-spoof fixture is realistic: its inert function body is shell Actions would run" \
+    "$(bash -n "$loopfix/spoof-body.sh" 2>/dev/null && printf runnable || printf broken)" "runnable"
+  chk "yaml-sweep check is NON-VACUOUS: a block-scalar NAME-spoof cannot mask a WEAKENED step" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-spoof-name-weakened.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "yaml-sweep check is NON-VACUOUS: a block-scalar NAME-spoof cannot mask a DELETED step" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-spoof-name-deleted.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "yaml-sweep check is NON-VACUOUS: an inert earlier duplicate cannot mask a WEAKENED step" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-dup-inert-weakened.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "yaml-sweep check is NON-VACUOUS: an inert earlier duplicate cannot mask a DELETED step" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-dup-inert-deleted.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "yaml-sweep check is NON-VACUOUS: a DUPLICATED step name is refused, not read as the first" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-dup-named-step.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "yaml-sweep check is NON-VACUOUS: a DROPPED glob no longer matches" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-glob-dropped.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "yaml-sweep check is NON-VACUOUS: an '|| true' on the parse no longer matches" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-parse-or-true.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "yaml-sweep check is NON-VACUOUS: a conditionally-inert 'if false' parse no longer matches" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-parse-if-false.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "yaml-sweep check is NON-VACUOUS: an '|| true' on actionlint no longer matches" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-lint-or-true.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "yaml-sweep check is NON-VACUOUS: a step-level 'if: false' no longer matches" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-step-if-false.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  # ATTRIBUTION for the three rows below. Each refuses by printing NOTHING, and so does a fixture
+  # that simply fails to parse -- a crash and a catch are the same empty string. Prove first that
+  # all three are workflows yaml accepts, so the refusal is the READER'S judgement about an
+  # ambiguous node and not an accidental syntax error in the fixture.
+  local sw_probe_ok=0 sw_probe_bad=''
+  for sw_line in yaml-alias.yml yaml-dup-key.yml yaml-step-scalar.yml; do
+    if python3 -c 'import sys,yaml; yaml.safe_load(open(sys.argv[1]))' "$loopfix/$sw_line" \
+         >/dev/null 2>&1; then sw_probe_ok=$((sw_probe_ok + 1)); else sw_probe_bad+="$sw_line "; fi
+  done
+  chk "the ambiguous-node fixtures are VALID yaml: refused by the reader, not by a syntax error" \
+    "$sw_probe_ok parse, unparseable: $sw_probe_bad" "3 parse, unparseable: "
+  chk "yaml-sweep check fails CLOSED on a step that is not a mapping (refused, not skipped)" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-step-scalar.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "yaml-sweep check fails CLOSED on an ALIAS (one node written twice is not readable)" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-alias.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "yaml-sweep check fails CLOSED on a DUPLICATE key (a weakened run: masked by an exact one)" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-dup-key.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "yaml-sweep check fails CLOSED on a workflow that does not parse" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-unparseable.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "yaml-sweep normalises the run body: a comment and a blank line inside it still match" \
+    "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-commented.yml" | paste -sd'|' -)" \
+    "$expected_yaml_sweep"
+  chk "yaml-sweep SKIPS a job with no steps (a uses: job must not refuse the whole read)" \
+    "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-stepless-job.yml" | paste -sd'|' -)" \
+    "$expected_yaml_sweep"
+  chk "yaml-sweep check is NON-VACUOUS: the run body replaced by a uses: no longer matches" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-run-replaced.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  local sw_shape=''
+  for sw_line in yaml-jobs-scalar.yml yaml-job-scalar.yml yaml-steps-scalar.yml; do
+    if [[ ! -f "$loopfix/$sw_line" ]]; then sw_shape+="$sw_line:missing "
+    elif [[ -n "$(_pr_gate_yaml_parse_sweep "$loopfix/$sw_line")" ]]; then
+      sw_shape+="$sw_line:read "
+    else sw_shape+="$sw_line:refused "; fi
+  done
+  chk "yaml-sweep fails CLOSED on a doc, job or steps: not the shape the schema requires" \
+    "$sw_shape" \
+    "yaml-jobs-scalar.yml:refused yaml-job-scalar.yml:refused yaml-steps-scalar.yml:refused "
+  chk "yaml-sweep check fails CLOSED on an unreadable workflow" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/absent.yml" 2>/dev/null | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
        && printf missed || printf caught)" "caught"
 
   # ---- [issue #1371] THE #824 PREFLIGHT IN THE REQUIRED LANE. registry_selftest_gate refuses
