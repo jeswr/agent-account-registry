@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1724,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "36fa4a3a90c87711b12d7e64902cbf3be65f14e7",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`newest_concluded_run` examines only `unconfirmed[:NON_VERDICT_PROBE_CAP]` and then returns the older non-cancelled verdict. Therefore, if the first cancelled run that created jobs is the 11th candidate above an older `action_required` run, the function publishes that stale rejection even though the newer job-bearing run proves ingestion recovered. The new `_cancel_storm` assertion explicitly expects this false alarm (`id == \"60\"`) when run 101 has four jobs, so the prior round's correctness defect remains for a bounded but supported input. Rate-limit pressure can justify limiting requests, but it cannot turn unexamined newer evidence into affirmative evidence that the older rejection is current.",
+    "file": "scripts/ci-latency-alert.py",
+    "fix_hint": "After exhausting the probe budget without finding a job-bearing cancellation, do not promote the older rejection as current while additional unconfirmed candidates remain. Represent the lane as indeterminate/unreadable (with an always-emitted census state and recovery-hold behavior as appropriate), or obtain bounded bulk evidence that adjudicates all newer candidates. Replace the current cancel-storm expectation with an anti-vacuity assertion that the older rejection is not emitted when an unprobed newer cancellation may have executed jobs.",
+    "severity": "major",
+    "title": "The probe cap can still resurrect a stale rejection after recovery"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe revision now distinguishes ordinary pre-job cancellations from cancelled runs that executed jobs, wires that distinction through `fetch_lanes`, and adds a strong end-to-end regression test for the prior finding. However, the fixed probe cap deliberately recreates the same stale-rejection false alarm whenever the first job-bearing cancelled run is more than ten candidate cancellations deep. The included cancel-storm test confirms that behavior rather than preventing it. Because a newer run with jobs remains positive ingestion evidence regardless of its position in the sampled listing, the change is still incomplete and requires changes.",
+  "verdict": "request_changes"
+ }
+}
