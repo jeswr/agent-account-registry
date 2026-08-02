@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1751,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c7e28e1b8f224416fc027ea76558a1cb9a34f1ed",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The test asserts that the output contains actions for three providers, but restoring `if not prov_records: continue` immediately after `prov_records` is built cannot skip any of them: `providers` was constructed from the same `records` list using the same provider value, so `prov_records` is non-empty for every loop iteration. Consequently the exact mutation this row and both surrounding comment blocks claim will turn red instead survives. The row may test a broader output invariant, but it is not evidence for deleting this unreachable branch and the stated mutation result is false.",
+    "file": "scripts/model-health.py",
+    "fix_hint": "Run the claimed reintroduction mutant and report it honestly as equivalent/unreachable. Remove or correct the claims that this row kills a reintroduced emptiness guard. Keep the output-invariant test only if it is justified as protection against a distinct reachable provider-skip mutation, and name that concrete mutation separately.",
+    "severity": "major",
+    "title": "New self-test cannot detect reintroduction of the deleted guard"
+   }
+  ],
+  "progress": null,
+  "summary": "The unreachable guard can be removed safely, but the added self-test is presented as mutation evidence that it cannot provide. Reintroducing the exact deleted `if not prov_records: continue` leaves the new row green, because each iterated provider is derived from `records` and therefore always has at least one matching `prov_records` entry. The source comments repeatedly claim the opposite, so the change's marquee validation claim is unsound.",
+  "verdict": "request_changes"
+ }
+}
