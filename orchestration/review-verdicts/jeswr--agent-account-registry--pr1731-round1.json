@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1731,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1e1303c8d93fad2e46d0e04be06bbd530a99708c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The introduction says operator recovery is \"the same shape\" reached by research/329, and section 6 says this decision is \"exactly as\" research/329 section 7 concluded. But research/329 section 7 begins, \"The refusal is not the terminal answer,\" recommends mechanism C, and describes the shipped refusal as temporary until that mechanism lands. The new record therefore attributes a terminal-refusal principle to a source that expressly rejects terminal refusal for its case. This is not just a loose cross-reference: the claim appears in both the executive recommendation and decision rationale, where future authors will use it as design precedent.",
+    "file": "research/1051-catalog-clobber-auto-restore.md",
+    "fix_hint": "Remove the analogy to research/329, or accurately distinguish it: #329 found a downstream invariant that made automated recovery sound, while this record argues that no analogous invariant exists for unconditional issue-body restoration. Keep the #1051 decision supported by its own sections 4-5 rather than claiming that research/329 section 7 reached the same result.",
+    "severity": "major",
+    "title": "The cited #329 precedent reaches the opposite conclusion"
+   }
+  ],
+  "progress": null,
+  "summary": "The change is behavior-neutral and the fail-closed recommendation is argued independently, but the new design record twice cites research/329 as reaching the same terminal-refusal/operator-recovery conclusion. That cited record says the opposite: its section 7 explicitly concludes that the refusal is not terminal and recommends a safe automated mechanism. Because this repository uses research records as durable design authority for later trust-plane changes, the contradictory provenance makes the new decision record materially misleading and should be corrected before approval.",
+  "verdict": "request_changes"
+ }
+}
