@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5737,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5049f31a56fc552b65f51881df9bedde6eb57df9",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new test:zk-proof script exercises the real ACIR/noir_js/bb.js path and is materially non-vacuous, but nothing in the diff adds it to test:unit or invokes it from CI. Repository search finds test:zk-proof only in this package script and source comments. Thus the exact nightly-package incompatibility and proving/verifying regressions identified in round 1 can still merge while every required test target passes.",
+    "file": "gui/app/package.json",
+    "fix_hint": "Invoke npm run test:zk-proof from an appropriate required CI job (with the dependencies and ACIR available), or include it in an existing required gated test target. Keep the pure unit lane separate if desired, but make the real proof test mandatory for changes to the circuit artifact, prover code, or pinned Noir/bb.js versions.",
+    "severity": "major",
+    "title": "The load-bearing proof integration test is still not gated"
+   },
+   {
+    "body": "PUBLIC_INPUT_KEYS and CircuitInputs describe challenge as a per-presentation verifier nonce, while buildCircuitInputs always sets challenge to 0x1 and explicitly says there is no replay context. The panel repeats that it publishes a verifier nonce. A constant is neither per-presentation nor a nonce and provides no freshness/replay binding, so the shipped wording overstates the statement.",
+    "file": "gui/app/src/lib/zk-filter.ts",
+    "fix_hint": "Either generate/accept a fresh verifier-supplied challenge for each presentation and document its actual replay context, or consistently label 0x1 as a fixed circuit/domain-separation input and explicitly state that this panel provides no freshness or replay protection.",
+    "severity": "minor",
+    "title": "A fixed challenge is described as a per-presentation verifier nonce"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 fixes the two prior ZK statement/classification blockers: candidate selection now checks the RDF term kind and exact xsd:integer datatype, and the panel repeatedly narrows the proof claim to knowledge of a value matching a published anchor without store/row provenance. A real prove/verify/mutation integration test was also added. However, that load-bearing test remains an opt-in npm script with no CI or other gated invocation, so dependency/ACIR/backend drift can still merge untested. The change also calls a hard-coded constant a per-presentation verifier nonce, which is inaccurate and could imply freshness or replay binding that the proof does not have. Because this round introduces an additional recorded honesty issue relative to round 1, progress is classified as regressing under the required scale despite resolving two blockers.",
+  "verdict": "request_changes"
+ }
+}
