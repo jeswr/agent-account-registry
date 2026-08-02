@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5559,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "83c777a47a9e2ea2605ccc22c22b8fb4072d071e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`aggregate()` computes `other_pct` from the entire OTHER bucket. That bucket contains both `rule == \"unmatched\"` steps and intentionally recognized `script-gate` steps such as guards, ratchets, reports, and scoreboards. `render_markdown()` then labels this value \"Unclassified share\", and `--max-other-pct` uses it as the classifier-decay threshold. Consequently, a workflow whose every step is successfully classified can report a large unclassified share or fail the threshold merely because it spends time in recognized guard/report work. This contradicts the script and research record's claim that the metric detects rules that no longer match real step names.",
+    "file": "scripts/ci_leg_walltime_inventory.py",
+    "fix_hint": "Track unmatched duration separately during decomposition/aggregation (for example, sum only the `unmatched` rule duration), compute and threshold `unclassified_pct` from that value, and keep the full OTHER bucket as a separate workload category. Add a test containing a long recognized `script-gate` step and assert that OTHER grows while the unclassified percentage remains zero; retain a separate unmatched-step test that makes the threshold fail. Update labels/docs to distinguish OTHER workload from unmatched classification time.",
+    "severity": "major",
+    "title": "Unclassified-share metric includes deliberately classified OTHER steps"
+   }
+  ],
+  "progress": null,
+  "summary": "The instrument is well structured and its hermetic tests cover many important seams, but the primary classifier-health metric is not what the CLI and design record claim it is. `other_pct` includes intentionally classified guard/report/ratchet time as well as genuinely unmatched time, yet it is rendered and thresholded as the \"unclassified share\". This can falsely diagnose classifier decay and make `--max-other-pct` fail even when every step is recognized, undermining the steering data's stated interpretation. The tests currently reinforce the conflation rather than exercising a recognized-OTHER control.",
+  "verdict": "request_changes"
+ }
+}
