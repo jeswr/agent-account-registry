@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1783,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8473ec94f2520c15348b99390137502b1583c2eb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 0, 2.1, 2.2, and 5 make registry-wide claims such as the recorded accounts having no refreshable form, the live fleet being necessarily bare-token, and no account storing `claude-credentials-json`. The cited routing equality proves only that an account in another format cannot successfully pass the current worker claim for those aliases. The current pre-store gate proves only that new incompatible enrollments are refused. Neither excludes a historical, pending, unusable, or otherwise recorded `claude-credentials-json` account. Indeed \u00a72.1 says the conclusion is provable without reading account records, which is exactly the missing evidence for the question as worded. This makes the headline answer and parts of the migration premise stronger than the demonstrated evidence.",
+    "file": "research/1676-anthropic-short-lived-credential-feasibility.md",
+    "fix_hint": "Either inspect and report authoritative account-record/census evidence showing the formats of all relevant recorded accounts, including pending/unusable records, or consistently narrow the claims to accounts that can currently pass routing and to credentials newly enrollable under the present workflow. Do not say that no account stores the format unless that fact is actually measured. Keep the external provisioning and TTL unknowns explicitly unresolved rather than presenting an unmeasured fleet fact as answered.",
+    "severity": "major",
+    "title": "Routing equality does not prove every recorded account is bare-token"
+   }
+  ],
+  "progress": null,
+  "summary": "The record usefully identifies the missing Anthropic write-side broker work and the TTL/provisioning gates, but its marquee fleet claim is not established by the evidence it cites. Routing and enrollment gates prove which formats can be newly enrolled and successfully run today; they do not prove the formats of every already-recorded account. The document explicitly says it reaches that conclusion without reading account records, then uses it to answer the question about recorded accounts and to state that no account stores the refreshable form. That gap matters because the feasibility and migration conclusions are framed as measurements of the live registry. The record should either obtain registry evidence/census for the account-format claim or narrow the conclusion consistently to the runnable/newly-enrollable fleet. Round 1, so progress is null.",
+  "verdict": "request_changes"
+ }
+}
