@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5324,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bb214645880154bc04db11d761cf31230391b3cb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "merge_export accepts duplicate bead IDs by overwriting fresh_by_id[rid] with the last occurrence, and accepts ID-less objects by counting and dropping them. The script claims an empty or unparseable export fails closed, but these structurally corrupt exports can be published with silent record loss or an arbitrary duplicate winning. Since this script writes the committed source of record, ambiguity in record identity must stop publication rather than be normalized silently. The current tests cover invalid JSON only, not invalid board structure.",
+    "file": "scripts/bead-export-sync.sh",
+    "fix_hint": "Validate both inputs before merging: require every bead record to have a non-empty string ID and reject duplicate IDs (at minimum in the fresh export, preferably in both files) with a nonzero exit. Add self-test and end-to-end refusal cases proving no branch is pushed for ID-less and duplicate-ID exports. If legacy committed ID-less records genuinely exist, document and narrowly grandfather only that committed-input case while still rejecting it in fresh exports.",
+    "severity": "major",
+    "title": "Malformed exports are silently rewritten instead of failing closed"
+   },
+   {
+    "body": "emit_json interpolates BRANCH and the gh-produced PR value directly into quoted JSON strings. --branch is a public option and neither value is escaped, so quotes, backslashes, or control characters produce invalid machine-readable output. This breaks the documented scheduler contract even if normal branch names happen to be safe.",
+    "file": "scripts/bead-export-sync.sh",
+    "fix_hint": "Generate the object with a JSON encoder (for example the already-required python3) rather than printf string interpolation, and add a test using a branch/value containing JSON-significant characters.",
+    "severity": "minor",
+    "title": "--json output is not JSON-escaped"
+   }
+  ],
+  "progress": null,
+  "summary": "The additive merge and end-to-end publication path are thoughtfully tested, but the export parser does not fail closed on structurally invalid bead records. In particular, duplicate IDs are silently collapsed with last-record-wins behavior and records without an ID are silently discarded. That can publish a board different from the exported database while presenting the operation as a safe durable sync. The machine-readable output is also assembled without JSON escaping, so supported branch values or CLI output can make --json invalid.",
+  "verdict": "request_changes"
+ }
+}
