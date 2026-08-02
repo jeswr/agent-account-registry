@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5631,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "32ebb7cafe42d7046b4d25a0263061700688f3c7",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The round-one concern remains through the public compatibility projection. equality_join_security() returns authenticated_abort(), whose adversary is SemiHonest, but the test requires auth.malicious_security(0) == HonestMajorityAbort and then asserts is_malicious_secure(). Public docs likewise advertise that projection. A consumer using the existing malicious_security API therefore sees this experimental, externally unaudited path as malicious-secure despite the AXIS-1 caveat and pending sq-qhy4 gate. Moving the claim between descriptor axes does not contain it when the supported public projection reconstructs the prohibited claim.",
+    "file": "crates/sparq-mpc/src/auth_join.rs",
+    "fix_hint": "Until sq-qhy4 closes, make the public projection for this descriptor return SemiHonestOnly (or introduce an explicitly experimental/tamper-evidence status that malicious_security/is_malicious_secure cannot interpret as malicious security). Update the test to assert that no public API classifies the path as malicious-secure, while separately testing the experimental abort/tamper-evidence property. Keep the current caveats and experimental names.",
+    "severity": "major",
+    "title": "Legacy security projection still publicly classifies the unaudited path as malicious-secure"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 removes the fixed row-count/wall-clock claim and adds prominent experimental/unaudited caveats, so it is improving. However, the prior major issue is not fully contained: although the new descriptor sets AXIS-1 to SemiHonest, its public legacy projection still returns HonestMajorityAbort and is_malicious_secure() == true. Thus callers using the advertised malicious_security API still receive a positive malicious-security classification before sq-qhy4 external review. The new guard test actually pins this contradictory state rather than preventing it.",
+  "verdict": "request_changes"
+ }
+}
