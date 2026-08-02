@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1711,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "df84197f530b4c12c953a4a4782d7b0b992d7b0a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The AST guard checks only that `repo_review_items` is assigned from a two-argument `review_service_order(...)` call and that argument 2 is `plan['generated_at']`. It never inspects argument 1. Consequently mutations such as `repo_review_items = review_service_order([], plan['generated_at'])`, passing `plan['review_items']` without the per-repository filter, or filtering on the wrong repository all satisfy `_service_order_violations`, while the helper-only fairness/totality assertions also stay green. Those mutations can silently drop all review work or feed another repository's rows into `_dispatch_review_items`, so the marquee behavior is unprotected at the actual delivery edge.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Pin the first argument's semantics as well: require the repository-filtered `plan['review_items']` expression (including `entry['repo'] == repo`), and add non-crashing mutation probes for an empty input, an unfiltered global input, and a wrong/inverted repository predicate. Preferably also exercise `dispatch()` with two repositories and assert each repository receives all and only its own rows in the expected rotated order.",
+    "severity": "major",
+    "title": "Call-site test does not validate the queue passed to the rotation helper"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe rotation helper itself is deterministic and fail-closed on malformed timestamp syntax, but the self-test does not actually pin the review rows passed at the production call site. A destructive call-site mutation can therefore discard or mis-scope the queue while every new assertion remains green. Because this is the delivery edge for the advertised starvation fix, the change is not yet supported by a non-vacuous end-to-end/call-site guard.",
+  "verdict": "request_changes"
+ }
+}
