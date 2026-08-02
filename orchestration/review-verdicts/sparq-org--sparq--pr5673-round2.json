@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5673,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3b4bb62dd48a2420150f8ab26cc0a5ef9da6a4ac",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The closure model now evaluates workspace feature selections, optional dependency activation, default-feature behavior, dependency feature forwarding, and command-specific dev-dependency inclusion. The focused synthetic tests independently demonstrate that disabled optional dependencies are absent and appear only when activated, while the real-manifest test confirms that service-loopback adds tokio to an otherwise tokio-free closure. The workflow grouping, measurement gate, and CI wiring are also pinned by non-vacuity and structural tests. The documented external-crate feature-resolution limitation remains an explicit conservative approximation and does not invalidate the workspace-boundary correction requested in round 1.",
+  "verdict": "approve"
+ }
+}
