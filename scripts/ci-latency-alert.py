@@ -317,10 +317,54 @@ INVISIBLE_TRIGGERS = frozenset({"schedule", "workflow_dispatch"})
 # what separates "GitHub refused to ingest the file" from "a human has not approved a
 # deployment", so the count is confirmed before alarming. It is fetched ONLY for a lane that
 # already looks rejected, so the healthy repo pays nothing.
+#
+# THE ONE LANE THIS MODE CANNOT READ OFF A CONCLUDED RUN — ITS OWN (issue #1457). This watchdog
+# is hosted in groom.yml, and groom.yml is one of the lanes it inspects. Its own run can never
+# be CONCLUDED while it is doing the reading, so on its own lane the newest concluded scheduled
+# run is always the PREVIOUS fire: the reading is structurally one cron period stale. MEASURED
+# 2026-07-31 — groom rejected at 14:37:56Z (run 30639419850, jobs 0), the offending commit
+# REVERTED at 14:45:09Z, a scheduled groom run concluded SUCCESS at 15:33:35Z, and the alert
+# THAT SAME RUN wrote at 15:34:44Z still named run 30639419850. Correct on the way up, ~50
+# minutes stale on the way down, every time — and a recovery detector that lags a cron period
+# trains readers to discount it, which is the failure this whole file's census exists against.
+#
+# THE FIX IS POSITIVE SELF-OBSERVATION, not a longer listing. A `schedule` run of this lane is
+# executing this very process, so GitHub ingested that lane's file and created at least one job
+# for it — the exact NEGATION of the M4 fingerprint, taken from the newest possible fire and
+# strictly fresher than any concluded run. So when the run doing the evaluating is a SCHEDULED
+# run of the lane being evaluated, that IS the lane's current verdict (`self-lane-executing`).
+#
+# WHY `event == "schedule"` AND NOT MERELY "my workflow is running". A `workflow_dispatch` run
+# of groom.yml says nothing about the cron lane, and dispatching the workflow by hand is the
+# LIKELY human response to a rejected schedule — accepting it would clear the alarm at exactly
+# the moment the alarm is true. The evidence has to come from the population M4 samples.
+#
+# EXCLUDING `GITHUB_RUN_ID` FROM THE LISTING was the issue's suggested mechanism and is
+# deliberately NOT done: a run cannot be `completed` while it is still executing the process
+# reading the listing, so `newest_concluded_run`'s `status == "completed"` filter already drops
+# it. An id exclusion is a guard that cannot fire in production, and this file has already
+# removed one of those for surviving its own mutant (`find_cron_deficits`'s `min(actual,
+# expected)`). The identity is spent on the positive reading instead, which is the fresh one.
+#
+# WHAT THIS STILL CANNOT SEE, stated rather than papered over: if groom.yml itself is rejected
+# then no groom run executes and this watchdog does not run at all, so on its OWN lane a
+# `rejected` reading was always historical by construction. That gap belongs to the hosting
+# decision (a watcher inside the watched workflow), not to this reading.
 MODE_INGESTION = "M4-workflow-ingestion-rejected"
 # The conclusion GitHub records on a run it created but never executed. Held as a constant
 # for the call sites; every fixture below writes the LITERAL, so mutating this reds.
 INGESTION_REJECTED_CONCLUSION = "action_required"
+# A run that CONCLUDED without ever adjudicating the workflow file, so it is not a verdict on
+# ingestion in either direction. MEASURED for #1457 on 2026-07-31: `groom.yml` and
+# `dispatch.yml` both declare a `concurrency` group (`registry-groom`, `registry-dispatcher`),
+# a run superseded there can be killed BEFORE job creation and then concludes `cancelled`
+# carrying `jobs.total_count = 0` — M4's own rejection fingerprint — and those rows sit NEWER
+# than the real verdict (dispatch carried FOUR cancelled runs above a `success` with jobs 5).
+# Reading one as the lane's verdict is wrong in both directions: as written it reports
+# `ingesting` and MASKS a rejection sitting under it, and any widening of the conclusion test
+# would report a healthy lane as rejected. So it is skipped and the verdict is taken from the
+# newest run that actually is one.
+NON_VERDICT_CONCLUSIONS = frozenset({"cancelled"})
 # Every state a lane can exit M4 through, seeded at zero so the census emits a row for each
 # on EVERY tick — including the all-clear. A census that only prints what it saw cannot
 # answer "would this alarm fire if this branch took 100% of the population?".
@@ -333,6 +377,8 @@ INGESTION_REJECTED_CONCLUSION = "action_required"
 M4_CENSUS_STATES = (
     "not-scheduled",
     "not-sampled",
+    # READ, and read from the freshest evidence there is — never indeterminate (#1457).
+    "self-lane-executing",
     "no-concluded-run",
     "ingesting",
     "approval-gated-with-jobs",
@@ -608,8 +654,40 @@ def find_cron_deficits(lanes: list[dict], now: dt.datetime,
     return findings, census
 
 
-def find_ingestion_rejections(lanes: list[dict],
-                              job_counts: dict) -> tuple[list[dict], dict]:
+def self_run_identity(repo, env=None):
+    """-> {"workflow", "event"} for the run executing THIS process, or None (#1457).
+
+    The three inputs are GitHub's own defaults on every step of every run, so nothing has to
+    be wired into the hosting job for this to resolve. FAIL-SAFE TO THE STATUS QUO in every
+    direction: an unset/short/unrecognisable value yields None, and None restores the reading
+    this file had before #1457 — stale on the way down, but a real concluded verdict. The
+    alternative failure (inventing an identity) would clear a live alarm.
+
+    THE REPO EQUALITY IS LOAD-BEARING, not decoration. `--repo`/`REGISTRY_REPO` names the repo
+    being WATCHED, which is not necessarily the repo this process is running in, and a lane key
+    is just `.github/workflows/<name>.yml` — a name most repos have a version of. Without this
+    a groom.yml running anywhere would self-clear the watched repo's groom.yml. It is also what
+    keeps this module's own `--self-test` hermetic: every fixture there watches `o/r`, so a
+    self-test executing inside a real Actions run resolves no identity and asserts the same
+    thing it asserts on a laptop.
+    """
+    env = os.environ if env is None else env
+    if not repo or (env.get("GITHUB_REPOSITORY") or "") != repo:
+        return None
+    event = (env.get("GITHUB_EVENT_NAME") or "").strip()
+    # `owner/repo/.github/workflows/groom.yml@refs/heads/master` -> the lane key. Sliced from
+    # the directory rather than split on "/" so it matches `fetch_lanes`'s key exactly; a ref
+    # naming no workflow file resolves nothing rather than half of one.
+    ref = (env.get("GITHUB_WORKFLOW_REF") or "").split("@", 1)[0]
+    idx = ref.find(f"{WORKFLOWS_DIR}/")
+    workflow = ref[idx:] if idx >= 0 else ""
+    if not (workflow and event):
+        return None
+    return {"workflow": workflow, "event": event}
+
+
+def find_ingestion_rejections(lanes: list[dict], job_counts: dict,
+                              self_run: dict | None = None) -> tuple[list[dict], dict]:
     """M4. `lanes` carry {runs_sampled, newest_concluded}; `job_counts` maps the run id of
     an apparently-rejected run (as a STRING — JSON object keys are strings, and a dict keyed
     by int here would silently miss every entry that came back through --state-file) to its
@@ -620,9 +698,17 @@ def find_ingestion_rejections(lanes: list[dict],
     the newest concluded run states the CURRENT condition and the alert self-clears one cycle
     after a fix lands. An `in_progress` newest run is skipped rather than treated as evidence
     either way — a run with no conclusion has not said anything yet.
+
+    EXCEPT ON THE EVALUATING RUN'S OWN LANE, where that cycle never comes cheap and the
+    reading is stale by construction (#1457). `self_run` is `self_run_identity`'s verdict; a
+    scheduled run of the lane under evaluation is the lane ingesting, right now, with at least
+    one job — see the M4 note above for why the event must be `schedule` and why this is not
+    an id exclusion.
     """
     findings: list[dict] = []
     census: dict[str, int] = {state: 0 for state in M4_CENSUS_STATES}
+    self_workflow = (self_run or {}).get("workflow")
+    self_event = (self_run or {}).get("event")
 
     def bump(state: str) -> None:
         census[state] += 1
@@ -635,6 +721,13 @@ def find_ingestion_rejections(lanes: list[dict],
             # "carries a cron and its runs were never listed", which is the disabled lane —
             # indeterminate, and the one that must not be read as a recovery.
             bump("not-sampled" if lane.get("in_scope") else "not-scheduled")
+            continue
+        # THE FRESHEST EVIDENCE WINS, and on this one lane it is the process itself. Placed
+        # ahead of the concluded-run read deliberately: the concluded run is the STALE reading
+        # this branch exists to replace, so consulting it first would just re-publish it.
+        if (self_workflow and lane.get("workflow") == self_workflow
+                and self_event == "schedule"):
+            bump("self-lane-executing")
             continue
         newest = lane.get("newest_concluded")
         if not newest:
@@ -914,9 +1007,14 @@ def newest_concluded_run(runs):
     The listing arrives newest-first, but that is GitHub's promise rather than this file's,
     and reading position 0 would key on a promise: `max` over the parsed timestamp costs
     nothing and cannot be wrong. Runs missing a `created_at` are unorderable and dropped.
+
+    A run that concluded WITHOUT adjudicating the workflow file is not a verdict and is
+    skipped, so a concurrency-cancelled row sitting above a real one cannot mask it — see
+    NON_VERDICT_CONCLUSIONS.
     """
     concluded = [r for r in runs
                  if r.get("status") == "completed" and r.get("conclusion")
+                 and r.get("conclusion") not in NON_VERDICT_CONCLUSIONS
                  and r.get("created_at")]
     if not concluded:
         return None
@@ -1595,15 +1693,29 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
         MODES == ("M1-cron-firing-deficit", "M3-execution-overrun",
                   "M4-workflow-ingestion-rejected"))
     chk("M4's census names every exit, in order, so the all-clear prints a row per state",
-        M4_CENSUS_STATES == ("not-scheduled", "not-sampled", "no-concluded-run", "ingesting",
-                             "approval-gated-with-jobs", "rejected-zero-jobs",
-                             "rejected-jobs-unreadable"))
+        M4_CENSUS_STATES == ("not-scheduled", "not-sampled", "self-lane-executing",
+                             "no-concluded-run", "ingesting", "approval-gated-with-jobs",
+                             "rejected-zero-jobs", "rejected-jobs-unreadable"))
     chk("the states that hold a recovery are exactly the two M4 never read the lane in",
         M4_INDETERMINATE_STATES == ("not-sampled", "no-concluded-run"))
+    # #1457: the self-lane exit is a READ, from the freshest evidence this detector can hold,
+    # so it must NOT join the indeterminate set — a lane that clears through it while the mode
+    # holds its own alert open would have replaced a stale alarm with a permanent one.
+    chk("the self-lane exit does not hold M4's recovery",
+        "self-lane-executing" not in M4_INDETERMINATE_STATES)
     # A blocker naming a state the census cannot emit is a PERMANENTLY INERT hold: it reads
     # as implemented and never fires once, which is the fail-open this row exists to prevent.
     chk("M4's recovery-blocking states are wired to states its census actually emits",
         set(RECOVERY_BLOCKING_STATES[MODE_INGESTION]) <= set(M4_CENSUS_STATES))
+    # #1457: which conclusions are NOT a verdict. Pinned against literals, and pinned in the
+    # DANGEROUS direction too: adding `action_required` here would take M4's whole population
+    # away and leave the mode permanently, silently quiet, and adding `success` would make
+    # every healthy lane fall through to whatever stale verdict sits under it.
+    chk("`cancelled` is the measured non-verdict conclusion (jobs 0 from a concurrency kill)",
+        NON_VERDICT_CONCLUSIONS == frozenset({"cancelled"}))
+    chk("the rejection fingerprint is NEVER a non-verdict — skipping it would silence M4",
+        INGESTION_REJECTED_CONCLUSION not in NON_VERDICT_CONCLUSIONS
+        and "success" not in NON_VERDICT_CONCLUSIONS)
 
     def _sched_run(rid, conclusion, created, status="completed"):
         return {"id": rid, "status": status, "conclusion": conclusion,
@@ -1633,6 +1745,63 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
                                          status="in_progress")]) is None)
     chk("M4 reports NO newest-concluded run over an empty listing",
         newest_concluded_run([]) is None)
+    # #1457, THE CONCURRENCY-KILL ROW. groom.yml and dispatch.yml both declare a `concurrency`
+    # group, so a superseded run concludes `cancelled` with jobs 0 — M4's own fingerprint — and
+    # lands NEWER than the verdict under it. Both directions are pinned because the two are
+    # different bugs: masking a rejection (fail-open) and, under any widening of the conclusion
+    # test, publishing a healthy lane as rejected (fail-loud-and-wrong). The ids are distinct
+    # values that appear nowhere else here, so a mutant returning the cancelled row is named.
+    _cancelled_over_bad = [_sched_run(41, "action_required", "2026-07-28T10:00:00Z"),
+                           _sched_run(42, "cancelled", "2026-07-28T11:00:00Z")]
+    chk("M4 looks THROUGH a newer `cancelled` run to the rejection underneath it — a run the "
+        "concurrency group killed before job creation adjudicated nothing",
+        (newest_concluded_run(_cancelled_over_bad) or {}).get("id") == "41")
+    _cancelled_over_good = [_sched_run(43, "success", "2026-07-28T10:00:00Z"),
+                            _sched_run(44, "cancelled", "2026-07-28T11:00:00Z")]
+    chk("...and through it to a SUCCESS underneath it, so the skip is a non-verdict rule and "
+        "not a second rejection test",
+        (newest_concluded_run(_cancelled_over_good) or {}).get("id") == "43")
+    chk("a lane whose only concluded run is `cancelled` has said NOTHING — indeterminate, "
+        "never healthy",
+        newest_concluded_run([_sched_run(45, "cancelled", "2026-07-28T11:00:00Z")]) is None)
+    chk("a `failure` IS a verdict — the workflow ingested and executed; only the work failed",
+        (newest_concluded_run([_sched_run(46, "failure", "2026-07-28T11:00:00Z")])
+         or {}).get("id") == "46")
+
+    # --- #1457: WHOSE RUN AM I? -------------------------------------------------------
+    # Every expected value below is a literal written here, never read back out of the env
+    # dict the code parses. The `o/r` repo is the one every fixture in this suite watches, so
+    # these rows also state the hermeticity the rest of the suite depends on.
+    _ACTIONS_ENV = {"GITHUB_REPOSITORY": "o/r",
+                    "GITHUB_WORKFLOW_REF": "o/r/.github/workflows/groom.yml@refs/heads/master",
+                    "GITHUB_EVENT_NAME": "schedule"}
+    chk("self-identity: a scheduled Actions run of the WATCHED repo resolves to its lane key "
+        "and its event, with the `@ref` suffix and the owner/repo prefix both stripped",
+        self_run_identity("o/r", _ACTIONS_ENV)
+        == {"workflow": ".github/workflows/groom.yml", "event": "schedule"})
+    chk("self-identity: the event is carried VERBATIM, not normalised to `schedule`",
+        self_run_identity("o/r", {**_ACTIONS_ENV, "GITHUB_EVENT_NAME": "workflow_dispatch"})
+        == {"workflow": ".github/workflows/groom.yml", "event": "workflow_dispatch"})
+    # THE CROSS-REPO GUARD. `.github/workflows/groom.yml` is a lane key most repos could
+    # produce, so without this a groom.yml running in ANOTHER repo would clear this repo's
+    # alarm — and this module's own --self-test, which watches `o/r` from inside a real
+    # Actions run, would resolve an identity it must not have.
+    chk("self-identity: a run of a DIFFERENT repo resolves nothing",
+        self_run_identity("o/r", {**_ACTIONS_ENV,
+                                  "GITHUB_REPOSITORY": "someone/else"}) is None)
+    chk("self-identity: with no repo to compare against, nothing resolves",
+        self_run_identity("", _ACTIONS_ENV) is None
+        and self_run_identity(None, _ACTIONS_ENV) is None)
+    for _missing in ("GITHUB_WORKFLOW_REF", "GITHUB_EVENT_NAME", "GITHUB_REPOSITORY"):
+        chk(f"self-identity: {_missing} absent resolves NOTHING — off a runner this falls back "
+            f"to the concluded-run reading rather than inventing health",
+            self_run_identity("o/r", {k: v for k, v in _ACTIONS_ENV.items()
+                                      if k != _missing}) is None)
+    chk("self-identity: a ref naming no workflow file resolves nothing rather than half a key",
+        self_run_identity("o/r", {**_ACTIONS_ENV,
+                                  "GITHUB_WORKFLOW_REF": "o/r@refs/heads/master"}) is None)
+    chk("self-identity: an empty environment resolves nothing",
+        self_run_identity("o/r", {}) is None)
 
     _M4_CLEAN = {s: 0 for s in M4_CENSUS_STATES}
 
@@ -1683,6 +1852,71 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     _f, _c = _m4({"workflow": "fresh.yml", "newest_conclusion": None}, {})
     chk("M4 counts a lane with no concluded run as such — never as healthy",
         _f == [] and _c == {**_M4_CLEAN, "no-concluded-run": 1})
+
+    # --- #1457: THE EVALUATING RUN'S OWN LANE ----------------------------------------
+    # THE DEFECT, stated as its live shape: the lane's newest CONCLUDED scheduled run is the
+    # rejection from before the revert, and the run reading it is a scheduled run of that same
+    # lane — which is the lane executing. Before this the alert kept naming the old run for a
+    # whole cron period after the fix landed.
+    _SELF = {"workflow": ".github/workflows/groom.yml", "event": "schedule"}
+    _stale_self = _lane(now=NOW, workflow=".github/workflows/groom.yml",
+                        newest_conclusion="action_required", run_id="30639419850")
+    _f, _c = find_ingestion_rejections([_stale_self], {"30639419850": 0}, _SELF)
+    chk("M4 clears its OWN lane from the run executing on it — the recovered lane stops "
+        "alarming on this tick, not one cron period later",
+        _f == [] and _c == {**_M4_CLEAN, "self-lane-executing": 1})
+    # ANTI-VACUITY, three ways, each a DIFFERENT reason the clear must not happen. `_stale_self`
+    # is the same object in all three, so the ONLY thing that moves is the identity.
+    _f, _c = find_ingestion_rejections([_stale_self], {"30639419850": 0}, None)
+    chk("...and with NO identity resolved the SAME lane still alarms (this is not an "
+        "unconditional mute of the M4 population)",
+        len(_f) == 1 and _c == {**_M4_CLEAN, "rejected-zero-jobs": 1})
+    _f, _c = find_ingestion_rejections(
+        [_stale_self], {"30639419850": 0},
+        {"workflow": ".github/workflows/dashboard.yml", "event": "schedule"})
+    chk("...and a scheduled run of ANOTHER lane clears nothing — the evidence is one lane's, "
+        "not the whole tick's", len(_f) == 1)
+    _f, _c = find_ingestion_rejections([_stale_self], {"30639419850": 0},
+                                       {**_SELF, "event": "workflow_dispatch"})
+    chk("...and a WORKFLOW_DISPATCH run of the same lane clears nothing — dispatching the "
+        "workflow by hand is the likely response to a rejected cron, so accepting it would "
+        "clear the alarm exactly when it is true", len(_f) == 1)
+    # The `self_workflow and` guard, which is not decoration: an identity that resolved NO lane
+    # key must match NO lane, and `None == None` would otherwise clear a lane nobody observed.
+    _f, _c = find_ingestion_rejections(
+        [{"workflow": None, "runs_sampled": True, "in_scope": True,
+          "newest_concluded": {"id": "9", "conclusion": "success",
+                               "created_at": "2026-07-28T11:00:00Z"}}],
+        {}, {"event": "schedule"})
+    chk("...and an identity carrying no lane key matches nothing, including a lane that "
+        "carries none", _f == [] and _c == {**_M4_CLEAN, "ingesting": 1})
+    # NO CONCLUDED RUN TO FALL BACK ON is still a READ on this lane, not an indeterminate: the
+    # process itself is the evidence. Resolving it the other way would hold M4's alert open
+    # forever on a newly-added scheduled lane that happens to host this watchdog. This row also
+    # pins the branch's POSITION — placed after the concluded-run read it would answer
+    # `no-concluded-run` here and re-publish the stale verdict in the row above.
+    _f, _c = find_ingestion_rejections(
+        [_lane(now=NOW, workflow=".github/workflows/groom.yml", newest_conclusion=None)],
+        {}, _SELF)
+    chk("M4 reads its own lane from the executing run even with no concluded run behind it",
+        _f == [] and _c == {**_M4_CLEAN, "self-lane-executing": 1})
+    # THE SELF-CLEAR IS NOT A TICK-WIDE AMNESTY: a sibling lane rejected on the same tick is
+    # still reported, and the census places both.
+    _f, _c = find_ingestion_rejections(
+        [_stale_self, _lane(now=NOW, workflow=".github/workflows/dead.yml",
+                            newest_conclusion="action_required", run_id="88")],
+        {"30639419850": 0, "88": 0}, _SELF)
+    chk("M4's self-lane clear leaves every OTHER lane's verdict intact",
+        len(_f) == 1 and _f[0]["workflow"] == ".github/workflows/dead.yml"
+        and _c == {**_M4_CLEAN, "self-lane-executing": 1, "rejected-zero-jobs": 1})
+    # The self exit must beat the STALE reading and nothing else: a lane that is not sampled
+    # is still counted unread, because that classification is about the population, not the
+    # verdict, and M1's guards key on it.
+    _f, _c = find_ingestion_rejections(
+        [_lane(now=NOW, workflow=".github/workflows/groom.yml", runs_sampled=False)],
+        {}, _SELF)
+    chk("M4 still counts an UNSAMPLED lane as unread even when it is the self lane",
+        _f == [] and _c == {**_M4_CLEAN, "not-sampled": 1})
     # The `--state-file` route round-trips through JSON, where every object key becomes a
     # STRING. An int-keyed lookup reads nothing there and the detector goes permanently
     # quiet on the live-equivalent path while every in-process assertion above stays green.
@@ -1929,6 +2163,51 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
               "--now", "2026-07-28T12:00:00Z"])
         chk("an unread lane never mutes a measured rejection — M4 still upserts",
             applied == ["close", "close", "upsert"])
+
+        # --- #1457 END TO END, AT THE TRANSPORT, WHICH IS WHERE THE DEFECT WAS PAID -------
+        # The pure rows above prove the detector; NOTHING there reaches the environment parse,
+        # `run()`'s wiring or `_apply`, and the live report was a rolling issue that stayed
+        # OPEN — so this is the layer the issue was actually filed about (AGENTS.md pre-flight
+        # 11). The tick reproduces 2026-07-31T15:34:44Z exactly: an alert is open, the self
+        # lane's newest concluded scheduled run is the pre-revert rejection, and the run doing
+        # the reading is a scheduled run of that lane.
+        _ENV_KEYS = ("GITHUB_REPOSITORY", "GITHUB_WORKFLOW_REF", "GITHUB_EVENT_NAME")
+        _saved_env = {k: os.environ.get(k) for k in _ENV_KEYS}
+
+        def _put_env(values):
+            for k in _ENV_KEYS:
+                if values.get(k) is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = values[k]
+
+        _self_tick = _state_path(
+            [_healthy, _lane(workflow=GROOM_WORKFLOW, fires=CAP, now=NOW,
+                             newest_conclusion="action_required", run_id="30639419850")],
+            job_counts={"30639419850": 0})
+        try:
+            for _label, _env, _want, _note in (
+                    ("a scheduled run of the alerting lane CLOSES M4's stale alert",
+                     {"GITHUB_REPOSITORY": "o/r",
+                      "GITHUB_WORKFLOW_REF": f"o/r/{GROOM_WORKFLOW}@refs/heads/master",
+                      "GITHUB_EVENT_NAME": "schedule"},
+                     ["close", "close", "close"],
+                     f"self-lane {GROOM_WORKFLOW} via schedule"),
+                    ("...and OFF a runner the very same tick still upserts it (the close is "
+                     "evidence, not a default)", {}, ["close", "close", "upsert"],
+                     "unresolved")):
+                applied.clear()
+                _put_env(_env)
+                _tick_log = io.StringIO()
+                with contextlib.redirect_stdout(_tick_log):
+                    main(["--state-file", _self_tick, "--now", "2026-07-28T12:00:00Z"])
+                chk(f"#1457 {_label}", applied == _want)
+                # The census must SAY which of the two it did, or an operator reading a zero
+                # `self-lane-executing` row cannot tell "no lane matched" from "no identity".
+                chk(f"#1457 the census names the resolved self-lane ({_note})",
+                    _note in _tick_log.getvalue())
+        finally:
+            _put_env(_saved_env)
     finally:
         globals()["_find_open_alert"], globals()["_apply"] = _real_find, _real_apply
 
@@ -1984,6 +2263,31 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
             "job count", _live_rc == 0
             and GROOM_WORKFLOW in _live_out.getvalue()
             and "jobs.total_count = 0" in _live_out.getvalue())
+        # #1457 ON THE LIVE PATH, against the identical stub. The row above IS the defect: the
+        # rejected lane is groom.yml, which is where this watchdog is hosted, and the tick still
+        # publishes the pre-revert run. Only the environment moves between the two, so this
+        # kills a `self_run = None` on run()'s LIVE branch — the state-file branch has its own
+        # rows and would not have covered it.
+        _live_env = {"GITHUB_REPOSITORY": "o/r",
+                     "GITHUB_WORKFLOW_REF": f"o/r/{GROOM_WORKFLOW}@refs/heads/master",
+                     "GITHUB_EVENT_NAME": "schedule"}
+        _live_saved = {k: os.environ.get(k) for k in _live_env}
+        _self_out = io.StringIO()
+        try:
+            os.environ.update(_live_env)
+            with contextlib.redirect_stdout(_self_out):
+                _self_rc = main(["--repo", "o/r", "--dry-run"])
+        finally:
+            for _k, _v in _live_saved.items():
+                if _v is None:
+                    os.environ.pop(_k, None)
+                else:
+                    os.environ[_k] = _v
+        chk("#1457 the LIVE path clears the lane the reading run is executing on — the run "
+            "IS the ingestion evidence, and it is fresher than any concluded run",
+            _self_rc == 0
+            and "self-lane-executing: 1" in _self_out.getvalue()
+            and "jobs.total_count" not in _self_out.getvalue())
         # THE COST CLAIM, asserted instead of merely written down: M4 is documented as
         # costing ZERO extra requests on a healthy repo. A job-count read per lane per tick
         # would be a real budget change on a repo that has measured a 403 at ~7969
@@ -2325,12 +2629,12 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
 MODES = ("M1-cron-firing-deficit", "M3-execution-overrun", MODE_INGESTION)
 
 
-def classify(lanes, live, baselines, now, window_hours, job_counts=None):
+def classify(lanes, live, baselines, now, window_hours, job_counts=None, self_run=None):
     """Pure: -> {mode: (findings, census)} for every detected mode."""
     return {
         MODES[0]: find_cron_deficits(lanes, now, window_hours),
         MODES[1]: find_execution_overruns(live, baselines, now),
-        MODES[2]: find_ingestion_rejections(lanes, job_counts or {}),
+        MODES[2]: find_ingestion_rejections(lanes, job_counts or {}, self_run),
     }
 
 
@@ -2342,6 +2646,7 @@ def run(args):
     if args.state_file:
         state = json.loads(Path(args.state_file).read_text(encoding="utf-8"))
         repo = state.get("repo") or registry_repo or "hermetic/fixture"
+        self_run = self_run_identity(repo)
         lanes = state.get("lanes", [])
         for lane in lanes:
             lane["schedule_run_times"] = [_ts(t)
@@ -2354,6 +2659,7 @@ def run(args):
         repo = registry_repo
         if "/" not in repo:
             raise AlarmError(f"no usable repo slug: {repo!r}")
+        self_run = self_run_identity(repo)
         root = Path(__file__).resolve().parents[1]
         lanes = fetch_lanes(repo, root, args.window_hours, now)
         live = fetch_live_runs(repo)
@@ -2392,11 +2698,15 @@ def run(args):
                          "every scheduled lane is disabled, or the sampling broke. "
                          "Refusing to report ingestion health over an empty population.")
 
-    results = classify(lanes, live, baselines, now, args.window_hours, job_counts)
+    results = classify(lanes, live, baselines, now, args.window_hours, job_counts, self_run)
 
-    # CENSUS EVERY RUN, including the all-clear.
+    # CENSUS EVERY RUN, including the all-clear. The resolved self-identity is printed with it
+    # because `self-lane-executing: 0` alone cannot tell an operator WHY it is zero — no lane
+    # matched, or no identity resolved at all (#1457).
+    self_note = (f"{self_run['workflow']} via {self_run['event']}" if self_run
+                 else "unresolved (not a run of the watched repo)")
     print(f"ci-latency census for {repo} at {now:%Y-%m-%dT%H:%M:%SZ} "
-          f"({len(lanes)} workflows, {len(live)} live runs):")
+          f"({len(lanes)} workflows, {len(live)} live runs; self-lane {self_note}):")
     for mode in MODES:
         findings, census = results[mode]
         print(f"  {mode}:")
