@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5722,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "11b00aae9f2b97c632e438494955d3e85870850a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "YamlRawTextReaderTests scans only crates/**/*.rs, but the claimed invariant covers every consumer of .github YAML. There are concrete raw-text consumers outside that scope: scripts/miri_classify_verdict.py reads .github/workflows/miri.yml and performs substring/count assertions, and scripts/check-fast-fix-ring-guard.py explicitly byte-pins .github/workflows/fast-fix-ring.yml with comments treated as meaningful. Neither path is in _YAML_RAW_TEXT_READERS. Thus a comment edit that adds/removes one of the asserted Miri substrings, or any comment edit to the byte-pinned workflow, parses identically and is labeled YAML-INERT; the selector may then skip the matrix/gate that observes the raw text. The test's statement that it derives the true reader set is therefore false, and the carve-out is unsound as currently scoped.",
+    "file": "scripts/tests/test_ci_select.py",
+    "fix_hint": "Build a complete, fail-closed inventory covering all repository languages/consumers (Python, shell, JS, etc.), add every confirmed raw-text-read YAML path to _YAML_RAW_TEXT_READERS, and add regression tests using at least the miri.yml and fast-fix-ring.yml examples. If completeness cannot be enforced robustly, restrict the carve-out to an explicit allowlist of YAML files whose consumers are audited as parse-based.",
+    "severity": "major",
+    "title": "Raw-text consumer inventory ignores non-Rust repository consumers"
+   }
+  ],
+  "progress": null,
+  "summary": "The parsed-YAML equality mechanism is fail-closed in isolation, but the proof that it is safe for every .github YAML file is incomplete. The new guard inventories only Rust sources under crates/, while this repository has non-Rust scripts that deliberately consume workflow files as raw text. Consequently a comment-only edit can be classified YAML-INERT even though it changes a repository gate/self-test, allowing the CI selector to omit the lane that would detect it.",
+  "verdict": "request_changes"
+ }
+}
