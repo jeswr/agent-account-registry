@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1692,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b1ecf0480adc832adb3b54f5f60cdaafe970df4a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`all(isinstance(row, dict) ...)` only validates each row's outer type. The matcher still evaluates `marker in (i.get(\"body\") or \"\")`, which raises `TypeError` for a row such as `{\"body\": 42}`, and then reads `i[\"number\"]`, which raises `KeyError` for `{\"body\": \"<matching marker>\"}` without `number` (the title fallback has the same indexed read). Thus a successful `gh` call returning malformed-but-object-shaped JSON can still propagate out of `main()` and take down upsert/recovery-close. The new tests exercise only scalar rows, so they do not detect this remaining boundary hole.",
+    "file": "scripts/metrics-alert.py",
+    "fix_hint": "Validate the complete row shape needed by the matcher before using any row (including a usable issue number and string-or-null `title`/`body`), refusing the whole listing on any invalid row, or rewrite matching so every JSON value is handled without exception while preserving whole-payload refusal. Add wrapped `run_main` cases for an object with non-string `body` and a matching object missing/invalid `number`, asserting warning, no payload echo, and no mutation.",
+    "severity": "major",
+    "title": "Malformed issue objects still escape the payload guard and crash the tick"
+   }
+  ],
+  "progress": null,
+  "summary": "The added all-dicts check correctly prevents scalar rows from reaching `.get()`, and the new main-path assertions meaningfully verify soft-skip, payload redaction, and absence of mutations in both watchdog modes. However, the validation stops at the container type. A syntactically valid JSON object can still have a missing `number` or a non-string `body`; both reach the matcher and can raise, defeating the stated goal of degrading on an unusable successful `gh issue list` payload. The row schema must be validated (or matching made total) and tested before this is complete.",
+  "verdict": "request_changes"
+ }
+}
