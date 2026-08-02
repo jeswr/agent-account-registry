@@ -1235,7 +1235,13 @@ def backfill_workflow_seam_report():
                                           .get("REQUESTED")),
         "resolver_step_unconditional": (resolve_step is not None and "if" not in resolve_step
                                         and not resolve_step.get("continue-on-error")),
-        "resolver_errexit": "set -euo pipefail" in resolve_run,
+        # EVERY command the runner's shell executes, in order — the heredoc body is stdin DATA,
+        # not commands. Pinned as a list so the self-test can exact-match it: a containment probe
+        # for `set -euo pipefail` is equally satisfied by a block that runs `set +o pipefail`
+        # straight after it, and THAT tree turns a resolver refusal into `refuse | tee` — tee
+        # exits 0, so the step and the whole targets job report SUCCESS publishing no `repos`
+        # (AGENTS.md pre-flight 6: exact-match at the YAML seam, never containment).
+        "resolver_shell_commands": _split_heredoc(resolve_run)[0],
         # Without the `| tee -a "$GITHUB_OUTPUT"` the resolver computes the right answer and
         # discards it: `steps.resolve.outputs.repos` renders empty and the matrix sweeps nothing,
         # with every text assertion above still green.
@@ -1244,14 +1250,37 @@ def backfill_workflow_seam_report():
     }
 
 
-def backfill_targets_resolver_source():
-    """The python heredoc the `targets` job's `resolve` step runs — extracted and COMPILED.
+def _split_heredoc(run_text):
+    """`(shell_command_lines, heredoc_body_lines, reason)` for a `run:` block with one heredoc.
 
-    Returns `(source, None)`, or `(None, reason)` when there is no resolver to extract. Every
-    seam assertion above reads workflow TEXT, and text cannot tell a policy-derived resolver from
+    The shell lines are what the runner's shell EXECUTES; the heredoc body is stdin data. Split
+    once, here, so the seam report and the resolver extractor below cannot drift apart (#958).
+    `reason` is a string when the block does not carry exactly one terminated `<<'EOF'`, and then
+    `heredoc_body_lines` is None — but `shell_command_lines` is still every non-blank line, so an
+    exact-match assertion on it stays meaningful (and red) for such a tree rather than vacuous."""
+    lines = str(run_text or "").split("\n")
+    # Containment, not `endswith`: the shipped opener pipes (`<<'EOF' | tee -a "$GITHUB_OUTPUT"`).
+    opens = [i for i, line in enumerate(lines) if "<<'EOF'" in line]
+    if len(opens) != 1:
+        return ([line for line in lines if line.strip()], None,
+                f"the resolver must run exactly one `<<'EOF'` heredoc, found {len(opens)}")
+    body = lines[opens[0] + 1:]
+    closes = [i for i, line in enumerate(body) if line.strip() == "EOF"]
+    if not closes:
+        return ([line for line in lines if line.strip()], None,
+                "the resolver's heredoc is unterminated")
+    shell = lines[:opens[0] + 1] + body[closes[0] + 1:]
+    return [line for line in shell if line.strip()], body[:closes[0]], None
+
+
+def backfill_targets_resolver_source():
+    """The `targets` job's `resolve` step: `(heredoc_source, whole_run_block, None)`.
+
+    Returns `(None, None, reason)` when there is no resolver to extract. Every seam assertion
+    above reads workflow TEXT, and text cannot tell a policy-derived resolver from
     `echo 'repos=["one/hardcoded-repo"]'` — which is exactly the defect #1544 exists to kill. So
     the self-test EXECUTES this source against synthetic policy fixtures and asserts the row it
-    emits.
+    emits, and executes the whole `run` block in a shell to assert the step's own exit status.
 
     It returns a reason rather than raising ON PURPOSE: the headline mutant here (a hardcoded
     `echo` in place of the resolver) carries no heredoc at all, and raising would abort the suite
@@ -1260,22 +1289,17 @@ def backfill_targets_resolver_source():
     steps = (_workflow("backfill-provenance.yml")["jobs"].get("targets") or {}).get("steps") or []
     found = [s for s in steps if isinstance(s, dict) and s.get("id") == "resolve"]
     if len(found) != 1:
-        return None, f"expected exactly one `id: resolve` step in `targets`, found {len(found)}"
-    lines = str(found[0].get("run") or "").split("\n")
-    # Containment, not `endswith`: the shipped opener pipes (`<<'EOF' | tee -a "$GITHUB_OUTPUT"`).
-    opens = [i for i, line in enumerate(lines) if "<<'EOF'" in line]
-    if len(opens) != 1:
-        return None, f"the resolver must run exactly one `<<'EOF'` heredoc, found {len(opens)}"
-    body = lines[opens[0] + 1:]
-    closes = [i for i, line in enumerate(body) if line.strip() == "EOF"]
-    if not closes:
-        return None, "the resolver's heredoc is unterminated"
-    source = textwrap.dedent("\n".join(body[:closes[0]]))
+        return None, None, f"expected exactly one `id: resolve` step in `targets`, found {len(found)}"
+    run_text = str(found[0].get("run") or "")
+    _, body, reason = _split_heredoc(run_text)
+    if reason is not None:
+        return None, None, reason
+    source = textwrap.dedent("\n".join(body))
     try:
         compile(source, "<targets.resolve>", "exec")
     except SyntaxError as exc:
-        return None, f"the resolver's heredoc does not compile: {exc}"
-    return source, None
+        return None, None, f"the resolver's heredoc does not compile: {exc}"
+    return source, run_text, None
 
 
 def _self_test():
@@ -1676,15 +1700,22 @@ def _self_test():
           seam["resolver_requested_binding"], "${{ inputs.target_repo }}")
     check("the resolver step is UNCONDITIONAL (an `if:`/`continue-on-error` here fails it green)",
           seam["resolver_step_unconditional"], True)
-    check("the resolver keeps `set -euo pipefail` (without pipefail `| tee` masks its refusal)",
-          seam["resolver_errexit"], True)
+    # Exact-match the shell's whole command SEQUENCE, not a `"set -euo pipefail" in run` probe.
+    # That probe stays green for a tree that runs `set +o pipefail` on the very next line, and
+    # with pipefail off a refusing resolver becomes the left side of `| tee` — tee exits 0, the
+    # step succeeds, and the targets job publishes no usable `repos` while every text assertion
+    # here reads green. The list form reds an INSERTED command, a deleted `set`, and a rewritten
+    # pipeline alike; the two execution-seam rows further down prove the resulting exit status.
+    check("the resolver's shell runs errexit+pipefail and NOTHING that could turn them back off",
+          seam["resolver_shell_commands"],
+          ["set -euo pipefail", "python3 - <<'EOF' | tee -a \"$GITHUB_OUTPUT\""])
     check("the resolver's stdout is APPENDED to $GITHUB_OUTPUT (else `repos` publishes nothing)",
           seam["resolver_emits_to_step_output"], True)
 
     # ...and the resolver's BEHAVIOUR, by executing the shipped heredoc. Text assertions cannot
     # distinguish "derived from policy" from "a literal that happens to look derived", so the step
     # is run against synthetic policy trees and asserted on what it emits.
-    _resolver_src, _resolver_why = backfill_targets_resolver_source()
+    _resolver_src, _resolver_run, _resolver_why = backfill_targets_resolver_source()
 
     def _resolve_targets(policy_toml, requested=None):
         """`(output_name, parsed_value)` the SHIPPED resolver emits for this policy tree.
@@ -1731,6 +1762,42 @@ def _self_test():
                 else:
                     os.environ["REQUESTED"] = saved_requested
 
+    def _resolve_step_result(policy_toml):
+        """`(step_succeeded, $GITHUB_OUTPUT text)` from running the step's WHOLE `run` block.
+
+        `_resolve_targets` above executes only the heredoc's PYTHON, so it is structurally blind
+        to the shell around it — every one of its rows stays green when `set +o pipefail` runs
+        before the pipeline. That mutant is the whole hazard: a resolver REFUSAL is then just the
+        left side of `| tee`, `tee` exits 0, so the step and the targets job SUCCEED having
+        published no `repos`. Only the execution seam can see it, so the shipped `run` text is
+        handed to bash verbatim, in a temp cwd with a fixture policy and a real $GITHUB_OUTPUT.
+
+        Named strings, never exceptions, for the same pre-flight-4 reason as `_resolve_targets`."""
+        if _resolver_run is None:
+            return f"NO-RESOLVER: {_resolver_why}"
+        with tempfile.TemporaryDirectory() as workdir:
+            os.makedirs(os.path.join(workdir, "policy"))
+            with open(os.path.join(workdir, "policy", "repos.toml"), "w",
+                      encoding="utf-8") as handle:
+                handle.write(policy_toml)
+            out_path = os.path.join(workdir, "github_output")
+            with open(out_path, "w", encoding="utf-8"):
+                pass
+            # `set -u` is in force, so GITHUB_OUTPUT must exist; REQUESTED is bound by the step's
+            # `env:` on a real runner and renders to the empty string when the input is unset —
+            # pinned here too, so an inherited REQUESTED cannot reach the fixture. The requested-
+            # target paths are asserted by `_resolve_targets` above; this seam tests the SHELL.
+            env = {**os.environ, "GITHUB_OUTPUT": out_path, "REQUESTED": ""}
+            try:
+                done = subprocess.run(["bash", "-c", _resolver_run], cwd=workdir, env=env,
+                                      capture_output=True, text=True, timeout=120, check=False)
+            except (OSError, subprocess.SubprocessError) as exc:
+                # Includes TimeoutExpired: a mutant that hangs must red THIS row, not abort the
+                # suite with every check below it unrun (AGENTS.md pre-flight 4).
+                return f"UNRUNNABLE: {type(exc).__name__}"
+            with open(out_path, encoding="utf-8") as handle:
+                return done.returncode == 0, handle.read().strip()
+
     # Fixture repositories named so they appear NOWHERE in the workflow, in policy/repos.toml, or
     # in this harness (pre-flight 2b/2c): the expected values below cannot be satisfied by any
     # constant the resolver could read, and no mutant's substituted value collides with them.
@@ -1759,6 +1826,15 @@ def _self_test():
           _resolve_targets(_POLICY, "zzz-fixture/delta"), "REFUSED")
     check("policy enabling NOTHING is REFUSED — never an empty matrix that reports success",
           _resolve_targets(_POLICY_NONE_ENABLED), "REFUSED")
+    # ...and the same two directions at the SHELL seam, which is where the refusal is converted
+    # into the step's exit status. A refusal the runner scores as SUCCESS is worse than no sweep:
+    # `targets` goes green, `needs.targets.outputs.repos` is empty, `fromJSON('')` collapses the
+    # matrix, and nothing anywhere reports that the population was not swept.
+    check("a resolver REFUSAL fails the shipped step (pipefail, not swallowed by `| tee`)",
+          _resolve_step_result(_POLICY_NONE_ENABLED), (False, ""))
+    check("...and a resolved sweep succeeds, publishing `repos=` into $GITHUB_OUTPUT",
+          _resolve_step_result(_POLICY),
+          (True, 'repos=["zzz-fixture/alpha", "zzz-fixture/beta"]'))
     check("two-page slurped listing flattens (sol r5)",
           flatten_pull_pages([[{"number": 1}], [{"number": 2}, {"number": 3}]]),
           [{"number": 1}, {"number": 2}, {"number": 3}])
