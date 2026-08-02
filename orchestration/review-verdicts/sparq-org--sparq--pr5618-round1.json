@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5618,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7d2e7fa1b2e76c8eed30d2846b5920ea61258be4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`DeployOnlyInertnessTests.test_no_deploy_entry_is_referenced_by_a_rust_ci_workflow` skips every `/`-suffixed entry, including `deploy/`, while its class/docstrings claim the suite will fail if a deploy path is later wired into a Rust-CI workflow. `ci_audit_inputs.py` covers crate source reads and the Cargo-manifest check covers crates under the directory, but neither detects a Rust workflow shell step that directly consumes a file under `deploy/`. The current listed Rust workflows do not appear to do so, so this is not a present unsound skip, but the advertised regression protection is incomplete.",
+    "file": "scripts/tests/test_ci_select.py",
+    "fix_hint": "Add a structural check for direct `deploy/` references in the enumerated Rust-CI workflows (with a narrowly documented mechanism for harmless prose if necessary), or narrow the comments to state that workflow-level references remain convention-audited rather than live-enforced.",
+    "severity": "minor",
+    "title": "Directory-prefix inertness guard does not inspect Rust workflow references"
+   }
+  ],
+  "progress": null,
+  "summary": "The classifier keeps a fail-closed `mixed`/`engine` path for any non-inert file, the workflow case arms exactly match `_INERT_CLASSES`, and the focused tests cover deploy-only, inert unions, engine-tainted batches, empty closures, and wiring. I found no correctness or security defect that should block this change. One minor test-strength issue remains: the deploy-directory future-inertness claim is broader than the guard that implements it.",
+  "verdict": "approve"
+ }
+}
