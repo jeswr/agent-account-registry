@@ -811,6 +811,27 @@ def review_service_order(items, generated_at):
     return ordered[offset:] + ordered[:offset]
 
 
+def review_service_queue(plan, repo):
+    """[registry #1515] THE per-repo review service queue CLAIM serves — the partition AND the
+    rotation, in ONE production expression the self-test can call, so what is tested is the code
+    dispatch() runs rather than a fixture-local re-implementation of it (the `normalize_plan_order`
+    doctrine above; an inline call-site expression is only pinnable by its SHAPE, and a shape pin
+    that never reads the queue argument accepts `[]`, the unfiltered global list, or another
+    repository's rows — review r1 on #1711).
+
+    Partition FIRST, rotate SECOND, and per repo: the caller's loop already handles one repository
+    per iteration, and rotating the global list before filtering would split a repo's group across
+    the wrap and yield no rotation at all for every repo but one.
+
+    The filter is EXACT-MATCH on the plan row's own `repo`. This is a trust boundary, not just a
+    fairness one: `_dispatch_review_items` is called with THIS repo's policy, routing, allocator
+    and worker PR, so a widened, inverted or absent predicate would hand another repository's rows
+    to them. Totality is per repo — every row of `repo` is returned, none of any other repo's."""
+    return review_service_order(
+        [entry for entry in plan["review_items"] if entry["repo"] == repo],
+        plan["generated_at"])
+
+
 def validate_plan(document):
     """Strictly validate the entire PLAN artifact before any network mutation."""
     _require_exact_fields(document, PLAN_FIELDS, "plan")
@@ -8944,16 +8965,11 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
             # Privacy (locked decision 22b): public workflow logs never carry account handles.
             print(f"dispatched {kind} {repo}#{number}: model={model}, claim={claim_id[:8]}")
 
-        # [#1515] Rotate the head of THIS repo's review queue. The filter preserves the plan's
-        # ascending `pr_number` order, which as a service order starves everything above the
-        # capacity cut-off forever; `review_service_order` re-anchors the start deterministically
-        # from the plan's own timestamp without dropping a row. Per-repo (not over the global
-        # list) because this loop already partitions by repo — rotating the global list and then
-        # filtering would split a repo's group across the wrap and yield no rotation at all for
-        # every repo but one.
-        repo_review_items = review_service_order(
-            [entry for entry in plan["review_items"] if entry["repo"] == repo],
-            plan["generated_at"])
+        # [#1515] THIS repo's review rows, with the head rotated. The plan's ascending
+        # `pr_number` order as a service order starves everything above the capacity cut-off
+        # forever; `review_service_queue` filters to this repo and re-anchors the start
+        # deterministically from the plan's own timestamp without dropping a row.
+        repo_review_items = review_service_queue(plan, repo)
         if repo_review_items:
             dispatched += _dispatch_review_items(
                 repo_review_items, repo, policy, routing, allocator, worker_pr,
@@ -10836,10 +10852,46 @@ def _self_test():
     assert _rota == list(range(10)), "review_service_order mutated its input"
     assert review_service_order([], "2026-08-01T01:53:00Z") == []
     assert review_service_order(["only"], "2026-08-01T01:53:00Z") == ["only"]
-    # (e) The real plan rows, rotated: the fixture's ascending 41/44/46 is served 46-first here, so
-    #     a PR is reached on its merits and not on its number.
-    _rota_plan = review_service_order(fixture["review_items"], "2026-08-01T01:53:00Z")
-    assert [_item["pr_number"] for _item in _rota_plan] == [46, 41, 44], _rota_plan
+    # (e) THE DELIVERY EDGE, on a real two-repository plan and through the SAME expression
+    #     dispatch() serves. This is what the AST pin in (g) cannot see: a queue argument that is
+    #     empty, unfiltered, or filtered on the wrong repository has the right SHAPE and would
+    #     either drop the lane's whole workload or hand another repo's rows to this repo's
+    #     policy/routing/allocator (review r1 on #1711).
+    _two = json.loads(json.dumps(mixed))          # repositories: aaa/first-lexically + example/repo
+    _extra = json.loads(json.dumps(_two["review_items"][0]))   # the aaa/first-lexically row
+    assert _extra["repo"] == "aaa/first-lexically", _extra
+    _extra["pr_number"] = 5
+    _two["review_items"].append(_extra)
+    validate_plan(normalize_plan_order(_two))     # a LEGAL plan in canonical global order
+    assert [(_i["repo"], _i["pr_number"]) for _i in _two["review_items"]] == [
+        ("aaa/first-lexically", 5), ("aaa/first-lexically", 41),
+        ("example/repo", 41), ("example/repo", 44), ("example/repo", 46)], _two["review_items"]
+    for _tick, _expected in (("2026-08-01T00:00:00Z", {"aaa/first-lexically": [41, 5],
+                                                       "example/repo": [44, 46, 41]}),
+                             ("2026-08-01T01:53:00Z", {"aaa/first-lexically": [5, 41],
+                                                       "example/repo": [46, 41, 44]})):
+        _two["generated_at"] = _tick
+        _delivered = []
+        for _repo, _want in _expected.items():
+            _queue = review_service_queue(_two, _repo)
+            # ALL and ONLY this repo's rows, in the expected rotated order. Pinned exactly, so an
+            # empty queue, the unfiltered global list and an inverted predicate are each red.
+            assert [_i["pr_number"] for _i in _queue] == _want, (_tick, _repo, _queue)
+            assert {_i["repo"] for _i in _queue} == {_repo}, (_tick, _repo, _queue)
+            _delivered.extend((_i["repo"], _i["pr_number"]) for _i in _queue)
+        # Across repositories the partition is TOTAL and disjoint: every planned review row is
+        # delivered exactly once, so per-repo service cannot become a silent global drop.
+        assert sorted(_delivered) == sorted(
+            (_i["repo"], _i["pr_number"]) for _i in _two["review_items"]), _delivered
+    # A repository with no review rows serves nothing (and must not borrow another's).
+    assert review_service_queue(_two, "zzz/no-such-repo") == []
+    # Fail-closed at the queue too: the timestamp is read from the hostile plan artifact.
+    _two["generated_at"] = "2026-08-01 01:53:00Z"
+    try:
+        review_service_queue(_two, "example/repo")
+        raise AssertionError("review_service_queue accepted a malformed plan generated_at")
+    except DispatchError:
+        pass
     # (f) FAIL-CLOSED on the hostile half. `generated_at` arrives from the plan artifact, so the
     #     rotation is re-gated on the SAME grammar validate_plan enforces and REFUSES rather than
     #     quietly falling back to the identity order — a silent fallback restores the starvation
@@ -10855,10 +10907,11 @@ def _self_test():
             except DispatchError:
                 pass
     # (g) THE CALL SITE. Every assertion above stays green while dispatch() keeps serving the bare
-    #     `(repo, pr_number)` comprehension, so the argument EXPRESSION is pinned on dispatch()'s
-    #     parsed AST: `repo_review_items` must be bound by a `review_service_order(...)` call whose
-    #     second argument is the plan's OWN validated timestamp. A literal or a substitute there
-    #     would freeze the head again with the whole rotation harness still passing.
+    #     `(repo, pr_number)` comprehension, so the binding is pinned on dispatch()'s parsed AST:
+    #     `repo_review_items` must come from `review_service_queue(plan, repo)` — the LIVE
+    #     validated plan and the loop's OWN repo, both arguments checked. A literal, a frozen
+    #     timestamp or a substituted repo there would freeze the head or cross the repo boundary
+    #     with the whole harness above still passing. (e) then covers what that call DELIVERS.
     def _service_order_violations(scope_body):
         assigns = [node for node in ast.walk(ast.Module(body=scope_body, type_ignores=[]))
                    if isinstance(node, ast.Assign)
@@ -10868,18 +10921,19 @@ def _self_test():
             return [f"expected exactly one repo_review_items binding, got {len(assigns)}"]
         value = assigns[0].value
         if not (isinstance(value, ast.Call)
-                and _callee_name(value.func) == "review_service_order"):
-            return [f"repo_review_items is not served through review_service_order: "
+                and _callee_name(value.func) == "review_service_queue"):
+            return [f"repo_review_items is not served through review_service_queue: "
                     f"{ast.unparse(value)}"]
-        if len(value.args) != 2 or ast.unparse(value.args[1]) != "plan['generated_at']":
-            return [f"the rotation must derive from the validated plan timestamp: "
+        if [ast.unparse(argument) for argument in value.args] != ["plan", "repo"] or value.keywords:
+            return [f"the review queue must be derived from the validated plan for THIS repo: "
                     f"{ast.unparse(value)}"]
         return []
     _service_scope = ast.parse(textwrap.dedent(inspect.getsource(dispatch))).body[0].body
     assert _service_order_violations(_service_scope) == [], \
         _service_order_violations(_service_scope)
-    # ...and that pin is itself mutation-tested against the three ways it could go permissive,
-    # applied to dispatch()'s REAL source — otherwise it is one more guard asserted to work.
+    # ...and that pin is itself mutation-tested against every way it could go permissive, applied
+    # to dispatch()'s REAL source — otherwise it is one more guard asserted to work. The last four
+    # are the queue-argument mutations the previous pin (which read only argument 2) accepted.
     for _probe, _replacement in {
             "reverted to the bare (repo, pr_number) comprehension":
                 "repo_review_items = [e for e in plan['review_items'] if e['repo'] == repo]",
@@ -10887,9 +10941,19 @@ def _self_test():
                 "repo_review_items = review_service_order("
                 "[e for e in plan['review_items'] if e['repo'] == repo], '2026-01-01T00:00:00Z')",
             "the helper called but its result thrown away":
-                "review_service_order([e for e in plan['review_items'] if e['repo'] == repo], "
-                "plan['generated_at'])\n"
+                "review_service_queue(plan, repo)\n"
                 "repo_review_items = [e for e in plan['review_items'] if e['repo'] == repo]",
+            "the lane's whole workload dropped":
+                "repo_review_items = review_service_queue({'review_items': [], "
+                "'generated_at': plan['generated_at']}, repo)",
+            "served the UNFILTERED global list (every repo's rows)":
+                "repo_review_items = review_service_order("
+                "plan['review_items'], plan['generated_at'])",
+            "filtered on a frozen repository instead of the loop's own":
+                "repo_review_items = review_service_queue(plan, 'example/repo')",
+            "the repo predicate inverted (every OTHER repo's rows)":
+                "repo_review_items = review_service_order("
+                "[e for e in plan['review_items'] if e['repo'] != repo], plan['generated_at'])",
     }.items():
         _probe_scope = ast.parse(textwrap.dedent(inspect.getsource(dispatch))).body[0].body
         _probe_loop = next(node for node in _probe_scope if isinstance(node, ast.For)
