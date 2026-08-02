@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1703,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ff38c5f824d843d65f05f24c37e8e2ecd84ef91b",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe added phase 1b remains a sound, non-vacuous regression test for the failed-primary/open-fallback state. It creates the fallback issue through the real delivery path, keeps the primary token unusable, passes the independently enumerated fallback marker, and checks three distinct observables: delivery result/state, the single open marker route, and absence of close/comment side effects. Those assertions detect an early unconditional supersede even when the subsequent retry reopens the issue and masks the final state. The recovery phase separately pins the one-open-route invariant after the primary succeeds. The helper derives its marker from the fixture action and inspects both repository stores, rather than reusing the production routing decision. No production behavior or trust check is weakened, and the diff contains no reviewer-directed instruction.",
+  "verdict": "approve"
+ }
+}
