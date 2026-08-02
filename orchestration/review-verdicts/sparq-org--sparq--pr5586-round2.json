@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5586,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e88f1042e4f5a5a6ae55a4cb7fff32f4cd3881b4",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major finding is resolved. `_enforce_unlegged` now includes every registry-named crate in enumeration even when it has no feature-matrix leg, validates its manifest and declared features, and performs the stale-entry sweep without the former `crate not in legged` escape. The focused `test_stale_entry_red_when_crate_has_no_leg` exercises the exact fragment-deletion shape, while converse tests cover a live gap and workspace-default execution for a legless registry crate. The 72-test scanner suite passes. The full live enforcement command could not be executed locally because PyYAML is absent, but this is an environment dependency already installed by the workflow rather than a defect in the change.",
+  "verdict": "approve"
+ }
+}
