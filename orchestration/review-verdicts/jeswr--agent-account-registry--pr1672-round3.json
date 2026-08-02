@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1672,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8b9c43f171acfadd8474dbb5e97e95b4d1ae99bb",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 closes the prior major finding. Section 6.1 now explicitly keeps both raw and derived candidate domains in the protected ephemeral/private handling class, prohibits every observed or derived hostname from durable or public telemetry, and requires allowlist entries to be independently typed by a trusted operator from provider documentation. Section 8.6 retains the load-bearing valid, repeated credential-encoded registrable-domain probe and now requires the candidate/review surface itself to contain zero marker occurrences. The document is internally consistent on this boundary: validation is only a bounds check, candidate frequency is not treated as sanitization, and durable telemetry is limited to counts and host-side allowlist-rule identifiers. I found no remaining correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
