@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1804,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d805106fdbf2c01fa89b122d1df1ff0a77fe1726",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly removes the definition-time capture of subprocess.run while preserving production behavior and explicit runner injection. The added regression row exercises probe() through its default write path, patches the module attribute, and verifies both the exact gh secret-set invocation and the resulting VALID verdict, so restoring the old default binding would fail non-vacuously. The patch does not weaken trust checks, expand permissions, expose token material, or introduce a permissive failure path.",
+  "verdict": "approve"
+ }
+}
