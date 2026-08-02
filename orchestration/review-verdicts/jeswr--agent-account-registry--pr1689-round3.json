@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1689,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d7de249934396a9d04925467c8d66ccc5b6e2f0b",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 approval remains supported. The complete Retry-After header value is passed unwrapped to a dedicated full-match parser, malformed and non-positive values fail closed to the existing exponential backoff, and accepted values share the established cap. The production call site and sleep path preserve those semantics. The tests are non-vacuous: they separately pin strict grammar, parser delegation and argument shape, zero-delay fallback through the real shared schedule, positive-delay honoring, and the HTTPError production leg. I found no remaining correctness, soundness, security, or test-validity issue in the diff.",
+  "verdict": "approve"
+ }
+}
