@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1770,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ae2caaa499c53b30baceb03fb359a4219d2899a4",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 diff is correct and complete. The added self-tests reach the production provider-capped scan and use literal, distinct expectations to verify that non-enabled accounts cannot affect firing, churn counts, or reset hints. The ACT case catches a removed/bypassed enabled-account filter through the hostile earlier reset, while the DO-NOTHING case catches the same defect through the later non-enabled limit record, reason, and reset hint. Expected values are not derived from production constants or fixture transformations, and both firing and non-firing behavior remain covered. The diff changes tests only, weakens no trust control, exposes no sensitive data, and contains no instruction-like injection. There are no review findings.",
+  "verdict": "approve"
+ }
+}
