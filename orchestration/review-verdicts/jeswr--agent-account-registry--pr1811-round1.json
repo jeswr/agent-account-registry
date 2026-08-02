@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1811,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "880de09edec39b6020e7cdae116f573cbf15148c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly converts executed-page harness failures into a string-like sentinel whose nested subscription and .get access remain non-throwing, so the existing named checks continue to run and fail instead of aborting the self-test. The added checks exercise both the throwing and successful paths against real Node execution, verify the sentinel's traversal behavior and diagnostic, and pin the production call site to the guarded wrapper. Successful page results remain unaltered, while failures remain fail-closed because the sentinel values disagree with the rows' independently stated expectations. No security or trust-plane weakening is introduced.",
+  "verdict": "approve"
+ }
+}
