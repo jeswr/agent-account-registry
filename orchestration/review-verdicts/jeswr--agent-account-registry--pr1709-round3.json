@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1709,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5fefe7ef87fabd0f66d893362b78a6a46a9ecdb9",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The loop binding check computes `iter_names` with `ast.walk(loop.iter)`, so syntactic presence of a bound target name is enough even when the iterable cannot yield it. For example, production can be changed to `for target in targets and []:` (or `for target in [] and targets:`). In both cases `targets` remains in `iter_names`, there is no `ast.Slice`, and the park call in the body is live in the AST, so `_park_call_site` returns `dispatch`; at runtime the loop always executes zero iterations and no holder is parked. This preserves the same exists-versus-runs bypass despite the new expression reachability logic.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Make the iterable proof establish that the loop directly iterates the bound target collection, rather than accepting the name anywhere below an arbitrary expression (or conservatively refuse expression shapes whose equivalence cannot be proved). Add synthetic refusals for both `targets and []` and `[] and targets`, prove the old checker accepts them, and retain accepted coverage for the exact live iterable shape used by production.",
+    "severity": "blocker",
+    "title": "A dead short-circuit loop iterable still certifies the park batch"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe prior round's constant short-circuit finding is addressed for branches and expressions containing the park call. However, the seam still uses exhaustive `ast.walk(loop.iter)` merely to find the bound target name and does not prove that the loop iterable actually yields those targets. A constant short-circuit iterable can retain the name syntactically while guaranteeing zero iterations, so the checker still certifies a park call that never runs. This is a new blocker relative to round 2, so progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
