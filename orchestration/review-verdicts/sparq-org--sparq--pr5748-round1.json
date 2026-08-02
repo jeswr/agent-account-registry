@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5748,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f2cb000c381c14949d2cb120c610d0a8789fd07f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 1.2, 3, 5, and 6 treat update_in_place_capturing as returning a set-valued actual delta. It does not: the DELETE DATA path applies the requested batch and then records that entire batch, including triples absent from the replica. Consequently, naming a masked triple produces a captured delete that fails vis_a validation, so step 5 denies the request. This contradicts the \u00a75 promise that deleting a masked/absent quad is a permitted silent no-op and makes the verdict differ between the proposed semantics and mechanism.",
+    "file": "research/pattern-scoped-update-enforcement-2026-08.md",
+    "fix_hint": "Revise the mechanism to derive effective deletes by intersecting each requested delete batch with the replica state at that operation, or extend capture with an actual-change mode. Specify and test DELETE DATA for (1) absent, (2) masked-but-present, and (3) visible-present triples; the first two must have identical outcomes and effects under the stated semantics. Do not describe the current capture log as an actual set-valued delta until this distinction is addressed.",
+    "severity": "major",
+    "title": "Captured DELETE DATA is not the actual state-changing delta assumed by W1"
+   },
+   {
+    "body": "The \u00a76.1 pipeline first runs the complete update against replica_graph and only afterward lowers Clear/Drop into explicit deletes over the replica. At that point the affected replica graph has already been cleared or dropped, so its visible pre-effect triples are unavailable. This is especially incorrect for ordered multi-operation requests: lowering from either the initial or final replica cannot reproduce the state at each structural operation, and flattening effects can change insert/delete ordering.",
+    "file": "research/pattern-scoped-update-enforcement-2026-08.md",
+    "fix_hint": "Require structural lowering during execution, against the replica state immediately before each Clear/Drop, and preserve the ordered effect stream. Alternatively retain per-operation snapshots or reject structural operations in W1. Add a real multi-operation acceptance test such as INSERT; CLEAR; INSERT and verify replay matches execution on the masked replica while masked store triples survive.",
+    "severity": "major",
+    "title": "Structural effects cannot be lowered after capture from the final replica"
+   }
+  ],
+  "progress": null,
+  "summary": "The record identifies the existing WHERE-clause disclosure well, but its proposed W1 mechanism does not implement the per-construct semantics it claims. The existing capture API records requested DELETE DATA terms even when absent, and structural effects cannot be lowered from the already-mutated final replica. Both gaps can turn intended silent no-ops into denials or produce an incorrect replay for multi-operation updates.",
+  "verdict": "request_changes"
+ }
+}
