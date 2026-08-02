@@ -1807,6 +1807,14 @@
    "model_alias": "sol",
    "exit_class": "success",
    "run_id": "30762905499.1"
+  },
+  {
+   "ts": 1785698205,
+   "provider": "fleet",
+   "account": "5f5b2dc3fb8e231b",
+   "model_alias": "",
+   "exit_class": "success",
+   "run_id": "30762554023.1"
   }
  ]
 }
