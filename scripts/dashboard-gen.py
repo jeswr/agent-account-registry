@@ -4249,6 +4249,154 @@ def _self_test():
           {label: pair for label, pair in anchored_thresholds.items() if pair[0] <= pair[1]},
           {})
 
+    # --- #1085: PER-TARGET JITTER, the optional half of #559 — ANSWERED here, not implemented.
+    #
+    # #559 asked optionally for per-target jitter so independent mesh sources "do not converge on
+    # the same second": two sources watching one target read the same COMPLETED anchor in the same
+    # tick, both conclude stale, and both dispatch. The #559 live-run guard BOUNDS that duplicate
+    # (it can no longer become self-sustaining) but cannot remove it, because neither kick is live
+    # yet at the moment the other reads.
+    #
+    # Jitter costs something on EVERY fire — #559's own sketch was a `sleep` in the keepalive step,
+    # i.e. runner minutes on ~96 fires a day per leg — so #559 required the residual duplicate rate
+    # to be MEASURED before paying it. That measurement cannot run from inside the worker container
+    # (no token, no network), and it does not have to: convergence is a STRUCTURAL property of the
+    # mesh's source -> target map, and that map is readable offline out of the three real step
+    # bodies. A target watched by exactly ONE source has no second source to converge with, whatever
+    # a dispatch-fire histogram would say. Two findings came out of reading it, and the rows below
+    # are what hold each of them in place:
+    #
+    # (1) NO target in this mesh is watched by more than one source. The six registry legs, the
+    #     cross-repo sweeper and metrics.yml's mutual kick of the dashboard partition cleanly, so
+    #     the convergence jitter would dephase does not exist to be dephased. The duplicate this
+    #     mesh really does produce is a keepalive kick racing the target's OWN cron delivery — and
+    #     jitter in the SOURCE cannot dephase that, because the cron is not ours to move. That one
+    #     is already addressed from the other side by the #680 bound above: a threshold strictly
+    #     above one cadence never kicks a punctual cron behind its own fire.
+    #
+    # (2) When a second source does appear, `hash(target) % window` — the derivation #559 itself
+    #     suggested — is the WRONG KEY and would buy nothing: both sources hash the SAME target
+    #     name to the SAME offset and stay exactly as converged as they were. A jitter that
+    #     actually dephases has to be keyed on the (source, target) PAIR.
+    #
+    # So the deliverable is the premise, enforced: the map pinned by equality, plus a collision
+    # detector that reds the moment any target acquires a second watcher — which is precisely the
+    # condition under which jitter stops being speculative and becomes required.
+    # ------------------------------------------------------------------------------------------
+    # Spelled out as a literal in every expected value below rather than interpolated from here:
+    # an expectation that reads its sentinel from the code under test agrees with any value that
+    # code happens to produce, which is the one shape an assertion cannot fail in.
+    _MESH_SELF = "<self>"
+
+    def _keepalive_leg_repository(script, leg):
+        """The ONE repository a keepalive leg addresses, read out of that leg's OWN
+        `repos/<x>/actions/…` endpoints rather than restated here.
+
+        `${GITHUB_REPOSITORY}` normalises to `<self>`, because the two registry legs name their
+        repository only through that variable: without the normalisation every registry target
+        would carry a different key from every other and the collision row below could never fire
+        at all. Anything other than exactly one addressed repository is a REFUSAL — a leg whose
+        target repository cannot be identified must not enter a map that decides whether two legs
+        watch the same thing."""
+        addressed = sorted(set(re.findall(
+            r"repos/(\$\{GITHUB_REPOSITORY\}|[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/actions/", script)))
+        # Resolved BEFORE the refusal, never by indexing the list under the guard: a guard that is
+        # the only thing between an empty list and `addressed[0]` cannot be measured — deleting it
+        # raises IndexError from the mutated line itself, aborting the suite and recording as a
+        # kill while every row below it never ran.
+        repository = addressed[0] if len(addressed) == 1 else None
+        if repository is None:
+            raise DashboardError(
+                f"{leg} addresses {len(addressed)} repositories, expected exactly 1 — refusing to "
+                "place its targets in the mesh map under a guessed repository")
+        return _MESH_SELF if repository == "${GITHUB_REPOSITORY}" else repository
+
+    def _mesh_watchers(legs):
+        """{(repository, workflow-file): [source-leg, …]} over the whole keepalive mesh."""
+        watchers = {}
+        for leg, (script, specs) in sorted(legs.items()):
+            repository = _keepalive_leg_repository(script, leg)
+            for name in sorted(specs):
+                watchers.setdefault((repository, name), []).append(leg)
+        return watchers
+
+    def _mesh_labelled(watchers, only_shared=False):
+        return {f"{repository} {name}": legs
+                for (repository, name), legs in sorted(watchers.items())
+                if not only_shared or len(legs) > 1}
+
+    # The reader's refusals and its normalisation, EXECUTED. `jit-org/*` appears nowhere else in
+    # this suite, so the positive controls cannot pass on a value the harness already had.
+    check("[#1085] the repository a mesh target is keyed by is READ out of the leg's own "
+          "`repos/<owner>/<name>/actions/…` endpoints, and `${GITHUB_REPOSITORY}` normalises to a "
+          "single key so the two registry legs are seen to watch ONE repository — a leg addressing "
+          "no repository, or two different ones, REFUSES rather than entering the map under a guess",
+          [_raises_dashboard(lambda: _keepalive_leg_repository("gh api -X POST dispatches", "x")),
+           _raises_dashboard(lambda: _keepalive_leg_repository(
+               "repos/jit-org/one/actions/workflows/probe.yml/runs?per_page=1\n"
+               "repos/jit-org/two/actions/workflows/probe.yml/dispatches", "x")),
+           _keepalive_leg_repository("repos/jit-org/three/actions/workflows/probe.yml/runs", "x"),
+           _keepalive_leg_repository(
+               "repos/${GITHUB_REPOSITORY}/actions/workflows/probe.yml/runs", "x")],
+          [True, True, "jit-org/three", "<self>"])
+    # The detector driven over a mesh that DOES collide — without this the production row below is
+    # satisfied by a detector that can never report anything, which is the whole failure mode a
+    # zero-row assertion has. `probe-c` watches the same workflow FILE in a different repository
+    # and must NOT be folded in: a detector keyed on the file name alone reports a collision that
+    # is not there, and would have declared this mesh in need of jitter it does not need.
+    _mesh_probe = {
+        "probe-a": ("repos/jit-org/one/actions/workflows/shared.yml/runs?per_page=1",
+                    {"shared.yml": (900, ""), "solo.yml": (900, "")}),
+        "probe-b": ("repos/jit-org/one/actions/workflows/shared.yml/runs?per_page=1",
+                    {"shared.yml": (900, "")}),
+        "probe-c": ("repos/jit-org/two/actions/workflows/shared.yml/runs?per_page=1",
+                    {"shared.yml": (900, "")}),
+    }
+    check("[#1085] the collision detector DETECTS one: over a fixture mesh where two legs watch a "
+          "target it names both watchers, a singly-watched target is not reported, and the same "
+          "workflow file in another repository is a different target",
+          (_mesh_labelled(_mesh_watchers(_mesh_probe), only_shared=True),
+           sorted(_mesh_labelled(_mesh_watchers(_mesh_probe)))),
+          ({"jit-org/one shared.yml": ["probe-a", "probe-b"]},
+           ["jit-org/one shared.yml", "jit-org/one solo.yml", "jit-org/two shared.yml"]))
+
+    # metrics.yml's mutual kick is the mesh's THIRD source and lives in another file entirely, so
+    # nothing above has ever read it. Extracted the same way as the two dashboard legs; its
+    # staleness `for spec in …` list is its watch list. The publish kick beside it in the same step
+    # is deliberately NOT a member: it is causal rather than staleness-driven and is deduped by the
+    # dashboard's own publish decision, so it cannot converge with a stale-anchor reader.
+    metrics_workflow = _repo_file(".github", "workflows", "metrics.yml")
+    metrics_keepalive_script = _workflow_step_script(metrics_workflow, "dashboard-publish")
+    metrics_specs = _keepalive_specs(metrics_keepalive_script,
+                                     "metrics.yml's mutual keepalive leg")
+    mesh_watchers = _mesh_watchers({
+        "dashboard.yml/registry-keepalive": (keepalive_script, keepalive_specs),
+        "dashboard.yml/sparq-keepalive-dispatch": (sparq_script, sparq_specs),
+        "metrics.yml/dashboard-publish": (metrics_keepalive_script, metrics_specs),
+    })
+    check("[#1085] the whole mesh's source -> target map, read out of the three REAL step bodies "
+          "and pinned by equality — a leg that quietly stops watching a workflow, or one that "
+          "stops being extractable at all, goes red HERE rather than letting the single-watcher "
+          "row below pass because there is nothing left to collide",
+          _mesh_labelled(mesh_watchers),
+          {"<self> conflict-resolver.yml": ["dashboard.yml/registry-keepalive"],
+           "<self> curate.yml": ["dashboard.yml/registry-keepalive"],
+           "<self> dashboard.yml": ["metrics.yml/dashboard-publish"],
+           "<self> dispatch.yml": ["dashboard.yml/registry-keepalive"],
+           "<self> groom.yml": ["dashboard.yml/registry-keepalive"],
+           "<self> metrics.yml": ["dashboard.yml/registry-keepalive"],
+           "<self> retriage.yml": ["dashboard.yml/registry-keepalive"],
+           "sparq-org/sparq rearm-sweeper.yml": ["dashboard.yml/sparq-keepalive-dispatch"]})
+    check("[#1085] ...and NO target in it is watched by more than one source (offenders listed as "
+          "target -> watching legs). This is the premise that makes per-target jitter unnecessary "
+          "and the exact condition under which it becomes REQUIRED: two sources on one target read "
+          "the same COMPLETED anchor in the same tick, both conclude stale and both dispatch, and "
+          "the #559 live-run guard cannot see it because neither kick is live yet when the other "
+          "reads. Adding a second watcher reds this row — dephase on the (SOURCE, target) pair, "
+          "never on `hash(target)`, which both sources compute identically",
+          _mesh_labelled(mesh_watchers, only_shared=True),
+          {})
+
     keepalive_gh_stub = r'''#!/usr/bin/env bash
 # Hermetic `gh` for dashboard.yml's cron-keepalive body. Every argv is recorded; the three reads
 # the body makes are served from fixture files; an argv this stub does not model exits 64, so a
