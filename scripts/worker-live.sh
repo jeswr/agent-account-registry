@@ -812,6 +812,12 @@ for p in paths:
 # nothing on stdout) rather than printing a partial digest, so every caller can `|| die`.
 _worktree_seal_digest() {
   local idx digest=''
+  # `mktemp` leaves a ZERO-BYTE file, and a zero-byte index is not a parseable index — but a
+  # tree-ish-only `git read-tree` never PARSES $GIT_INDEX_FILE, it only writes it (builtin/read-tree
+  # reads the existing index solely for --reset/--merge/--prefix, none of which are used here), so
+  # the empty file is overwritten with a valid index and the `git add` below parses that. Verified
+  # both directions on git 2.39: plain `read-tree HEAD` rc 0, `read-tree --reset HEAD` dies with
+  # "index file smaller than expected". Keep this call tree-ish-only; adding --reset would break it.
   idx=$(mktemp "${TMPDIR:-/tmp}/worker-seal-index.XXXXXX") || return 1
   if GIT_INDEX_FILE="$idx" git read-tree HEAD 2>/dev/null &&
       GIT_INDEX_FILE="$idx" git add -A -- . 2>/dev/null; then
