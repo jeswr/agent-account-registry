@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5711,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d3635413c0a10fcf87a12675413ca7fd570801e5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The workflow change correctly replaces job-scoped `key` inputs with one `shared-key` for the run matrix and dependent merge job, while retaining the existing save-on-main posture. The new hermetic test checks both the relevant rust-cache key-construction distinction and the live YAML wiring, including explicit non-vacuity guards. No correctness, soundness, test-validity, or security issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
