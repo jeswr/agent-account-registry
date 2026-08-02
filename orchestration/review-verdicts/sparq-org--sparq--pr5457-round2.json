@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5457,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f2f3d5dffd5b4c4064f41ed42a9eaab308770c9f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "print_census labels every no-area, no-needs:area issue as `with no board state at all`, although the tests intentionally include unparked issues carrying priority, role, kind, and needs:user labels. The census classification is correct; only the human-facing description overstates what was measured. The workflow's example tally repeats the same phrase.",
+    "file": "scripts/triage-area.py",
+    "fix_hint": "Rename the category to the precise measured condition, such as `without needs:area`, `unparked`, or `with neither area:* nor needs:area`, and update the corresponding wording in .github/workflows/triage-area.yml consistently.",
+    "severity": "minor",
+    "title": "Unparked issues are still inaccurately described as having no board state"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-one wording issue remains materially unchanged: the census correctly measures issues with neither an area:* label nor needs:area, but print_census still describes every unparked issue as having \"no board state at all\", and the workflow repeats that wording in its tally example. Such issues may carry priority, role, kind, or needs:user labels, as the added tests themselves demonstrate. This is a minor human-facing accuracy defect rather than a correctness, soundness, security, or test-validity failure, so approval remains appropriate, but progress is stagnant.",
+  "verdict": "approve"
+ }
+}
