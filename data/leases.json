@@ -53,12 +53,12 @@
   {
    "account": "58b7c92faa5b5ca5",
    "claim_id": "021ae1d4aa4a419681900b604228249e",
-   "holder": "fix:jeswr/agent-account-registry#1748@dispatch-30762554023.1",
+   "holder": "fix:jeswr/agent-account-registry#1748@30762999463.1",
    "package": "dashboard",
    "role": "fix",
    "model": "opus5",
-   "issued_at": 1785698177,
-   "expires_at": 1785704477
+   "issued_at": 1785698203,
+   "expires_at": 1785704503
   },
   {
    "account": "f79434c3ffba014f",
