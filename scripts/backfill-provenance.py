@@ -1170,6 +1170,10 @@ def backfill_workflow_seam_report():
     triggers = workflow.get("on") if "on" in workflow else workflow.get(True)
     inputs = (((triggers or {}).get("workflow_dispatch") or {}).get("inputs") or {})
     job = workflow["jobs"]["backfill"]
+    # `.get`, not an index: a DELETED targets job must surface as a named FAIL below, not as a
+    # KeyError that aborts the suite and leaves every check after this one unrun.
+    targets_job = workflow["jobs"].get("targets") or {}
+    strategy = job.get("strategy") or {}
     steps = job["steps"]
     step = next((s for s in steps if "backfill-provenance.py" in str(s.get("run") or "")), None)
     run = str((step or {}).get("run") or "")
@@ -1198,6 +1202,21 @@ def backfill_workflow_seam_report():
         "no_draft_convert_default": inputs.get("no_draft_convert", {}).get("default"),
         "step_env_bindings": {key: step_env.get(key)
                               for key in ("TARGET_REPO", "APPLY", "NO_DRAFT_CONVERT")},
+        # --- issue #1544: the sweep must be MACHINE-DRIVEN, over EVERY enabled target ------------
+        # Read the trigger and the matrix themselves. The APPLY expression above only proves what a
+        # scheduled run WOULD do, not that one ever happens, and `${{ matrix.repo }}` only proves
+        # where the target is read from, not what the matrix contains.
+        "schedule_crons": [str(entry.get("cron"))
+                           for entry in ((triggers or {}).get("schedule") or [])],
+        "target_repo_declared": "target_repo" in inputs,
+        "target_repo_default": inputs.get("target_repo", {}).get("default"),
+        "matrix_repo_expr": str((strategy.get("matrix") or {}).get("repo")),
+        "matrix_fail_fast": strategy.get("fail-fast"),
+        # The EXACT guard text on both jobs, not a containment probe: `job_ref_guarded` above is
+        # satisfied by `<the real guard> && false`, which skips every scheduled run while reading
+        # as a hardened ref check (AGENTS.md pre-flight 6; sparq #4743 shipped that mutant).
+        "job_if": guard,
+        "targets_job_if": str(targets_job.get("if") or ""),
     }
 
 
@@ -1547,6 +1566,42 @@ def _self_test():
           "github.event_name == 'schedule'" in _apply_expr, True)
     check("...while a manual run still defaults to a DRY RUN (inputs.apply is still consulted)",
           "inputs.apply" in _apply_expr, True)
+    # [#1544] ...and the CRON ITSELF, which is the whole fix and which NOTHING above pins. Delete
+    # `on.schedule` and every check to this point stays green: TARGET_REPO still reads the matrix
+    # and the APPLY expression still names `schedule` — it simply never renders true again. The
+    # workflow reverts to dispatch-only, which is the measured defect: an orphaned worker PR is
+    # fail-closed INVISIBLE to the review loop, so the population drains only when a human
+    # remembers to run this by hand (five stranded PRs on 2026-08-01). Exact-match on the parsed
+    # trigger, so both DELETING the cron (-> []) and SLOWING it are red, not silent.
+    check("the sweep is SCHEDULED, at the cadence #1544 shipped",
+          seam["schedule_crons"], ["23 */4 * * *"])
+    # Paired with the next check on purpose: `target_repo_default` reads None both when the input
+    # carries no default AND when the input is gone entirely, so on its own it is vacuous.
+    check("the manual single-target recovery path survives alongside the cron",
+          seam["target_repo_declared"], True)
+    # [#1555] A `default:` is materialised for workflow_dispatch, so ANY value here makes the
+    # documented "leave EMPTY to sweep every enabled target" unreachable from the UI/API — the
+    # manual path would silently disagree with its own description and with the schedule.
+    check("target_repo carries NO default (empty = sweep every enabled target stays reachable)",
+          seam["target_repo_default"], None)
+    # [#1544] The targets are POLICY-derived. A hardcoded matrix is the measured shape of both
+    # stalls — "nobody pointed it at this repo lately", not "it never ran" — and a second copy of
+    # the enabled set is what took dispatch fully down on 2026-08-01 (#1537/#1540). Assert the
+    # exact expression: a literal list here lints clean and strands every repo not named in it.
+    check("the matrix is the POLICY-derived target list, never a hardcoded copy",
+          seam["matrix_repo_expr"], "${{ fromJSON(needs.targets.outputs.repos) }}")
+    check("fail-fast is OFF (one target's failure must not cancel the other targets' sweep)",
+          seam["matrix_fail_fast"], False)
+    # A scheduled run that is SKIPPED is indistinguishable from no schedule at all, and the
+    # containment probe above (`job_ref_guarded`) accepts `<guard> && false`. Both jobs carry the
+    # same guard and both must be exact — `targets` is `needs:`-upstream, so skipping it alone
+    # takes the whole matrix with it.
+    _REF_GUARD = ("${{ github.ref == format('refs/heads/{0}', "
+                  "github.event.repository.default_branch) }}")
+    check("the backfill job's guard is EXACTLY the default-branch check (no appended `&& false`)",
+          seam["job_if"], _REF_GUARD)
+    check("the targets job's guard is EXACTLY the default-branch check (no appended `&& false`)",
+          seam["targets_job_if"], _REF_GUARD)
     check("two-page slurped listing flattens (sol r5)",
           flatten_pull_pages([[{"number": 1}], [{"number": 2}, {"number": 3}]]),
           [{"number": 1}, {"number": 2}, {"number": 3}])
