@@ -38,8 +38,11 @@
 #      is therefore never inferred: it must be ASSERTED by a durable expected-record manifest
 #      (`--expected-records`, {target: {window, records: [PR numbers]}}) that the maintainer
 #      derives from the authoritative enumeration of that target's worker PRs in an observation
-#      window (DERIVED by `--generate-manifest`, never typed — see MANIFEST GENERATION below,
-#      issue #1027), and VERIFIED here — every expected record must actually be present.
+#      window. That manifest must be DERIVED by `--generate-manifest` and never typed (see MANIFEST
+#      GENERATION below, issue #1027): the reader REFUSES a manifest carrying no generation
+#      provenance, because a claim that can be typed can be typed SHORT, and a short claim is
+#      satisfied by the very partial corpus it was meant to bound — strictly more dangerous than no
+#      claim at all. What is derived is then VERIFIED here: every expected record must be present.
 #      Verification is by FILENAME, so a filename must be worth trusting: each record's name is
 #      parsed exactly and must agree with the `pr_number` INSIDE it, or the audit refuses.
 #      Otherwise a record parked under another PR's name would witness a record that is really
@@ -80,6 +83,11 @@ DEFAULT_PROVENANCE_DIR = "orchestration/provenance"
 # The env var holding the salt, when the operator opts in to mapping. Never read unless asked for,
 # never printed.
 DEFAULT_SALT_ENV = "PROVENANCE_SALT"
+# The `generated.basis` an expected-record manifest must carry to be READ AT ALL. Written by the
+# generator (MANIFEST GENERATION below) and required by the reader (`generation_provenance`): a
+# completeness claim that can be typed can be typed SHORT, and short is the false-revocation case
+# this module exists to prevent.
+MANIFEST_BASIS = "ledger-provenance-records"
 
 STATUS_INSUFFICIENT = "insufficient-evidence"   # no records: say nothing about this row's pool
 STATUS_UNMAPPED = "unmapped-evidence"           # records, but no salt: counts only, no candidates
@@ -231,6 +239,55 @@ def record_fingerprint(text, filename, number):
     return value
 
 
+def generation_provenance(document):
+    """(stamped window, source record count) from a manifest's `generated` block. Refuses without.
+
+    THE READER IS THE ARM SIDE, so derivation is ENFORCED here rather than recommended in the help
+    text. A manifest this function accepts is what turns `partial-evidence` into `scoped` and a
+    live account into a revocation candidate, so shipping a generator while still accepting a
+    hand-typed `{"targets": ...}` document would leave the exact hole the generator exists to
+    close: a transcription short of a PR is invisible, is satisfied by the very partial corpus it
+    was meant to bound, and arms. A document without this block is therefore REFUSED, not read as
+    advisory — a manifest that is read at all is a manifest that can arm.
+
+    WHAT THIS DOES AND DOES NOT PROVE, stated because "refuses hand-written manifests" would be an
+    overclaim. There is no secret to sign a manifest with: the audit runs offline and its only
+    credential is the provenance salt, which anyone who can type a manifest can also read, so this
+    is a STRUCTURAL bind and not a cryptographic one. Its force is that the block must AGREE with
+    the entries it describes — same basis, same window, same record COUNT — so the realistic
+    failure, an operator editing or retyping a generated artifact and dropping a PR from it, breaks
+    the count and refuses. It cannot stop a deliberate, self-consistent forgery; only an
+    authoritative enumeration the auditor fetches itself could, and that needs the network and a
+    token this module deliberately does not have. What it removes is the SLIP."""
+    block = document.get("generated")
+    if not isinstance(block, dict):
+        raise AuditError(
+            "expected-records manifest carries no `generated` block: only a manifest DERIVED by "
+            "--generate-manifest may assert completeness, because a hand-written one that is short "
+            "of a PR is satisfied by the partial corpus it was meant to bound and would license a "
+            "revocation on missing evidence — regenerate it with `--generate-manifest "
+            "--from-records <authoritative tree> --window <window>`")
+    basis = block.get("basis")
+    if basis != MANIFEST_BASIS:
+        raise AuditError(
+            f"expected-records manifest states generated.basis={basis!r}, not {MANIFEST_BASIS!r} — "
+            "refusing a completeness claim that was not derived from an authoritative record tree")
+    window = block.get("window")
+    if not isinstance(window, str) or not window.strip():
+        raise AuditError(
+            "expected-records manifest's `generated` block states no observation `window` — "
+            "refusing an unbounded completeness claim")
+    count = block.get("source_records")
+    # No lower bound: a negative or otherwise absurd count cannot equal the number of records the
+    # entries list, so the comparison in `expected_records` refuses it anyway. What that comparison
+    # canNOT see is a non-int that compares EQUAL to it (2.0 == 2), which is what this guard is for.
+    if isinstance(count, bool) or not isinstance(count, int):
+        raise AuditError(
+            f"expected-records manifest states generated.source_records={count!r}, which is not a "
+            "record count — refusing a claim whose entries are bound to nothing")
+    return window, count
+
+
 def expected_records(manifest_text, targets):
     """{target: {"window": str, "records": frozenset(filenames)}} from a completeness manifest.
 
@@ -250,6 +307,7 @@ def expected_records(manifest_text, targets):
         raise AuditError(f"expected-records manifest does not parse as JSON: {exc}") from exc
     if not isinstance(document, dict) or not isinstance(document.get("targets"), dict):
         raise AuditError("expected-records manifest must be a JSON object with a `targets` object")
+    derived_window, source_records = generation_provenance(document)
     claims = {}
     for target, entry in document["targets"].items():
         if target not in targets:
@@ -264,6 +322,11 @@ def expected_records(manifest_text, targets):
             raise AuditError(
                 f"expected-records entry for {target!r} states no observation `window` — refusing "
                 "to accept an unbounded completeness claim")
+        if window != derived_window:
+            raise AuditError(
+                f"expected-records entry for {target!r} states window {window!r}, but the manifest "
+                f"was derived over {derived_window!r} — refusing an entry that does not belong to "
+                "the generation that produced it")
         numbers = entry.get("records")
         if not isinstance(numbers, list) or not numbers:
             raise AuditError(
@@ -283,6 +346,13 @@ def expected_records(manifest_text, targets):
                           "records": frozenset(f"{prefix}{n}{RECORD_SUFFIX}" for n in numbers)}
     if not claims:
         raise AuditError("expected-records manifest declares no target — nothing is bounded by it")
+    listed = sum(len(claim["records"]) for claim in claims.values())
+    if listed != source_records:
+        raise AuditError(
+            f"expected-records manifest lists {listed} record(s) across its entries, but its "
+            f"`generated` block was derived from {source_records} — refusing a manifest whose "
+            "entries were edited after generation: a claim short of a PR is satisfied by the very "
+            "corpus it was meant to bound")
     return claims
 
 
@@ -343,6 +413,11 @@ def read_corpus(directory):
 # reader) before it is printed. Still READ-ONLY, and still no policy write path: it prints to
 # stdout, and the maintainer redirects it and REVIEWS a generated artifact instead of typing one.
 #
+# And derivation is REQUIRED, not merely offered: the generator stamps `generated` and the reader
+# refuses any manifest that does not carry it, consistent with its entries (`generation_provenance`
+# states exactly how far that binding goes). A generator the arm side treats as optional would have
+# left the typed short manifest above arming exactly as before.
+#
 # TWO THINGS A GENERATED MANIFEST DOES NOT PROVE, stated because a generated artifact reads as more
 # authoritative than a typed one:
 #   * It bounds the corpus against the ledger's RECORD SET, not against the set of worker PRs that
@@ -354,7 +429,6 @@ def read_corpus(directory):
 #   * It cannot bound a corpus it was DERIVED FROM. Generating from the very tree the audit reads
 #     yields a manifest that is complete by construction and asserts nothing, so pointing
 #     `--from-records` at the audited corpus REFUSES rather than emitting that tautology.
-MANIFEST_BASIS = "ledger-provenance-records"
 
 
 def is_same_directory(left, right):
@@ -394,7 +468,9 @@ def manifest_from_corpus(corpus, targets, window):
         the audit gives them.
       * The document is round-tripped through `expected_records` before it is returned, so the
         generator can never emit an artifact the audit would refuse, and the manifest grammar keeps
-        exactly ONE definition: the reader's. That round trip is also what validates `window`."""
+        exactly ONE definition: the reader's. That round trip is what validates `window`, and — now
+        that the reader REQUIRES a `generated` block — what proves this generator is a path through
+        that gate rather than something the gate would lock out."""
     _evidence, observed, foreign = collect_evidence(corpus, targets)
     entries, unbounded = {}, []
     for target in sorted(targets):
@@ -404,8 +480,11 @@ def manifest_from_corpus(corpus, targets, window):
         else:
             unbounded.append(target)
     document = {
-        # Advisory provenance for the human reviewing the artifact. `expected_records` ignores it;
-        # it exists so a manifest cannot be mistaken for an enumeration of merged PRs.
+        # The block the READER requires (`generation_provenance`): `basis`, `window` and
+        # `source_records` are what an accepted manifest is bound to, so an artifact edited after
+        # generation no longer agrees with it. `foreign_records` and `targets_without_records` are
+        # advisory, for the human reviewing the artifact — they say what the source held that this
+        # document does NOT claim, so a manifest cannot be mistaken for an enumeration of merged PRs.
         "generated": {
             "basis": MANIFEST_BASIS,
             "window": window,
@@ -620,10 +699,32 @@ def _record(handle, number):
                        "impl_account_h": _H[handle], "issue": 1, "recorded_at_run": "1.1"})
 
 
-def _manifest(rows, window="2026-07-01..2026-07-28"):
-    """A completeness manifest naming, per target, the PR numbers that MUST be present."""
-    return json.dumps({"targets": {target: {"window": window, "records": list(numbers)}
-                                   for target, numbers in rows.items()}})
+# The self-test's OWN copy of the generator's basis string, and of the window `_manifest` stamps.
+# GEN_BASIS is deliberately a LITERAL rather than MANIFEST_BASIS: a fixture that reads the constant
+# the reader compares against agrees with whatever value the module carries, so it could not see a
+# basis drift at all (AGENTS.md 2c).
+GEN_BASIS = "ledger-provenance-records"
+WINDOW = "2026-07-01..2026-07-28"
+
+
+def _block(source_records, window=WINDOW, basis=GEN_BASIS):
+    """The generation-provenance block a manifest must carry to be READ at all."""
+    return {"basis": basis, "window": window, "source_records": source_records}
+
+
+def _manifest(rows, window=WINDOW, basis=GEN_BASIS, source_records=None, derived=True):
+    """A completeness manifest naming, per target, the PR numbers that MUST be present.
+
+    It carries the generation-provenance block by default because the reader accepts nothing else
+    (#1027 review round 1). `derived=False` produces the LEGACY hand-typed shape — the document an
+    operator transcribes — which every check below expects to be refused, never read."""
+    document = {"targets": {target: {"window": window, "records": list(numbers)}
+                            for target, numbers in rows.items()}}
+    if derived:
+        listed = sum(len(list(numbers)) for numbers in rows.values())
+        document["generated"] = _block(listed if source_records is None else source_records,
+                                       window=window, basis=basis)
+    return json.dumps(document)
 
 
 # The window the GENERATOR is asked to stamp. Deliberately not `_manifest`'s default: a check that
@@ -677,12 +778,13 @@ def _self_test():
     def refuses(label, thunk):
         try:
             thunk()
-        except AuditError:
+        except AuditError as exc:
             print(f"ok   {label}")
-            return
-        nonlocal ok
+            return str(exc)             # so a caller can pin WHICH guard refused, not merely that
+        nonlocal ok                     # one did — layered guards mask each other otherwise
         ok = False
         print(f"FAIL {label}: no refusal")
+        return ""
 
     grant_account = _load_sibling("grant-account.py", "registry_grant_account")
 
@@ -868,12 +970,18 @@ def _self_test():
             lambda: expected_records(json.dumps({"records": [1]}), ["o/a"]))
     refuses("a manifest naming an unaudited target refuses (a stale manifest bounds nothing)",
             lambda: expected_records(_manifest({"o/zz": [1]}), ["o/a"]))
+    # These two carry a well-formed `generated` block on purpose: without one they would refuse at
+    # the derivation gate above, and the entry grammar they exist to test would never be reached.
     refuses("a manifest entry that is not an object refuses",
-            lambda: expected_records(json.dumps({"targets": {"o/a": [1, 2]}}), ["o/a"]))
+            lambda: expected_records(json.dumps({"generated": _block(2),
+                                                 "targets": {"o/a": [1, 2]}}), ["o/a"]))
     refuses("a manifest entry with no observation window refuses",
-            lambda: expected_records(json.dumps({"targets": {"o/a": {"records": [1]}}}), ["o/a"]))
+            lambda: expected_records(json.dumps({"generated": _block(1),
+                                                 "targets": {"o/a": {"records": [1]}}}), ["o/a"]))
     refuses("a manifest entry with an empty window refuses",
-            lambda: expected_records(_manifest({"o/a": [1]}, window="  "), ["o/a"]))
+            lambda: expected_records(json.dumps({"generated": _block(1),
+                                                 "targets": {"o/a": {"window": "  ",
+                                                                     "records": [1]}}}), ["o/a"]))
     refuses("a manifest entry expecting NO record refuses (it asserts nothing)",
             lambda: expected_records(_manifest({"o/a": []}), ["o/a"]))
     refuses("a manifest entry with a non-PR-number record refuses",
@@ -885,11 +993,72 @@ def _self_test():
           sorted(expected_records(_manifest({"o/a": [1, 2]}), ["o/a", "o/b"])["o/a"]["records"]),
           ["o--a--pr1.json", "o--a--pr2.json"])
 
+    # -- THE DERIVATION GATE (#1027 review round 1). The READER is the arm side: a generator the
+    # reader treats as optional closes nothing, because the dangerous document is precisely the one
+    # a human produced by hand. Every refusal below is a document that, if READ, would mark this
+    # corpus `scoped` and name a live account for revocation.
+    refuses("[#1027] a LEGACY hand-typed manifest — no `generated` block at all — is REFUSED, "
+            "never read as advisory",
+            lambda: expected_records(_manifest({"o/a": [1, 2], "o/b": [3]}, derived=False),
+                                     ["o/a", "o/b"]))
+    refuses("...and one asserting some other basis is refused: the block must be THIS generator's",
+            lambda: expected_records(_manifest({"o/a": [1, 2]}, basis="transcribed-from-the-board"),
+                                     ["o/a"]))
+    refuses("...and one whose block asserts NO basis at all is refused: a block must say what "
+            "derived it, not merely be present",
+            lambda: expected_records(json.dumps(
+                {"generated": {"window": WINDOW, "source_records": 2},
+                 "targets": {"o/a": {"window": WINDOW, "records": [1, 2]}}}), ["o/a"]))
+    # Pinned by MESSAGE, not merely by refusal: the entry/block window bind below would refuse this
+    # document too (no entry can equal an absent window), so a refusal alone leaves this guard
+    # individually unkillable — the masked-duplicate case AGENTS.md 4 names.
+    windowless = refuses("...and one whose block states no derivation window is refused",
+                         lambda: expected_records(json.dumps(
+                             {"generated": {"basis": GEN_BASIS, "source_records": 2},
+                              "targets": {"o/a": {"window": WINDOW, "records": [1, 2]}}}), ["o/a"]))
+    check("...and it is the BLOCK's missing window that is named, not an entry mismatch",
+          "`generated` block states no observation `window`" in (windowless or ""), True)
+    refuses("...and one whose block states no source record count is refused",
+            lambda: expected_records(json.dumps(
+                {"generated": {"basis": GEN_BASIS, "window": WINDOW},
+                 "targets": {"o/a": {"window": WINDOW, "records": [1, 2]}}}), ["o/a"]))
+    refuses("...and a non-numeric count is refused rather than compared as a string",
+            lambda: expected_records(_manifest({"o/a": [1, 2]}, source_records="2"), ["o/a"]))
+    # A FLOAT count is the one non-int the comparison below CANNOT catch — `2 != 2.0` is False — so
+    # it is what makes the type guard load-bearing rather than a duplicate of the count bind.
+    refuses("...including a float count, which the count comparison alone would accept as equal",
+            lambda: expected_records(_manifest({"o/a": [1, 2]}, source_records=2.0), ["o/a"]))
+    refuses("...and an entry stating a window the manifest was NOT derived over refuses — the "
+            "block is BOUND to the entries it describes, not merely present alongside them",
+            lambda: expected_records(json.dumps(
+                {"generated": _block(2, window=GEN_WINDOW),
+                 "targets": {"o/a": {"window": WINDOW, "records": [1, 2]}}}), ["o/a"]))
+    # THE TRANSCRIPTION SLIP ITSELF, now against a GENERATED artifact: delete one PR from an entry
+    # and the count the block was derived from no longer covers what the document lists. This is
+    # the realistic #1027 failure — an operator hand-editing an artifact — and it is what the
+    # structural bind is for; `generation_provenance` states what it cannot do.
+    refuses("[#1027] a generated manifest with a PR DELETED from an entry refuses: it lists 3 "
+            "record(s) where the block it carries was derived from 4",
+            lambda: expected_records(_manifest({"o/a": [1, 2], "o/b": [3]}, source_records=4),
+                                     ["o/a", "o/b"]))
+    refuses("...and one with a PR ADDED refuses on the same comparison — the count is matched "
+            "EXACTLY, in both directions, never as a floor",
+            lambda: expected_records(_manifest({"o/a": [1, 2, 9], "o/b": [3]}, source_records=3),
+                                     ["o/a", "o/b"]))
+    check("...while BOTH of those documents are accepted once their counts agree — the refusals "
+          "above are about the BIND, not about the records they list",
+          (sorted(expected_records(_manifest({"o/a": [1, 2], "o/b": [3]}, source_records=3),
+                                   ["o/a", "o/b"])),
+           sorted(expected_records(_manifest({"o/a": [1, 2, 9], "o/b": [3]}, source_records=4),
+                                   ["o/a", "o/b"])["o/a"]["records"])),
+          (["o/a", "o/b"], ["o--a--pr1.json", "o--a--pr2.json", "o--a--pr9.json"]))
+
     # -- MANIFEST GENERATION (#1027). The manifest was TYPED until now, and a typed manifest that
     # omits a PR fails OPEN: the short claim is satisfied by the very partial corpus it was meant
-    # to bound. `ledger` is the authoritative tree — the audited `corpus` above, plus PR 9, which
-    # is exactly the master/ledger split this module was written for (records have gone to the
-    # `ledger` branch since #96).
+    # to bound. The reader now refuses a typed manifest outright (THE DERIVATION GATE above); this
+    # is the path it leaves open. `ledger` is the authoritative tree — the audited `corpus` above,
+    # plus PR 9, which is exactly the master/ledger split this module was written for (records have
+    # gone to the `ledger` branch since #96).
     ledger = corpus + [("o--a--pr9.json", _record("acct03", 9))]
     generated = manifest_from_corpus(ledger, ["o/a", "o/b"], GEN_WINDOW)
     check("the manifest is DERIVED per target, as PR numbers, from the authoritative tree",
@@ -910,11 +1079,14 @@ def _self_test():
           sorted(expected_records(json.dumps(generated), ["o/a", "o/b"])["o/a"]["records"]),
           ["o--a--pr1.json", "o--a--pr2.json", "o--a--pr9.json"])
     # THE #1027 CLAIM ITSELF, both directions, over the SAME audited corpus, salt and pools —
-    # only the manifest differs. `scoped` above is the typed manifest that omitted PR 9.
+    # only the manifest differs. `scoped` above is a manifest SHORT of PR 9: the gate refuses the
+    # hand-typed and the edited forms of it (above), but a claim that is internally consistent is
+    # still believed, and this is what believing a short one costs. That residue is why the source
+    # of the claim — a derivation from an authoritative tree — is the actual fix, not the gate.
     from_generated = audit(pools, evidence, foreign=foreign, salt=SALT, observed=observed,
                            expected=expected_records(json.dumps(generated), ["o/a", "o/b"]))
-    check("[#1027] the TYPED manifest omitting PR 9 declares this partial corpus complete and "
-          "proposes acct03 — whose only record is the one it omitted",
+    check("[#1027] a manifest SHORT of PR 9 declares this partial corpus complete and proposes "
+          "acct03 — whose only record is the one it omits",
           (scoped["targets"]["o/a"]["status"], scoped["targets"]["o/a"]["revocation_candidates"]),
           (STATUS_SCOPED, ["acct03"]))
     check("[#1027] ...while the GENERATED manifest sees PR 9 absent from that corpus and proposes "
@@ -1151,6 +1323,23 @@ def _self_test():
               (status, f"o/a [{STATUS_PARTIAL}]" in out,
                "    revocation CANDIDATES (2): acct01, acct02" in out,
                "revocation CANDIDATES (1): acct03" in out), (0, True, True, False))
+        # THE ARM-SIDE NEGATIVE (#1027 review round 1), end to end. The short HAND-TYPED manifest —
+        # the shape an operator transcribes, and the shape `--expected-records` accepted before
+        # derivation was required — must reach no conclusion at all. The positive control is three
+        # checks up: the DERIVED manifest at `manifest_path`, over this same corpus and salt, prints
+        # "revocation CANDIDATES (1): acct03", so this refusal is about provenance, not about a
+        # document the audit could not have used.
+        legacy_path = root / "hand-typed.json"
+        legacy_path.write_text(_manifest({"o/a": [1, 2], "o/b": [3]}, derived=False),
+                               encoding="utf-8")
+        status, out, err = _cli(gen_base + ["--expected-records", str(legacy_path),
+                                            "--salt-env", _SELFTEST_SALT_ENV],
+                                env={_SELFTEST_SALT_ENV: SALT})
+        check("[#1027] a hand-typed manifest exits 2 at the CLI and prints NO report: no scoped "
+              "row, no revocation candidate, no handle named",
+              (status, out, STATUS_SCOPED in out, "revocation CANDIDATES" in out,
+               "acct03" in out, "`generated` block" in err),
+              (2, "", False, False, False, True))
         status, out, err = _cli(gen_base + ["--generate-manifest", "--from-records", str(prov),
                                             "--window", GEN_WINDOW])
         check("at the CLI, generating from the audited corpus exits 2 and emits no manifest",
@@ -1201,11 +1390,12 @@ def main():
               "is ever proposed. The salt is never printed."))
     parser.add_argument(
         "--expected-records", default=None,
-        help=("path to the durable expected-record manifest that bounds the corpus "
-              '({"targets": {"<owner>/<repo>": {"window": "...", "records": [<PR number>, ...]}}}).'
-              " Without it, or with any expected record absent, the row is partial-evidence and no "
+        help=("path to the durable expected-record manifest that bounds the corpus. It must be a "
+              "--generate-manifest artifact: a manifest carrying no `generated` provenance block, "
+              "or one whose entries no longer agree with it, is REFUSED rather than believed. "
+              "Without it, or with any expected record absent, the row is partial-evidence and no "
               "revocation candidate is proposed — a corpus not known to be complete cannot show "
-              "disuse. Derive it with --generate-manifest rather than typing it."))
+              "disuse."))
     parser.add_argument(
         "--generate-manifest", action="store_true",
         help=("derive an --expected-records manifest from an authoritative record tree and print "
