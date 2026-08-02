@@ -754,3 +754,4 @@ jobs:
           set -uo pipefail
           python3 registry/scripts/groom-alert.py --self-test
           python3 registry/scripts/groom-alert.py
+
