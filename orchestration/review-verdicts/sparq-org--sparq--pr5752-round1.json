@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5752,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "55564f9ac5eb5176e57b9978c349b777373b3175",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "fetch_merge_group_runs requests status=completed, so queued/in-progress runs are absent rather than available for group_entries's incomplete-entry check. If an entry has two completed workflows and another still running, the returned subset passes every status/conclusion check and is profiled as a finished entry; the apparent closer, exclusive tail, and wall time can all be wrong. dropped_incomplete is therefore ineffective for live API data. The test_incomplete_entry_is_dropped_and_counted test is vacuous with respect to the real fetch path because it injects a state the query filters out.",
+    "file": "scripts/ci_merge_group_poles.py",
+    "fix_hint": "Fetch merge_group runs without the status=completed filter (or otherwise fetch/reconcile all statuses for every observed head_sha), then let group_entries drop and count entries containing any non-completed run. Add a fetch-path test that supplies a mixed completed/in-progress API population and proves the whole head_sha is dropped rather than profiling the completed subset.",
+    "severity": "major",
+    "title": "Completed-only API filter silently profiles partially running entries"
+   }
+  ],
+  "progress": null,
+  "summary": "The profiler's API query excludes queued and in-progress workflow runs before entries are grouped. Consequently, a currently executing merge-group entry can appear to be a clean completed entry made only of its already-finished workflows, producing a false closer and understated wall time. This contradicts the stated population/fail-loud guarantees and is not covered by the hermetic test because that test injects an in-progress run directly into group_entries, a state the fetch path can never return.",
+  "verdict": "request_changes"
+ }
+}
