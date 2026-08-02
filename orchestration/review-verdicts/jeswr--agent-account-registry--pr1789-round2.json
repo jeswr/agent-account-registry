@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1789,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a39d1214cda74365e506f48b4a94c9ec3872021c",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`resolver_errexit` is only `\"set -euo pipefail\" in resolve_run`. A non-crashing mutant such as inserting `set +o pipefail` after the existing `set -euo pipefail` leaves this assertion and every behavioral resolver assertion green: the behavioral harness executes only the Python heredoc, not the surrounding shell pipeline. In the real workflow, a resolver refusal then becomes the left side of `python3 ... | tee`; without pipefail, `tee` can return zero, so the targets job succeeds while publishing no usable `repos` value. The assertion therefore does not prove the fail-closed behavior its name and comment claim.",
+    "file": "scripts/backfill-provenance.py",
+    "fix_hint": "Test the shell control at the execution seam rather than by substring. Parse/pin the effective command sequence so no command can disable `errexit` or `pipefail` before the exact resolver pipeline, or execute the extracted run block in a controlled shell fixture and assert that a refusing resolver produces a nonzero step result. Add a non-crashing `set +o pipefail`-before-pipeline mutant and require the same named check count as pristine.",
+    "severity": "major",
+    "title": "Pipefail assertion passes when the resolver pipeline runs with pipefail disabled"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 closes the prior producer/dependency finding: the self-test now pins `backfill.needs`, the job-output binding, the resolver step identity and input binding, and executes the resolver against independent policy fixtures covering full sweep, narrowing, disabled/unknown targets, and an empty enabled set. However, the newly claimed pipefail guard remains a containment assertion and can stay green when pipefail is disabled before the resolver pipeline. That permits resolver refusal to be masked by `tee`, allowing the targets job to report success without a valid matrix output. Because this is a new major fail-closed gap in the added producer seam, changes are still required.",
+  "verdict": "request_changes"
+ }
+}
