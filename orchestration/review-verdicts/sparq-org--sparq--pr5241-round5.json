@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5241,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f2fd6b110f0f4ba37609dc27c33439990b9c04a1",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`artifact_covers_crate()` returns true for any token-delimited crate name in any matched file. For the site rule, a comment or unrelated blurb in `surfaces.ts` can suppress the follow-on without a Surface record identifying the crate. For the guide rule, a crate mention in an unrelated page or in `SUMMARY.md` alone suppresses the follow-on without both a linked chapter and a crate-specific page. The added tests cover a valid README include and a file with no crate mention, but still omit the false-suppression cases identified in round 4.",
+    "file": "scripts/flow-on.py",
+    "fix_hint": "Use artifact-specific structural validation. Require a crate-specific Surface record (for example, its README/href identifies the evaluated crate). For the guide, require a SUMMARY chapter link whose target page exists and whose include identifies that crate's README or SKILL. Add negative tests for comment/blurb-only site mentions, unrelated book cross-references, and SUMMARY-only crate mentions.",
+    "severity": "major",
+    "title": "Bare crate-name mentions still suppress incomplete site and guide artifacts"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant: the round-4 major finding remains. `artifact_covers_crate()` still treats any token-delimited crate-name occurrence in any matched artifact as proof of coverage. The new site and guide tests exercise valid README includes and absent names, but do not enforce the structural contracts described by the rule: a real crate-specific Surface entry for the site, and both a SUMMARY link plus a corresponding crate-specific guide page. A comment/blurb/cross-reference, or a SUMMARY-only mention, can therefore suppress the only follow-on despite the artifact being incomplete.",
+  "verdict": "request_changes"
+ }
+}
