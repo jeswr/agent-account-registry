@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1724,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "df4532c67c0c616152d556e7b45090cb5c916f1a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`newest_concluded_run` now skips every run whose conclusion is `cancelled`, but the motivating evidence only establishes that a concurrency-cancelled run with zero jobs may be non-adjudicating. A workflow can also be cancelled after one or more jobs have started. Such a run is positive evidence that the workflow was ingested, yet this code looks through it and can select an older `action_required`/zero-job run, causing M4 to report a stale rejection. The current tests pin only zero-job-shaped cancelled fixtures (and do not pass job information into this selection function), so they cannot catch this false-alarm path.",
+    "file": "scripts/ci-latency-alert.py",
+    "fix_hint": "Do not classify `cancelled` from conclusion alone. Preserve enough run/job evidence to distinguish a pre-job concurrency cancellation from a cancelled run that created or ran jobs, and treat the latter as an ingestion verdict. Add an anti-vacuity test with a newer cancelled run that has jobs over an older `action_required` run and assert that M4 does not resurrect the older rejection.",
+    "severity": "major",
+    "title": "All cancelled runs are discarded even when they executed jobs"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe self-lane observation is narrowly bound to the watched repository, workflow, and scheduled event, and the new tests exercise its pure, state-file, and live wiring. However, the new global treatment of every `cancelled` run as a non-verdict is broader than the evidence supports and can make M4 publish an older rejection after a newer run demonstrably executed jobs. Because that creates a false ingestion alarm and the suite does not cover the distinguishing case, this round requires changes.",
+  "verdict": "request_changes"
+ }
+}
