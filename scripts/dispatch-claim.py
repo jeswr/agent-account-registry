@@ -22403,11 +22403,14 @@ def _escalation_call_site(source):
 # [registry #1028] REACHABILITY, for the call-site seams below.
 #
 # `ast.walk` answers "does this node EXIST in the tree", which is a strictly weaker question than
-# "does this node RUN". Three shapes exploit the gap, and each leaves a seam checker returning
+# "does this node RUN". Four shapes exploit the gap, and each leaves a seam checker returning
 # `"dispatch"` while the production behaviour it certifies is gone:
 #
 #   - the statement is parsed but never executed  -> `if False:` / `while False:` / the `else:`
 #     of a constant-true guard;
+#   - the expression is parsed but SHORT-CIRCUITED past -> `False and park(...)`,
+#     `True or park(...)`, and the untaken arm of `park(...) if False else None`. These are the
+#     same dead-branch shape written as an expression, so they hide in a single statement;
 #   - the statement is executed only if something CALLS it -> a nested `def` / `async def` /
 #     `lambda`, including a method in a class body, that nothing ever calls.
 #   - the expression is executed only if something CONSUMES it -> the element of a GENERATOR
@@ -22426,17 +22429,33 @@ _SCOPE_BOUNDARIES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 
 
 def _constant_test_truth(test):
-    """`True`/`False` when `test` is decided by the literal alone; `None` when it is not.
+    """`True`/`False` when `test` is decided by the literals alone; `None` when it is not.
 
-    Only literals and `not <literal>` are decided. Anything a run could change — a name, a call,
-    a comparison — returns `None` and its branches stay live, so a mis-read never PRUNES real
-    production code out from under a seam check.
+    Only literals, `not <literal>` and an `and`/`or` of those are decided. Anything a run could
+    change — a name, a call, a comparison — returns `None` and its branches stay live, so a
+    mis-read never PRUNES real production code out from under a seam check.
     """
     if isinstance(test, ast.Constant):
         return bool(test.value)
     if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
         inner = _constant_test_truth(test.operand)
         return None if inner is None else (not inner)
+    if isinstance(test, ast.BoolOp):
+        # `if False and ready:` never runs its body and `if True or ready:` always does. The
+        # TRUTH of an `and` is decided by ANY falsy operand wherever it sits — reach it and the
+        # result is that falsy value, short-circuit before it and the result is the earlier falsy
+        # one — and an `or` is decided by any truthy operand the same way. So a single decided
+        # operand settles the expression; with none decided either way, the answer is only known
+        # when EVERY operand is (all-truthy `and`, all-falsy `or`). Anything else is `None`, the
+        # conservative direction that keeps both branches live.
+        #
+        # This asks a different question from `_live_children`'s `BoolOp` clause, which asks
+        # which OPERANDS evaluate and so must respect left-to-right position exactly.
+        decides = isinstance(test.op, ast.Or)
+        truths = [_constant_test_truth(value) for value in test.values]
+        if any(truth == decides for truth in truths):
+            return decides
+        return None if any(truth is None for truth in truths) else (not decides)
     return None
 
 
@@ -22448,6 +22467,28 @@ def _live_children(node):
             # `if False:`/`while False:` never runs its body; the `else:` of a constant-true
             # guard never runs either. The test itself is kept: it is evaluated.
             return [node.test, *(node.body if truth else node.orelse)]
+    if isinstance(node, ast.IfExp):
+        # The EXPRESSION form of the same shape, and it needs its own clause because `body`/
+        # `orelse` are single nodes here, not statement lists: `park(...) if False else None`
+        # evaluates only the `else` arm.
+        truth = _constant_test_truth(node.test)
+        if truth is not None:
+            return [node.test, node.body if truth else node.orelse]
+    if isinstance(node, ast.BoolOp):
+        # `and`/`or` SHORT-CIRCUIT: operands are evaluated left to right and evaluation stops at
+        # the first one that decides the result — falsy for `and`, truthy for `or`. So
+        # `False and park(...)` and `True or park(...)` never evaluate the park call, while both
+        # still contain it. The first operand always runs; a later one runs only if EVERY operand
+        # before it failed to decide the result, and an operand whose truth is not a parse-time
+        # fact decides nothing, so everything after it stays live.
+        decides = isinstance(node.op, ast.Or)
+        live = []
+        for value in node.values:
+            live.append(value)
+            truth = _constant_test_truth(value)
+            if truth is not None and truth == decides:
+                break              # this operand settles the result; the rest never run
+        return live
     if isinstance(node, ast.GeneratorExp):
         # Building a generator evaluates EXACTLY ONE thing: the outermost iterable, which is
         # iterated eagerly. The element, the `if` filters and every later `for` clause run only
@@ -22463,9 +22504,11 @@ def _live_children(node):
 def _live_nodes(root):
     """[registry #1028] Yield `root` and every descendant reached by RUNNING `root`.
 
-    Three differences from `ast.walk`, and they are the whole point:
+    Four differences from `ast.walk`, and they are the whole point:
 
-      - a branch under a constant-false test is pruned (see `_constant_test_truth`);
+      - a branch under a constant-false test is pruned (see `_constant_test_truth`), in both the
+        statement (`if`/`while`) and the expression (`... if ... else ...`) form;
+      - an operand a constant `and`/`or` SHORT-CIRCUITS past is pruned (see `_live_children`);
       - a nested `def`/`async def`/`lambda` is a DEFERRED scope: reaching the `def` statement
         binds a name, it does not run the body. The boundary node itself is yielded (it really
         does execute) but traversal stops there.
@@ -22503,8 +22546,9 @@ def _park_call_site(source):
                                                        not a number retyped at the call site.
 
     [registry #1028] Every ACCEPTING scan runs over `_live_nodes`, never `ast.walk`: a loop, or a
-    park call, buried under `if False:`, moved into a nested `def`/`async def`/class-body method
-    that nothing calls, or left as the element of an unconsumed GENERATOR expression restores the
+    park call, buried under `if False:`, short-circuited past by a constant `and`/`or` or a
+    constant conditional expression, moved into a nested `def`/`async def`/class-body method that
+    nothing calls, or left as the element of an unconsumed GENERATOR expression restores the
     same 1-holder-per-tick defect while EXISTING in the tree. The REFUSING scan over the iterable
     stays exhaustive (`ast.walk`) on purpose — a refusal must see a `[:1]` wherever it hides, so
     pruning there could only ever weaken it.
@@ -22555,12 +22599,14 @@ def _park_call_site_reachability_self_test():
 
     The production assertion in `_starvation_sweep_self_test` can only ever say "the shipped tree
     still parks every target". It says nothing about what the checker would refuse, so before this
-    the refusals were unpinned — and three of them did not exist: `ast.walk` proves a node EXISTS,
+    the refusals were unpinned — and four of them did not exist: `ast.walk` proves a node EXISTS,
     never that it RUNS, so the park loop (or its park call) under `if False:` / `while False:` /
-    the `else:` of a constant-true guard, the park call moved into an uncalled nested
-    `def`/`async def`/class-body method, and the park call left as the element of a GENERATOR
-    expression nothing consumes, each restored the exact 1-holder-per-tick defect #822
-    removed with `_park_call_site` still returning `"dispatch"` and the whole suite green.
+    the `else:` of a constant-true guard, the park call as the operand a constant `and`/`or`
+    SHORT-CIRCUITS past or the untaken arm of a constant conditional EXPRESSION, the park call
+    moved into an uncalled nested `def`/`async def`/class-body method, and the park call left as
+    the element of a GENERATOR expression nothing consumes, each restored the exact
+    1-holder-per-tick defect #822 removed with `_park_call_site` still returning `"dispatch"`
+    and the whole suite green.
 
     Every reachability mutant below is proved to be EXACTLY that shape and nothing else: the same
     source is re-run with `_live_nodes` swapped back to `ast.walk`, and each one must then be
@@ -22594,6 +22640,73 @@ def _park_call_site_reachability_self_test():
             else:
                 for target in targets:
                     park_starved_partition_holder(repo, target, starved)
+        """)),
+        # The operands a constant `and`/`or` really does evaluate. The FIRST operand always runs
+        # whatever the operator decides, and the operand after a non-deciding one runs too — so
+        # pruning a `BoolOp` wholesale, or stopping at the wrong polarity, reds here.
+        ("park call in the live operand of `True and ...`", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                True and park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("park call in the live operand of `False or ...`", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                False or park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("park call as the FIRST operand of `... and False`", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                park_starved_partition_holder(repo, target, starved) and False
+        """)),
+        # `ready` is a name: its truth is not a parse-time fact, so it decides nothing and every
+        # operand after it stays live. This is the fail-open direction of the short-circuit rule.
+        ("park call after an operand whose truth is not a parse-time fact", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                ready and park_starved_partition_holder(repo, target, starved)
+        """)),
+        # ...and the same two directions for the conditional EXPRESSION: the taken arm runs, and
+        # an undecidable test leaves BOTH arms live.
+        # ...and the folded forms at a STATEMENT guard: `True or ready` decides true, while an
+        # undecidable operand reached first leaves the whole guard undecided and the body live.
+        ("loop under `if True or ...:`", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            if True or ready:
+                for target in targets:
+                    park_starved_partition_holder(repo, target, starved)
+        """)),
+        # ...and the case where every operand is decided and NONE short-circuits: an all-truthy
+        # `and` is true, so this body runs. (Its `or` mirror, `if False or False:`, is refused
+        # below — together they pin the fallback that neither `False and ...` nor `True or ...`
+        # reaches.)
+        ("loop under `if True and True:` — decided by the LAST operand", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            if True and True:
+                for target in targets:
+                    park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("loop under `if ready and True:` — the guard is NOT decided", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            if ready and True:
+                for target in targets:
+                    park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("loop under `if ready or False:` — the guard is NOT decided", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            if ready or False:
+                for target in targets:
+                    park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("park call in the taken arm of `... if True else ...`", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                _receipt = park_starved_partition_holder(repo, target, starved) if True else None
+        """)),
+        ("park call in an arm of a conditional expression with a runtime test", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                _receipt = park_starved_partition_holder(repo, target, starved) if ready else None
         """)),
         # A class BODY executes in place when the `class` statement runs, so it is deliberately
         # not a scope boundary. Only the methods inside it are deferred (see `class-body method`).
@@ -22661,6 +22774,62 @@ def _park_call_site_reachability_self_test():
             targets = starvation_park_targets(items, starved, occupancy)
             for target in targets:
                 if not True:
+                    park_starved_partition_holder(repo, target, starved)
+        """)),
+        # The short-circuit shapes. `and`/`or` stop at the first operand that decides the result,
+        # and a constant conditional expression evaluates exactly one arm — so each of these is a
+        # dead branch that fits inside ONE statement, with no `if` for a reader to notice.
+        ("park call in the operand `False and ...` short-circuits past", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                False and park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("park call in the operand `True or ...` short-circuits past", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                True or park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("park call in an operand after a DECIDING one, `True and False and ...`", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                True and False and park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("park call in the untaken arm of `... if False else ...`", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                _receipt = park_starved_partition_holder(repo, target, starved) if False else None
+        """)),
+        ("park call in the untaken `else` arm of `... if True else ...`", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            for target in targets:
+                _receipt = None if True else park_starved_partition_holder(repo, target, starved)
+        """)),
+        # ...and the same folding at a STATEMENT guard. `ready and False` is falsy WHATEVER
+        # `ready` is, so the guard is decided even though one operand is not.
+        ("loop under `if False and ready:`", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            if False and ready:
+                for target in targets:
+                    park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("loop under `if ready and False:` — decided by a LATER operand", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            if ready and False:
+                for target in targets:
+                    park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("loop under `if False or False:` — every operand decided, none short-circuits", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            if False or False:
+                for target in targets:
+                    park_starved_partition_holder(repo, target, starved)
+        """)),
+        ("loop in the `else:` of `if True or ready:`", wrap("""
+            targets = starvation_park_targets(items, starved, occupancy)
+            if True or ready:
+                pass
+            else:
+                for target in targets:
                     park_starved_partition_holder(repo, target, starved)
         """)),
         ("park call in an uncalled nested `def` under the loop", wrap("""
@@ -22747,7 +22916,8 @@ def _park_call_site_reachability_self_test():
             f"got {_park_call_site(source)!r}. A reachability predicate that drops live code "
             "turns every refusal in this battery into a pass for the wrong reason.")
     print(f"  ok   #1028 park seam ACCEPTS the {len(accepted)} shapes that really execute "
-          "(live call site, both live arms of a constant guard, a class body, a comprehension, "
+          "(live call site, both live arms of a constant guard, the operands a constant "
+          "`and`/`or` does evaluate, an undecided guard, a class body, a comprehension, "
           "a generator's outermost iterable)")
 
     for what, source in unreachable + rescalarised:
@@ -22755,8 +22925,8 @@ def _park_call_site_reachability_self_test():
             f"#1028 park seam must REFUSE `{what}`: it certifies a park that never happens, "
             "which is the 1-holder-per-tick defect #822 removed at ~10 min/holder, with every "
             "other assertion in this file green.")
-    print(f"  ok   #1028 park seam REFUSES all {len(unreachable)} dead/deferred-scope shapes and "
-          f"all {len(rescalarised)} re-scalarised ones")
+    print(f"  ok   #1028 park seam REFUSES all {len(unreachable)} dead/short-circuited/"
+          f"deferred-scope shapes and all {len(rescalarised)} re-scalarised ones")
 
     # The false-kill leg: each reachability mutant is well-formed source that the PREVIOUS
     # (`ast.walk`) checker accepted, so the refusal above is caused by reachability and by
