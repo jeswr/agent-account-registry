@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1680,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "090f048f669ab7c685e6ddbb5e7a50ce96e5fd99",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_pr_gate_yaml_parse_sweep` treats any stripped line equal to `- name: actionlint + yaml-parse every workflow` as the target, without proving that the line is a YAML sequence item under the job's `steps`. A prior `run: |` block can contain an uncalled shell function whose indented body reproduces the exact pinned `- name:`, `run: |`, and sweep lines. Awk captures that text as the sole match, while GitHub Actions treats it only as shell text; deleting or weakening the real named step then still leaves the exact expected extraction. The added `yaml-dup-inert-*` fixtures reproduce only the sweep body under a differently named real YAML step, so they cannot detect this spoofed-name variant.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Parse the workflow as YAML and locate exactly one actual step object with the required `name`, then compare that step's keys and literal `run` value to an independently frozen expectation; fail closed on parse errors, aliases/non-mapping steps, or duplicates. Add a non-crashing fixture where the complete expected named-step text appears inside an uncalled function in another step's block scalar while the real step is absent or weakened, and require rejection.",
+    "severity": "major",
+    "title": "Named-step text inside a block scalar can still mask the real guard"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe revision rejects duplicate actual-looking names and binds capture to the name text, but it still does not establish that the matched line is a YAML step. Because the awk reader strips indentation and scans block-scalar contents as ordinary lines, an exact frozen named-step block can be placed inside an uncalled shell function in another step's `run: |`; the real lint step can then be deleted or weakened while the marquee comparison remains green. The new inert-duplicate fixtures omit the pinned `- name:` line, so they do not exercise this remaining form of the prior mutually-masking duplicate. The prior major finding therefore remains materially unresolved.",
+  "verdict": "request_changes"
+ }
+}
