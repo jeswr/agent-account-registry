@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5631,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a35651e3ea2aa094af63d84fa1a72030d51904d8",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The matrix promotes the minimal-N malicious equality and join cells to `BUILT (with-abort)` and the public API reports `AdversaryModel::Malicious`, while the same row states that external sign-off under `sq-qhy4` is pending. This is a cryptographic soundness claim, and the pending accredited-cryptographer review is an unresolved release gate rather than evidence that can be discharged by the in-process tests. The tests demonstrate selected tamper cases but cannot establish the claimed malicious-security theorem.",
+    "file": "research/mpc-sparql-capability-matrix.md",
+    "fix_hint": "Keep the capability status explicitly experimental/not-yet-audited and do not expose/report the production malicious tier until sq-qhy4 is complete, or hold this PR until that audit is available and its findings are incorporated. If the code lands as research scaffolding, use a descriptor/status that cannot be mistaken for an audited malicious-security guarantee.",
+    "severity": "major",
+    "title": "Soundness-critical capability is marked BUILT before the required external audit"
+   },
+   {
+    "body": "The public docs state a concrete `10^3-10^4 rows/holder` and `minutes` feasibility envelope. No canonical benchmark artifact is cited or updated by this diff, so these figures can become stale and are not reproducible evidence for this implementation.",
+    "file": "crates/sparq-mpc/src/auth_join.rs",
+    "fix_hint": "Remove the fixed row-count/time claims or replace them with a link to a generated canonical benchmark artifact; retain only the asymptotic cost and qualitative warning in the API docs.",
+    "severity": "minor",
+    "title": "New API documentation hard-codes non-canonical performance limits"
+   }
+  ],
+  "progress": null,
+  "summary": "The implementation and adversarial tests are carefully scoped, but this PR promotes the minimal-party equality/join cell to BUILT malicious-with-abort while the diff itself says the construction still awaits the external cryptographer review tracked by sq-qhy4. For this soundness-critical MPC surface, that unresolved audit gate prevents approval in this round. The new documentation also introduces fixed performance/envelope numbers that are not backed by a canonical benchmark artifact.",
+  "verdict": "request_changes"
+ }
+}
