@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5355,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "88fdda477f083c470ff38525f7f1cbcbe42dd4bf",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The prior-round finding remains: section 2.3 includes the inference legs among lanes protected by an existing whole-step two-attempt wrapper, but the D-entailment, RIF WG Core, RIF-Core, EL, QL, and Direct-Semantics steps each run cargo test once and only inspect PIPESTATUS. The added guard in .config/nextest.toml likewise says the relevant legs' existing wrappers already cover fetch aborts, without excluding these single-attempt inference lanes.",
+    "file": "research/ci-nextest-leg-conversion-evaluation.md",
+    "fix_hint": "Remove the inference legs from the whole-step-wrapper claim and explicitly state that those inference lanes are currently single-attempt, or add whole-step wrappers to them. Also narrow the .config/nextest.toml guard so it does not imply universal wrapper coverage.",
+    "severity": "minor",
+    "title": "Inference ratchet legs still lack the claimed whole-step retry wrappers"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The documentation-only decision remains broadly correct, but the prior minor accuracy issue is unchanged. Section 2.3 still claims that an existing whole-step two-attempt wrapper covers the inference legs, while the D-entailment, RIF WG Core, RIF-Core, EL, QL, and Direct-Semantics workflow steps shown in ci.yml each invoke cargo test only once and then inspect PIPESTATUS. The new nextest.toml guard repeats the overbroad wrapper claim. This factual issue is minor and does not invalidate the recommendation against mechanically converting these output-parsing lanes to nextest.",
+  "verdict": "approve"
+ }
+}
