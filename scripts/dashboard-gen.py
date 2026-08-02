@@ -975,20 +975,24 @@ def _workflow_step_script(text, step_id):
     return _workflow_step_block(text, step_id, "run")
 
 
-def _workflow_step_env(text, step_id):
-    """The `env:` mapping of the step whose `id:` is `step_id`, as {NAME: raw expression text}.
+def _workflow_step_mapping(text, step_id, key):
+    """The `<key>:` mapping of the step whose `id:` is `step_id`, as {name: raw value text}.
 
     #612 review round 4: deleting `SECRETS_STEP_OUTCOME: ${{ steps.acct-secrets.outcome }}` from the
     probe step survived the suite, because the executed body reads the variable from the process
     environment the HARNESS supplies — execution can never see a missing workflow-level wiring. A
     mapping (rather than a substring search) is what makes "this step defines this variable, from
     that step's outcome" falsifiable, and resolving the step id it names is what stops the wiring
-    from pointing at a step that no longer exists."""
+    from pointing at a step that no longer exists.
+
+    #935 review round 1 shares the reader with `with:`: an action's INPUTS are wiring by exactly
+    the same argument — nothing a harness can execute observes which owner/repository/permission a
+    mint step asked for, so the only place that is falsifiable is the YAML."""
     lines = _workflow_step(text, step_id).split("\n")
-    heads = [index for index, line in enumerate(lines) if line.strip() == "env:"]
+    heads = [index for index, line in enumerate(lines) if line.strip() == f"{key}:"]
     if len(heads) != 1:
         raise DashboardError(
-            f"step `id: {step_id}` has {len(heads)} `env:` mappings, expected exactly 1")
+            f"step `id: {step_id}` has {len(heads)} `{key}:` mappings, expected exactly 1")
     head = heads[0]
     indent = len(lines[head]) - len(lines[head].lstrip())
     mapping = {}
@@ -1001,8 +1005,41 @@ def _workflow_step_env(text, step_id):
         if separator:
             mapping[name.strip()] = value.strip()
     if not mapping:
-        raise DashboardError(f"step `id: {step_id}` has an empty `env:` mapping — refusing")
+        raise DashboardError(f"step `id: {step_id}` has an empty `{key}:` mapping — refusing")
     return mapping
+
+
+def _workflow_step_env(text, step_id):
+    """The `env:` mapping of the step whose `id:` is `step_id`, as {NAME: raw expression text}."""
+    return _workflow_step_mapping(text, step_id, "env")
+
+
+def _workflow_step_key(text, step_id, key):
+    """The raw scalar value of the step's OWN top-level `<key>:`, or None when it has none.
+
+    #935: executing a step body — which is all a hermetic shell harness can do — can never see the
+    `if:` that decides whether production runs that body at all. Bounded to the step's own key
+    column, so a `key:` nested under `with:`/`env:` cannot satisfy an assertion about the step
+    itself, and two of them at that column is a refusal rather than a first-wins guess."""
+    lines = _workflow_step(text, step_id).split("\n")
+    indent = len(lines[0]) - len(lines[0].lstrip()) + 2
+    values = []
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        # The `- ` of the sequence entry carries the step's first key two columns right of the
+        # dash — the same column every later key sits at.
+        here = (" " * indent + line.lstrip()[2:]
+                if index == 0 and line.lstrip().startswith("- ") else line)
+        if len(here) - len(here.lstrip()) != indent:
+            continue
+        name, separator, value = here.strip().partition(":")
+        if separator and name.strip() == key:
+            values.append(value.strip())
+    if len(values) > 1:
+        raise DashboardError(
+            f"step `id: {step_id}` has {len(values)} top-level `{key}:` keys, expected at most 1")
+    return values[0] if values else None
 
 
 def _js_function_body(text, name):
@@ -4105,6 +4142,107 @@ esac
     keepalive_check(
         "[#559] control: a sweeper that ran inside its threshold is not kicked at all — the leg is "
         "not simply dispatching on every fire", (code, dispatched), (0, []), log)
+
+    # --- #935: the SEAM around that leg, which no amount of executing the body can reach. The rows
+    # above drive the script directly; production reaches it only through a step-level `if:`, and
+    # only on the token the mint step before it produces. Both of those wirings are deletable with
+    # every row above still green: `if: false` on the step retires the sweeper's only fallback in
+    # complete silence (a skipped step concludes the job green), and re-pointing GH_TOKEN at the
+    # default `github.token` breaks it exactly when it is needed and at no other time, because that
+    # token has no actions:write in sparq-org and so 403s at the moment of the kick. #935 names this
+    # leg the hardest silent break to notice from the registry side; both survivors are that break.
+    # Pinned by EQUALITY on the raw expression text — a containment check is satisfied by appending
+    # `&& false`. (The JOB carrying both legs is asserted ungated by metrics.py's own suite, which
+    # parses dashboard.yml at job level; not restated here.)
+    # ------------------------------------------------------------------------------------------
+    sparq_env = _workflow_step_env(dashboard_workflow, "sparq-keepalive-dispatch")
+    minted = re.fullmatch(r"\$\{\{\s*steps\.([A-Za-z0-9_-]+)\.outputs\.token\s*\}\}",
+                          sparq_env.get("GH_TOKEN") or "")
+    # ...and WHAT THE PRODUCER IS, not merely that something answers to its id. Round 1's review:
+    # resolving the step id proved only that SOME step carries it, so a same-id `run: echo` no-op —
+    # or the same mint re-pointed at another owner/repository, or asked for `permission-actions:
+    # read` — left the tuple identical while the dispatch can no longer obtain the cross-repo
+    # actions:write credential this leg exists to spend. Every input the credential's SCOPE depends
+    # on is pinned by equality, including the App the secrets name: a mint fed a different App's
+    # id/key is a different (possibly uninstalled) identity on sparq-org.
+    #
+    # A wiring naming a step that no longer exists, or one that is no longer a mint at all, must go
+    # RED on this row and never abort the suite part-way: every row below an unhandled refusal
+    # stops running and the mutant reads as a kill.
+    def _minted_by(text, step_id):
+        try:
+            uses = _workflow_step_key(text, step_id, "uses")
+            inputs = _workflow_step_mapping(text, step_id, "with")
+        except DashboardError:
+            return None
+        # The pin's trailing ` # v3.2.0` annotates the SHA; it is not part of the reference.
+        return ((uses or "").partition(" #")[0].strip(), inputs.get("app-id"),
+                inputs.get("private-key"), inputs.get("owner"), inputs.get("repositories"),
+                inputs.get("permission-actions"))
+
+    mint_pin = ("actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
+                "${{ secrets.REGISTRY_ADMIN_APP_ID }}", "${{ secrets.REGISTRY_ADMIN_APP_KEY }}",
+                "sparq-org", "sparq", "write")
+    check("[#935] the cross-repo leg is GATED on a minted App token and RUNS on that same minted "
+          "token, and the step it names IS the SHA-pinned App mint scoped to sparq-org/sparq with "
+          "actions:write — dropping or weakening any of those wirings leaves every executed row "
+          "above green while the sweeper's only fallback is dead",
+          (_workflow_step_key(dashboard_workflow, "sparq-keepalive-dispatch", "if"),
+           sparq_env.get("GH_TOKEN"),
+           minted.group(1) if minted else None,
+           _minted_by(dashboard_workflow, minted.group(1)) if minted else None),
+          ("steps.sparq-keepalive-token.outputs.token != ''",
+           "${{ steps.sparq-keepalive-token.outputs.token }}",
+           "sparq-keepalive-token",
+           mint_pin))
+    # ...and that the row above is the thing killing those mutants, driven as mutations of the LIVE
+    # file so neither reads its own stub: a same-id non-mint step is a NAMED miss rather than a
+    # raise (the suite keeps running, so the row count is the same red-or-green), and a redirected
+    # scope is read back changed rather than defaulted away.
+    noop_mint = ("      - name: synthetic\n"
+                 "        id: sparq-keepalive-token\n"
+                 "        run: |\n"
+                 "          true\n")
+
+    def _mint_input(text, slot):
+        """One slot of the producer's identity under a mutation, or None when the mutant left no
+        readable mint — indexing a miss here would abort the suite on the very mutant this row
+        exists to prove is survivable, which is how the count stops being comparable."""
+        found = _minted_by(text, "sparq-keepalive-token")
+        return found[slot] if found else None
+
+    check("[#935] the producer pin is falsifiable: a same-id non-mint step reads as None without "
+          "aborting the suite, and a redirected owner or downgraded permission is read back as "
+          "the changed value",
+          (_minted_by(noop_mint, "sparq-keepalive-token"),
+           _mint_input(dashboard_workflow.replace("          owner: sparq-org\n",
+                                                  "          owner: jeswr\n"), 3),
+           _mint_input(dashboard_workflow.replace("          permission-actions: write\n",
+                                                  "          permission-actions: read\n"), 5)),
+          (None, "jeswr", "read"))
+    # The extractor's OWN guards, driven directly: the live step has exactly one `if:` at its own
+    # column, so neither the nesting bound nor the absent/duplicate paths execute above — and an
+    # extractor that answered `nested-must-not-count` (or first-wins on a duplicate) would make the
+    # row above pass against a step carrying no gate at all.
+    nested_key = ("      - name: synthetic\n"
+                  "        id: synthetic-step\n"
+                  "        with:\n"
+                  "          if: nested-must-not-count\n"
+                  "        run: |\n"
+                  "          true\n")
+    own_key = nested_key.replace("          if: nested-must-not-count\n",
+                                 "          ref: main\n"
+                                 "        if: own-gate\n")
+    check("[#935] the step-key extractor reads the step's OWN keys: a nested `if:` is not one, an "
+          "absent gate is None rather than a default, the first key rides the `- `, and two gates "
+          "at that column is a refusal",
+          (_workflow_step_key(nested_key, "synthetic-step", "if"),
+           _workflow_step_key(own_key, "synthetic-step", "if"),
+           _workflow_step_key(own_key, "synthetic-step", "name"),
+           _raises_dashboard(lambda: _workflow_step_key(
+               own_key.replace("        run: |\n", "        if: second-gate\n        run: |\n"),
+               "synthetic-step", "if"))),
+          (None, "own-gate", "synthetic", True))
 
     # --- #612 review round 2, finding 5 (MINOR): the successful CLI -> builder handoff. Deleting
     # `probe_status=probe_status` from main()'s build_dashboard call left every direct-builder test
