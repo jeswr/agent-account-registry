@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1689,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d7de249934396a9d04925467c8d66ccc5b6e2f0b",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-1 semantic mismatch is resolved. `groom` now passes the complete raw header value to a dedicated full-match parser, so trailing junk and embedded `Retry-After:` tokens are rejected while the diagnostic-text parser retains its search semantics. Both entry points converge on the same positive-and-capped numeric policy. The added tests independently pin malformed-field rejection, the production adapter and call site, zero-delay fallback through the real sleep policy, positive-delay honoring, and delegation to the shared header parser. I found no remaining correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
