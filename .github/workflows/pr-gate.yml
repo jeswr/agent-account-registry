@@ -400,6 +400,29 @@ jobs:
           print(f"CLI flag check OK: {len(pairs)} workflow-passed flags are declared by their scripts")
           PY
 
+      # [issue #1315] A predicate exists in N places; a fix narrows N-1; the suite stays green,
+      # because every fixture exercises the copy that was fixed. Four measured instances in one
+      # session. #1275's missed copy lives in a 6.6k-line shell script, its refusal string appears
+      # only at three `die` sites with ZERO coverage, and every worker-live.sh fixture uses a
+      # worker-shaped branch — so 55/55 passed while the lane delivered nothing. The miss fails in
+      # the EXPENSIVE direction: admission says yes, a round is charged and a model runs, and a
+      # LATER copy still refuses, so the product is discarded and the item parks.
+      #
+      # The census declares, per governed predicate, its distinguishing literal and a partition of
+      # its copies into cells; everything else — which files hold a copy, and what guards it — is
+      # DERIVED from the tree on every run, over `.py`, `.sh` and `.yml` repository-wide. So the
+      # check cannot be satisfied by editing its own declaration (#1315's explicit anti-pattern:
+      # two hand-maintained lists verify their agreement, not their truth).
+      #
+      # HARD, not advisory, and no `if:`: this is the class of defect whose whole signature is that
+      # the suite stayed green, so an annotation-only channel would reproduce the failure it
+      # exists to catch. The step body is pinned EXACT-MATCH by the script's own --self-test —
+      # deleting it, adding an `if:`, dropping the flag or appending `|| true` all red.
+      - name: "Assert no copy of a governed predicate was left behind by a narrowing (#1315)"
+        run: |
+          set -euo pipefail
+          python3 scripts/predicate-census.py --census
+
       - name: Assert every non-local action reference is pinned to a 40-hex commit
         run: |
           set -euo pipefail
