@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1632,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ae397b4909e06273bd1107c4225d51f5756f7808",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Step C still says to run `python3 scripts/ledger-invariant.py` against a fresh checkout of the rewritten branch. The shipped CLI requires a positional checkout root unless `--self-test` is used, so the literal command exits in argparse without checking the tree. The rewritten `ledger` checkout is also intentionally data-only and therefore has no `scripts/ledger-invariant.py` to execute. The later contents-API and parser checks do not perform this separately prescribed allowlist/tree-shape validation. This is the same major defect recorded in round 4.",
+    "file": "research/536-ledger-history-rewrite.md",
+    "fix_hint": "Name two distinct checkouts and provide an exact executable command: invoke `scripts/ledger-invariant.py` from a trusted registry code checkout pinned to a specified reviewed SHA, and pass the fresh rewritten-ledger checkout as its positional root, for example `python3 <registry-code-checkout>/scripts/ledger-invariant.py <rewritten-ledger-checkout>`. Keep the code source and validation target explicit and distinct.",
+    "severity": "major",
+    "title": "The ledger-invariant post-check still cannot run as written"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-4 major finding remains materially unchanged. Step C still prescribes `python3 scripts/ledger-invariant.py` against a fresh rewritten-ledger checkout, but the literal command has no required root argument and therefore exits through argparse without validating anything. In addition, the rewritten branch is explicitly data-only, so it does not contain the referenced script. The subsequent contents-API and schema checks validate tip content but do not execute the separately required Git tree allowlist check. The maintenance runbook remains non-executable as written at a fail-closed post-rewrite gate.",
+  "verdict": "request_changes"
+ }
+}
