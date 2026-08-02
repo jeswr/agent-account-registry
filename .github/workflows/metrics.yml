@@ -203,6 +203,8 @@ jobs:
           # #1021: presence is the WHOLE test here — this router does not probe the token's write
           # capability at ALERT_REPO and does not verify that ALERT_REPO is private (unlike the
           # #432/#436 hardened router in usage-alert.py). Do not describe it as if it did.
+          # This block is pinned CLOSED (exact text, not containment) by metrics-alert.py's
+          # `_test_alert_route_contract`; edit it there in the same change or the gate reds.
           ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
         run: |

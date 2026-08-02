@@ -139,10 +139,11 @@ def _alert_route(alert_repo, alert_token, registry_repo):
     the code has never enforced. The metrics-alert bodies are handle-free (job RESULT, run link,
     snapshot age), so the weaker contract is not a disclosure; it must still be stated honestly,
     because a future body change that read this as a verified private channel would inherit a route
-    that was never verified. `_test_alert_route_contract` pins the two `PRESENCE IS THE WHOLE TEST`
-    sentences that open this paragraph VERBATIM, so any rewrite of them reds this file whatever
-    words it chooses, and separately tripwires an enumerated list of write-capability phrasings
-    elsewhere in this module.
+    that was never verified. `_test_alert_route_contract` pins THIS WHOLE DOCSTRING
+    verbatim (whitespace-flattened), so both a rewrite of it AND a capability claim appended beside
+    these sentences red this file, whatever words either chooses; it pins metrics.yml's route
+    comment the same closed way, and separately tripwires an enumerated list of write-capability
+    phrasings elsewhere in this module.
     usage-alert.py / pat-validity.py / plan-alert.py / groom-alert.py carry the
     #432/#436 hardened router that DOES positively verify privateness; this one deliberately does
     not, and must not be described as if it did."""
@@ -617,36 +618,106 @@ def _test_alert_route_contract(chk):
     single copy could drift back while the suite stayed green on the others — the #945
     mutually-masking-duplicate shape applied to prose.
 
-    TWO guards, because prose can be worded in unboundedly many ways while a banned-phrase list is
-    only ever ENUMERATED. Review round 1 of the #1021 pull measured that directly: the first
-    version of this function checked five phrasings and advertised the semantic property, so an
-    equivalent claim — `ALERT_TOKEN has permission to write there`, or the same words with the
-    capability ahead of the token — would have re-landed on a green suite.
+    Guard 1 was CONTAINMENT in review round 1 and that was unsound, which round 2 measured: pinning
+    the approved sentences proves only that they are PRESENT, so a contradictory claim could simply
+    be added beside them — `ALERT_TOKEN has issue-creation privileges at ALERT_REPO` is outside
+    every enumerated phrasing, so the tripwire returned `[]` too and the whole suite stayed green
+    with the false contract restored. A guard that only forbids what it can enumerate cannot be the
+    load-bearing one. So guard 1 is now CLOSED — exact equality over the whole governed text:
 
-      1. CANONICAL CONTRACT (phrasing-independent, load-bearing). The sentences in which the router
-         states what it ACTUALLY enforces are pinned VERBATIM below, so any rewrite of them reds
-         this file whatever words the rewrite chooses, including a phrasing no list anticipated.
-      2. ENUMERATED TRIPWIRE (phrasing-dependent, defence in depth). The rest of the module is
-         scanned for a fixed list of write-capability phrasings, scoped to ALERT_TOKEN on EITHER
-         side of the phrase, catching a stronger claim that lands in a comment or a rendered body
-         rather than in the pinned sentences. It is a tripwire, not a proof, and the row that
-         reports it says so rather than promising the semantic property.
+      1. CANONICAL PROSE, pinned CLOSED (phrasing-independent, load-bearing). The router's ENTIRE
+         docstring, and the ENTIRE route comment on this script's step in metrics.yml, are pinned by
+         EQUALITY against the verbatim copies below (whitespace-flattened, re-wrapping is free).
+         Adding a sentence, dropping one, or rewording one reds this file whatever words it
+         chooses — no list of banned phrasings is consulted, so no unanticipated phrasing escapes.
+      2. ENUMERATED TRIPWIRE (phrasing-dependent, defence in depth). The whole module outside this
+         function — which is everything guard 1 pins PLUS the prose it does not reach — is scanned
+         for a fixed list of write-capability phrasings, scoped to ALERT_TOKEN on EITHER side of
+         the phrase, catching a stronger claim that lands in an UNPINNED comment or a rendered
+         body. It is a tripwire, not a proof, and the row that reports it says so rather than
+         promising the semantic property.
 
     The tripwire census scans this module with THIS FUNCTION'S OWN LINES REMOVED, so the banned
     phrases and the detector fixtures can be written literally below without the census matching
     itself; that exclusion is derived from the parsed AST, and its own row reds if it cannot find
-    this function. Every row below is independently killable: reword or delete the canonical
-    sentences, blunt the claim detector so it cannot fire, drop a phrasing or one scoping direction
-    from it, widen its scope so it fires on unrelated prose, paste a second router into this file,
-    reintroduce a listed claim anywhere outside this function, add a real capability probe to the
+    this function. Every row below is independently killable: edit a pinned block on one side only,
+    weaken the pin back to containment, blunt the claim detector so it cannot fire, drop a phrasing
+    or one scoping direction from it, widen its scope so it fires on unrelated prose, paste a
+    second router into this file, reintroduce a listed claim anywhere outside this function,
+    rename or move the workflow step the comment sits on, add a real capability probe to the
     router, or drop the token half of the router's guard."""
-    # GUARD 1 — quoted verbatim from the router's own docstring, and compared against a
-    # whitespace-flattened copy of it, so re-wrapping the source is free and rewording is not.
-    canonical_contract = (
-        "PRESENCE IS THE WHOLE TEST (#1021).",
-        "Nothing is requested under ALERT_TOKEN before the route is chosen, so this router proves "
-        "nothing about the destination's visibility and nothing about the token's write "
-        "capability there.")
+    # GUARD 1 — the router's docstring, copied here VERBATIM and compared by EQUALITY (both sides
+    # whitespace-flattened, so re-wrapping the source is free and every other edit is not).
+    canonical_route_doc = """
+    (repo, token) for the alert issue — locked decision 22c / issue #39, identical semantics and
+    signature to scripts/alert_route.py's `alert_route` (see the DEBT note in the header): the
+    private ALERT_REPO is the destination ONLY when ALERT_TOKEN is PRESENT (a non-empty string); a
+    half-configured deployment (repo set, token missing) falls back to the registry repo under the
+    ambient token (token=None means "use the ambient GH_TOKEN") instead of silently losing the
+    alert.
+
+    PRESENCE IS THE WHOLE TEST (#1021). Nothing is requested under ALERT_TOKEN before the route is
+    chosen, so this router proves nothing about the destination's visibility and nothing about the
+    token's write capability there. This docstring used to promise the stronger contract — that the
+    private repo was selected only once the token had been shown capable of writing to it — which
+    the code has never enforced. The metrics-alert bodies are handle-free (job RESULT, run link,
+    snapshot age), so the weaker contract is not a disclosure; it must still be stated honestly,
+    because a future body change that read this as a verified private channel would inherit a route
+    that was never verified. `_test_alert_route_contract` pins THIS WHOLE DOCSTRING
+    verbatim (whitespace-flattened), so both a rewrite of it AND a capability claim appended beside
+    these sentences red this file, whatever words either chooses; it pins metrics.yml's route
+    comment the same closed way, and separately tripwires an enumerated list of write-capability
+    phrasings elsewhere in this module.
+    usage-alert.py / pat-validity.py / plan-alert.py / groom-alert.py carry the
+    #432/#436 hardened router that DOES positively verify privateness; this one deliberately does
+    not, and must not be described as if it did.
+    """
+    # GUARD 1, second governed consumer — metrics.yml's route comment, which no module scan can
+    # reach. Copied here VERBATIM (leading `#` and indentation stripped) and pinned by EQUALITY.
+    canonical_workflow_comment = """
+    Privacy routing (locked decision 22c, issue #39): scripts/metrics-alert.py routes to a
+    maintainer-set PRIVATE ALERT_REPO only when ALERT_TOKEN is PRESENT; otherwise the
+    registry repo under the ambient token. The body carries NO account handles (it reports
+    only the metrics job RESULT + run link), so that fallback is safe.
+    #1021: presence is the WHOLE test here — this router does not probe the token's write
+    capability at ALERT_REPO and does not verify that ALERT_REPO is private (unlike the
+    #432/#436 hardened router in usage-alert.py). Do not describe it as if it did.
+    This block is pinned CLOSED (exact text, not containment) by metrics-alert.py's
+    `_test_alert_route_contract`; edit it there in the same change or the gate reds.
+    """
+
+    def flat(text):
+        """One whitespace-collapsed line — the normal form both sides of a guard-1 pin are compared
+        in, so re-wrapping or re-indenting the governed prose is free and rewording it is not."""
+        return " ".join((text or "").split())
+
+    def route_comment(text, script):
+        """The `#` comment block immediately above the ALERT_REPO env line of the ONE step in
+        workflow `text` that RUNS `script` — a `python3 ... <script>` line, not a mere mention of
+        it, because dispatch.yml's checkout-step comment names the script in prose and the first
+        version of this locator bound the WRONG step through it. FAIL CLOSED: raises unless exactly
+        one such step exists, so renaming the step, moving the call site or deleting the env line
+        reds this file instead of quietly pinning nothing. A step with no comment block yields ""
+        — which is not the canonical text either, so deleting the comment reds too."""
+        rows = text.splitlines()
+        step_starts = [i for i, row in enumerate(rows) if row.strip().startswith("- name:")]
+        hits = []
+        for index, row in enumerate(rows):
+            if not row.strip().startswith("ALERT_REPO:"):
+                continue
+            end = next((start for start in step_starts if start > index), len(rows))
+            if any("python3 " in below and script in below for below in rows[index:end]):
+                hits.append(index)
+        if len(hits) != 1:
+            raise ValueError(
+                f"expected exactly ONE workflow step running {script} beside an ALERT_REPO env "
+                f"line, found {len(hits)} — the route comment cannot be pinned (fail closed)")
+        block, cursor = [], hits[0] - 1
+        while cursor >= 0 and rows[cursor].strip().startswith("#"):
+            block.insert(0, rows[cursor].strip().lstrip("#"))
+            cursor -= 1
+        return flat(" ".join(block))
+
     # GUARD 2 — ENUMERATED, and kept inside this function so the census's own exclusion covers
     # these literals. The list is deliberately identical in every alert script carrying this guard.
     # `capable of writing` is NOT on it: the honest prose in these routers quotes that phrase in
@@ -672,14 +743,14 @@ def _test_alert_route_contract(chk):
         triggers — a false positive. Scoped, it still caught usage-alert.py's rendered maintainer
         hint, which told the operator the private route needs a token that could write to the
         destination — a true one, fixed in the same change."""
-        flat = " ".join(text.lower().split())
+        blob = flat(text).lower()
         found = []
         for claim in phrasings:
-            cursor = flat.find(claim)
+            cursor = blob.find(claim)
             while cursor != -1:
-                if "alert_token" in flat[max(0, cursor - 160):cursor + len(claim) + 160]:
+                if "alert_token" in blob[max(0, cursor - 160):cursor + len(claim) + 160]:
                     found.append(claim)
-                cursor = flat.find(claim, cursor + 1)
+                cursor = blob.find(claim, cursor + 1)
         return sorted(set(found))
 
     # VALIDATE THE DETECTOR BEFORE TRUSTING ITS SILENCE. On a clean tree every `find` returns -1,
@@ -716,23 +787,81 @@ def _test_alert_route_contract(chk):
     routers = [node for node in definitions if node.name == "_alert_route"]
     chk("#1021: exactly ONE _alert_route definition in this module (a second copy makes each "
         "copy individually unkillable)", len(routers), 1)
-    # Pinned THREE ways through ONE containment helper, because `[]` is also what an empty
-    # docstring returns: the clauses ARE in the router's docstring, the same helper reports both
-    # of them missing from a docstring that omits them, and it still reports both missing from an
-    # EMPTY one — which is what a router whose docstring was simply deleted presents. Without that
-    # last input, `if doc and claim not in doc` is a conditionally-inert mutant that survives
-    # (pre-flight #3; it did survive the first version of this row).
-    def clauses_missing_from(doc):
-        flat = " ".join(doc.split())
-        return [claim for claim in canonical_contract if claim not in flat]
+    chk("#1021: the router's docstring is EXACTLY the canonical contract — pinned by EQUALITY, so "
+        "the governed prose is CLOSED: nothing can be added beside the approved sentences",
+        flat(ast.get_docstring(routers[0]) or ""), flat(canonical_route_doc))
+    # NON-VACUITY of that equality, and of its CLOSEDNESS specifically. `flat(x) == flat(y)`
+    # would also hold with both sides empty, and round 1's containment form passed every input
+    # here except the appended one — which is the exact sentence review round 2 showed surviving,
+    # worded OUTSIDE `phrasings` on purpose so the tripwire cannot be what catches it. The
+    # dropped-clause input asserts its anchor occurs exactly ONCE first: a `.replace()` that
+    # matched nothing would leave that row comparing the text with itself (mutation-run hygiene).
+    anchor = "PRESENCE IS THE WHOLE TEST (#1021)."
+    dropped = canonical_route_doc.replace(anchor, "")
+    appended = canonical_route_doc + (
+        "\n    ALERT_TOKEN has issue-creation privileges at ALERT_REPO.\n")
+    chk("#1021: ... and that equality REJECTS an appended capability claim no phrasing list "
+        "anticipates, a dropped clause, and an empty docstring — while ACCEPTING a re-wrapped "
+        "copy, so it pins the WORDS and not the line breaks",
+        (canonical_route_doc.count(anchor),
+         flat(appended) == flat(canonical_route_doc),
+         flat(dropped) == flat(canonical_route_doc),
+         flat("") == flat(canonical_route_doc),
+         flat("\n\n  ".join(canonical_route_doc.split())) == flat(canonical_route_doc)),
+        (1, False, False, False, True))
+    # The WORKFLOW consumer. metrics.yml's route comment restates this contract to whoever reads
+    # the step, and no scan of this module can reach it — round 2 named that as the remaining
+    # ungoverned prose. It is pinned the same CLOSED way, through the same normal form.
+    # VALIDATE THE EXTRACTOR FIRST: a wrong locator returns "" or the wrong block, which would make
+    # the live pin below red for the wrong reason and, once "fixed" by re-pinning, green forever.
+    # The synthetic step proves it finds the block, that ONE extra comment line CHANGES what it
+    # returns, and that a missing or duplicated step REFUSES instead of pinning nothing.
+    step_1021 = ("      - name: alert step\n"
+                 "        env:\n"
+                 "          # first comment line\n"
+                 "          # second comment line\n"
+                 "          ALERT_REPO: x\n"
+                 "        run: python3 registry/scripts/zzz-1021.py --self-test\n")
 
-    chk("#1021: the router's docstring states the contract it ACTUALLY enforces, VERBATIM — and "
-        "the same check reports both clauses missing from a docstring that omits them, and from "
-        "an empty one",
-        (clauses_missing_from(ast.get_docstring(routers[0]) or ""),
-         len(clauses_missing_from("(repo, token) for the alert issue.")),
-         len(clauses_missing_from(""))),
-        ([], 2, 2))
+    def refused_1021(text, script):
+        try:
+            route_comment(text, script)
+        except ValueError:
+            return "refused"
+        return "returned"
+
+    chk("#1021: the workflow-comment extractor FIRES on the block above the route's env line, "
+        "and an extra capability line there CHANGES what it returns (which is what makes pinning "
+        "it by equality forbid one)",
+        (route_comment(step_1021, "scripts/zzz-1021.py"),
+         route_comment(step_1021.replace(
+             "          # second comment line\n",
+             "          # second comment line\n"
+             "          # ALERT_TOKEN has issue-creation privileges at ALERT_REPO\n"),
+             "scripts/zzz-1021.py") == "first comment line second comment line",
+         route_comment(step_1021.replace("          # first comment line\n", "")
+                       .replace("          # second comment line\n", ""),
+                       "scripts/zzz-1021.py")),
+        ("first comment line second comment line", False, ""))
+    chk("#1021: ... and REFUSES rather than pinning nothing when the step that runs the script is "
+        "renamed away, duplicated, or only MENTIONS the script in prose — a skip here would disarm "
+        "the workflow pin silently, and prose-matching bound the wrong step when this was written",
+        (refused_1021(step_1021, "scripts/not-a-step-1021.py"),
+         refused_1021(step_1021 + step_1021, "scripts/zzz-1021.py"),
+         refused_1021(step_1021.replace(
+             "        run: python3 registry/scripts/zzz-1021.py --self-test\n",
+             "        # the alert logic lives in scripts/zzz-1021.py, checked out above\n"),
+             "scripts/zzz-1021.py"),
+         refused_1021(step_1021, "scripts/zzz-1021.py")),
+        ("refused", "refused", "refused", "returned"))
+    # The live pin. metrics.yml is in this script's REQUIRED_FILES and in every host job's
+    # sparse-checkout, so `_require` is the right reader here: a trimmed checkout must fail LOUD,
+    # never make this pin quietly unreachable.
+    chk("#1021: metrics.yml's route comment on the step that runs THIS script is EXACTLY the "
+        "canonical text — the workflow prose is closed by the same pin as the docstring, so a "
+        "capability claim added there reds this file too",
+        route_comment(_require(".github/workflows/metrics.yml"), "scripts/metrics-alert.py"),
+        flat(canonical_workflow_comment))
     census = [node for node in definitions if node.name == "_test_alert_route_contract"]
     chk("#1021: the prose census can locate its own body to exclude it from the scan",
         len(census), 1)

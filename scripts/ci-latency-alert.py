@@ -859,10 +859,11 @@ def _alert_route(alert_repo, alert_token, registry_repo):
     (workflow names, run links, ages, census counts), so the weaker contract is not a
     disclosure; it must still be stated honestly, because a future body change that read this
     as a verified private channel would inherit a route that was never verified.
-    `_test_alert_route_contract` pins the two `PRESENCE IS THE WHOLE TEST` sentences that
-    open this paragraph VERBATIM, so any rewrite of them reds this file whatever words it
-    chooses, and separately tripwires an enumerated list of write-capability phrasings
-    elsewhere in this module. See metrics-alert.py's header for why the copies cannot simply be folded together."""
+    `_test_alert_route_contract` pins THIS WHOLE DOCSTRING
+    verbatim (whitespace-flattened), so both a rewrite of it AND a capability claim appended beside
+    these sentences red this file, whatever words either chooses; it separately tripwires an
+    enumerated list of write-capability phrasings elsewhere in this module. See
+    metrics-alert.py's header for why the copies cannot simply be folded together."""
     if alert_repo and alert_token:
         return alert_repo, alert_token
     return registry_repo, None
@@ -1225,36 +1226,63 @@ def _test_alert_route_contract(chk):
     single copy could drift back while the suite stayed green on the others — the #945
     mutually-masking-duplicate shape applied to prose.
 
-    TWO guards, because prose can be worded in unboundedly many ways while a banned-phrase list is
-    only ever ENUMERATED. Review round 1 of the #1021 pull measured that directly: the first
-    version of this function checked five phrasings and advertised the semantic property, so an
-    equivalent claim — `ALERT_TOKEN has permission to write there`, or the same words with the
-    capability ahead of the token — would have re-landed on a green suite.
+    Guard 1 was CONTAINMENT in review round 1 and that was unsound, which round 2 measured: pinning
+    the approved sentences proves only that they are PRESENT, so a contradictory claim could simply
+    be added beside them — `ALERT_TOKEN has issue-creation privileges at ALERT_REPO` is outside
+    every enumerated phrasing, so the tripwire returned `[]` too and the whole suite stayed green
+    with the false contract restored. A guard that only forbids what it can enumerate cannot be the
+    load-bearing one. So guard 1 is now CLOSED — exact equality over the whole governed text:
 
-      1. CANONICAL CONTRACT (phrasing-independent, load-bearing). The sentences in which the router
-         states what it ACTUALLY enforces are pinned VERBATIM below, so any rewrite of them reds
-         this file whatever words the rewrite chooses, including a phrasing no list anticipated.
-      2. ENUMERATED TRIPWIRE (phrasing-dependent, defence in depth). The rest of the module is
-         scanned for a fixed list of write-capability phrasings, scoped to ALERT_TOKEN on EITHER
-         side of the phrase, catching a stronger claim that lands in a comment or a rendered body
-         rather than in the pinned sentences. It is a tripwire, not a proof, and the row that
-         reports it says so rather than promising the semantic property.
+      1. CANONICAL PROSE, pinned CLOSED (phrasing-independent, load-bearing). The router's ENTIRE
+         docstring is pinned by EQUALITY against the verbatim copy below (whitespace-flattened, so
+         re-wrapping is free). Adding a sentence, dropping one, or rewording one reds this file
+         whatever words it chooses — no list of banned phrasings is consulted, so no unanticipated
+         phrasing escapes. This module's step comment in groom.yml is NOT pinned here: it is prose this
+         change never touched, and it stays under guard 2 only — a boundary, not a proof.
+      2. ENUMERATED TRIPWIRE (phrasing-dependent, defence in depth). The whole module outside this
+         function — which is everything guard 1 pins PLUS the prose it does not reach — is scanned
+         for a fixed list of write-capability phrasings, scoped to ALERT_TOKEN on EITHER side of
+         the phrase, catching a stronger claim that lands in an UNPINNED comment or a rendered
+         body. It is a tripwire, not a proof, and the row that reports it says so rather than
+         promising the semantic property.
 
     The tripwire census scans this module with THIS FUNCTION'S OWN LINES REMOVED, so the banned
     phrases and the detector fixtures can be written literally below without the census matching
     itself; that exclusion is derived from the parsed AST, and its own row reds if it cannot find
-    this function. Every row below is independently killable: reword or delete the canonical
-    sentences, blunt the claim detector so it cannot fire, drop a phrasing or one scoping direction
-    from it, widen its scope so it fires on unrelated prose, paste a second router into this file,
-    reintroduce a listed claim anywhere outside this function, add a real capability probe to the
-    router, or drop the token half of the router's guard."""
-    # GUARD 1 — quoted verbatim from the router's own docstring, and compared against a
-    # whitespace-flattened copy of it, so re-wrapping the source is free and rewording is not.
-    canonical_contract = (
-        "PRESENCE IS THE WHOLE TEST (#1021).",
-        "Nothing is requested under ALERT_TOKEN before the route is chosen, so this router proves "
-        "nothing about the destination's visibility and nothing about the token's write "
-        "capability there.")
+    this function. Every row below is independently killable: edit a pinned block on one side only,
+    weaken the pin back to containment, blunt the claim detector so it cannot fire, drop a phrasing
+    or one scoping direction from it, widen its scope so it fires on unrelated prose, paste a
+    second router into this file, reintroduce a listed claim anywhere outside this function,
+    add a real capability probe to the router, or drop the token half of the router's guard."""
+    # GUARD 1 — the router's docstring, copied here VERBATIM and compared by EQUALITY (both sides
+    # whitespace-flattened, so re-wrapping the source is free and every other edit is not).
+    canonical_route_doc = """
+    (repo, token) for the alert issue — locked decision 22c / issue #39, identical
+    semantics and signature to scripts/dispatch-stall-alert.py's private copy: the private
+    ALERT_REPO is the destination ONLY when ALERT_TOKEN is PRESENT (a non-empty string); a
+    half-configured deployment (repo set, token missing) falls back to the registry repo under
+    the ambient token instead of silently losing the alert.
+
+    PRESENCE IS THE WHOLE TEST (#1021). Nothing is requested under ALERT_TOKEN before the route
+    is chosen, so this router proves nothing about the destination's visibility and nothing
+    about the token's write capability there. This docstring used to promise the stronger
+    contract — that the private repo was selected only once the token had been shown capable of
+    writing to it — which the code has never enforced. The ci-latency bodies are handle-free
+    (workflow names, run links, ages, census counts), so the weaker contract is not a
+    disclosure; it must still be stated honestly, because a future body change that read this
+    as a verified private channel would inherit a route that was never verified.
+    `_test_alert_route_contract` pins THIS WHOLE DOCSTRING
+    verbatim (whitespace-flattened), so both a rewrite of it AND a capability claim appended beside
+    these sentences red this file, whatever words either chooses; it separately tripwires an
+    enumerated list of write-capability phrasings elsewhere in this module. See
+    metrics-alert.py's header for why the copies cannot simply be folded together.
+    """
+
+    def flat(text):
+        """One whitespace-collapsed line — the normal form both sides of a guard-1 pin are compared
+        in, so re-wrapping or re-indenting the governed prose is free and rewording it is not."""
+        return " ".join((text or "").split())
+
     # GUARD 2 — ENUMERATED, and kept inside this function so the census's own exclusion covers
     # these literals. The list is deliberately identical in every alert script carrying this guard.
     # `capable of writing` is NOT on it: the honest prose in these routers quotes that phrase in
@@ -1280,14 +1308,14 @@ def _test_alert_route_contract(chk):
         triggers — a false positive. Scoped, it still caught usage-alert.py's rendered maintainer
         hint, which told the operator the private route needs a token that could write to the
         destination — a true one, fixed in the same change."""
-        flat = " ".join(text.lower().split())
+        blob = flat(text).lower()
         found = []
         for claim in phrasings:
-            cursor = flat.find(claim)
+            cursor = blob.find(claim)
             while cursor != -1:
-                if "alert_token" in flat[max(0, cursor - 160):cursor + len(claim) + 160]:
+                if "alert_token" in blob[max(0, cursor - 160):cursor + len(claim) + 160]:
                     found.append(claim)
-                cursor = flat.find(claim, cursor + 1)
+                cursor = blob.find(claim, cursor + 1)
         return sorted(set(found))
 
     # VALIDATE THE DETECTOR BEFORE TRUSTING ITS SILENCE. On a clean tree every `find` returns -1,
@@ -1322,23 +1350,28 @@ def _test_alert_route_contract(chk):
     routers = [node for node in definitions if node.name == "_alert_route"]
     chk("#1021: exactly ONE _alert_route definition in this module (a second copy makes each "
         "copy individually unkillable)", len(routers) == 1)
-    # Pinned THREE ways through ONE containment helper, because `[]` is also what an empty
-    # docstring returns: the clauses ARE in the router's docstring, the same helper reports both
-    # of them missing from a docstring that omits them, and it still reports both missing from an
-    # EMPTY one — which is what a router whose docstring was simply deleted presents. Without that
-    # last input, `if doc and claim not in doc` is a conditionally-inert mutant that survives
-    # (pre-flight #3; it did survive the first version of this row).
-    def clauses_missing_from(doc):
-        flat = " ".join(doc.split())
-        return [claim for claim in canonical_contract if claim not in flat]
-
-    chk("#1021: the router's docstring states the contract it ACTUALLY enforces, VERBATIM — and "
-        "the same check reports both clauses missing from a docstring that omits them, and from "
-        "an empty one",
-        (clauses_missing_from(ast.get_docstring(routers[0]) or ""),
-         len(clauses_missing_from("(repo, token) for the alert issue.")),
-         len(clauses_missing_from("")))
-        == ([], 2, 2))
+    chk("#1021: the router's docstring is EXACTLY the canonical contract — pinned by EQUALITY, so "
+        "the governed prose is CLOSED: nothing can be added beside the approved sentences",
+        flat(ast.get_docstring(routers[0]) or "") == flat(canonical_route_doc))
+    # NON-VACUITY of that equality, and of its CLOSEDNESS specifically. `flat(x) == flat(y)`
+    # would also hold with both sides empty, and round 1's containment form passed every input
+    # here except the appended one — which is the exact sentence review round 2 showed surviving,
+    # worded OUTSIDE `phrasings` on purpose so the tripwire cannot be what catches it. The
+    # dropped-clause input asserts its anchor occurs exactly ONCE first: a `.replace()` that
+    # matched nothing would leave that row comparing the text with itself (mutation-run hygiene).
+    anchor = "PRESENCE IS THE WHOLE TEST (#1021)."
+    dropped = canonical_route_doc.replace(anchor, "")
+    appended = canonical_route_doc + (
+        "\n    ALERT_TOKEN has issue-creation privileges at ALERT_REPO.\n")
+    chk("#1021: ... and that equality REJECTS an appended capability claim no phrasing list "
+        "anticipates, a dropped clause, and an empty docstring — while ACCEPTING a re-wrapped "
+        "copy, so it pins the WORDS and not the line breaks",
+        (canonical_route_doc.count(anchor),
+         flat(appended) == flat(canonical_route_doc),
+         flat(dropped) == flat(canonical_route_doc),
+         flat("") == flat(canonical_route_doc),
+         flat("\n\n  ".join(canonical_route_doc.split())) == flat(canonical_route_doc))
+        == (1, False, False, False, True))
     census = [node for node in definitions if node.name == "_test_alert_route_contract"]
     chk("#1021: the prose census can locate its own body to exclude it from the scan",
         len(census) == 1)
