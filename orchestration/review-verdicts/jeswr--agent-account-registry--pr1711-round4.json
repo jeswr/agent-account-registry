@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1711,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "fb483b14561f54bae4b5b03b7d67b3f79b877f1b",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 remains sound and complete. The shared generated_at grammar is enforced both at artifact validation and at the service-order boundary; the new queue helper exact-matches repository rows before applying a deterministic, total, non-destructive rotation; and dispatch is bound to that helper with the validated plan and current repository. The change does not overclaim bounded fairness: it accurately characterizes hashing as probabilistic, retains the nonzero residual tail, and explains the scope tradeoff. The tests independently pin exact offsets, rotation shape, totality, per-repository isolation and delivery, malformed-input refusal including empty queues, production call-site arguments, and non-vacuity against representative permissive mutations. I found no correctness, soundness, test-validity, injection, or security issue in the diff. Because round 3 also had no findings at the same severity profile, progress is stagnant under the required rubric, while the verdict remains approve.",
+  "verdict": "approve"
+ }
+}
