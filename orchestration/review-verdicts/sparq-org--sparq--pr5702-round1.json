@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5702,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c24bc5ce0dcfd3b81dfb58f7738860bcf5275053",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 1 says that because the defining symbols first appear in sparq's whole-tree import commit, the three branches 'were merged upstream, before the snapshot was taken.' `git log -S` in this repository proves only that the imported snapshot contains those symbols; it says nothing about whether the named upstream branches were merged, abandoned, or contained additional changes. The document itself acknowledges that branch tips were unreachable, says commit-level completeness is unproved, and asks the maintainer in section 8 whether the branches were merged. Consequently, the unconditional outcome 'all three branches are DROP \u2014 subsumed' is not established by the evidence. This matters operationally because deleting an upstream branch could discard work outside each headline capability.",
+    "file": "research/lws-branch-port-triage.md",
+    "fix_hint": "Either obtain and compare the three upstream branch tips against import revision `1e555b10` before issuing branch-level DROP verdicts, or narrow the record consistently to 'headline capability already present; branch-level port/drop deferred pending upstream comparison/maintainer confirmation.' Remove the claim that the branches were merged before the snapshot unless supported by upstream history, and align the outcome line, verdict table, and section 8 with the weaker capability-level conclusion.",
+    "severity": "major",
+    "title": "DROP verdict relies on an unverified upstream-merge inference"
+   }
+  ],
+  "progress": null,
+  "summary": "The record is careful in several places to disclose that upstream branch tips were unavailable and that only capability-level evidence was checked. However, its central DROP/subsumed conclusion is presented more strongly than that evidence permits, and section 1 makes an unsupported historical inference that directly conflicts with the stated limitation and open questions. The cited in-tree tests support the presence of the headline capabilities, but cannot establish that each upstream branch was merged before the snapshot or that no branch work remains to port.",
+  "verdict": "request_changes"
+ }
+}
