@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5365,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "01ffabc620508850b258806840db8c2c7c39ec4f",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`receipt_comment()` interpolates `thread.location()` directly into a Markdown table cell wrapped with backticks. Review-thread paths originate from the PR diff and are attacker-controlled; Git permits filenames containing backticks, pipes, and newlines. Such a path can terminate the inline-code/table structure and inject arbitrary rendered Markdown, including mentions or text that impersonates the bot's audit receipt. Because this scheduled workflow posts with repository `pull-requests: write`, the generated comment must treat path/location values as untrusted display data.",
+    "file": "scripts/stale-analysis-threads.py",
+    "fix_hint": "Render locations through a dedicated Markdown-safe encoder before inserting them into the receipt: reject or visibly escape control characters/newlines, escape table delimiters, and use a code representation whose delimiter cannot be closed by the value (or HTML-escape into a `<code>` element). Add a test with a path containing a backtick, pipe, newline, and `@mention`, asserting the resulting receipt remains one inert table cell and cannot create active Markdown or a mention.",
+    "severity": "major",
+    "title": "PR-controlled paths can inject content into privileged receipt comments"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 substantively fixes both prior major findings: workflow authority is revalidated before enumeration and before each mutation group with the unavoidable residual TOCTOU documented, and receipts are now posted before resolution so a posting failure leaves the sweep retryable. However, the new receipt path copies an untrusted PR-controlled filename directly into a privileged bot comment without Markdown sanitization. A crafted filename can break out of the table/code formatting and inject mentions or misleading receipt content, so the change is not yet safe to approve.",
+  "verdict": "request_changes"
+ }
+}
