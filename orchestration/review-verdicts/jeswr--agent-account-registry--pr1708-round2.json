@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1708,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a304e3bce686ff356ea72003b9eb20bbe7bca37f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Unchanged from round 1. Within the same fence the sibling placeholders are self-describing angle-bracket forms (`<uuid>`, `<owner/repo@run>`), while `account` is an opaque hex literal `0123456789abcdef`. A reader skimming only this block cannot tell the value is `sha256(handle + ':' + PROVENANCE_SALT)[:16]` rather than a literal constant or a real account identifier; the explanation lives ~785 lines away in the Security posture section (locked decision 22a, README.md:879-887).\n\nFiled as a nit, not a defect, for the same reason as round 1: an angle-bracket placeholder would NOT be a valid substitute, because `select-and-claim.ACCOUNT_FINGERPRINT_RE` (:391) and `lease_schema.ACCOUNT` (:17) fullmatch `[0-9a-f]{16}`, and a `<fingerprint>` token would not match -- so a concrete hex literal is the correct way to convey the ENFORCED shape, and JSON has no comment syntax to annotate it inline. The literal chosen also matches the existing in-repo fixture convention (scripts/groom.py:4331). The change is correct and complete as written; nothing here blocks the merge.",
+    "file": "README.md",
+    "fix_hint": "Optional only, and safe to decline. If desired, add one sentence of prose immediately BELOW the fenced block, e.g.: \"`account` is the salted fingerprint `sha256(handle + ':' + PROVENANCE_SALT)[:16]` -- 16 hex characters, never a raw `[redacted-account]` handle (locked decision 22a); `validate_lease_account_identities` drops any row that does not fullmatch that shape.\" Leave the literal inside the JSON fence unchanged so it continues to depict the enforced shape.",
+    "severity": "nit",
+    "title": "Fingerprint placeholder is still not self-describing beside the angle-bracket placeholders around it (carried from round 1)"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 re-review of an unchanged one-line docs diff: the lease-ledger JSON example in README.md now shows `\"account\": \"0123456789abcdef\"` instead of the raw handle `[redacted-account]`. Verified against code, not prose. `scripts/select-and-claim.py:391` defines ACCOUNT_FINGERPRINT_RE = [0-9a-f]{16}; `account_fingerprint()` (:394) returns sha256(f\"{handle}:{salt}\")[:16] and raises LeaseIOError when PROVENANCE_SALT or the handle is missing (fail closed); `validate_lease_account_identities()` (:402) DROPS any row whose `account` is not a 16-hex fullmatch, and its own self-test at :3147-3151 is non-vacuous on exactly that point (a raw \"[redacted-account]\" must yield [], a canonical fingerprint must survive). `scripts/lease_schema.py:17` carries the identical ACCOUNT regex, enforced at :170. The pre-change example therefore contradicted an ENFORCED invariant: an agent following it verbatim would write a row the next CAS write silently discards. The new literal is exactly 16 lowercase hex characters, fullmatches both regexes, and matches the convention already used in-repo by scripts/groom.py:4331. It is consistent with README's own locked decision 22a (:879-887).\n\nNo trust check is weakened: nothing under scripts/, .github/workflows/, policy/ or orchestration/ is touched; no self-test deleted, relaxed or skipped; no default-allow path opened. Test validity: no test changed, and scripts/readme-runbook-check.py:71 opens only on ```toml fences, so this ```json fence in the lease section is outside its scope and the suite is unaffected. Security: the placeholder is a synthetic, obviously-sequential digest-shaped string -- not a credential, not a real fingerprint, and unreversible to a handle without the salt; nothing token-shaped or PII-shaped enters the repo. README.md is explicitly non-trust-surface (scripts/worker-pr.py:7070 asserts trust_surface_paths_touched([\"README.md\", ...]) == []), so no arm path is engaged.\n\nPROGRESS: the diff is byte-identical to round 1 and the s\u2026 [truncated 195 chars]",
+  "verdict": "approve"
+ }
+}
