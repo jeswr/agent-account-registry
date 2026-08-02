@@ -42,7 +42,13 @@
 #      GENERATION below, issue #1027): the reader REFUSES a manifest carrying no generation
 #      provenance, because a claim that can be typed can be typed SHORT, and a short claim is
 #      satisfied by the very partial corpus it was meant to bound — strictly more dangerous than no
-#      claim at all. What is derived is then VERIFIED here: every expected record must be present.
+#      claim at all. But NO DOCUMENT PROVES ITS OWN DERIVATION: a hand-written manifest whose block
+#      agrees with its own shortened entry list passes every check made against the document alone.
+#      So the audit does not take the manifest's word for it — `--expected-records` REQUIRES
+#      `--from-records <authoritative tree>`, the audit ENUMERATES that tree itself, re-derives the
+#      claim it supports, and refuses unless the manifest equals that derivation exactly, in both
+#      directions (`source_bound_records`, which states what the tree can and cannot prove).
+#      What is derived is then VERIFIED here: every expected record must be present.
 #      Verification is by FILENAME, so a filename must be worth trusting: each record's name is
 #      parsed exactly and must agree with the `pr_number` INSIDE it, or the audit refuses.
 #      Otherwise a record parked under another PR's name would witness a record that is really
@@ -254,11 +260,16 @@ def generation_provenance(document):
     overclaim. There is no secret to sign a manifest with: the audit runs offline and its only
     credential is the provenance salt, which anyone who can type a manifest can also read, so this
     is a STRUCTURAL bind and not a cryptographic one. Its force is that the block must AGREE with
-    the entries it describes — same basis, same window, same record COUNT — so the realistic
-    failure, an operator editing or retyping a generated artifact and dropping a PR from it, breaks
-    the count and refuses. It cannot stop a deliberate, self-consistent forgery; only an
-    authoritative enumeration the auditor fetches itself could, and that needs the network and a
-    token this module deliberately does not have. What it removes is the SLIP."""
+    the entries it describes — same basis, same window, same record COUNT — so an operator EDITING
+    a generated artifact and dropping a PR from it breaks the count and refuses.
+
+    It proves nothing more than that, and in particular it does NOT prove the document was
+    generated: every field it checks is public and self-attested, so a manifest typed from scratch
+    with a matching count is internally consistent and passes. That is why this is not the gate on
+    the arm path. `source_bound_records` re-derives the whole claim from an authoritative record
+    tree the audit enumerates ITSELF and refuses anything that disagrees; this block stays because
+    it names the artifact's provenance and kills the edited-after-generation case cheaply and by
+    name, one layer before the source comparison."""
     block = document.get("generated")
     if not isinstance(block, dict):
         raise AuditError(
@@ -418,6 +429,12 @@ def read_corpus(directory):
 # states exactly how far that binding goes). A generator the arm side treats as optional would have
 # left the typed short manifest above arming exactly as before.
 #
+# THE STAMP IS NOT THE PROOF, though — every field in it is public and self-attested, so a manifest
+# typed from scratch with a count matching its own shortened entry list satisfies it. The audit
+# therefore re-runs this same derivation at AUDIT time, over the tree `--from-records` names, and
+# accepts the artifact only where it EQUALS what that tree supports (`source_bound_records`). The
+# generator prints what a human reviews; the re-derivation is what the arm path actually trusts.
+#
 # TWO THINGS A GENERATED MANIFEST DOES NOT PROVE, stated because a generated artifact reads as more
 # authoritative than a typed one:
 #   * It bounds the corpus against the ledger's RECORD SET, not against the set of worker PRs that
@@ -498,25 +515,97 @@ def manifest_from_corpus(corpus, targets, window):
     return document
 
 
-def generate(policy_path, source_dir, window, audited_dir):
-    """Derive the manifest for `policy_path`'s enabled targets from `source_dir`. READ-ONLY."""
+def derived_manifest(source_dir, audited_dir, targets, window):
+    """The manifest the AUTHORITATIVE tree `source_dir` supports for `targets`. READ-ONLY.
+
+    ONE definition, used by both directions of the #1027 flow — `generate`, which prints the
+    artifact for a maintainer to review, and `source_bound_records`, which re-derives it at AUDIT
+    time and refuses any artifact that disagrees. Two copies of this refusal would make each copy
+    individually unkillable (AGENTS.md 4), and the arm path must refuse exactly the sources the
+    generator refuses: a source that IS the audited corpus yields a manifest complete by
+    construction, which asserts nothing while reading as a verified completeness claim."""
     if is_same_directory(source_dir, audited_dir):
         raise AuditError(
             f"--from-records {str(source_dir)!r} is the corpus this audit reads "
             f"({str(audited_dir)!r}): a manifest derived from the corpus it bounds is complete by "
             "construction and asserts nothing — point it at an authoritative tree, such as a "
             "`ledger`-branch checkout of the provenance directory")
+    return manifest_from_corpus(read_corpus(source_dir), targets, window)
+
+
+def generate(policy_path, source_dir, window, audited_dir):
+    """Derive the manifest for `policy_path`'s enabled targets from `source_dir`. READ-ONLY."""
     grant_account = _load_sibling("grant-account.py", "registry_grant_account")
     pools = pools_by_target(_read(policy_path, "policy"), grant_account)
-    return manifest_from_corpus(read_corpus(source_dir), sorted(pools), window)
+    return derived_manifest(source_dir, audited_dir, sorted(pools), window)
+
+
+def source_bound_records(manifest_text, source_dir, audited_dir, targets):
+    """The expected records, RE-DERIVED from `source_dir` and merely CONFIRMED by the manifest.
+
+    THE ROUND-2 FINDING (#1027). `generation_provenance` authenticates a manifest against ITSELF —
+    a public literal basis, a window it chose, and a count of the entries it lists — so it catches
+    an artifact EDITED after generation and nothing else. A document written from scratch with a
+    well-formed `generated` block, any window, and a `source_records` that agrees with its own
+    SHORTENED entry list satisfies every one of those guards. And a short claim is satisfied by the
+    very partial corpus it was meant to bound: the row is marked `scoped` and a live account whose
+    only record is the omitted one is proposed for revocation. Self-attested fields cannot prove a
+    derivation, so on the arm path the manifest's own account of itself is not evidence at all.
+
+    What decides completeness here is therefore evidence the document does not control: the audit
+    ENUMERATES the authoritative tree itself, re-derives the claim that tree supports, and requires
+    the artifact to equal it EXACTLY. The comparison runs in BOTH directions — a PR omitted, a PR
+    added, or a whole target dropped all refuse the run rather than silently downgrading to the
+    shorter claim. The manifest survives as the durable thing a human reviewed and as the stated
+    window; it is no longer what proves the bound.
+
+    WHAT THIS STILL DOES NOT PROVE, stated because this binding is now the load-bearing one. The
+    trust root moves from a typed document to a RECORD TREE, and that tree is trusted as given: an
+    operator who points `--from-records` at a checkout with records deleted still shortens the
+    claim. A `ledger`-branch checkout is diffable against its remote and reviewable as a tree of
+    per-PR documents, which one integer in a JSON file is not — but that is a floor, not a proof.
+    And no tree shows a PR whose record was never MINTED (MANIFEST GENERATION above): it is absent
+    from the source and from the corpus alike, so the derivation never expects it and the audit
+    would still call that corpus complete. Only an enumeration of the target's merged worker PRs
+    closes that, and it needs the network and a token this module deliberately does not have."""
+    claimed = expected_records(manifest_text, targets)
+    # `expected_records` binds every entry's window to the `generated` block's and refuses an empty
+    # manifest, so any entry's window IS this manifest's window. The derivation is stamped with it
+    # so the comparison below is about the RECORD SETS, never about the annotation.
+    window = next(iter(claimed.values()))["window"]
+    derived = expected_records(
+        json.dumps(derived_manifest(source_dir, audited_dir, targets, window)), targets)
+    if claimed != derived:
+        def held(claims, target):
+            claim = claims.get(target)
+            return claim["records"] if claim else frozenset()
+        omitted = sorted(name for target, claim in derived.items()
+                         for name in claim["records"] - held(claimed, target))
+        unsupported = sorted(name for target, claim in claimed.items()
+                             for name in claim["records"] - held(derived, target))
+        raise AuditError(
+            f"expected-records manifest disagrees with the authoritative tree {str(source_dir)!r} "
+            f"it must be derived from: it OMITS {', '.join(omitted) or 'nothing'} and CLAIMS "
+            f"{', '.join(unsupported) or 'nothing'} that tree does not hold — refusing a "
+            "completeness claim the audit cannot re-derive, because a manifest that attests to "
+            "its own completeness attests to it however short it was written")
+    return derived
 
 
 def manifest_mode_error(generating, from_records, window, expected_path):
     """The refusal for an incoherent invocation, or None when the flags cohere.
 
+    ONE definition of how these flags may combine, called at BOTH seams that can act on them
+    (`main` exits 2, `run` raises), so a library caller cannot enter the arm path through a
+    combination the CLI refuses.
+
     Generation and audit are separate runs over separate trees. A flag belonging to the other mode
     is REFUSED rather than ignored: an accepted-but-inert flag reads to its operator as though it
-    took effect, and here that operator is deciding whether to revoke a live capability."""
+    took effect, and here that operator is deciding whether to revoke a live capability. And
+    `--expected-records` now REQUIRES `--from-records` (review round 2): a manifest is believed
+    only where the audit can re-derive it from an authoritative tree, so an audit handed a manifest
+    and no tree has no completeness evidence at all and must refuse rather than take the document's
+    word for its own completeness."""
     if generating:
         if expected_path:
             return ("--generate-manifest DERIVES a manifest and reads none, so --expected-records "
@@ -527,10 +616,17 @@ def manifest_mode_error(generating, from_records, window, expected_path):
             return (f"--generate-manifest requires {' and '.join(missing)}: a manifest with no "
                     "authoritative source, or with no stated observation window, bounds nothing")
         return None
-    stray = [flag for flag, value in (("--from-records", from_records), ("--window", window))
-             if value]
-    if stray:
-        return f"{' and '.join(stray)} only apply to --generate-manifest"
+    if window:
+        return ("--window only applies to --generate-manifest: an audit takes its observation "
+                "window from the manifest it was given, never from the command line")
+    if expected_path and not from_records:
+        return ("--expected-records requires --from-records <authoritative tree>: the manifest is "
+                "RE-DERIVED from that tree and believed only where the two agree, because a "
+                "manifest that attests to its own completeness attests to it however short it was "
+                "written")
+    if from_records and not expected_path:
+        return ("--from-records bounds nothing without --expected-records: it is the tree a "
+                "manifest is re-derived from, not a completeness claim on its own")
     return None
 
 
@@ -663,11 +759,18 @@ def _read(path, what):
         raise AuditError(f"cannot read {what} {str(path)!r}: {exc}") from exc
 
 
-def run(policy_path, provenance_dir, salt=None, expected_path=None):
+def run(policy_path, provenance_dir, salt=None, expected_path=None, source_dir=None):
+    # The SAME coherence rule the CLI applies, enforced here too and BEFORE any evidence is read: a
+    # caller handing over a manifest with no authoritative tree to re-derive it from must not get
+    # an audit that believes the manifest (`manifest_mode_error`, `source_bound_records`).
+    mode_error = manifest_mode_error(False, source_dir, None, expected_path)
+    if mode_error:
+        raise AuditError(mode_error)
     grant_account = _load_sibling("grant-account.py", "registry_grant_account")
     pools = pools_by_target(_read(policy_path, "policy"), grant_account)
     evidence, observed, foreign = collect_evidence(read_corpus(provenance_dir), sorted(pools))
-    expected = (expected_records(_read(expected_path, "expected-records manifest"), sorted(pools))
+    expected = (source_bound_records(_read(expected_path, "expected-records manifest"),
+                                     source_dir, provenance_dir, sorted(pools))
                 if expected_path else None)
     return audit(pools, evidence, foreign=foreign, salt=salt, observed=observed, expected=expected)
 
@@ -785,6 +888,26 @@ def _self_test():
         ok = False
         print(f"FAIL {label}: no refusal")
         return ""
+
+    def refusal_type(thunk):
+        """The NAME of whatever `thunk` raises, or "no refusal". Used where DELETING the guard
+        under test would make the call crash rather than refuse: a mutant that aborts the suite
+        records as a kill while every row below it goes unrun (AGENTS.md 4,
+        crash-after-partial-run), so the outcome is turned into a comparable VALUE instead."""
+        try:
+            thunk()
+        except Exception as exc:        # noqa: BLE001 — the exception TYPE is the measurement
+            return type(exc).__name__
+        return "no refusal"
+
+    def value_or_error(thunk):
+        """`thunk()`, or the NAME of whatever it raises. For the POSITIVE control of a guard: a
+        control that RAISES instead of reding aborts the suite, so every row below it goes unrun
+        while the mutant that caused it records as a kill (AGENTS.md 4)."""
+        try:
+            return thunk()
+        except Exception as exc:        # noqa: BLE001 — a refusal here is a red row, never a stop
+            return type(exc).__name__
 
     grant_account = _load_sibling("grant-account.py", "registry_grant_account")
 
@@ -1079,14 +1202,15 @@ def _self_test():
           sorted(expected_records(json.dumps(generated), ["o/a", "o/b"])["o/a"]["records"]),
           ["o--a--pr1.json", "o--a--pr2.json", "o--a--pr9.json"])
     # THE #1027 CLAIM ITSELF, both directions, over the SAME audited corpus, salt and pools —
-    # only the manifest differs. `scoped` above is a manifest SHORT of PR 9: the gate refuses the
-    # hand-typed and the edited forms of it (above), but a claim that is internally consistent is
-    # still believed, and this is what believing a short one costs. That residue is why the source
-    # of the claim — a derivation from an authoritative tree — is the actual fix, not the gate.
+    # only the manifest differs. `scoped` is the audit LAYER handed a claim short of PR 9: it
+    # believes whatever claim it is given, which is exactly why nothing may REACH it that the audit
+    # could not re-derive. Round 1's gate does not achieve that (a short claim consistent with its
+    # own block passes it); `source_bound_records` does, and is measured over real trees and at the
+    # CLI in the tempdir block below.
     from_generated = audit(pools, evidence, foreign=foreign, salt=SALT, observed=observed,
                            expected=expected_records(json.dumps(generated), ["o/a", "o/b"]))
-    check("[#1027] a manifest SHORT of PR 9 declares this partial corpus complete and proposes "
-          "acct03 — whose only record is the one it omits",
+    check("[#1027] the audit layer BELIEVES the claim it is handed: one short of PR 9 declares "
+          "this partial corpus complete and proposes acct03 — whose only record is the omitted one",
           (scoped["targets"]["o/a"]["status"], scoped["targets"]["o/a"]["revocation_candidates"]),
           (STATUS_SCOPED, ["acct03"]))
     check("[#1027] ...while the GENERATED manifest sees PR 9 absent from that corpus and proposes "
@@ -1118,8 +1242,14 @@ def _self_test():
     # The mode check refuses a flag belonging to the other mode instead of accepting it inert.
     check("a coherent generate invocation is not refused (the refusals below are not vacuous)",
           manifest_mode_error(True, "src", GEN_WINDOW, None), None)
-    check("...nor is a coherent audit invocation carrying an --expected-records path",
-          manifest_mode_error(False, None, None, "manifest.json"), None)
+    check("...nor is an audit invocation naming BOTH a manifest and the tree it is re-derived from",
+          manifest_mode_error(False, "src", None, "manifest.json"), None)
+    # Pinned by MESSAGE: `--from-records` with no manifest is refused too, so a bare refusal here
+    # would not say WHICH direction of the pairing this check measures.
+    check("[#1027] ...but a manifest with NO authoritative tree to re-derive it from is refused: "
+          "an audit never takes a document's word for its own completeness",
+          "--expected-records requires --from-records" in
+          (manifest_mode_error(False, None, None, "manifest.json") or ""), True)
 
     # -- FAIL CLOSED 3: no salt => no candidate anywhere, on the SAME corpus that produces them.
     # Called through a catcher: without the no-salt gate `fingerprint()` refuses (the second
@@ -1178,11 +1308,30 @@ def _self_test():
         (prov / "README.md").write_text("not a record", encoding="utf-8")
         # Named like a record but not one: the corpus reader must skip it rather than read it.
         (prov / "o--a--pr8.txt").write_text("not a record either", encoding="utf-8")
+        # The AUTHORITATIVE tree every audit below re-derives its manifest from (review round 2). A
+        # `ledger`-branch checkout is a DIFFERENT directory from the audited corpus; here it holds
+        # exactly the same records, which is precisely what makes THIS corpus provably complete —
+        # and `manifest_path` is a real `generate` artifact rather than a typed document.
+        ledger_complete = root / "ledger-complete"
+        ledger_complete.mkdir()
+        for name, text in corpus:
+            (ledger_complete / name).write_text(text, encoding="utf-8")
         manifest_path = root / "expected.json"
-        manifest_path.write_text(_manifest({"o/a": [1, 2], "o/b": [3]}), encoding="utf-8")
-        before = {path.name: path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()}
-        end_to_end = run(str(policy_path), str(prov), salt=SALT,
-                         expected_path=str(manifest_path))
+        manifest_path.write_text(
+            json.dumps(generate(str(policy_path), str(ledger_complete), WINDOW, str(prov))),
+            encoding="utf-8")
+        before = {path.relative_to(root).as_posix(): path.read_bytes()
+                  for path in sorted(root.rglob("*")) if path.is_file()}
+        # Every row below reads this report by subscript, so a mutant that made the BOUND run
+        # refuse would abort the suite here and record as a kill with the rest unmeasured. The
+        # refusal is turned into a value first (AGENTS.md 4), and the rows below then run against a
+        # report that is known to exist — the `unmapped` idiom above.
+        end_to_end = value_or_error(lambda: run(str(policy_path), str(prov), salt=SALT,
+                                                expected_path=str(manifest_path),
+                                                source_dir=str(ledger_complete)))
+        check("the bound end-to-end run produces a report rather than refusing",
+              type(end_to_end).__name__, "dict")
+        end_to_end = end_to_end if isinstance(end_to_end, dict) else audit(pools, {}, salt=SALT)
         check("the end-to-end run reproduces the per-target scoping",
               end_to_end["targets"]["o/a"]["revocation_candidates"], ["acct03"])
         check("a non-record file in the corpus directory is ignored",
@@ -1191,7 +1340,8 @@ def _self_test():
               [row["revocation_candidates"]
                for row in run(str(policy_path), str(prov), salt=SALT)["targets"].values()],
               [[], []])
-        after = {path.name: path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()}
+        after = {path.relative_to(root).as_posix(): path.read_bytes()
+                  for path in sorted(root.rglob("*")) if path.is_file()}
         check("the audit is READ-ONLY (policy + corpus byte-identical after a full run)",
               after, before)
 
@@ -1203,12 +1353,15 @@ def _self_test():
         misnamed.write_text(_record("acct01", 5), encoding="utf-8")
         refuses("end to end, a corpus file whose name and content name different PRs refuses",
                 lambda: run(str(policy_path), str(prov), salt=SALT,
-                            expected_path=str(manifest_path)))
+                            expected_path=str(manifest_path), source_dir=str(ledger_complete)))
         misnamed.unlink()
         check("...and the SAME run without that one file scopes normally (the refusal is not "
               "vacuous)",
-              run(str(policy_path), str(prov), salt=SALT,
-                  expected_path=str(manifest_path))["targets"]["o/a"]["revocation_candidates"],
+              value_or_error(
+                  lambda: run(str(policy_path), str(prov), salt=SALT,
+                              expected_path=str(manifest_path),
+                              source_dir=str(ledger_complete))["targets"]["o/a"][
+                                  "revocation_candidates"]),
               ["acct03"])
 
         refuses("a missing provenance directory refuses",
@@ -1217,7 +1370,21 @@ def _self_test():
                 lambda: run(str(root / "nope.toml"), str(prov), salt=SALT))
         refuses("an unreadable expected-records manifest refuses",
                 lambda: run(str(policy_path), str(prov), salt=SALT,
-                            expected_path=str(root / "nope.json")))
+                            expected_path=str(root / "nope.json"),
+                            source_dir=str(ledger_complete)))
+        # [#1027 round 2] The SAME manifest that scopes this corpus two checks up, offered with no
+        # authoritative tree to re-derive it from: the run refuses outright rather than believing
+        # the document. A manifest is never evidence for itself, however well-formed it is. Pinned
+        # as a refusal TYPE because without the guard this argv reaches the source reader with no
+        # path and crashes — which would abort the suite instead of reding this row.
+        check("[#1027] a manifest with NO authoritative tree refuses the whole run, though that "
+              "exact manifest scopes this corpus WITH one",
+              refusal_type(lambda: run(str(policy_path), str(prov), salt=SALT,
+                                       expected_path=str(manifest_path))), "AuditError")
+        refuses("...and a source tree that IS the audited corpus refuses too — a manifest cannot "
+                "be re-derived from the corpus it bounds",
+                lambda: run(str(policy_path), str(prov), salt=SALT,
+                            expected_path=str(manifest_path), source_dir=str(prov)))
 
         # -- #1027 OVER REAL DIRECTORIES. A manifest bounds a corpus only when it was derived from
         # a DIFFERENT tree, so the source/corpus identity check is exercised against real paths.
@@ -1245,11 +1412,54 @@ def _self_test():
               {path.name: path.read_bytes() for path in sorted(ledger_dir.iterdir())},
               ledger_before)
 
+        # -- THE SOURCE BINDING (#1027 review round 2). `short` is the document round 1 cannot
+        # see: nobody generated it, but it carries a well-formed `generated` block whose
+        # `source_records` agrees with its own SHORTENED entry list, so every check made against
+        # the document ALONE passes it. `ledger_dir` holds PR 9; this corpus does not. Believed, it
+        # marks o/a `scoped` and proposes acct03 — whose only record is the omitted PR 9.
+        short = _manifest({"o/a": [1, 2], "o/b": [3]})
+        check("the short manifest IS self-consistent — it passes the document-only gate, so the "
+              "refusals below come from the SOURCE binding and not from that gate",
+              sorted(expected_records(short, ["o/a", "o/b"])["o/a"]["records"]),
+              ["o--a--pr1.json", "o--a--pr2.json"])
+        omission = refuses(
+            "[#1027] a SELF-CONSISTENT short manifest is refused against the authoritative tree: "
+            "what it says about itself is not evidence, and the tree does not support it",
+            lambda: source_bound_records(short, str(ledger_dir), str(prov), ["o/a", "o/b"]))
+        check("...and the record it omits is NAMED, not merely counted",
+              ("o--a--pr9.json" in omission, "OMITS o--a--pr9.json" in omission), (True, True))
+        derived_text = json.dumps(
+            generate(str(policy_path), str(ledger_dir), GEN_WINDOW, str(prov)))
+        check("...while the manifest that tree DOES support is accepted over the same two trees "
+              "(the refusals here are not vacuous)",
+              value_or_error(lambda: sorted(
+                  source_bound_records(derived_text, str(ledger_dir), str(prov),
+                                       ["o/a", "o/b"])["o/a"]["records"])),
+              ["o--a--pr1.json", "o--a--pr2.json", "o--a--pr9.json"])
+        overclaim = refuses(
+            "...and a manifest claiming a PR the tree does NOT hold is refused too: the "
+            "comparison is exact in BOTH directions, never a floor",
+            lambda: source_bound_records(_manifest({"o/a": [1, 2, 9, 11], "o/b": [3]}),
+                                         str(ledger_dir), str(prov), ["o/a", "o/b"]))
+        check("...and the record the tree cannot support is named",
+              "CLAIMS o--a--pr11.json" in overclaim, True)
+        refuses("...and a manifest DROPPING a whole target the tree bounds is refused, not read "
+                "as a claim about the target it kept",
+                lambda: source_bound_records(_manifest({"o/a": [1, 2, 9]}), str(ledger_dir),
+                                             str(prov), ["o/a", "o/b"]))
+        refuses("re-deriving from the audited corpus itself refuses — ONE definition of that "
+                "tautology, refused on the audit path exactly as on the generate path",
+                lambda: source_bound_records(derived_text, str(prov), str(prov), ["o/a", "o/b"]))
+        refuses("...and re-deriving from a missing tree refuses rather than bounding nothing",
+                lambda: source_bound_records(derived_text, str(root / "no-ledger"), str(prov),
+                                             ["o/a", "o/b"]))
+
         # -- THE CLI SEAM. Everything above calls run()/audit() directly; the production controls
         # live in main(), so they are exercised HERE, through argparse and the real environment.
         # Each check pins a VALUE the flag controls, not merely that the flag is accepted.
         base = ["--policy", str(policy_path), "--provenance-dir", str(prov),
-                "--expected-records", str(manifest_path)]
+                "--expected-records", str(manifest_path),
+                "--from-records", str(ledger_complete)]
         status, out, err = _cli(base, env={_SELFTEST_SALT_ENV: SALT})
         check("the CLI default is UNMAPPED even with a salt sitting in the environment",
               (status, "account identity mapping: OFF (no salt)" in out,
@@ -1316,6 +1526,7 @@ def _self_test():
         generated_path = root / "generated.json"
         generated_path.write_text(gen_out, encoding="utf-8")
         status, out, _ = _cli(gen_base + ["--expected-records", str(generated_path),
+                                          "--from-records", str(ledger_dir),
                                           "--salt-env", _SELFTEST_SALT_ENV],
                               env={_SELFTEST_SALT_ENV: SALT})
         check("the generated file drives a REAL audit: o/a is partial (PR 9 is absent here) and "
@@ -1333,6 +1544,7 @@ def _self_test():
         legacy_path.write_text(_manifest({"o/a": [1, 2], "o/b": [3]}, derived=False),
                                encoding="utf-8")
         status, out, err = _cli(gen_base + ["--expected-records", str(legacy_path),
+                                            "--from-records", str(ledger_dir),
                                             "--salt-env", _SELFTEST_SALT_ENV],
                                 env={_SELFTEST_SALT_ENV: SALT})
         check("[#1027] a hand-typed manifest exits 2 at the CLI and prints NO report: no scoped "
@@ -1340,6 +1552,35 @@ def _self_test():
               (status, out, STATUS_SCOPED in out, "revocation CANDIDATES" in out,
                "acct03" in out, "`generated` block" in err),
               (2, "", False, False, False, True))
+        # THE ARM-SIDE NEGATIVE FOR ROUND 2, end to end, and the one that matters: this manifest is
+        # NOT hand-typed in any way the document itself reveals. It carries a well-formed
+        # `generated` block, a window, and a `source_records` that matches its own shortened entry
+        # list, so it clears every check above — round 1 accepted it, marked o/a `scoped`, and
+        # proposed acct03 off a corpus missing PR 9. Against the authoritative tree it must now
+        # reach NO conclusion. The positive control is `mapped_out` above: the same corpus, salt
+        # and flags, with a manifest its tree DOES support, prints "revocation CANDIDATES (1):
+        # acct03" — so this is a refusal to believe an unbindable claim, not an inability to audit.
+        short_path = root / "self-consistent-short.json"
+        short_path.write_text(short, encoding="utf-8")
+        status, out, err = _cli(gen_base + ["--expected-records", str(short_path),
+                                            "--from-records", str(ledger_dir),
+                                            "--salt-env", _SELFTEST_SALT_ENV],
+                                env={_SELFTEST_SALT_ENV: SALT})
+        check("[#1027] a SELF-CONSISTENT short manifest exits 2 at the CLI and prints NO report: "
+              "no scoped row, no revocation candidate, no handle named, and the omitted PR named",
+              (status, out, STATUS_SCOPED in out, "revocation CANDIDATES" in out,
+               "acct03" in out, "OMITS o--a--pr9.json" in err),
+              (2, "", False, False, False, True))
+        check("...and the positive control it is measured against really does arm on this corpus",
+              "    revocation CANDIDATES (1): acct03" in mapped_out, True)
+        try:                        # without the pairing rule this argv CRASHES; red the row
+            status, out, err = _cli(gen_base + ["--expected-records", str(short_path),
+                                                "--salt-env", _SELFTEST_SALT_ENV],
+                                    env={_SELFTEST_SALT_ENV: SALT})
+        except Exception as exc:    # noqa: BLE001 — any escape from main() is the defect here
+            status, out, err = repr(exc), "", ""
+        check("...and offering it with NO --from-records at all is refused, not audited unbound",
+              (status, out, "requires --from-records" in err), (2, "", True))
         status, out, err = _cli(gen_base + ["--generate-manifest", "--from-records", str(prov),
                                             "--window", GEN_WINDOW])
         check("at the CLI, generating from the audited corpus exits 2 and emits no manifest",
@@ -1353,6 +1594,10 @@ def _self_test():
                                         "--window", GEN_WINDOW,
                                         "--expected-records", str(manifest_path)]),
                 ("--from-records", ["--from-records", str(ledger_dir)]),
+                ("--from-records", ["--expected-records", str(manifest_path)]),
+                ("--window", ["--window", GEN_WINDOW,
+                              "--expected-records", str(manifest_path),
+                              "--from-records", str(ledger_complete)]),
                 ("--window", ["--window", GEN_WINDOW])):
             try:
                 status, out, err = _cli(gen_base + flags)
@@ -1390,10 +1635,12 @@ def main():
               "is ever proposed. The salt is never printed."))
     parser.add_argument(
         "--expected-records", default=None,
-        help=("path to the durable expected-record manifest that bounds the corpus. It must be a "
-              "--generate-manifest artifact: a manifest carrying no `generated` provenance block, "
-              "or one whose entries no longer agree with it, is REFUSED rather than believed. "
-              "Without it, or with any expected record absent, the row is partial-evidence and no "
+        help=("path to the durable expected-record manifest that bounds the corpus. Requires "
+              "--from-records: the manifest is RE-DERIVED from that authoritative tree and "
+              "believed only where the two agree EXACTLY, because no document proves its own "
+              "completeness. A manifest carrying no `generated` provenance block, disagreeing "
+              "with it, or disagreeing with the tree, is REFUSED rather than believed. Without a "
+              "manifest, or with any expected record absent, the row is partial-evidence and no "
               "revocation candidate is proposed — a corpus not known to be complete cannot show "
               "disuse."))
     parser.add_argument(
@@ -1403,9 +1650,11 @@ def main():
               "--from-records and --window."))
     parser.add_argument(
         "--from-records", default=None,
-        help=("with --generate-manifest: the authoritative provenance tree to derive from, e.g. a "
-              "`ledger`-branch checkout of " + DEFAULT_PROVENANCE_DIR + ". It must NOT be the "
-              "corpus the audit reads, which a manifest cannot bound."))
+        help=("the authoritative provenance tree, e.g. a `ledger`-branch checkout of "
+              + DEFAULT_PROVENANCE_DIR + ". With --generate-manifest it is what the manifest is "
+              "derived FROM; with --expected-records it is what that manifest is re-derived "
+              "AGAINST and must agree with. Either way it must NOT be the corpus the audit reads, "
+              "which a manifest cannot bound."))
     parser.add_argument(
         "--window", default=None,
         help=("with --generate-manifest: the observation window the source tree covers, stamped "
@@ -1439,7 +1688,7 @@ def main():
                 "proposed)\n")
     try:
         report = run(args.policy, args.provenance_dir, salt=salt,
-                     expected_path=args.expected_records)
+                     expected_path=args.expected_records, source_dir=args.from_records)
     except AuditError as exc:
         sys.stderr.write(f"grant-scope-audit: {exc}\n")
         return 2
