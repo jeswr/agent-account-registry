@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1744,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1cc3e7f8f166421b7f7f4395c20732948718a60d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The added sweep-level regression test exercises the real terminal-reap path at the relevant mutation boundary. With the initial open-issue listing empty in all three legs, it distinguishes a fresh direct read showing an open non-terminal issue (claim retained) from both a 404-equivalent absence and a closed issue (claim released). The combined assertions cover both fail-closed retention and continued legitimate reaping, record exceptions as values so a crash cannot masquerade as detection, and verify the release set as well as the summary count. The accompanying rationale is consistent with the existing direct-read revalidation flow. No correctness, soundness, security, or test-vacuity issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
