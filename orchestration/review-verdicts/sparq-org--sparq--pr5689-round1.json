@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5689,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "755ca6d08281cc43b018a094e6a05cacfbc74aeb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The consolidation preserves the former advisory lane's effective coverage: the secret scan still runs first, Terraform setup and validation continue after a scan failure via !cancelled(), and all four module paths are attempted before the job reports failure. The shared plugin cache is created before initialization, the advisory registry matches the new job ID and display name, and the documentation accurately reflects the resulting workflow. No correctness, soundness, test-validity, or security defect is evident in the diff.",
+  "verdict": "approve"
+ }
+}
