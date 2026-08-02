@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5697,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6aa6eacb8e177a9e3175b2619b3d8389b4221c75",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The documentation-only change accurately narrows the remaining divergence for New-Feature-SelfRestriction-002 to output vocabulary. The cited implementation behavior is supported by Names::self_concept storing no dictionary term, the realizer emitting named-class type assertions while separately reading self concepts back as self-loop assertions, and the focused converse test exercising CRs3 on the real realization path. No correctness, soundness, test-validity, or security issue is introduced.",
+  "verdict": "approve"
+ }
+}
