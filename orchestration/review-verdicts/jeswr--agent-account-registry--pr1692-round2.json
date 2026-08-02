@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1692,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "41455740d9c6cceb54f96e72191603117d461247",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The malformed-object table exercises an invalid `body`, but never an invalid `title` with an otherwise valid positive issue number and null/absent body. Consequently, changing the guard's key tuple from `(\"title\", \"body\")` to `(\"body\",)` would leave the added suite green. That survivor matters because a malformed title can hide a legacy title-only alert and, if accepted, allow the failure path to create a duplicate instead of refusing the incomplete dedupe view. The implementation is sound; this is a focused regression-coverage gap rather than a current production defect.",
+    "file": "scripts/metrics-alert.py",
+    "fix_hint": "Add a wrapped full-`main()` case such as `[{\"number\": 7, \"title\": 42, \"body\": null}]` on a failing tick, asserting rc 0, a sanitized warning, no payload echo, and no mutation after `issue list`. Verify that removing only `title` from `_usable_row`'s checked keys makes this row fail.",
+    "severity": "minor",
+    "title": "The title-type half of the row guard lacks an independent red test"
+   }
+  ],
+  "progress": "improving",
+  "summary": "The prior major finding is resolved. `_usable_row` validates every value consumed by the matcher and every issue number passed to mutation commands, explicitly excluding booleans and non-positive integers. `_find_open_alert` refuses the complete listing before matching, so malformed or partial evidence produces a sanitized soft skip with no create, edit, comment, or close. The new full-`main()` cases cover the previously demonstrated crashes and unsafe mutation targets in both watchdog modes, and the null-body case prevents an over-strict guard from disabling real listings. One minor mutation-testing gap remains: no case independently proves that the `title` half of the title/body type guard is necessary.",
+  "verdict": "approve"
+ }
+}
