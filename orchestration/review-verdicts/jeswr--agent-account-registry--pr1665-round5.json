@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1665,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ec7588aa19e87d803b18c3f01c66dd4b82326adc",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new guard still extracts and exactly compares only `_alert_route`'s docstring and dispatch.yml's route comment. This diff also rewrites the private-route contract in `render()` and in the comment immediately above `_alert_route()` in `main()`, but neither changed consumer is extracted or pinned by equality. The remaining module census is deliberately phrasing-dependent: its finite `phrasings` tuple omits the round-2 counterexample. Appending `ALERT_TOKEN has issue-creation privileges at ALERT_REPO` to either changed block changes neither canonical value and yields no tripwire match, so all new assertions stay green. Thus the changed prose boundary is still not closed and the round-4 major remains unresolved.",
+    "file": "scripts/usage-alert.py",
+    "fix_hint": "Extract and normalize both changed route-contract consumers in this file\u2014the private-route guidance returned by `render()` and the route comment in `main()`\u2014and compare each by exact equality with independently specified canonical text. Add an appended, deliberately unlisted capability-claim fixture for each extractor so each pin demonstrably rejects the counterexample independently; keep the lexical census only as defense in depth.",
+    "severity": "major",
+    "title": "Changed render and main route prose remain outside the closed guard"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 5 does not close the round-4 boundary. `usage-alert.py` still changes the operator guidance emitted by `render()` and the route-contract comment in `main()`, while guard 1 pins only `_alert_route`'s docstring and the dispatch workflow comment. The module-wide census remains an explicitly finite lexical tripwire, so appending an unlisted assertion such as `ALERT_TOKEN has issue-creation privileges at ALERT_REPO` to either changed block leaves both exact-equality pins untouched and is outside `phrasings`; the self-test remains green. The prior major finding therefore persists at the same severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
