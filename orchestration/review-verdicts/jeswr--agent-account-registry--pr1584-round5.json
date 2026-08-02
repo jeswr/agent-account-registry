@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1584,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "af022db52f535b8a5aafb451a98dee9157c13e9f",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_worker_no_change_pred` returns false when `worker_no_change_rate_1h` is null, and `compute_recoveries` still adds a recovery whenever that predicate is false for every row in the recovery window. Thus, after `recover_snapshots` consecutive unreadable-ledger snapshots, a collected target can auto-close an existing `worker-no-change` alert without any measured evidence that the rate cleared. The collection-target guard does not prevent this because worker-run collection can succeed while only the auxiliary health ledger is unavailable. The new test proves recovery for measured 0.0 snapshots, but it never starts from null-rate snapshots and therefore does not catch this path.",
+    "file": "scripts/metrics.py",
+    "fix_hint": "Give this class a measurable-clear recovery condition: require each recovery-window row to have a numeric no-change rate (and the required sample semantics) before declaring `WORKER_NO_CHANGE` recovered. Add a non-vacuous assertion that two collected null-rate snapshots do not include `(target, WORKER_NO_CHANGE)` in recoveries, while two measured healthy snapshots still do.",
+    "severity": "major",
+    "title": "Unavailable no-change telemetry is still treated as confirmed recovery"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-4 major finding remains unchanged. Missing model-health evidence correctly suppresses firing, but the generic recovery rule still treats a false predicate as proof of clearance. Consequently, consecutive snapshots with a null no-change rate can auto-close a live worker-no-change alert. The added recovery test covers measured healthy snapshots only and does not exercise the unavailable-telemetry case. Progress is stagnant because the same fail-open recovery path remains at the same severity.",
+  "verdict": "request_changes"
+ }
+}
