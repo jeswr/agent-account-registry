@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1734,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7102c7717f5b9f2494df335715f441f981a283b4",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The change remains correct and complete. `worker-prep.sh` now rejects `claude-credentials-json` before spooling the source credential, while `worker-live.sh` independently rejects it at the launcher delivery seam. The supported Anthropic opaque formats remain admitted, and the Codex pre-flight no longer has a permissive original-document fallback: both refresh and dry-run paths derive a minimal mount and unconditionally inspect the materialized file for the original refresh-token value. The new checks are substantive and non-vacuous: they prove the refused fixture really contains the durable sentinel, require operator-visible refusal, scan the entire prepared tree for that value, require no mount material, retain a positive opaque-token control, exercise the expired-token dry-run branch, and assert the launcher's exact non-dying format set. I found no correctness, fail-closed, security, or test-validity defect. Round 1 also had no findings, so progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
