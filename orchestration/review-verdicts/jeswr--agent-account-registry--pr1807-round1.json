@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1807,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8aaa1646c5bf5f003fccddc170372e5aad8026e0",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_worktree_seal_digest` assigns `idx=$(mktemp ...)`, which creates a zero-byte file, and immediately runs `GIT_INDEX_FILE=\"$idx\" git read-tree HEAD`. Git treats an existing `GIT_INDEX_FILE` as an index to parse and rejects a zero-byte file (typically `fatal: ... index file smaller than expected`). The `&&` chain therefore never reaches `git add` or digest generation, the helper returns 1, and the new mandatory calls in `bundle_work` and `stage_fix` die. This prevents both worker and review-fix lanes from producing a pre-gate seal on honest input. The added self-test should also fail at its first 64-hex assertion; it does not validate a working helper as written.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Create a private temporary directory and point `GIT_INDEX_FILE` at a path that does not yet exist, or remove the `mktemp`-created file before `git read-tree`. Preserve cleanup on every return path, then run the complete self-test and add/preserve an assertion that the helper succeeds from a normal repository while leaving HEAD, the real index, and the worktree unchanged.",
+    "severity": "blocker",
+    "title": "Temporary index is created as an invalid empty Git index"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe post-gate binding is fail-closed in intent, but the temporary-index implementation prevents every legitimate seal from succeeding. `_worktree_seal_digest` creates an empty file with `mktemp` and then passes that existing empty file as `GIT_INDEX_FILE` to `git read-tree`; Git rejects it as an invalid/truncated index. Consequently `bundle_work` and `stage_fix` cannot emit their new digest outputs, and both live gate lanes stop before the gate. This is a blocking correctness/availability regression. Round 1, so progress is null.",
+  "verdict": "request_changes"
+ }
+}
