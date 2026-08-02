@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1744,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c7283eeebbb28fa3edf54b14bf73750d9df29e1b",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The added sweep-level regression test exercises the real run_sweep terminal-reap path at the load-bearing fresh-read boundary. Its three cases hold the lease and empty listing constant while varying only the direct issue response, and the assertions distinguish retention for a freshly confirmed open, non-terminal issue from release after a true absence or a closed response. The exact released claim sets and reap counts are checked, while exceptions are converted into mismatching values so a crash cannot masquerade as detection. The rationale accurately describes the paging residual and does not weaken production behavior, trust checks, or security controls. No correctness, soundness, security, or test-vacuity defect is evident. Round 3 is materially unchanged from the prior approved round, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
