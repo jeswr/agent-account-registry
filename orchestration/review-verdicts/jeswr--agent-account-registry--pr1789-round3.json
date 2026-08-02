@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1789,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3194e2d7c8b380b09053dbf95644f997cea5055e",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 closes the prior major finding. The resolver shell command sequence is now exact-matched, so inserting `set +o pipefail` (or any other command), deleting the strict-mode command, or rewriting the pipeline produces a named failure. More importantly, the self-test executes the complete shipped run block under Bash with an all-disabled policy and verifies that resolver refusal yields a nonzero step status and no output; it separately verifies that a valid sweep succeeds and writes the expected `repos=` value. This directly covers the runner execution seam that was previously untested, while the existing independent policy fixtures and producer/consumer binding assertions remain intact. I found no new correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
