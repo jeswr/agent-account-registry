@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5643,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3266db5cd4de74f06a1226441ae262425c5e271d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The change remains correct and complete on round 2. `fetch_bd_map` preserves all claimants long enough to detect both authenticated and marker-only ambiguity, excludes ambiguous bead IDs from the resume maps, and retains the established authenticated-owner shadow rule. `apply_migration` limits the fail-closed check to the actual plan and performs it before label or issue creation. The focused self-tests exercise claimant classification and the real apply path with network seams stubbed; `python3 scripts/bd-to-issues.py --self-test` passes. No correctness, security, soundness, or test-validity issue was found.",
+  "verdict": "approve"
+ }
+}
