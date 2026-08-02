@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5641,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5e909b6906214cc7ff8c00fc7015b0897f4ee27c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In test_guards_reading_a_release_workflow_run_outside_the_selector, `if not runners: continue` makes the central safety check fail open. If a guard that reads an allowlisted release workflow is removed from docs-quality.yml (or otherwise ceases to be invoked by any workflow), it is skipped rather than rejected. The final `checked > 0` is global, so guards for other release files can keep the test green. This contradicts the documented obligation that the release-lane entries' own guards still run and permits an allowlisted workflow to lose its validating lane silently.",
+    "file": "scripts/tests/test_ci_select.py",
+    "fix_hint": "Treat a discovered guard with no workflow runners as a failure, and enforce coverage per allowlisted release workflow (or, preferably, maintain an explicit release-workflow-to-required-guard mapping and assert every required guard is invoked by at least one non-selector-gated workflow). Keep a per-entry non-vacuity assertion so coverage for one workflow cannot mask missing coverage for another.",
+    "severity": "major",
+    "title": "Release guard audit ignores guards that are no longer run"
+   }
+  ],
+  "progress": null,
+  "summary": "The allowlist behavior itself is pinned, but the new test intended to prove that release-workflow guards remain active has a fail-open gap. It explicitly ignores a guard when no workflow invokes it, so removing the non-selector-gated invocation that justifies this carve-out can leave the test green. Because this invariant is the stated safety basis for skipping the full matrix, the change is not yet sound as scoped.",
+  "verdict": "request_changes"
+ }
+}
