@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5259,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c320ad0731f014f48da9d8d396f7dacd0b1c87b5",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "main calls run_gate_once before save_state_file. Verdict paths inside evaluate_once/render_verdict emit the summary and diagnostics, and only after run_gate_once returns does main atomically persist terminal_exit. A crash, eviction, or save failure after emission leaves the prior nonterminal record; retrying can then fetch a changed sibling set and publish the opposite verdict. terminal_exit prevents sequential duplicates only when the post-verdict save succeeds. The added replay tests always save successfully, and test_save_state_file_is_atomic_and_leaves_no_debris proves a failed write preserves the old record, so neither test closes this ambiguous-publication gap.",
+    "file": "scripts/ci_summary_gate.py",
+    "fix_hint": "Separate decision computation from externally authoritative rendering. Atomically persist the state containing terminal_exit before publishing/rendering that decision, then replay the persisted decision for output. Add a CLI/transport-path test that forces the terminal-state save to fail, retries against the opposite sibling set, and proves no opposite verdict can be emitted. If Phase 1 intentionally cannot guarantee this, remove claims that retries after ambiguous transport failure are closed and explicitly retain it as a Phase-2 transport obligation.",
+    "severity": "major",
+    "title": "Verdict is still emitted before terminal state is durably committed"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3's major finding remains materially unchanged. The terminal marker is now recorded in memory on every verdict path and the documentation acknowledges carrier loss, but the actual CLI transport still calls run_gate_once (which renders/emits the authoritative verdict) before save_state_file durably commits terminal_exit. If the write fails or the process is evicted in that interval, the previous nonterminal carrier remains and a retry can re-evaluate a changed sibling set and publish the opposite result. The new duplicate-delivery tests exercise only successful save/reload cycles, while the atomic-write test confirms that a failed write preserves precisely the unsafe previous state. Progress is therefore stagnant.",
+  "verdict": "request_changes"
+ }
+}
