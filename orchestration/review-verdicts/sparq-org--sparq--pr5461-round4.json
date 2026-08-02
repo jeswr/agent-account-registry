@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5461,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ee808413e0577a205ea474b701097f190333cafe",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`lane_admission()` correctly treats ELIGIBLE as only an upper bound because registry provenance is unreadable, but `decide()` still returns `flag` for that population. Renaming the state and disclaiming enrollment in an internal reason string cannot change the externally persisted meaning of `review:unreviewed`, which AGENTS.md and this module define as \"enrolled, awaiting review\". Thus a worker-shaped same-repo bot PR with no provenance record is still presented to every label consumer as enrolled. `registry-lane-unconfirmed` only counts the ambiguity after it ages and does not remove or correct the misleading label. This is materially the same correctness gap as round 3.",
+    "file": "scripts/verdict-bridge.py",
+    "fix_hint": "Do not add `review:unreviewed` from ELIGIBLE alone. Require an authoritative registry-produced enrollment/provenance signal before applying an enrollment-shaped label, or introduce a distinct label whose public semantics are explicitly \"author-side eligible, enrollment unconfirmed\" and update every census and consumer accordingly. Add a real-path test proving that an eligible PR lacking registry provenance never receives an enrollment-shaped label; a separate age-based alarm may still report it.",
+    "severity": "major",
+    "title": "ELIGIBLE PRs are still labelled as enrolled without provenance"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 adds more explicit documentation, tests, and a time-based census for the provenance-unknown residual, but the load-bearing correctness issue is unchanged. `decide()` still writes `review:unreviewed` for every merely ELIGIBLE PR even though ELIGIBLE expressly does not establish registry enrollment and the repository defines that label as meaning \"enrolled, awaiting review\". A later census can reveal an aging uncertain population, but it neither prevents nor repairs the false persisted state. The same major finding remains, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
