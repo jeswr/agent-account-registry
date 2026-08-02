@@ -528,7 +528,18 @@ def _persist_one(number, handle, line, registry_repo, run, schema_errors):
             # nothing was lost -> re-merge the limits line onto the writer's fresh body
             continue
         # any other shape (our body live with >=2 edits, or >=3 edits) means a foreign edit may
-        # have landed INSIDE our read->write window and been replaced by our write -> fail loudly
+        # have landed INSIDE our read->write window and been replaced by our write -> fail loudly.
+        # DELIBERATELY TERMINAL — do not add an automatic restore here (#1051 WONTFIX, design
+        # record research/1051-catalog-clobber-auto-restore.md). Re-applying the replaced revision
+        # is a SECOND unconditional write (there is still no CAS, see above) to a record we have
+        # just PROVEN a foreign writer was editing seconds ago, and the confirm above can only
+        # count edits, never certify that the reconstructed content is right. This body is the
+        # account->credential binding, and the schema guard is structural: a stale-but-well-formed
+        # secret_ref/credential_format from an older revision passes it with zero violations, so a
+        # wrong restore silently un-rotates a credential instead of failing loudly. That holds
+        # whatever GitHub's UserContentEdit trail turns out to expose — it is a property of the
+        # write, not the read. Recovery is an OPERATOR step, which is what WRITE_FAILURE_WARNING
+        # points at the issue's edit history for.
         return False
     return False
 
