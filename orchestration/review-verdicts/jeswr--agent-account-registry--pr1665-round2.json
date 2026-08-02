@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1665,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "fa3cfeca4601dbd3a72270c524ce2e37f098b403",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`clauses_missing_from(ast.get_docstring(routers[0]) or \"\") == []` proves only that the two approved sentences occur somewhere in the docstring. It does not reject additional prose such as `ALERT_TOKEN has issue-creation privileges at ALERT_REPO`; that claim is outside the enumerated `phrasings`, so the module census also returns `[]`. Thus the stronger false contract can reappear alongside the pinned sentences and all new assertions stay green. The same copied guard has the same hole in the other changed scripts, while the changed workflow comments are outside every module scan entirely. This is the same semantic soundness defect reported in round 1, despite the improved synonym fixtures and more honest description of the tripwire.",
+    "file": "scripts/metrics-alert.py",
+    "fix_hint": "Make the load-bearing contract closed rather than additive: derive and compare a normalized exact contract block (or a centrally defined canonical marker/text) so extra route-capability assertions in the governed prose fail. Cover every changed prose consumer, including workflow comments, from that single canonical definition. Keep the lexical list only as defense in depth rather than as the mechanism that forbids additional claims.",
+    "severity": "major",
+    "title": "Canonical containment still permits contradictory capability claims"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 improves the detector fixtures and accurately labels the lexical scan as an enumerated tripwire, but the load-bearing canonical check is only a containment check on the router docstring. It does not enforce that the module's route contract is limited to the canonical text, and it does not cover the separately duplicated workflow prose. An unsupported capability promise can therefore be appended using an unlisted synonym while every new row remains green. The prior round's major soundness finding remains materially unresolved, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
