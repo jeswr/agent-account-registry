@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5730,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "16c9a5892baf6b0a035e27fd0c0ff5aaba59207f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The workflow-only change correctly adds Cargo's `--lib` target alongside each existing explicit integration-test target, causing feature-gated unit tests in the library to run without removing or weakening the conformance runners, floor assertions, retry/error handling, or output checks. The selected features match the relevant module gates: `jsonld-suite` exposes `jsonld_bench`, `http-protocol` forwards to `service-loopback` for `http_protocol`, `federation-descriptors` exposes `sd_gsp`, and the QL/DL features expose their inference unit-test modules. Cargo supports combining `--lib` with one or more `--test` selectors, so both target classes are exercised. No security, soundness, test-validity, or completeness defect is apparent in the diff.",
+  "verdict": "approve"
+ }
+}
