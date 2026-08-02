@@ -235,8 +235,10 @@ format before routing anything onto it.
 
 **1a — OBSERVE (the recommended first increment).** Move the model container onto a per-run
 internal network behind a proxy sidecar, with the proxy in **log-only** mode: it allows everything
-and records the host set. Fail closed — if the network or sidecar cannot be created, `die`; never
-silently fall back to the default bridge (that fallback would be the whole control, quietly absent).
+and records the host set **under §6.1's telemetry contract**, which is part of this increment and
+not a follow-on polish item — what gets recorded is model-chosen strings, not run metadata. Fail
+closed — if the network or sidecar cannot be created, `die`; never silently fall back to the default
+bridge (that fallback would be the whole control, quietly absent).
 
 Why this first, and why it is the right size:
 - It changes the topology, which is where **all** the liveness risk lives, while enforcing nothing —
@@ -251,7 +253,58 @@ Why this first, and why it is the right size:
 **1b — ENFORCE.** Flip the proxy to deny-by-default with the derived allowlist, add the
 `egress-denied` exit class (host-observable, classified from the proxy's own log, never from model
 stdout — same rule as `_run_headless_harness`'s existing classifier), and make `model-health.py`
-treat it as operator-actionable rather than a provider outage.
+treat it as operator-actionable rather than a provider outage. The exit class carries the **refusal
+count and the allowlist rule that failed to match — never the refused hostname**: an exit class
+reaches the run summary, the issue comment and `model-health.py`, all of which are public, so a
+hostname there is §6.1's leak with a shorter path.
+
+### 6.1 The observation record is itself model-controlled — the telemetry contract
+
+The CONNECT authority and the DNS query name are chosen by the **model**, not by the provider. A
+steered model can encode the credential, or chunks of it, into subdomain labels
+(`<b64-chunk>.attacker.example`) or into an arbitrary CONNECT target — and it does not need the
+connection to succeed: in 1a the proxy allows everything, and in 1b a **refused** connection is
+recorded too. So an observer built to answer §8.3 will faithfully copy attacker-authored bytes into
+a brand-new durable surface, and 1a would have traded a covert channel for a *recorded* one while
+calling it observability.
+
+**Host-observed is not the same as model-independent.** The proxy log is observed by the host but
+authored by the container. Every other host-observable signal this repo classifies from (exit
+status, wall time, argv, usage counts) has host-chosen *content*; this is the first that does not,
+so the "host-observable signals only" rule in §4 does **not** carry the safety it carries elsewhere.
+The posture that must extend to destinations is the neighbouring one: the model log is withheld and
+only usage/tool counts are lifted from it (§2, §4).
+
+The contract, binding on any implementation of 1a and 1b:
+
+1. **Classified as hostile model output, not as run metadata.** Every observed field — CONNECT
+   authority, SNI, DNS QNAME, any path — carries the same handling class as the withheld model log.
+2. **Never published.** No raw observation enters a PR body, an issue, a comment, a workflow log, a
+   run artifact, `data/`, or any committed file. In-repo publication is exactly what makes channel 2
+   work (§3.2); a telemetry file that lands in the tree **is** channel 2 with extra steps. If a raw
+   record must leave the runner at all it goes to the positively-verified private route only —
+   `ALERT_REPO`/`ALERT_TOKEN` gated by `_confirmed_private()` (`scripts/pat-validity.py:539`), the
+   pattern established in `research/370-private-diagnostic-sink.md` — and never to this public repo.
+3. **Ephemeral, with a named owner and a named deletion.** The raw log lives on the runner for the
+   run and, if anywhere else, in that private sink under a retention stated in the implementing diff.
+   No raw retention "for later analysis" without both an owner and a deletion date.
+4. **Validated and bounded BEFORE it is written.** Refuse to record a name over 253 bytes, a label
+   over 63, more than a stated label count, any non-LDH character, or any authority that is not
+   `host:port`. A value that fails validation increments a `malformed` counter carrying its
+   **length and the reason — never the value**. That is fail-closed in the telemetry sense: the
+   unrecordable case loses the datum, not the boundary.
+5. **The allowlist is derived by reviewed aggregation, not by transcription.** §6's "derive the
+   allowlist empirically" means: collapse to **registrable domain + port**, drop anything not seen
+   across at least two independent runs, and have a **human read the resulting short list** before a
+   line enters the allowlist config. High-cardinality subdomains under one parent are the exfil
+   signature and are reported as a **count, not enumerated**. No path from an observation to a
+   committed config file may skip that review.
+6. **The operational datum is the anomaly, not the address.** `allowed`/`refused`, a count, and the
+   registrable domain answer every question §8 actually poses for running 1b; full FQDNs are needed
+   only while deriving the first allowlist. An implementation that concludes it needs exact raw
+   FQDNs **durably** must say so in its diff and record the residual in these terms — *this store
+   now retains attacker-chosen bytes that may be a credential* — naming its access restriction and
+   deletion procedure, rather than claiming unqualified observability value.
 
 **2 — anthropic credential parity** (§5.E), after the latent `claude-credentials-json` hole is
 closed.
@@ -288,10 +341,20 @@ must be recorded (as a comment at the implementation site or an appendix here) r
 4. Which of those hosts are write-and-read-back stores (§5.A) and must therefore be refused even
    though the CLI touches them?
 5. Does anything in a normal run need a package registry from *inside* the container?
+6. **Does a credential-shaped destination reach any durable output?** Required before 1a is called
+   done, and adversarial rather than observational: drive a run that issues a `CONNECT` to — and a
+   DNS query for — a marker host of the shape `sk-ant-<40 chars>.<base64 chunk>.example.invalid:443`,
+   then search **every durable surface that run produces** for the marker: PR body, issue comments,
+   workflow logs, run artifacts, committed files, and the aggregated allowlist candidate. Record the
+   exact surface list that was checked. **Any hit means 1a is not fail-closed and must not land**;
+   the same probe run against §6.1's validation bounds must land in the `malformed` counter with a
+   length and a reason and no value.
 
 ## 9. Follow-on issues filed from this record
 
-1. **1a — internal network + logging egress proxy sidecar, observe mode, fail-closed.**
+1. **1a — internal network + logging egress proxy sidecar, observe mode, fail-closed** — including
+   §6.1's telemetry contract and §8.6's adversarial credential-shaped-destination check, which are
+   part of the increment and not separable from it.
 2. **1b — enforce the derived allowlist + the `egress-denied` exit class.** Blocked on 1a's
    measurement.
 3. **`claude-credentials-json` mounts the anthropic refresh token into the model container.**
@@ -309,5 +372,7 @@ them.
 It decides a **shape**, not a diff. Nothing here authorizes weakening an existing control: every
 increment is additive, each fails closed (a control that cannot be established stops the run rather
 than degrading to today's posture), and none of them touches the gate, the arm path, or the
-credential write-back. If an implementation of any increment finds itself deleting or relaxing a
+credential write-back. Nor may an increment create a **new durable record of model-chosen content**
+outside §6.1's contract — an observer that publishes what the model named is a channel, not a
+control. If an implementation of any increment finds itself deleting or relaxing a
 check in §4 to make its own change fit, that is the signal to stop and amend this record instead.
