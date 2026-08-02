@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5673,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c03db9cf694c00769fd768d2286bd8c2a69b7c70",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_declared_deps()` unconditionally returns every entry in the selected dependency tables and never evaluates `optional = true`, `[features]`, or the actual feature flags used by each CI command. Consequently `measure()` treats a root such as `sparq-conformance` as compiling all of its optional dependency graph in every grouped job, even though the workflow runs materially different feature sets (for example jsonld-suite, service-loopback/service/http-protocol, and the inference features). Because most grouped roots include sparq-conformance, this over-approximation manufactures a large common core and can make unrelated real build closures exceed the 0.90 floor. The test merely reruns the same flawed model, so it is non-independent and cannot validate the grouping's stated premise.",
+    "file": "scripts/ci-cache-closure-overlap.py",
+    "fix_hint": "Model each job's actual Cargo feature selection (including default-feature behavior), traverse only enabled optional dependencies and feature-gated target edges for workspace crates, and add a focused fixture/test proving that a disabled optional dependency is absent while enabling its feature adds it. Then recompute the grouping and threshold from those feature-accurate closures. Alternatively use Cargo metadata with an appropriately prepared offline dependency cache if faithfully reproducing feature resolution in stdlib is impractical.",
+    "severity": "major",
+    "title": "Closure measurement counts disabled optional dependencies"
+   }
+  ],
+  "progress": null,
+  "summary": "The cache-key wiring and its structural tests are coherent, but the load-bearing closure measurement is not feature-aware at the workspace boundary. It includes every declared optional dependency of each root regardless of which features the CI job enables, artificially inflating the shared closure (especially for sparq-conformance) and making the 0.90 Jaccard result incapable of justifying that these jobs compile near-coincident dependency sets.",
+  "verdict": "request_changes"
+ }
+}
