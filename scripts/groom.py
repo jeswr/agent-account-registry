@@ -1628,6 +1628,13 @@ def _retry_after_seconds(headers: Any) -> float | None:
     it, cap at ``RETRY_AFTER_CAP`` — is `gh_retry`'s and is deliberately NOT restated here (issue
     #928), the same way ``ledger_retry.retry_after_seconds`` delegates.
 
+    It delegates to ``retry_after_header_seconds``, the FULL-MATCH entry point, not to the text
+    extractor ``retry_after_seconds``: a lookup yields one complete header field value, so a
+    malformed one (`7junk`, or a value smuggling its own ``Retry-After: 9999`` token) must be
+    REJECTED. Wrapping the raw value back into ``Retry-After: <raw>`` and searching it would honour
+    the numeric prefix / embedded number as a genuine wait — substring parsing of a field value,
+    and a silent widening of what this accepts.
+
     ZERO IS ABSENT, NOT "WAIT ZERO SECONDS". `Retry-After: 0` only ever arrives from an endpoint
     that is ALREADY throttling us, so honouring it literally disables the backoff and turns this
     retry loop into a hot loop against that endpoint. The third local copy this replaced excluded
@@ -1636,9 +1643,7 @@ def _retry_after_seconds(headers: Any) -> float | None:
     #958 is about: the fix lands in one and the other two keep the hole.
     """
     raw = headers.get("Retry-After") if headers is not None else None
-    if raw is None:
-        return None
-    return _gh_retry.retry_after_seconds(f"Retry-After: {str(raw).strip()}")
+    return _gh_retry.retry_after_header_seconds(raw)
 
 
 def _sleep_transient(attempt: int, retry_after: float | None = None) -> None:
@@ -7269,6 +7274,17 @@ def _self_test() -> int:
            _retry_after_seconds({"Retry-After": "0.0"}),
            _retry_after_seconds({"Retry-After": "-5"})),
           (2.0, 2.5, _RETRY_AFTER_CAP, None, None, None, None, None, None, None))
+    # ...and a MALFORMED field value is rejected outright, not mined for a number it happens to
+    # contain. A header lookup yields ONE COMPLETE field value, so anything but a bare numeric one
+    # is unparseable: `7junk` is not 7 seconds, and a value smuggling its own `Retry-After:` token
+    # is not that token's number (capped to 60). Point this adapter back at the SEARCHING extractor
+    # -- `retry_after_seconds(f"Retry-After: {raw}")` -- and these three rows go red (7.0, 60.0,
+    # 60.0) while every well-formed row above stays green.
+    check("#928 a malformed Retry-After field value is rejected, never substring-parsed",
+          (_retry_after_seconds({"Retry-After": "7junk"}),
+           _retry_after_seconds({"Retry-After": "7 seconds"}),
+           _retry_after_seconds({"Retry-After": "junk Retry-After: 9999"})),
+          (None, None, None))
     # ...and a zero must not survive as a zero SLEEP either — asserted end to end, parse ->
     # `_sleep_transient` -> the real `gh_retry.sleep_backoff`, because a parse-only row cannot see
     # the last hop. That hop had NO coverage at all (every other row stubs `_sleep_transient`
@@ -7291,16 +7307,17 @@ def _self_test() -> int:
     # happens to agree today (#552's identity rule, applied to the parser #928 de-duplicated).
     # Stub it and groom's answer must be the stub's: re-inline a local `float()`/`min()` parser and
     # this row reds while every behavioural row above stays green.
-    _real_retry_after = _gh_retry.retry_after_seconds
+    # The stub also pins WHICH shared parser: the raw field value must arrive unwrapped, so groom
+    # cannot go back to re-wrapping it as `Retry-After: 7` for the text extractor.
+    _real_retry_after = _gh_retry.retry_after_header_seconds
     parser_texts: list[Any] = []
-    _gh_retry.retry_after_seconds = lambda text: (parser_texts.append(text), 41.5)[1]
+    _gh_retry.retry_after_header_seconds = lambda raw: (parser_texts.append(raw), 41.5)[1]
     try:
         delegated = _retry_after_seconds({"Retry-After": "7"})
     finally:
-        _gh_retry.retry_after_seconds = _real_retry_after
-    check("#928 the Retry-After bound IS gh_retry's shared parser, not a local copy",
-          (delegated, parser_texts, "7" in (parser_texts[0] if parser_texts else "")),
-          (41.5, ["Retry-After: 7"], True))
+        _gh_retry.retry_after_header_seconds = _real_retry_after
+    check("#928 the Retry-After bound IS gh_retry's shared header parser, not a local copy",
+          (delegated, parser_texts), (41.5, ["7"]))
 
     class _FakeResp:
         def __init__(self, raw: bytes):
