@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1680,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "cd60a24405db43af3a713cee63bc197b2ed75068",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_pr_gate_yaml_parse_sweep` turns on at the first stripped line matching `for f in .github/` anywhere in the file and exits at the next `actionlint`. It does not establish that this block belongs to the named `actionlint + yaml-parse every workflow` step, or even that the shell will execute it. A contributor can place the exact frozen six-line block inside an uncalled shell function (or another inert context) before the real step, then delete or weaken the real step; extraction still equals `expected_yaml_sweep` and the marquee check stays green. The four mutant fixtures only alter the sole extracted copy, so they do not exercise this mutually-masking duplicate outcome required by the repository pre-flight rules.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Bind extraction to the unique named workflow step and include enough surrounding YAML/shell structure to prove the commands are in that step's active `run` body; reject duplicate matching steps/blocks. Add a non-crashing fixture containing an earlier exact but inert duplicate plus a weakened/absent real step, and assert that fixture is rejected.",
+    "severity": "major",
+    "title": "An inert duplicate sweep can mask deletion of the active workflow guard"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new assertion catches the supplied single-site mutants, but it does not bind the extracted block to the actual `actionlint + yaml-parse every workflow` step. Because the extractor accepts the first matching loop anywhere in the workflow, an inert duplicate can satisfy the frozen literal while the real required step is weakened or removed. That is a trust-check masking path, so this round cannot approve.",
+  "verdict": "request_changes"
+ }
+}
