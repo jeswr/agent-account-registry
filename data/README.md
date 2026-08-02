@@ -125,6 +125,10 @@ before it fires, so a single spiky tick never alarms. Document shape:
        "review_lane_runs_1h": 3,                         //   0 success + a review:changes backlog;
        "worker_attempts_1h": 4,                          //   idle = backlog but 0 concluded runs;
        "worker_success_rate_1h": 0.75,                   //   drafts are NOT part of the backlog
+       "worker_no_change_1h": 3,                         // the WASTED-RUN class: concluded worker
+       "worker_no_change_rate_1h": 0.75,                 //   runs that produced NO diff. null (never
+       "worker_no_change_reasons_1h": {"underspecified": 2, "already_done": 1},   // 0) when there is
+       "worker_no_change_repeat_issues_1h": [4242],      //   no signal or no concluded run this hour
        "pr_open_rate": 5.0, "pr_close_rate": 0.0, "net_pr_flow": 5.0  // net>0 => backlog GROWING
      }
    }}
@@ -137,11 +141,28 @@ driven cross-repo from here, not from a sparq-hosted workflow), filtered to the 
 run-name and windowed by run COMPLETION time; in-progress runs count as neither an attempt nor a
 success. Absent that signal the health is `unknown` (fail-open — never a false `ok`).
 
+The `worker_no_change_*` fields (#466 AC3 / #987) make the fleet's WASTED-RUN rate observable: a run
+that concluded having produced no repository change still burned a worker slot and an account lease,
+and before this it was indistinguishable from a compile error or a lost lease. They are derived by
+joining the `no_change` rows of the shared model-health ledger (`data/model-health.json`, read
+through model-health's own validated reader — never a parallel store) to the worker runs already
+attributed to the target, on the run id both sides carry. That join is the only attribution
+available: a health record stores the target ISSUE number but not the target REPO. Counting is per
+RUN, so the rate can never exceed 1. `why_no_diff` is the closed `no_change_routing.NO_CHANGE_REASONS`
+enum, which is what separates `already_done` (close the issue) from `underspecified` (a human must
+specify it); an undeclared reason reads as `unspecified`, never an inferred one.
+`worker_no_change_repeat_issues_1h` names the issues that looped more than once inside the hour. An
+unreadable health ledger leaves every one of these fields null and logs a warning — never a
+reassuring zero, and a null rate can never fire the alert below.
+
 The current snapshot is also CAS-written to `data/metrics.json` on the `ledger` branch (same
 per-target shape plus a top-level `alerts: [...]`). The sole Pages owner, `dashboard.yml`, copies it
 to `site/metrics.json` in its generated artifact for the dashboard panel to consume. Alert rows:
 `{target, classification, fire, summary, metrics}` where `classification ∈ {backlog-growing,
-review-lane-stalled, ready-starved, worker-failing}`. Alerts are deduped to ONE rolling
+review-lane-stalled, ready-starved, worker-failing, worker-no-change}`. `worker-no-change` is
+deliberately separate from `worker-failing`: a no-diff run need not conclude `failure` at all, and
+the two ask the maintainer for different actions (fix a broken lane vs. close/specify a backlog).
+Alerts are deduped to ONE rolling
 `throughput-alert`-labelled issue per `(target, classification)`, and auto-close only with
 hysteresis (the condition must be clear for `recover_snapshots` consecutive ticks) so a
 boundary-flapping metric never churns the same issue open/closed — never spammed. A target SKIPPED

@@ -47,6 +47,12 @@
 #         "review_lane_runs_1h": int | null,   # review-fix runs CONCLUDED this hour (null=no signal)
 #         "worker_attempts_1h": int,           # worker runs concluded this hour (0 => rate null)
 #         "worker_success_rate_1h": float | null,
+#         # the WASTED-RUN class (#466 AC3 / #987): concluded worker runs that produced NO diff.
+#         # null (never 0) when the model-health ledger carries no signal for this target's runs.
+#         "worker_no_change_1h": int | null,
+#         "worker_no_change_rate_1h": float | null,      # no_change / worker_attempts_1h
+#         "worker_no_change_reasons_1h": {"<why_no_diff>": int, ...},   # closed enum, {} if none
+#         "worker_no_change_repeat_issues_1h": [int, ...],  # issues that looped >1x this hour
 #         # derived:
 #         "pr_open_rate": float,      # PRs opened / hr (from prs_opened_1h, or the ring delta)
 #         "pr_close_rate": float,     # PRs closed+merged / hr
@@ -103,6 +109,19 @@ BACKLOG_GROWING = "backlog-growing"
 REVIEW_LANE_STALLED = "review-lane-stalled"
 READY_STARVED = "ready-starved"
 WORKER_FAILING = "worker-failing"
+WORKER_NO_CHANGE = "worker-no-change"
+
+# --- no_change telemetry (#466 AC3 / #987) ------------------------------------------------------
+# The exit class model-health folds a clean model exit that produced no repository change into, and
+# the default `why_no_diff` for a row that declared none. Restated here rather than imported at
+# module scope so the PURE core stays import-light; `_test_no_change_seam` loads model-health.py /
+# no_change_routing.py and asserts BOTH literals against their owners, so a rename over there turns
+# this file red instead of silently zeroing the counter.
+NO_CHANGE_CLASS = "no_change"
+NO_CHANGE_UNSPECIFIED = "unspecified"
+# How many no_change outcomes ONE issue must accumulate inside the hour before it is named as a
+# repeat offender. 2 is the smallest count that is a loop rather than a first attempt.
+REPEAT_OFFENDER_MIN = 2
 
 # --- per-target default thresholds; overridable in policy/repos.toml [repos.*].throughput ---
 DEFAULT_THRESHOLDS = {
@@ -110,10 +129,13 @@ DEFAULT_THRESHOLDS = {
     "ready_alert_threshold": 40,     # ready-starved needs issues_ready above this
     "sustain_snapshots": 2,          # K: how many recent snapshots must agree (SUSTAINED, not spiky)
     "worker_success_floor": 0.5,     # worker-failing when success rate below this with >0 attempts
-    "worker_min_samples": 3,         # worker-failing needs at least this many attempts (anti-noise)
+    "worker_min_samples": 3,         # worker-failing/no-change need this many attempts (anti-noise)
+    "worker_no_change_ceiling": 0.5,  # worker-no-change when the no-diff rate exceeds this
     "recover_snapshots": 2,          # hysteresis: condition must be clear this many ticks to recover
 }
 CURATOR_THROUGHPUT_KEYS = {"target_ready"}
+# Thresholds that are a RATE, validated as a float in [0, 1] rather than a positive int.
+RATE_THRESHOLD_KEYS = frozenset({"worker_success_floor", "worker_no_change_ceiling"})
 
 # readiness engines per target (declared in policy; falls back by repo below)
 READY_STATUS_ENGINE = "status-ready"   # sparq: the ready-issues.py fail-closed frontier
@@ -144,6 +166,9 @@ def compute_target_metrics(counts):
       review_lane_success_1h  (int: # of SUCCEEDED review-fix runs in the last hour),
       review_lane_runs_1h      (int: # of review-fix runs attempted in the last hour),
       worker_success_1h, worker_attempts_1h  (ints: worker run outcomes in the last hour)
+      worker_no_change_1h      (int: concluded worker runs that produced NO diff)
+      worker_no_change_reasons_1h   (dict: declared `why_no_diff` -> count over those runs)
+      worker_no_change_issues_1h    (list[int]: issues that produced >1 of them this hour)
 
     The instantaneous per-hour rates come straight from authoritative REST list windows; the REAL
     rate-OVER-TIME signal is the SUSTAINED (K-snapshot) condition that evaluate_alerts() reads off
@@ -189,6 +214,18 @@ def compute_target_metrics(counts):
     worker_success_rate = (round(g("worker_success_1h") / worker_attempts, 4)
                            if worker_attempts > 0 else None)
 
+    # WASTED-RUN telemetry (#466 AC3 / #987). ABSENT is not ZERO: when the health ledger carried no
+    # signal for this target's runs the key is missing and every derived field stays null, exactly
+    # as review_lane_runs_1h does — a telemetry outage must never publish as "no wasted runs".
+    # A rate of null is likewise NOT 0.0 when the hour concluded no worker run at all: 0/0 wasted
+    # is not a healthy fleet, it is no measurement.
+    has_no_change = "worker_no_change_1h" in counts
+    worker_no_change = g("worker_no_change_1h") if has_no_change else None
+    worker_no_change_rate = (round(worker_no_change / worker_attempts, 4)
+                             if has_no_change and worker_attempts > 0 else None)
+    reasons = counts.get("worker_no_change_reasons_1h") if has_no_change else None
+    repeat_issues = counts.get("worker_no_change_issues_1h") if has_no_change else None
+
     return {
         "issues_open": g("issues_open"),
         "issues_ready": g("issues_ready"),
@@ -209,9 +246,74 @@ def compute_target_metrics(counts):
         "review_lane_runs_1h": concluded if "review_lane_runs_1h" in counts else None,
         "worker_attempts_1h": worker_attempts,
         "worker_success_rate_1h": worker_success_rate,
+        "worker_no_change_1h": worker_no_change,
+        "worker_no_change_rate_1h": worker_no_change_rate,
+        "worker_no_change_reasons_1h": dict(reasons) if isinstance(reasons, dict) else {},
+        "worker_no_change_repeat_issues_1h": (
+            list(repeat_issues) if isinstance(repeat_issues, (list, tuple)) else []),
         "pr_open_rate": round(pr_open_rate, 4),
         "pr_close_rate": round(pr_close_rate, 4),
         "net_pr_flow": net_pr_flow,
+    }
+
+
+def _health_run_key(run_id):
+    """The workflow-RUN identity a model-health `run_id` names, or None if it names none.
+
+    model-health rows carry `run_id = "$GITHUB_RUN_ID.$ATTEMPT"` (worker.yml's health-record step),
+    and the actions API reports the same run as `id`. The leading segment is therefore the join key
+    between a ledger row and the run this collector already attributed to a target — which is the
+    ONLY attribution available: a health record stores the target ISSUE number but not the target
+    REPO, so counting ledger rows directly would mix every target in the fleet into one number."""
+    if not isinstance(run_id, str) or not run_id:
+        return None
+    head = run_id.split(".", 1)[0]
+    return head or None
+
+
+def summarize_no_change(records, run_ids):
+    """PURE per-target `no_change` telemetry (#466 AC3 / #987) from a validated health window.
+
+    `records` are model-health rows (already validated + pruned by their owning reader);  `run_ids`
+    is the set of workflow-run ids (as strings) this collector attributed to ONE target and counted
+    into `worker_attempts_1h`. Returns {count, reasons, repeat_issues}.
+
+    Counted per RUN, not per record: the denominator counts a run once, so a replayed/duplicated
+    row for the same run must not push the derived rate above 1.0. Where one run somehow carries
+    several rows the NEWEST wins, which keeps sum(reasons.values()) == count exactly.
+
+    `repeat_issues` names the loopers — the issues that burned more than one worker slot in the SAME
+    hour producing nothing. Its scope is deliberately the hour (not the ledger's full 48h retention)
+    because attribution to a target only exists for runs inside this window; an issue looping ACROSS
+    hours is dispatch's own decline ladder to bound (no_change_routing), not this panel's. The list
+    is bounded by the hour's concluded worker runs, which fleet dispatch concurrency already caps."""
+    newest_by_run = {}
+    for rec in records or ():
+        if not isinstance(rec, dict) or rec.get("exit_class") != NO_CHANGE_CLASS:
+            continue
+        key = _health_run_key(rec.get("run_id"))
+        if key is None or key not in run_ids:
+            continue
+        ts = rec.get("ts")
+        ts = ts if isinstance(ts, int) and not isinstance(ts, bool) else 0
+        previous = newest_by_run.get(key)
+        if previous is None or ts >= previous[0]:
+            newest_by_run[key] = (ts, rec)
+
+    reasons, per_issue = {}, {}
+    for _ts, rec in newest_by_run.values():
+        why = rec.get("why_no_diff")
+        # An absent/odd declaration reads as `unspecified` — the SAME fail-closed default
+        # no_change_routing applies, never an inferred `underspecified`/`too_large`.
+        why = why if isinstance(why, str) and why else NO_CHANGE_UNSPECIFIED
+        reasons[why] = reasons.get(why, 0) + 1
+        issue = rec.get("issue")
+        if isinstance(issue, int) and not isinstance(issue, bool) and issue > 0:
+            per_issue[issue] = per_issue.get(issue, 0) + 1
+    return {
+        "count": len(newest_by_run),
+        "reasons": dict(sorted(reasons.items())),
+        "repeat_issues": sorted(n for n, hits in per_issue.items() if hits >= REPEAT_OFFENDER_MIN),
     }
 
 
@@ -260,6 +362,24 @@ def _worker_failing_pred(th):
                 and r.get("worker_attempts_1h", 0) >= th["worker_min_samples"]
                 and wsr < th["worker_success_floor"])
     return pred
+
+
+def _worker_no_change_pred(th):
+    def pred(r):
+        rate = r.get("worker_no_change_rate_1h")
+        # Same min-sample floor as worker-failing: one wasted run out of one is not a wasted fleet.
+        # A null rate (no telemetry, or no concluded run) can never trip this — absent is not 0/1.
+        return (isinstance(rate, (int, float)) and not isinstance(rate, bool)
+                and r.get("worker_attempts_1h", 0) >= th["worker_min_samples"]
+                and rate > th["worker_no_change_ceiling"])
+    return pred
+
+
+def _dominant_reason(reasons):
+    """The most-declared `why_no_diff` in a reason breakdown, ties broken by name for determinism."""
+    if not isinstance(reasons, dict) or not reasons:
+        return NO_CHANGE_UNSPECIFIED
+    return max(sorted(reasons.items()), key=lambda kv: kv[1])[0]
 
 
 def evaluate_alerts(current, history, thresholds_by_target):
@@ -317,6 +437,31 @@ def evaluate_alerts(current, history, thresholds_by_target):
                                  f"({m.get('worker_attempts_1h', 0)} attempts this hour)",
                                  {"worker_success_rate_1h": wsr,
                                   "worker_attempts_1h": m.get("worker_attempts_1h", 0)}))
+
+        # 5) worker-no-change: the WASTED-RUN rate (#466 AC3 / #987). A run that concluded with no
+        #    diff still burned a worker slot and an account lease, and #466 measured that class at
+        #    ~75% — invisible here until now, because a no_change was indistinguishable from a
+        #    compile error or a lost lease. Deliberately SEPARATE from worker-failing rather than
+        #    folded into it: the two ask for different actions (a failing lane is a bug to fix; a
+        #    no-change lane is a backlog whose issues need closing or specifying), and a no_change
+        #    run does not even have to conclude `failure`, so neither rule subsumes the other.
+        if _sustained(history, target, k, _worker_no_change_pred(th)):
+            rate = m.get("worker_no_change_rate_1h")
+            reasons = m.get("worker_no_change_reasons_1h") or {}
+            loopers = m.get("worker_no_change_repeat_issues_1h") or []
+            summary = (f"{m.get('worker_no_change_1h')} of "
+                       f"{m.get('worker_attempts_1h', 0)} concluded worker runs produced NO diff "
+                       f"({rate:.0%} > {th['worker_no_change_ceiling']:.0%} ceiling) over {k} "
+                       f"snapshots — dominant declared reason `{_dominant_reason(reasons)}`")
+            if loopers:
+                summary += (" — repeat offenders: "
+                            + ", ".join(f"#{n}" for n in loopers))
+            alerts.append(_alert(target, WORKER_NO_CHANGE, summary,
+                                 {"worker_no_change_rate_1h": rate,
+                                  "worker_no_change_1h": m.get("worker_no_change_1h"),
+                                  "worker_attempts_1h": m.get("worker_attempts_1h", 0),
+                                  "worker_no_change_reasons_1h": reasons,
+                                  "worker_no_change_repeat_issues_1h": list(loopers)}))
     return alerts
 
 
@@ -369,7 +514,7 @@ def _thresholds_of(repo, row):
             if not isinstance(val, int) or isinstance(val, bool) or not 1 <= val <= 100:
                 raise MetricsError(f"{key} for {repo!r} must be an integer in [1, 100]")
             continue
-        if key == "worker_success_floor":
+        if key in RATE_THRESHOLD_KEYS:
             if not isinstance(val, (int, float)) or isinstance(val, bool) or not (0.0 <= val <= 1.0):
                 raise MetricsError(f"{key} for {repo!r} must be a float in [0, 1]")
         elif not isinstance(val, int) or isinstance(val, bool) or val <= 0:
@@ -636,14 +781,19 @@ def _ready_issues_module():
     return mod
 
 
-def collect_counts(repo, kind, token, now, orchestration=None):
+def collect_counts(repo, kind, token, now, orchestration=None, health_records=None):
     """Live raw counts from REST lists, lag-tolerant 24h search, and the readiness engine.
 
     `orchestration`, when given, is (orchestration_repo, orchestration_token): the repo that HOSTS
     this target's review-fix / worker workflows. sparq's review orchestration is driven cross-repo
     from the REGISTRY's own review-fix.yml/worker.yml, NOT from a sparq-hosted workflow — so the
     lane/worker health for a target must be read off the ORCHESTRATION repo's runs, filtered to
-    that target, not off `repo`'s actions. When absent, lane/worker health is left unknown/null."""
+    that target, not off `repo`'s actions. When absent, lane/worker health is left unknown/null.
+
+    `health_records` is the validated model-health window (read ONCE per tick by build_snapshot,
+    never per target). It supplies the no_change/wasted-run telemetry, joined to THIS target by the
+    run ids the worker-run window above already attributed. None (unreadable ledger) leaves every
+    no_change field out of the counts, which publishes as null — never as a reassuring zero."""
     h1, h24 = _iso_ago(3600, now), _iso_ago(86400, now)
     current, open_issues = _current_state(repo, token)
     c = {
@@ -666,10 +816,16 @@ def collect_counts(repo, kind, token, now, orchestration=None):
             c["review_lane_runs_1h"] = total
             c["review_lane_success_1h"] = ok
         # worker success this hour (best-effort; absent => worker_success_rate_1h stays null)
-        wattempts, wok = _worker_runs(orch_repo, repo, orch_token, now)
+        wattempts, wok, wrun_ids = _worker_runs(orch_repo, repo, orch_token, now)
         if wattempts is not None:
             c["worker_attempts_1h"] = wattempts
             c["worker_success_1h"] = wok
+            # ...and, over exactly those runs, how many produced NO diff (#466 AC3 / #987).
+            if health_records is not None:
+                nc = summarize_no_change(health_records, wrun_ids)
+                c["worker_no_change_1h"] = nc["count"]
+                c["worker_no_change_reasons_1h"] = nc["reasons"]
+                c["worker_no_change_issues_1h"] = nc["repeat_issues"]
     return c
 
 
@@ -703,8 +859,12 @@ def _run_in_window(run, since_iso):
 
 def _orchestration_lane_runs(orch_repo, target, lane_names, token, now, window_s=3600,
                              fetch_lookback_s=6 * 3600):
-    """(concluded, succeeded) run counts for `target`'s runs of `lane_names` on the ORCHESTRATION
-    repo that CONCLUDED within the trailing window, or (None, None) if the runs API is unavailable.
+    """(concluded, succeeded, run_ids) for `target`'s runs of `lane_names` on the ORCHESTRATION repo
+    that CONCLUDED within the trailing window, or (None, None, None) if the runs API is unavailable.
+    `run_ids` is the id (as a string) of every run counted into `concluded` — the join key the
+    no_change telemetry uses to attribute model-health ledger rows to THIS target (see
+    `_health_run_key`); it is exactly the population `concluded` counts, so a rate over it is
+    bounded by 1.
 
     Only runs whose conclusion is set (completed) count toward `concluded`; an in-progress run is
     neither an attempt nor a success — treating it as attempted-but-failed reads the lane as
@@ -722,8 +882,8 @@ def _orchestration_lane_runs(orch_repo, target, lane_names, token, now, window_s
     fetch_since = _iso_ago(max(window_s, fetch_lookback_s), now)
     runs = _paginate_runs(orch_repo, fetch_since, token, now)
     if runs is None:
-        return (None, None)
-    concluded, succeeded = 0, 0
+        return (None, None, None)
+    concluded, succeeded, run_ids = 0, 0, set()
     for r in runs:
         if not isinstance(r, dict) or not _run_matches(r, lane_names, target):
             continue
@@ -735,7 +895,10 @@ def _orchestration_lane_runs(orch_repo, target, lane_names, token, now, window_s
         concluded += 1
         if conclusion == "success":
             succeeded += 1
-    return (concluded, succeeded)
+        run_id = r.get("id")
+        if isinstance(run_id, (int, str)) and not isinstance(run_id, bool) and str(run_id):
+            run_ids.add(str(run_id))
+    return (concluded, succeeded, run_ids)
 
 
 def _paginate_runs(repo, since_iso, token, now, page_cap=10):
@@ -764,11 +927,64 @@ def _paginate_runs(repo, since_iso, token, now, page_cap=10):
 
 
 def _review_lane_runs(orch_repo, target, token, now):
-    return _orchestration_lane_runs(orch_repo, target, REVIEW_LANE_WORKFLOWS, token, now)
+    """(concluded, succeeded) — the review lane has no ledger telemetry to join, so it drops ids."""
+    concluded, succeeded, _ids = _orchestration_lane_runs(
+        orch_repo, target, REVIEW_LANE_WORKFLOWS, token, now)
+    return (concluded, succeeded)
 
 
 def _worker_runs(orch_repo, target, token, now):
+    """(concluded, succeeded, run_ids) — ids carried through for the no_change join (#987)."""
     return _orchestration_lane_runs(orch_repo, target, WORKER_WORKFLOWS, token, now)
+
+
+def _model_health_module():
+    """Import the shared model-health.py reader (dashed filename => importlib, cached).
+
+    Its reader — not a private re-implementation — is what validates the ledger, so the record
+    grammar (closed `why_no_diff` enum, salted-hash accounts, bounded ints) can never drift between
+    the writer, dispatch's consumer, and this panel."""
+    cached = getattr(_model_health_module, "_mod", None)
+    if cached is not None:
+        return cached
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "model-health.py")
+    spec = importlib.util.spec_from_file_location("registry_model_health_for_metrics", path)
+    if spec is None or spec.loader is None:
+        raise MetricsError(
+            "cannot load scripts/model-health.py — if this job was made sparse, add "
+            "scripts/model-health.py (and scripts/no_change_routing.py) to metrics.yml")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _model_health_module._mod = mod
+    return mod
+
+
+def read_health_window(registry_repo, token, now):
+    """The VALIDATED model-health window, or None (loudly) if it cannot be read.
+
+    Read once per tick, through model-health's own authoritative reader and prune — the same window
+    `dispatch-claim._read_model_health_window` consumes, never a parallel store.
+
+    NON-TERMINAL by design, and this is the honest trade-off: an unreadable health ledger must not
+    take down the throughput tick that six other metrics depend on, so this degrades to null
+    no_change fields instead of raising. The cost is that a telemetry outage cannot itself fire
+    `worker-no-change` (a null rate never trips the predicate) — it is visible as a ::warning:: and
+    as nulls in the published snapshot, not as an alert."""
+    try:
+        model_health = _model_health_module()
+        api = model_health.GitHubAPI(token)
+        records, _sha = model_health.read_ledger(api, registry_repo)
+        # int(now): the ledger's own callers stamp whole seconds, and prune's retention arithmetic
+        # is compared against integer record timestamps.
+        return model_health.prune(records, int(now))
+    # RuntimeError covers BOTH MetricsError (module load) and model_health.HealthError (missing
+    # ledger branch, malformed document); ValueError its validators; OSError/HTTPError the socket.
+    except (RuntimeError, ValueError, OSError) as exc:
+        print(f"::warning::metrics: the model-health ledger is unreadable "
+              f"({type(exc).__name__}: {exc}) — no_change telemetry publishes as null this tick "
+              "(never as zero)")
+        return None
 
 
 # =============================================================================================
@@ -1114,7 +1330,8 @@ def upsert_alert(action, repo, token, maintainer):
     return False
 
 
-ALERT_CLASSES = (BACKLOG_GROWING, REVIEW_LANE_STALLED, READY_STARVED, WORKER_FAILING)
+ALERT_CLASSES = (BACKLOG_GROWING, REVIEW_LANE_STALLED, READY_STARVED, WORKER_FAILING,
+                 WORKER_NO_CHANGE)
 
 # The per-class predicate factory used both to FIRE (sustained over K) and to RECOVER (clear over
 # recover_snapshots). Keeping one source of truth means the recovery test can never drift from the
@@ -1124,6 +1341,7 @@ _CLASS_PRED = {
     REVIEW_LANE_STALLED: _review_stalled_pred,
     READY_STARVED: _ready_starved_pred,
     WORKER_FAILING: _worker_failing_pred,
+    WORKER_NO_CHANGE: _worker_no_change_pred,
 }
 
 
@@ -1183,15 +1401,19 @@ def build_snapshot(targets, token_map, default_token, now, orchestration=None):
     token; a target whose token is missing is SKIPPED loudly (never silently zero) — a skipped
     target has NO row, which the recovery reconciler uses to avoid closing its alerts on no
     evidence. `orchestration` = (orch_repo, orch_token): the repo hosting the review-fix/worker
-    workflows, read for per-target lane/worker health."""
+    workflows, read for per-target lane/worker health — and, on the same repo's `ledger` branch,
+    the model-health window the no_change telemetry is joined from (read ONCE, not per target)."""
     generated_at = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     out = {"generated_at": generated_at, "_ts": int(now), "schema_version": 1, "targets": {}}
+    health_records = (read_health_window(orchestration[0], orchestration[1], now)
+                      if orchestration is not None else None)
     for repo, kind, _thr in targets:
         tok = _token_for(repo, token_map, default_token)
         if not tok:
             print(f"::warning::metrics: no token for {repo} — skipping (not counted as zero)")
             continue
-        counts = collect_counts(repo, kind, tok, now, orchestration=orchestration)
+        counts = collect_counts(repo, kind, tok, now, orchestration=orchestration,
+                                health_records=health_records)
         out["targets"][repo] = compute_target_metrics(counts)
     return out
 
@@ -1359,6 +1581,8 @@ def _self_test():
     _test_rate_derivation(chk)
     _test_alert_rules(chk)
     _test_alert_mutation_nonvacuous(chk)
+    _test_no_change_seam(chk)
+    _test_no_change_telemetry(chk)
     _test_list_api_contract(chk)
     _test_event_list_contract(chk)
     _test_collection_contract(chk)
@@ -1590,31 +1814,44 @@ def _test_collection_contract(chk):
         "sparq-org/sparq": [
             {"path": ".github/workflows/review-fix.yml",
              "display_title": f"review-fix fix sparq-org/sparq#3400 claim={'d' * 32}",
-             "name": "review-fix",
+             "name": "review-fix", "id": 8001,
              "status": "completed", "conclusion": "failure",
              "updated_at": _iso_ago(600, now), "created_at": _iso_ago(1200, now)},
             {"path": ".github/workflows/worker.yml",
-             "display_title": "worker sparq-org/sparq claim=aaa", "name": "worker",
+             "display_title": "worker sparq-org/sparq claim=aaa", "name": "worker", "id": 9001,
              "status": "completed", "conclusion": "success",
              "updated_at": _iso_ago(300, now), "created_at": _iso_ago(900, now)},
             {"path": ".github/workflows/worker.yml",
-             "display_title": "worker sparq-org/sparq claim=bbb", "name": "worker",
+             "display_title": "worker sparq-org/sparq claim=bbb", "name": "worker", "id": 9002,
              "status": "completed", "conclusion": "failure",
              "updated_at": _iso_ago(200, now), "created_at": _iso_ago(800, now)},
             {"path": ".github/workflows/worker.yml",
-             "display_title": "worker sparq-org/sparq claim=ccc", "name": "worker",
+             "display_title": "worker sparq-org/sparq claim=ccc", "name": "worker", "id": 9003,
              "status": "in_progress", "conclusion": None,
              "updated_at": _iso_ago(60, now), "created_at": _iso_ago(120, now)},
             {"path": ".github/workflows/worker.yml",   # a DIFFERENT target — must not count for sparq
-             "display_title": "worker other/repo claim=zzz", "name": "worker",
+             "display_title": "worker other/repo claim=zzz", "name": "worker", "id": 9004,
              "status": "completed", "conclusion": "failure",
              "updated_at": _iso_ago(100, now), "created_at": _iso_ago(150, now)},
             {"path": ".github/workflows/ci.yml",        # unrelated workflow — ignored
-             "display_title": "ci sparq-org/sparq", "name": "ci",
+             "display_title": "ci sparq-org/sparq", "name": "ci", "id": 9005,
              "status": "completed", "conclusion": "failure",
              "updated_at": _iso_ago(50, now), "created_at": _iso_ago(90, now)},
         ],
     }
+    # ...and the model-health window those runs wrote into. Only run 9002 is BOTH sparq's and
+    # concluded, so it is the only row that may reach sparq's counter: 9003 is still in progress
+    # (counted as neither an attempt nor a waste), 9004 belongs to another target, and 9001 is a
+    # success carrying no no_change fields at all.
+    health_records = [
+        {"ts": now - 200, "exit_class": "no_change", "run_id": "9002.1", "issue": 4242,
+         "why_no_diff": "underspecified", "model_alias": "opus5"},
+        {"ts": now - 60, "exit_class": "no_change", "run_id": "9003.1", "issue": 4243,
+         "why_no_diff": "too_large", "model_alias": "opus5"},
+        {"ts": now - 100, "exit_class": "no_change", "run_id": "9004.1", "issue": 4244,
+         "why_no_diff": "already_done", "model_alias": "sol"},
+        {"ts": now - 300, "exit_class": "success", "run_id": "9001.1", "model_alias": "opus5"},
+    ]
 
     def fake_paginate(repo, since_iso, token, now_, page_cap=10):
         return list(runs_by_target.get("sparq-org/sparq", []))
@@ -1626,7 +1863,8 @@ def _test_collection_contract(chk):
         _ready_count = lambda *args: 86   # drainable candidates, NOT the 4-wide frontier
         _paginate_runs = fake_paginate
         counts = collect_counts("sparq-org/sparq", READY_STATUS_ENGINE, "tok", now,
-                                orchestration=("jeswr/agent-account-registry", "regtok"))
+                                orchestration=("jeswr/agent-account-registry", "regtok"),
+                                health_records=health_records)
         # readiness is the DRAINABLE count (blocker #1) — not the concurrency width.
         chk("collect: issues_ready is the 86 drainable count", counts["issues_ready"], 86)
         chk("collect: authoritative LIST counts all five live state/label metrics",
@@ -1649,7 +1887,22 @@ def _test_collection_contract(chk):
         chk("collect: worker_attempts_1h = 2 concluded sparq runs (in_progress/other excluded)",
             counts.get("worker_attempts_1h"), 2)
         chk("collect: worker_success_1h = 1", counts.get("worker_success_1h"), 1)
+        # no_change telemetry (#987) joined by RUN ID over exactly that attributed population:
+        # the in-progress and other-target no_change rows are excluded, so 1 of sparq's 2 runs.
+        chk("collect: worker_no_change_1h = 1 (in_progress + other-target rows excluded)",
+            counts.get("worker_no_change_1h"), 1)
+        chk("collect: the declared reason is carried, not inferred",
+            counts.get("worker_no_change_reasons_1h"), {"underspecified": 1})
+        chk("collect: no issue looped twice this hour", counts.get("worker_no_change_issues_1h"), [])
         m = compute_target_metrics(counts)
+        chk("collect->metrics: wasted-run rate 1/2", m["worker_no_change_rate_1h"], 0.5)
+        # A tick with NO health window at all publishes nulls, never a reassuring zero.
+        counts_no_health = collect_counts(
+            "sparq-org/sparq", READY_STATUS_ENGINE, "tok", now,
+            orchestration=("jeswr/agent-account-registry", "regtok"), health_records=None)
+        chk("collect: an unreadable health ledger leaves no_change NULL (not 0)",
+            [compute_target_metrics(counts_no_health)[key]
+             for key in ("worker_no_change_1h", "worker_no_change_rate_1h")], [None, None])
         # the derived metrics + alerts that ACTUALLY result from the sparq shape:
         chk("collect->metrics: review lane STALLED (real, off orchestration)",
             m["review_lane_health"], "stalled")
@@ -1711,13 +1964,13 @@ def _test_run_windowing(chk):
     real_pr = _paginate_runs
     try:
         _paginate_runs = lambda *a, **k: []
-        chk("no runs at all => (0 concluded, 0 succeeded) — idle, not stalled",
+        chk("no runs at all => (0 concluded, 0 succeeded, no ids) — idle, not stalled",
             _orchestration_lane_runs("o/r", "sparq-org/sparq", REVIEW_LANE_WORKFLOWS, "t", now),
-            (0, 0))
+            (0, 0, set()))
         _paginate_runs = lambda *a, **k: None
-        chk("runs API unavailable => (None, None) — health stays unknown",
+        chk("runs API unavailable => (None, None, None) — health stays unknown",
             _orchestration_lane_runs("o/r", "sparq-org/sparq", REVIEW_LANE_WORKFLOWS, "t", now),
-            (None, None))
+            (None, None, None))
     finally:
         _paginate_runs = real_pr
 
@@ -1903,6 +2156,135 @@ def _test_alert_mutation_nonvacuous(chk):
                          {"sparq-org/sparq": {**DEFAULT_THRESHOLDS, "sustain_snapshots": 3}})
     chk("backlog SILENT when K exceeds available history (non-vacuous)",
         any(a["classification"] == BACKLOG_GROWING for a in k3), False)
+
+
+def _no_change_row(run_id, issue, why=None, ts=1000, alias="opus5"):
+    """A model-health `no_change` row in the shape model-health.make_record writes (#701)."""
+    row = {"ts": ts, "provider": "anthropic", "account": "a" * 16, "model_alias": alias,
+           "exit_class": "no_change", "run_id": run_id, "issue": issue}
+    if why is not None:
+        row["why_no_diff"] = why
+    return row
+
+
+def _test_no_change_seam(chk):
+    """[#987] The two literals this file restates are pinned against the modules that OWN them.
+
+    `NO_CHANGE_CLASS` / `NO_CHANGE_UNSPECIFIED` are copied here to keep the pure core import-light,
+    and a copied literal is exactly the drift that produces a silent zero: rename the exit class in
+    model-health and every wasted run stops matching, which is indistinguishable from a fleet that
+    suddenly wastes nothing. So load the owners and compare."""
+    model_health = _model_health_module()
+    chk("[#987] the exit class this panel counts is model-health's own",
+        NO_CHANGE_CLASS, model_health.CLASS_NO_CHANGE)
+    chk("[#987] ...and the default reason is no_change_routing's fail-closed index 0",
+        NO_CHANGE_UNSPECIFIED, model_health.NO_CHANGE_REASONS[0])
+    # A record the OWNER constructs must be countable by the join above — the shape is not ours to
+    # assume. (make_record validates fail-closed, so this also pins the field names.)
+    built = model_health.make_record("anthropic", "b" * 16, "opus5", "no_change", "770077.2",
+                                     1_000_000, issue=4242, why_no_diff="already_done")
+    chk("[#987] a record built by model-health itself is attributed by the run-id join",
+        summarize_no_change([built], {"770077"}),
+        {"count": 1, "reasons": {"already_done": 1}, "repeat_issues": []})
+
+
+def _test_no_change_telemetry(chk):
+    """[#466 AC3 / #987] The wasted-run counter: attribution, the null contract, and the alert."""
+    run_ids = {"9001", "9002", "9003"}
+    window = [
+        _no_change_row("9001.1", 501, "underspecified", ts=100),
+        _no_change_row("9002.1", 501, "underspecified", ts=200),   # SAME issue -> a looper
+        _no_change_row("9003.1", 777, ts=300),                     # no declaration -> unspecified
+        _no_change_row("8888.1", 999, "already_done", ts=400),     # another target's run
+        {"ts": 500, "exit_class": "limit", "run_id": "9001.1"},    # not a no_change at all
+    ]
+    got = summarize_no_change(window, run_ids)
+    chk("[#987] only rows joined to THIS target's runs are counted", got["count"], 3)
+    chk("[#987] the reason breakdown separates a human-needed issue from a finished one",
+        got["reasons"], {"underspecified": 2, "unspecified": 1})
+    chk("[#987] the repeat offender is named by issue number", got["repeat_issues"], [501])
+    # A duplicated/replayed row for ONE run counts ONCE — otherwise the derived rate exceeds 1.0.
+    dup = summarize_no_change(
+        [_no_change_row("9001.1", 501, "too_large", ts=100),
+         _no_change_row("9001.1", 501, "already_done", ts=900)], {"9001"})
+    chk("[#987] two rows for one run count once (rate can never exceed 1)", dup["count"], 1)
+    chk("[#987] ...and the NEWEST row's reason is the one reported, so the breakdown still sums",
+        dup["reasons"], {"already_done": 1})
+
+    # THE NULL CONTRACT: zero attempts leaves the RATE null, never 0.0 — 0 wasted out of 0 run is
+    # no measurement, and publishing 0.0 would read as a healthy fleet on the dashboard.
+    idle = compute_target_metrics({**REGISTRY_LIVE, "worker_attempts_1h": 0, "worker_success_1h": 0,
+                                   "worker_no_change_1h": 0})
+    chk("[#987] zero attempts => rate null (NOT 0.0)", idle["worker_no_change_rate_1h"], None)
+    chk("[#987] ...while the raw count of 0 is still published", idle["worker_no_change_1h"], 0)
+    absent = compute_target_metrics(REGISTRY_LIVE)
+    chk("[#987] no telemetry at all => count AND rate null",
+        [absent["worker_no_change_1h"], absent["worker_no_change_rate_1h"]], [None, None])
+    chk("[#987] ...with the breakdown empty rather than absent",
+        [absent["worker_no_change_reasons_1h"], absent["worker_no_change_repeat_issues_1h"]],
+        [{}, []])
+
+    # THE ALERT. #466 measured ~75% wasted; 3 of 4 is that shape, over the default 50% ceiling.
+    wasteful = compute_target_metrics({**REGISTRY_LIVE, "worker_attempts_1h": 4,
+                                       "worker_success_1h": 4, "worker_no_change_1h": 3,
+                                       "worker_no_change_reasons_1h": {"underspecified": 2,
+                                                                       "already_done": 1},
+                                       "worker_no_change_issues_1h": [4242]})
+    target = "jeswr/agent-account-registry"
+    hist = [_snap(1000, {target: wasteful}), _snap(2000, {target: wasteful})]
+    fired = evaluate_alerts(hist[-1], hist, {target: DEFAULT_THRESHOLDS})
+    chk("[#987] worker-no-change fires at 3/4 wasted, sustained",
+        any(a["classification"] == WORKER_NO_CHANGE for a in fired), True)
+    row = next(a for a in fired if a["classification"] == WORKER_NO_CHANGE)
+    chk("[#987] the alert carries the reason breakdown the maintainer must act on",
+        row["metrics"]["worker_no_change_reasons_1h"], {"underspecified": 2, "already_done": 1})
+    chk("[#987] ...and names the loopers in the summary", "#4242" in row["summary"], True)
+    chk("[#987] the run lane is SUCCEEDING (4/4) — worker-failing cannot cover this class",
+        any(a["classification"] == WORKER_FAILING for a in fired), False)
+    # MUTATION (non-vacuity): raise the ceiling above the live 0.75 => the alert goes silent, so the
+    # rule reads the threshold rather than a constant.
+    hi = evaluate_alerts(hist[-1], hist,
+                         {target: {**DEFAULT_THRESHOLDS, "worker_no_change_ceiling": 0.9}})
+    chk("[#987] SILENT once the ceiling is raised past 0.75 (non-vacuous)",
+        any(a["classification"] == WORKER_NO_CHANGE for a in hi), False)
+    # ...and the same mutation in the other direction: drop the ceiling under a HEALTHY 1/4 rate.
+    thrifty = compute_target_metrics({**REGISTRY_LIVE, "worker_attempts_1h": 4,
+                                      "worker_success_1h": 4, "worker_no_change_1h": 1})
+    h2 = [_snap(1000, {target: thrifty}), _snap(2000, {target: thrifty})]
+    chk("[#987] a 25% wasted rate is silent at the default ceiling",
+        any(a["classification"] == WORKER_NO_CHANGE
+            for a in evaluate_alerts(h2[-1], h2, {target: DEFAULT_THRESHOLDS})), False)
+    chk("[#987] ...and fires once the ceiling drops below it (non-vacuous, both directions)",
+        any(a["classification"] == WORKER_NO_CHANGE
+            for a in evaluate_alerts(h2[-1], h2, {target: {**DEFAULT_THRESHOLDS,
+                                                           "worker_no_change_ceiling": 0.1}})), True)
+    # MIN-SAMPLE FLOOR: one wasted run out of one is noise, not a wasted fleet.
+    lone = compute_target_metrics({**REGISTRY_LIVE, "worker_attempts_1h": 1, "worker_success_1h": 1,
+                                   "worker_no_change_1h": 1})
+    h3 = [_snap(1000, {target: lone}), _snap(2000, {target: lone})]
+    chk("[#987] SILENT below worker_min_samples even at a 100% wasted rate",
+        any(a["classification"] == WORKER_NO_CHANGE
+            for a in evaluate_alerts(h3[-1], h3, {target: DEFAULT_THRESHOLDS})), False)
+    # SUSTAINED like every other rule: one bad tick never alarms.
+    one = [_snap(2000, {target: wasteful})]
+    chk("[#987] SILENT on a single tick (sustained, like every other rule)",
+        any(a["classification"] == WORKER_NO_CHANGE
+            for a in evaluate_alerts(one[-1], one, {target: DEFAULT_THRESHOLDS})), False)
+    # The POLICY validator has to admit the new threshold as a RATE: under the positive-int rule
+    # every tunable value between 0 and 1 would be rejected, so the knob would exist in name only.
+    chk("[#987] a float ceiling is accepted from policy",
+        _thresholds_of("o/r", {"throughput": {"worker_no_change_ceiling": 0.75}})
+        ["worker_no_change_ceiling"], 0.75)
+    refused = None
+    try:
+        _thresholds_of("o/r", {"throughput": {"worker_no_change_ceiling": 1.5}})
+    except MetricsError as exc:
+        refused = "must be a float in [0, 1]" in str(exc)
+    chk("[#987] ...and a ceiling outside [0, 1] is refused loudly", refused, True)
+    # RECOVERY reads the SAME predicate, so a cleared condition auto-closes the rolling issue.
+    chk("[#987] the class recovers once the rate is clear over the hysteresis window",
+        (target, WORKER_NO_CHANGE) in compute_recoveries(h2, [target], {target: DEFAULT_THRESHOLDS}),
+        True)
 
 
 def _test_ledger_cas(chk):
