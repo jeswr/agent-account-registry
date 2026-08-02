@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1661,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2fd120cdd4b5540e9ba40767fd6377802cb4f8f3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The guard degrades only when `len(worker_pulls) > WORKER_PR_STATUS_LIMIT`, so a count of 100 is still processed and the first overflow is 101. However, the warning says `At the limit this repo degrades` and computes `WORKER_PR_STATUS_LIMIT - len(worker_pulls)`, yielding `within 0` at 100. At 91 there are ten additional PRs before overflow (92 through 101), while the message reports nine. This does not weaken admission safety, but it gives operators an inaccurate boundary and the new tests do not exercise the upper boundary or validate the numeric headroom.",
+    "file": "scripts/plan-snapshot.py",
+    "fix_hint": "Describe degradation as occurring when the limit is exceeded and compute distance to the first overflowing count, for example `WORKER_PR_STATUS_LIMIT + 1 - len(worker_pulls)`. Add assertions for counts 100 and 101 that verify both warning behavior and the reported distance/boundary wording.",
+    "severity": "minor",
+    "title": "Warning reports the overflow cliff one PR too early"
+   }
+  ],
+  "progress": null,
+  "summary": "The change correctly adds a non-blocking early warning for the worker-PR census range and preserves the existing fail-closed overflow behavior. The added assertions are non-vacuous for deletion and unconditional-warning mutations, and the worker-PR filtering remains appropriately scoped. One minor operator-message boundary error remains: overflow starts above 100, not at 100, and the displayed remaining capacity is consequently one low.",
+  "verdict": "approve"
+ }
+}
