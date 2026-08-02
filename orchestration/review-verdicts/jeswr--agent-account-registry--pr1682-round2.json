@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1682,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c18c00c1c1b6d8bd52c73eb6d25a6b166994b8f9",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-1 blocker is fixed. Standing-refusal evidence now requires both the reason marker and the exact `github-actions[bot]` author identity used by the pinned registry workflow token; missing, malformed, and unexpected author metadata fails closed as non-standing. The end-to-end sweep tests demonstrate that forged markers neither increment the standing census nor suppress the legitimate annotation, while trusted markers still deduplicate and count by reason. The new refusal-disposition seal and zero-emitting census are coherent, and comment-read/post failures are honestly partitioned as unannounced. I found no remaining correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
