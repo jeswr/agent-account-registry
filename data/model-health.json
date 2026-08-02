@@ -1,70 +1,6 @@
 {
  "records": [
   {
-   "ts": 1785673788,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30747854976.1"
-  },
-  {
-   "ts": 1785673824,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30747881291.1"
-  },
-  {
-   "ts": 1785673953,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30747962823.1"
-  },
-  {
-   "ts": 1785674062,
-   "provider": "anthropic",
-   "account": "51bde6688e140866",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "30747542198.1"
-  },
-  {
-   "ts": 1785674099,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30748043743.1"
-  },
-  {
-   "ts": 1785674099,
-   "provider": "fleet",
-   "account": "5f5b2dc3fb8e231b",
-   "model_alias": "",
-   "exit_class": "success",
-   "run_id": "30747675849.1"
-  },
-  {
-   "ts": 1785674121,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30748055100.1"
-  },
-  {
-   "ts": 1785674131,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30748065034.1"
-  },
-  {
    "ts": 1785674142,
    "provider": "openai",
    "account": "dc2d751954080e13",
@@ -1786,6 +1722,14 @@
    "model_alias": "opus5",
    "exit_class": "success",
    "run_id": "30762943788.1"
+  },
+  {
+   "ts": 1785699331,
+   "provider": "anthropic",
+   "account": "f79434c3ffba014f",
+   "model_alias": "opus5",
+   "exit_class": "success",
+   "run_id": "30763166053.1"
   }
  ]
 }
