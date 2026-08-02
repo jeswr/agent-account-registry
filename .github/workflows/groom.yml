@@ -2,8 +2,9 @@
 # orphans, exhausted attempt budgets, and stale worker PRs. The cron was enabled after the REG-4
 # staged pilot proved target writes end-to-end (issues #2407–#2416 flowed; PRs #2417–#2421
 # merged) — groom is the ONLY crash-recovery path, so scheduled runs are load-bearing for
-# autonomy. The minute offset avoids same-minute lease-ledger CAS contention with
-# groom-leases.yml's */15 cron (both writers are CAS-safe; this is contention reduction).
+# autonomy. The minute offset avoids same-minute lease-ledger CAS contention with the lease
+# groomer (both writers are CAS-safe; this is contention reduction). That lane's own minutes are
+# NOT restated here — they are DERIVED (#1046 — ci-latency-alert.py's `schedule_minute_map`).
 name: groom
 
 on:

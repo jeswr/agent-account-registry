@@ -525,6 +525,58 @@ def schedule_minute_map(root) -> dict[str, set[int]]:
 MIN_SCHEDULED_LANES = 10
 
 
+# ---- THE STAMPEDE MINUTE, and lanes that must not share one (#1048) -----------------------------
+# A `*/N` minute field NECESSARILY contains :00 — the top-of-hour minute GitHub's schedule queue is
+# most contended on, and the one dispatch.yml's ":03 not :00" offset exists to avoid. It is also,
+# mechanically, the one tick EVERY other `*/N` lane lands on, so two such lanes overlap
+# tick-for-tick rather than merely sometimes.
+#
+# NO DELIVERY WIN is on offer for moving off it, and THIS FILE is where that was measured: the
+# per-lane census in CRON_MAX_CREDIBLE_FIRINGS_PER_HOUR's note above records the `*/15` lanes
+# delivering 30/day against explicit-minute lanes' 31/day — inside the noise. What a repoint buys
+# is CONTENTION: for a lane that CAS-writes the shared ledger tip, a minute shared with another
+# writer is the #558 write-burst shape, not a scheduling nicety.
+STAMPEDE_MINUTE = 0
+
+# The lease groomer — the ledger CAS writer whose schedule this module asserts (#1048). Its PERIOD
+# is not free: select-and-claim.py's renewal constants are asserted THERE against "the 15-minute
+# groom-leases cron" (the lead brackets two ticks, the window three), so a longer period here
+# silently un-brackets them and a live lease can expire between two ticks unseen.
+LEDGER_GROOM_LANE = f"{WORKFLOWS_DIR}/groom-leases.yml"
+LEDGER_GROOM_PERIOD_MINUTES = 15
+
+
+def exclusive_lane_faults(schedule_map: dict, workflow: str, period_minutes: int,
+                          forbid=(STAMPEDE_MINUTE,)) -> list[str]:
+    """-> sorted fault codes for a lane that must OWN its minutes at a fixed period; [] is clean.
+
+    PURE over an ALREADY-DERIVED map — the same split `cron_collisions` uses in regate-sweep.py:
+    the live-tree seam hands it the real derivation, the hermetic test hands it a map it wrote.
+
+    FAIL CLOSED ON ABSENCE. A lane missing from the map — thin checkout, renamed file, deleted
+    `schedule:` — reports `absent` rather than clean, because an EMPTY minute set is
+    forbidden-free, evenly spaced by vacuous truth, and collides with nothing.
+
+    A clean report is only meaningful once the CALLER has established that the map saw the tree
+    (MIN_SCHEDULED_LANES): over a one-lane map the collision half of this cannot fail.
+    """
+    mine = sorted(schedule_map.get(workflow) or ())
+    if not mine:
+        return ["absent"]
+    faults = [f"forbidden-minute:{m}" for m in mine if m in set(forbid)]
+    # CYCLIC gaps, so the wrap from the last minute back to the first is checked too: {0, 30}
+    # reads evenly spaced left-to-right and is not a 30-minute cadence at the hour boundary
+    # unless the wrap agrees. A single-minute lane wraps to a gap of 0, i.e. the hourly period.
+    gaps = {((mine[(i + 1) % len(mine)] - mine[i]) % 60) or 60 for i in range(len(mine))}
+    if gaps != {period_minutes}:
+        faults.append(f"period:{sorted(gaps)}")
+    for name, taken in schedule_map.items():
+        shared = sorted(set(mine) & set(taken or ()))
+        if shared and name != workflow:
+            faults.append(f"collision:{name}:{','.join(str(m) for m in shared)}")
+    return sorted(faults)
+
+
 # ---------------------------------------------------------------------------------
 # detectors — pure functions over already-fetched state
 # ---------------------------------------------------------------------------------
@@ -1363,6 +1415,48 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
         pass
     except Exception:
         chk("schedule map: a missing workflows directory raised the wrong error", False)
+
+    # --- exclusive_lane_faults (#1048), on maps written HERE. The live-tree row in the seam
+    # section can only ever exercise the clean direction — this repo has one such lane and it
+    # passes — so every fault code is driven from a fixture that differs from the CLEAN control
+    # by one lane or one minute. A checker that stopped detecting anything reds these, not the
+    # control. ---
+    _LANE = f"{WORKFLOWS_DIR}/g.yml"
+    _CLEAN = {_LANE: {5, 20, 35, 50},
+              f"{WORKFLOWS_DIR}/o.yml": {4, 24, 44},
+              f"{WORKFLOWS_DIR}/p.yml": {7, 22, 37, 52}}
+    chk("exclusive lane [CONTROL]: a lane that owns its minutes at its period, clear of :00, "
+        "reports NO faults",
+        exclusive_lane_faults(_CLEAN, _LANE, 15) == [])
+    chk("exclusive lane [RED #1048]: `*/15` reports BOTH the stampede minute AND the "
+        "tick-for-tick collision it creates with the other `*/15` lane",
+        exclusive_lane_faults({**_CLEAN, _LANE: {0, 15, 30, 45},
+                               f"{WORKFLOWS_DIR}/q.yml": {0, 15, 30, 45}}, _LANE, 15)
+        == [f"collision:{WORKFLOWS_DIR}/q.yml:0,15,30,45", "forbidden-minute:0"])
+    chk("exclusive lane: the forbidden minute DEFAULTS to :00 — the minute `*/N` cannot avoid",
+        STAMPEDE_MINUTE == 0
+        and exclusive_lane_faults({**_CLEAN, _LANE: {0, 15, 30, 45}}, _LANE, 15)
+        == ["forbidden-minute:0"])
+    chk("exclusive lane: `forbid` is honoured as a VALUE, not as a hard-wired :00 — a lane "
+        "asked to clear a minute it actually holds reports that minute",
+        exclusive_lane_faults(_CLEAN, _LANE, 15, forbid=(20,)) == ["forbidden-minute:20"])
+    chk("exclusive lane: a lane MISSING from the map, or holding no minutes, is `absent` and "
+        "never clean — an empty minute set collides with nothing and would read as free",
+        (exclusive_lane_faults({k: v for k, v in _CLEAN.items() if k != _LANE}, _LANE, 15),
+         exclusive_lane_faults({**_CLEAN, _LANE: set()}, _LANE, 15)) == (["absent"], ["absent"]))
+    chk("exclusive lane: the period is read as a VALUE — the same clean lane is a fault "
+        "against a different declared period",
+        exclusive_lane_faults(_CLEAN, _LANE, 20) == ["period:[15]"])
+    chk("exclusive lane: the period is checked CYCLICALLY — :05/:35 is not a 15-minute "
+        "cadence however evenly its two minutes read left to right",
+        exclusive_lane_faults({**_CLEAN, _LANE: {5, 35}}, _LANE, 15) == ["period:[30]"])
+    chk("exclusive lane: a single-minute lane wraps to the HOURLY period, not to a gap of 0 "
+        "(which would read as a 0-minute cadence and match nothing)",
+        exclusive_lane_faults({**_CLEAN, _LANE: {5}}, _LANE, 15) == ["period:[60]"])
+    chk("exclusive lane: a collision on ONE tick of four is reported with the minute, and a "
+        "lane never collides with ITSELF",
+        exclusive_lane_faults({**_CLEAN, f"{WORKFLOWS_DIR}/o.yml": {5, 25, 45}}, _LANE, 15)
+        == [f"collision:{WORKFLOWS_DIR}/o.yml:5"])
 
     # --- M1 scope: EVERY scheduled lane here (no cron_lane_liveness counterpart) ---
     sched_only = {"schedule": [{"cron": "*/15 * * * *"}], "workflow_dispatch": None}
@@ -2235,6 +2329,17 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
             len(_map) >= MIN_SCHEDULED_LANES)
         chk("seam: every lane in the schedule map holds at least one minute",
             all(minutes for minutes in _map.values()))
+        # #1048, over that same derived map and only AFTER the floor above has established it
+        # saw the tree. The lease groomer was on `*/15`, so it held :00 and shared all four of
+        # its ticks with every other `*/15` lane while CAS-writing the shared ledger tip. WHICH
+        # minutes it moved to is deliberately not written here (#1046) — the PROPERTY is what is
+        # asserted, so repointing ANY lane in this directory on top of it reds HERE.
+        _groom_faults = exclusive_lane_faults(_map, LEDGER_GROOM_LANE,
+                                              LEDGER_GROOM_PERIOD_MINUTES)
+        chk(f"seam: {LEDGER_GROOM_LANE} owns its minutes, clears the :{STAMPEDE_MINUTE:02d} "
+            f"stampede minute, and still fires every {LEDGER_GROOM_PERIOD_MINUTES} min "
+            f"(faults: {_groom_faults})",
+            _groom_faults == [])
         wf = yaml.safe_load((root / GROOM_WORKFLOW).read_text())
         jobs = wf.get("jobs", {})
         chk("seam: groom.yml hosts a `ci-latency` job", "ci-latency" in jobs)

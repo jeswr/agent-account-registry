@@ -18,7 +18,25 @@
 name: groom-leases
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    # NOT `*/15` (#1048). A `*/N` minute field NECESSARILY contains :00 — the top-of-hour minute
+    # dispatch.yml's ":03 not :00" schedule comment exists to avoid, and mechanically the one tick
+    # EVERY other `*/N` lane in this directory also lands on, so two such lanes overlap
+    # tick-for-tick rather than merely sometimes. This lane CAS-writes the shared ledger tip, so a
+    # co-occupied minute is the #558 write-burst shape rather than a scheduling nicety.
+    #
+    # NO DELIVERY WIN IS CLAIMED, because this repo measured that there is none: the 24h per-lane
+    # census in ci-latency-alert.py's CRON_MAX_CREDIBLE_FIRINGS_PER_HOUR note has `*/15` and
+    # explicit-minute lanes converging to the same ~30/day. Contention is the whole argument.
+    #
+    # THE PERIOD IS LOAD-BEARING and stays 15 minutes: select-and-claim.py's RENEWAL_LEAD_SECONDS
+    # and RENEWAL_SECONDS are asserted there to bracket "the 15-minute groom-leases cron", so a
+    # longer period silently un-brackets them and a live lease can expire between two ticks unseen.
+    #
+    # WHICH minutes are free is NOT restated here as a list — that list went stale once already
+    # (#1046). It is DERIVED from this directory by ci-latency-alert.py's `schedule_minute_map` and
+    # asserted through its `exclusive_lane_faults` seam, so repointing any lane in this directory
+    # on top of these minutes reds the gate instead of walking the next author into a collision.
+    - cron: "5,20,35,50 * * * *"
   workflow_dispatch: {}
 
 permissions:
