@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1726,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "493affa13a19a7b79ea3d5d51cc5477120eabccb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The PR de-pins two citations of `_confirmed_private()` because `:534` had drifted (the function is really at scripts/pat-validity.py:539). Line 60 of the same file carries the same class of stale pin: \"with the reasoning at `pat-validity.py:67-68`: 'configuration alone' is not enough\". In the checkout, pat-validity.py:67-68 is the `# Alerting mirrors usage-alert.py: ONE rolling from:agent issue ...` comment; the quoted phrase \"configuration alone\" actually appears at pat-validity.py:73, inside the ROUTING comment block. Same ~5-line drift as the pin this PR fixes, left unfixed. Purely cosmetic \u2014 a stale prose citation in a design record that changes no behaviour \u2014 hence nit, not blocking. Also note research/249-model-container-egress.md:288 already cites the correct `:539`, so the tree is now internally consistent on the `_confirmed_private` location.",
+    "file": "research/370-private-diagnostic-sink.md",
+    "fix_hint": "Apply the same treatment as the two lines already fixed: replace \"with the reasoning at `pat-validity.py:67-68`\" with a name-anchored reference, e.g. \"with the reasoning in `pat-validity.py`'s ROUTING comment\" or quote the anchor phrase (\"configuration alone is not enough\") without a line number, so the citation survives future line drift.",
+    "severity": "nit",
+    "title": "A third stale line-pin to pat-validity.py survives the same cleanup (line 60: `pat-validity.py:67-68`)"
+   }
+  ],
+  "progress": null,
+  "summary": "Docs-only change to research/370-private-diagnostic-sink.md (3 lines). It replaces two line-pinned citations of `scripts/pat-validity.py:534` `_confirmed_private()` with name-based references. Verified against the checkout: `_confirmed_private` is defined at scripts/pat-validity.py:539, so `:534` was STALE (534 is inside the unrelated AlertWriteError raise) and the fix is correct \u2014 dropping the brittle line pin is the right remedy, since the symbol name is unique in that file and greppable. The blockquoted docstring text at lines 57-58 still matches the real docstring at pat-validity.py:540-544 verbatim in substance (\"True ONLY on a definitive `\\\"private\\\": true` ... anything but a literal boolean true reads as NOT private \u2014 the caller then redacts\"). No behaviour, no workflow, no policy, no self-test, no trust check is touched: `git diff --stat` for the head commit is exactly 1 file / 3 insertions / 3 deletions, all prose in a design record that itself declares it changes no behaviour. Fail-closed posture, routing, token handling, permissions and action pinning are all untouched, so there is no trust-surface weakening and no vacuous-test concern (no test is added or modified \u2014 appropriate for a prose-only edit). No token-shaped or PII content is introduced. Nothing in the diff reads as an instruction directed at the reviewer. One non-blocking nit: a third stale line-pin in the same file (`pat-validity.py:67-68` at line 60) was left behind by the same drift; recorded below as a nit only.",
+  "verdict": "approve"
+ }
+}
