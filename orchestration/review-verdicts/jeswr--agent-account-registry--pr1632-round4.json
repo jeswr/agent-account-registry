@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1632,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ae397b4909e06273bd1107c4225d51f5756f7808",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Step C still says to run `python3 scripts/ledger-invariant.py` against a fresh checkout of the rewritten branch. The shipped CLI requires a positional `root`, so the literal command exits in argparse without checking the tree. Moreover, the rewritten `ledger` checkout is intentionally data-only and therefore has no `scripts/ledger-invariant.py` to execute. The later contents-API and parser checks validate tip content, but they do not make this separately prescribed allowlist/tree-shape check executable. This is the same major defect recorded in round 3.",
+    "file": "research/536-ledger-history-rewrite.md",
+    "fix_hint": "Name two distinct checkouts and an exact executable command: invoke `scripts/ledger-invariant.py` from a trusted registry code checkout at a specified reviewed SHA, and pass the fresh rewritten-ledger checkout as the positional root, for example `python3 <registry-code-checkout>/scripts/ledger-invariant.py <rewritten-ledger-checkout>`. Keep the code source and validation target explicit and distinct.",
+    "severity": "major",
+    "title": "The ledger-invariant post-check still cannot run as written"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 major finding remains materially unchanged. Step C still prescribes `python3 scripts/ledger-invariant.py` against a fresh rewritten-ledger checkout, but that program requires the checkout root as a positional argument and the data-only ledger checkout does not contain `scripts/ledger-invariant.py`. The surrounding new API checks do not repair this first, explicitly required tree-shape gate. The runbook therefore still is not executable as written before writers resume.",
+  "verdict": "request_changes"
+ }
+}
