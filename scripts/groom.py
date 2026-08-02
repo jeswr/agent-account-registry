@@ -7819,12 +7819,18 @@ def _self_test() -> int:
         #
         # The three legs share ONE lease and ONE empty listing and differ ONLY in what the fresh
         # read returns, so each kills its own mutant. (a) skipped-but-open must RETAIN: a mutant
-        # that short-circuits the fresh read for an issue the snapshot already called absent — or
-        # seeds `fresh_reap_issues` from the snapshot — leaves the reap-cap check below and every
-        # other reap check in this file green, and reds only this leg. (b) genuinely gone must
-        # still RELEASE, so the retention is not universal and (a) cannot be satisfied by simply
-        # never reaping. (c) a CLOSED payload releases too, which is what stops the boundary's
-        # `state == "open"` test from being satisfiable by any payload at all.
+        # that still ISSUES the fresh read but short-circuits its ANSWER for an issue the snapshot
+        # already called absent survived the whole pre-#1121 suite (512/512) and reds only this
+        # leg. (b) genuinely gone must still RELEASE, so the retention is not universal and (a)
+        # cannot be satisfied by simply never reaping. (c) a CLOSED payload releases too: deleting
+        # the boundary's `state == "open"` test likewise survived 512/512 and now reds only this
+        # leg — that half of #509's boundary had no killer at all before.
+        #
+        # NOT claimed, because it is not true: seeding `fresh_reap_issues` from the SNAPSHOT is
+        # unkillable here. This fixture's listing is empty, so `{repo: {} for repo in issues}` and
+        # any snapshot-seeded spelling are the same empty mapping. The seeding mutant that IS
+        # killable — confirming off `issues` instead of `fresh_reap_issues` at the
+        # `_terminal_non_pr_claims` call — is already owned by the #509 release guard above.
         skipped_lease = {
             **base, "claim_id": race_claim, "holder": "owner/repo#7@777.1",
             "issued_at": 1, "expires_at": 2,
