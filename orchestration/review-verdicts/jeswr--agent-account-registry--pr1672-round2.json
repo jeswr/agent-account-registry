@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1672,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "47d16ca92d632d547749b60bd25848972fdeac9a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 6.1 treats collapsing observations to registrable domain + port and seeing them in two independent runs as sufficient before presenting a candidate list for review. Neither operation sanitizes the registrable-domain bytes: a steered model can choose a valid domain whose registrable label encodes a credential and repeat it in two runs. The LDH/length checks accept such a value, a low-cardinality repeated domain avoids the high-cardinality signal, and human review is not a secret-redaction boundary. This conflicts directly with section 8.6, which says any marker hit in the aggregated allowlist candidate means 1a must not land, and with item 6's claim that registrable domains are suitable operational data. The prior finding is reduced but not eliminated: raw FQDN publication is forbidden, yet the proposed derived durable surface can still retain attacker-authored credential bytes.",
+    "file": "research/249-model-container-egress.md",
+    "fix_hint": "Define an aggregation/candidate format that never carries attacker-supplied domain labels into durable or public output. For example, keep candidate domains only in the same protected ephemeral/private store as raw observations and require a trusted operator to independently enter approved provider endpoints, while durable/public telemetry contains only counts or opaque host-side identifiers. Make the adversarial test use a syntactically valid, within-bounds credential-encoded registrable domain repeated across the threshold number of runs, and require zero occurrences in every durable candidate/review surface. Clarify that validation rejects malformed telemetry but is not redaction and cannot make a valid attacker-chosen hostname safe to publish.",
+    "severity": "major",
+    "title": "Aggregated registrable domains remain an attacker-controlled durable secret surface"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 materially improves the record: it now classifies destination fields as hostile model output, forbids raw publication, names retention and validation requirements, and adds an adversarial durable-surface probe. However, the proposed reviewed aggregation still copies an attacker-controlled registrable domain into the allowlist-candidate path. A steered model can repeat the same credential-encoded registrable domain across two runs, satisfying the stated threshold; validation, cardinality counting, and human review do not remove those bytes. Section 8.6 itself requires that no credential-shaped marker reach the aggregated candidate, but the specified aggregation would include a syntactically valid marker domain. The telemetry contract therefore remains internally inconsistent and does not yet close the prior round's durable-retention concern.",
+  "verdict": "request_changes"
+ }
+}
