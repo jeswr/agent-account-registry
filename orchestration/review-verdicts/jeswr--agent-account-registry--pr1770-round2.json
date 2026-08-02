@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1770,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ae2caaa499c53b30baceb03fb359a4219d2899a4",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 diff remains correct and complete. The added self-tests exercise the existing enabled-fleet filter at the production call path with distinct literal expectations: removing or bypassing the filter admits the rotated-out limit record, changing the reset hint and the enabled-only churn reason. The firing and non-firing cases also verify that the provider-cap decision remains based on enabled accounts. Assertions do not derive expected values from production constants or fixture transformations, no trust check or production behavior is changed, and no injection-like instruction appears in the diff. There are no review findings.",
+  "verdict": "approve"
+ }
+}
