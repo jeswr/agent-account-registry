@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5755,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c2c4d3e91b59409d93665f4d0fd2ec3d4dbddff8",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The README and test constant identify the vendor source as ffaea0497de41cd709a742e0c4a90831a500fd97, but vectors/manifest.json has specSource lws-spec@59da847 and each case carries the same older source tag. This may legitimately mean the later checkout retained vectors generated at the earlier revision, but the current prose does not explain that distinction, making provenance review unnecessarily ambiguous.",
+    "file": "crates/sparq-lws-core/conformance/lws-spec/README.md",
+    "fix_hint": "State that ffaea049... is the repository revision copied while 59da847 is the embedded vector-generation/spec-source revision, if that is accurate; otherwise regenerate or correct the stale embedded provenance fields during re-vendoring.",
+    "severity": "minor",
+    "title": "Vendored revision differs from embedded fixture provenance"
+   }
+  ],
+  "progress": null,
+  "summary": "The new conformance harness is coherent and fail-closed: it executes the vendored decision semantics in declared strata, checks the real permit predicate, exercises all 19 evaluate-access vectors, and adds direct witnesses for encoder rejection paths. The dependency remains native-only and dev-only. I found no correctness, soundness, or security defect requiring changes. One provenance detail is confusing but non-blocking: the vendored checkout is identified as ffaea049..., while the embedded manifests and vector source fields still identify lws-spec@59da847; clarify that relationship on the next re-vendor.",
+  "verdict": "approve"
+ }
+}
