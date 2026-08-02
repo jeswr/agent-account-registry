@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [GPT-5.6] REG-3 target-issue control plane: revision-bound trust revalidation, durable attempt
+# [SPARQ agent] REG-3 target-issue control plane: revision-bound trust revalidation, durable attempt
 # accounting, and fail-closed status transitions. It never reads registry account credentials.
 """Small GitHub API helper for the live registry worker."""
 

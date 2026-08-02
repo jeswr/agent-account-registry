@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# [GPT-5.6] REG-2/REG-3 worker preparation. Materialize exactly one selected account credential
+# [SPARQ agent] REG-2/REG-3 worker preparation. Materialize exactly one selected account credential
 # into an isolated HOME, retain a private comparison baseline for rotation write-back, and install
 # the policy-selected model harness. This script never runs the model.
 set -euo pipefail
