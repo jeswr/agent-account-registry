@@ -68,6 +68,18 @@ jobs:
               "\`action_required\` + \`jobs=0\` means GitHub created the run and ran nothing — the workflow FILE was refused. This is silent: no failing check, no red, just lanes not running." "" \
               "Mechanism is unexplained across 9+ instances (#1566); a 10-candidate elimination table is on #1706. groom is the ONLY crash-recovery path, so its rejection is never cosmetic." "" \
               "⚠️ Verify any fix by \`jobs > 0\`, never by colour." > /tmp/body.md
+            # UPSERT, never blind-create. This lane ticks every 30 min; an unconditional
+            # `issue create` would file a duplicate EVERY tick for as long as the outage
+            # lasts, and each issue event fans out into workflow runs that spend the shared
+            # API budget. A recurring alarm that floods the tracker is a second outage.
+            EXISTING=$(gh issue list --repo "$REPO" --state open --limit 20 \
+                         --search "ingestion rejection in:title" \
+                         --json number -q '.[0].number // empty' || true)
+            if [ -n "$EXISTING" ]; then
+              echo "alarm already open as #$EXISTING — commenting instead of duplicating"
+              gh issue comment "$EXISTING" --repo "$REPO" --body-file /tmp/body.md || true
+              exit 1
+            fi
             gh issue create --repo "$REPO" \
               --title "⚠️ ingestion rejection: lanes running ZERO jobs" \
               --label "priority:P1,area:dispatch,role:impl,from:agent" \
