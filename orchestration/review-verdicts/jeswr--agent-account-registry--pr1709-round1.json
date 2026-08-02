@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1709,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f2b3933a32996192bd3dd4b450e03178dc7db926",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_live_nodes` stops at functions and lambdas, but not at `ast.GeneratorExp`. A production loop can therefore contain only `(park_starved_partition_holder(repo, target, starved) for _ in (0,))` as an expression statement. Creating that generator does not execute its element expression, yet `_live_nodes(loop)` descends into the generator and `_park_call_site` finds the call and returns `dispatch`. Thus every target can remain unparked while the new checker and shipped-tree assertion stay green. The reachability self-test has no generator-expression refusal, so it does not pin this deferred scope.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Treat generator-expression bodies as deferred execution (while accounting for the iterable expressions that are evaluated at generator creation), and add a synthetic refusal proving a park call placed only in an unconsumed generator expression is rejected. Include the old-checker acceptance leg so the test demonstrates the intended reachability gap rather than malformed source.",
+    "severity": "blocker",
+    "title": "Generator expressions let an unexecuted park call pass the seam"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe reachability hardening remains bypassable by a Python deferred-execution scope that the new traversal treats as live. The otherwise useful branch and nested-function tests do not exercise this case, so the claimed structural proof is incomplete.",
+  "verdict": "request_changes"
+ }
+}
