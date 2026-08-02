@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1687,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d1084aa7c15affe03b67ea8700b81abe67d3ba0a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new rule reads: \"Model-qualified header markers such as `[OPUS-5]`, `[FABLE-5]`, and `[HAIKU-\u2026]` are legacy and migrate when touched.\"\n\nRead as \"when the FILE is touched\", this PR is already non-compliant with the rule it lands: it touches scripts/policy-resolve.py but leaves `[OPUS-5]` at lines 43, 63 and 120 and `[FABLE-5]` at 116, and touches policy/repos.toml while leaving `[FABLE-5]` at 14 and 21. Read as \"when that HEADER is rewritten\" \u2014 which is what the prior round's fix hint intended and what the diff actually does \u2014 the PR is compliant and the residual markers are a documented backlog.\n\nAcross 48 files carrying ~189 of these markers, the two readings differ by a lot of incidental churn on unrelated diffs, and a future reviewer citing this line has no text to settle which one they are enforcing. Comments only; nothing parses them; not blocking.",
+    "file": "AGENTS.md",
+    "fix_hint": "Add three words to AGENTS.md:7 so the unit is explicit, e.g. \"\u2026 are legacy; convert one when you edit that header line, not merely when you edit the file.\" No other change needed \u2014 the rest of the paragraph is accurate and matches .claude/agents/registry-docs.md:20.",
+    "severity": "nit",
+    "title": "\"migrate when touched\" does not say whether the unit of touch is the header line or the file"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 resolves both round-1 findings; the diff is comment/doc-only and I found no new defect.\n\nR1 MAJOR (incomplete sweep) \u2014 FIXED. containers/worker-model.Dockerfile:1 is now `# [SPARQ agent] REG-3 model sandbox: ...`. A tree-wide grep for the literal `[GPT-5.6]` returns ZERO matches. The surviving plain-prose `GPT-5.6` mentions (README.md:84/250/262, orchestration/routing.toml:254/268, policy/repos.toml:5/10/16/23, scripts/triage.py:186, scripts/plan-alert.py:8, scripts/worker-live.sh model_display_name table + its #97 self-test literals at 7385-7550) are the issue-#97 variant-qualified model taxonomy and were correctly left alone \u2014 genericizing them would have re-asserted the exact mislabelling #97 exists to stop.\n\nR1 MINOR (undocumented bracket form) \u2014 FIXED via the cheaper option the prior hint recommended. AGENTS.md:6-7 now defines `[SPARQ agent]` as the source-file provenance header and declares `[OPUS-5]`/`[FABLE-5]`/`[HAIKU-\u2026]` legacy, migrating on touch. Wording mirrors the existing .claude/agents/registry-docs.md:20 phrasing verbatim, so the two do not drift. The mixed state inside scripts/policy-resolve.py (`[SPARQ agent]` at 2, `[OPUS-5]` at 43/63/120, `[FABLE-5]` at 116) and policy/repos.toml is now a documented migration rather than silent drift.\n\nMy own round-2 checks, all clean:\n- Diff is exactly the 11 files shown (`git diff master...HEAD --stat` matches): 9 one-line header swaps, 1:1 line counts, plus 3 added lines in AGENTS.md. No hidden file.\n- Nothing executable is touched, so no self-test is owed and no vacuous-test question arises. Every changed line sits ahead of `FROM`, the module docstring, or `set -euo pipefail`.\n- No consumer reads these strings: each header sentence occurs exactly ONCE tree-wide, so no README/runbook copy can diverge, and readme-runbook-check.py parses policy/repos.toml through tomllib (semantic, not textual) \u2014 a leading comment is inert to it.\n- worker-live.sh's registry-selftest classifier st\u2026 [truncated 1203 chars]",
+  "verdict": "approve"
+ }
+}
