@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5261,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e48006b760273de8e6ed3436f36c2b88bcbc9789",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The round-3 blocker remains unchanged. Immediately above the newly added DONE note, the durable prose still states fixed timings for conformance ratchets, container-scan, and CodeQL (44\u201376 s, 3.6 m, and 3.8 m). The repository contract forbids hard-coded performance numbers in markdown and treats dated CI/work-box measurements as non-canonical. Adding a qualitative restatement elsewhere does not remove the prohibited figures from the changed record.",
+    "file": "research/ci-mergequeue-speedup-2026-07.md",
+    "fix_hint": "Remove the three literal durations from the companion record. Keep the conclusion qualitative (short parallel legs that are never the pole; parallel non-critical-path scan; security gate with negligible profile benefit) and direct readers to the cited profile tables or run logs for measurements.",
+    "severity": "major",
+    "title": "Companion record still embeds prohibited fixed performance timings"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is stagnant. The Appendix A text correctly avoids restating measured durations, but the changed companion record still retains the same fixed per-leg timings immediately before the newly added DONE note: conformance ratchets (44\u201376 s), container-scan (3.6 m), and CodeQL (3.8 m). This is materially the same major repository-policy violation reported in round 3. Because this PR updates and ratifies that durable research record, approval remains blocked until those literal timings are removed and the conclusion is expressed qualitatively with the existing profile tables and run logs as the measurement source.",
+  "verdict": "request_changes"
+ }
+}
