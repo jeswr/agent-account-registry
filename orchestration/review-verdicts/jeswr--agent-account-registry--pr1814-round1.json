@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1814,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b283236e8fb7b5a285392f0f14dec0f34dceb0f4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe provider-capped condition remains fail-closed on silence: in-window standing caps continue to fire, while stale evidence is explicitly disclosed only on the private, unredacted alert path. The implementation preserves the earliest reset hint, measures age from the newest standing cap observation, allows later success to clear an account, and retains rolling-window expiry as the final recovery boundary. The added tests exercise aged direct and derived caps, disclosure/redaction, recapping, success invalidation, expiry, and orphan-alert recovery with independent literal expectations. I found no correctness, soundness, test-validity, or security defect in the diff.",
+  "verdict": "approve"
+ }
+}
