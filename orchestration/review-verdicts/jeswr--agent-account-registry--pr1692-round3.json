@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1692,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "41455740d9c6cceb54f96e72191603117d461247",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The malformed-object table includes a non-string body, but it still has no row with a valid positive issue number, an invalid title, and a null or absent body. Therefore changing the checked key tuple from `(\"title\", \"body\")` to `(\"body\",)` would leave the added suite green. That survivor matters because an accepted malformed title can conceal a legacy title-only alert and permit a duplicate to be created instead of refusing an incomplete dedupe view. The implementation itself correctly validates title; this is the same focused regression-coverage gap recorded in round 2.",
+    "file": "scripts/metrics-alert.py",
+    "fix_hint": "Add a wrapped full-`main()` failing-tick case such as `[{\"number\": 7, \"title\": 42, \"body\": null}]`, asserting rc 0, a sanitized warning, no payload echo, and no commands after `issue list`. Confirm that removing only `title` from `_usable_row`'s checked keys makes this case fail.",
+    "severity": "minor",
+    "title": "The title-type half of the row guard still lacks an independent red test"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The production change remains sound and fail-closed: it validates the full row shape consumed by matching, rejects malformed listings wholesale before dedupe or recovery decisions, sanitizes the warning, and performs no mutation on a soft skip. The added full-main tests cover scalar and mixed rows, invalid bodies and issue numbers, both watchdog modes, and the valid null-body case. The prior round's sole minor coverage gap remains materially unchanged: no test independently makes the title-type check necessary. This does not establish a current production defect, so approval remains appropriate, but progress is stagnant relative to round 2.",
+  "verdict": "approve"
+ }
+}
