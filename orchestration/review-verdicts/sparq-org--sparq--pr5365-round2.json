@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5365,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "670ed93c7ec3b344c774c7eacbf0e36a79ee4a91",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`analysis_state()` reads the workflow state once, then performs two run queries, enumerates all open PRs, and finally mutates threads. The claim in `run_census()` that a new run cannot race because the caller established the workflow is disabled assumes that state remains immutable. An administrator can re-enable the workflow after the initial state read; a newly triggered run can then own or supersede threads while this sweep still uses the old DEAD verdict. The new busy-run test covers a run already visible to the census, but not re-enablement between authorization and mutation.",
+    "file": "scripts/stale-analysis-threads.py",
+    "fix_hint": "Revalidate the workflow's disabled state after the run census and again immediately before using its authorization for mutations (and fail closed on every revalidation error or state change). Add a stateful fixture that returns disabled for the first workflow read and active for the later read, asserting no PR enumeration/mutation where possible and no resolve in all cases. Document the remaining unavoidable API TOCTOU honestly rather than claiming the initial read makes races impossible.",
+    "severity": "major",
+    "title": "Workflow authorization can become stale before thread mutation"
+   },
+   {
+    "body": "`sweep_group()` resolves every thread before posting its receipt. If `post_receipt()` fails, the job exits nonzero, but the mutations have already landed. On the next scheduled run those threads classify as `already-resolved`, so the receipt is never retried and the audit trail can never become complete. The self-test explicitly accepts this terminal state while the module documentation promises that every resolve is receipted and calls a resolve without a receipt a failure rather than a silent success. Reporting failure is useful, but it does not restore the claimed invariant.",
+    "file": "scripts/stale-analysis-threads.py",
+    "fix_hint": "Use a recoverable receipt protocol, such as posting an intent receipt before resolving and then updating/finalizing it after successful mutations, or persist enough deterministic marker data that a later run can detect and repair an incomplete receipt. Extend the receipt-error test through a second tick and assert the audit record is eventually completed without duplicate or misattributed resolutions.",
+    "severity": "major",
+    "title": "Receipt failure leaves permanently unreceipted resolved threads"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Both round-1 findings were substantively addressed: disabled workflows now require a fail-closed run census, and a PR with truncated review-thread enumeration is skipped wholesale. However, the revised implementation introduces/retains two load-bearing gaps. Authorization is a time-of-check/time-of-use snapshot: the workflow can be re-enabled after its state read and start a run before mutations. Also, a receipt failure occurs after irreversible resolutions, and later ticks skip those resolved threads, so the documented guarantee that every resolve is receipted is not recoverable. Because these are new major findings despite the prior findings being fixed, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
