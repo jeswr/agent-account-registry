@@ -124,6 +124,7 @@ td:nth-child(3), td:nth-child(4), th:nth-child(3), th:nth-child(4) { text-align:
 th.numeric, td.numeric { text-align: right; font-variant-numeric: tabular-nums; }
 td.repository { font-family: "SFMono-Regular", Consolas, monospace; }
 tbody tr:last-child td { border-bottom: 0; }
+td.degraded { color: var(--warn); }   /* [#1106] an unreadable dispatch history, not a quiet fleet */
 .empty { padding: 32px 20px; border: 1px dashed var(--line); border-radius: var(--radius); color: var(--muted); text-align: center; }
 .empty.subtle { margin: 0; padding: 10px 1px; border: 0; text-align: left; font-size: .82rem; }
 
