@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1748,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f4b10587bfc3d9bcd66a46602d3edad47f6be628",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_fetch_dispatch_history` uses `json.loads(...).get(\"workflow_runs\") or []` and then unconditionally returns an `ok` status. Thus a syntactically valid but invalid response such as `{}`, `{\"message\": \"error\"}`, or `{\"workflow_runs\": null}` becomes `([], {\"outcome\": \"ok\"})` and the public page says the fleet genuinely has no history. A non-list truthy value is also unsafe: a dict can raise at `runs[:count]`, while a string is sliced and silently reduced to no accepted rows before being marked `ok`. The new tests cover invalid JSON and a non-object root, but not this response-schema seam. Only an explicit list-valued `workflow_runs` field is evidence that history was fetched; missing or wrongly typed data must not license `fetched: true`.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Validate that the decoded root is an object containing `workflow_runs` as a list before iterating. Return a failed/unparseable status for a missing, null, or non-list field, and add self-test cases (at minimum `{}` and a non-list `workflow_runs`) that assert they render as fetch failures rather than quiet history. Keep the explicit empty list as the successful quiet-fleet case.",
+    "severity": "major",
+    "title": "Malformed run-listing schemas are marked fetched successfully"
+   }
+  ],
+  "progress": null,
+  "summary": "The new marker is wired through the generator and executed UI tests, but the fetcher still treats malformed successful responses as a successfully observed quiet fleet. That leaves the exact ambiguity this change is intended to close reachable at the response-schema seam.",
+  "verdict": "request_changes"
+ }
+}
