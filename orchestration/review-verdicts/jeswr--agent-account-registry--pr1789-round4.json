@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1789,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3194e2d7c8b380b09053dbf95644f997cea5055e",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 remains sound. The added seam report reads absent workflow structure defensively so deletions become named assertion failures rather than suite-aborting exceptions. It pins the schedule, manual input, matrix consumer, dependency and output bindings, both exact job guards, resolver step identity and unconditional execution, and the complete shell-command sequence. The behavioral fixtures independently exercise policy-derived selection, sorting, whitespace handling, enabled/disabled/unknown targets, and the empty-enabled-set refusal. The whole shipped run block is also executed under Bash, directly verifying both refusal propagation through the tee pipeline and successful publication to GITHUB_OUTPUT. These checks are non-vacuous and cover the producer, consumer, and runner seams without weakening trust controls or exposing secrets. I found no correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
