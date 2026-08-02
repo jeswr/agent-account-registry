@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1717,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "254d96e1b2f58bbfd6399219792b497f7b966e5a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`read_health_window()` deliberately returns `None` on an unreadable ledger, and `compute_target_metrics()` consequently publishes a null `worker_no_change_rate_1h`. `_worker_no_change_pred()` returns false for that null. `compute_recoveries()` interprets any false predicate across `recover_snapshots` as a clear condition, so two ledger-outage ticks add `(target, WORKER_NO_CHANGE)` to the recovery set and close an existing alert. Missing evidence is therefore treated as recovery even though the new contract says it must never look like a reassuring zero. The recovery test only exercises a measured 25% rate, so it does not catch this outage path.",
+    "file": "scripts/metrics.py",
+    "fix_hint": "Make recovery for this class require a numeric no-change rate (and the relevant sample signal) on every recovery-window row before declaring it clear; alternatively separate an `evaluable` predicate from the fire predicate. Add a test that first has a firing alert and then supplies at least `recover_snapshots` rows with null no-change telemetry, asserting the alert is not eligible for recovery.",
+    "severity": "major",
+    "title": "Null no-change telemetry auto-closes a live alert"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe no-change aggregation and alert firing path are generally well scoped and tested, but the recovery path treats missing telemetry as proof of recovery. That can silently close the new alert during the exact ledger outage that the change otherwise represents with nulls. This is a fail-open trust/operations behavior and needs a red test plus a guarded recovery predicate.",
+  "verdict": "request_changes"
+ }
+}
