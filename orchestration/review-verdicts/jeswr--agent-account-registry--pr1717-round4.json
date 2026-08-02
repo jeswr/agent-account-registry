@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1717,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d222437e1ea3747158c8fa3d88b80a3db038abcc",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`summarize_no_change` still applies `rec.get(\"exit_class\") != NO_CHANGE_CLASS` before grouping records by `_health_run_key`. Because `_health_run_key` removes the attempt suffix, the implementation must first select the newest validated record across all exit classes for each attributed base workflow-run ID, and only then decide whether that winning record is `no_change`. As written, a `9001.1` no-change row is counted even if a newer `9001.2` success, limit, or other non-no-change row exists. `_test_no_change_telemetry` preserves the blind spot: it includes a later `limit` row for run 9001 but still asserts a count of three. This can publish a stale wasted-run result and falsely trigger `worker-no-change`.",
+    "file": "scripts/metrics.py",
+    "fix_hint": "Group every validated attributed record by base run ID first, choose the newest record regardless of exit class, then include that run in the no-change aggregation only when the winner is `no_change`. Add explicit tests with older `9001.1` no-change and newer `9001.2` non-no-change asserting exclusion, plus the inverse ordering asserting that a newer no-change attempt replaces an older outcome. Ensure timestamps or another authoritative ordering field unambiguously select the latest attempt.",
+    "severity": "major",
+    "title": "Older no-change attempts still survive newer non-no-change reruns"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 major finding remains unresolved. `summarize_no_change` still discards every non-`no_change` row before selecting the newest row by base workflow-run ID, so an older no-change attempt remains current even when a newer rerun attempt for that same Actions run concludes with another exit class. The updated test continues to encode the faulty behavior: its later `limit` record for run 9001 is ignored and the expected count remains three. This can still inflate the wasted-run rate and fire a false alert.",
+  "verdict": "request_changes"
+ }
+}
