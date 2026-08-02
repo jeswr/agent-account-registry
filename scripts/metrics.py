@@ -375,6 +375,28 @@ def _worker_no_change_pred(th):
     return pred
 
 
+def _worker_no_change_evaluable(th):
+    """Whether a row carries enough no_change EVIDENCE for `clear` to mean anything.
+
+    Recovery is NOT the logical negation of firing here. `_worker_no_change_pred` is false in two
+    very different worlds: the lane MEASURED a healthy wasted-run rate, and there is no measurement
+    at all — an unreadable health ledger degrades to a null rate (read_health_window is non-terminal
+    by design), and an hour that concluded no worker run has no rate either. Auto-closing a live
+    worker-no-change alert off those rows would make missing evidence read as the reassuring zero
+    the whole null contract exists to forbid, so recovery demands a MEASURED row: a numeric rate
+    over the same min-sample floor the fire side applies.
+
+    The accepted cost: a target that stops running workers entirely (or whose ledger stays
+    unreadable) keeps its live worker-no-change issue open until real telemetry returns. That is the
+    fail-closed direction — a stale open alert is a question for the maintainer, a wrongly closed
+    one is a silently un-measured fleet."""
+    def evaluable(r):
+        rate = r.get("worker_no_change_rate_1h")
+        return (isinstance(rate, (int, float)) and not isinstance(rate, bool)
+                and r.get("worker_attempts_1h", 0) >= th["worker_min_samples"])
+    return evaluable
+
+
 def _dominant_reason(reasons):
     """The most-declared `why_no_diff` in a reason breakdown, ties broken by name for determinism."""
     if not isinstance(reasons, dict) or not reasons:
@@ -1344,6 +1366,13 @@ _CLASS_PRED = {
     WORKER_NO_CHANGE: _worker_no_change_pred,
 }
 
+# Classes whose fire predicate is false BOTH when measured-clear and when un-measured. For those,
+# recovery additionally requires every row in the hysteresis window to be evaluable; a class absent
+# from this map is evaluable from any row (its inputs are plain counts that are always collected).
+_CLASS_EVALUABLE = {
+    WORKER_NO_CHANGE: _worker_no_change_evaluable,
+}
+
 
 def compute_recoveries(history, collected_targets, thresholds_by_target):
     """The set of (target, class) pairs eligible to AUTO-CLOSE this tick, with hysteresis.
@@ -1354,7 +1383,11 @@ def compute_recoveries(history, collected_targets, thresholds_by_target):
         and must NEVER have its live alerts closed as 'recovered' on zero evidence (blocker); and
       * its fire predicate has been FALSE for the last `recover_snapshots` consecutive snapshots
         (hysteresis) — so a metric flapping across the rolling-1h boundary does not churn the same
-        issue open->closed->open every tick.
+        issue open->closed->open every tick; AND
+      * every one of those snapshots is EVALUABLE for the class (`_CLASS_EVALUABLE`) — a false fire
+        predicate over rows carrying no telemetry means UNKNOWN, not clear, and a collected target
+        whose model-health ledger was unreadable must no more auto-close its alerts than a skipped
+        one does.
     Pure: history + collected set + thresholds in, recovery key set out."""
     recoveries = set()
     for target in collected_targets:
@@ -1364,6 +1397,9 @@ def compute_recoveries(history, collected_targets, thresholds_by_target):
         if len(rows) < n:
             continue   # not enough clear history to assert recovery yet — leave the issue open
         for cls in ALERT_CLASSES:
+            evaluable = _CLASS_EVALUABLE.get(cls)
+            if evaluable is not None and not all(map(evaluable(th), rows)):
+                continue   # un-measured, not clear — leave the issue open until evidence returns
             pred = _CLASS_PRED[cls](th)
             if not any(pred(row) for row in rows):   # clear in EVERY one of the last n snapshots
                 recoveries.add((target, cls))
@@ -2053,7 +2089,11 @@ def _test_review_lane_states(chk):
 def _test_recovery_hysteresis_and_skip(chk):
     """compute_recoveries: hysteresis + skipped-target protection (blockers #4, #9)."""
     sparq_firing = compute_target_metrics(SPARQ_LIVE)
-    healthy = compute_target_metrics(REGISTRY_LIVE)
+    # a row that is clear on EVERY class has to be MEASURED on every class, no_change included:
+    # 1 wasted of 4 concluded runs is a real, healthy reading (the outage case below proves that a
+    # null-telemetry row is NOT interchangeable with this one).
+    healthy = compute_target_metrics({**REGISTRY_LIVE, "worker_attempts_1h": 4,
+                                      "worker_success_1h": 4, "worker_no_change_1h": 1})
     thr = {"sparq-org/sparq": DEFAULT_THRESHOLDS}
     # BLOCKER #4: a SKIPPED target (absent from collected_targets) yields NO recoveries even though
     # the ring's last rows show it clear — its live alerts must NOT be auto-closed on no evidence.
@@ -2075,6 +2115,34 @@ def _test_recovery_hysteresis_and_skip(chk):
     chk("insufficient clear history yields no recovery",
         compute_recoveries([_snap(2000, {"sparq-org/sparq": healthy})], ["sparq-org/sparq"], thr),
         set())
+    # [#987] THE TELEMETRY-OUTAGE PATH. read_health_window is non-terminal: an unreadable model-health
+    # ledger publishes NULL no_change fields. The fire predicate is false on such a row for exactly
+    # the same reason it is false on a measured-healthy one, so without the evaluable gate two outage
+    # ticks would auto-close a LIVE worker-no-change issue on zero evidence — the reassuring-zero
+    # failure the null contract forbids.
+    reg = "jeswr/agent-account-registry"
+    rthr = {reg: DEFAULT_THRESHOLDS}
+    wasteful = compute_target_metrics({**REGISTRY_LIVE, "worker_attempts_1h": 4,
+                                       "worker_success_1h": 4, "worker_no_change_1h": 3})
+    outage = compute_target_metrics({**REGISTRY_LIVE, "worker_attempts_1h": 4,
+                                     "worker_success_1h": 4})   # ledger unreadable => rate null
+    live = [_snap(1000, {reg: wasteful}), _snap(2000, {reg: wasteful})]
+    chk("[#987] the alert is LIVE first (3/4 wasted, sustained)",
+        any(a["classification"] == WORKER_NO_CHANGE for a in evaluate_alerts(live[-1], live, rthr)),
+        True)
+    blind = live + [_snap(3000, {reg: outage}), _snap(4000, {reg: outage})]
+    blind_rec = compute_recoveries(blind, [reg], rthr)
+    chk("[#987] null no_change telemetry over the whole window does NOT recover the live alert",
+        (reg, WORKER_NO_CHANGE) in blind_rec, False)
+    # ...and the gate is scoped to the class that needs it: the SAME rows still carry a measured
+    # 4/4 success rate, so worker-failing recovers off them (this is not a blanket recovery freeze).
+    chk("[#987] ...while classes still measured on those rows recover normally",
+        (reg, WORKER_FAILING) in blind_rec, True)
+    # NON-VACUITY: replace only the telemetry, keeping the same window shape — a MEASURED clear rate
+    # recovers, so the gate reads the evidence rather than refusing every recovery.
+    seen = live + [_snap(3000, {reg: healthy}), _snap(4000, {reg: healthy})]
+    chk("[#987] ...and a MEASURED clear rate over the same window does recover it",
+        (reg, WORKER_NO_CHANGE) in compute_recoveries(seen, [reg], rthr), True)
 
 
 def _test_alert_rules(chk):

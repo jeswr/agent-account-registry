@@ -153,7 +153,10 @@ enum, which is what separates `already_done` (close the issue) from `underspecif
 specify it); an undeclared reason reads as `unspecified`, never an inferred one.
 `worker_no_change_repeat_issues_1h` names the issues that looped more than once inside the hour. An
 unreadable health ledger leaves every one of these fields null and logs a warning — never a
-reassuring zero, and a null rate can never fire the alert below.
+reassuring zero, and a null rate can neither fire the alert below nor auto-close a live one:
+recovery for `worker-no-change` demands a MEASURED rate (over `worker_min_samples` attempts) on
+every tick of the hysteresis window, so a telemetry outage leaves an open alert open instead of
+reading as a cleared condition.
 
 The current snapshot is also CAS-written to `data/metrics.json` on the `ledger` branch (same
 per-target shape plus a top-level `alerts: [...]`). The sole Pages owner, `dashboard.yml`, copies it
