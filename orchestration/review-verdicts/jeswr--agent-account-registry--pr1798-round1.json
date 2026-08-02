@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1798,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e38cea3e3d3f87fb39ba43aaff6cdba30555d38a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The shim stores `className` and `classes` independently. In a real DOM, assigning `el.className = \"degraded\"` or calling `el.setAttribute(\"class\", \"degraded\")` changes what `el.classList.contains(\"degraded\")` reports, and classList mutations update className. The new self-test exercises only classList directly, so it passes despite this divergence. Current assertions happen to add the `degraded` class through classList, so this does not invalidate this change, but the now-shared shim can still produce a false result for page code that assigns the same class through another standard DOM API.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Back className, setAttribute(\"class\", ...), and classList with one shared class set (or add synchronized getters/setters), then extend the probe to assign a class through className or setAttribute and observe it through classList, plus the reverse direction.",
+    "severity": "minor",
+    "title": "Shared shim does not synchronize className and classList"
+   }
+  ],
+  "progress": null,
+  "summary": "The refactor correctly consolidates the three Node page harnesses behind one builder, preserves each harness's exports and body, and adds a non-vacuous executed check of the shim's class, attribute, child-replacement, recursive-degradation, ID-memoization, namespace, text, and app-loading behavior. The existing page assertions continue to exercise their real renderers, and the exact-count check catches reintroduction of the former literal prelude. I found no blocker or major correctness, security, or fail-closed regression. One minor fidelity gap remains in the shared DOM model: className/setAttribute(\"class\") and classList do not share state as they do in a browser.",
+  "verdict": "approve"
+ }
+}
