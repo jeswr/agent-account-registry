@@ -1604,7 +1604,10 @@ _http_transient = _load_module(
 )
 _IDEMPOTENT_METHODS = {"GET", "HEAD"}
 _TRANSIENT_RETRIES = _gh_retry.MAX_ATTEMPTS  # total attempts before a transient failure fails loud
-_RETRY_AFTER_CAP = _gh_retry.RETRY_AFTER_CAP  # never let a hostile Retry-After stall the sweep
+# The cap groom INHERITS (it is applied inside gh_retry, not here) — never let a hostile or
+# confused Retry-After stall a whole sweep. Named so the self-test can assert the inherited bound
+# without restating the number.
+_RETRY_AFTER_CAP = _gh_retry.RETRY_AFTER_CAP
 
 # groom's declared opt-in: the WHOLE 5xx range and no 4xx at all (429 and 403 excluded — see the
 # policy's own `rationale`, which carries the #291/#494 history that used to live in the docstring
@@ -1616,19 +1619,26 @@ _is_transient_network = _http_transient.is_transient_network
 
 
 def _retry_after_seconds(headers: Any) -> float | None:
-    """Parse a numeric Retry-After (seconds) into a capped delay; None when absent/unparseable so
-    the caller falls back to exponential backoff. HTTP-date forms are treated as absent (rare from
-    GitHub) rather than mis-parsed, and a negative value is ignored."""
+    """The server's requested wait (seconds, capped) from a response's headers, or None when it
+    sent none — the caller then falls back to the exponential schedule.
+
+    groom owns only the header LOOKUP, because its witness is an ``HTTPError.headers`` mapping
+    rather than the `gh` stderr text every other consumer parses. The numeric POLICY — reject
+    absent / unparseable / NON-POSITIVE, treat an HTTP-date form as absent rather than mis-parse
+    it, cap at ``RETRY_AFTER_CAP`` — is `gh_retry`'s and is deliberately NOT restated here (issue
+    #928), the same way ``ledger_retry.retry_after_seconds`` delegates.
+
+    ZERO IS ABSENT, NOT "WAIT ZERO SECONDS". `Retry-After: 0` only ever arrives from an endpoint
+    that is ALREADY throttling us, so honouring it literally disables the backoff and turns this
+    retry loop into a hot loop against that endpoint. The third local copy this replaced excluded
+    only NEGATIVE values and so returned ``0.0`` there — neutralised in practice by
+    `sleep_backoff`'s own non-positive guard, but a bound written out in three files is the drift
+    #958 is about: the fix lands in one and the other two keep the hole.
+    """
     raw = headers.get("Retry-After") if headers is not None else None
     if raw is None:
         return None
-    try:
-        seconds = float(str(raw).strip())
-    except (TypeError, ValueError):
-        return None
-    if seconds < 0:
-        return None
-    return min(seconds, _RETRY_AFTER_CAP)
+    return _gh_retry.retry_after_seconds(f"Retry-After: {str(raw).strip()}")
 
 
 def _sleep_transient(attempt: int, retry_after: float | None = None) -> None:
@@ -7242,12 +7252,55 @@ def _self_test() -> int:
     # it. A classifier that ships broken must not be adopted silently by its consumer.
     check("#552 the shared http_transient taxonomy's own self-test passes",
           _http_transient._self_test(), True)
-    check("Retry-After is honoured and capped",
+    # [registry #928] Retry-After: both directions, including the two degenerate values the local
+    # parser this replaced let through. `Retry-After: 0` is ABSENT, not a zero-second wait — the
+    # old `if seconds < 0` bound returned 0.0 for it, which is the hot-loop shape #594 removed at
+    # gh_retry's two layers. Restore that bound here and the zero/`0.0` rows go red while every
+    # positive row above and below stays green.
+    check("#928 Retry-After honoured, capped, and absent for every degenerate form",
           (_retry_after_seconds({"Retry-After": "2"}),
+           _retry_after_seconds({"Retry-After": "2.5"}),
            _retry_after_seconds({"Retry-After": "9999"}),
            _retry_after_seconds({}),
-           _retry_after_seconds({"Retry-After": "soon"})),
-          (2.0, _RETRY_AFTER_CAP, None, None))
+           _retry_after_seconds(None),
+           _retry_after_seconds({"Retry-After": "soon"}),
+           _retry_after_seconds({"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"}),
+           _retry_after_seconds({"Retry-After": "0"}),
+           _retry_after_seconds({"Retry-After": "0.0"}),
+           _retry_after_seconds({"Retry-After": "-5"})),
+          (2.0, 2.5, _RETRY_AFTER_CAP, None, None, None, None, None, None, None))
+    # ...and a zero must not survive as a zero SLEEP either — asserted end to end, parse ->
+    # `_sleep_transient` -> the real `gh_retry.sleep_backoff`, because a parse-only row cannot see
+    # the last hop. That hop had NO coverage at all (every other row stubs `_sleep_transient`
+    # wholesale), so `sleep_backoff(attempt)` — dropping the parsed wait on the floor — was
+    # unkillable here. Only the sleeper and the jitter draw are injected; the SCHEDULE is real.
+    real_sleep_backoff = _gh_retry.sleep_backoff
+    transient_waits: list[float] = []
+    _gh_retry.sleep_backoff = (
+        lambda attempt, retry_after=None: real_sleep_backoff(
+            attempt, retry_after, sleeper=transient_waits.append, draw=lambda lo, hi: hi))
+    try:
+        _sleep_transient(1, _retry_after_seconds({"Retry-After": "0"}))   # -> exponential schedule
+        _sleep_transient(1, _retry_after_seconds({"Retry-After": "7"}))   # -> the server's wait
+    finally:
+        _gh_retry.sleep_backoff = real_sleep_backoff
+    check("#928 a zero Retry-After falls back to the schedule; a positive one is still honoured",
+          (transient_waits, bool(transient_waits) and transient_waits[0] > 0.0),
+          ([_gh_retry.backoff_ceiling(1) + _gh_retry.JITTER, 7.0], True))
+    # ...and the NUMERIC bound IS gh_retry's one implementation, not a fourth private copy that
+    # happens to agree today (#552's identity rule, applied to the parser #928 de-duplicated).
+    # Stub it and groom's answer must be the stub's: re-inline a local `float()`/`min()` parser and
+    # this row reds while every behavioural row above stays green.
+    _real_retry_after = _gh_retry.retry_after_seconds
+    parser_texts: list[Any] = []
+    _gh_retry.retry_after_seconds = lambda text: (parser_texts.append(text), 41.5)[1]
+    try:
+        delegated = _retry_after_seconds({"Retry-After": "7"})
+    finally:
+        _gh_retry.retry_after_seconds = _real_retry_after
+    check("#928 the Retry-After bound IS gh_retry's shared parser, not a local copy",
+          (delegated, parser_texts, "7" in (parser_texts[0] if parser_texts else "")),
+          (41.5, ["Retry-After: 7"], True))
 
     class _FakeResp:
         def __init__(self, raw: bytes):
@@ -7311,6 +7364,24 @@ def _self_test() -> int:
         throttled = api.request("GET", "/repos/o/r/issues?state=open")
         check("503 retried, honouring the Retry-After header",
               (throttled, calls["n"], transient_sleeps), ([], 2, [(1, 2.0)]))
+
+        # [registry #928] ...and THE PRODUCTION LEG for the degenerate value, because the parse-only
+        # rows above cannot see what the call site forwards. A `Retry-After: 0` from an endpoint that
+        # is already throttling us must arrive at the sleeper as ABSENT (None -> the exponential
+        # schedule), never as a zero wait that would re-fire this GET immediately at the limiter.
+        calls["n"] = 0
+        transient_sleeps.clear()
+
+        def _throttled_zero(_request, timeout=None):   # 503 + `Retry-After: 0`, then a good page
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise HTTPError("https://x", 503, "Unavailable", {"Retry-After": "0"}, None)
+            return _FakeResp(json.dumps([]).encode())
+
+        globals()["urlopen"] = _throttled_zero
+        throttled_zero = api.request("GET", "/repos/o/r/issues?state=open")
+        check("#928 a `Retry-After: 0` reaches the sleeper as ABSENT, not as a zero wait",
+              (throttled_zero, calls["n"], transient_sleeps), ([], 2, [(1, None)]))
 
         # [issue #291] THE PRODUCTION LEG, end to end. Asserting only `_is_transient_status(500)`
         # would stay green if the call site still consulted the old allow-list, and "500 is in a
