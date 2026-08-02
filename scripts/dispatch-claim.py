@@ -779,8 +779,8 @@ def review_service_order(items, generated_at):
     others, and `review-fix` loses ~17 % of its runs to the shared installation budget (#1303) — a
     fixed head plus a lossy server means the tail is never REACHED, not reached slowly.
 
-    So the head rotates. The list is served from a plan-derived offset and wraps, which keeps every
-    property the fixed order had except the starvation:
+    So the head rotates. The list is served from a plan-derived offset and wraps, which keeps all
+    three properties the fixed order was worth keeping for:
 
       * DETERMINISTIC and reproducible — a function of the plan artifact alone. The same plan
         replayed yields the same order, which is what made the old key worth keeping.
@@ -791,9 +791,31 @@ def review_service_order(items, generated_at):
 
     The offset is a hash of the plan's `generated_at` rather than the timestamp's own arithmetic:
     a plain `epoch % len(items)` advances by a fixed stride per tick, and whenever that stride
-    shares a factor with the item count only `len/gcd` of the positions can ever be the head — a
-    quieter version of the same starvation. With `c` items served per tick out of `n`, the expected
-    wait becomes ~`n/c` ticks instead of unbounded.
+    shares a factor with the item count only `len/gcd(len, stride)` of the positions can ever be
+    the head — a quieter version of the same starvation. On the live 5-minute plan cadence
+    `epoch_minutes % n` freezes ONE head for a queue of 5 and reaches 2 of 10 for a queue of 10;
+    the self-test pins the shipped offset's reach against exactly that alternative.
+
+    ⚠️ WHAT THIS IS, PRECISELY — stated before the benefit because the first draft of this
+    docstring overclaimed it (review r2 on #1711). The fairness is PROBABILISTIC, not bounded.
+    Each tick's head is an independent hash of THAT tick's timestamp; no state carries from one
+    tick to the next, so no position is ever *scheduled* and none is ever *owed* — the sequence of
+    heads is not a traversal and visits no residue on a promise. Modelling blake2s over distinct
+    timestamps as a uniform draw — which is how it measures: over 2016 consecutive 5-minute ticks
+    every position of every queue length in 2..50 took the head, with per-position head counts
+    inside [0.70, 1.31] x uniform — a queue of `n` served `c` deep gives each row ~`c/n` per tick,
+    so the MEAN wait is ~`n/c` ticks and the tail decays geometrically. What that does NOT give is
+    a per-row deadline: `P(unserved after k ticks) ~ (1 - c/n)**k` shrinks fast but is never zero,
+    and over a SHORT window coverage is not even empirically total — a 50-row queue over one day
+    of 15-minute ticks reached 41 of 50 heads. A bounded worst case needs a persisted cursor, or a
+    monotonic tick counter this artifact does not carry; that is issue-sized and deliberately not
+    attempted here.
+
+    It is still the right trade for #1515, because the defect being fixed is not a long tail, it is
+    a CLOSED DOOR: under `(repo, pr_number)` a row past the capacity cut-off has probability ZERO
+    of ever being served, however long it waits and however many ticks run. Moving that from 0 to
+    ~`c/n` per tick is what makes the wait finite at all; bounding the residual tail is a further,
+    separable change.
 
     `generated_at` reaches this from the HOSTILE plan artifact, so it is re-gated here on the same
     single `PLAN_GENERATED_AT` grammar `validate_plan` enforces, and a malformed value REFUSES
@@ -10823,16 +10845,51 @@ def _self_test():
     # what changed is what CLAIM SERVES. Every assertion below flips if `review_service_order`
     # regresses to returning its input unchanged, which is the whole defect.
     _rota = list(range(10))
-    # (a) THE FAIRNESS PROPERTY, and the one that is red against the identity order: over a day of
-    #     5-minute plan timestamps EVERY item is served first at least once. Under `(repo,
-    #     pr_number)` alone this set is `{0}` for all 288 ticks — item 9 is not behind the queue,
-    #     it is permanently behind it.
-    _rota_ticks = [f"2026-08-01T{_h:02d}:{_m:02d}:00Z"
-                   for _h in range(24) for _m in range(0, 60, 5)]
-    _rota_heads = {review_service_order(_rota, _tick)[0] for _tick in _rota_ticks}
-    assert _rota_heads == set(_rota), (
-        "the review service order starves the tail: only "
-        f"{sorted(_rota_heads)} of {_rota} ever reached the head across {len(_rota_ticks)} ticks")
+    # (a) THE FAIRNESS PROPERTY, measured across MANY queue lengths over a week of consecutive
+    #     production ticks — one length over one day is a property of that fixture and was read as
+    #     a proof of a bound it cannot establish (review r2 on #1711). The head is an independent
+    #     hash per tick, so what holds is PROBABILISTIC and that is what is asserted: over a long
+    #     run every position reaches the head, and the head is near-UNIFORM over positions, which
+    #     is the whole basis for the docstring's ~`n/c` MEAN wait. The bands are deliberately wide
+    #     (measured [0.70, 1.31] x uniform, max wait 9.1n) — they exist to be red against a
+    #     DEGENERATE order, not to certify a deadline. Under `(repo, pr_number)` position 0 takes
+    #     2016 of 2016 heads and every other position takes 0: item 9 is not behind the queue, it
+    #     is permanently behind it. A fixed-stride offset is red here too whenever the stride
+    #     shares a factor with the length. No finite bound below is a guarantee: see the docstring.
+    _rota_ticks = [f"2026-08-{_d:02d}T{_h:02d}:{_m:02d}:00Z"
+                   for _d in range(1, 8) for _h in range(24) for _m in range(0, 60, 5)]
+    assert len(_rota_ticks) == 2016, len(_rota_ticks)
+    for _length in (2, 3, 5, 6, 10, 12, 15, 20, 27, 30, 50):
+        _rota_queue = list(range(_length))
+        _rota_heads = [review_service_order(_rota_queue, _tick)[0] for _tick in _rota_ticks]
+        assert set(_rota_heads) == set(_rota_queue), (
+            f"queue length {_length}: only {sorted(set(_rota_heads))} of {_length} positions ever "
+            f"reached the head across {len(_rota_ticks)} ticks")
+        _rota_uniform = len(_rota_ticks) / _length
+        _rota_counts = Counter(_rota_heads)
+        assert all(0.5 * _rota_uniform <= _rota_counts[_p] <= 1.6 * _rota_uniform
+                   for _p in _rota_queue), (_length, sorted(_rota_counts.items()))
+        # Longest run of consecutive ticks a position spent off the head, tail included.
+        _rota_last = {_p: -1 for _p in _rota_queue}
+        _rota_wait = 0
+        for _index, _head in enumerate(_rota_heads):
+            _rota_wait = max(_rota_wait, _index - _rota_last[_head])
+            _rota_last[_head] = _index
+        _rota_wait = max([_rota_wait] + [len(_rota_ticks) - _rota_last[_p] for _p in _rota_queue])
+        assert _rota_wait <= 12 * _length, (
+            f"queue length {_length}: a position waited {_rota_wait} ticks for the head")
+    #     ...and the ALTERNATIVE the docstring rejects, made red rather than merely asserted in
+    #     prose: an offset advancing by a fixed stride per tick (`epoch_minutes % n` on the live
+    #     5-minute cadence) can only ever reach `n/gcd(n, 5)` positions — ONE of them at length 5,
+    #     5 of 25. The shipped offset reaches EVERY position at both, and 25 is deliberately a
+    #     length the loop above does not run, so this pair carries its own kill rather than
+    #     restating one of that loop's.
+    for _length, _stride_reach in ((5, 1), (25, 5)):
+        _stride_heads = {(_index * 5) % _length for _index in range(len(_rota_ticks))}
+        _hashed_heads = {review_service_order(list(range(_length)), _tick)[0]
+                         for _tick in _rota_ticks}
+        assert len(_stride_heads) == _stride_reach and len(_hashed_heads) == _length, (
+            _length, sorted(_stride_heads), sorted(_hashed_heads))
     # (b) PINNED, so "it rotates" cannot be satisfied by an order nobody can predict. Two distinct
     #     plan timestamps, two distinct heads, both exact — expected values written out here, not
     #     recomputed from the function under test.
