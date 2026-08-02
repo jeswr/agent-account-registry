@@ -1057,9 +1057,13 @@ def _pr_status_snapshot(fetch, claim, repo, pulls, concurrency=SNAPSHOT_CONCURRE
         and ((pull.get("head") or {}).get("repo") or {}).get("full_name") == repo
     ]
     if WORKER_PR_STATUS_WARN_AT < len(worker_pulls) <= WORKER_PR_STATUS_LIMIT:
+        # [review round 1] The distance is to the first OVERFLOWING count, not to the limit:
+        # the guard degrades on `> WORKER_PR_STATUS_LIMIT`, so a count equal to the limit is
+        # still processed normally and 100 is one PR of headroom, not zero.
         print(f"::warning::plan-snapshot: {repo} carries {len(worker_pulls)} worker PRs, within "
-              f"{WORKER_PR_STATUS_LIMIT - len(worker_pulls)} of WORKER_PR_STATUS_LIMIT "
-              f"({WORKER_PR_STATUS_LIMIT}). At the limit this repo degrades to NO prstatus at all "
+              f"{WORKER_PR_STATUS_LIMIT + 1 - len(worker_pulls)} of the first count that "
+              f"overflows ({WORKER_PR_STATUS_LIMIT + 1}). ABOVE WORKER_PR_STATUS_LIMIT "
+              f"({WORKER_PR_STATUS_LIMIT}) this repo degrades to NO prstatus at all "
               "(worker-pr-census-overflow) and every snapshot-derived admission stands down. "
               "Land or close stale worker PRs before that happens.")
     if len(worker_pulls) > WORKER_PR_STATUS_LIMIT:
