@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1783,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "208405c577cce437c3b3f2fa39971c177a60189f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 0 asks, \"do the recorded ... accounts have a refreshable form?\" and answers \"No\". But the newly added scope paragraph says no census of existing account records was taken, section 2.1 says routing proves executability rather than existence, and section 6 says only a census can make the corresponding fleet-format claim sayable. The cited routing equality and pre-store gate establish that other formats cannot currently run and cannot be newly enrolled through that gate; they do not establish the formats of all recorded, historical, pending, failed, retired, or otherwise unusable accounts. Thus the document's own evidence expressly disclaims the fact required by its first headline answer. This is materially the same major issue as round 1, notwithstanding the otherwise useful narrowing elsewhere.",
+    "file": "research/1676-anthropic-short-lived-credential-feasibility.md",
+    "fix_hint": "Change section 0 question 1 and its answer so they concern accounts that can currently run and/or credentials that can currently be newly enrolled, and state that the recorded-account question remains unanswered pending the section 6 census. Alternatively, perform and report the authoritative census, including pending, failed, retired, and unusable Anthropic records, before retaining the recorded-account \"No\". Ensure the one-line answer and any migration premise use the same narrowed scope.",
+    "severity": "major",
+    "title": "The headline still answers an unmeasured question about recorded accounts"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The prior round's evidentiary gap is explained accurately in the new scope note and in sections 2.1, 5, and 6, but it remains in the document's marquee answer. Question 1 explicitly asks about the recorded accounts and still answers \"No\" despite the document repeatedly acknowledging that no account-record census was taken and that routing/enrolment evidence cannot establish the contents of existing records. That internal contradiction leaves materially the same major finding as round 1. Narrow the table's question/answer to runnable and newly enrollable accounts, or supply the authoritative census before claiming an answer about recorded accounts.",
+  "verdict": "request_changes"
+ }
+}
