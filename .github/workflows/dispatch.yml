@@ -1,4 +1,4 @@
-# [SPARQ agent] REG-4 privilege-separated dispatcher. PLAN executes protected public-target planner
+# [GPT-5.6] REG-4 privilege-separated dispatcher. PLAN executes protected public-target planner
 # code with no secrets in its environment; CLAIM treats the PLAN artifact as hostile data before
 # any mutation.
 #
