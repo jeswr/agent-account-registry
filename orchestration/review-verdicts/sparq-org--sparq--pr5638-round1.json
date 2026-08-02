@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5638,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "769c85826a805131e3144f5ef3823e89a577d987",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_NEEDS_REF_RE` recognizes only `needs.<job>.`, but GitHub expressions also permit index/property access such as `needs['queue-validated'].outputs.foo`. Adding a push-skip conjunct in that form would not change `got`, so `test_push_chain_guards_gain_no_undeclared_needs_gate` would remain green. The behavioral assertions do not close this hole: their synthetic contexts omit the new dependency, which is precisely why this PR adds a structural check. This contradicts the load-bearing claim that every new `needs.*` gate is pinned and leaves the silent post-merge skip path unprotected.",
+    "file": "scripts/tests/test_ci_select_wiring.py",
+    "fix_hint": "Parse all valid GitHub expression property/index forms when extracting references (including quoted bracket access), or conservatively reject any `needs` access that cannot be fully classified. Add a mutation-style test using a bracket-indexed undeclared dependency and assert that the structural validator rejects it.",
+    "severity": "major",
+    "title": "Needs-reference pin can be bypassed with valid bracket syntax"
+   }
+  ],
+  "progress": null,
+  "summary": "The new tests improve coverage of the current push-to-main chain, but the structural guard-reference check does not actually enforce its stated invariant for all valid GitHub Actions expressions. A future push skip can use bracket-indexed `needs` syntax and bypass the regex while the synthetic evaluator also treats the absent dependency in a way that can leave the behavioral assertions green. Because this is the exact silent-skip class the change claims to prevent, the test is incomplete.",
+  "verdict": "request_changes"
+ }
+}
