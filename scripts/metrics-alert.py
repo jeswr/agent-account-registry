@@ -245,6 +245,22 @@ def _gh(args, capture=False, token=None, check=False, label="metrics-alert"):
     return result
 
 
+def _usable_row(row):
+    """Can the matcher below consume this listing row WITHOUT raising, and is what it would hand
+    back actually an issue number? Object-shape alone is not enough: `{"body": 42}` raises
+    TypeError on the `marker in ...` test, and a matching row with no `number` raises KeyError on
+    the indexed read. A non-int `number` raises nothing at all — it would be worse, silently
+    reaching `issue edit <garbage>`. `bool` is an `int` subclass, so it is excluded explicitly.
+    Missing `title`/`body` keys are tolerated (the matcher already reads them via `.get`); a
+    present-but-wrong TYPE is not."""
+    if not isinstance(row, dict):
+        return False
+    number = row.get("number")
+    if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+        return False
+    return all(isinstance(row.get(key), (str, type(None))) for key in ("title", "body"))
+
+
 def _find_open_alert(repo, token, marker, title, label):
     """-> (issue_number|None, hard_error:bool, soft_skip:bool).
 
@@ -260,8 +276,9 @@ def _find_open_alert(repo, token, marker, title, label):
     # A SUCCESSFUL gh call can still hand back malformed JSON (truncated output, an HTML error page,
     # a proxy interposing). Degrade rather than crash: warn (sanitized — the payload is remote
     # content and is never echoed) and skip this tick; the next tick retries.
-    # The ROWS get the same treatment as the envelope: a listing that parses as `[1, 2, 3]` would
-    # otherwise reach the matcher below and raise AttributeError out of main(), taking the whole
+    # The ROWS get the same treatment as the envelope, and on the FULL shape the matcher below
+    # depends on (see _usable_row) — not merely `isinstance(row, dict)`. An unchecked row reaches
+    # the matcher and raises AttributeError/TypeError/KeyError out of main(), taking the whole
     # tick's upsert AND recovery-close down with it. Refuse the payload wholesale rather than
     # dropping the offending rows: which rows were lost is exactly what cannot be known, so a
     # filtered view could miss the open alert and file a DUPLICATE on a failing tick, or miss the
@@ -270,11 +287,11 @@ def _find_open_alert(repo, token, marker, title, label):
         found = json.loads(listed.stdout or "[]")
         if not isinstance(found, list):
             raise ValueError("expected a JSON array")
-        if not all(isinstance(row, dict) for row in found):
-            raise ValueError("expected every row to be a JSON object")
+        if not all(_usable_row(row) for row in found):
+            raise ValueError("expected every row to be a usable issue object")
     except ValueError:
         print(f"::warning::{label}: gh issue list succeeded but returned an unusable payload "
-              "(not a JSON array of issue objects) — skipping this tick "
+              "(not a JSON array of usable issue objects) — skipping this tick "
               "(no dedupe/recovery data; next tick retries)")
         return None, False, True
     # Match the stable body MARKER first (survives a retitled alert), exact title second (legacy
@@ -803,6 +820,44 @@ def _test_gh_flows(chk):
             got = f"raised {type(exc).__name__}"
         chk("flow A: ONE non-object row among valid ones -> whole listing refused, no close on a "
             "partial dedupe view", got, (0, True, []))
+        # OBJECT-shaped but not USABLE — the hole an `isinstance(row, dict)`-only guard leaves
+        # open. Each row below is a plain JSON object and each one breaks the matcher differently,
+        # so each is driven through the FULL main(): degrade-not-crash AND no-mutation, not just
+        # the predicate. The last three raise nothing at all, which is the worse half: with no
+        # exception to notice, they reach `issue edit/comment/close <garbage>` on a live repo.
+        for what, result, rows in (
+            ("non-string body (TypeError on the marker test)", "failure",
+             [{"number": 7, "title": "SENTINEL-BAD-BODY", "body": 42}]),
+            ("marker match with NO number (KeyError on the indexed read)", "success",
+             [{"title": "SENTINEL-NO-NUMBER", "body": JOB_ALERT_MARKER}]),
+            ("title match with NO number (KeyError via the legacy fallback)", "success",
+             [{"title": JOB_ALERT_TITLE, "body": "SENTINEL-TITLE-NO-NUMBER"}]),
+            ("non-int number -> silently mutates `issue comment <garbage>`, no exception to catch",
+             "success", [{"number": "SENTINEL-STR-NUMBER", "title": JOB_ALERT_TITLE}]),
+            ("number 0 -> matches, but _apply's `if num:` reads it as none-open and files a "
+             "DUPLICATE", "failure",
+             [{"number": 0, "title": JOB_ALERT_TITLE, "body": "SENTINEL-ZERO-NUMBER"}]),
+            ("boolean number -> `bool` is an `int` subclass, so it reaches `issue edit True`",
+             "failure", [{"number": True, "title": JOB_ALERT_TITLE,
+                          "body": "SENTINEL-BOOL-NUMBER"}]),
+        ):
+            try:
+                rc, out = run_main([], json.dumps(rows), metrics_result=result)
+                got = (rc, "::warning::" in out, "SENTINEL" in out,
+                       [s for s in subs() if s != ("issue", "list")])
+            except Exception as exc:  # noqa: BLE001 — a malformed row must DEGRADE, never propagate
+                got = f"raised {type(exc).__name__}"
+            chk(f"flow A: {what} -> soft skip, payload not echoed, no mutation", got,
+                (0, True, False, []))
+        # ...and the guard must stay a guard, not a blindfold: gh renders an empty body as JSON
+        # null, so rejecting null would refuse every REAL listing and leave the watchdog
+        # permanently soft-skipped — a dead alert that reports itself as merely degraded.
+        rc, _ = run_main([], json.dumps([{"number": 4, "title": JOB_ALERT_TITLE, "body": None}]),
+                         metrics_result="failure")
+        edit_null, _ = find(("issue", "edit"))
+        chk("row guard is not over-strict: null body still matches by title -> edit #4, no create",
+            (rc, ("issue", "create") in subs(), edit_null is not None and "4" in edit_null),
+            (0, False, True))
         for failing in (("issue", "create"), ("issue", "edit")):
             rc, out = run_main([], open_job if failing == ("issue", "edit") else "[]",
                                fail=(failing,), metrics_result="failure")
@@ -876,7 +931,9 @@ def _test_gh_flows(chk):
                 ("org/registry", True, False))
 
         # ---- dedupe: --limit 100, marker-first, legacy title fallback -------------------------
-        crowd = [{"number": i, "title": f"unrelated ops alert {i}"} for i in range(25)]
+        # 1-based: GitHub has no issue #0, and _apply's `if num:` would read a 0 as "no open
+        # alert" and file a duplicate — so the row guard rejects it and the fixture must be real.
+        crowd = [{"number": i, "title": f"unrelated ops alert {i}"} for i in range(1, 26)]
         rc, _ = run_main([], json.dumps(crowd + [{"number": 99, "title": JOB_ALERT_TITLE}]),
                          metrics_result="failure")
         list_cmd, _ = find(("issue", "list"))
