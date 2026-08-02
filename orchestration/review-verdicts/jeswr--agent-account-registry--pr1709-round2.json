@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1709,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6c2b90e985e9c0f7f38510402a69b7cdf3899530",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_live_children` prunes constant `if`/`while` arms and generator-deferred children, but it traverses every operand of `ast.BoolOp` and both arms of `ast.IfExp`. Production can therefore replace the loop body with `False and park_starved_partition_holder(repo, target, starved)` (or `True or park_starved_partition_holder(...)`, or `park_starved_partition_holder(...) if False else None`). Python never evaluates the park call, yet `_live_nodes(loop)` reaches its `ast.Call`, `_park_call_site` returns `dispatch`, and the shipped-tree assertion stays green. This restores the one-holder-per-tick defect through the same exists-versus-runs gap the change claims to close.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Make `_live_children` model constant short-circuit reachability for `BoolOp` and constant `IfExp` without pruning operands whose truth cannot be decided. Add synthetic refusals for at least `False and park(...)`, `True or park(...)`, and a dead conditional-expression arm, plus accepted cases for the corresponding operands that do execute. As with the existing cases, prove the old `ast.walk` checker accepts each refusal source.",
+    "severity": "blocker",
+    "title": "Constant short-circuit expressions still certify an unexecuted park call"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe prior round's generator-expression finding is addressed: `_live_children` retains only the eagerly evaluated outer iterable, and the new synthetic cases pin the element, filter, and later-clause refusals. However, the claimed live-tree traversal remains bypassable through constant short-circuit expressions. A park call can still exist beneath the loop without ever running while `_park_call_site` returns `dispatch`, so the structural proof is not yet sound.",
+  "verdict": "request_changes"
+ }
+}
