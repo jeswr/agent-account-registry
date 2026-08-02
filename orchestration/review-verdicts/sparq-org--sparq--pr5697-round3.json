@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5697,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6aa6eacb8e177a9e3175b2619b3d8389b4221c75",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The final parenthetical still says this is \"the same anonymous-class output-vocabulary gap as WebOnt-I5.5-005\". That comparison remains unsupported: this case concerns reification/output of an in-profile anonymous hasSelf restriction, while the audited WebOnt case depends on owl:unionOf/list vocabulary outside EL. Both involve anonymous conclusion structure, but their blockers are materially different.",
+    "file": "crates/sparq-conformance/tests/el_suite.rs",
+    "fix_hint": "Remove the final comparison, or explicitly contrast the cases: hasSelf is an in-profile anonymous-restriction reification/output gap; WebOnt-I5.5-005 is blocked because owl:unionOf and its list structure are outside EL and skipped.",
+    "severity": "minor",
+    "title": "The hasSelf gap is still incorrectly equated with WebOnt-I5.5-005"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2's documentation finding remains unchanged. The revised entry still calls this hasSelf case \"the same anonymous-class output-vocabulary gap as WebOnt-I5.5-005\", although the adjacent audit categorizes WebOnt-I5.5-005 by its owl:unionOf conclusion being outside EL. The present case instead reaches an in-profile anonymous hasSelf concept internally but cannot reify that concept back to the restriction bnode in output. Conflating those mechanisms makes the permanent-divergence audit inaccurate. Because the same minor finding remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
