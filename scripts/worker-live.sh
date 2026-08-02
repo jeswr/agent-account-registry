@@ -1272,6 +1272,37 @@ _pr_gate_suite_loop() {
   ' "$file"
 }
 
+# [issue #1035] PURE (self-tested): print pr-gate.yml's yaml-parse SWEEP -- the `for f in .github/`
+# glob list through the `actionlint` invocation the step ends on -- normalised to stripped,
+# comment-free lines, so WHAT THE SWEEP COVERS can be pinned by exact whole-block match. Prints
+# nothing when the file or the sweep is absent, which fails closed against any expected block.
+#
+# The GLOB LIST is the payload. Every other pin in this file guards a command; this one guards a
+# SET, and a set silently shrinks: drop a glob from the `for` line and the step still parses
+# something, still prints its `== yaml-parse ... ==` rows, still exits 0 -- the removed population
+# is simply never looked at again, and every PR merges green over it. `shopt -s nullglob` is what
+# makes that quiet (a glob matching nothing expands to nothing rather than erroring), so the loop
+# is CAPABLE of running over zero files; any `[[ "$n" -gt 0 ]]`-style vacuity guard placed between
+# the `done` and the lint therefore sits INSIDE this extraction on purpose, and deleting it is a
+# changed block, not a lost comment.
+#
+# Extraction runs `for` -> `actionlint` rather than `for` -> `done` for the same reason: it pins the
+# parse, the guards after it, and the lint that follows as ONE ordered block, so `|| true` on either
+# command, an `if false; then` wrapper (extra lines), and a lint hoisted above the loop (no
+# terminator until EOF) all fail the comparison. This is the #941/#956 YAML-seam shape -- a mutant
+# here is invisible to every python assertion in this repo.
+_pr_gate_yaml_parse_sweep() {
+  local file=$1
+  [[ -f "$file" ]] || return 0
+  awk '
+    { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+    line ~ /^#/ || line == "" { next }
+    line ~ /^for f in \.github\// { on = 1 }
+    on { print line }
+    on && line ~ /^actionlint([ \t]|$)/ { exit }
+  ' "$file"
+}
+
 # [issue #1371] PURE (self-tested): pr-gate.yml's suite DERIVATION line together with the line that
 # immediately follows it -- the #824 dependency preflight -- normalised to stripped, comment-free
 # lines, so the preflight can be pinned by exact ADJACENT-PAIR match.
@@ -8006,6 +8037,79 @@ CHANNEL
        && printf missed || printf caught)" "caught"
   chk "pr-gate loop check fails CLOSED on an unreadable workflow" \
     "$([[ "$(_pr_gate_suite_loop "$loopfix/absent.yml" 2>/dev/null | paste -sd'|' -)" == "$expected_loop" ]] \
+       && printf missed || printf caught)" "caught"
+
+  # ---- [issue #1035] THE OTHER LOOP AT THE SAME SEAM. The suite loop above is pinned because a
+  # mutation there greens the gate with the control gone; the yaml-parse + actionlint step is the
+  # SAME shape and had no pin at all. Its failure mode is quieter than a suppressed command: the
+  # step guards a SET of globs, and a set shrinks silently -- `shopt -s nullglob` means a glob that
+  # matches nothing simply contributes nothing, so dropping one leaves a step that still parses
+  # files, still prints rows and still exits 0 while an entire population goes unparsed forever.
+  # Pin the sweep by EXACT WHOLE-BLOCK match, `for` through the lint, so the glob list, the parse,
+  # anything guarding the loop's own vacuity, and the lint's ordering are all one comparable value.
+  # An absent file or a renamed loop yields an empty extraction, which fails closed.
+  #
+  # MEASURED before this pin existed: deleting the whole `actionlint + yaml-parse every workflow`
+  # step from pr-gate.yml survived the entire 646-check suite with zero new FAIL rows, and so did
+  # dropping the `*.yaml` glob from it. With the six rows below, each mutant reds exactly one row --
+  # this one -- at an unchanged total check count (652), so neither is a crash-after-partial-run. The expected block below is typed here, NOT derived from
+  # pr-gate.yml, so it cannot compare the file against itself. It is deliberately a FROZEN literal:
+  # widening the sweep (#855 adds a `.github/ISSUE_TEMPLATE/` pass and an `[[ "$n" -gt 0 ]]`
+  # fail-closed guard, neither of which is on master yet) reds this row until the widened block is
+  # written here too -- that is the control working, not a conflict to route around. ----
+  local expected_yaml_sweep
+  expected_yaml_sweep=$(cat <<'SWEEP' | paste -sd'|' -
+for f in .github/workflows/*.yml .github/workflows/*.yaml; do
+echo "== yaml-parse $f =="
+python3 -c 'import sys,yaml; yaml.safe_load(open(sys.argv[1]))' "$f"
+done
+echo "== actionlint =="
+actionlint -color
+SWEEP
+)
+  chk "pr-gate.yml yaml-parses every workflow glob and then lints (exact block)" \
+    "$(_pr_gate_yaml_parse_sweep "$SCRIPT_DIR/../.github/workflows/pr-gate.yml" | paste -sd'|' -)" \
+    "$expected_yaml_sweep"
+  # NON-VACUITY of the extractor: it must actually change under each mutant it claims to catch, or
+  # the row above is a constant comparing itself. The DROPPED-GLOB row is the one issue #1035 is
+  # about -- it is the mutant that leaves a green, plausible-looking step behind.
+  printf '%s\n' '      - name: x' '        run: |' \
+    '          for f in .github/workflows/*.yml; do' '            echo "== yaml-parse $f =="' \
+    '            python3 -c '"'"'import sys,yaml; yaml.safe_load(open(sys.argv[1]))'"'"' "$f"' \
+    '          done' '          echo "== actionlint =="' '          actionlint -color' \
+    > "$loopfix/yaml-glob-dropped.yml"
+  printf '%s\n' '      - name: x' '        run: |' \
+    '          for f in .github/workflows/*.yml .github/workflows/*.yaml; do' \
+    '            echo "== yaml-parse $f =="' \
+    '            python3 -c '"'"'import sys,yaml; yaml.safe_load(open(sys.argv[1]))'"'"' "$f" || true' \
+    '          done' '          echo "== actionlint =="' '          actionlint -color' \
+    > "$loopfix/yaml-parse-or-true.yml"
+  printf '%s\n' '      - name: x' '        run: |' \
+    '          for f in .github/workflows/*.yml .github/workflows/*.yaml; do' \
+    '            echo "== yaml-parse $f =="' '            if false; then' \
+    '              python3 -c '"'"'import sys,yaml; yaml.safe_load(open(sys.argv[1]))'"'"' "$f"' \
+    '            fi' '          done' '          echo "== actionlint =="' '          actionlint -color' \
+    > "$loopfix/yaml-parse-if-false.yml"
+  printf '%s\n' '      - name: x' '        run: |' \
+    '          for f in .github/workflows/*.yml .github/workflows/*.yaml; do' \
+    '            echo "== yaml-parse $f =="' \
+    '            python3 -c '"'"'import sys,yaml; yaml.safe_load(open(sys.argv[1]))'"'"' "$f"' \
+    '          done' '          echo "== actionlint =="' '          actionlint -color || true' \
+    > "$loopfix/yaml-lint-or-true.yml"
+  chk "yaml-sweep check is NON-VACUOUS: a DROPPED glob no longer matches" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-glob-dropped.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "yaml-sweep check is NON-VACUOUS: an '|| true' on the parse no longer matches" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-parse-or-true.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "yaml-sweep check is NON-VACUOUS: a conditionally-inert 'if false' parse no longer matches" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-parse-if-false.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "yaml-sweep check is NON-VACUOUS: an '|| true' on actionlint no longer matches" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/yaml-lint-or-true.yml" | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "yaml-sweep check fails CLOSED on an unreadable workflow" \
+    "$([[ "$(_pr_gate_yaml_parse_sweep "$loopfix/absent.yml" 2>/dev/null | paste -sd'|' -)" == "$expected_yaml_sweep" ]] \
        && printf missed || printf caught)" "caught"
 
   # ---- [issue #1371] THE #824 PREFLIGHT IN THE REQUIRED LANE. registry_selftest_gate refuses
