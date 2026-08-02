@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5300,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e5e41ebc6993027b3f29fbcb4a96080bc39e2ef6",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "pick_cache_seeds still ranks candidates with (-feature_breadth, -weight, idx). For two groups of the same cache_crate with equal breadth and weight, idx is their position in the supplied list, so reversing or shuffling that list can change the selected group. This directly contradicts the documented invariant that the seed is stable and independent of scheduling/order.",
+    "file": "scripts/assemble-feature-matrix.py",
+    "fix_hint": "Replace idx with a stable group property, such as the group identifier or a canonical tuple derived from its legs. Ensure the stable property is unique or add a deterministic final tie-breaker that is independent of list position.",
+    "severity": "major",
+    "title": "Cache-seed tie-breaker still depends on input order"
+   },
+   {
+    "body": "list(reversed(groups)) copies only the outer list. pick_cache_seeds mutates cache_save on the same group dictionaries referenced by groups, so the second call overwrites the original selection. The final group-ID comparison therefore observes the same post-mutation dictionaries on both sides. The initial seeds value records only cache_crate names, not the selected group IDs, and cannot detect a changed winner.",
+    "file": "scripts/tests/test_feature_matrix_assemble.py",
+    "fix_hint": "Capture the original selected group IDs before reselection or use copy.deepcopy before reversing. Add a synthetic same-crate pair with equal feature breadth and equal weight but distinct stable identities, then assert that the same group wins in both orders; this test must fail with the current idx tie-breaker.",
+    "severity": "major",
+    "title": "Determinism test remains vacuous through shared mutation"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 is stagnant: both round-1 major findings remain. The selector still uses the input position as its final tie-breaker, so equal-breadth/equal-weight groups can select different cache seeds after reordering. The determinism test still reverses only the outer list while sharing the same mutable group dictionaries; the second selection overwrites the first selection's cache_save flags, making the group-identity comparison compare the mutated objects against themselves. No synthetic tied-rank case was added, so the claimed order independence remains unverified and false.",
+  "verdict": "request_changes"
+ }
+}
