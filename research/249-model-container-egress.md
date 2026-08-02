@@ -242,8 +242,11 @@ resume skips login by design — and the routing flip and the re-enrolment canno
 because `worker.yml`'s exact-equality gate and `set-up-account.yml`'s pre-store format gate bind the
 two sides together. Increment 2 is gated on two **measurements**, not a PR: whether a
 registry-dedicated *refreshable* anthropic authorization can be minted at all (`README.md`'s
-enrolment runbook forbids the one refreshable format this repo records), and whether the access-token
-TTL exceeds the 90-minute `worker_timeout_minutes` ceiling.
+enrolment runbook forbids the one refreshable format this repo knows), and whether the access-token
+TTL exceeds the 90-minute `worker_timeout_minutes` ceiling. That record scopes itself explicitly: it
+measures what can **run** and what can be **newly enrolled**, and takes **no census of existing
+account records** — so item 3 below is cheap because the format is *unrouted*, not because "no
+account stores it".
 
 ## 6. The recommended increment
 

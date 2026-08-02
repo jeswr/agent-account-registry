@@ -6,10 +6,17 @@
 > from the hardening, by re-measuring §5.E's premises against the tree. It edits no script, no
 > workflow and no policy.
 >
-> **Answer, in one line: not today, and NOT with a code-only change.** The registry records exactly
+> **Answer, in one line: not today, and NOT with a code-only change.** The registry knows exactly
 > one refreshable anthropic format, its own enrolment runbook forbids that format on measured
-> operational grounds, and its enrolment broker refuses to store it. Increment 2 is a
-> *provisioning* project gated on a *measurement*, and §5.E's cost estimate is too low.
+> operational grounds, and its enrolment broker refuses to store it on any new enrolment. Increment 2
+> is a *provisioning* project gated on a *measurement*, and §5.E's cost estimate is too low.
+>
+> **Scope of every account claim below**, stated once: the evidence here is `routing.toml` +
+> `worker.yml`'s claim gate (what can **run**) and `set-up-account.yml`'s pre-store gate (what can be
+> **newly enrolled**). This record takes **no census of existing account records** — that is a GitHub
+> read its authoring container deliberately cannot perform (§2.1). Nothing below asserts what formats
+> the recorded accounts are actually in; where that distinction changes an action, it is called out
+> (§5 step 3, §6).
 
 ## 0. The four questions, answered
 
@@ -39,27 +46,40 @@ budgeted — so neither is cosmetic (AGENTS.md pre-flight item 10: publish the c
   (`:1146`, `:1159-1161`). Re-recording an account is a **fresh enrolment on a fresh handle**, and
   the old slot is burned permanently — claims are never reclaimed (`README.md:427-433`, #245).
 
-## 2. Question 1 — is there any refreshable form? No, and it is refused by design
+## 2. Question 1 — is any refreshable form usable today? No, and it is refused by design
 
-Three independent facts, each sufficient on its own.
+Three independent facts, each closing a different door — routing, enrolment, provisioning. Each is
+about what the registry can **run**, **enrol** or **mint**; none is a statement about what its
+account records happen to contain (§0's scope line, and §2.1's note).
 
-**2.1 The live fleet is necessarily bare-token, and that is provable without reading any account
-record.** Every anthropic alias in `orchestration/routing.toml` (`haiku:42`, `sonnet:47`,
+**2.1 Every anthropic account that can RUN is bare-token, and that much is provable without reading
+any account record.** Every anthropic alias in `orchestration/routing.toml` (`haiku:42`, `sonnet:47`,
 `opus5:64`) declares `credential_format = "claude-oauth-token"`; `worker.yml:895-912` requires
 **exact equality** between the routed format and the claimed account's format (#142, and it is the
 last gate before a secret is exposed). So an anthropic account recorded in any *other* format
-cannot run a single worker — it fails the claim, not the model call. Whatever the account issues
-say, the anthropic accounts that actually execute are `claude-oauth-token`, and a bare
-`sk-ant-…` has **no refresh material to exchange**. `anthropic-api-key` is the same shape and
-additionally is not a grant at all.
+cannot run a single worker — it fails the claim, not the model call. The anthropic accounts that
+actually execute are therefore `claude-oauth-token`, and a bare `sk-ant-…` has **no refresh material
+to exchange**. `anthropic-api-key` is the same shape and additionally is not a grant at all.
 
-**2.2 The enrolment broker cannot store the refreshable format.** `set-up-account.yml:619-652`
-(#191) refuses, *before the irreversible secret write*, any enrolment whose captured
-`credential_format` is not equal to the declared `credential_format` of **every** alias in the
-account's `models` list. `account-login.sh:62-72` prefers `claude setup-token`'s printed
+⚠️ **What this does NOT prove, because the gap changes an action.** It is a claim about
+*executability*, not about *existence*. It excludes a `claude-credentials-json` account from the
+**running** fleet; it does not exclude one from the **record set** — a historical, pending, revoked
+or otherwise unusable account issue in that format would fail the claim silently and never surface
+in this argument. Settling that needs an account-record census (every `provider: anthropic` account
+issue and its `credential_format`, pending and retired ones included), which is a GitHub read this
+record's authoring container has no token for by design. **It is not taken here**, and no sentence
+below should be read as having taken it. §6 carries it as an open measurement.
+
+**2.2 The enrolment broker refuses the refreshable format on every NEW enrolment.**
+`set-up-account.yml:619-652` (#191) refuses, *before the irreversible secret write*, any enrolment
+whose captured `credential_format` is not equal to the declared `credential_format` of **every**
+alias in the account's `models` list. `account-login.sh:62-72` prefers `claude setup-token`'s printed
 `sk-ant-…` and falls back to copying `~/.claude/.credentials.json` only when no token was printed —
 so the `claude-credentials-json` fallback, today, produces an enrolment the broker **rejects**.
-The format is not merely latent; it is actively unenrollable while routing pins the bare token.
+The format is actively un-enrollable *going forward* while routing pins the bare token. Note what
+kind of gate this is: a **pre-store** check on the enrolment path (#191). It constrains enrolments
+made through it from #191 onward, and says nothing about records written before it or by any path
+that does not traverse it — §2.1's scope note is the same boundary seen from the other side.
 
 **2.3 The runbook forbids it, and the reason is not stylistic.** `README.md:437-441`:
 
@@ -80,9 +100,9 @@ enrolment on a new handle (the old slot burns), a policy PR adding the new handl
 in **every** target that lists it — three today, `policy/repos.toml:97`, `:156`, `:194` — and the
 old handle's removal. Because §2.1's equality gate is exact and §2.2's pre-store gate compares the
 captured format against **every declared alias**, the routing flip and the account re-enrolment
-**cannot move independently**: flip `routing.toml` first and every existing anthropic account fails
-its claim; re-enrol first and the new account fails the pre-store gate. That two-sided,
-must-move-together property is precisely the shape
+**cannot move independently**: flip `routing.toml` first and every anthropic account still recorded
+in the old format fails its claim; re-enrol first and the new account fails the pre-store gate. That
+two-sided, must-move-together property is precisely the shape
 [`research/271-coordinated-secret-migration-runbook.md`](271-coordinated-secret-migration-runbook.md)
 was written for, and an increment-2 implementation needs its own cutover sequence in that style
 before it touches a line of Python.
@@ -204,7 +224,10 @@ The dependency chain, in the only order that is safe:
    Either way it must be closed, and it is **not sufficient** — fixing it changes nothing about
    §2's provisioning wall.
    ⚠️ It is cheap **today** and stops being cheap the moment step 5 lands, because the format is
-   currently latent — no account stores it (§2.2) and no route selects it.
+   currently **unrouted**: no route selects it, and no new enrolment can record it (§2.2). *Unrouted*
+   is what is measured; *"no account stores it"* is **not** (§2.1's scope note). If the census in §6
+   turns up an existing record in that format, step 3 is not cheap-and-optional-ordering — it is
+   already overdue, and it moves ahead of steps 1 and 2.
 4. **The broker work** (§3.1) plus the delivery decision (§3.2), with the equality-gate constraint
    honoured.
 5. **The coordinated cutover** (§2, `research/271`-shaped): re-enrol, policy PRs across all three
@@ -223,7 +246,14 @@ Nothing in code, for this issue. Concretely:
 - Answer §2.3 — whether a registry-dedicated refreshable anthropic authorization can be minted at
   all — before budgeting increment 2.
 - Land #249 §9 item 3 (`claude-credentials-json` refresh-token mount) on its own merits, now, while
-  it is latent.
+  it is unrouted.
+- Take the account-record census §2.1 leaves open: enumerate the `provider: anthropic` account
+  issues — **including pending, failed and retired records**, not just claimable ones — and report
+  each one's `credential_format`. It is a GitHub read, not a code change, and it is the only way the
+  sentence *"no account stores `claude-credentials-json`"* becomes sayable. It does **not** move the
+  verdict — §2.3's provisioning wall and §4's TTL are what defer increment 2, and both stand whatever
+  the census says — but a record already in that format makes the previous bullet urgent rather than
+  merely cheap (§5 step 3).
 
 An impl issue for increment 2 itself is deliberately **not** filed, for the reason §5.B of #249
 gives for not filing option B: *an open issue for work whose preconditions are unmeasured is a stale
