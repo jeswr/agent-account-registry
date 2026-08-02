@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "51bde6688e140866",
-   "claim_id": "ccf67b7552c945ada698ccea04cc5b73",
-   "holder": "sparq-org/sparq#5220@30725162410.1",
-   "package": "ci",
-   "role": "ci",
-   "model": "opus5",
-   "issued_at": 1785630312,
-   "expires_at": 1785636612
-  },
-  {
-   "account": "51bde6688e140866",
    "claim_id": "2b6b012677c24d6682ef720ed7544cce",
    "holder": "fix:sparq-org/sparq#5631@30725254627.1",
    "package": "sparq-mpc",
