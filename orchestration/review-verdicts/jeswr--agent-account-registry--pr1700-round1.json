@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1700,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3bf07bab786dbd9746d28ae32b184ba22b608b66",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The added stateful self-test is sound and non-vacuous. It exercises the real delivery, upsert, and decide call sites; independently asserts in-place body refresh, the edit/create operation split, fallback after a failed refresh, nonzero decide status when both routes fail, and fail-closed handling of an unreadable closed tracker. Fixture inputs and expected reason strings are independent of production constants, failed mutations do not alter fake state, globals and environment are restored, and the test is wired into the aggregate self-test result. No correctness, security, or completeness issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
