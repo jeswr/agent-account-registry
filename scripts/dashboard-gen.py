@@ -1172,6 +1172,39 @@ def _node_json(script, payload):
             f"the page-script harness printed no parseable result: {completed.stdout!r}") from exc
 
 
+class _RaisedPage(str):
+    """Stand-in for a page script that threw: EVERY lookup below yields the diagnostic itself.
+
+    Issue #1341. The sibling harnesses compare the whole page object, or read it through a
+    `.get`-based helper, so a plain-dict fallback is enough there. The executed-page block that
+    consumes `_executed_page` subscripts the page directly (`page["cards"]["measured"]["deg…"]`),
+    where a dict fallback would raise `KeyError` and abort the suite exactly as the unguarded call
+    did. Returning self from every `[...]`/`.get` instead keeps every row below reachable: each one
+    compares this diagnostic against its expected tuple and goes red BY NAME, and the suite still
+    reaches its full check count."""
+
+    def __getitem__(self, key):
+        return self
+
+    def get(self, key, default=None):
+        return self
+
+
+def _executed_page(harness, payload):
+    """`_node_json(harness, payload)`, with a page that THROWS reported as a VALUE, never an abort.
+
+    Issue #1341. A renderer that reaches a DOM API the shim does not implement — or a mutant that
+    drops an exported symbol from the harness's `new Function(... return {...})` list — otherwise
+    raises out of `_self_test` and terminates the run: every check below it never executes, while a
+    mutation run scores the abort as a KILL (AGENTS.md AUTHOR pre-flight item 4,
+    *crash-after-partial-run*). It also loses the diagnostic — an abort names the exception, a red
+    row names WHICH assertion the broken page failed. So the raise becomes the rows' value."""
+    try:
+        return _node_json(harness, payload)
+    except DashboardError as exc:
+        return _RaisedPage(f"page script raised: {str(exc)[:160]}")
+
+
 def _probe_epoch(value):
     """`value` as a UTC epoch second, reusing _utc_iso's tolerant epoch/ISO parsing, or None."""
     iso = _utc_iso(value)
@@ -4973,7 +5006,62 @@ esac
                              "soonest_reset": soonest, "oldest_reset": oldest}],
                 "soonest_reset": soonest, "oldest_reset": oldest}
 
-    page = _node_json(
+    # --- [#1341] the guard the executed-page call below depends on, held to BOTH directions on a
+    # real `node` run: a page that throws becomes the rows' VALUE (every nested lookup they make
+    # resolves to the diagnostic, so each row goes red BY NAME and the suite still reaches its full
+    # check count), and a page that renders reaches them unaltered.
+    def _guard_probe(exports, body, probe):
+        """`probe` applied to what `_executed_page` hands the rows below — or the raise, as a value.
+
+        Own-abort insurance: the regressions this row exists to catch (an unguarded call, or a
+        fallback whose nested lookups cannot be traversed) RAISE, and a raise here would terminate
+        the suite in exactly the way #1341 is about — recording as a kill with every later check
+        unrun. Reporting it as the row's value keeps this row red by name instead.
+
+        `exports` and the non-empty payload come from the caller so that they MATCH the real call
+        site below: a guard made conditionally inert on either (pre-flight item 3 — the mutant that
+        is not a deletion) then goes inert here too, and is caught, instead of surviving because the
+        probe happened to call through a differently-shaped harness."""
+        harness = _page_harness(exports, body)
+        try:
+            return probe(_executed_page(harness, {"probe": "1341"}))
+        except Exception as exc:  # noqa: BLE001 — any raise out of the guard IS the finding
+            return f"probe raised: {type(exc).__name__}: {exc}"[:120]
+
+    _thrown_probe = _guard_probe(
+        "usageProbeCard, updateFreshness, render, providerQuotaCard",
+        "  throw new Error('deliberate-1341-page-failure');",
+        lambda page: ("deliberate-1341-page-failure" in page,
+                      page.startswith("page script raised:"),
+                      page["cards"]["measured"]["degraded"] is page,
+                      page["warnings"].get("quietHistory") is page,
+                      page["cards"]["absent"] is None,
+                      "NOT MEASURED" in page["cards"]["failed"]["text"]))
+    _rendered_probe = _guard_probe(
+        "usageProbeCard, updateFreshness, render, providerQuotaCard",
+        "  console.log(JSON.stringify({ loaded: typeof scope.render }));",
+        lambda page: (page, isinstance(page, _RaisedPage)))
+    check("[#1341] a page script that THROWS is reported as the rows' value rather than raised: "
+          "the diagnostic names the underlying failure, and the nested lookups the rows below make "
+          "resolve to it instead of aborting the suite on a KeyError",
+          _thrown_probe, (True, True, True, True, False, False))
+    check("[#1341] ...and a page that RENDERS reaches those rows untouched — the guard reports a "
+          "failed render, it never stands in for a successful one",
+          _rendered_probe, ({"loaded": "function"}, False))
+    # The two rows above test the GUARD; this one tests its USE. A call site rewired back to a bare
+    # `_node_json` keeps them both green while losing the whole protection, which is the AGENTS.md
+    # pre-flight item 6 seam — so the executed-page call below is pinned by exact shape here.
+    _own_source = Path(__file__).resolve().read_text(encoding="utf-8")
+    check("[#1341] the executed-page block reaches `node` THROUGH the guard: exactly one guarded "
+          "call site and no bare `_node_json` one",
+          (len(re.findall(r'_executed_page\(\s*_page_harness\("usageProbeCard', _own_source)),
+           len(re.findall(r'_node_json\(\s*_page_harness\("usageProbeCard', _own_source))),
+          (1, 0))
+
+    # `_executed_page`, never a bare `_node_json`: a page that throws while rendering IS the
+    # finding, and reporting it as the value of every row below keeps those rows named and red
+    # instead of aborting the suite mid-run with its later checks unexecuted (issue #1341).
+    page = _executed_page(
         _page_harness("usageProbeCard, updateFreshness, render, providerQuotaCard", page_body),
         {"probes": {"measured": measured_document["usage_probe"],
                     "failed": failed_document["usage_probe"],
