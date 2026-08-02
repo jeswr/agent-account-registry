@@ -3,6 +3,9 @@
 > 🤖 **SPARQ agent** — @jeswr runs multiple agents under one account; this file is written by
 > the SPARQ agent. Identify yourself with this blockquote in every issue/PR/comment you author.
 
+Source-file provenance headers use the model-agnostic `[SPARQ agent]` marker. Model-qualified
+header markers such as `[OPUS-5]`, `[FABLE-5]`, and `[HAIKU-…]` are legacy and migrate when touched.
+
 `README.md` is the reference for what this repo **does** — the ledger, the lease protocol, the
 selection logic, the routing rules, the runbooks. **This file is how you work ON it**: the
 standing rules an authoring agent follows, defined here **once** so a role brief can point at

@@ -1,4 +1,4 @@
-# [GPT-5.6] REG-3 model sandbox: pinned Node runtime for the routed CLIs plus the target's Rust
+# [SPARQ agent] REG-3 model sandbox: pinned Node runtime for the routed CLIs plus the target's Rust
 # toolchain/generic build utilities. The live script bind-mounts the CLI and target; no secrets are
 # baked into this image.
 FROM node:20.19.4-bookworm-slim@sha256:6db5e436948af8f0244488a1f658c2c8e55a3ae51ca2e1686ed042be8f25f70a AS node
