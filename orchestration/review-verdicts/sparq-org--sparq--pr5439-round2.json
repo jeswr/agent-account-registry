@@ -1,0 +1,44 @@
+{
+ "host_envelope": {
+  "pr": 5439,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "302f838bddd74cc27d1e96bdc8f32e499998849b",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The note attributes the whole restatement to one bug: the old pair counter 'dropped every PR whose changed-file list was empty', and the fix 'retain[s] genuinely empty PRs ... and exclude[s] only named failed reads'.\n\nThat fix can only grow the DENOMINATOR. A PR with an empty changed-file list intersects nothing, so it adds pairs that share no file; the 'sharing >=1 file' NUMERATOR is invariant under it. Named failed reads are excluded in both the old and new counts, so they add nothing either.\n\nBut every numerator grew: ci 6 -> 40, docs 2 -> 30, deps 3 -> 21.\n\nThe deps row makes this decisive. Its pair count went 3 -> 21, i.e. holders 3 -> 7, while the sharing rate stayed at exactly 100%. If even ONE genuinely empty PR had entered the deps holder set it would form 6 pairs sharing no file, capping deps at 15/21 (~71%), not 100%. So the deps holder set gained zero empty PRs \u2014 yet it septupled. Retaining empty PRs therefore cannot be what changed these figures.\n\nThe only reading consistent with the numbers is that the new table is a DIFFERENT, larger/later snapshot (30, 36 and 7 holders vs the old 16, 12 and 3). Naming a counter bug as the sole cause of a delta that a snapshot change actually explains is the same class of defect the note sets out to correct.",
+    "file": "scripts/ready-issues.py",
+    "fix_hint": "State the snapshot provenance for the new table the way the neighbouring blocks in this file already do (e.g. 'MEASURED 2026-07-26 ... cursor-paginated, len == GraphQL totalCount'): the date, the holder query, and the holder counts (30 ci / 36 docs / 7 deps). Then separate the two effects honestly \u2014 how much of the delta is the re-snapshot and how much is the empty-list fix \u2014 or, if the empty-list fix is not in fact what moved these figures, say that the table was re-measured on a later snapshot and describe the counter fix as a correctness fix that did not by itself change the conclusion. Re-deriving the old snapshot with the fixed counter and reporting both would settle it.",
+    "severity": "major",
+    "title": "HONESTY NOTE's stated cause cannot produce the new numbers; the deps row disproves it"
+   },
+   {
+    "body": "The corrected table now contradicts still-live copies of the same measured claim:\n\n- scripts/ready-issues.py:1324 (this file, ~940 lines below the diff): 'The SAFETY half. deps: 3 of 3 live holder pairs collide, all on Cargo.lock.' The table now says 21 of 21.\n- scripts/tests/test_readiness_visibility.py:1622-1623: '5% of open `area:ci` holder pairs and 3% of `area:docs` pairs share a changed file' \u2014 and it explicitly directs the reader to this table ('see NON_RESERVING_PARTITIONS for the table'), which now reads 9.2% and 4.8%. A reader following that pointer lands on numbers that disagree with the sentence that sent them there.\n- scripts/tests/test_readiness_visibility.py:1660: '# MEASURED: 3 of 3 open `area:deps` holder pairs share a changed file'.\n\nThese are documentation of the safety argument, not assertions, so nothing fails \u2014 which is precisely why they will rot silently. A change made specifically to correct a stated measurement should leave one consistent account of it.",
+    "file": "scripts/ready-issues.py",
+    "fix_hint": "Update the three sites to the new figures (9.2% ci, 4.8% docs, 21 of 21 deps), or, better, make this comment block the single source and have the other three refer to it without restating the numbers \u2014 the same single-source discipline the file already applies to NON_RESERVING_PARTITIONS ('THE ONE PLACE THIS IS DECLARED').",
+    "severity": "major",
+    "title": "Superseded 5% / 3% / '3 of 3' figures left in three other places, one in this same file"
+   },
+   {
+    "body": "Four lines below the edited block, the same comment still asserts: '14 open PRs co-hold `ci` and 10 co-hold `docs` right now, concurrently'.\n\nThe new pair counts are stated to be 'the full nCr pair count for its holder set', so 435 and 630 imply 30 and 36 holders respectively. Those cannot both be 'right now' unless they come from different snapshots \u2014 which is not disclosed. The old counts (120 and 66 pairs, i.e. 16 and 12 holders) were at least in the neighbourhood of 14 and 10; the new ones are not.\n\nSame concern for the sentence immediately above it: 'Measured counterfactual on that same snapshot, through this engine: baseline frontier 1; `ci` non-reserving 2; ...'. If the table has moved to a new snapshot, 'that same snapshot' no longer refers to anything the reader can see, and the counterfactual has not been revalidated against it.",
+    "file": "scripts/ready-issues.py",
+    "fix_hint": "Refresh the 14/10 co-hold figures from the same snapshot as the new table (or drop the raw counts and keep only the qualitative point that these partitions already run concurrently with zero admission control). Either re-run the counterfactual on the new snapshot, or label it explicitly with its own snapshot date so 'that same snapshot' is unambiguous.",
+    "severity": "minor",
+    "title": "Adjacent un-updated prose contradicts the holder counts the new table implies"
+   },
+   {
+    "body": "The header still reads only 'live sparq snapshot, open non-parked PRs holding each area'. Other measured blocks in this file are markedly more disciplined \u2014 see the native-dependency block a few lines down: 'MEASURED 2026-07-26 over all 1368 open sparq issues (cursor-paginated, len == GraphQL totalCount)'. That block can be re-run and falsified by a later reader; this one cannot, which is what allowed the earlier counter bug to sit undetected in the first place.",
+    "file": "scripts/ready-issues.py",
+    "fix_hint": "Add the measurement date and enough of the query to reproduce it (state filter, the parked exclusion, how the changed-file list is read, and which failed reads were excluded by name), matching the style of the `NATIVE_SUMMARY` block below.",
+    "severity": "nit",
+    "title": "The new table carries no snapshot date or reproduction command"
+   }
+  ],
+  "progress": null,
+  "summary": "Comment-only change to the NON_RESERVING_PARTITIONS measured-basis table in scripts/ready-issues.py, adding an HONESTY NOTE explaining a restated pair count. Internal consistency of the new table checks out (40/435=9.2%, 30/630=4.8%, 21/21=100%; 435, 630 and 21 are exact nCr(n,2) for n=30, 36, 7 holders, matching the claim that every count is a full pair count). But the NOTE's stated CAUSE cannot produce the new numbers, and this is a PR whose entire purpose is the honesty of these numbers. The described fix \u2014 retaining genuinely empty PRs that the old counter dropped, while still excluding named failed reads \u2014 grows only the DENOMINATOR: a PR with an empty changed-file list shares a file with nothing, so the 'sharing >=1 file' numerator is invariant under it. Yet all three numerators grew (ci 6->40, docs 2->30, deps 3->21). The deps row disproves the explanation outright: it stays at exactly 100% (21/21) while its holder set grew 3->7, and if even one genuinely empty PR had entered that holder set it would contribute 6 non-sharing pairs, capping deps at 15/21 (~71%). So deps demonstrably gained zero empty PRs, yet its pair count septupled \u2014 the delta comes from a different (larger/later) snapshot, not from the counter bug the note names as the sole cause. Secondly, the change updates one copy of these figures and leaves at least three stale copies contradicting it, including one in the same file (scripts/ready-issues.py:1324, '3 of 3 live holder pairs') and a test docstring that explicitly points readers AT this table while quoting the superseded 5%/3%. Third, adjacent un-updated prose in the same comment block ('14 open PRs co-hold ci and 10 co-hold docs') contradicts the 30/36 holder counts the new table implies, and the counterfactual below is still asserted 'on that same snapshot'. No runtime behaviour changes and no test is weakened; the objection is confined to the accuracy and completeness of the claim, which is exactly what this change is for.",
+  "verdict": "request_changes"
+ }
+}
