@@ -12,16 +12,6 @@
   },
   {
    "account": "51bde6688e140866",
-   "claim_id": "d820c433d53c4e00b04dfb8591c9af6b",
-   "holder": "review:sparq-org/sparq#5671@30724310841.1",
-   "package": "sparq-canon",
-   "role": "review",
-   "model": "opus5",
-   "issued_at": 1785628654,
-   "expires_at": 1785632854
-  },
-  {
-   "account": "51bde6688e140866",
    "claim_id": "a4367f2a5b264376a228838276f6a522",
    "holder": "jeswr/agent-account-registry#1603@30724341296.1",
    "package": "review-loop",
