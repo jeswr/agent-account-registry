@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5682,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "aea52e4f51b68559c88215dbc28a0fa4cfcc44ab",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new rationale says ignoring `unlabeled` leaves the wider scope decision standing until the next push. However, this workflow remains subscribed to every `labeled` event and has no job-level label guard. After `ci-full` is removed, adding any unrelated label starts both jobs and evaluates the current label set without `ci-full`, so the scope can narrow before a push. The same overstatement is repeated in the wiring test and documentation; the test verifies only trigger membership, not persistence of the previously wider decision.",
+    "file": ".github/workflows/vectorized-feature-off.yml",
+    "fix_hint": "Change the claims to say the wider result stands only until the next subscribed event (including any later `labeled` event) or push. Explicitly distinguish the four guarded ci-select callers from unguarded `vectorized-feature-off.yml`, and adjust the focused test's docstring/messages so they do not claim an invariant the test cannot prove.",
+    "severity": "minor",
+    "title": "Wider scope does not necessarily stand until the next push"
+   }
+  ],
+  "progress": null,
+  "summary": "The trigger reduction itself is plausible, but the central documented and tested guarantee is overstated. Removing a *-full label does not necessarily leave the wider selection standing until the next push: any later `labeled` event retriggers these workflows, and `vectorized-feature-off.yml` explicitly has no label-event guard, so an unrelated label addition reruns its scope decision with `ci-full` absent. The focused test only checks the static event-type lists and cannot establish the claimed persistence behavior. Revise the rationale and test commentary to state the actual boundary (next subscribed `labeled` event or push), especially for the unguarded vectorized workflow.",
+  "verdict": "request_changes"
+ }
+}
