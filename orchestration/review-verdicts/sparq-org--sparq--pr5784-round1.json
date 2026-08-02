@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5784,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "616b63cb537d3c4766959886cec9a301cbb54102",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly makes jq an explicit hard precondition for every extracted workflow-body harness execution, preventing missing-tool behavior from being misdiagnosed as a production ring regression. The added test genuinely removes jq from PATH, verifies the precondition is active, and checks that the resulting diagnostic names jq without repeating the misleading regression accusations. The change is narrowly scoped, uses standard-library facilities, and introduces no apparent correctness, soundness, test-validity, or security issue.",
+  "verdict": "approve"
+ }
+}
