@@ -566,9 +566,6 @@ jobs:
       # M1 derives each lane's expectation from the workflow files themselves, and
       # `policy/repos.toml` is the one M3's execution-overrun floor is derived from
       # (1.5x the longest `worker_timeout_minutes`) — the self-test reds if they diverge.
-      # `scripts/gh_retry.py` is an INPUT too (#1502): every GitHub read the watchdog makes runs
-      # through that shared bounded backoff, so dropping it makes the FIRST read raise and the
-      # whole tick exit 2 — the very whole-tick loss the retry was adopted to end.
       - name: Check out ONLY the watchdog's inputs (pinned, sparse, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
