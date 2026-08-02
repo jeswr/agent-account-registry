@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5669,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4d53f9f8a41bf088606ae238d2786b59f1ff7bb6",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The workflow change correctly gives the coverage-engine run matrix and merge job the same rust-cache namespace via an identical shared-key, while preserving the existing save-on-main policy. The regression tests are non-vacuous: they locate both top-level jobs, require at least one rust-cache step in each, assert a shared-key is present and equal across jobs, and reject reintroduction of the job-scoped key input. The targeted test class passes at the PR head. No correctness, soundness, test-validity, or security issue was found in the diff.",
+  "verdict": "approve"
+ }
+}
