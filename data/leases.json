@@ -32,16 +32,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "fadd09ba0c6e49da869d06537d2c2d51",
-   "holder": "jeswr/agent-account-registry#1633@30747250176.1",
-   "package": "docs",
-   "role": "docs",
-   "model": "sol",
-   "issued_at": 1785672626,
-   "expires_at": 1785675326
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "2e369dffb5dd4b669ef5447b8cdc5bf8",
    "holder": "sparq-org/sparq#2702@dispatch-30747284677.1",
    "package": "gui",
