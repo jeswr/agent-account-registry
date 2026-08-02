@@ -1170,6 +1170,14 @@ def backfill_workflow_seam_report():
     triggers = workflow.get("on") if "on" in workflow else workflow.get(True)
     inputs = (((triggers or {}).get("workflow_dispatch") or {}).get("inputs") or {})
     job = workflow["jobs"]["backfill"]
+    # `.get`, not an index: a DELETED targets job must surface as a named FAIL below, not as a
+    # KeyError that aborts the suite and leaves every check after this one unrun.
+    targets_job = workflow["jobs"].get("targets") or {}
+    resolve_step = next((s for s in (targets_job.get("steps") or [])
+                         if isinstance(s, dict) and s.get("id") == "resolve"), None)
+    resolve_run = str((resolve_step or {}).get("run") or "")
+    needs = job.get("needs")
+    strategy = job.get("strategy") or {}
     steps = job["steps"]
     step = next((s for s in steps if "backfill-provenance.py" in str(s.get("run") or "")), None)
     run = str((step or {}).get("run") or "")
@@ -1198,7 +1206,100 @@ def backfill_workflow_seam_report():
         "no_draft_convert_default": inputs.get("no_draft_convert", {}).get("default"),
         "step_env_bindings": {key: step_env.get(key)
                               for key in ("TARGET_REPO", "APPLY", "NO_DRAFT_CONVERT")},
+        # --- issue #1544: the sweep must be MACHINE-DRIVEN, over EVERY enabled target ------------
+        # Read the trigger and the matrix themselves. The APPLY expression above only proves what a
+        # scheduled run WOULD do, not that one ever happens, and `${{ matrix.repo }}` only proves
+        # where the target is read from, not what the matrix contains.
+        "schedule_crons": [str(entry.get("cron"))
+                           for entry in ((triggers or {}).get("schedule") or [])],
+        "target_repo_declared": "target_repo" in inputs,
+        "target_repo_default": inputs.get("target_repo", {}).get("default"),
+        "matrix_repo_expr": str((strategy.get("matrix") or {}).get("repo")),
+        "matrix_fail_fast": strategy.get("fail-fast"),
+        # The EXACT guard text on both jobs, not a containment probe: `job_ref_guarded` above is
+        # satisfied by `<the real guard> && false`, which skips every scheduled run while reading
+        # as a hardened ref check (AGENTS.md pre-flight 6; sparq #4743 shipped that mutant).
+        "job_if": guard,
+        "targets_job_if": str(targets_job.get("if") or ""),
+        # The PRODUCER half of the same claim. `matrix_repo_expr` proves only that the CONSUMER
+        # reads an output of that name; it holds just as well when the resolver is replaced by
+        # `echo 'repos=["one/hardcoded-repo"]'`, which is the hardcoded-target defect itself. And
+        # deleting `needs: targets` leaves the strategy and both guards byte-identical while the
+        # `needs.targets.outputs.repos` expression no longer resolves to anything. So pin the whole
+        # path: the dependency EDGE, the output BINDING, and the step that step id names.
+        "backfill_needs": sorted([needs] if isinstance(needs, str) else list(needs or [])),
+        "targets_repos_output": str((targets_job.get("outputs") or {}).get("repos")),
+        "targets_step_ids": [str(s.get("id")) for s in (targets_job.get("steps") or [])
+                             if isinstance(s, dict) and s.get("id")],
+        "resolver_requested_binding": str(((resolve_step or {}).get("env") or {})
+                                          .get("REQUESTED")),
+        "resolver_step_unconditional": (resolve_step is not None and "if" not in resolve_step
+                                        and not resolve_step.get("continue-on-error")),
+        # EVERY command the runner's shell executes, in order — the heredoc body is stdin DATA,
+        # not commands. Pinned as a list so the self-test can exact-match it: a containment probe
+        # for `set -euo pipefail` is equally satisfied by a block that runs `set +o pipefail`
+        # straight after it, and THAT tree turns a resolver refusal into `refuse | tee` — tee
+        # exits 0, so the step and the whole targets job report SUCCESS publishing no `repos`
+        # (AGENTS.md pre-flight 6: exact-match at the YAML seam, never containment).
+        "resolver_shell_commands": _split_heredoc(resolve_run)[0],
+        # Without the `| tee -a "$GITHUB_OUTPUT"` the resolver computes the right answer and
+        # discards it: `steps.resolve.outputs.repos` renders empty and the matrix sweeps nothing,
+        # with every text assertion above still green.
+        "resolver_emits_to_step_output": bool(
+            re.search(r"""^python3 - <<'EOF' \| tee -a "\$GITHUB_OUTPUT"$""", resolve_run, re.M)),
     }
+
+
+def _split_heredoc(run_text):
+    """`(shell_command_lines, heredoc_body_lines, reason)` for a `run:` block with one heredoc.
+
+    The shell lines are what the runner's shell EXECUTES; the heredoc body is stdin data. Split
+    once, here, so the seam report and the resolver extractor below cannot drift apart (#958).
+    `reason` is a string when the block does not carry exactly one terminated `<<'EOF'`, and then
+    `heredoc_body_lines` is None — but `shell_command_lines` is still every non-blank line, so an
+    exact-match assertion on it stays meaningful (and red) for such a tree rather than vacuous."""
+    lines = str(run_text or "").split("\n")
+    # Containment, not `endswith`: the shipped opener pipes (`<<'EOF' | tee -a "$GITHUB_OUTPUT"`).
+    opens = [i for i, line in enumerate(lines) if "<<'EOF'" in line]
+    if len(opens) != 1:
+        return ([line for line in lines if line.strip()], None,
+                f"the resolver must run exactly one `<<'EOF'` heredoc, found {len(opens)}")
+    body = lines[opens[0] + 1:]
+    closes = [i for i, line in enumerate(body) if line.strip() == "EOF"]
+    if not closes:
+        return ([line for line in lines if line.strip()], None,
+                "the resolver's heredoc is unterminated")
+    shell = lines[:opens[0] + 1] + body[closes[0] + 1:]
+    return [line for line in shell if line.strip()], body[:closes[0]], None
+
+
+def backfill_targets_resolver_source():
+    """The `targets` job's `resolve` step: `(heredoc_source, whole_run_block, None)`.
+
+    Returns `(None, None, reason)` when there is no resolver to extract. Every seam assertion
+    above reads workflow TEXT, and text cannot tell a policy-derived resolver from
+    `echo 'repos=["one/hardcoded-repo"]'` — which is exactly the defect #1544 exists to kill. So
+    the self-test EXECUTES this source against synthetic policy fixtures and asserts the row it
+    emits, and executes the whole `run` block in a shell to assert the step's own exit status.
+
+    It returns a reason rather than raising ON PURPOSE: the headline mutant here (a hardcoded
+    `echo` in place of the resolver) carries no heredoc at all, and raising would abort the suite
+    part-way — recording as a crash, not a kill, with every check below it unrun (AGENTS.md
+    pre-flight 4). A reason reds each behavioural row BY NAME at an unchanged check count."""
+    steps = (_workflow("backfill-provenance.yml")["jobs"].get("targets") or {}).get("steps") or []
+    found = [s for s in steps if isinstance(s, dict) and s.get("id") == "resolve"]
+    if len(found) != 1:
+        return None, None, f"expected exactly one `id: resolve` step in `targets`, found {len(found)}"
+    run_text = str(found[0].get("run") or "")
+    _, body, reason = _split_heredoc(run_text)
+    if reason is not None:
+        return None, None, reason
+    source = textwrap.dedent("\n".join(body))
+    try:
+        compile(source, "<targets.resolve>", "exec")
+    except SyntaxError as exc:
+        return None, None, f"the resolver's heredoc does not compile: {exc}"
+    return source, run_text, None
 
 
 def _self_test():
@@ -1547,6 +1648,193 @@ def _self_test():
           "github.event_name == 'schedule'" in _apply_expr, True)
     check("...while a manual run still defaults to a DRY RUN (inputs.apply is still consulted)",
           "inputs.apply" in _apply_expr, True)
+    # [#1544] ...and the CRON ITSELF, which is the whole fix and which NOTHING above pins. Delete
+    # `on.schedule` and every check to this point stays green: TARGET_REPO still reads the matrix
+    # and the APPLY expression still names `schedule` — it simply never renders true again. The
+    # workflow reverts to dispatch-only, which is the measured defect: an orphaned worker PR is
+    # fail-closed INVISIBLE to the review loop, so the population drains only when a human
+    # remembers to run this by hand (five stranded PRs on 2026-08-01). Exact-match on the parsed
+    # trigger, so both DELETING the cron (-> []) and SLOWING it are red, not silent.
+    check("the sweep is SCHEDULED, at the cadence #1544 shipped",
+          seam["schedule_crons"], ["23 */4 * * *"])
+    # Paired with the next check on purpose: `target_repo_default` reads None both when the input
+    # carries no default AND when the input is gone entirely, so on its own it is vacuous.
+    check("the manual single-target recovery path survives alongside the cron",
+          seam["target_repo_declared"], True)
+    # [#1555] A `default:` is materialised for workflow_dispatch, so ANY value here makes the
+    # documented "leave EMPTY to sweep every enabled target" unreachable from the UI/API — the
+    # manual path would silently disagree with its own description and with the schedule.
+    check("target_repo carries NO default (empty = sweep every enabled target stays reachable)",
+          seam["target_repo_default"], None)
+    # [#1544] The targets are POLICY-derived. A hardcoded matrix is the measured shape of both
+    # stalls — "nobody pointed it at this repo lately", not "it never ran" — and a second copy of
+    # the enabled set is what took dispatch fully down on 2026-08-01 (#1537/#1540). Assert the
+    # exact expression: a literal list here lints clean and strands every repo not named in it.
+    check("the matrix is the POLICY-derived target list, never a hardcoded copy",
+          seam["matrix_repo_expr"], "${{ fromJSON(needs.targets.outputs.repos) }}")
+    check("fail-fast is OFF (one target's failure must not cancel the other targets' sweep)",
+          seam["matrix_fail_fast"], False)
+    # A scheduled run that is SKIPPED is indistinguishable from no schedule at all, and the
+    # containment probe above (`job_ref_guarded`) accepts `<guard> && false`. Both jobs carry the
+    # same guard and both must be exact — `targets` is `needs:`-upstream, so skipping it alone
+    # takes the whole matrix with it.
+    _REF_GUARD = ("${{ github.ref == format('refs/heads/{0}', "
+                  "github.event.repository.default_branch) }}")
+    check("the backfill job's guard is EXACTLY the default-branch check (no appended `&& false`)",
+          seam["job_if"], _REF_GUARD)
+    check("the targets job's guard is EXACTLY the default-branch check (no appended `&& false`)",
+          seam["targets_job_if"], _REF_GUARD)
+    # --- the PRODUCER side of the same claim [#1544, round-1 review] ----------------------------
+    # Everything above this point pins the CONSUMER: it proves `backfill` reads a matrix from an
+    # output named `repos`. It does NOT reach the job that computes that output, so both of the
+    # mutants that recreate the shipped defect stay green — swapping the resolver for
+    # `echo 'repos=["one/hardcoded-repo"]'`, and deleting `needs: targets` (which leaves the
+    # strategy and both guards byte-identical while the expression it names resolves to nothing).
+    check("the backfill job DEPENDS on targets (no edge => the matrix expression is unbacked)",
+          seam["backfill_needs"], ["targets"])
+    check("the targets job PUBLISHES the resolver step's output as `repos`",
+          seam["targets_repos_output"], "${{ steps.resolve.outputs.repos }}")
+    check("...and `resolve` is the only id'd step there, so that binding names a step that exists",
+          seam["targets_step_ids"], ["resolve"])
+    check("the resolver reads the requested target from the workflow_dispatch input",
+          seam["resolver_requested_binding"], "${{ inputs.target_repo }}")
+    check("the resolver step is UNCONDITIONAL (an `if:`/`continue-on-error` here fails it green)",
+          seam["resolver_step_unconditional"], True)
+    # Exact-match the shell's whole command SEQUENCE, not a `"set -euo pipefail" in run` probe.
+    # That probe stays green for a tree that runs `set +o pipefail` on the very next line, and
+    # with pipefail off a refusing resolver becomes the left side of `| tee` — tee exits 0, the
+    # step succeeds, and the targets job publishes no usable `repos` while every text assertion
+    # here reads green. The list form reds an INSERTED command, a deleted `set`, and a rewritten
+    # pipeline alike; the two execution-seam rows further down prove the resulting exit status.
+    check("the resolver's shell runs errexit+pipefail and NOTHING that could turn them back off",
+          seam["resolver_shell_commands"],
+          ["set -euo pipefail", "python3 - <<'EOF' | tee -a \"$GITHUB_OUTPUT\""])
+    check("the resolver's stdout is APPENDED to $GITHUB_OUTPUT (else `repos` publishes nothing)",
+          seam["resolver_emits_to_step_output"], True)
+
+    # ...and the resolver's BEHAVIOUR, by executing the shipped heredoc. Text assertions cannot
+    # distinguish "derived from policy" from "a literal that happens to look derived", so the step
+    # is run against synthetic policy trees and asserted on what it emits.
+    _resolver_src, _resolver_run, _resolver_why = backfill_targets_resolver_source()
+
+    def _resolve_targets(policy_toml, requested=None):
+        """`(output_name, parsed_value)` the SHIPPED resolver emits for this policy tree.
+
+        Any non-emitting outcome is returned as a NAMED string instead of propagating, so a
+        mutant reds this row and the rows below it still run (AGENTS.md pre-flight 4)."""
+        if _resolver_src is None:
+            return f"NO-RESOLVER: {_resolver_why}"
+        saved_cwd, saved_requested = os.getcwd(), os.environ.get("REQUESTED")
+        with tempfile.TemporaryDirectory() as workdir:
+            try:
+                os.makedirs(os.path.join(workdir, "policy"))
+                with open(os.path.join(workdir, "policy", "repos.toml"), "w",
+                          encoding="utf-8") as handle:
+                    handle.write(policy_toml)
+                os.chdir(workdir)
+                if requested is None:
+                    os.environ.pop("REQUESTED", None)
+                else:
+                    os.environ["REQUESTED"] = requested
+                buffer = io.StringIO()
+                try:
+                    with contextlib.redirect_stdout(buffer):
+                        exec(_resolver_src, {"__name__": "__main__"})  # noqa: S102 — the step
+                except SystemExit as exc:
+                    # A refusal is a NONZERO exit: `raise SystemExit("...")` exits with the
+                    # message. `SystemExit(0)` is a silent success emitting nothing, which is a
+                    # different (and equally wrong) outcome, so it is named separately.
+                    return "REFUSED" if exc.code not in (0, None) else "EXITED-CLEAN"
+                except BaseException as exc:       # noqa: BLE001 — a mutant must red, not abort
+                    return f"ABORTED: {type(exc).__name__}"
+                printed = [line for line in buffer.getvalue().split("\n") if line.strip()]
+                if len(printed) != 1 or "=" not in printed[0]:
+                    return f"UNPARSED: {printed}"
+                name, _, value = printed[0].partition("=")
+                try:
+                    return (name, json.loads(value))
+                except ValueError:
+                    return f"NOT-JSON: {value!r}"
+            finally:
+                os.chdir(saved_cwd)
+                if saved_requested is None:
+                    os.environ.pop("REQUESTED", None)
+                else:
+                    os.environ["REQUESTED"] = saved_requested
+
+    def _resolve_step_result(policy_toml):
+        """`(step_succeeded, $GITHUB_OUTPUT text)` from running the step's WHOLE `run` block.
+
+        `_resolve_targets` above executes only the heredoc's PYTHON, so it is structurally blind
+        to the shell around it — every one of its rows stays green when `set +o pipefail` runs
+        before the pipeline. That mutant is the whole hazard: a resolver REFUSAL is then just the
+        left side of `| tee`, `tee` exits 0, so the step and the targets job SUCCEED having
+        published no `repos`. Only the execution seam can see it, so the shipped `run` text is
+        handed to bash verbatim, in a temp cwd with a fixture policy and a real $GITHUB_OUTPUT.
+
+        Named strings, never exceptions, for the same pre-flight-4 reason as `_resolve_targets`."""
+        if _resolver_run is None:
+            return f"NO-RESOLVER: {_resolver_why}"
+        with tempfile.TemporaryDirectory() as workdir:
+            os.makedirs(os.path.join(workdir, "policy"))
+            with open(os.path.join(workdir, "policy", "repos.toml"), "w",
+                      encoding="utf-8") as handle:
+                handle.write(policy_toml)
+            out_path = os.path.join(workdir, "github_output")
+            with open(out_path, "w", encoding="utf-8"):
+                pass
+            # `set -u` is in force, so GITHUB_OUTPUT must exist; REQUESTED is bound by the step's
+            # `env:` on a real runner and renders to the empty string when the input is unset —
+            # pinned here too, so an inherited REQUESTED cannot reach the fixture. The requested-
+            # target paths are asserted by `_resolve_targets` above; this seam tests the SHELL.
+            env = {**os.environ, "GITHUB_OUTPUT": out_path, "REQUESTED": ""}
+            try:
+                done = subprocess.run(["bash", "-c", _resolver_run], cwd=workdir, env=env,
+                                      capture_output=True, text=True, timeout=120, check=False)
+            except (OSError, subprocess.SubprocessError) as exc:
+                # Includes TimeoutExpired: a mutant that hangs must red THIS row, not abort the
+                # suite with every check below it unrun (AGENTS.md pre-flight 4).
+                return f"UNRUNNABLE: {type(exc).__name__}"
+            with open(out_path, encoding="utf-8") as handle:
+                return done.returncode == 0, handle.read().strip()
+
+    # Fixture repositories named so they appear NOWHERE in the workflow, in policy/repos.toml, or
+    # in this harness (pre-flight 2b/2c): the expected values below cannot be satisfied by any
+    # constant the resolver could read, and no mutant's substituted value collides with them.
+    # `stray` is deliberately not a table, to exercise the `isinstance(r, dict)` filter.
+    _POLICY = ('[repos]\n'
+               'stray = "not-a-row"\n'
+               '[repos."zzz-fixture/beta"]\n'
+               'enabled = true\n'
+               '[repos."zzz-fixture/alpha"]\n'
+               'enabled = true\n'
+               '[repos."zzz-fixture/gamma"]\n'
+               'enabled = false\n')
+    _POLICY_NONE_ENABLED = '[repos."zzz-fixture/gamma"]\nenabled = false\n'
+    _SWEEP = ("repos", ["zzz-fixture/alpha", "zzz-fixture/beta"])
+    check("the resolver emits EVERY enabled policy row (sorted) as JSON under the name `repos`",
+          _resolve_targets(_POLICY), _SWEEP)
+    check("...and an all-whitespace target_repo is still that full sweep (the input is stripped)",
+          _resolve_targets(_POLICY, "   "), _SWEEP)
+    check("a requested ENABLED target narrows the matrix to exactly that one repo",
+          _resolve_targets(_POLICY, "zzz-fixture/beta"), ("repos", ["zzz-fixture/beta"]))
+    # Fail LOUD, both ways: the manual path must never admit a non-policy target (the sol r1
+    # arbitrary-repo class), and must never silently widen to the whole sweep instead.
+    check("a requested DISABLED target is REFUSED, not admitted and not silently swept",
+          _resolve_targets(_POLICY, "zzz-fixture/gamma"), "REFUSED")
+    check("a requested UNKNOWN target is REFUSED the same way",
+          _resolve_targets(_POLICY, "zzz-fixture/delta"), "REFUSED")
+    check("policy enabling NOTHING is REFUSED — never an empty matrix that reports success",
+          _resolve_targets(_POLICY_NONE_ENABLED), "REFUSED")
+    # ...and the same two directions at the SHELL seam, which is where the refusal is converted
+    # into the step's exit status. A refusal the runner scores as SUCCESS is worse than no sweep:
+    # `targets` goes green, `needs.targets.outputs.repos` is empty, `fromJSON('')` collapses the
+    # matrix, and nothing anywhere reports that the population was not swept.
+    check("a resolver REFUSAL fails the shipped step (pipefail, not swallowed by `| tee`)",
+          _resolve_step_result(_POLICY_NONE_ENABLED), (False, ""))
+    check("...and a resolved sweep succeeds, publishing `repos=` into $GITHUB_OUTPUT",
+          _resolve_step_result(_POLICY),
+          (True, 'repos=["zzz-fixture/alpha", "zzz-fixture/beta"]'))
     check("two-page slurped listing flattens (sol r5)",
           flatten_pull_pages([[{"number": 1}], [{"number": 2}, {"number": 3}]]),
           [{"number": 1}, {"number": 2}, {"number": 3}])
