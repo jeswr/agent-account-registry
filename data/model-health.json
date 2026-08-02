@@ -1703,6 +1703,14 @@
    "wall_seconds": 127,
    "issue": 5366,
    "why_no_diff": "other"
+  },
+  {
+   "ts": 1785702085,
+   "provider": "anthropic",
+   "account": "f79434c3ffba014f",
+   "model_alias": "opus5",
+   "exit_class": "success",
+   "run_id": "30764667334.1"
   }
  ]
 }
