@@ -260,13 +260,22 @@ def _find_open_alert(repo, token, marker, title, label):
     # A SUCCESSFUL gh call can still hand back malformed JSON (truncated output, an HTML error page,
     # a proxy interposing). Degrade rather than crash: warn (sanitized — the payload is remote
     # content and is never echoed) and skip this tick; the next tick retries.
+    # The ROWS get the same treatment as the envelope: a listing that parses as `[1, 2, 3]` would
+    # otherwise reach the matcher below and raise AttributeError out of main(), taking the whole
+    # tick's upsert AND recovery-close down with it. Refuse the payload wholesale rather than
+    # dropping the offending rows: which rows were lost is exactly what cannot be known, so a
+    # filtered view could miss the open alert and file a DUPLICATE on a failing tick, or miss the
+    # recovery-close on a recovering one. Doing nothing for one tick is the recoverable outcome.
     try:
         found = json.loads(listed.stdout or "[]")
         if not isinstance(found, list):
             raise ValueError("expected a JSON array")
+        if not all(isinstance(row, dict) for row in found):
+            raise ValueError("expected every row to be a JSON object")
     except ValueError:
-        print(f"::warning::{label}: gh issue list succeeded but returned unparseable JSON — "
-              "skipping this tick (no dedupe/recovery data; next tick retries)")
+        print(f"::warning::{label}: gh issue list succeeded but returned an unusable payload "
+              "(not a JSON array of issue objects) — skipping this tick "
+              "(no dedupe/recovery data; next tick retries)")
         return None, False, True
     # Match the stable body MARKER first (survives a retitled alert), exact title second (legacy
     # alerts filed before the marker existed).
@@ -770,6 +779,30 @@ def _test_gh_flows(chk):
         chk("flow A: non-array list JSON -> soft skip, payload not echoed",
             (rc, "::warning::" in out, "sentinel-error-object" in out,
              [s for s in subs() if s != ("issue", "list")]), (0, True, False, []))
+        # ROW-level malformedness: the matcher calls .get() on each row, so a scalar row raises
+        # AttributeError out of main() unless it is refused here. run_main is wrapped so a
+        # regression records as ONE red row rather than aborting the suite mid-run (which would
+        # bank every check below it as never-executed).
+        scalar_rows = '[4242, "SENTINEL-SCALAR-ROW"]'
+        try:
+            rc, out = run_main([], scalar_rows, metrics_result="failure")
+            got = (rc, "::warning::" in out, "SENTINEL-SCALAR-ROW" in out,
+                   [s for s in subs() if s != ("issue", "list")])
+        except Exception as exc:  # noqa: BLE001 — a malformed row must DEGRADE, never propagate
+            got = f"raised {type(exc).__name__}"
+        chk("flow A: non-object ROWS -> soft skip like the non-array case, payload not echoed, "
+            "no crash", got, (0, True, False, []))
+        # A PARTIALLY decodable listing is not a usable dedupe view: the rows that did not decode
+        # could have been the open alert. Refuse the tick rather than acting on a filtered view —
+        # under a filter-and-proceed reading this would close #7 on the evidence of half a payload.
+        mixed_rows = json.dumps([{"number": 7, "title": JOB_ALERT_TITLE}, 4242])
+        try:
+            rc, out = run_main([], mixed_rows, metrics_result="success")
+            got = (rc, "::warning::" in out, [s for s in subs() if s != ("issue", "list")])
+        except Exception as exc:  # noqa: BLE001
+            got = f"raised {type(exc).__name__}"
+        chk("flow A: ONE non-object row among valid ones -> whole listing refused, no close on a "
+            "partial dedupe view", got, (0, True, []))
         for failing in (("issue", "create"), ("issue", "edit")):
             rc, out = run_main([], open_job if failing == ("issue", "edit") else "[]",
                                fail=(failing,), metrics_result="failure")
@@ -807,6 +840,15 @@ def _test_gh_flows(chk):
         rc, _ = run_main([], open_stale, metrics_result="success")
         chk("flow A: a METRICS success does NOT close an open STALENESS alert",
             (rc, [s for s in subs() if s != ("issue", "list")]), (0, []))
+        # The same listing backs BOTH watchdogs, so the row guard has to hold on the --stale-check
+        # tick too — and that soft-skip return had no executing test before this row.
+        try:
+            rc, out = run_main(["--stale-check"], scalar_rows, snapshot=stale_snapshot)
+            got = (rc, "::warning::" in out, [s for s in subs() if s != ("issue", "list")])
+        except Exception as exc:  # noqa: BLE001
+            got = f"raised {type(exc).__name__}"
+        chk("flow B: non-object ROWS -> soft skip, no create even though the snapshot is STALE "
+            "(degrade for one tick, never crash the staleness watchdog)", got, (0, True, []))
         # No byte of the snapshot may reach the issue body.
         rc, _ = run_main(["--stale-check"],
                          snapshot='{"generated_at": "SENTINEL-SNAPSHOT-PAYLOAD"}')
