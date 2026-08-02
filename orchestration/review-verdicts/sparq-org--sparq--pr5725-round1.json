@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5725,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5a79f3553b384b9eb587a7e6b637a654475dc93b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "ProtocolAnnotations::admits returns true for MaliciousSecurity whenever no assertion contains SECX_SEMI_HONEST, and likewise for DishonestMajority. Thus an existing protocol entry with an empty assertions vector, an assertion with an empty assumption set, or assertions silently discarded by assertion_from_pairs because assurance is missing/unknown is admitted for both stronger threat models. admits_protocol only rejects a missing map key, so it does not provide the documented fail-closed behavior. The included hypothetical test even codifies absence of SemiHonest as positive evidence of malicious security, although the module says malicious/covert assumptions are unrepresentable. The separate drift guard does not protect callers because admits_protocol neither invokes it nor requires validated annotations.",
+    "file": "crates/sparq-mpc/src/secprop.rs",
+    "fix_hint": "Represent positive support for each adversary requirement explicitly and admit only when that support is present and the annotation is structurally valid; absence of SemiHonest/HonestMajority must not imply a stronger guarantee. Alternatively return a validated annotation type from parsing and make admission possible only after validation that rejects empty/malformed assertions and unknown adversary axes. Add mutation tests for an empty block, missing/unknown assurance, and missing assumptions, asserting all requirements are denied. Update the current data-driven hypothetical test to include explicit malicious-security evidence once the vocabulary can represent it.",
+    "severity": "major",
+    "title": "Admission fails open when an annotation has no usable assumptions"
+   }
+  ],
+  "progress": null,
+  "summary": "The annotation graph is appropriately opt-in and the shipped Turtle is candid about the semi-honest, externally unaudited posture. However, the public admission API is not actually fail-closed for malformed or incomplete annotations: it interprets absence of a limiting assumption as satisfaction of the stronger requirement. This is a security-significant mismatch with the documented invariant and must be corrected before approval.",
+  "verdict": "request_changes"
+ }
+}
