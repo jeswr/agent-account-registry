@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5786,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "71a82827169e67b45409669f4c72bbfa1eeacbb1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The cache is correctly keyed by the full normalized (graph, scope) value, so hash collisions cannot cross-serve masks; normalization preserves the visibility predicate; unmasked forks preserve the prior dataset shape; and cache invalidation covers both authorization rematerialization and successful or potentially partial in-place data updates. The integration tests exercise the real authorized update path, stale INSERT/DELETE behavior, post-write masking, warm/cold oracle equivalence, and distinct-scope isolation. The cache remains feature-gated, bounded, and dependency-neutral, and the documentation consistently labels work-box measurements non-canonical.",
+  "verdict": "approve"
+ }
+}
