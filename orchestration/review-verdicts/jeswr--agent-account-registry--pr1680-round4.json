@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1680,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c1797c084a2cd3f39cecf43ae45cd62cf79aff45",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe parsed-YAML pin remains correct, fail-closed, and non-vacuous. It selects exactly one named step only from actual `jobs.*.steps` mappings, rejects aliases, duplicate keys, malformed workflow shapes, non-mapping steps, and zero or multiple matches, and compares the complete normalized step object against an independently constructed frozen expectation. The faithful intact fixtures prove that the extractor can positively match, while the weakened, deleted, duplicated, spoofed, conditionally inert, and malformed fixtures exercise the claimed failure paths without relying solely on empty-output negatives. The real workflow provisions hash-locked PyYAML before running the enrolled self-test suite. I found no blocker, major, or other actionable diff-scoped issue. Because round 3 likewise had no findings, this round is materially unchanged rather than improving.",
+  "verdict": "approve"
+ }
+}
