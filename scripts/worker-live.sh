@@ -315,6 +315,41 @@ _credential_mount_args() {
   printf '%s\n' --mount "type=bind,src=$credential_path,dst=/home/worker/$rel,readonly"
 }
 
+# PURE (self-tested): print one `<src> <dst> <rw|readonly>` line per bind mount the model launcher
+# hard-codes, in file order, read out of the SHIPPED source of _run_headless_harness. Argument is a
+# shell source file (the live script, or a mutant copy); an unreadable one fails closed.
+#
+# [issue #300] WHY THIS IS A TRUST CHECK, not documentation. The rotation write-back runs
+# `registry/scripts/worker-live.sh write-back` with REGISTRY_SECRETS_PAT in scope, AFTER the model
+# step, out of the registry checkout that sits beside the target tree — so the write-back is only
+# safe while the model cannot WRITE that checkout. It cannot: the model is a container whose whole
+# filesystem view is this mount set (plus the read-only credential mount `_credential_mount_args`
+# builds), and the registry checkout is not in it. That containment is the entire reason the step
+# may execute registry code with a secrets-capable credential, and until now nothing failed if a
+# future edit mounted `$SCRIPT_DIR/..` — or dropped a `readonly` — into the model's container.
+#
+# The caller asserts the EXACT set (AGENTS.md AUTHOR pre-flight item 6): an added mount, a removed
+# mount, a re-pointed dst and a dropped `readonly` are each a different list. SCOPE: this reads the
+# mounts the launcher writes LITERALLY. The one mount added indirectly (the credential mount, via
+# `container+=`) has its own contract rows against `_credential_mount_args`, and the caller pins the
+# number of indirect appends so a NEW indirect mount cannot slip past this scan either.
+_model_container_binds() {
+  local file=$1
+  [[ -f "$file" ]] || { printf 'worker-live: launcher source missing: %s\n' "$file" >&2; return 1; }
+  awk '
+    /^_run_headless_harness\(\) \{/ { inside=1; next }
+    !inside { next }
+    /^\}/ { exit }
+    /^[[:space:]]*#/ { next }
+    match($0, /type=bind,[^"]*/) {
+      spec = substr($0, RSTART, RLENGTH)
+      src = spec; sub(/.*,src=/, "", src); sub(/,.*$/, "", src)
+      dst = spec; sub(/.*,dst=/, "", dst); sub(/,.*$/, "", dst)
+      print src " " dst " " (spec ~ /,readonly$/ ? "readonly" : "rw")
+    }
+  ' "$file"
+}
+
 # mutation_mode:
 #   allow — today's implementation tooling (claude Bash/Edit/Write; codex unchanged).
 #   deny  — reviewer posture: claude is restricted to Read/Glob/Grep. codex KEEPS
@@ -3969,19 +4004,74 @@ purge_credentials() {
 # Both are matched on their exact `run:`/`- name:` line rather than by substring: `worker-live.sh
 # gate` also appears inside a comment above the gate step in worker.yml, and a containment match
 # there would measure the comment's position, not the step's.
+#
+# [issue #300] The two line numbers are shared with `_pat_before_target_code` through
+# `_first_target_code_line` rather than written out twice: a duplicated definition of "where the
+# hostile code starts" makes EACH copy individually unkillable (AGENTS.md AUTHOR pre-flight item 4,
+# and #945 measured exactly that), and a repoint of the gate step would otherwise have to be made in
+# two places for both orderings to keep holding.
+_first_target_code_line() {
+  local file=$1 tool_ln gate_ln
+  tool_ln=$(_first_match_line '^      - name: Ensure a Rust toolchain for the crate-scoped gate$' < "$file")
+  gate_ln=$(_first_match_line '^        run: bash \.\./registry/scripts/worker-live\.sh gate$' < "$file")
+  # BOTH must be present: each is a distinct target-controlled step, so a lane missing either is not
+  # a lane whose ordering was measured — it is a lane whose shape this check no longer recognises.
+  [[ -n "$tool_ln" && -n "$gate_ln" ]] || return 1
+  if [[ "$tool_ln" -lt "$gate_ln" ]]; then printf '%s\n' "$tool_ln"; else printf '%s\n' "$gate_ln"; fi
+}
+
 _purge_before_target_code() {
   local file=$1
   [[ -f "$file" ]] || { printf 'worker-live: workflow file missing: %s\n' "$file" >&2; return 1; }
-  local purge_ln tool_ln gate_ln
+  local purge_ln target_ln
   purge_ln=$(_first_match_line '^        run: bash registry/scripts/worker-live\.sh purge-credentials$' < "$file")
-  tool_ln=$(_first_match_line '^      - name: Ensure a Rust toolchain for the crate-scoped gate$' < "$file")
-  gate_ln=$(_first_match_line '^        run: bash \.\./registry/scripts/worker-live\.sh gate$' < "$file")
   [[ -n "$purge_ln" ]] || { printf 'no-purge-step\n'; return 0; }
-  [[ -n "$tool_ln" && -n "$gate_ln" ]] || { printf 'no-target-code-step\n'; return 0; }
-  if [[ "$purge_ln" -lt "$tool_ln" && "$purge_ln" -lt "$gate_ln" ]]; then
+  target_ln=$(_first_target_code_line "$file") || { printf 'no-target-code-step\n'; return 0; }
+  if [[ "$purge_ln" -lt "$target_ln" ]]; then
     printf 'ordered\n'
   else
     printf 'purge-after-target-code\n'
+  fi
+}
+
+# PURE (self-tested): verdict on whether a live worker lane makes REGISTRY_SECRETS_PAT live ONLY in
+# steps that run BEFORE any target-controlled code. `ordered` is the only passing value; a lane with
+# no PAT at all, or no target-controlled step, is a NAMED refusal rather than a vacuous pass.
+#
+# [issue #300] The rotation write-back is the one step of these lanes that holds a secrets-capable
+# credential, and it executes `registry/scripts/worker-live.sh` — a checkout that sits beside the
+# target tree on the same runner. Two things keep that safe, and this is the second of them:
+#   * the model cannot write that checkout (it is a container; see `_model_container_binds`), and
+#   * no TARGET-controlled code has executed on the runner yet when the step runs — the gate and the
+#     rustup provisioning that honours the target's own `rust-toolchain.toml` both come later.
+# Move the write-back after the gate (or hand the PAT to any step that far down) and the target's own
+# build scripts get to rewrite the script that is about to run with the PAT in its environment. That
+# is the #575 finding with the App token replaced by the registry PAT, and `_tokens_after_gate` does
+# not see it: it scans for `GH_TOKEN:` only.
+#
+# EVERY occurrence is checked, not the first: a second PAT-bearing step appended after the gate is
+# precisely the regression, and a first-match test would report `ordered` while it sat there. The
+# needle is the SECRET EXPANSION (`secrets.REGISTRY_SECRETS_PAT`), not an env key at one indent, so a
+# job-wide `env:` — which hands the PAT to every step in the job, gate included — is caught too. A
+# mention inside a comment below the gate counts as an occurrence; that direction is a false ALARM,
+# never a false pass, and it is one comment reword to clear.
+_pat_before_target_code() {
+  local file=$1
+  [[ -f "$file" ]] || { printf 'worker-live: workflow file missing: %s\n' "$file" >&2; return 1; }
+  local hits target_ln hit late=0
+  # `|| true`: no match is a normal empty result here, and the pipeline-free form keeps grep's own
+  # status from aborting the caller under `set -e` (same reasoning as `_first_match_line`).
+  hits=$(grep -Fn -e 'secrets.REGISTRY_SECRETS_PAT' -- "$file" || true)
+  [[ -n "$hits" ]] || { printf 'no-pat-step\n'; return 0; }
+  target_ln=$(_first_target_code_line "$file") || { printf 'no-target-code-step\n'; return 0; }
+  while IFS= read -r hit; do
+    [[ -n "$hit" ]] || continue
+    [[ "${hit%%:*}" -lt "$target_ln" ]] || late=$((late + 1))
+  done <<< "$hits"
+  if [[ "$late" -eq 0 ]]; then
+    printf 'ordered\n'
+  else
+    printf 'pat-after-target-code\n'
   fi
 }
 
@@ -4231,6 +4321,63 @@ self_test() {
   chk "a credential outside the mounted HOME fails closed (never left writable)" \
     "$( (_credential_mount_args /w/root /w/root/elsewhere/auth.json >/dev/null 2>&1 && echo ok) || echo refused)" \
     "refused"
+
+  # --- [issue #300] THE MODEL'S ENTIRE FILESYSTEM VIEW, pinned as an EXACT list. The rotation
+  # write-back runs `registry/scripts/worker-live.sh` with REGISTRY_SECRETS_PAT in its environment,
+  # after the model step, out of a checkout that sits beside the target tree — so #300 asked whether
+  # a hostile model could rewrite that script first and capture the PAT. It cannot, for ONE reason:
+  # the model is a container and the registry checkout is not among its mounts. That was true and
+  # entirely unasserted; the list below is what makes mounting it (or anything else) a red tick.
+  # The expected value is written out here literally rather than derived from the launcher, so it
+  # cannot agree with the code under test by construction (AGENTS.md AUTHOR pre-flight item 2b). ---
+  local hh_src="$SCRIPT_DIR/worker-live.sh" hh_mut="$tmp/hh-mutants" hh_binds_expected
+  hh_binds_expected='$TARGET_DIR /workspace rw
+$TARGET_DIR/.git /workspace/.git readonly
+$worker_root/home /home/worker rw
+$worker_root/cli /opt/model-cli readonly'
+  mkdir -p "$hh_mut"
+  chk "#300: the model container binds EXACTLY the target tree, its read-only .git, the worker HOME and the read-only CLI" \
+    "$(_model_container_binds "$hh_src")" "$hh_binds_expected"
+  # ...and the ONE mount that arrives indirectly stays exactly one: a new `container+=` group is a
+  # mount this text scan cannot see, so its count is pinned rather than left to the scan above.
+  chk "#300: the launcher appends exactly ONE indirect mount group (the read-only credential mount)" \
+    "$(sed -n '/^_run_headless_harness() {/,/^}/p' "$hh_src" | grep -c '^  container+=(' || true)" "1"
+  # CONTROL: the file carries OTHER `type=bind` lines (the credential-mount helper, the fixtures
+  # above), so a scan that matched them all would not print four lines. This is what proves the
+  # launcher boundary in the extractor is doing work rather than trivially matching everything.
+  chk "#300: ...and the file really does carry type=bind text outside the launcher (bounded scan)" \
+    "$([[ "$(grep -c 'type=bind' "$hh_src" || true)" -gt 4 ]] && printf outside || printf none)" "outside"
+
+  # NON-VACUITY — three line-anchored mutants of the SHIPPED launcher, each verified to have changed
+  # the tree before its verdict is read (mutation-run hygiene: a `str.replace` that hit nothing
+  # reports a phantom survivor). The first of them — the registry checkout handed to the model as a
+  # writable mount — is the exact shape #300 describes.
+  local hh_anchor_cli='    --mount "type=bind,src=$worker_root/cli,dst=/opt/model-cli,readonly"'
+  local hh_anchor_git='    --mount "type=bind,src=$TARGET_DIR/.git,dst=/workspace/.git,readonly"'
+  # Counted inside the LAUNCHER BODY, and every mutation below is a whole-LINE equality test: these
+  # anchors are also written out verbatim two lines above, so a file-wide substring count reads 2
+  # and a substring-based deletion would edit this test's own source as well as the launcher.
+  local hh_body="$tmp/hh-launcher-body.sh"
+  sed -n '/^_run_headless_harness() {/,/^}/p' "$hh_src" > "$hh_body"
+  chk "#300 (mutation hygiene): each mutated anchor occurs EXACTLY once in the shipped launcher" \
+    "$(grep -Fxc -e "$hh_anchor_cli" "$hh_body" || true):$(grep -Fxc -e "$hh_anchor_git" "$hh_body" || true)" \
+    "1:1"
+  awk -v anchor="$hh_anchor_cli" '{ print } $0 == anchor {
+      print "    --mount \"type=bind,src=$SCRIPT_DIR/..,dst=/registry\"" }' \
+    "$hh_src" > "$hh_mut/registry-mounted.sh"
+  awk -v anchor="$hh_anchor_cli" '$0 != anchor { print }' "$hh_src" > "$hh_mut/cli-unmounted.sh"
+  awk -v anchor="$hh_anchor_git" '{ if ($0 == anchor) { sub(/,readonly"$/, "\""); } print }' \
+    "$hh_src" > "$hh_mut/git-writable.sh"
+  local hh_mutant
+  for hh_mutant in registry-mounted cli-unmounted git-writable; do
+    chk "#300 ($hh_mutant): the mutant really differs from the shipped launcher" \
+      "$(cmp -s "$hh_src" "$hh_mut/$hh_mutant.sh" && printf same || printf changed)" "changed"
+    chk "#300 ($hh_mutant): the exact-list assertion CATCHES it (non-vacuous)" \
+      "$([[ "$(_model_container_binds "$hh_mut/$hh_mutant.sh")" == "$hh_binds_expected" ]] \
+        && printf missed || printf caught)" "caught"
+  done
+  chk "#300: the launcher scan fails CLOSED on an unreadable source (never an empty pass)" \
+    "$(_model_container_binds "$tmp/no-such-launcher.sh" 2>/dev/null; printf '%s' "$?")" "1"
 
   # --- telemetry: claude stream-json fixture (with transcript content that must NOT cross) ---
   cat > "$tmp/claude.log" <<'LOG'
@@ -5488,6 +5635,77 @@ WFFIX
     "$(_purge_before_target_code "$wf_purge_nogate")" "no-target-code-step"
   chk "#232 r2: _purge_before_target_code fails CLOSED on an unreadable workflow" \
     "$(_purge_before_target_code "$tmp/no-such-workflow.yml" 2>/dev/null; printf '%s' "$?")" "1"
+
+  # --- [issue #300] THE SAME ORDERING PROPERTY FOR THE ONE SECRETS-CAPABLE CREDENTIAL THESE LANES
+  # HOLD. The rotation write-back executes `registry/scripts/worker-live.sh` with
+  # REGISTRY_SECRETS_PAT live; both lanes deliberately run it BEFORE the gate, because from the gate
+  # onwards the target's own build scripts and tests have executed as the runner user and can rewrite
+  # that very script between steps. Only a comment said so. `_tokens_after_gate` cannot cover it — it
+  # scans for `GH_TOKEN:` — and `_purge_before_target_code` stays green if the write-back alone moves
+  # down, so this is the assertion that makes the move a red tick. ---
+  chk "#300 (LIVE worker.yml): REGISTRY_SECRETS_PAT is live only BEFORE any target-controlled step" \
+    "$(_pat_before_target_code "$wf")" "ordered"
+  chk "#300 (LIVE review-fix.yml): ...and the review/fix lane orders its write-back the same way" \
+    "$(_pat_before_target_code "$rf_wf")" "ordered"
+  # CONTROL: each lane really does expand the PAT exactly once, so `ordered` above is a verdict about
+  # a credential that exists — and a SECOND PAT-bearing step anywhere is itself a red tick here.
+  local pat_expr='secrets.REGISTRY_SECRETS_PAT'
+  chk "#300: each lane expands the PAT exactly once (the verdict above is not about an absent needle)" \
+    "$(grep -Fc -e "$pat_expr" "$wf" || true):$(grep -Fc -e "$pat_expr" "$rf_wf" || true)" "1:1"
+  # NON-VACUITY, every verdict, on the REAL workflow. The two "late" mutants ADD a second PAT-bearing
+  # step and leave the legitimate one in place — the regression shape, and the one a first-match test
+  # cannot see (it would find the early, correct occurrence and report `ordered` with the late step
+  # sitting right there). The second of them lands between the rustup provisioning and the gate, so
+  # "the first target-controlled step" cannot be narrowed to the gate alone either.
+  local wf_pat_extra="$tmp/worker-pat-extra.yml" wf_pat_mid="$tmp/worker-pat-mid.yml"
+  local wf_pat_gone="$tmp/worker-pat-gone.yml"
+  # The injected step is written out here rather than lifted from the workflow: the mutant's input
+  # must not be derived from the file under test (AGENTS.md AUTHOR pre-flight item 2c).
+  local -a pat_step=(
+    '      - name: Write back a rotated full account credential'
+    '        env:'
+    '          REGISTRY_SECRETS_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}'
+    '        run: bash registry/scripts/worker-live.sh write-back'
+  )
+  grep -Fv -e "$pat_expr" "$wf" > "$wf_pat_gone"
+  awk -v step="$(printf '%s\n' "${pat_step[@]}")" '{ print }
+       /worker-live\.sh gate$/ { print step }' "$wf" > "$wf_pat_extra"
+  awk -v step="$(printf '%s\n' "${pat_step[@]}")" \
+      '/^      - name: Run policy-selected local gate$/ { print step } { print }' \
+    "$wf" > "$wf_pat_mid"
+  chk "#300 (mutation hygiene): each late-PAT mutant carries the ORIGINAL expansion plus the added one" \
+    "$(grep -Fc -e "$pat_expr" "$wf_pat_extra" || true):$(grep -Fc -e "$pat_expr" "$wf_pat_mid" || true)" \
+    "2:2"
+  chk "#300: a SECOND PAT-bearing step added after the gate is REPORTED (non-vacuous)" \
+    "$(_pat_before_target_code "$wf_pat_extra")" "pat-after-target-code"
+  chk "#300: ...and one added between the rustup provisioning and the gate is REPORTED too" \
+    "$(_pat_before_target_code "$wf_pat_mid")" "pat-after-target-code"
+  chk "#300: a lane with NO PAT is named, never read as ordered (fail closed)" \
+    "$(_pat_before_target_code "$wf_pat_gone")" "no-pat-step"
+  chk "#300: ...and a lane whose target-controlled step is missing is named too" \
+    "$(_pat_before_target_code "$wf_purge_nogate")" "no-target-code-step"
+  chk "#300: _pat_before_target_code fails CLOSED on an unreadable workflow" \
+    "$(_pat_before_target_code "$tmp/no-such-workflow.yml" 2>/dev/null; printf '%s' "$?")" "1"
+  # ...and "the first target-controlled step" is really the FIRST of the two, whichever comes first
+  # in the file: this fixture reverses their live order, which is the only input that exercises that
+  # comparison's other branch. Both rows read the SAME fixture and move only the PAT's position.
+  local wf_pat_rev="$tmp/pat-reversed-lane.yml"
+  {
+    printf '      - name: Run policy-selected local gate\n'
+    printf '        run: bash ../registry/scripts/worker-live.sh gate\n'
+    printf '%s\n' "${pat_step[@]}"
+    printf '      - name: Ensure a Rust toolchain for the crate-scoped gate\n'
+  } > "$wf_pat_rev"
+  chk "#300: a PAT between a lane's FIRST and second target-controlled steps is still REPORTED" \
+    "$(_pat_before_target_code "$wf_pat_rev")" "pat-after-target-code"
+  {
+    printf '%s\n' "${pat_step[@]}"
+    printf '      - name: Run policy-selected local gate\n'
+    printf '        run: bash ../registry/scripts/worker-live.sh gate\n'
+    printf '      - name: Ensure a Rust toolchain for the crate-scoped gate\n'
+  } > "$wf_pat_rev"
+  chk "#300: ...and the same fixture with the PAT ahead of both reads ordered (verdict tracks input)" \
+    "$(_pat_before_target_code "$wf_pat_rev")" "ordered"
 
   local verify_ln mint_ln
   verify_ln=$(_first_match_line 'worker-live\.sh verify-bundle' < "$wf")

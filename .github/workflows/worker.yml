@@ -1296,6 +1296,22 @@ jobs:
         # persist. With no marker this step is a no-op: it reports rotated=false and exits 0.
         # Asserted by dispatch-secrets-guard.rotation_writeback_reachable_verdict, so restoring a
         # success-only guard is a red tick rather than a silent regression.
+        #
+        # [issue #300] WHY IT IS SAFE for the one step that holds the registry PAT to execute a
+        # script out of the registry checkout AFTER the model has run. Two containments, and neither
+        # was asserted anywhere until #300 asked — both are now rows in `worker-live.sh --self-test`:
+        #   * THE MODEL CANNOT WRITE THAT CHECKOUT. It runs inside a container whose entire
+        #     filesystem view is the target tree, that tree's read-only .git, the isolated worker
+        #     HOME and the read-only CLI install; the registry checkout beside it is not mounted.
+        #     `_model_container_binds` pins that mount list EXACTLY, so adding a mount — or dropping
+        #     a `readonly` — is a red tick.
+        #   * NO TARGET-CONTROLLED CODE HAS RUN ON THIS RUNNER YET. The rustup provisioning (which
+        #     honours the target's own rust-toolchain.toml) and the policy gate (which executes the
+        #     target's build scripts and tests) are both BELOW this step, and
+        #     `_pat_before_target_code` refuses any lane that makes the PAT live at or after them.
+        # Move this step down, or hand the PAT to a second step further on, and the target's own
+        # build scripts get to rewrite the script that is about to run with the PAT in its
+        # environment — #575's finding with the App token swapped for the registry PAT.
         if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.selected.outcome == 'success' }}
         env:
           WORKER_ROOT: ${{ runner.temp }}/registry-worker

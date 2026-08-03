@@ -1830,6 +1830,13 @@ jobs:
       # refresh cannot happen there — which is exactly why this lane died. Still runs BEFORE the
       # gate: REGISTRY_SECRETS_PAT must never be live in a step that runs after hostile target code
       # executed on this runner (the fix-mode cargo gate below).
+      #
+      # [issue #300] That ordering is ASSERTED now, not just stated here: `_pat_before_target_code`
+      # (worker-live.sh --self-test) refuses either lane that makes the PAT live at or after the
+      # rustup provisioning / the gate. The other half of the same property — the model cannot
+      # rewrite `registry/scripts/worker-live.sh` before this step executes it, because the registry
+      # checkout is not among the model container's bind mounts — is pinned by
+      # `_model_container_binds`. See the long note on the same step in worker.yml.
       - name: Write back a rotated full account credential
         # NO model-step guard (issue #596): see worker.yml — a host-side rotation must be
         # persisted even when the model step never ran, or the consumed grant strands the account.
