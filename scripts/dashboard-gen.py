@@ -4537,9 +4537,58 @@ esac
         silently is unusable, and attaching the log unconditionally would bury every row."""
         check(name, got if got == want else (got, log), want)
 
+    def _tool_probe(*argv):
+        """Exit status of `argv`, or a NAMED diagnostic string when the binary cannot be executed.
+
+        A bare `subprocess.run` raises `FileNotFoundError` on a host without the tool, and it
+        raises it while building the `check(...)` argument — so the row it was meant to produce
+        never prints and the suite ABORTS mid-run. #1496 measured 178 rows on a worker container
+        without `jq`; re-measured on this checkout, 203 of the suite's 305 rows printed and every
+        check below never executed, with no named FAIL to say why — the count differs because the
+        suite grew, the truncation does not. That is the crash-after-partial-run hazard of pre-flight
+        item 4, baked into the suite itself: any author comparing a mutant's kill count against a
+        pristine run would be comparing a truncated run against a full one. Returning the
+        diagnostic as the row's VALUE keeps the dependency NAMED and red — the #922 contract —
+        while the rest of the suite still runs. `node` is guarded the same way (`_node_json`)."""
+        try:
+            return subprocess.run(argv, capture_output=True, check=False).returncode
+        except OSError as exc:
+            return f"`{argv[0]}` could not be executed: {type(exc).__name__}: {exc}"
+
+    # [#1496] The guard's OWN two directions, before the row that depends on it. A probe that
+    # still raises reds `_probe_raised` here instead of aborting, so the mutant is a KILL with the
+    # suite's full check count intact rather than another truncated run.
+    _probe_raised = False
+    try:
+        _absent_probe = _tool_probe("dashboard-gen-1496-no-such-binary", "--version")
+    except OSError:
+        _absent_probe = None
+        _probe_raised = True
+    check("[#1496] a MISSING binary is reported as the probe's value, never raised: the row below "
+          "goes red by name and every check after it still executes",
+          (_probe_raised, isinstance(_absent_probe, str),
+           "dashboard-gen-1496-no-such-binary" in str(_absent_probe), _absent_probe == 0),
+          (False, True, True, False))
+    check("[#1496] ...and the guard is not blanket exception-swallowing: a binary that EXISTS and "
+          "exits non-zero still reports THAT exit status, so a broken tool cannot be mistaken for "
+          "a working one (nor a working one for a missing one)",
+          (_tool_probe(sys.executable, "-c", "raise SystemExit(37)"),
+           _tool_probe(sys.executable, "-c", "")), (37, 0))
+    # The rows above test the GUARD; this one tests its USE. A call site rewired back to an
+    # unguarded `subprocess.run` on the binary keeps them both green while restoring the abort,
+    # which is the AGENTS.md pre-flight item 6 seam — so pin the shape by exact count, both
+    # directions. (The rejected spelling is deliberately never written out below: its own regex is
+    # backslash-escaped and the prose around it says `jq` and the call separately, so this row
+    # counts real call sites rather than matching the text that describes them.)
+    _probe_source = Path(__file__).resolve().read_text(encoding="utf-8")
+    check("[#1496] the jq probe reaches the binary THROUGH the guard: exactly one guarded call "
+          "site and no bare `subprocess.run` one",
+          (len(re.findall(r'_tool_probe\("jq", "--version"\)', _probe_source)),
+           len(re.findall(r'subprocess\.run\(\["jq"', _probe_source))),
+          (1, 0))
     check("[#922] jq is available for the hermetic harness below (a missing dependency must be "
           "NAMED, never silently skipped into a green run)",
-          subprocess.run(["jq", "--version"], capture_output=True).returncode, 0)
+          _tool_probe("jq", "--version"), 0)
     # THE REGRESSION. Fresh runs everywhere — exactly the steady state #79's ring sources produce —
     # and no executed tick for well past the threshold. The pre-#922 body kicked nothing here.
     code, kicked, log = run_keepalive_step(artifacts=[_ka_marker(dispatch_limit + 600)])
