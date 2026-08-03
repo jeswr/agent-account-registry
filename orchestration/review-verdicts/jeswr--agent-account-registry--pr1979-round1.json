@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1979,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "88f9e79916a8826fc9496f1901fc0492652503ba",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "For every non-markdown form element, GitHub requires an `id` with a constrained format, and IDs must be unique within the form. `_assert_issue_form_valid` never inspects `id`, so an input/textarea/dropdown/checkboxes element with no ID, an invalid ID, or a duplicate ID passes this gate despite not satisfying the renderer schema. The truthiness-only `attributes.get(required)` checks have the same problem for types and nested shape: for example, `label: [x]`, `options: text`, or checkbox options without per-option `label` values are truthy and accepted even though they are not valid renderer shapes. The added tests only mutate body presence, name, element type, and one top-level required attribute, so none turns red for these omissions. This contradicts the marquee claim that touched forms are held to the shape GitHub's renderer requires and leaves a silent non-rendering path.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Validate required non-markdown IDs (type, allowed syntax, and uniqueness), validate required attributes by their renderer-required types, and validate the nested option schema for dropdowns/checkboxes. Add focused negative fixtures for at least a missing/invalid/duplicate ID, wrong attribute types, and a checkbox option missing its label, while retaining a positive fixture for every supported element type.",
+    "severity": "major",
+    "title": "Validator accepts renderer-invalid element IDs and attribute shapes"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new classification and fail-closed gate wiring are sound, but the validator does not actually enforce the renderer-required issue-form shape it claims to enforce. It accepts multiple syntactically valid forms that GitHub cannot render, and the self-tests omit those cases. Because this leaves the mint-path gap only partially closed, changes are required.",
+  "verdict": "request_changes"
+ }
+}
