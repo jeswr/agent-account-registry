@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5856,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c7d0b3367f05fdfc52dd4bb28411af803c2938b8",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`analyse_run_body()` records the full logical `text` for every statement, and `check_tree()` tests the waiver command as a substring of that full line without preventing a waiver from matching more than once. For `cargo test || true; cargo clippy || true`, both findings carry the same line text. A single waiver whose command is `cargo test` therefore matches and suppresses both findings, contradicting the documented one-command scope and allowing an undeclared swallow through R1.",
+    "file": "scripts/check-workflow-run-swallow.py",
+    "fix_hint": "Store the offending statement (or an exact command identity) in each finding, match the waiver only against that statement, and enforce one-to-one waiver consumption. Add a negative fixture with two swallowed gate commands on one logical line and a waiver for only the first; the second must remain an R1 offence.",
+    "severity": "major",
+    "title": "One waiver can cover multiple swallowed commands on the same logical line"
+   },
+   {
+    "body": "D2 recognizes capture only when the next flattened statement exactly matches `CAPTURE_RE`. In `set +e; cargo test || rc=$?; set -e; exit \"${rc:-0}\"`, the capture is part of the gate statement, so `captured` is false and the checker reports D2. This status is not discarded: the failure arm captures it for later propagation, exactly like the documented disciplined `cmd || rc=$?` form. The existing clean fixture tests that form only while errexit is enabled and therefore does not exercise the D2 branch.",
+    "file": "scripts/check-workflow-run-swallow.py",
+    "fix_hint": "Recognize a non-discarding `|| <name>=$?` arm as an inline capture for D2 (without treating arbitrary `|| ...` as safe). Add a clean fixture combining `set +e`, the inline capture, re-arming, and an exit that propagates the captured status.",
+    "severity": "major",
+    "title": "D2 rejects a legitimate `|| rc=$?` capture when errexit is off"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The two round-1 bypasses are repaired and now have direct fixtures, but round 2 exposes two new correctness gaps in the checker. Waivers are matched against an entire logical line and may be reused, so one waiver can silently cover multiple swallowed verification commands on that line. The D2 analysis also misclassifies a legitimate same-statement status capture (`cmd || rc=$?`) whenever errexit is disabled. Because these are new major findings, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
