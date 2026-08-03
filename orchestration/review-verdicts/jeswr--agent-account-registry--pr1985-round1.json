@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1985,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a53fed26b2b74c24739dd3da79519317f24ffda2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe DOM shim now models `childElementCount` as element-only, and the focused shim assertion independently proves that appending a text node does not increase it. The new executed page checks exercise both sides of `renderObservability`'s empty-grid branch using normalized documents, inspect the grid without filtering away non-card children, and compare against literal expected output. This closes the prior vacuity without weakening a trust check or introducing a security-sensitive path.",
+  "verdict": "approve"
+ }
+}
