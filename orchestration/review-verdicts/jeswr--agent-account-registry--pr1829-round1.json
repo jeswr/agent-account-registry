@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1829,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "36bf82eeb68c2d047efb8f3d51faa7141241235d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change correctly converts an unexecutable jq dependency from an uncaught OSError that truncates the self-test into a named failing value while allowing later rows to run. The helper preserves real exit statuses, the added checks exercise missing, failing, and successful executables, and the source-shape assertion independently pins the jq call site to the guard rather than merely testing the helper in isolation. I found no correctness, soundness, test-validity, or security defect in the diff.",
+  "verdict": "approve"
+ }
+}
