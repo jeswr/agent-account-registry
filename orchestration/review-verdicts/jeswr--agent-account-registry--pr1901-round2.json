@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1901,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e04a80e31169e74ed43416c22f453a9305aabe07",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The two round-1 major findings are corrected. The design now describes the actual auto-arm path precisely: independent cross-provider approval is the arm decision for this target, with SHA binding and the trust-surface audit trail, rather than claiming a separate human arm. The adversarial live criterion now separates TCP and DNS denial from the deliberately open log channel, requires both network attempts to fail, requires printing to succeed as a positive control, and requires a repeat if that control does not execute. The added run_gate comment is consistent with those boundaries and changes no control flow. I found no new correctness, soundness, test-validity, or security defect in the diff.",
+  "verdict": "approve"
+ }
+}
