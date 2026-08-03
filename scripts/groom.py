@@ -1708,6 +1708,36 @@ def _release_claims(
 ACCT_CLAIM_REF_RE = re.compile(r"^refs/acct-claims/acct([0-9]+)$")
 ACCT_ISSUE_TITLE_RE = re.compile(r"^acct([0-9]+)$")
 ACCT_SECRET_NAME_RE = re.compile(r"^ACCT([0-9]+)_TOKEN$")
+# [#1260] The credential-BINDING namespace (#534):
+# `refs/acct-requests/<request>/<handle>/<provider>/<format>/<digest>`, written by the
+# set-up-account store step after it owns the slot claim and BEFORE the secret-absence probes and
+# the `gh secret set` upsert. A burned slot that CARRIES a binding is a run that died inside that
+# window — the resumable case an operator most wants named — while a burned slot without one may
+# have died before capture. Until this report read the namespace nothing enumerated the bindings.
+#
+# ⚠️ THE PRODUCER IS NOT IN THIS TREE. `.github/workflows/set-up-account.yml` here creates only
+# `refs/acct-claims/$cand` and then stores the secret; the binding write ships with #534 and has
+# not landed. So on this tree the listing is EMPTY BY CONSTRUCTION and `bindings=0` says nothing
+# about enrolment history. That is why an all-zero census emits ORPHAN_CLAIM_NO_BINDINGS_NOTE
+# rather than letting a reader take a silent row as `this slot died before capture`: absence of a
+# binding is only evidence once a producer exists to have written one. This consumer is written
+# against the ref grammar #534 builds so it goes live unchanged when that producer lands; do NOT
+# read a burned row's missing annotation as `not resumable` until it has.
+#
+# The handle component uses the CANONICAL account grammar (`acct[0-9a-z]{2,}`, `grant-account.py`
+# HANDLE_RE), not `acctNN`: the pool carries legacy non-numeric handles (`acct2css`) and assuming
+# digits would refuse a perfectly valid binding. Only a numeric handle keys a claim SLOT, which is
+# what this report is indexed by; a non-numeric one is counted and binds no slot.
+#
+# PRIVACY: a binding ref is NEVER printed. Its `<digest>` and `<provider>`/`<format>` components
+# describe a captured credential, and its `<handle>` may name an account-backed slot — both outside
+# what decision 22b lets a public log carry. Bindings are COUNTED in the summary, and a burned slot
+# (which by construction backs no account) is annotated with the mere FACT that one exists.
+ACCT_BINDING_NAMESPACE = "refs/acct-requests/"
+ACCT_BINDING_REF_RE = re.compile(
+    r"^refs/acct-requests/[^/]+/(acct[0-9a-z]{2,})/[^/]+/[^/]+/[^/]+$"
+)
+ACCT_BINDING_HANDLE_SLOT_RE = re.compile(r"^acct([0-9]+)$")
 # The names-only ACCTNN_TOKEN inventory groom.yml's least-exposure filter step derives from the
 # job's `toJSON(secrets)` context (dispatch.yml's `acct-secrets` pattern): only that tiny inline
 # step ever sees the secrets map, and only NAMES reach this process.
@@ -1715,7 +1745,25 @@ ACCT_SECRET_NAMES_ENV = "ACCT_SECRET_NAMES"
 ORPHAN_CLAIM_NOTE = (
     "ORPHAN-CLAIMS report-only — NEVER delete a claim ref: a burned slot is harmless, while "
     "recycling its number re-opens the credential-overwrite race the claim closes "
-    "(`gh secret set` is an upsert, and GitHub does not enforce unique issue titles)."
+    "(`gh secret set` is an upsert, and GitHub does not enforce unique issue titles). The same "
+    "rule covers a `refs/acct-requests/` binding: deleting one re-opens the resume gap it closes, "
+    "because a retry reads it as `this enrolment captured a credential for this slot`."
+)
+ORPHAN_CLAIM_BOUND_SUFFIX = (
+    "; a credential BINDING exists for this slot, so the run died between the binding write and "
+    "the `gh secret set` upsert — the RESUMABLE case (re-apply set-up-account; never delete the "
+    "binding)"
+)
+# Emitted when burned slots exist but the binding namespace is EMPTY. Without it a reader takes
+# every unannotated burned row as `died before capture`, which is only a sound reading once an
+# enrolment actually writes bindings — and on this tree none does (#534's producer has not landed).
+# An empty namespace and a deployed-but-never-exercised one are indistinguishable from here, so the
+# report states the ambiguity instead of resolving it in the direction that happens to look tidy.
+ORPHAN_CLAIM_NO_BINDINGS_NOTE = (
+    "ORPHAN-CLAIMS bindings=0 — the `refs/acct-requests/` namespace is empty, so NO burned slot "
+    "above can be classified as resumable. This is NOT evidence that these slots died before "
+    "credential capture: the binding writer ships with #534 and is absent from set-up-account "
+    "here, so an empty namespace is the expected reading until it lands."
 )
 
 
@@ -1819,6 +1867,56 @@ def parse_acct_secret_names(raw: Any) -> list[str]:
     return names
 
 
+def binding_ref_handles(refs: Any) -> list[str]:
+    """Pure: the `<handle>` component of every `refs/acct-requests/` binding, in listing order.
+
+    FAIL CLOSED, for the same reason the other three listings do and with a failure of its own.
+    A silently short binding set annotates NOTHING, so a burned slot that is one `gh secret set`
+    away from complete prints as though its broker died before capture — the operator reads
+    `not resumable` off a listing that merely could not be parsed.
+
+    A ref that IS inside the namespace but does not match the binding grammar therefore refuses
+    rather than being skipped: it may well bind the very slot about to be printed as unbound, and
+    an unrecognised shape here means the namespace moved and this reader no longer understands it.
+    Refs OUTSIDE the namespace are ignored (the `matching-refs/acct-requests/` prefix is what
+    selects the listing; a foreign ref in it is not this report's to interpret)."""
+    if not isinstance(refs, list):
+        raise GroomError("acct-requests binding listing is malformed")
+    handles: list[str] = []
+    for entry in refs:
+        ref = entry.get("ref") if isinstance(entry, dict) else None
+        if not isinstance(ref, str):
+            raise GroomError("acct-requests binding listing is malformed")
+        if not ref.startswith(ACCT_BINDING_NAMESPACE):
+            continue
+        match = ACCT_BINDING_REF_RE.match(ref)
+        if match is None:
+            # Names no ref: an unparseable binding may still name an account-backed handle, and
+            # its `<digest>` component describes a captured credential (decision 22b).
+            raise GroomError(
+                "acct-requests binding listing carries a ref that is not a "
+                "`<request>/<handle>/<provider>/<format>/<digest>` binding — refusing to report "
+                "any burned slot as unbound (fail closed)"
+            )
+        handles.append(match.group(1))
+    return handles
+
+
+def binding_slots(handles: list[str]) -> set[int]:
+    """Pure: the claim SLOT numbers a set of binding handles names.
+
+    A binding under a legacy non-numeric handle (`acct2css`) names no slot number — the claim
+    namespace this report is indexed by is `acctNN` only — so it is counted by the census and
+    annotates nothing. Several bindings may name one slot (a resumed enrolment writes another
+    request), which is not an ambiguity: the report only ever asks whether one EXISTS."""
+    slots: set[int] = set()
+    for handle in handles:
+        match = ACCT_BINDING_HANDLE_SLOT_RE.match(handle)
+        if match:
+            slots.add(int(match.group(1)))
+    return slots
+
+
 def orphaned_claim_slots(
     claims: dict[int, str] | set[int], issue_slots: set[int], secret_slots: set[int]
 ) -> list[int]:
@@ -1829,24 +1927,43 @@ def orphaned_claim_slots(
     enrolment died between the upsert and the issue), not a burned slot; a claim + issue with no
     secret is an account mid-enrolment. Neither is free, and neither is what this reports.
     Slots with an issue or a secret but NO claim are the legacy/out-of-band numbers the namespace
-    was never backfilled for — allocated, not burned, and outside this report."""
+    was never backfilled for — allocated, not burned, and outside this report.
+
+    A `refs/acct-requests/` binding is deliberately NOT a third exclusion (#1260). A binding proves
+    a credential was captured for the slot, not that one was ever STORED, so excluding it would
+    hide the burned slot closest to being recoverable. It only ANNOTATES the row."""
     return sorted(set(claims) - issue_slots - secret_slots)
 
 
 def format_orphan_claim_report(
-    claims: dict[int, str], issue_slots: set[int], secret_slots: set[int]
+    claims: dict[int, str],
+    issue_slots: set[int],
+    secret_slots: set[int],
+    binding_handles: list[str],
 ) -> list[str]:
-    """Pure: the report lines. One counted summary, one named line per burned slot."""
+    """Pure: the report lines. One counted summary, one named line per burned slot.
+
+    `binding_handles` is REQUIRED, not defaulted: a caller that skipped the binding listing would
+    otherwise silently report every burned slot as carrying no binding.
+
+    When burned slots exist and NO binding does, the report says so explicitly (#1260 review r1):
+    the annotation's absence is only informative once a producer exists to have written one, and
+    on this tree none does. A silent zero would read as `none of these are resumable`."""
     orphans = orphaned_claim_slots(claims, issue_slots, secret_slots)
+    bound = binding_slots(binding_handles)
     lines = [
         f"ORPHAN-CLAIMS claims={len(claims)} account_issues={len(issue_slots)} "
-        f"account_secrets={len(secret_slots)} burned={len(orphans)}"
+        f"account_secrets={len(secret_slots)} bindings={len(binding_handles)} "
+        f"burned={len(orphans)}"
     ]
     for slot in orphans:
         lines.append(
             f"ORPHAN-CLAIM {claims[slot]}: slot claimed, but no acct{slot:02d} issue and no "
             f"ACCT{slot:02d}_TOKEN secret exist — burned by a failed enrolment"
+            + (ORPHAN_CLAIM_BOUND_SUFFIX if slot in bound else "")
         )
+    if orphans and not binding_handles:
+        lines.append(ORPHAN_CLAIM_NO_BINDINGS_NOTE)
     lines.append(
         ORPHAN_CLAIM_NOTE
         if orphans
@@ -1856,7 +1973,8 @@ def format_orphan_claim_report(
 
 
 def report_orphan_claims(args: argparse.Namespace) -> int:
-    """Report the burned account slots. READ-ONLY: three listings and a print, no mutation.
+    """Report the burned account slots. READ-ONLY: an env-derived secret inventory, three
+    paginated listings and a print, no mutation.
 
     The secret inventory is resolved FIRST and fails closed, so a run that cannot prove which
     ACCTNN_TOKEN secrets exist refuses before it reads anything else — it never degrades into
@@ -1868,16 +1986,22 @@ def report_orphan_claims(args: argparse.Namespace) -> int:
         parse_acct_secret_names(os.environ.get(ACCT_SECRET_NAMES_ENV))
     )
     api = GitHubAPI(os.environ.get("REGISTRY_GH_TOKEN", ""), "registry")
-    # Both listings are FULLY PAGINATED, for the reason the broker's union is: a capped page
-    # silently drops account issues (over-reporting burned slots) or claim refs (under-reporting
-    # them). A listing that fails raises — the report refuses rather than guessing.
+    # All THREE API listings are FULLY PAGINATED, for the reason the broker's union is: a capped page
+    # silently drops account issues (over-reporting burned slots), claim refs (under-reporting
+    # them) or bindings (reporting a resumable slot as one whose broker died before capture). A
+    # listing that fails raises — the report refuses rather than guessing.
     claims = claim_ref_slots(
         api.paginate(f"/repos/{registry_repo}/git/matching-refs/acct-claims/")
     )
     issue_slots = account_issue_slots(
         api.paginate(f"/repos/{registry_repo}/issues?state=all")
     )
-    for line in format_orphan_claim_report(claims, issue_slots, secret_slots):
+    # Read BEFORE anything prints, so a refusal here never leaves a half-published report (#1260).
+    # An empty namespace lists as `[]`, so a registry with no bindings at all reports bindings=0.
+    binding_handles = binding_ref_handles(
+        api.paginate(f"/repos/{registry_repo}/git/matching-refs/acct-requests/")
+    )
+    for line in format_orphan_claim_report(claims, issue_slots, secret_slots, binding_handles):
         print(line)
     return 0
 
@@ -10859,6 +10983,39 @@ def _self_test() -> int:
     check("orphan-claims: a PROVEN-EMPTY inventory is accepted (it is not the same as unset)",
           parse_acct_secret_names("[]"), [])
 
+    # ---- the credential-binding namespace (issue #1260) ---------------------------------------
+    # Literal refs, never built from ACCT_BINDING_REF_RE: an input derived from the constant the
+    # code reads cannot fail when that constant moves (AGENTS.md item 2c).
+    check("orphan-claims: a binding ref yields its HANDLE component, and the canonical grammar "
+          "(not acctNN) is what parses it — the pool carries legacy `acct2css`-shaped handles",
+          binding_ref_handles([
+              {"ref": "refs/acct-requests/req-1/acct05/anthropic/claude-oauth-token/9f8e7d"},
+              {"ref": "refs/acct-requests/req-2/acct2css/openai/codex-auth-json/1a2b3c"},
+              {"ref": "refs/heads/acct05"},
+          ]),
+          ["acct05", "acct2css"])
+    check("orphan-claims: only a NUMERIC handle keys a claim slot; a legacy handle is counted but "
+          "names none, and two bindings on one slot are not an ambiguity (a resumed enrolment "
+          "writes a second request)",
+          (binding_slots(["acct05", "acct2css", "acct5", "acct05"]), binding_slots([])),
+          ({5}, set()))
+    check("orphan-claims: a malformed binding listing REFUSES rather than reporting a short set "
+          "as clean — an unparseable binding may name the very slot about to print as unbound",
+          [_orphan_raises(binding_ref_handles, payload)
+           for payload in ("not-a-list", None, [{"ref": 7}],
+                           ["refs/acct-requests/req-1/acct05/a/b/c"],
+                           # In-namespace refs that are NOT the documented binding shape.
+                           [{"ref": "refs/acct-requests/req-1/acct05/anthropic/fmt"}],
+                           [{"ref": "refs/acct-requests/req-1/acct05/a/b/c/extra"}],
+                           [{"ref": "refs/acct-requests/req-1/notahandle/a/b/c"}],
+                           [{"ref": "refs/acct-requests/"}])],
+          [True] * 8)
+    check("orphan-claims: the in-namespace refusal is EXACT — a well-formed binding beside a "
+          "foreign ref still parses, so the guard cannot swallow a normal inventory",
+          binding_ref_handles([{"ref": "refs/acct-claims/acct05"},
+                               {"ref": "refs/acct-requests/req-1/acct05/a/b/c"}]),
+          ["acct05"])
+
     orphan_claims_fixture = {5: "refs/acct-claims/acct05", 6: "refs/acct-claims/acct06",
                              7: "refs/acct-claims/acct07", 8: "refs/acct-claims/acct08"}
     check("orphan-claims: ONLY a claim with NEITHER an issue NOR a secret is burned — claim+secret "
@@ -10872,22 +11029,97 @@ def _self_test() -> int:
           "burned, and is not reported",
           orphaned_claim_slots({}, {2}, {3}), [])
 
-    orphan_burned_report = format_orphan_claim_report(orphan_claims_fixture, {6}, {7})
-    check("orphan-claims: the report counts the fleet and NAMES each burned ref",
-          (orphan_burned_report[0],
-           [line for line in orphan_burned_report if line.startswith("ORPHAN-CLAIM ")]),
-          ("ORPHAN-CLAIMS claims=4 account_issues=1 account_secrets=1 burned=2",
-           [f"ORPHAN-CLAIM refs/acct-claims/acct0{slot}: slot claimed, but no acct0{slot} issue "
-            f"and no ACCT0{slot}_TOKEN secret exist — burned by a failed enrolment"
-            for slot in (5, 8)]))
+    # Slot 5 is burned AND bound; slot 8 is burned and unbound; slot 6 is bound but carries an
+    # issue, and the legacy handle names no slot at all — so the census counts three bindings
+    # while exactly one row is annotated.
+    orphan_burned_report = format_orphan_claim_report(
+        orphan_claims_fixture, {6}, {7}, ["acct05", "acct06", "acct2css"])
+    orphan_burned_rows = [line for line in orphan_burned_report
+                          if line.startswith("ORPHAN-CLAIM ")]
+    check("orphan-claims: the report counts the fleet — the binding namespace included, so it is "
+          "no longer unenumerated — and NAMES each burned ref",
+          (orphan_burned_report[0], [row.split()[1].rstrip(":") for row in orphan_burned_rows]),
+          ("ORPHAN-CLAIMS claims=4 account_issues=1 account_secrets=1 bindings=3 burned=2",
+           ["refs/acct-claims/acct05", "refs/acct-claims/acct08"]))
+    check("orphan-claims [#1260]: BOTH DIRECTIONS — a burned slot WITH a binding is annotated as "
+          "the RESUMABLE case (the run died between the binding write and the secret upsert) and "
+          "a burned slot WITHOUT one is not; the two used to print identically. Expected lines "
+          "are written out in full, never assembled from the constants the code formats from",
+          orphan_burned_rows,
+          ["ORPHAN-CLAIM refs/acct-claims/acct05: slot claimed, but no acct05 issue and no "
+           "ACCT05_TOKEN secret exist — burned by a failed enrolment; a credential BINDING exists "
+           "for this slot, so the run died between the binding write and the `gh secret set` "
+           "upsert — the RESUMABLE case (re-apply set-up-account; never delete the binding)",
+           "ORPHAN-CLAIM refs/acct-claims/acct08: slot claimed, but no acct08 issue and no "
+           "ACCT08_TOKEN secret exist — burned by a failed enrolment"])
+
+    check("orphan-claims [#1260]: an EMPTY binding namespace still emits its count — a registry "
+          "whose enrolments never wrote a binding must read `bindings=0`, never a missing field, "
+          "and no burned row is annotated",
+          format_orphan_claim_report(orphan_claims_fixture, {6}, {7}, [])[:2],
+          ["ORPHAN-CLAIMS claims=4 account_issues=1 account_secrets=1 bindings=0 burned=2",
+           "ORPHAN-CLAIM refs/acct-claims/acct05: slot claimed, but no acct05 issue and no "
+           "ACCT05_TOKEN secret exist — burned by a failed enrolment"])
+
+    # Review round 1 of #1964: no producer writes `refs/acct-requests/` on this tree, so an empty
+    # namespace is the STEADY STATE, not a finding about enrolment history. A silent zero would let
+    # every burned row read as `died before capture` — the exact claim the report cannot support.
+    def _orphan_zero_note(report: list[str]) -> list[str]:
+        return [line for line in report if line.startswith("ORPHAN-CLAIMS bindings=0")]
+
+    zero_binding_note = (
+        "ORPHAN-CLAIMS bindings=0 — the `refs/acct-requests/` namespace is empty, so NO burned "
+        "slot above can be classified as resumable. This is NOT evidence that these slots died "
+        "before credential capture: the binding writer ships with #534 and is absent from "
+        "set-up-account here, so an empty namespace is the expected reading until it lands.")
+    check("orphan-claims [#1260 r1]: BOTH DIRECTIONS — burned slots with an EMPTY binding "
+          "namespace emit the not-evidence disclosure (nothing produces a binding on this tree, so "
+          "an unannotated row must NOT read as `died before capture`), while a report that DID see "
+          "a binding does not. Expected text is written out in full, never read from the constant",
+          (_orphan_zero_note(format_orphan_claim_report(orphan_claims_fixture, {6}, {7}, [])),
+           _orphan_zero_note(orphan_burned_report)),
+          ([zero_binding_note], []))
+    check("orphan-claims [#1260 r1]: the disclosure is scoped to a report that NAMES a burned slot "
+          "— a clean fleet with no bindings has nothing to misread, so it stays quiet",
+          _orphan_zero_note(format_orphan_claim_report({6: "refs/acct-claims/acct06"}, {6},
+                                                       set(), [])),
+          [])
+    check("orphan-claims [#1260 r1]: the disclosure is an EXTRA line, never a replacement — the "
+          "never-delete note still lands last and every burned row is still named",
+          (format_orphan_claim_report(orphan_claims_fixture, {6}, {7}, [])[-1] == ORPHAN_CLAIM_NOTE,
+           len([line for line in format_orphan_claim_report(orphan_claims_fixture, {6}, {7}, [])
+                if line.startswith("ORPHAN-CLAIM ")])),
+          (True, 2))
+
+    def _orphan_named(issues: set[int], secrets: set[int], handles: list[str]) -> list[str]:
+        return [line.split()[1].rstrip(":") for line
+                in format_orphan_claim_report(orphan_claims_fixture, issues, secrets, handles)
+                if line.startswith("ORPHAN-CLAIM ")]
+
+    check("orphan-claims [#1260]: a binding is an ANNOTATION, never a third exclusion and never a "
+          "row of its own — with EVERY slot bound the reported set is unchanged, and dropping "
+          "either exclusion still changes the answer",
+          (_orphan_named({6}, {7}, ["acct05", "acct06", "acct07", "acct08"]),
+           _orphan_named(set(), {7}, ["acct05", "acct06", "acct07", "acct08"]),
+           _orphan_named({6}, set(), ["acct05", "acct06", "acct07", "acct08"])),
+          (["refs/acct-claims/acct05", "refs/acct-claims/acct08"],
+           ["refs/acct-claims/acct05", "refs/acct-claims/acct06", "refs/acct-claims/acct08"],
+           ["refs/acct-claims/acct05", "refs/acct-claims/acct07", "refs/acct-claims/acct08"]))
     check("orphan-claims: a burned report carries the NEVER-DELETE instruction (deletion re-opens "
-          "the overwrite race the claim closes)",
-          orphan_burned_report[-1], ORPHAN_CLAIM_NOTE)
-    orphan_clean_report = format_orphan_claim_report({6: "refs/acct-claims/acct06"}, {6}, set())
-    check("orphan-claims: a clean fleet reports `none` and names no slot",
-          (len(orphan_clean_report), "burned=0" in orphan_clean_report[0],
+          "the overwrite race the claim closes; deleting a binding re-opens the resume gap)",
+          (orphan_burned_report[-1] == ORPHAN_CLAIM_NOTE,
+           "NEVER delete a claim ref" in orphan_burned_report[-1],
+           "deleting one re-opens the resume gap" in orphan_burned_report[-1]),
+          (True, True, True))
+    orphan_clean_report = format_orphan_claim_report(
+        {6: "refs/acct-claims/acct06"}, {6}, set(), ["acct06", "acct2css"])
+    check("orphan-claims: a clean fleet reports `none` and names no slot — and the binding census "
+          "still emits its real count on that quiet tick, rather than going silent",
+          (len(orphan_clean_report), orphan_clean_report[0],
            [line for line in orphan_clean_report if line.startswith("ORPHAN-CLAIM ")]),
-          (2, True, []))
+          (2,
+           "ORPHAN-CLAIMS claims=1 account_issues=1 account_secrets=0 bindings=2 burned=0",
+           []))
 
     # The CLI contract, driven through main() exactly as groom.yml drives it: real argument
     # parsing, real environment resolution, the real paginated request sequence. A pure function
@@ -10907,6 +11139,13 @@ def _self_test() -> int:
             # the pull_request exclusion silently loses that row from the report.
             {"title": "acct09", "pull_request": {"url": "x"}},
             {"title": "groom: report orphaned acct-claims refs"},
+        ],
+        # [#1260] Burned slot 5 carries a binding (died between the binding write and the secret
+        # upsert); burned slot 9 does not. Slot 7's binding backs a stored credential and must
+        # never surface. Dropping this listing from the call site reports slot 5 as unbound.
+        f"/repos/{orphan_repo}/git/matching-refs/acct-requests/": [
+            {"ref": "refs/acct-requests/req-1/acct05/anthropic/claude-oauth-token/9f8e7d"},
+            {"ref": "refs/acct-requests/req-2/acct07/openai/codex-auth-json/1a2b3c"},
         ],
     }
     orphan_saved_api = globals()["GitHubAPI"]
@@ -10953,16 +11192,32 @@ def _self_test() -> int:
            sorted(line.split()[1].rstrip(":") for line in orphan_text.splitlines()
                   if line.startswith("ORPHAN-CLAIM "))),
           (0, ["refs/acct-claims/acct05", "refs/acct-claims/acct09"]))
-    check("orphan-claims CLI: the summary line counts what the three listings proved",
+    check("orphan-claims CLI: the summary line counts what the four inventories proved",
           [line for line in orphan_text.splitlines() if line.startswith("ORPHAN-CLAIMS ")][0],
-          "ORPHAN-CLAIMS claims=4 account_issues=1 account_secrets=1 burned=2")
-    check("orphan-claims CLI: REPORT-ONLY — every request is a GET, so no claim ref can be "
-          "deleted (deletion re-opens the credential-overwrite race the claim closes)",
+          "ORPHAN-CLAIMS claims=4 account_issues=1 account_secrets=1 bindings=2 burned=2")
+    check("orphan-claims CLI [#1260]: END TO END the binding annotation reaches the log on the "
+          "burned slot that has one and NOT on the burned slot that does not",
+          sorted(("bound" if "credential BINDING exists" in line else "unbound")
+                 + " " + line.split()[1].rstrip(":")
+                 for line in orphan_text.splitlines() if line.startswith("ORPHAN-CLAIM ")),
+          ["bound refs/acct-claims/acct05", "unbound refs/acct-claims/acct09"])
+    check("orphan-claims CLI [#1260]: no binding ref, digest, provider or request id reaches the "
+          "log — decision 22b lets a burned SLOT be named, not a captured credential",
+          ([token for token in ("9f8e7d", "1a2b3c", "req-1", "req-2",
+                                "claude-oauth-token", "codex-auth-json")
+            if token in orphan_text],
+           # The namespace is named in the never-delete note; a REF under it never is.
+           re.findall(r"refs/acct-requests/[^`\s]", orphan_text)),
+          ([], []))
+    check("orphan-claims CLI: REPORT-ONLY — every request is a GET, so no claim ref and no "
+          "binding can be deleted (deletion re-opens the credential-overwrite race the claim "
+          "closes, and the resume gap the binding closes)",
           sorted({method for method, _path, _body in orphan_calls}), ["GET"])
-    check("orphan-claims CLI: both listings go through the PAGINATED reader (a capped page drops "
-          "claim refs or account issues and silently changes the verdict)",
+    check("orphan-claims CLI: all three listings go through the PAGINATED reader (a capped page "
+          "drops claim refs, account issues or bindings and silently changes the verdict)",
           sorted(path for _method, path, _body in orphan_calls),
           [f"/repos/{orphan_repo}/git/matching-refs/acct-claims/?per_page=100&page=1",
+           f"/repos/{orphan_repo}/git/matching-refs/acct-requests/?per_page=100&page=1",
            f"/repos/{orphan_repo}/issues?state=all&per_page=100&page=1"])
     check("orphan-claims CLI: no secret VALUE and no token reaches the report's output",
           [token for token in ("registry-token", "REGISTRY_SECRETS_PAT") if token in orphan_text],
@@ -10986,6 +11241,32 @@ def _self_test() -> int:
           "count that quietly dropped a real claim ref must never be published as the fleet's "
           "burned-slot truth",
           (orphan_ambiguous_code, "ORPHAN-CLAIM" in orphan_ambiguous_text), (1, False))
+    orphan_unbound_code, orphan_unbound_text, _ = _orphan_cli(
+        {"REGISTRY_GH_TOKEN": "registry-token", ACCT_SECRET_NAMES_ENV: '["ACCT07_TOKEN"]'},
+        {**orphan_pages,
+         f"/repos/{orphan_repo}/git/matching-refs/acct-requests/": [
+             {"ref": "refs/acct-requests/req-1/acct05/anthropic/claude-oauth-token"},
+         ]})
+    check("orphan-claims CLI [#1260]: an UNPROVEN binding inventory exits NON-ZERO and emits NO "
+          "report — a short binding set must never be published as `these burned slots carry no "
+          "binding`, and the refusal lands before any line is printed",
+          (orphan_unbound_code, "ORPHAN-CLAIM" in orphan_unbound_text), (1, False))
+    # The state this tree is ACTUALLY in: set-up-account writes no binding, so the live listing is
+    # `[]`. Drive the real CLI through it and require the not-evidence disclosure to reach the log.
+    orphan_nobind_code, orphan_nobind_text, _ = _orphan_cli(
+        {"REGISTRY_GH_TOKEN": "registry-token", ACCT_SECRET_NAMES_ENV: '["ACCT07_TOKEN"]'},
+        {**orphan_pages, f"/repos/{orphan_repo}/git/matching-refs/acct-requests/": []})
+    check("orphan-claims CLI [#1260 r1]: with NO producer writing the namespace — this tree's real "
+          "steady state — the report still succeeds, still names every burned slot, annotates NONE "
+          "of them as resumable, and SAYS SO rather than leaving a silent zero to read as `these "
+          "died before capture`",
+          (orphan_nobind_code,
+           sorted(line.split()[1].rstrip(":") for line in orphan_nobind_text.splitlines()
+                  if line.startswith("ORPHAN-CLAIM ")),
+           "credential BINDING exists" in orphan_nobind_text,
+           any(line.startswith("ORPHAN-CLAIMS bindings=0 — the `refs/acct-requests/` namespace "
+                               "is empty") for line in orphan_nobind_text.splitlines())),
+          (0, ["refs/acct-claims/acct05", "refs/acct-claims/acct09"], False, True))
     orphan_untoken_code, orphan_untoken_text, _ = _orphan_cli(
         {"REGISTRY_GH_TOKEN": None, ACCT_SECRET_NAMES_ENV: '["ACCT07_TOKEN"]'}, orphan_pages)
     check("orphan-claims CLI: a missing registry token is a REFUSAL, not an empty report",
@@ -11127,8 +11408,9 @@ def main() -> int:
         "--report-orphan-claims",
         action="store_true",
         help="report `refs/acct-claims/` slots burned by a failed enrolment — claimed, but with "
-             "no acctNN issue and no ACCTNN_TOKEN secret (issue #245), then exit. REPORT-ONLY: "
-             "claim refs are never deleted",
+             "no acctNN issue and no ACCTNN_TOKEN secret (issue #245) — annotated with whether a "
+             "`refs/acct-requests/` credential binding exists for the slot (issue #1260), then "
+             "exit. REPORT-ONLY: neither a claim ref nor a binding is ever deleted",
     )
     parser.add_argument("--registry-repo")
     parser.add_argument("--policy-file", default="policy/repos.toml")

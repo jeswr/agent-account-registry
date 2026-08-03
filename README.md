@@ -442,6 +442,22 @@ REPORT-ONLY and deliberately has no cleanup mode: deleting a claim ref re-opens 
 above. A slot that carries a secret but no issue is NOT reported — that is a stored credential
 whose enrolment died before registration, and it needs the account issue written, not a cleanup.
 
+The same line also counts the credential-binding namespace (`bindings=`, from
+`refs/acct-requests/`) and annotates a burned slot that carries a binding of its own (#1260). That
+annotation is the **resumable** case: the enrolment writes its binding (#534) after it owns the
+slot claim and before the credential is stored, so a burned slot with one died in that window.
+Bindings are counted, never printed (a binding ref names a handle and a credential digest), and
+never deleted — deleting one re-opens the resume gap it closes. If the binding listing cannot be
+read or parsed, the whole report refuses rather than reporting a short set as clean.
+
+⚠️ **The binding writer is not deployed yet.** `set-up-account.yml` in this tree claims the slot
+and stores the credential without writing a binding; that write lands with #534. Until it does,
+`bindings=0` is the expected steady state and carries **no** information about enrolment history,
+so the report emits an explicit `bindings=0 … NOT evidence` line whenever it names a burned slot
+with an empty namespace. Do not read a burned slot's missing annotation as "not resumable" before
+the producer ships. The reader is written against the exact ref grammar #534 builds, so it starts
+reporting real bindings unchanged once that PR merges.
+
 ### Step 0 — obtain a DURABLE, NON-ROTATING token (do NOT use a subscription blob)
 
 - **Anthropic** (Claude models): run `claude setup-token` while logged into the target account. It
