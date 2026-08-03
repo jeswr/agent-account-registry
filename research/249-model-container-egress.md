@@ -57,6 +57,11 @@ Credential delivery splits by format, and the two halves are **not equally expos
 | `anthropic-api-key` | `--env ANTHROPIC_API_KEY` (`worker-live.sh:443`) | **yes** — `sk-ant-…`, valid until revoked |
 | `claude-credentials-json` | read-only bind mount of the credential **unmodified** — the `codex-auth-json`-only pre-flight in `worker-prep.sh` never rewrites it | **yes** — `claudeAiOauth.refreshToken` reaches the container |
 
+⚠️ **Row 4 is superseded: #1675 closed that hole by REFUSING the format outright**, in both
+`worker-prep.sh` and `worker-live.sh`. The row is kept because it is the state §5.E and §9 item 3
+were written against, and because the refusal — not a strip — is what increment 2 must replace; see
+[`research/1676-anthropic-short-lived-credential-feasibility.md`](1676-anthropic-short-lived-credential-feasibility.md) §6.
+
 `orchestration/routing.toml` pins `credential_format = "claude-oauth-token"` for **every** anthropic
 model (`haiku`, `sonnet`, `opus5`), and the selected-model step requires exact equality between the
 routed format and the claimed account's format (`worker.yml:895-912`). So today the live anthropic
@@ -232,6 +237,14 @@ format before routing anything onto it.
 
 **Verdict: increment 2, and the feasibility question is filed separately from the hardening.**
 
+> **Answered (2026-08-03), and it corrects this section — read it before starting increment 2:**
+> [`research/1676-anthropic-short-lived-credential-feasibility.md`](1676-anthropic-short-lived-credential-feasibility.md).
+> Three corrections in particular: `anthropic-api-key` can **never** reach parity (an API key is not
+> a grant); the migration cannot be staged per account, because `worker.yml` compares the routed and
+> claimed formats for exact equality and all three anthropic aliases share one format string; and
+> the value claimed just above ("degrades channel 2 almost to zero") is **conditional on an
+> unmeasured access-token lifetime** and does not apply to channel 1 at all.
+
 ## 6. The recommended increment
 
 **1a — OBSERVE (the recommended first increment).** Move the model container onto a per-run
@@ -389,6 +402,9 @@ must be recorded (as a comment at the implementation site or an appendix here) r
    be fixed while it is cheap.
 4. **Feasibility: can the anthropic lane carry a short-lived credential at all?** (§5.E) — the
    provisioning question that gates increment 2. Filed as research, not implementation.
+   **ANSWERED** (#1676): [`research/1676-anthropic-short-lived-credential-feasibility.md`](1676-anthropic-short-lived-credential-feasibility.md)
+   — qualified yes, gated on one offline lifetime measurement that can end the increment, and
+   costing an all-at-once re-recording of every anthropic account.
 
 Option B is deliberately **not** filed (§5.B): its preconditions are unmeasured, and 1a measures
 them.
