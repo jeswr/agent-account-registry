@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1973,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5bcd7c3d81d914490390e9c9be08dd36bacb6d76",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is correct and narrowly scoped. The two nullable allocator assertions now project an absent claim or unwritten CAS ledger to a stable sentinel, so the named check fails and the rest of the self-test continues instead of aborting. Successful claims still validate the actual account/model fields, including the last ledger row, and the added helper checks independently exercise both absent and present cases. No production control flow, trust check, workflow permission, or security boundary is weakened.",
+  "verdict": "approve"
+ }
+}
