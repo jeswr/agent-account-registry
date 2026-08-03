@@ -1870,6 +1870,37 @@ def _self_test():
         ok = ok and good
         print(f"  {'ok  ' if good else 'FAIL'} {n}: {got} (want {want})")
 
+    # [#1859] Allocator results are NULLABLE by contract (`claim()` returns None = "no eligible
+    # account/slot"), and so is the stub ledger's `written` list until a CAS actually lands. A row
+    # that subscripts one of those directly turns a capacity-emptying regression into a TypeError
+    # that ABORTS the run: the mutant that voided fable eligibility printed 187 `ok` rows, ZERO
+    # named FAIL rows, and skipped the remaining ~227 checks — including the very rows that detect
+    # it. Line-anchored kill extraction (AGENTS.md pre-flight item 7) then reads that as a
+    # SURVIVOR, and any unrelated defect below the crash point is invisible in the same run
+    # (item 4, *crash-after-partial-run*, which requires the mutant's total check count to equal
+    # the pristine run's). Projecting through these keeps the row red BY NAME, keeps the count
+    # equal, and lets the suite run to completion.
+    # Names are suite-unique on purpose: this function scope already rebinds a bare `field` in a
+    # later `for field in (...)` loop, and a shadowed helper reintroduces the very abort it removes.
+    ABSENT_FIELD = "<absent>"
+
+    def claim_field(record, key):
+        """`record[key]`, or the ABSENT_FIELD sentinel when the allocator returned None."""
+        return ABSENT_FIELD if record is None else record[key]
+
+    def last_written_row(rows):
+        """Last written ledger row, or None when nothing was written (never raises)."""
+        return rows[-1] if rows else None
+
+    check("[#1859] a None allocator result projects to a sentinel instead of aborting the suite",
+          (claim_field(None, "account"), claim_field(last_written_row(None), "model"),
+           claim_field(last_written_row([]), "model")),
+          ("<absent>", "<absent>", "<absent>"))
+    check("[#1859] a real allocator result still projects its own fields",
+          (claim_field({"account": "acctX", "model": "fable"}, "account"),
+           claim_field(last_written_row([{"model": "sol"}, {"model": "fable"}]), "model")),
+          ("acctX", "fable"))
+
     A = [
         {"handle": "acct01", "models": ["terra"], "max_concurrent_workers": 1, "available": True},
         {"handle": "acct02", "models": ["fable", "sonnet", "opus", "haiku"], "max_concurrent_workers": 2, "available": True},
@@ -3253,8 +3284,8 @@ def _self_test():
             "r", "p", "impl", ["sol", "fable"], "o/r#514@run", now,
             usage=chain_usage)
     check("chain walk: exhausted lead provider selects fallback and records fallback alias",
-          (fallback_claim["account"], fallback_claim["model"],
-           fallback_ledger.written[-1]["model"]),
+          (claim_field(fallback_claim, "account"), claim_field(fallback_claim, "model"),
+           claim_field(last_written_row(fallback_ledger.written), "model")),
           ("acctfallback", "fable", "fable"))
 
     fallback_full = make_lease(
@@ -3270,7 +3301,8 @@ def _self_test():
             "r", "p", "impl", ["sol", "fable"], "o/r#514@run", now,
             usage=chain_usage)
     check("chain walk: eligible lead provider wins without fallback",
-          (lead_claim["account"], lead_claim["model"]), ("acctlead", "sol"))
+          (claim_field(lead_claim, "account"), claim_field(lead_claim, "model")),
+          ("acctlead", "sol"))
 
     fallback_backoff_usage = {
         **chain_usage,
