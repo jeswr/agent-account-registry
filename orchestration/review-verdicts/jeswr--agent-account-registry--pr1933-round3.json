@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1933,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "513808f6bdb959b0a944ea9e895951521fb0bf54",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Bead 2 specifies `worker_no_change_max_unattributed` as an integer with default `0` and explicitly says that this needs no validation-branch edit. But `_thresholds_of` accepts only `worker_success_floor` as a bounded numeric exception; every other non-curator threshold must be an integer with `val > 0`, otherwise it raises `must be a positive integer`. Thus the documented fail-closed value cannot be supplied as a policy override, and adding it to `DEFAULT_THRESHOLDS` alone does not make a configured zero valid. This is especially material because zero is the recommended initial gate and the boundary whose behavior the design relies on.",
+    "file": "research/987-no-change-telemetry.md",
+    "fix_hint": "Specify a dedicated validation case for `worker_no_change_max_unattributed` that accepts non-boolean integers `>= 0` (and define any upper bound), update the surfaces table and bead-2 implementation steps accordingly, and add acceptance coverage proving `0` is accepted while `-1`, booleans, and non-integers are rejected. Do not group it into the existing positive-integer branch.",
+    "severity": "major",
+    "title": "The zero unattributed default is rejected by the existing threshold validator"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-2 attribution-completeness defect is substantially corrected: the design now keeps unattributed rows fleet-scoped, mirrors the fleet signal into target history, defers recovery rather than suppressing firing, and explicitly scopes recorder-delivery completeness out. However, bead 2's proposed default completeness threshold cannot pass the existing policy validator. The record says a default of zero needs no integer-validation change, while `_thresholds_of` rejects every integer `<= 0`. That makes the recommended design internally inconsistent and leaves its fail-closed default unimplementable as specified. This is a new major finding after the prior finding was resolved, so progress is regressing under the mandated rubric.",
+  "verdict": "request_changes"
+ }
+}
