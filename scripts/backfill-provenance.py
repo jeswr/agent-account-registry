@@ -35,6 +35,7 @@ prints a handle either.
 import argparse
 import ast
 import contextlib
+import copy
 import functools
 import importlib.util
 import inspect
@@ -1116,6 +1117,24 @@ def _workflow(name):
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
+def _if_condition(node):
+    """`(declared, exact_text)` for one workflow node's `if:` — presence AND value, never a
+    containment probe over the value (issue #1619, AGENTS.md pre-flight 6).
+
+    The two are DIFFERENT failures and must not collapse into one finding. A **missing** job `if:`
+    runs the secret-reading job from ANY ref — the arbitrary-ref class the guard exists for, and
+    the fail-OPEN direction. `if: false`, or the shipped guard with `&& false` appended, keeps a
+    guard that reads as hardened while disabling the lane entirely — the fail-CLOSED-forever
+    direction, indistinguishable from a drained population (sparq #4743 shipped exactly that).
+    A containment probe (`"github.ref ==" in guard`) is blind to the second: `<the real guard> &&
+    false` satisfies every substring it looks for.
+
+    `str()` on the declared value, NOT `value or ""`: PyYAML parses `if: false` to the boolean
+    `False`, so `or ""` would report a neutered job identically to one with no guard at all."""
+    node = node or {}
+    return ("if" in node, str(node["if"]) if "if" in node else "")
+
+
 def worker_yaml_shape_report():
     """Findings about the LIVE worker.yml, each asserted by the self-test."""
     jobs = _workflow("worker.yml")["jobs"]
@@ -1161,27 +1180,34 @@ def worker_yaml_shape_report():
     }
 
 
-def backfill_workflow_seam_report():
+def backfill_workflow_seam_report(workflow=None):
     """Findings about the LIVE backfill-provenance.yml invocation, each asserted by the
     self-test. Substring/count assertions do not catch YAML-seam mutations (`if: false`, a
-    deleted step, a reordered command), so every finding below is structural."""
-    workflow = _workflow("backfill-provenance.yml")
+    deleted step, a reordered command), so every finding below is structural.
+
+    `workflow` overrides the parsed document so the self-test's MUTANT TABLE can feed a
+    deliberately neutered copy through the same reader and prove each finding reds."""
+    workflow = _workflow("backfill-provenance.yml") if workflow is None else workflow
     # PyYAML parses a bare `on:` key as the boolean True.
     triggers = workflow.get("on") if "on" in workflow else workflow.get(True)
     inputs = (((triggers or {}).get("workflow_dispatch") or {}).get("inputs") or {})
-    job = workflow["jobs"]["backfill"]
-    # `.get`, not an index: a DELETED targets job must surface as a named FAIL below, not as a
-    # KeyError that aborts the suite and leaves every check after this one unrun.
-    targets_job = workflow["jobs"].get("targets") or {}
+    # `.get`, not an index, on BOTH jobs: a DELETED job must surface as a named FAIL below, not as
+    # a KeyError that aborts the suite and leaves every check after this one unrun (AGENTS.md
+    # pre-flight 4 — a crash records as a kill while the rows below it never ran). Measured on the
+    # index form: renaming `backfill:` stopped the suite at 74 of 215 checks with ZERO FAIL rows.
+    jobs = workflow.get("jobs") or {}
+    job = jobs.get("backfill") or {}
+    targets_job = jobs.get("targets") or {}
     resolve_step = next((s for s in (targets_job.get("steps") or [])
                          if isinstance(s, dict) and s.get("id") == "resolve"), None)
     resolve_run = str((resolve_step or {}).get("run") or "")
     needs = job.get("needs")
     strategy = job.get("strategy") or {}
-    steps = job["steps"]
+    steps = job.get("steps") or []
     step = next((s for s in steps if "backfill-provenance.py" in str(s.get("run") or "")), None)
     run = str((step or {}).get("run") or "")
-    guard = str(job.get("if") or "")
+    job_if_declared, guard = _if_condition(job)
+    targets_if_declared, targets_guard = _if_condition(targets_job)
     self_at = run.find("backfill-provenance.py --self-test")
     invoke_at = run.find('backfill-provenance.py "${args[@]}"')
     # The WRONG-INPUT seam: `NO_DRAFT_CONVERT: ${{ inputs.apply }}` is valid YAML, lints clean, and
@@ -1189,7 +1215,10 @@ def backfill_workflow_seam_report():
     # expression each env name is bound to, not merely that the name appears.
     step_env = {k: str(v) for k, v in ((step or {}).get("env") or {}).items()}
     return {
-        "job_ref_guarded": "github.ref ==" in guard and "default_branch" in guard,
+        # [#1619] PRESENCE, not a containment probe over the value. The value itself is pinned
+        # EXACTLY by `job_if` below; the containment form this replaced (`"github.ref ==" in guard
+        # and "default_branch" in guard`) reported a hardened guard for `<the real guard> && false`.
+        "job_if_declared": job_if_declared,
         "job_environment": job.get("environment"),
         "actions_read": (job.get("permissions") or {}).get("actions"),
         "contents_write": (job.get("permissions") or {}).get("contents"),
@@ -1216,11 +1245,13 @@ def backfill_workflow_seam_report():
         "target_repo_default": inputs.get("target_repo", {}).get("default"),
         "matrix_repo_expr": str((strategy.get("matrix") or {}).get("repo")),
         "matrix_fail_fast": strategy.get("fail-fast"),
-        # The EXACT guard text on both jobs, not a containment probe: `job_ref_guarded` above is
-        # satisfied by `<the real guard> && false`, which skips every scheduled run while reading
-        # as a hardened ref check (AGENTS.md pre-flight 6; sparq #4743 shipped that mutant).
+        # The EXACT guard text on both jobs — never a containment probe, which is satisfied by
+        # `<the real guard> && false`: that skips every scheduled run while reading as a hardened
+        # ref check (AGENTS.md pre-flight 6; sparq #4743 shipped that mutant). Paired with the
+        # `*_if_declared` presence findings so a DELETED guard and a NEUTERED one are distinct.
         "job_if": guard,
-        "targets_job_if": str(targets_job.get("if") or ""),
+        "targets_job_if_declared": targets_if_declared,
+        "targets_job_if": targets_guard,
         # The PRODUCER half of the same claim. `matrix_repo_expr` proves only that the CONSUMER
         # reads an output of that name; it holds just as well when the resolver is replaced by
         # `echo 'repos=["one/hardcoded-repo"]'`, which is the hardcoded-target defect itself. And
@@ -1609,8 +1640,12 @@ def _self_test():
 
     # --- WORKFLOW SEAM: backfill-provenance.yml is how this script is invoked ------------------
     seam = backfill_workflow_seam_report()
-    check("backfill workflow refuses to run off the default branch", seam["job_ref_guarded"],
-          True)
+    # [#1619] PRESENCE only — the fail-OPEN direction: no job `if:` at all runs the
+    # PROVENANCE_SALT-reading job from ANY ref. The guard's TEXT is exact-matched further down
+    # (`job_if`); this row deliberately no longer carries the "refuses to run off the default
+    # branch" claim, because the containment probe it replaced could not back that claim.
+    check("the backfill job DECLARES a job-level `if:` (none at all => it runs from any ref)",
+          seam["job_if_declared"], True)
     check("backfill workflow keeps the dispatch-secrets environment guard",
           seam["job_environment"], "dispatch-secrets")
     check("backfill workflow grants actions:read (without it EVERY PR is log-unavailable)",
@@ -1643,7 +1678,9 @@ def _self_test():
     # report success, and record nothing, which is indistinguishable from a drained population.
     # That is the exact "built, wired, never fired" shape this estate keeps paying for, so it is
     # asserted on the SHIPPED expression rather than trusted.
-    _apply_expr = seam["step_env_bindings"]["APPLY"]
+    # `or ""`: the binding reads None when the whole step (or job) is gone, and `x in None` raises
+    # — which would abort the suite mid-run on exactly the mutants the rows below exist to red.
+    _apply_expr = seam["step_env_bindings"]["APPLY"] or ""
     check("a SCHEDULED run applies (the cron is not a permanent dry run)",
           "github.event_name == 'schedule'" in _apply_expr, True)
     check("...while a manual run still defaults to a DRY RUN (inputs.apply is still consulted)",
@@ -1674,16 +1711,61 @@ def _self_test():
           seam["matrix_repo_expr"], "${{ fromJSON(needs.targets.outputs.repos) }}")
     check("fail-fast is OFF (one target's failure must not cancel the other targets' sweep)",
           seam["matrix_fail_fast"], False)
-    # A scheduled run that is SKIPPED is indistinguishable from no schedule at all, and the
-    # containment probe above (`job_ref_guarded`) accepts `<guard> && false`. Both jobs carry the
-    # same guard and both must be exact — `targets` is `needs:`-upstream, so skipping it alone
-    # takes the whole matrix with it.
+    # A scheduled run that is SKIPPED is indistinguishable from no schedule at all, and a
+    # containment probe over the guard TEXT accepts `<guard> && false` — which is why neither job
+    # is asserted that way any more (#1619). Both jobs carry the same guard and both must be
+    # exact — `targets` is `needs:`-upstream, so skipping it alone takes the whole matrix with it.
     _REF_GUARD = ("${{ github.ref == format('refs/heads/{0}', "
                   "github.event.repository.default_branch) }}")
+    check("the targets job DECLARES a job-level `if:` (none at all => it runs from any ref)",
+          seam["targets_job_if_declared"], True)
     check("the backfill job's guard is EXACTLY the default-branch check (no appended `&& false`)",
           seam["job_if"], _REF_GUARD)
     check("the targets job's guard is EXACTLY the default-branch check (no appended `&& false`)",
           seam["targets_job_if"], _REF_GUARD)
+    # [#1619] ...and the MUTANT TABLE that proves those rows can actually RED. Asserting the happy
+    # path only proves the reader can read a correct workflow, not that it would catch a neutered
+    # one. Each edit below is a real way this guard has been (or could be) disabled; each must move
+    # a NAMED finding OFF the value its row expects. The deleted-JOB edit additionally proves the
+    # reader does not RAISE: the `workflow["jobs"]["backfill"]` index form this replaced aborted
+    # the suite at 74 of 215 checks with ZERO anchored FAIL rows — a crash records as a kill while
+    # every row below it never runs (AGENTS.md pre-flight 4).
+    _NEUTERED = _REF_GUARD.replace(" }}", " && false }}")
+
+    def _seam_mutant(edit):
+        doc = copy.deepcopy(_workflow("backfill-provenance.yml"))
+        edit(doc)
+        return backfill_workflow_seam_report(doc)
+
+    def _mut_job(doc, name):
+        """The mutant EDITS must be total, never indexes. A run over an already-neutered tree —
+        which is every run that matters, because that is when these rows are being consulted —
+        would otherwise die inside the edit itself and take the rest of the suite with it: the
+        index form here crashed the guard-deleted mutant at 98 of 221 checks."""
+        return doc.setdefault("jobs", {}).setdefault(name, {})
+
+    # POSITIVE CONTROL for the table itself, and it is not optional: every row below asserts a
+    # finding is NOT its expected value, and ANY broken reader satisfies that for free — an empty
+    # parse, a moved file, a renamed key would each pass all five while measuring nothing. This
+    # row runs the SAME harness with a no-op edit and requires the SHIPPED guard back out, so the
+    # rows below are measuring the EDIT rather than a harness that reads nothing.
+    check("the mutant harness reads the SHIPPED tree (a no-op edit returns the live guard)",
+          _seam_mutant(lambda d: None)["job_if"], _REF_GUARD)
+    for _label, _edit, _key, _expected in (
+            ("`if: false` on the backfill job",
+             lambda d: _mut_job(d, "backfill").update(**{"if": False}), "job_if", _REF_GUARD),
+            ("`&& false` appended to the backfill guard",
+             lambda d: _mut_job(d, "backfill").update(**{"if": _NEUTERED}), "job_if", _REF_GUARD),
+            ("the backfill guard deleted outright",
+             lambda d: _mut_job(d, "backfill").pop("if", None), "job_if_declared", True),
+            ("the whole backfill job deleted",
+             lambda d: d.setdefault("jobs", {}).pop("backfill", None), "job_if_declared", True),
+            ("`&& false` appended to the targets guard",
+             lambda d: _mut_job(d, "targets").update(**{"if": _NEUTERED}),
+             "targets_job_if", _REF_GUARD),
+    ):
+        check(f"MUTANT moves `{_key}` off its expected value: {_label}",
+              _seam_mutant(_edit)[_key] != _expected, True)
     # --- the PRODUCER side of the same claim [#1544, round-1 review] ----------------------------
     # Everything above this point pins the CONSUMER: it proves `backfill` reads a matrix from an
     # output named `repos`. It does NOT reach the job that computes that output, so both of the
