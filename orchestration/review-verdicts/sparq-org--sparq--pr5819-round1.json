@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5819,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c687ef374ee49451307a7eefcc2ff7b9811e5ae1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "When PyYAML is absent and CI is truthy, `_SEAM_MUST_RUN` is true, so the class is not skipped. `test_pyyaml_is_installed_in_ci` fails, but unittest does not stop the class; each later test calls `_job_hosting`, which executes `yaml.safe_load(...)` while `yaml` is `None`. The run therefore reports the intended failure plus multiple AttributeErrors, contrary to the stated one-clear-failure behavior. The added unit tests only test the predicate and decorator metadata under the current interpreter; they never execute the class in a CI-marked process where importing yaml fails.",
+    "file": "scripts/tests/test_preflight.py",
+    "fix_hint": "Fail once before the YAML-dependent tests execute, for example by making each dependent test/class skip after a dedicated CI dependency failure or by raising one clear setup-time failure without subsequently dereferencing `yaml`. Add a subprocess test that masks PyYAML, sets a CI marker, runs the relevant suite, and asserts a nonzero result with the clear dependency message and no `None.safe_load`/AttributeError cascade.",
+    "severity": "major",
+    "title": "Missing PyYAML in CI still produces cascading errors"
+   }
+  ],
+  "progress": null,
+  "summary": "The local-only skip policy is sound, and the policy tests correctly pin common truthy/falsy CI markers. However, the CI-missing-PyYAML path does not behave as claimed: the new assertion fails, then unittest continues into every remaining seam test, where `yaml.safe_load` dereferences `None`. This recreates the noisy cascade the change says it prevents. The test suite also does not exercise that real missing-parser/CI execution path, so it cannot catch the discrepancy.",
+  "verdict": "request_changes"
+ }
+}
