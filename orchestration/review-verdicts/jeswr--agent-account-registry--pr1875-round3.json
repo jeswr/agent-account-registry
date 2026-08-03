@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1875,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0bf985f0e233cf5a47ea20ab2f8c8d1a7b3cccfb",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 resolves the remaining major finding. W1 now carries the admission-time epoch rather than re-reading it at write time, and every bind or retraction advances that epoch. The specified same-head ABA race (`none \u2192 head \u2192 none`) therefore makes the older W1 stale even though the live head and immutable verdict still name the same SHA; the older bind aborts and the retraction remains byte-identical. The record also requires both race orders and non-vacuous same-head/ABA assertions. The broader design remains fail-closed: absent state is UNKNOWN, disarm readers act while admission readers defer, authority changes at one sealed-census-gated resolver boundary, and mutable writes use semantic preconditions in addition to blob CAS. This documentation-only change is correct and complete for the requested design record.",
+  "verdict": "approve"
+ }
+}
