@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5835,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "47813e4b637915b9b698232fea9600bb34b79639",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change consistently implements the documented reason-bearing G1 exemption across the merge-time gate and periodic drift scanner. The exemption remains fail-closed for missing or empty README directives, continues to require a README in the introducing PR, and narrowly waives only benchmark and SKILL requirements. Tests exercise the real disk-reading parser, both exempt and non-exempt control paths, the invariant that README remains mandatory, and parity between the independently loaded gate and scanner implementations. No correctness, soundness, test-validity, or security defect is evident in the diff.",
+  "verdict": "approve"
+ }
+}
