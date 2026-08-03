@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5850,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c7789a66d04d254c27a210976d0e6b06eb229b6f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The shared composite correctly selects the SHA-pinned prebuilt installer only for Linux/X64 and uses the exact complementary source-build fallback for all other runner OS/architecture combinations. All 16 converted workflow sites reference the local action, the release matrix therefore retains source builds on arm64/macOS/Windows, and the Dependabot entry covers the nested action manifest. The hermetic posture test exercises the load-bearing wiring, pinning, exact version, architecture gate, and complementary fallback; it passes at the PR head. No correctness, soundness, test-validity, or security defect was found in the diff.",
+  "verdict": "approve"
+ }
+}
