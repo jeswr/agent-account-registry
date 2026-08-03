@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1911,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9580ad007612f6987e4e3fd64fa977857290237a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_live_children` treats every expression for which `_constant_truth` returns `None` as live, but this is permissive\u2014not fail-closed\u2014when the traversal supplies acceptance evidence. For example, `_park_call_site` certifies `for number in (([] * 1) and targets): park_starved_partition_holder(...)`: the `BinOp` is reported undecidable, so the dead `targets` operand is visited, although `[] * 1` is always empty, `and` returns that empty list, and the loop parks nothing. Likewise, `targets if 1 == 0 else []` is accepted because the constant comparison is unmodelled. Thus the prior dead-expression bypass remains through equally decidable syntax, and the new tests only pin the enumerated literal forms.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Do not use an over-approximation of possibly evaluated nodes as proof that the batch expression executes. Either structurally restrict accepted loop iterables to a small, explicitly safe grammar that guarantees evaluation of the bound batch name, or implement a conservative evaluator where any unproved control expression refuses certification. Add live controls plus named red tests for at least `([] * 1) and targets` and `targets if 1 == 0 else []`.",
+    "severity": "major",
+    "title": "Unknown constant expressions still become acceptance evidence"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-two traversal handles the named literal IfExp and BoolOp examples, but the acceptance proof remains permissive for other expressions whose truth is statically certain. `_constant_truth` returning `None` causes all operands/arms to be treated as live, so the checker can still certify a loop that provably iterates an empty value and never parks a holder. This is materially the same reachability finding at the same severity as round one.",
+  "verdict": "request_changes"
+ }
+}
