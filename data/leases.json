@@ -12,16 +12,6 @@
   },
   {
    "account": "58b7c92faa5b5ca5",
-   "claim_id": "df071c90e8a84503ab0d7681eb26fc57",
-   "holder": "sparq-org/sparq#5701@30785833418.1",
-   "package": "ci",
-   "role": "ci",
-   "model": "opus5",
-   "issued_at": 1785733104,
-   "expires_at": 1785739404
-  },
-  {
-   "account": "58b7c92faa5b5ca5",
    "claim_id": "258c66260cff430aaaf7f92b457465e5",
    "holder": "jeswr/agent-account-registry#1571@30785963818.1",
    "package": "dashboard",
