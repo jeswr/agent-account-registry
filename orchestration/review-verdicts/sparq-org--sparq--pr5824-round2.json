@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5824,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "94068c0db15b133737dbc60f8123ebbf2eda6370",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "run() opens and JSON-decodes --fixture/--overrides outside any conversion to InventoryError, while main catches only InventoryError. A missing/unreadable file or malformed JSON therefore still emits a traceback and exits 1, contradicting the module's explicit 'There is no exit 1' contract. Separately, decompose_job iterates `job.get(\"steps\") or []` without requiring a list: an empty object/string/null/missing steps value is silently treated as no steps, yielding a plausible table with zero unclassified time rather than rejecting an unusable payload. The new tests cover runs/jobs shapes but do not exercise these remaining real CLI paths.",
+    "file": "scripts/ci_leg_inventory.py",
+    "fix_hint": "Validate steps with _require_list before iteration (and decide explicitly whether a missing/null steps key is valid; if not, reject it). Convert OSError and json.JSONDecodeError from fixture/override loading into concise InventoryError diagnostics, or widen main's intentional input-error boundary while preserving traceback-free exit 2. Add CLI-level tests asserting exit 2, empty stdout, one-line stderr, and no traceback for malformed steps collections, malformed JSON, and unreadable/nonexistent input files.",
+    "severity": "major",
+    "title": "The no-exit-1 boundary still excludes input and step-shape failures"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 fixes the previously demonstrated malformed runs/jobs entries and adds real CLI-level regression coverage; the 63-test hermetic suite passes. However, the advertised no-exit-1 contract is still not complete: fixture/override file and JSON failures escape the InventoryError boundary, and a malformed empty/non-list steps collection can be accepted as an empty step population and produce a plausible report. The same load-bearing fail-loud concern therefore remains at major severity.",
+  "verdict": "request_changes"
+ }
+}
