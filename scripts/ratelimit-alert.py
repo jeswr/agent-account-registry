@@ -136,7 +136,9 @@ def census(payload):
       rows          well-formed and measurable, each carrying its own `threshold`/`breached`
       inapplicable  `limit == 0` — the token is not entitled to that resource, so there is no
                     budget to exhaust. Reported, never breached: a permanently-firing row is a
-                    silenced alarm within a week.
+                    silenced alarm within a week. PER BUCKET only — a census where EVERY bucket is
+                    inapplicable measures nothing, so it is no evidence of health either; `decide`
+                    refuses the tick rather than reading it as recovery.
       unreadable    present but malformed. FAIL CLOSED: it counts as a breach reason, because a
                     bucket this cannot parse is a bucket it cannot prove healthy.
     """
@@ -187,15 +189,25 @@ def breached(counts):
     return reasons
 
 
-def decide(reasons, has_open_alert):
-    """Pure: 'upsert' | 'close' | 'noop'.
+def decide(reasons, has_open_alert, measured):
+    """Pure: 'upsert' | 'close' | 'noop' | 'defer'.
 
     Close ONLY on an explicitly healthy census computed from a budget actually read. `main()` never
     reaches here on a failed read — the ABSENCE of evidence of a breach is not evidence of
     recovery, and closing on it is how an alert silently disarms itself (plan-alert.py's rule).
+
+    `measured` is the number of MEASURABLE buckets (`counts["rows"]`), and zero of them is the
+    second, quieter form of that same absence. A payload whose every bucket is `limit: 0` parses
+    fine and produces no breach reasons, so a rule keyed on `reasons` alone reads it as recovery
+    and closes a live alert — while what it actually says is that the ambient token is entitled to
+    NO bucket this can measure, which is a fault, not health. So it DEFERS: no lifecycle decision
+    at all, the open alert left exactly as the read-failed path leaves it. A breach still outranks
+    this — an all-UNREADABLE census has zero measurable rows AND real reasons, and must alarm.
     """
     if reasons:
         return "upsert"
+    if measured <= 0:
+        return "defer"
     if has_open_alert:
         return "close"
     return "noop"
@@ -421,7 +433,14 @@ def main(argv=None):
     if num is None:
         num = next((i["number"] for i in found if i.get("title") == ALERT_TITLE), None)
 
-    action = decide(reasons, num is not None)
+    action = decide(reasons, num is not None, len(counts["rows"]))
+    if action == "defer":
+        # Same posture as the read-failed branch above: the census row is already out, so this tick
+        # is distinguishable from a dead watchdog, and nothing is mutated.
+        print("::warning::ratelimit-alert: the payload reported NO measurable bucket "
+              f"({counts['buckets']} bucket(s), all inapplicable) — deferring this tick "
+              "(no evidence of budget health; an open alert is left exactly as it is)")
+        return 1
     if action == "upsert":
         _gh(["label", "create", ALERT_LABEL, "-R", repo, "--color", "d73a4a",
              "--description", "Autonomous ops alert (maintainer action)"],
@@ -583,11 +602,24 @@ def _test_summary(chk):
 
 
 def _test_decide(chk):
-    chk("decide: breach -> upsert", decide(["r"], False), "upsert")
+    chk("decide: breach -> upsert", decide(["r"], False, 2), "upsert")
     chk("decide: breach with an open alert -> upsert (edit in place, never a duplicate)",
-        decide(["r"], True), "upsert")
-    chk("decide: healthy with an open alert -> close", decide([], True), "close")
-    chk("decide: healthy with no alert -> noop", decide([], False), "noop")
+        decide(["r"], True, 2), "upsert")
+    chk("decide: healthy with an open alert -> close", decide([], True, 2), "close")
+    chk("decide: healthy with no alert -> noop", decide([], False, 2), "noop")
+    # ---- [RED] NO MEASURABLE BUCKET IS NOT RECOVERY. An all-`limit: 0` payload parses, breaches
+    # nothing, and on a `reasons`-only rule closes a live alert on the tick the ambient token lost
+    # its entitlements — the same silent disarm as closing on a failed read, one layer quieter.
+    chk("[RED] decide: zero measurable buckets with an open alert DEFERS, never closes",
+        decide([], True, 0), "defer")
+    chk("decide: ...and defers with no open alert too (nothing was measured, so nothing is known)",
+        decide([], False, 0), "defer")
+    # ANTI-VACUITY for the row above: `defer` must not swallow the alarm. An ALL-UNREADABLE census
+    # also has zero measurable rows, and it must still page.
+    chk("decide: a breach with zero measurable rows (all-unreadable) still UPSERTS",
+        decide(["r"], True, 0), "upsert")
+    # Boundary from both sides: ONE measurable bucket is enough evidence to act on.
+    chk("decide: exactly one measurable bucket is enough to close on", decide([], True, 1), "close")
 
 
 def _test_body(chk):
@@ -792,9 +824,35 @@ def _test_end_to_end(chk):
 
         # ---- an ALL-INAPPLICABLE census still emits a row. Without this, a token entitled to
         # nothing looks identical to a dead watchdog.
-        _, out_zero, _ = run(_payload(scim=_bucket(0, 0)), [])
+        marked = [{"number": 77, "title": "whatever", "body": "x " + ALERT_MARKER + " y"}]
+        nothing_measurable = _payload(scim=_bucket(0, 0), core=_bucket(0, 0))
+        rc_zero, out_zero, calls_zero = run(nothing_measurable, [])
         chk("e2e: an all-inapplicable census STILL emits its row (a zero row is a row)",
             "ratelimit-alert: {" in out_zero and '"measured": 0' in out_zero, True)
+        # ---- ...AND IT IS NOT A RECOVERY. Every bucket at `limit: 0` breaches nothing, so a
+        # lifecycle rule keyed on reasons alone would comment-and-close a live alert on the tick
+        # the ambient token could measure no budget at all. Driven through main() because that is
+        # the layer that spends the mutation.
+        rc_open, out_open, calls_open = run(nothing_measurable, marked)
+        chk("[RED] e2e: an all-inapplicable census NEVER comments on or closes the open alert",
+            [c[1][:3] for c in calls_open if c[0] == "gh" and c[1][0] == "issue"],
+            [["issue", "list", "-R"]])
+        chk("e2e: ...and writes nothing else either (no label create, no create/edit)",
+            [c[1][:2] for c in calls_open if c[0] == "gh"], [["issue", "list"]])
+        chk("e2e: ...exits NONZERO so the deferred tick is visible", (rc_open, rc_zero), (1, 1))
+        chk("e2e: ...naming the deferral rather than reporting health",
+            "deferring this tick" in out_open, True)
+        chk("e2e: ...and STILL emits the census row (a deferred tick is not a silent one)",
+            "ratelimit-alert: {" in out_open and '"measured": 0' in out_open, True)
+        chk("e2e: ...and with no alert open it stays a no-write tick too",
+            [c[1][:2] for c in calls_zero if c[0] == "gh"], [["issue", "list"]])
+        # ANTI-VACUITY: an ALL-UNREADABLE census ALSO has zero measurable rows. It must still
+        # alarm — a deferral that swallowed the fail-closed path would be worse than the bug.
+        _, _, calls_odd = run({"resources": {"odd": {"limit": 5000}}}, marked)
+        chk("e2e: an all-UNREADABLE census still EDITS the alert — the deferral does not swallow "
+            "the fail-closed path",
+            [c[1][:3] for c in calls_odd if c[0] == "gh" and c[1][0] == "issue"],
+            [["issue", "list", "-R"], ["issue", "edit", "77"]])
 
         # ---- breach -> create
         breach = _payload(core=_bucket(5000, 4900), search=_bucket(30, 0))
