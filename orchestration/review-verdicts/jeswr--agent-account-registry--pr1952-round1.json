@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1952,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6a0ef567c5cb93bb6c75ed85f8360795fe948732",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change is correct and complete for the reviewed scope. It separates `if:` presence from exact value, preserves false-valued YAML conditions instead of collapsing them into absence, makes deleted backfill/targets jobs and steps produce named findings rather than aborting the self-test, and exact-matches both job guards. The added positive control prevents the mutant table from passing on a broken reader, while the five focused mutants exercise the fail-open deletion cases and fail-closed neutering cases without mutating the checkout. I found no trust-check weakening, vacuous assertion, secret-handling regression, or workflow-permission expansion in the diff.",
+  "verdict": "approve"
+ }
+}
