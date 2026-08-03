@@ -33,8 +33,13 @@ on:
     # `triage.py --apply` proves machine ownership from the issue's OWN TIMELINE first
     # (`area_park_clearance` -> park_policy.label_application_machine_owned, plus an attributability
     # requirement) and refuses on every ambiguity. That is ONE extra `GET .../issues/N/timeline`,
-    # made ONLY when the park is live AND already false — never on an ordinary issue event — and it
-    # needs no permission this job does not already hold (`issues: write` covers the read; the
+    # made ONLY when the park is live AND already false — never on an ordinary issue event — plus a
+    # SECOND, confirming read taken only when the first one attests, because the proof has to be
+    # bound to the label set the strip is issued against (`_bound_area_clearance`, PR #1848 review
+    # round 1: a human who re-applies the park mid-run must not lose the hold to a verdict computed
+    # before it existed). So: 0 reads on an ordinary event, 1 on a refusal, 2 on the one event in an
+    # issue's life that actually clears the park — and none of them
+    # needs a permission this job does not already hold (`issues: write` covers the read; the
     # collaborator-permission probe the trust step uses is deliberately NOT reused, see the
     # `is_human` note in scripts/triage.py). Both directions are pinned by that script's --self-test.
     #
