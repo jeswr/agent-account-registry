@@ -116,6 +116,11 @@ manifest whose every record is present the row is `partial-evidence` and propose
 is deliberate — the manifest is the maintainer *asserting* what the corpus must contain, which is
 the only thing that turns "this handle appears in no record" into "this handle was not used".
 
+`expected.json` is hand-authored today, and a slip that omits a PR re-opens the false-revocation
+path this flag closes (#1027). `research/1027-expected-record-manifest-generation.md` works out
+where it should be derived from instead — and why the `ledger` provenance records, the obvious
+candidate, are the one source that cannot be used.
+
 Then, **one reviewed `policy/repos.toml` change per revocation** — never a batch. The scoping
 primitives to prove such an edit is exactly bounded already exist in `scripts/grant-account.py`:
 `verify_grant` (every other row byte-identical, every changed line inside the intended row and an
