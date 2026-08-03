@@ -2388,6 +2388,36 @@ def _self_test():
         (_code4, _calls4, sorted(_live4), _reason1490 in _out4),
         (0, [(["priority:P4", "status:ready"], ["status:untriaged"])],
          ["area:dispatch", "priority:P4", "role:impl", "status:ready"], False))
+    # ...and the OTHER exit of the same entry point: its FAIL-CLOSED branch. Every row above leaves
+    # `except RoleInvariantError` unexecuted (measured with `python3 -B -m trace --count --missing`
+    # over this suite: post-#1490 those two lines were the only never-executed lines of
+    # `_apply_cli`), and an unexecuted fail-closed branch in an entry point is the worst place to
+    # have one — AGENTS.md pre-flight 1. Nothing else proves that a refusal from `triage()` reaches
+    # `triage-issue.yml` as a RED step rather than a traceback or a silent success: editing the
+    # `return 1` here to `return 0` left the whole suite green (registry #1509).
+    #
+    # The reason string is a fixture value that appears NOWHERE else in this harness (pre-flight 4,
+    # value-identical survivor) and the annotation is pinned as a WHOLE line — prefix, title, issue
+    # number and interpolated reason — so an applier that annotates without the reason, or with the
+    # wrong issue, reds. Captured rather than asserted directly so that DELETING `_apply_cli`'s
+    # try/except reds this row cleanly instead of aborting the suite (pre-flight 4,
+    # crash-after-partial-run).
+    _msg1509 = "role:quixotic is not a role this repository defines"
+    _real_triage1509 = triage
+    try:
+        globals()["triage"] = lambda *a, **kw: (_ for _ in ()).throw(RoleInvariantError(_msg1509))
+        try:
+            _code5, _calls5, _live5, _out5 = run_apply(_floored, REAL)
+        except Exception as exc:                                  # noqa: BLE001
+            _code5, _calls5, _live5, _out5 = f"RAISED {type(exc).__name__}", [], set(_floored), ""
+    finally:
+        globals()["triage"] = _real_triage1509
+    chk("[#1509] FAIL-CLOSED ENTRY POINT: a RoleInvariantError from the classifier exits 1 with an "
+        "::error annotation carrying the reason and issues NO mutation — a silent 0 here reports "
+        "SUCCESS to triage-issue.yml while the issue is stranded (#582's failure mode)",
+        (_code5, _calls5, _live5 == _floored,
+         f"::error title=triage #7::{_msg1509}" in _out5),
+        (1, [], True, True))
 
     # -----------------------------------------------------------------------------------------------
     # [PR #595 finding 5] THE QUARANTINE LABEL WRITE IS FAIL-LOUD. `gh issue edit ... || true` on the
