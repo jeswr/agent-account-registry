@@ -55,6 +55,35 @@ HARD SCOPE RULE (do not widen):
     label edits, comments): an ambiguous transient failure does not prove GitHub skipped the
     attempt — a replay duplicates comments, repeats state transitions, or double-dispatches a
     worker (incident #559's storm class). Their fail-loud semantics are deliberate (#558).
+  * THE ONE CARVE-OUT (registry #1174), narrow by construction: ``gh api graphql`` carrying a
+    document PROVEN to hold nothing but ``query``/``fragment`` definitions. Nothing else about the
+    rule moves — see `graphql_read_reject` for the admission conditions and
+    ``research/1174-graphql-query-read-admission.md`` for why they are the conditions.
+
+GRAPHQL READS (registry #1174). gh sends ``-f``/``-F`` fields with no explicit ``-X`` as a POST
+body, so `read_cli_reject` — correctly, by the measured rule above — used to refuse EVERY
+``gh api graphql`` call as a non-GET and `run_gh` dropped it to a single attempt. That is right for
+``enablePullRequestAutoMerge`` and wrong for a read: `latch-watchdog`'s open-PR listing, the read
+that fans out to every PR it considers, had NO bounded backoff, so one transient 502 or
+secondary-403 redded the whole scheduled run. Query and mutation are indistinguishable at the FLAG
+level — both are ``-f query=`` — so the discriminator has to be the DOCUMENT, and it is sound
+because of a property of the GraphQL GRAMMAR rather than of any particular schema:
+
+  * an executable document contains only OPERATION definitions (``query``/``mutation``/
+    ``subscription``, or the anonymous ``{ … }`` shorthand, which is ALWAYS a query) and FRAGMENT
+    definitions. There is no other spelling for a side-effecting request and no way to nest an
+    operation inside another definition, so a document whose every top-level definition begins
+    ``query``, ``fragment`` or ``{`` cannot mutate, whatever schema is behind it.
+
+The admission is therefore: exactly one locatable ``query=`` field, no request body, no explicit
+``--method``, and a document that parses — with string literals and comments removed FIRST — into
+top-level definitions that are all ``query``/``fragment``/anonymous, with no ``mutation`` or
+``subscription`` keyword surviving anywhere. Every parse this layer cannot complete (unterminated
+literal, unbalanced braces, a value gh would read at request time from ``@file`` or stdin, an
+endpoint that is not the token immediately after ``api``) is a REFUSAL, never a guess: over-refusing
+costs one retry budget, under-refusing replays a mutation. The one observable effect a replayed
+query does have is rate-limit point accounting, which is bounded by ``MAX_ATTEMPTS`` and is the same
+cost the REST reads here already pay.
 
 ARGV CONTRACT (registry #1137): every entry point here runs ``["gh", *args]`` — the binary is
 prepended by this layer, so an argv must START AT THE SUBCOMMAND (``["api", ...]``, never
@@ -68,9 +97,10 @@ SHELL CALLERS (PR #595 finding 6): `python3 scripts/gh_retry.py read <gh args...
 idempotent read through this same policy and exits with gh's own status, so a workflow step gets the
 bounded backoff without hand-rolling (and drifting from) the loop in bash. The subcommand is
 STRUCTURALLY reads-only — `read_cli_reject` refuses any non-read verb, any `gh api` whose EFFECTIVE
-method is not GET, and any request body — so the hard scope rule above cannot be violated by
-routing a mutation through the wrapper. `run_gh` applies the SAME predicate: a non-read gets exactly
-ONE attempt and a `GH-RETRY-SCOPE-REFUSED` log line, never a replay.
+method is not GET (bar the proven-read-only GraphQL documents above), and any request body — so the
+hard scope rule above cannot be violated by routing a mutation through the wrapper. `run_gh` applies
+the SAME predicate: a non-read gets exactly ONE attempt and a `GH-RETRY-SCOPE-REFUSED` log line,
+never a replay.
 
 The method/body parse lives in ONE place (`gh_request_shape`) because two copies drifted: registry
 #731 measured that the previous flag scan saw only the DETACHED forms, so `-XPUT`, `--method=POST`,
@@ -325,10 +355,11 @@ def classify_read_failure(message, status=None):
     the two things retrying provably cannot fix: a recovered REFUSAL status, and a gh usage error.
 
     It is NOT a blanket "retry every unparseable error": this function is only ever consulted for
-    argv that `read_cli_reject` admits, i.e. a read verb (or `gh api` whose effective method is GET)
-    with no request body. A write cannot become non-idempotent through this branch because a write
-    never reaches it — `run_gh` selects the conservative `is_transient_stderr` for anything the
-    read predicate refuses, and caps it at one attempt."""
+    argv that `read_cli_reject` admits, i.e. a read verb, or `gh api` whose effective method is GET
+    with no request body, or (registry #1174) a `gh api graphql` POST whose document is PROVEN to
+    hold nothing but queries and fragments. A write cannot become non-idempotent through this branch
+    because a write never reaches it — `run_gh` selects the conservative `is_transient_stderr` for
+    anything the read predicate refuses, and caps it at one attempt."""
     lowered = (message or "").lower()
     if status in _REFUSAL_STATUSES:
         if status == "403" and any(marker in lowered for marker in _THROTTLE_403):
@@ -501,9 +532,31 @@ _METHOD_FLAGS = frozenset({"-X", "--method"})
 _FIELD_FLAGS = frozenset({"-f", "-F", "--field", "--raw-field"})
 # `-XPUT`, `--method=POST`, `-fkey=val`, `--field=k=v`: the ATTACHED forms pflag accepts, which the
 # pre-#731 scan (equality + `flag=` prefix only) did not see. `-X=PUT` is also accepted by pflag.
-_ATTACHED_METHOD_RE = re.compile(r"^(?:--method=|-X=?)(.+)$")
-_ATTACHED_FIELD_RE = re.compile(r"^(?:--(?:field|raw-field)=|-[fF]=?)(.+)$")
-_INPUT_FLAG_RE = re.compile(r"^--input(?:=.*)?$")
+#
+# `re.S` + `\Z`, NOT the default `.`/`$` (registry #1174). A field VALUE is arbitrary bytes and
+# routinely spans lines — a GraphQL document, a PR-body comment. Without DOTALL, `(.+)$` cannot
+# match a value containing a newline, so an ATTACHED multi-line field was invisible to this parser:
+# `gh api repos/o/r/issues/7/comments -fbody=<two lines>` produced `fields=[]` and therefore
+# `effective_method='GET'`, and `read_cli_reject` ADMITTED that POST as an idempotent read. A
+# transient failure on it would have been replayed up to MAX_ATTEMPTS times — a duplicated comment,
+# incident #559's exact class, through the guard that exists to prevent it. `\Z` rather than `$` so
+# a value ending in a newline cannot be silently truncated by `$`'s before-final-newline match.
+_ATTACHED_METHOD_RE = re.compile(r"^(?:--method=|-X=?)(.+)\Z", re.S)
+_ATTACHED_FIELD_RE = re.compile(r"^(?:--(?:field|raw-field)=|-[fF]=?)(.+)\Z", re.S)
+_INPUT_FLAG_RE = re.compile(r"^--input(?:=.*)?\Z", re.S)
+
+
+def _field_entry(flag, raw):
+    """One `-f/-F/--field/--raw-field` argument as `{flag, raw, name, value}`.
+
+    `name`/`value` are None when the `key=value` grammar is NOT satisfied — including a detached
+    flag with no following token at all. A caller that cannot read a field must REFUSE, never guess
+    which field it was: that is the whole reason the pair is carried here rather than re-split at
+    each decision site (registry #731's two-drifting-scans lesson applies to the VALUES too)."""
+    name, separator, value = (raw or "").partition("=")
+    if raw is None or not separator or not name:
+        return {"flag": flag, "raw": raw, "name": None, "value": None}
+    return {"flag": flag, "raw": raw, "name": name, "value": value}
 
 
 def gh_request_shape(args):
@@ -514,7 +567,11 @@ def gh_request_shape(args):
       * `-X GET … -f q=…`  -> GET, fields become QUERY PARAMETERS, no request body (a real read);
       * `… -f a=b` with no `-X` -> POST with a JSON body (gh's implicit method — NOT a read);
       * `-XPUT` / `--method=POST` / `-X=DELETE` -> the attached forms are real methods.
-    So field flags are admissible ONLY under an explicit GET, and `--input` never is."""
+    So field flags are admissible ONLY under an explicit GET, and `--input` never is.
+
+    `fields` is a list of `_field_entry` records rather than raw flag tokens (registry #1174): the
+    GraphQL admission has to read the `query=` VALUE, and re-splitting it at that decision site
+    would be the second copy of this parse."""
     listed = list(args)
     verb = (listed[0],) if listed and listed[0] == "api" else tuple(listed[:2])
     method, fields, body = None, [], None
@@ -530,18 +587,190 @@ def gh_request_shape(args):
             method = attached_method.group(1).upper()
             index += 1
             continue
+        attached_field = _ATTACHED_FIELD_RE.match(arg)
         if _INPUT_FLAG_RE.match(arg):
             body = arg
         elif arg in _FIELD_FLAGS:
-            fields.append(arg)
+            fields.append(_field_entry(arg, listed[index + 1] if index + 1 < len(listed) else None))
             index += 2
             continue
-        elif _ATTACHED_FIELD_RE.match(arg):
-            fields.append(arg)
+        elif attached_field:
+            fields.append(_field_entry(arg, attached_field.group(1)))
         index += 1
     effective = method or ("POST" if fields or body else "GET")
     return {"verb": verb, "method": method, "effective_method": effective,
             "fields": fields, "body": body}
+
+
+# ---------------------------------------------------------------------------------------------------
+# Registry #1174: proving a `gh api graphql` POST is a READ. See the module docstring for why the
+# document — not the flags — is the only available discriminator, and why the grammar (not the
+# schema) is what makes the proof hold.
+GRAPHQL_ENDPOINT = "graphql"          # admitted only as the token IMMEDIATELY after `api`
+GRAPHQL_QUERY_FIELD = "query"         # the field gh reads the document out of
+# Every executable definition starts with one of these. `{` is the anonymous operation shorthand,
+# which the GraphQL spec defines as a QUERY; `fragment` cannot execute on its own.
+_GQL_READ_ONLY_STARTS = frozenset({"query", "fragment", "{"})
+# Word-bounded so a field named `mutationCount` is not mistaken for an operation keyword — and this
+# scan runs on the LITERAL-STRIPPED document, so a `mutation` inside a string or a comment neither
+# refuses a real read nor hides one.
+_GQL_WRITE_KEYWORD_RE = re.compile(r"\b(?:mutation|subscription)\b")
+# THIS SCAN DELIBERATELY OVERLAPS the `_GQL_READ_ONLY_STARTS` walk, declared rather than left
+# implicit (AGENTS.md pre-flight 4: a duplicated guard can make each copy individually unkillable).
+# For a REAL top-level mutation both refuse, so that document alone cannot separate them. Each is
+# still killable on its own — only this scan refuses `query Q { mutation }` (a field merely NAMED
+# `mutation`), and only the walk refuses `query Q { id } type Foo { bar: Int }` — and both deleted
+# TOGETHER is its own mutant, which reds. The overlap is kept on purpose: the walk's soundness rests
+# on this module's own brace arithmetic, and this scan is the backstop for a bug in that arithmetic.
+# Names as one token, every other non-space character on its own: enough to track brace depth and to
+# read the first token of each top-level definition, which is all the admission needs.
+_GQL_TOKEN_RE = re.compile(r"[_A-Za-z][_0-9A-Za-z]*|\S")
+_GQL_CLOSERS = {"{": "}", "(": ")", "[": "]"}
+
+
+def graphql_strip_literals(document):
+    """`document` with `#` comments and every string / block-string literal removed, or None when a
+    literal cannot be closed.
+
+    Stripping FIRST is what makes the brace depth and the keyword scan trustworthy: a `\"\"\"…\"\"\"`
+    block string may legally contain `{`, `}` and the word `mutation`, so a scanner reading the raw
+    document either miscounts depth or refuses a valid read for the wrong reason. Returning None on
+    an UNTERMINATED literal — rather than a best effort — is the fail-closed direction: whatever
+    follows the opening quote was never understood, so nothing about the document is proven.
+
+    None reads as the empty document (which `graphql_document_reject` refuses as empty), so `None`
+    out of here means UNTERMINATED and nothing else."""
+    document = document or ""
+    index, length, kept = 0, len(document), []
+    while index < length:
+        char = document[index]
+        if char == "#":
+            newline = document.find("\n", index)
+            index = length if newline < 0 else newline
+            continue
+        if document.startswith('"""', index):
+            close = document.find('"""', index + 3)
+            # `\"""` is the only escape a block string has, so a terminator preceded by a backslash
+            # is not one. Over-skipping an escaped BACKSLASH here can only end in "unterminated",
+            # which refuses — the safe direction.
+            while close > 0 and document[close - 1] == "\\":
+                close = document.find('"""', close + 1)
+            if close < 0:
+                return None
+            index = close + 3
+            continue
+        if char == '"':
+            index += 1
+            closed = False
+            while index < length:
+                if document[index] == "\\":
+                    index += 2
+                    continue
+                if document[index] == "\n":
+                    break            # a single-quoted GraphQL string may not span lines
+                if document[index] == '"':
+                    closed, index = True, index + 1
+                    break
+                index += 1
+            if not closed:
+                return None
+            continue
+        kept.append(char)
+        index += 1
+    return "".join(kept)
+
+
+def graphql_definition_starts(stripped):
+    """`(first token of each TOP-LEVEL definition, complete)` for a literal-stripped document.
+
+    `complete` is False when a bracket is unbalanced or the last definition never closed — i.e.
+    whenever the walk did not understand the whole document. Top-level is tracked by CURLY depth
+    because only a selection set can contain a nested definition-looking token; parens and brackets
+    are balanced too so a malformed argument list cannot desynchronise the walk."""
+    starts, stack, depth, starting = [], [], 0, True
+    for token in _GQL_TOKEN_RE.findall(stripped or ""):
+        if token in _GQL_CLOSERS:
+            if token == "{":
+                if depth == 0 and starting:
+                    starts.append("{")
+                    starting = False
+                depth += 1
+            stack.append(_GQL_CLOSERS[token])
+        elif token in ("}", ")", "]"):
+            if not stack or stack.pop() != token:
+                return starts, False
+            if token == "}":
+                depth -= 1
+                if depth == 0:
+                    starting = True
+        elif depth == 0 and starting:
+            starts.append(token)
+            starting = False
+    return starts, (not stack) and starting
+
+
+def graphql_document_reject(document):
+    """Reason `document` is not PROVABLY a read-only GraphQL request, or None when it is.
+
+    Order matters: literals are stripped, THEN the keyword scan, THEN the definition walk. Each
+    refusal below is reachable on its own — a document can carry a `mutation` keyword the walk would
+    never see (a field named `mutation`), and a document can start with a definition the keyword
+    scan would never see (`type Foo { bar: Int }`).
+
+    A value gh would resolve at REQUEST time — `@file`, or `-` for stdin — needs no branch of its
+    own: neither is a GraphQL definition, so both fail the walk below and are refused. That is the
+    only correct answer available here, since the bytes that would actually be sent are not in the
+    argv at all."""
+    stripped = graphql_strip_literals(document)
+    if stripped is None:
+        return ("the document has an unterminated string literal, so it could not be read to its "
+                "end and nothing about it is proven")
+    if _GQL_WRITE_KEYWORD_RE.search(stripped):
+        return ("the document carries a `mutation`/`subscription` keyword; only a document that is "
+                "entirely queries and fragments may be replayed")
+    starts, complete = graphql_definition_starts(stripped)
+    if not complete:
+        return ("the document does not parse to a complete set of definitions (unbalanced braces, "
+                "brackets, or a definition with no selection set)")
+    if not starts:
+        return "the document is empty"
+    unexpected = [token for token in starts if token not in _GQL_READ_ONLY_STARTS]
+    if unexpected:
+        return (f"a top-level definition begins with {unexpected[0]!r}; only `query`, `fragment` "
+                "and the anonymous `{ … }` operation are admitted")
+    if not any(token in ("query", "{") for token in starts):
+        return "the document declares fragments but no query operation, so it is not a read"
+    return None
+
+
+def graphql_read_reject(args, shape=None):
+    """Reason a `gh api graphql` argv may NOT be replayed, or None when its document is a proven
+    read. THE single decision site for registry #1174's carve-out.
+
+    Returns a reason (never None) for an argv that is not `api graphql …` at all, so no caller can
+    mistake "this is not a GraphQL call" for "this GraphQL call is admitted"."""
+    listed = list(args)
+    if listed[:2] != ["api", GRAPHQL_ENDPOINT]:
+        return ("not a `gh api graphql` argv: the endpoint must be the token immediately after "
+                "`api`, because a call whose endpoint this layer cannot locate is a call whose "
+                "document it cannot bind to that endpoint")
+    shape = gh_request_shape(listed) if shape is None else shape
+    if shape["body"] is not None:
+        return (f"the call carries a request body ({shape['body']}), which gh reads at request "
+                "time — the bytes that would be replayed are not visible here")
+    if shape["method"] is not None:
+        return (f"the call sets an explicit --method {shape['method']!r}; only gh's implicit POST "
+                "of a proven read-only document is admitted")
+    unreadable = [entry["raw"] for entry in shape["fields"] if entry["name"] is None]
+    if unreadable:
+        return (f"a field argument does not parse as key=value ({unreadable[0]!r}), so the fields "
+                "this call would send cannot be enumerated")
+    documents = [entry["value"] for entry in shape["fields"]
+                 if entry["name"] == GRAPHQL_QUERY_FIELD]
+    if len(documents) != 1:
+        return (f"the call carries {len(documents)} `{GRAPHQL_QUERY_FIELD}=` fields; exactly one "
+                "identifiable document is required before a replay can be proven safe")
+    return graphql_document_reject(documents[0])
 
 
 def read_cli_reject(args):
@@ -554,18 +783,30 @@ def read_cli_reject(args):
     doubled = doubled_binary_reject(args)
     if doubled:
         return doubled
-    shape = gh_request_shape(args)
+    listed = list(args)
+    shape = gh_request_shape(listed)
     if shape["verb"] not in _READ_VERBS:
         return (f"refusing to retry {' '.join(args[:2])!r}: the read wrapper admits only "
                 f"{sorted(' '.join(verb) for verb in _READ_VERBS)} (mutations must stay "
                 "single-attempt and fail loud — see this module's hard scope rule)")
+    # Registry #1174. EVERY `gh api graphql` argv is decided by the GraphQL policy — including one
+    # that would otherwise pass the GET/body checks below — so this endpoint has exactly one
+    # admission rule instead of two that could disagree about the same document.
+    if listed[:2] == ["api", GRAPHQL_ENDPOINT]:
+        graphql_reason = graphql_read_reject(listed, shape)
+        if graphql_reason is None:
+            return None
+        return (f"refusing to retry `gh api graphql`: {graphql_reason}. A GraphQL POST is a read "
+                "only when every top-level definition in its document is a query or a fragment "
+                "(registry #1174 — see this module's hard scope rule)")
     if shape["body"] is not None:
         return (f"refusing to retry a gh api call carrying a request body ({shape['body']}) — a "
                 "replayed body is a replayed write")
     if shape["effective_method"] != "GET":
         detail = (f"--method {shape['method']!r}" if shape["method"]
-                  else f"implicit POST from {shape['fields'][0]!r} (gh sends fields with no -X as a "
-                       "POST body)")
+                  else f"implicit POST from "
+                       f"{(shape['fields'][0]['raw'] or shape['fields'][0]['flag'])!r} (gh sends "
+                       "fields with no -X as a POST body)")
         return f"refusing to retry a non-GET gh api call ({detail})"
     return None
 
@@ -630,6 +871,31 @@ DEBUG_TRACE_SAMPLE = """* Request at 2026-07-26 21:30:08.998188174 +0000 UTC m=+
 {"message": "secret-response-body"}
 * Request took 987.59µs
 unexpected end of JSON input"""
+
+# Registry #1174 fixtures. Both are the SHAPE this fleet actually issues, copied from
+# `scripts/latch-watchdog.py` (`OPEN_PR_QUERY` / `REARM_MUTATION`) — the read that fans out to every
+# PR the watchdog considers, and the re-arm mutation running beside it through the same `gh api
+# graphql` entry point. The point of #1174 is that these two are indistinguishable at the FLAG
+# level, so the admission is asserted against the real pair rather than against toy documents.
+GRAPHQL_READ_DOCUMENT = """
+query($owner: String!, $name: String!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: OPEN, first: 50, after: $cursor,
+                 orderBy: {field: UPDATED_AT, direction: DESC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        id number url isDraft isInMergeQueue isMergeQueueEnabled mergeable mergeStateStatus
+        headRefOid
+        autoMergeRequest { enabledAt mergeMethod }
+        labels(first: 60) { nodes { name } }
+      }
+    }
+  }
+}
+"""
+GRAPHQL_WRITE_DOCUMENT = ("mutation($pr:ID!,$oid:GitObjectID!){"
+                          "enablePullRequestAutoMerge(input:{pullRequestId:$pr,"
+                          "expectedHeadOid:$oid,mergeMethod:SQUASH}){clientMutationId}}")
 
 
 def _self_test():
@@ -997,12 +1263,13 @@ def _self_test():
               [cmd[:3] for cmd in spawned], [["gh", "api", "graphql"]])
         # The secondary defect in #1137: with the doubled argv the verb parsed as ("gh","api"),
         # so the scope layer logged `admits only ['api', …]` about an argv whose second token IS
-        # `api`. Corrected, a graphql call is still refused a retry — but ON ITS MERITS, as the
-        # implicit POST it really is, which is the message an operator can act on.
-        check("#1137 the corrected argv is refused a retry as a non-GET, never with the "
+        # `api`. Corrected, `query=x` is STILL refused a retry — registry #1174 admits a GraphQL
+        # POST only when its document parses, and a bare `x` has no selection set — but the refusal
+        # names the real reason, which is the message an operator can act on.
+        check("#1137 the corrected argv is refused a retry ON ITS MERITS, never with the "
               "self-contradictory 'admits only' verb message",
               ([line for line in logged if "admits only" in line],
-               any("non-GET" in line for line in logged)), ([], True))
+               any("gh api graphql" in line for line in logged)), ([], True))
     finally:
         subprocess.run = real_run
 
@@ -1287,6 +1554,214 @@ def _self_test():
           "the invariant above vacuously)",
           len([1 for _l, text, status, _w in OBSERVED_GH_FAILURES
                if status is None and failure_status(text) is None]) >= 8, True)
+
+    # ---- registry #1174: a GraphQL *query* is a read; a mutation is still not ----------------
+    # G10a — the DOCUMENT policy, both directions, on the shapes that separate the guards. Each
+    # refusal below is the ONLY one that fires for its row, so no guard here is masked by another:
+    # `query Q { mutation }` is caught by the keyword scan alone (its one definition starts
+    # `query`), `type Foo { … }` by the definition walk alone (it carries no operation keyword),
+    # and the literal-stripping rows go the OTHER way — a `mutation` inside a block string or after
+    # a `#` must NOT refuse a real read, which is what proves the stripping runs first.
+    for label, document, admissible in (
+            ("latch-watchdog's open-PR listing (the read #1174 is about)",
+             GRAPHQL_READ_DOCUMENT, True),
+            ("the anonymous `{ … }` shorthand, which the spec defines as a query",
+             "{ viewer { login } }", True),
+            ("a query plus the fragment it spreads",
+             'query Q { repository(owner: "o", name: "r") { ...F } }\n'
+             "fragment F on Repository { id }", True),
+            ("a block string carrying braces and the word mutation is NOT a mutation",
+             'query Q { search(query: """a { mutation } b""", type: ISSUE, first: 1) '
+             "{ issueCount } }", True),
+            ("a `#`-commented mutation does not refuse the real query beside it",
+             "query Q { id } # mutation M { enablePullRequestAutoMerge }", True),
+            # The three ESCAPE paths, each of which had ZERO line coverage until these rows existed
+            # (AGENTS.md pre-flight 1). Every one is written so the wrong answer is ADMITTING a
+            # `mutation` token that leaked out of a literal, not merely a different message:
+            #   * `\"""` is a block string's only escape — stop at it and the rest of the literal,
+            #     including its `mutation`, is read as source;
+            #   * `\"` inside a line string — stop at it and the same thing happens;
+            #   * a raw newline inside a line string is NOT legal GraphQL, and treating it as
+            #     ordinary content lets the literal swallow the `)` and close on a later quote.
+            ("a block string whose content contains the escaped terminator \\\"\"\"",
+             'query Q { f(a: """x \\""" mutation y""") { id } }', True),
+            ("a line string whose content contains escaped quotes",
+             'query Q { f(a: "x \\" mutation \\" y") { id } }', True),
+            ("a line string broken by a raw newline is NOT legal GraphQL and is refused",
+             'query Q { f(a: "oops\n b") { id } }', False),
+            ("the latch re-arm MUTATION", GRAPHQL_WRITE_DOCUMENT, False),
+            ("a subscription", "subscription S { x }", False),
+            ("a query FOLLOWED by a mutation (operationName could select either)",
+             GRAPHQL_READ_DOCUMENT + "\n" + GRAPHQL_WRITE_DOCUMENT, False),
+            ("a field merely NAMED `mutation` (fail closed: over-refusing costs a retry budget)",
+             "query Q { mutation }", False),
+            ("a type-system definition — no operation keyword anywhere",
+             "type Foo { bar: Int }", False),
+            # The definition allow-list's OWN kill. `type Foo { … }` on its own is also refused by
+            # the no-operation check below it, so that row cannot tell the two guards apart; this
+            # document HAS a query, so only the allow-list refuses it.
+            ("a real query with a type-system definition appended",
+             "query Q { id }\ntype Foo { bar: Int }", False),
+            ("an unterminated block string", 'query Q { x(a: """oops) }', False),
+            ("an unterminated line string", 'query Q { x(a: "oops) }', False),
+            # ...and the unterminated-literal refusals' OWN kills. Both rows above leave a prefix
+            # that ALSO fails the completeness walk, so a `graphql_strip_literals` returning a best
+            # effort instead of None would still refuse them. These two are complete UP TO the
+            # unterminated literal, so only the fail-closed None does any work — measured: with a
+            # best-effort strip both are ADMITTED.
+            ("a complete document with an unterminated line string appended",
+             'query Q { id } "oops', False),
+            ("a complete document with an unterminated block string appended",
+             'query Q { id } """oops', False),
+            ("unbalanced braces", "query Q { x ", False),
+            ("a stray closing brace", "query Q { x } }", False),
+            ("mismatched brackets", "query Q { x(a: [1) }", False),
+            ("a definition with no selection set", "query", False),
+            ("an empty document", "   \n  ", False),
+            ("a comment-only document", "# query Q { id }", False),
+            ("fragments with no operation", "fragment F on T { id }", False),
+            ("a document gh would read from @file at request time", "@document.graphql", False),
+            ("a document gh would read from stdin at request time", "-", False)):
+        check(f"#1174 document policy — {label}: "
+              f"{'ADMITTED' if admissible else 'refused'}",
+              graphql_document_reject(document) is None, admissible)
+    # The allow-list CONSTANT, by exact membership. Every row above is a document, and a mutation
+    # document is refused by the keyword scan as well — so adding `mutation` to this set changes no
+    # verdict anywhere in the corpus (measured: that mutant SURVIVED the whole suite). The set is
+    # what the walk's whole proof rests on, so it is pinned directly, in the shape AGENTS.md
+    # pre-flight 6 requires: exact membership, not containment.
+    check("#1174 the read-only definition allow-list is EXACTLY query/fragment/anonymous",
+          sorted(_GQL_READ_ONLY_STARTS), ["fragment", "query", "{"])
+    # The refusals are also asserted BY NAME where a neighbouring guard would otherwise refuse the
+    # same document for a different reason: an empty document falls through to the no-operation
+    # check, so without this row the empty branch is unkillable and an operator reads
+    # "declares fragments but no query" about a document with nothing in it.
+    check("#1174 an empty / comment-only document is refused AS EMPTY, not as a fragment document",
+          [graphql_document_reject(document) for document in ("", "   \n  ", "# query Q { id }")],
+          ["the document is empty"] * 3)
+
+    # G10b — the ARGV policy. The accept row is latch-watchdog's exact call; every refusal row
+    # differs from it by ONE thing, so deleting the guard that names that thing reds exactly here.
+    _GQL_READ_ARGV = ["api", "graphql", "-f", "query=" + GRAPHQL_READ_DOCUMENT,
+                      "-F", "owner=sparq-org", "-F", "name=sparq"]
+    _GQL_WRITE_ARGV = ["api", "graphql", "-f", "query=" + GRAPHQL_WRITE_DOCUMENT,
+                       "-F", "pr=PR_kwNODEID", "-F", "oid=cd0ca3f"]
+    for label, argv, admissible in (
+            ("latch-watchdog's open-PR listing argv, verbatim", _GQL_READ_ARGV, True),
+            ("the attached `-fquery=` form", ["api", "graphql",
+                                              "-fquery=" + GRAPHQL_READ_DOCUMENT], True),
+            ("the `--raw-field=query=` form",
+             ["api", "graphql", "--raw-field=query=" + GRAPHQL_READ_DOCUMENT], True),
+            ("`--paginate`, which only repeats the same read",
+             ["api", "graphql", "--paginate", "-f", "query=" + GRAPHQL_READ_DOCUMENT], True),
+            ("the latch re-arm mutation argv, verbatim", _GQL_WRITE_ARGV, False),
+            ("an explicit --method beside a proven read document",
+             ["api", "graphql", "-X", "POST", "-f", "query=" + GRAPHQL_READ_DOCUMENT], False),
+            ("an explicit -XGET beside a proven read document",
+             ["api", "graphql", "-XGET", "-f", "query=" + GRAPHQL_READ_DOCUMENT], False),
+            ("a request body beside a proven read document",
+             ["api", "graphql", "--input=payload.json",
+              "-f", "query=" + GRAPHQL_READ_DOCUMENT], False),
+            ("two `query=` fields (which document would be replayed?)",
+             ["api", "graphql", "-f", "query=" + GRAPHQL_READ_DOCUMENT,
+              "-f", "query=" + GRAPHQL_WRITE_DOCUMENT], False),
+            ("no `query=` field at all", ["api", "graphql", "-F", "owner=o"], False),
+            # ...and with NO fields whatsoever, which is the shape a graphql branch made inert on
+            # `if shape["fields"]` would wave through (measured: that mutant survived without this
+            # row, because every other refusal row here carries at least one field).
+            ("no fields whatsoever", ["api", "graphql"], False),
+            ("a field that does not parse as key=value, beside a proven read document",
+             ["api", "graphql", "-f", "notakeyvaluepair",
+              "-f", "query=" + GRAPHQL_READ_DOCUMENT], False),
+            ("a detached -f with no value at all, beside a proven read document",
+             ["api", "graphql", "-f", "query=" + GRAPHQL_READ_DOCUMENT, "-f"], False),
+            ("`query=@file`, which gh reads at request time",
+             ["api", "graphql", "-F", "query=@document.graphql"], False),
+            ("an endpoint that is not the token immediately after `api`",
+             ["api", "-H", "Accept: application/vnd.github+json", "graphql",
+              "-f", "query=" + GRAPHQL_READ_DOCUMENT], False),
+            ("THE CONTROL: the same read document posted to a REST endpoint is still a write",
+             ["api", "repos/o/r/issues/7/labels", "-f", "query=" + GRAPHQL_READ_DOCUMENT], False)):
+        check(f"#1174 argv policy — {label}: {'ADMITTED' if admissible else 'refused'}",
+              read_cli_reject(argv) is None, admissible)
+    # The endpoint guard is asserted on its REASON too: without this row a `graphql_read_reject`
+    # that answered None for a non-graphql argv would still look refused, because the non-GET
+    # branch below it refuses the same argv for a different reason.
+    check("#1174 an argv that is not `api graphql` never gets a None (=admitted) answer out of the "
+          "GraphQL decision site",
+          (graphql_read_reject(["api", "repos/o/r/pulls/7"]) is None,
+           graphql_read_reject(["api", "-H", "x", "graphql", "-f",
+                                "query=" + GRAPHQL_READ_DOCUMENT]) is None,
+           graphql_read_reject(_GQL_READ_ARGV)), (False, False, None))
+
+    # G10c — THE PRODUCTION LEG. `read_cli_reject` returning None is not the property #1174 is
+    # about: the property is that the open-PR listing SPENDS the retry budget on a transient 502
+    # and the re-arm mutation still does not. Counted at the subprocess boundary, which is where
+    # the whole class of "the table says retryable but the loop never re-invoked gh" hides.
+    real_run = subprocess.run
+    try:
+        for label, argv, want_calls, want_scoped, want_refusal in (
+                ("the open-PR listing", _GQL_READ_ARGV, MAX_ATTEMPTS, True, False),
+                ("the re-arm mutation", _GQL_WRITE_ARGV, 1, False, True)):
+            gql_calls, gql_logged = [], []
+
+            def _flaky_gateway(cmd, **kwargs):
+                gql_calls.append(list(cmd))
+                return subprocess.CompletedProcess(cmd, 1, stdout="",
+                                                   stderr="gh: Bad Gateway (HTTP 502)")
+
+            subprocess.run = _flaky_gateway
+            gql = run_gh(argv, sleep=lambda a, r=None: None, log=gql_logged.append)
+            check(f"#1174 through the REAL loop, {label} spends {want_calls} attempt(s) on a "
+                  f"transient 502",
+                  (len(gql_calls), gql.gh_read_scoped, gql.gh_retry_reason,
+                   any(SCOPE_REFUSED_MARKER in line for line in gql_logged)),
+                  (want_calls, want_scoped, "transient-http-502" if want_scoped
+                   else "non-read-conservative", want_refusal))
+    finally:
+        subprocess.run = real_run
+    # ...and the SHELL entry point agrees with the library one, on the same pair.
+    gql_stub = _Stub()
+    check("#1174 the shell `read` entrypoint runs the GraphQL query and refuses the mutation",
+          (read_cli(_GQL_READ_ARGV, runner=gql_stub, out=io.StringIO(), err=io.StringIO()),
+           read_cli(_GQL_WRITE_ARGV, runner=gql_stub, out=io.StringIO(), err=io.StringIO()),
+           [call[:2] for call in gql_stub.calls]),
+          (0, 2, [["api", "graphql"]]))
+    # G10c-bis — THE FAIL-OPEN found while widening this seam, and the reason the widening could not
+    # be sound without it. A field VALUE spanning lines (a GraphQL document, a PR-body comment) did
+    # not match the ATTACHED-form regexes at all, so `fields` came back EMPTY and the effective
+    # method fell through to GET: on the shipped tree `read_cli_reject` ADMITTED a multi-line
+    # `-fbody=` comment POST as an idempotent read, i.e. a replayed duplicate comment (#559's class)
+    # straight through the guard that exists to stop one. Asserted on the METHOD and on the
+    # ADMISSION, in the multi-line and single-line forms, so a regex that loses `re.S` reds here.
+    _MULTILINE_BODY = "line one\nline two"
+    check("#1174 an ATTACHED field whose value spans lines is still seen as a field, so the POST "
+          "it makes is REFUSED (pre-fix: parsed as GET and admitted for replay)",
+          [(gh_request_shape(argv)["effective_method"], read_cli_reject(argv) is None)
+           for argv in (["api", "repos/o/r/issues/7/comments", "-fbody=" + _MULTILINE_BODY],
+                        ["api", "repos/o/r/issues/7/comments", "-Fbody=" + _MULTILINE_BODY],
+                        ["api", "repos/o/r/issues/7/comments",
+                         "--field=body=" + _MULTILINE_BODY],
+                        ["api", "repos/o/r/issues/7/comments", "-fbody=one line"])],
+          [("POST", False)] * 4)
+    check("#1174 a multi-line `--input=` and a multi-line attached `--method=` are seen too",
+          (gh_request_shape(["api", "repos/o/r/x", "--input=a\nb"])["body"],
+           gh_request_shape(["api", "repos/o/r/x", "--method=POST\nX"])["method"]),
+          ("--input=a\nb", "POST\nX"))
+    check("#1174 a value ENDING in a newline is captured whole, never truncated at `$`",
+          gh_request_shape(["api", "graphql", "-fquery=abc\n"])["fields"][0]["value"], "abc\n")
+
+    # G10d — the field parse is carried as name/value pairs by the ONE shape parser, not re-split
+    # at the decision site (registry #731's lesson). Both the detached and the attached forms, plus
+    # the unreadable one, which must come back as None rather than a guess.
+    check("#1174 gh_request_shape carries every field flag's (name, value), and an unreadable "
+          "field parses to (None, None) instead of being guessed",
+          [(entry["name"], entry["value"]) for entry in
+           gh_request_shape(["api", "graphql", "-f", "query=Q", "-Fowner=o",
+                             "--raw-field=name=r", "--field=cursor=c", "-f", "junk",
+                             "-F"])["fields"]],
+          [("query", "Q"), ("owner", "o"), ("name", "r"), ("cursor", "c"),
+           (None, None), (None, None)])
 
     ok = all(checks)
     print("gh-retry self-test", "PASSED" if ok else "FAILED")
