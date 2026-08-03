@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1933,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "513808f6bdb959b0a944ea9e895951521fb0bf54",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Bead 2 still defines `worker_no_change_max_unattributed` as an integer with default `0` and says only that it needs no float-branch edit. The current `_thresholds_of` validator accepts `worker_success_floor` as its sole bounded numeric special case; every other non-curator threshold must be a non-boolean integer greater than zero. Therefore an explicit policy override of the documented zero boundary raises `must be a positive integer`. The design must specify the validator change needed to make its recommended fail-closed boundary implementable.",
+    "file": "research/987-no-change-telemetry.md",
+    "fix_hint": "Add a dedicated `_thresholds_of` validation case for `worker_no_change_max_unattributed` accepting non-boolean integers `>= 0` (and state an upper bound if intended). Update the bead-2 surface/implementation text and acceptance criteria to require that `0` is accepted while `-1`, booleans, and non-integers are rejected.",
+    "severity": "major",
+    "title": "The zero unattributed threshold is still incompatible with policy validation"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-3 major finding remains materially unchanged. The design still specifies `worker_no_change_max_unattributed` with default `0` while saying it needs no relevant validator edit, but the existing `_thresholds_of` positive-integer fallback rejects zero. As written, the recommended fail-closed default cannot be supplied as a policy override. Because the same major issue persists at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
