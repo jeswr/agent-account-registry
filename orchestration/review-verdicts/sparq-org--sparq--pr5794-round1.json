@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5794,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6eaa1fe45dd2bb91a31fb1820fc4130b86ca8d87",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [
+   {
+    "body": "The new text says the OpenSSF answers are reconciled to the disabled CodeQL state and that no control is overclaimed, but `compliance/openssf/controls/openssf.md` still says `static_analysis_common_vulnerabilities` is met by CodeQL security queries and that sparq exceeds the bronze analysis bar with active CodeQL. That document is part of the same compliance evidence surface and now directly contradicts this diff's `Unmet` answer and GX-OSSF-4. A machine-readable answer plus two human-readable control documents cannot safely attest opposite operational states.",
+    "file": "compliance/openssf/evidence.md",
+    "fix_hint": "Update `compliance/openssf/controls/openssf.md` in this PR to state that CodeQL is `disabled_manually`, mark the common-vulnerability static-analysis claim unmet, and link GX-OSSF-4. Search the OpenSSF compliance subtree for remaining present-tense CodeQL claims and reconcile every instance to the same status.",
+    "severity": "major",
+    "title": "CodeQL posture is not reconciled across the OpenSSF evidence surface"
+   }
+  ],
+  "progress": null,
+  "summary": "The PR improves the primary self-cert and evidence pages by honestly recording that CodeQL is disabled, but the reconciliation is incomplete: another OpenSSF control document in the checkout still presents CodeQL as active evidence and claims the project exceeds the bronze analysis bar. That leaves mutually contradictory compliance attestations after this change. The diff also contains imperative text directed at future agents/editors (for example, \"Do not re-litigate this\"), so injection detection is set even though it was not followed.",
+  "verdict": "request_changes"
+ }
+}
