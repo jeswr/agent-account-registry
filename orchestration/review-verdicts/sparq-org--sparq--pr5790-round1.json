@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5790,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "10c5a31d5d4cf9b77a4bb7433aa7e68b70761ee1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The design-only record is internally coherent and correctly rejects event-equality filtering because the trusted feature-matrix reporter is workflow_run-triggered. Its accepted rule is narrowly fail-closed: only positively resolved schedule runs are excluded; workflow_run, workflow_dispatch, and unknown/manual checks remain gating. The specification also preserves the empty-set hold, avoids cron supersession, requires explicit exclusion reporting, guards a future schedule-triggered gate, and lists non-vacuous regression tests for the load-bearing cases. The current implementation context supports the described seams: workflow runs do not yet project event, run resolution preserves unknown producers, and the feature-matrix reporter is workflow_run-triggered. Residual routing risk is explicitly acknowledged and F2 is made a prerequisite to implementation. No hostile reviewer-directed instruction was detected; imperative text is ordinary implementation-spec content.",
+  "verdict": "approve"
+ }
+}
