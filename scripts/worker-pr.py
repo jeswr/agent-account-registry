@@ -5952,6 +5952,47 @@ def revalidate_outcome_head(state, login, draft, live_head, reviewed_sha, bot_lo
     return "ok"
 
 
+def orchestrator_changes_handoff(round_n):
+    """[registry #1523] The comment that SIGNPOSTS the orchestrator class's `review:changes` state.
+
+    PURE — returns the body; the caller posts it, and only when the label actually landed.
+
+    WHY THIS PROSE HAS TO EXIST. `review:changes` is the normal outcome of round 1 and, in the
+    WORKER lane, it is a hand-off to a machine: enumerate_review_items emits `needs-fix`, the fix
+    lane pushes a repair, and its outcome flips the PR back to `review:needs` on its own. The
+    ORCHESTRATOR class has NEITHER half of that loop, by two independent design decisions —
+    PLAN's review-only choke point refuses every state but `needs-review` for a self-attested
+    record, and `review_fix_pr_admission` refuses `fix` mode outright (the class is non-draft by
+    design, and a self-attested record must never buy write access to its own branch). So no
+    machine ever moves this PR out of `review:changes`. The author must, by relabelling it back to
+    `review:needs` after pushing — and MEASURED on #1433/#1451/#1479, nothing anywhere said so:
+    three PRs sat in the state for hours with no dispatch of any mode and no instruction on them.
+
+    The DIRECTION is load-bearing: `review:needs` is the label `enumerate_review_items` re-enters
+    on, so a body naming the reverse transition — or only one of the two labels — would signpost
+    the author straight back into the same absorbing state. The self-test asserts the ordered pair
+    against its OWN literals, never against this function's.
+
+    The "push first" ordering is load-bearing too, not politeness: a relabel that lands before the
+    fix dispatches a review round against the unchanged head, which charges the bounded round
+    budget (`decide_budget`) for a tree the reviewer has already read and moves the PR one round
+    closer to a terminal `needs:user` park."""
+    return "\n".join([
+        f"> 🤖 SPARQ agent — orchestrator-class review hand-off (round {round_n}).",
+        "",
+        "This pull request is **orchestrator-class** (self-attested provenance), which the loop "
+        "serves **review-only**: the fix lane refuses it, so nothing autonomous will move it out "
+        "of `review:changes`. This state is the author's, not the machine's — the review loop "
+        "will not look at this PR again until it is relabelled.",
+        "",
+        "**Next round: push the fix, then relabel this PR `review:changes` -> `review:needs`.**",
+        "",
+        "Relabel only AFTER the fix is pushed. A round dispatched against the unchanged head is "
+        "still charged to the bounded review-round budget, and spending it on a tree the reviewer "
+        "has already read moves this PR one round closer to a terminal human park.",
+    ])
+
+
 def review_outcome(args):
     """Apply the review outcome. Deliberate ordering for crash-window liveness (the durable
     registry verdict record is written by the workflow BEFORE this step, the round marker was
@@ -6079,7 +6120,20 @@ def review_outcome(args):
         if budget["action"] == "extend-model-pin" and budget["pin"]:
             record_model_pin(args.repo, args.pr, args.round, budget["pin"],
                              args.impl_provider, args.run_key, args.bot_login)
-        set_review_state(args.repo, args.pr, "changes")
+        applied = set_review_state(args.repo, args.pr, "changes")
+        # [registry #1523] SIGNPOST THE HAND-OFF for the review-only class, and ONLY for it. For
+        # the worker lane this label IS the dispatch signal to the fix lane, so a comment telling
+        # that author to relabel by hand would be false and would race the fixer. For the
+        # orchestrator class no lane consumes the label at all (see orchestrator_changes_handoff),
+        # so the round ends with the PR stalled and — until this comment — silent about it.
+        #
+        # Gated on what set_review_state ACTUALLY DID, never on the request: "converged" means an
+        # ambiguous namespace resolved to the human-owned review:needs-user instead, and
+        # "refused-hold"/"park-abort" mean a live hold vetoed the write. In every one of those the
+        # PR is NOT in review:changes and is human- or park-owned, so instructing the author to
+        # relabel it to review:needs would be talking a human out of their own hold.
+        if applied == "applied" and getattr(args, "self_attested", False):
+            _comment(args.repo, args.pr, orchestrator_changes_handoff(args.round))
     elif decision == "needs-user":
         approved = document["verdict"] == "approve" and not has_blockers
         # The capacity park's attempt fingerprint (#555 recurrence gap): the reviewed head —
@@ -12386,11 +12440,15 @@ def _self_test():
     # `oc_reasons` by both runners: a stale kwargs list would let a #869 row read the PREVIOUS
     # run's park and pass for the wrong reason.
     oc_kwargs = []
+    # [registry #1523] every BODY the stubbed commenter was handed, in call order. The hand-off
+    # signpost is prose posted to the PR, so the only honest way to test the write site is to read
+    # what it actually emitted — a call counter would pass on an empty string.
+    oc_bodies = []
     emitted_injection_prose = {}
     real_oc = {name: globals()[name] for name in (
         "_gh_json", "_paginated_comments", "set_review_state", "needs_user",
         "post_findings", "record_model_pin", "_write_outputs", "_alert_route",
-        "set_reviewed_sha", "record_marker", "marker_runs")}
+        "set_reviewed_sha", "record_marker", "marker_runs", "_comment")}
 
     def oc_gh_json(args, **_kw):
         path = args[1] if len(args) > 1 else ""
@@ -12404,9 +12462,10 @@ def _self_test():
                          "sha": oc_state.get("head", "b" * 40)}}
 
     def run_review_outcome(verdict, labels=(), issue_labels=(), injection=False,
-                           reviewed_sha="b" * 40, self_attested=False, **live_over):
+                           reviewed_sha="b" * 40, self_attested=False, round_n=1, **live_over):
         oc_calls.clear(); oc_outputs.clear(); oc_state.clear(); oc_reasons.clear()
         oc_kwargs.clear()                                            # [#869] lockstep with oc_reasons
+        oc_bodies.clear()                                            # [#1523] and with oc_calls
         oc_state.update(labels=labels, issue_labels=issue_labels, **live_over)
         with tempfile.TemporaryDirectory() as tmp:
             verdict_file = Path(tmp) / "verdict.json"
@@ -12419,7 +12478,7 @@ def _self_test():
             files_file.write_text("src/a.rs\n", encoding="utf-8")
             review_outcome(argparse.Namespace(
                 repo="o/r", pr=41, verdict_file=str(verdict_file),
-                files_file=str(files_file), round=1, max_rounds=3, security=False,
+                files_file=str(files_file), round=round_n, max_rounds=3, security=False,
                 surface_path=[], issue=7, impl_provider="anthropic",
                 bot_login="sparq[bot]", run_key="9.1", reviewed_sha=reviewed_sha,
                 self_attested=self_attested))
@@ -12429,6 +12488,7 @@ def _self_test():
                         bot_login="sparq[bot]", **live_over):
         oc_calls.clear(); oc_outputs.clear(); oc_state.clear(); oc_reasons.clear()
         oc_kwargs.clear()                                            # [#869] lockstep with oc_reasons
+        oc_bodies.clear()                                            # [#1523] and with oc_calls
         oc_state.update(labels=labels, issue_labels=issue_labels, comments=list(comments),
                         **live_over)
         fix_outcome(argparse.Namespace(
@@ -12453,7 +12513,15 @@ def _self_test():
             lambda repo, pr, sha: oc_calls.append(f"reviewed-sha:{sha}"))
         globals()["record_marker"] = lambda *a, **kw: oc_calls.append("marker")
         globals()["marker_runs"] = lambda *a, **kw: []
-        globals()["set_review_state"] = lambda repo, pr, s: oc_calls.append(f"state:{s}")
+        # [registry #1523] The stub now RETURNS what the real primitive returns — "applied" by
+        # default, overridable per run. review_outcome's hand-off signpost is gated on that return
+        # value (a converged/vetoed write leaves the PR human-owned, not in review:changes), so a
+        # stub that answered None for every case would make the gate untestable in BOTH directions.
+        globals()["set_review_state"] = (
+            lambda repo, pr, s: (oc_calls.append(f"state:{s}")
+                                 or oc_state.get("state_result", "applied")))
+        globals()["_comment"] = lambda repo, pr, body: (oc_calls.append("comment")
+                                                        or oc_bodies.append(body))
         globals()["needs_user"] = oc_needs_user
         globals()["post_findings"] = lambda *a, **kw: oc_calls.append("post-findings")
         globals()["record_model_pin"] = lambda *a, **kw: oc_calls.append("model-pin")
@@ -12512,6 +12580,77 @@ def _self_test():
         run_review_outcome("approve")
         check("the worker lane still arms on an approve",
               (oc_calls, oc_outputs.get("decision")), (["post-findings"], "arm"))
+
+        # ---- [registry #1523] THE review:changes HAND-OFF SIGNPOST ------------------------
+        # For the orchestrator class `review:changes` is an ABSORBING state: PLAN's review-only
+        # choke point refuses needs-fix and review_fix_pr_admission refuses `fix` mode, so no lane
+        # consumes the label and only the author can move the PR on (measured on #1433/#1451/#1479
+        # — no dispatch of any mode for hours). The round must therefore SAY what the author has to
+        # do. Every expectation below is a literal written HERE, never read back from the function
+        # under test (AGENTS.md pre-flight 2b).
+        run_review_outcome("request_changes", draft=False, self_attested=True, round_n=2)
+        handoff = oc_bodies[0] if oc_bodies else ""
+        check("[#1523] an orchestrator-class request_changes labels AND signposts, in that order",
+              (oc_calls, oc_outputs.get("decision"), len(oc_bodies)),
+              (["post-findings", "state:changes", "comment"], "changes", 1))
+        # The DIRECTION is the whole content of the signpost: the ordered pair, with the label the
+        # enumerator re-enters on (`review:needs`) as the destination. Naming one label, or naming
+        # them the other way round, sends the author back into the same absorbing state.
+        check("[#1523] ...and the signpost names the exact relabel, in the recoverable direction",
+              ("`review:changes` -> `review:needs`" in handoff,
+               "`review:needs` -> `review:changes`" in handoff),
+              (True, False))
+        # Push FIRST: a relabel ahead of the fix dispatches a round against the unchanged head and
+        # charges the bounded budget for it. And the round number is interpolated, not hard-coded.
+        check("[#1523] ...orders the push before the relabel, under the agent's own identity",
+              ("push the fix, then relabel" in handoff,
+               "> 🤖 SPARQ agent" in handoff,
+               "(round 2)" in handoff),
+              (True, True, True))
+        # DIRECTION 2 — the WORKER lane must NOT get this comment. There `review:changes` is the
+        # live dispatch signal to the fix lane, so telling that author to relabel by hand would be
+        # false and would race the fixer. Same verdict, same decision, one flag apart.
+        run_review_outcome("request_changes")
+        check("[#1523] CONTROL: a worker-lane request_changes labels and stays SILENT",
+              (oc_calls, oc_outputs.get("decision"), oc_bodies),
+              (["post-findings", "state:changes"], "changes", []))
+        # DIRECTION 3 — the signpost rides what set_review_state ACTUALLY DID. A converged write
+        # left the PR on the human-owned review:needs-user, so an instruction to relabel it to
+        # review:needs would be talking a human out of their own hold.
+        run_review_outcome("request_changes", draft=False, self_attested=True,
+                           state_result="converged")
+        check("[#1523] CONTROL: a CONVERGED label write (human hold won) is never signposted",
+              (oc_calls, oc_bodies), (["post-findings", "state:changes"], []))
+        run_review_outcome("request_changes", draft=False, self_attested=True,
+                           state_result="refused-hold")
+        check("[#1523] CONTROL: a REFUSED label write is never signposted either",
+              (oc_calls, oc_bodies), (["post-findings", "state:changes"], []))
+        # ...and the pure body is bound to its round argument at every round, so the site check
+        # above cannot pass on a constant.
+        check("[#1523] the body interpolates the round it was handed",
+              ("(round 5)" in orchestrator_changes_handoff(5),
+               "(round 5)" in orchestrator_changes_handoff(6)),
+              (True, False))
+        # The gate word itself. Everything above drives a STUBBED set_review_state, so the site's
+        # `applied == "applied"` would keep passing if the real primitive's vocabulary changed
+        # under it — and the only symptom in production would be a signpost that silently stopped
+        # being posted. So run the REAL primitive over the three outcomes the gate distinguishes
+        # (`live_review` handed in, which is a production call shape, so no second label read is
+        # needed) and pin the words it actually returns.
+        _rs_real = real_oc["set_review_state"]
+        _rs_labels = (globals()["_ensure_label"], globals()["_remove_label"])
+        try:
+            globals()["_ensure_label"] = lambda repo, label: None
+            globals()["_remove_label"] = lambda repo, pr, label: None
+            _rs_outcomes = (_rs_real("o/r", 41, "changes", live_review=set()),
+                            _rs_real("o/r", 41, "changes",
+                                     live_review={"review:needs", "review:pass"}),
+                            _rs_real("o/r", 41, "changes", live_review={"review:needs-user"}))
+        finally:
+            globals()["_ensure_label"], globals()["_remove_label"] = _rs_labels
+        check("[#1523] the site's gate word is the label primitive's OWN vocabulary "
+              "(clean write / ambiguity-converged / hold-refused)",
+              _rs_outcomes, ("applied", "converged", "refused-hold"))
 
         # the fix outcome paths drop the same way (re-review + injection->needs-user)
         for injection, park_name in (("false", "re-review"), ("true", "needs-user")):
