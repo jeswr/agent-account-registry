@@ -40,6 +40,7 @@ plan-alert.py
 plan-snapshot.py
 policy-resolve.py
 pr-body-ref.py
+ratelimit-alert.py
 readme-runbook-check.py
 ready-issues.py
 reconcile-conflict-park.py
