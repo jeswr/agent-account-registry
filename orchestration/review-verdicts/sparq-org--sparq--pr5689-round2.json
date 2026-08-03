@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5689,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "755ca6d08281cc43b018a094e6a05cacfbc74aeb",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains clean. The consolidated workflow preserves the former advisory jobs' effective behavior: the secret scan runs before Terraform setup, `!cancelled()` allows Terraform checks to continue after a scan failure, and the module loop records all four module outcomes before failing the job. Creating the shared plugin cache before the first init is correct, the registry entry matches the consolidated job ID and check name, and the README accurately describes the advisory classification. No correctness, soundness, test-validity, or security issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
