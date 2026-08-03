@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1981,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "58b87d8ce50948ba66c48c6180cb7d826c9fffda",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`claims_about_the_route()` returns `sorted(set(found))`, so the `render_alert` assertion sees `[\"can write to\"]` whether that phrase occurs once or many times. Appending a second ALERT_TOKEN-scoped `can write to` sentence inside `render_alert` therefore leaves both the phrase assertion and the independent scoping-clause assertion green, despite the test's explicit contract that a second occurrence must red. This is the duplicated-guard/multiplicity case the added prose says it prevents, so the exact-one claim is not actually tested.",
+    "file": "scripts/pat-validity.py",
+    "fix_hint": "For the separately scanned `render_alert` span, retain occurrence counts (or independently count ALERT_TOKEN-scoped matches) and assert exactly one total match, exactly one `can write to` match, and no other phrasing. Add a non-vacuity fixture containing the same scoped phrase twice and assert that the exact-one predicate rejects it. Keep deduplication only where set membership is the intended property.",
+    "severity": "major",
+    "title": "Maintainer-hint census cannot detect duplicate expected phrases"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new contract checks are generally careful, but the `pat-validity.py` maintainer-hint census does not enforce the exact-one-occurrence property it claims. Because the detector deduplicates matches, duplicated copies of the expected capability phrase survive the self-test. That leaves the prose guard materially weaker than its stated, load-bearing contract and makes the test non-vacuous for presence but vacuous for multiplicity.",
+  "verdict": "request_changes"
+ }
+}
