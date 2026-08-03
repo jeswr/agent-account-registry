@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1734,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7102c7717f5b9f2494df335715f441f981a283b4",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change remains correct and complete. `worker-prep.sh` refuses `claude-credentials-json` during initial format admission, before creating the worker tree or spooling the source credential, and `worker-live.sh` independently refuses it at the container-delivery seam. The Codex pre-flight has no original-document fallback: both refresh and skip paths derive minimal mount material, and the materialized file is checked unconditionally for refresh-shaped fields and the original refresh-token value. The added tests are substantive: they exercise the expired-token dry-run skip branch, prove the refused Anthropic fixture actually carries the durable sentinel, require an actionable refusal before any sentinel or mount material is written, retain a positive opaque-token control, and assert the launcher's exact non-dying credential-format set. I found no correctness, fail-closed, security, injection, or test-validity defect. Round 4 also had no findings, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
