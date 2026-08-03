@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1961,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7b22e46bf3eb8b6071c532698c17c6659525a49e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`receipt_from_log` treats a syntactically valid receipt from the current workflow's reporting `(job, step)` as evidence of the merge-ref base that the run graded. But that step runs `python3 scripts/gate-staleness.py` from the checked-out PR head. A PR can change that script to print any valid `tested_base` while retaining the step name and one-receipt shape. Selecting the step only excludes forgeries printed by other steps; it does not establish who wrote the code producing this step's output. Consequently an author can fabricate `equal`/`lags` evidence, and 24 such runs can produce an exonerating population verdict. This contradicts the source's stated author-control defense and makes the marquee measurement unsound for adversarial PR history.",
+    "file": "scripts/gate-base-lead.py",
+    "fix_hint": "Bind the tested-base receipt to trusted code or trusted metadata rather than PR-head executable output. For example, have a base-controlled workflow component derive and publish the merge-parent SHA in an authenticated check-run output/annotation, or verify the exact reporter implementation against a trusted base version before admitting its receipt. Add an adversarial test where the designated step emits a well-formed forged receipt and require that row to be refused.",
+    "severity": "major",
+    "title": "The designated reporting step still emits author-controlled evidence"
+   }
+  ],
+  "progress": null,
+  "summary": "The crosstab's central `tested_base` operand is not authenticated by filtering the log to the reporting step. That step executes `scripts/gate-staleness.py` from the pull-request checkout, so the PR author controls the receipt emitted under the very `(job, step)` pair this instrument trusts. A forged receipt can therefore fabricate a lead or, more importantly, fabricate enough equal/lag rows to exonerate clause (1). The otherwise careful parsing and refusal behavior do not close this provenance hole.",
+  "verdict": "request_changes"
+ }
+}
