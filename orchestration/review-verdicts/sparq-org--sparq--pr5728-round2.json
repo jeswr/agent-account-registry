@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5728,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a27ee721d9d0d0323d09287ead3362ca1362e894",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`validate_crate_identity()` explicitly treats `{crate}` in `tmpl.labels` as supported and the rules documentation says a template may name `{crate}` in labels, but `evaluate()` constructs `labels_full` from `BASE_LABELS + tmpl.labels` without applying `expand(..., ctx)`. Thus a valid template with `dedup_key = \"follow-up-{crate}\"` and label `area:{crate}` produces distinct issues carrying the invalid literal label `area:{crate}` rather than `area:sparq-alpha` / `area:sparq-beta`. The added test only calls the validator and never exercises the emitted labels, so it is vacuous for this promised behavior.",
+    "file": "scripts/flow-on.py",
+    "fix_hint": "Expand each template label in the active context before de-duplication/routing, e.g. build the label list from `expand(label, ctx)` values. Add an `evaluate()` regression test with `{crate}` in both `dedup_key` and a label and assert that each emitted follow-on receives its corresponding expanded crate label. Alternatively, if label placeholders are intentionally unsupported, remove labels from the identity rule and documentation and reject `{crate}` there explicitly.",
+    "severity": "major",
+    "title": "Per-crate label placeholders are validated but never expanded"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-1 identity gap is now addressed by rejecting templates that use `{crate}` outside a crate-specific dedup key, and the title/body cases are tested. However, the newly documented and validated labels case is not actually implemented: labels are copied from the template without placeholder expansion. A coherent template using `area:{crate}` therefore mints per-crate issues whose labels remain the literal `area:{crate}`. Because this is a new correctness finding relative to round 1, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
