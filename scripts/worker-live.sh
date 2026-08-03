@@ -1665,6 +1665,23 @@ PY
 # element `type` (an unknown one renders nothing), the attributes each type needs — each judged by
 # its SHAPE, not merely by being non-empty — and ids that github will accept.
 #
+# ⚠️ A PRESENT-BUT-MALFORMED OPTIONAL FIELD BREAKS THE DOCUMENT TOO — it is not harmlessly ignored,
+# so "only the required attributes are checked" would still hand a form to github that github then
+# refuses to render. Every field github's schema defines is therefore judged by its SHAPE whenever
+# it is present: `validations` is a MAPPING whose `required` is a BOOLEAN (`validations: required`
+# — the scalar — is the common spelling of this mistake), a dropdown's `multiple` is a BOOLEAN and
+# its `default` an integer INDEX into `options`, a checkbox option's `required` is a BOOLEAN, and
+# the free-text attributes (`description`/`placeholder`/`value`/`render`) are STRINGS.
+#
+# ⚠️ CLOSED-WORLD BELOW THE TOP LEVEL, OPEN-WORLD AT IT — a deliberate asymmetry, for the same
+# reason `id` stays optional below. Element keys, per-type attributes, `validations` keys and
+# checkbox-option keys are FIXED, documented sets, and github's parser rejects a document carrying
+# a key outside them (a `label:` written one level too high, a `render:` on an `input`) — so an
+# unknown key there is refused. Top-level keys are NOT closed: that is where github keeps adding
+# fields (`type` for issue types, `projects`), and refusing a document github.com renders is the
+# opposite failure from the one this closes. When github adds an element attribute, this table is
+# the one line to extend, and the refusal names the key.
+#
 # ⚠️ `id` IS OPTIONAL, DELIBERATELY, FOR EVERY TYPE. GitHub's form schema lists `id` as
 # `Required: false` in each of the input/textarea/dropdown/checkboxes tables: it is the key used to
 # prefill/address a field by URL query parameter, not a render requirement, and a form with no ids
@@ -1699,17 +1716,35 @@ except Exception as exc:  # fail closed -- never "no faults found" because nothi
           file=sys.stderr)
     sys.exit(1)
 
-# The element types github.com renders. An unrecognised type is not ignored -- the form breaks.
-REQUIRED_ATTRS = {
-    "markdown": ("value",),
-    "input": ("label",),
-    "textarea": ("label",),
-    "dropdown": ("label", "options"),
-    "checkboxes": ("label", "options"),
+# The element types github.com renders, each with the ATTRIBUTES its own docs table defines:
+# `<shape>` for an optional attribute, `<shape>*` for one the element cannot render without. The
+# table is CLOSED (see the header): an attribute outside its type's row is a fault, because that is
+# how the mistake is actually made -- `render:` on an `input`, `options:` on a `textarea`.
+ATTR_SCHEMA = {
+    "markdown": {"value": "text*"},
+    "input": {"label": "text*", "description": "text", "placeholder": "text", "value": "text"},
+    "textarea": {"label": "text*", "description": "text", "placeholder": "text", "value": "text",
+                 "render": "text"},
+    "dropdown": {"label": "text*", "description": "text", "multiple": "bool",
+                 "options": "options*", "default": "index"},
+    "checkboxes": {"label": "text*", "description": "text", "options": "options*"},
 }
+
+# The keys an ELEMENT itself carries. Anything else is an attribute written one level too high.
+ELEMENT_KEYS = ("type", "id", "attributes", "validations")
+# `validations` has exactly one documented key, and it is a boolean.
+VALIDATION_SHAPE = {"required": "bool"}
+# A checkbox option is a mapping of exactly these -- the label renders, `required` blocks submit.
+OPTION_SHAPE = {"label": "text*", "required": "bool"}
 
 # github's documented id charset: "Can only contain numbers, letters, - and _".
 ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+# A chooser link's `url` is a link TARGET, not prose: github needs an absolute URI, so a bare
+# "runbooks" or "www.example.com" is refused, and so is a scheme with nothing after it. The scheme
+# SET is deliberately NOT enumerated -- github documents none, and refusing `mailto:` would refuse
+# a chooser github.com renders; this pins the SHAPE (scheme, optional `//`, then a target).
+URL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:(//)?[^/\s]\S*$")
 
 def empty(value):
     return (value is None
@@ -1720,12 +1755,56 @@ def text(value):
     """A renderable text attribute: a non-empty STRING. A number/bool/list is not one."""
     return isinstance(value, str) and bool(value.strip())
 
+def shape_faults(where, mapping, shape, etype=None):
+    """Fault strings for `mapping` judged against a {key: shape} table, CLOSED-WORLD.
+
+    Shapes: "text" a non-empty string, "bool" a real boolean, "options" a renderable option list,
+    "index" an integer position in the sibling `options`; a trailing "*" marks a required key. A
+    key outside `shape` is a fault in its own right -- github's schema defines a fixed set at this
+    level and rejects the whole document over an unrecognised one, it does not ignore it.
+    """
+    out = []
+    for key, kind in shape.items():
+        required = kind.endswith("*")
+        kind = kind.rstrip("*")
+        if key not in mapping:
+            if required:
+                out.append(f"{where} required `{key}` is missing")
+            continue
+        value = mapping[key]
+        if kind == "text":
+            if not text(value):
+                out.append(f"{where} `{key}` is not a non-empty string (got {value!r})")
+        elif kind == "bool":
+            # `isinstance(True, int)` is True in python, so booleans are tested BEFORE numbers
+            # anywhere it matters -- here the shape simply is a boolean and nothing else.
+            if not isinstance(value, bool):
+                out.append(f"{where} `{key}` is not a boolean (got {value!r})")
+        elif kind == "options":
+            out += [f"{where} {f}" for f in option_faults(etype, value)]
+        elif kind == "index":
+            out += [f"{where} {f}" for f in index_faults(key, value, mapping.get("options"))]
+    for key in mapping:
+        if key not in shape:
+            out.append(f"{where} has `{key}`, which github's schema does not define here "
+                       f"(defined: {', '.join(sorted(shape))})")
+    return out
+
+def index_faults(key, value, options):
+    """`default` selects an option by POSITION, not by value: a string or a bool is not one, and
+    an index past the end of `options` selects nothing."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return [f"`{key}` is not an integer index into `options` (got {value!r})"]
+    if value < 0 or (isinstance(options, list) and value >= len(options)):
+        return [f"`{key}` is {value}, which is not a position in `options`"]
+    return []
+
 def option_faults(etype, options):
     """Fault strings for a dropdown/checkboxes `options` value.
 
     A non-empty LIST is not enough to be renderable: a dropdown's options are distinct non-empty
-    STRINGS, and a checkboxes' options are MAPPINGS each carrying a non-empty `label` (`required`
-    is the only other key). `[null]`, `[{required: true}]` and a bare-string checkbox item all
+    STRINGS, and a checkboxes' options are MAPPINGS each carrying a non-empty `label` and, at most,
+    a BOOLEAN `required`. `[null]`, `[{required: true}]` and a bare-string checkbox item all
     satisfy "non-empty list" and none of them render.
     """
     if not isinstance(options, list) or not options:
@@ -1742,8 +1821,8 @@ def option_faults(etype, options):
         elif not isinstance(opt, dict):
             out.append(f"`options[{j}]` is not a mapping "
                        "(checkbox options are `- label: ...` items)")
-        elif not text(opt.get("label")):
-            out.append(f"`options[{j}]` has no non-empty `label`")
+        else:
+            out += shape_faults(f"`options[{j}]`", opt, OPTION_SHAPE)
     return out
 
 try:
@@ -1770,6 +1849,9 @@ elif os.path.basename(path) in ("config.yml", "config.yaml"):
             for key in ("name", "url", "about"):
                 if empty(link.get(key)) or not isinstance(link.get(key), str):
                     faults.append(f"chooser config: contact_links[{i}] has no `{key}`")
+                elif key == "url" and not URL_RE.match(link[key].strip()):
+                    faults.append(f"chooser config: contact_links[{i}] `url` {link[key]!r} is not "
+                                  "an absolute URL (a scheme, then a target, no whitespace)")
 else:
     for key in ("name", "description"):
         if empty(doc.get(key)) or not isinstance(doc.get(key), str):
@@ -1784,21 +1866,31 @@ else:
             faults.append(f"body[{i}] is not a mapping")
             continue
         etype = element.get("type")
-        if etype not in REQUIRED_ATTRS:
+        if etype not in ATTR_SCHEMA:
             faults.append(f"body[{i}] has unrenderable type {etype!r} "
-                          f"(known: {', '.join(sorted(REQUIRED_ATTRS))})")
+                          f"(known: {', '.join(sorted(ATTR_SCHEMA))})")
             continue
+        for key in element:
+            if key not in ELEMENT_KEYS:
+                faults.append(f"body[{i}] ({etype}) has element key `{key}`, which github's schema "
+                              f"does not define (defined: {', '.join(ELEMENT_KEYS)}) -- an "
+                              "attribute written one level too high invalidates the document")
         attrs = element.get("attributes")
         if not isinstance(attrs, dict):
             faults.append(f"body[{i}] ({etype}) has no `attributes` mapping")
         else:
-            for attr in REQUIRED_ATTRS[etype]:
-                if attr == "options":
-                    faults += [f"body[{i}] ({etype}) {f}"
-                               for f in option_faults(etype, attrs.get(attr))]
-                elif not text(attrs.get(attr)):
-                    faults.append(f"body[{i}] ({etype}) required attribute `{attr}` is "
-                                  f"missing or not a non-empty string")
+            faults += shape_faults(f"body[{i}] ({etype})", attrs, ATTR_SCHEMA[etype], etype)
+        # `validations` is OPTIONAL, but a present one is part of the document github parses: the
+        # scalar spelling (`validations: required`) and a stringy `required` both invalidate it.
+        if "validations" in element:
+            validations = element["validations"]
+            if not isinstance(validations, dict):
+                faults.append(f"body[{i}] ({etype}) `validations` is not a mapping "
+                              f"(it is `validations:` then `required: <bool>`, "
+                              f"got {validations!r})")
+            else:
+                faults += shape_faults(f"body[{i}] ({etype}) validations",
+                                       validations, VALIDATION_SHAPE)
         # An ABSENT id is legal for every type (see the header) -- only a github-INVALID one is a
         # fault, so this checks the charset and uniqueness and never the presence.
         if "id" in element:
@@ -5236,6 +5328,21 @@ PY
     > "$tmp/form-nooptions.yml"
   chk "a dropdown with no options is REJECTED (label alone is not renderable)" \
     "$(_form "$tmp/form-nooptions.yml")" "broken"
+  # PRESENT but not a list, and present but EMPTY: distinct from ABSENT above, and a line-coverage
+  # sweep showed the "not a non-empty list" refusal never executing without these two.
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: dropdown\n    attributes:\n      label: L\n      options: a, b\n'
+  } > "$tmp/form-options-scalar.yml"
+  chk "a SCALAR options is REJECTED (a comma-separated string is not a choice list)" \
+    "$(_form "$tmp/form-options-scalar.yml")" "broken"
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: checkboxes\n    attributes:\n      label: L\n      options: []\n'
+  } > "$tmp/form-options-empty.yml"
+  chk "an EMPTY options list is REJECTED (the element renders no choices at all)" \
+    "$(_form "$tmp/form-options-empty.yml")" "broken"
+  printf 'a bare scalar document\n' > "$tmp/form-scalar-doc.yml"
+  chk "a form whose TOP LEVEL is not a mapping is REJECTED" \
+    "$(_form "$tmp/form-scalar-doc.yml")" "broken"
   # A required attribute that is PRESENT but the wrong SHAPE. Non-emptiness alone accepts every one
   # of these, and github renders none of them — this is the gap that made "the form is valid"
   # weaker than it reads.
@@ -5265,6 +5372,108 @@ PY
   } > "$tmp/form-checkbox-nolabel.yml"
   chk "a checkbox option with no label is REJECTED (the box would render blank)" \
     "$(_form "$tmp/form-checkbox-nolabel.yml")" "broken"
+  # PRESENT-BUT-MALFORMED OPTIONAL FIELDS. Checking only the REQUIRED attributes leaves the
+  # headline claim ("the gate refuses a form github cannot render") false for a whole class of
+  # documents: github's schema types these fields too, and a malformed one invalidates the
+  # document rather than being ignored. POSITIVE CONTROL FIRST — every optional field github
+  # defines, at a VALID value, in one document, so the per-field refusals below cannot be blanket
+  # refusals of the fields' mere presence.
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: input\n    id: handle\n    attributes:\n      label: Handle\n'
+    printf '      description: who it is\n      placeholder: acct-x\n      value: acct-\n'
+    printf '    validations:\n      required: true\n'
+    printf '  - type: textarea\n    attributes:\n      label: Spec\n      render: yaml\n'
+    printf '    validations:\n      required: false\n'
+    printf '  - type: dropdown\n    attributes:\n      label: Pick\n      multiple: true\n'
+    printf '      default: 1\n      options: [a, b]\n'
+    printf '  - type: checkboxes\n    attributes:\n      label: Ack\n      description: confirm\n'
+    printf '      options:\n        - label: one\n          required: false\n        - label: two\n'
+  } > "$tmp/form-optionals.yml"
+  chk "EVERY optional field at a valid value is ACCEPTED (the shape rules are not presence bans)" \
+    "$(_form "$tmp/form-optionals.yml")" "renders"
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: input\n    attributes:\n      label: L\n    validations: required\n'
+  } > "$tmp/form-validations-scalar.yml"
+  chk "a SCALAR \`validations\` is REJECTED (it is a mapping — this is the usual misspelling)" \
+    "$(_form "$tmp/form-validations-scalar.yml")" "broken"
+  # QUOTED on purpose: unquoted `true`/`yes` are BOOLEANS to the yaml reader, so an unquoted
+  # fixture would test the loader rather than the validator and pass for the wrong reason.
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: input\n    attributes:\n      label: L\n'
+    printf '    validations:\n      required: "true"\n'
+  } > "$tmp/form-validations-string.yml"
+  chk "a STRING \`validations.required\` is REJECTED (github's schema types it boolean)" \
+    "$(_form "$tmp/form-validations-string.yml")" "broken"
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: input\n    attributes:\n      label: L\n'
+    printf '    validations:\n      required: true\n      requred: true\n'
+  } > "$tmp/form-validations-unknown.yml"
+  chk "an unknown key inside \`validations\` is REJECTED (a typo'd \`requred\` is silent otherwise)" \
+    "$(_form "$tmp/form-validations-unknown.yml")" "broken"
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: dropdown\n    attributes:\n      label: L\n      multiple: "true"\n'
+    printf '      options: [a, b]\n'
+  } > "$tmp/form-multiple-string.yml"
+  chk "a STRING dropdown \`multiple\` is REJECTED (it is a boolean)" \
+    "$(_form "$tmp/form-multiple-string.yml")" "broken"
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: dropdown\n    attributes:\n      label: L\n      default: a\n'
+    printf '      options: [a, b]\n'
+  } > "$tmp/form-default-value.yml"
+  chk "a dropdown \`default\` naming a CHOICE is REJECTED (it is an integer index)" \
+    "$(_form "$tmp/form-default-value.yml")" "broken"
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: dropdown\n    attributes:\n      label: L\n      default: 2\n'
+    printf '      options: [a, b]\n'
+  } > "$tmp/form-default-range.yml"
+  chk "a dropdown \`default\` past the end of \`options\` is REJECTED (it selects nothing)" \
+    "$(_form "$tmp/form-default-range.yml")" "broken"
+  # A BOOLEAN default, which is the one non-integer that an `is it in range?` check alone accepts:
+  # python's bool IS an int, so `true` reads as index 1 and passes every range test. (Measured: a
+  # mutant that dropped the type check survived the whole suite until this fixture existed.)
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: dropdown\n    attributes:\n      label: L\n      default: true\n'
+    printf '      options: [a, b]\n'
+  } > "$tmp/form-default-bool.yml"
+  chk "a BOOLEAN dropdown \`default\` is REJECTED (a bool is not an index, however int-like)" \
+    "$(_form "$tmp/form-default-bool.yml")" "broken"
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: checkboxes\n    attributes:\n      label: L\n'
+    printf '      options:\n        - label: one\n          required: "yes"\n'
+  } > "$tmp/form-checkbox-required-string.yml"
+  chk "a STRING checkbox-option \`required\` is REJECTED (it is a boolean)" \
+    "$(_form "$tmp/form-checkbox-required-string.yml")" "broken"
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: checkboxes\n    attributes:\n      label: L\n'
+    printf '      options:\n        - label: one\n          requiredd: true\n'
+  } > "$tmp/form-checkbox-unknown.yml"
+  chk "an unknown key on a checkbox option is REJECTED (\`requiredd\` never blocks submit)" \
+    "$(_form "$tmp/form-checkbox-unknown.yml")" "broken"
+  # CLOSED-WORLD below the top level: an attribute valid for ANOTHER type, or one written a level
+  # too high, is exactly how a form breaks silently — and both parse fine.
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: input\n    attributes:\n      label: L\n      render: yaml\n'
+  } > "$tmp/form-wrongtype-attr.yml"
+  chk "an attribute belonging to ANOTHER type is REJECTED (\`render\` is textarea-only)" \
+    "$(_form "$tmp/form-wrongtype-attr.yml")" "broken"
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: input\n    label: L\n    attributes:\n      label: L\n'
+  } > "$tmp/form-misindented.yml"
+  chk "an attribute written one level too HIGH is REJECTED (element keys are a fixed set)" \
+    "$(_form "$tmp/form-misindented.yml")" "broken"
+  { printf 'name: n\ndescription: d\nbody:\n'
+    printf '  - type: input\n    attributes:\n      label: L\n      description: 42\n'
+  } > "$tmp/form-nonstring-optional.yml"
+  chk "a non-STRING optional text attribute is REJECTED (\`description\` is typed too)" \
+    "$(_form "$tmp/form-nonstring-optional.yml")" "broken"
+  # ...and the OPPOSITE direction for the top level, which is deliberately OPEN-world: github keeps
+  # adding top-level keys (`type` for issue types, `projects`), and a closed set there would refuse
+  # a document github.com renders — the failure this gate exists to avoid causing.
+  { printf 'name: n\ndescription: d\ntitle: "t"\nlabels: [a]\nassignees: [u]\ntype: Bug\nbody:\n'
+    printf '  - type: input\n    attributes:\n      label: L\n'
+  } > "$tmp/form-toplevel-extras.yml"
+  chk "unknown TOP-LEVEL keys are ACCEPTED (github adds them; refusing would be the wrong failure)" \
+    "$(_form "$tmp/form-toplevel-extras.yml")" "renders"
   # BOTH DIRECTIONS ON `id`. It is `Required: false` in github's schema for every element type — the
   # prefill query-parameter key, not a render requirement — so a form with NO ids must be ACCEPTED;
   # requiring one would refuse documents github.com renders, which is the opposite of this gate's
@@ -5321,6 +5530,27 @@ PY
   printf 'contact_links:\n  - a bare string\n' > "$tmp/chooser-item/config.yml"
   chk "a contact_links entry that is not a mapping is REJECTED" \
     "$(_form "$tmp/chooser-item/config.yml")" "broken"
+  # A chooser `url` is a link TARGET: "non-empty string" accepts prose and a bare hostname, and
+  # github renders neither. Both directions, because the scheme set is deliberately not enumerated
+  # — `mailto:` must keep passing, or this refuses a chooser github.com renders.
+  mkdir -p "$tmp/chooser-url" "$tmp/chooser-host" "$tmp/chooser-mailto"
+  printf 'contact_links:\n  - name: R\n    url: runbooks\n    about: a\n' \
+    > "$tmp/chooser-url/config.yml"
+  chk "a chooser url that is not a URL is REJECTED (non-empty string is not a link target)" \
+    "$(_form "$tmp/chooser-url/config.yml")" "broken"
+  printf 'contact_links:\n  - name: R\n    url: www.example.invalid/r\n    about: a\n' \
+    > "$tmp/chooser-host/config.yml"
+  chk "a chooser url with no scheme is REJECTED (a bare hostname is not absolute)" \
+    "$(_form "$tmp/chooser-host/config.yml")" "broken"
+  mkdir -p "$tmp/chooser-scheme"
+  printf 'contact_links:\n  - name: R\n    url: "https://"\n    about: a\n' \
+    > "$tmp/chooser-scheme/config.yml"
+  chk "a chooser url that is a scheme with NO target is REJECTED" \
+    "$(_form "$tmp/chooser-scheme/config.yml")" "broken"
+  printf 'contact_links:\n  - name: R\n    url: "mailto:x@example.invalid"\n    about: a\n' \
+    > "$tmp/chooser-mailto/config.yml"
+  chk "a non-http chooser url is ACCEPTED (the URL check pins SHAPE, it does not allowlist schemes)" \
+    "$(_form "$tmp/chooser-mailto/config.yml")" "renders"
   # THE #1110 DEPENDENCY DECISION, EXECUTED: with PyYAML unimportable this lane must REFUSE, not
   # skip. Shadowing `yaml` on PYTHONPATH reproduces the model container, where `import yaml` fails.
   mkdir -p "$tmp/noyaml"
@@ -5328,6 +5558,37 @@ PY
   chk "an absent PyYAML REFUSES the form check (fail closed — it is never skipped)" \
     "$(PYTHONPATH="$tmp/noyaml" _assert_issue_form_valid "$tmp/form-ok.yml" >/dev/null 2>&1 \
        && echo renders || echo broken)" "broken"
+  # AGENTS.md pre-flight item 4, the *false kill*: `_form` reports "broken" for ANY non-zero exit,
+  # so a negative row also passes when the fixture merely fails to PARSE (a stray yaml typo) or when
+  # the validator CRASHES on it — in both cases the rule the row names never ran, and the row would
+  # keep passing with that rule deleted. (Measured: a mutant that dropped the `default` type check
+  # left `"a" < 0` to raise TypeError, and the row it should have killed passed on the traceback.)
+  # Sweep every fixture and require that each refusal comes from the SCHEMA, excluding by name the
+  # one fixture that is meant to be unparseable.
+  # [#879] CAPTURE-then-TEST, never `producer | grep -q`: an early-exiting consumer SIGPIPEs the
+  # producer and `pipefail` (line 6) then reports 141, which here would silently invert the sweep.
+  local form_fix form_report form_parsefail=0 form_crash=0 form_fixtures=0
+  for form_fix in "$tmp"/form-*.yml "$tmp"/chooser/config.y*ml "$tmp"/chooser-*/config.yml; do
+    [[ -f "$form_fix" ]] || continue
+    [[ "$form_fix" == *form-unparseable.yml ]] && continue
+    form_fixtures=$((form_fixtures + 1))
+    form_report="$(_assert_issue_form_valid "$form_fix" 2>&1 || true)"
+    if [[ "$form_report" == *"issue form does not parse"* ]]; then
+      form_parsefail=$((form_parsefail + 1))
+      printf 'worker-live: self-test fixture is not valid yaml: %s\n' "$form_fix" >&2
+    fi
+    if [[ "$form_report" == *"Traceback (most recent call last)"* ]]; then
+      form_crash=$((form_crash + 1))
+      printf 'worker-live: validator CRASHED on fixture %s:\n%s\n' "$form_fix" "$form_report" >&2
+    fi
+  done
+  chk "the fixture parse sweep actually saw the fixtures (non-vacuous)" \
+    "$([[ "$form_fixtures" -gt 15 ]] && echo swept || echo "only $form_fixtures")" "swept"
+  chk "every issue-form fixture is VALID yaml: refused by the SCHEMA, not by the reader" \
+    "$form_parsefail" "0"
+  chk "no fixture is refused by a CRASH (a traceback is not a schema fault — it is a false kill)" \
+    "$form_crash" "0"
+
   # WIRING, pinned as an EXACT BLOCK rather than by containment: every assertion above can be
   # perfectly correct and simply never reached from the gate. Containment is not enough here — a
   # loop that is PRESENT and INERT (`&& [[ -n "${LINT_FORMS:-}" ]]`, an `|| true` on the refusal, a
