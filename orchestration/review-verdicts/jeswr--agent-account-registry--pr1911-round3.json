@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1911,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b3bdf56614549bdd3e36148dd8327bd367920719",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The static/runtime split does not make the acceptance proof sound. For example, `_park_call_site` certifies `for number in (targets if pending is not pending else []): park_starved_partition_holder(...)`. The test contains a `Name`, so `_static_control` is false; `_constant_truth` does not model `Compare`; `_control_arms` therefore marks both arms live. But two reads of the same ordinary local binding are identical, so the selected arm is always `[]` and the loop parks nothing. A simpler broader class remains too: `for number in filter(lambda _: False, targets): ...` exposes a live `targets` name to the scan although the iterator is always empty. The new tests cover enumerated static spellings but do not establish that an accepted iterable actually iterates the bound batch.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Make acceptance structural: restrict the accepted iterable to an explicitly safe grammar that guarantees iteration of the bound batch (ideally the bound name itself, plus only justified transparent forms), instead of treating arbitrary runtime-bearing expressions as evidence. Add a live control and named red tests for at least `targets if pending is not pending else []` and an always-empty runtime wrapper such as `filter(lambda _: False, targets)`; ensure the production call site still certifies.",
+    "severity": "major",
+    "title": "Runtime-valued expressions still provide unsound acceptance evidence"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-three change closes the two named literal-only bypasses, but acceptance is still permissive for runtime-valued expressions that are statically guaranteed not to iterate the selected batch. `_control_arms` treats every undecided expression containing a `Name` or `Call` as making both arms live, and `_park_call_site` accepts any live occurrence of the bound name in the iterable. Consequently, an author can still disable parking while retaining certification. This is materially the same reachability/soundness finding at the same severity as round two.",
+  "verdict": "request_changes"
+ }
+}
