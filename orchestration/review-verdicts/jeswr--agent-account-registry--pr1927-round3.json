@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1927,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6968cbe282ca6e662a4efea3dc7400c3a9a4febe",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_model_container_binds` recognizes only mount flags that appear as literal whitespace-delimited source tokens. For example, `_run_headless_harness` can define `local registry_flag=--volume registry_spec=\"$SCRIPT_DIR/..:/registry\"` before `container`, then add `\"$registry_flag\" \"$registry_spec\"` inside the initial `container=(...)`. Docker receives a writable bind of the registry checkout, but the awk scan skips both assignments and expansions, still prints exactly the four expected records, and the separate `grep -c '^  container+=('` remains 1. This is valid shell and does not rely on exotic Docker syntax. Consequently the model can rewrite the registry script later executed with `REGISTRY_SECRETS_PAT`, while all added #300 containment rows stay green.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Assert the argv Docker actually receives, or constrain and structurally validate every element-producing construct in the launcher so variable/array/function/command-substitution expansion cannot add arguments outside the independently expected set. Add a non-crashing mutant that composes `--volume` and its spec through variables expanded into the initial `container` array and require the assertion to fail. A lexical inventory of recognized literal spellings is not an exact runtime-argv check.",
+    "severity": "blocker",
+    "title": "Exact mount assertion misses shell-composed Docker arguments"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-2 literal `--volume`/`-v` bypass is covered, but the same blocker remains at the shell-composition seam. `_model_container_binds` lexically scans selected literal tokens anywhere in `_run_headless_harness`; it does not compute or validate the actual `container` argv executed by Docker. A mount flag and spec placed in ordinary shell variables and expanded into the initial array expose the writable registry checkout while the extractor still emits the expected four records and the `container+=(` count remains one. The new mutants exercise spellings, not argument construction, so the headline exact-filesystem assertion is still non-vacuously incomplete. This is materially the prior blocker at the same severity, therefore progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
