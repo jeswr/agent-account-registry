@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5891,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4b6e6de4a86520f4da4c472ab2c93856a0cef21d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The live `run_mutants` step both catches `cargo mutants` failure with `|| echo` and has `continue-on-error: true`; its own workflow comment says the job exits success even when cargo-mutants fails. This reporter only reads the job-level `status`/`conclusion`, so an ordinary mutation failure is classified `ok`. The tests manufacture job objects with `conclusion: failure`, bypassing the actual suppression and therefore do not validate the claimed real path. The report can expose timeout/cancellation or unrelated job-level failures, but not the hidden cargo-mutants failures that motivate the PR.",
+    "file": "scripts/nightly/mutants_leg_report.py",
+    "fix_hint": "Persist an explicit per-leg outcome that survives `continue-on-error` (for example, a small status artifact or step output uploaded under `always()`), have the report consume those outcomes, and add an integration-shaped fixture matching the live shell behavior where cargo-mutants exits nonzero while the Actions job concludes success. Alternatively stop suppressing the relevant step outcome if the advisory architecture permits it.",
+    "severity": "major",
+    "title": "Jobs API conclusions cannot reveal the suppressed mutation failures"
+   },
+   {
+    "body": "`OK_CONCLUSIONS` includes `skipped`, and `unusable_crates` only rejects states other than `ok`. Consequently a skipped leg is counted under the report's `success` column, contributes to \u201cAll ... produced a verdict,\u201d and leaves its crate seedable. A skipped mutation leg did not execute and cannot provide the complete outcomes required for seeding; the negative-control test explicitly locks in this incorrect behavior.",
+    "file": "scripts/nightly/mutants_leg_report.py",
+    "fix_hint": "Classify `skipped` as an incomplete/non-verdict state (with an appropriate annotation and nonzero verdict), keep only conclusions that prove execution completed in the usable set, and update the green-run test to use actual successful legs while adding a skipped-leg fail-closed test.",
+    "severity": "major",
+    "title": "Skipped legs are incorrectly treated as successful, seedable verdicts"
+   }
+  ],
+  "progress": null,
+  "summary": "The reporter's fixtures pass, but they model conclusions that the live mutation job deliberately suppresses, so the new check cannot reliably expose the cargo-mutants failures it claims to report. It also classifies skipped legs as usable for seeding even though a skipped leg produces no mutation verdict/artifact.",
+  "verdict": "request_changes"
+ }
+}
