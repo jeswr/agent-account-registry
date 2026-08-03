@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "58b7c92faa5b5ca5",
-   "claim_id": "3acce761090745f4ba1a94e97b07ea75",
-   "holder": "sparq-org/sparq#5772@30790657188.1",
-   "package": "ci",
-   "role": "ci",
-   "model": "opus5",
-   "issued_at": 1785738918,
-   "expires_at": 1785745218
-  },
-  {
-   "account": "58b7c92faa5b5ca5",
    "claim_id": "45477059dbce4e1aa8faefa0d7923205",
    "holder": "fix:jeswr/agent-account-registry#1866@30790883186.1",
    "package": "dashboard",
