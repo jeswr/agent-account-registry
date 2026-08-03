@@ -56,8 +56,10 @@ the two is not cosmetic — it is what fixes the denominator:
 The derived view is only sound if each decision names the rows it consumed — otherwise the reader
 cannot recover membership, cannot compute either denominator, and cannot tell two decisions over
 different windows apart. Naming the rows is necessary but *not* sufficient: the arm also moves with
-the 6 h exclusion cutoff over an unchanged window, so the binding has to cover the decision's whole
-input. §8's option C is what has to carry it, and §8.1 specifies it.
+the 6 h exclusion cutoff over an unchanged window, and with the route the chain is resolved against,
+so the binding has to cover the decision's whole input — the rows *and* the tier sequence they are
+evaluated against. §8's option C is what has to carry it; §8.1 specifies it, and states what the
+artifact degrades to if the tier sequence has to stay off the target timeline.
 
 ## 2. What the repo records today — the three seams, grounded
 
@@ -233,7 +235,8 @@ Finding A one layer over.
 Concretely, C is: at `dispatch-claim.py:8586-8613`, post one bot comment carrying a **new** marker
 naming the `arm` (`proceed` / `retry-other-tier` / `decompose`), whether a decompose was
 **reason-driven or exhaustion-driven** (§5's population split, which is the fact nothing records
-today), and — §8.1 — a binding to the decision's *whole* input, not only to the rows. It is bot-authored, so it
+today), and — §8.1 — a binding to the decision's *whole* input, rows and tier sequence both (or, if
+the sequence must stay unpublished, the weaker artifact §8.1 scopes it down to). It is bot-authored, so it
 inherits the existing "only the orchestration bot's own comments are receipts" filter (pre-flight
 item 5) and cannot be forged from a target repo. It is *adjacent to*, and must not modify, the
 existing decline-escalation receipt, whose `key=` is an idempotence hash over evidence
@@ -276,17 +279,66 @@ named below because it will otherwise be copied wrong:
   `_decline_escalation_evidence` (`:6402-6406`) truncates its own. Its **preimage is the comment
   body**, so any reader recomputes it offline; it is stable across ticks over an unchanged window,
   which is what lets a reader group the receipts that share one evidence set.
-- **`key=<sha256 hex[:16]>` — the idempotence key, over the WHOLE decision input**: the `evidence`
-  digest, the per-entry recency bit `ts >= at - TIER_EXCLUSION_SECONDS`, `chain`, `remaining`, the
-  arm, and the `reason-driven`/`exhaustion-driven` flag. Every one of those is on the comment, so
-  `key=` is recomputable there too.
+- **`key=<sha256 hex[:16]>` — the idempotence key**: the `evidence` digest, the per-entry recency
+  bit `ts >= at - TIER_EXCLUSION_SECONDS`, `chain`, `remaining`, the arm, the
+  `reason-driven`/`exhaustion-driven` flag, **and `chain-digest`/`remaining-digest`** — canonical
+  digests, taken exactly as `evidence=` is, of the **ordered alias lists** `chain`
+  (`no_change_routing.py:184`) and `remaining` (`:191`). Those last two are what make the key a
+  binding of the decision *input* rather than of its published shadow, and they are not optional
+  padding: `retry_decision` is a function of the alias **sequences**, not of their lengths, so
+  `chain=<n> remaining=<m>` is satisfied by more than one routing input — and for
+  `retry-other-tier`, `remaining=<n>` never says *which* tier runs next.
 
 > **The departure.** `_decline_escalation_evidence` digests the **full validated rows** — `account`,
 > `provider` and `model_alias` included. That is fine for a marker that only has to be *stable*, but
 > its preimage is a health row pruned at 48 h (§7), so after the window it is an **opaque token**:
-> nothing on the timeline can ever check it. Both digests above are defined over the **published
-> projection only**, and that is the entire reason they are checkable. Do not reuse
+> nothing on the timeline can ever check it. `evidence=` above is defined over the **published
+> projection only**, and that is the entire reason it is checkable; `key=`'s two chain digests are
+> the one deliberate exception, and the paragraph below states exactly what that costs. Do not reuse
 > `_decline_escalation_evidence` for the new marker, and do not describe its `key=` as verifiable.
+
+**`key=` is therefore only half-checkable — do not describe it the way `evidence=` is described.**
+The two chain digests' preimages are **not** on the comment. A reader recomputes `evidence=` from the
+body alone; it can recompute `key=` only if it also holds the dispatching commit's
+`resolved["model_chain"]` (`dispatch-claim.py:8587-8588`), and that is not a pure function of the
+public route table — the review chain proper is computed cross-provider in `dispatch-claim.py`
+(`orchestration/routing.toml:308`), and the table itself can be edited between two ticks of the same
+issue. Nor do the digests buy confidentiality: this repo's table holds only three distinct chains
+(`["opus5", "sol"]`, `["opus5"]`, `["sol", "opus5"]`), so anyone holding it inverts a chain digest by
+enumeration. They buy **collision-freedom only** — which is precisely what an idempotence key needs
+and what the published counts cannot supply. If the maintainer will not put a field on a target-repo
+timeline that a reader there cannot verify, the honest alternative is to omit the two digests and
+**scope the artifact down**, next paragraph — not to keep the counts and call the result a
+whole-input binding.
+
+**Scoped-down variant: without the chain digests, `key=` is an outcome-projection key, and distinct
+keys are a LOWER BOUND on distinct routing decisions.** The preimage is then the published
+projection plus the arm and the flag, and two genuinely different decision inputs collide whenever
+they agree on it. Both cases are reachable:
+
+1. **The chain moved under an unchanged window.** Two chains of equal length that differ in order or
+   membership are the same `chain=<n>`, and — since `remaining` preserves chain order over the same
+   exclusion set — often the same `remaining=<n>` and the same arm. That pair is live today:
+   `role = "ci"`/`role = "site"` resolve to `["opus5", "sol"]` and `role = "docs"` to
+   `["sol", "opus5"]` (`orchestration/routing.toml:284,262,302`), and `choose_account` walks the
+   chain **in order** (`select-and-claim.py:613-624`, "Walks the model chain"). The chain is
+   re-resolved on every tick from the issue's labels — which
+   dispatch itself rewrites (`role:impl` → `role:research`, `dispatch-claim.py:5315`) and triage can
+   re-label — against a table that is editable between two ticks of the same issue. The receipt reads
+   `proceed` on a 2-rung chain both times; the model that actually runs differs. Equal-length chains
+   differing in **membership** are not prevented either — every onboarded target carries its own
+   `routing.toml` (`orchestration/routing.toml:253-257`) — and that is the case where the *narrowed*
+   chain's next tier differs at an identical `remaining=<n>`.
+2. **The exclusion moved under an unchanged projection.** `excluded_tiers` keys on `model_alias`
+   (`no_change_routing.py:153-155`), which is deliberately unpublished. Entries publish
+   `ts`/`run_id`-or-`ledger-ts-<ts>`/`why_no_diff` only, so a row with an empty `run_id` that is
+   pruned and replaced by another row of the same `ts` and reason but a **different alias** leaves
+   `evidence=` and every recency bit identical while retiring a different tier of the same count.
+
+In both, the second tick is suppressed although the tier sequence changed. So under that variant the
+comment is a receipt of the **published outcome projection**, not a binding of the decision, and the
+distinct-`key=` count must be labelled a lower bound on distinct routing decisions rather than a
+count of them.
 
 **What that payload does and does not reconstruct — state it, do not over-claim.** The entries carry
 the `declared_reasons` input in full, so the **reason** half of the arm is re-derivable offline, and
@@ -297,6 +349,8 @@ fields: reason intersection first, then `remaining == 0` → `decompose`, `remai
 is *which* tiers `excluded_tiers` retired: no `model_alias` is published, so `chain` and `remaining`
 are **bot-asserted counts, not reader-derived ones**, and a reader can only check them for internal
 consistency against the arm and the flag — a disagreement is detectable, a jointly-wrong pair is not.
+`chain-digest`/`remaining-digest` are bot-asserted in exactly the same sense: they let a reader tell
+two decisions **apart**, never tell it which tiers either one held.
 That residual is the disclosure tradeoff, and it is taken deliberately: publishing aliases would make
 the counts independently checkable but puts fleet composition onto a public target-repo timeline,
 which the existing decline receipt (`_decline_outcome_name`) pointedly does not do — a separate
@@ -332,7 +386,8 @@ The four cases the binding has to define, each answered from the code:
   `MAX_RECORDS` count cap** and not only to age (`prune`, `:602-617`) — so "the window shrank" is
   not a pure function of elapsed time, and unrelated fleet traffic can change an issue's evidence
   set.
-- **Repeated decisions.** Idempotence is on `key=` — the *whole* decision input — and never on the
+- **Repeated decisions.** Idempotence is on `key=` — the decision input, rows *and* tier sequence
+  (or, in the scoped-down variant, its published projection) — and never on the
   evidence alone: if the bot has already posted this marker with this key, post nothing, exactly as
   `_decline_marker_action` (`:6409-6427`) does. **An evidence-only key would be wrong here, and the
   routing function is why.** `excluded_tiers` cuts on `now` (`no_change_routing.py:145-151`), so an
@@ -342,20 +397,26 @@ The four cases the binding has to define, each answered from the code:
   `remaining`. Deduplicating on the rows would suppress the second arm entirely, leaving a receipt
   count that is neither a count of decisions nor a faithful arm history; and a `reason-driven` /
   `exhaustion-driven` flag cannot repair that, because the second receipt would never be written to
-  carry it. With the recency bits, `chain`/`remaining` and the arm inside the preimage, **any cutoff
-  transition that changes the arm necessarily yields a new `key=`**, and a row added or pruned yields
-  one via `evidence`. ⚠️ What stays deliberately invisible is a tick that changes *nothing* — same
-  rows, same recency partition, same chain projection, same arm. Those collapse to one receipt, so
-  this is a count of distinct **decisions**, never of dispatch attempts. A tick count needs a
-  separate counter, and this record does not propose one.
+  carry it. With the recency bits, `chain`/`remaining`, the two chain digests and the arm inside the
+  preimage, **any cutoff transition that changes the arm necessarily yields a new `key=`**, a row
+  added or pruned yields one via `evidence`, and a re-resolved or edited chain yields one via
+  `chain-digest`. ⚠️ What stays deliberately invisible is a tick that changes *nothing* — same rows,
+  same recency partition, same chain, same arm. Those collapse to one receipt, so this is a count of
+  distinct **decisions**, never of dispatch attempts. A tick count needs a separate counter, and this
+  record does not propose one. ⚠️ Under the scoped-down variant the two collisions listed above stay
+  invisible as well, and they are *not* no-op ticks — that is the whole cost of omitting the digests.
 
 **The denominators this yields.** Decision-level: the count of distinct `key=` receipts — which is
-**distinct (evidence, recency partition, chain projection, arm) decisions**, and must be labelled
-that way rather than as "decisions" unqualified or "dispatch attempts". Row-level: the sum of entry
+**distinct (evidence, recency partition, ordered chain, ordered remaining, arm) decisions**, and must
+be labelled that way rather than as "decisions" unqualified or "dispatch attempts"; under the
+scoped-down variant it is instead a **lower bound** on distinct routing decisions, because the two
+collisions above merge inputs that differ, and it must be published under that name. Row-level: the sum of entry
 counts across receipts, where a row appearing in K receipts contributes K times — double-counted, but
 *visibly* so, because the receipts name it, and `evidence=` is what lets a reader collapse the
-receipts that share one window. Both are auditable offline from the issue timeline, because both
-digests' preimages are the comment bodies themselves.
+receipts that share one window. Both are countable offline from the issue timeline, and the row-level
+one is *verifiable* there, because `evidence=`'s preimage is the comment body itself. The
+decision-level one is only verifiable to a reader that also holds the resolved chain: `key=` is
+counted from the timeline, checked from the dispatch side.
 
 ⚠️ **One denominator hazard, named because §10 invites it.** If the maintainer takes §10's
 suggestion and suppresses the `proceed`-arm receipt as noise, the denominator is no longer *all*
@@ -415,7 +476,9 @@ Stated plainly, because an over-claimed design record gets cited as a decision:
   in particular may be pure noise and is probably better left unrecorded; §8.1 states what that
   choice costs the denominator, and the maintainer should steer it before anyone writes the marker.
   The marker's grammar, and whether a decision over an unchanged *input* should be visible at all,
-  are also still open — as is the disclosure call §8.1 leaves to the maintainer (aliases would make
-  `chain`/`remaining` reader-derivable instead of bot-asserted).
+  are also still open — as is the disclosure call §8.1 leaves to the maintainer, which is the larger
+  of the two: publishing aliases would make `chain`/`remaining` reader-derivable instead of
+  bot-asserted, and withholding even their digests decides whether `key=` binds the decision at all
+  or only its published projection (§8.1's scoped-down variant, whose denominator is a lower bound).
 - **Findings B and D are defects, not design options.** Both are filed separately; neither is
   repaired here, and (b) cannot be answered honestly while D stands.
