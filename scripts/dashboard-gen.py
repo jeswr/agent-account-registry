@@ -1479,13 +1479,63 @@ def _model_health_module():
     return _MODEL_HEALTH_MODULE
 
 
+def _no_change_reason_census(records, health):
+    """Issue #1827 — the DECLARED-reason distribution of the ledger's `no_change` runs.
+
+    #738 §7 M4 asks which reasons workers actually declare when they produce no diff. The
+    aggregation existed only as a line printed once per `model-health.py decide` tick, i.e. in a
+    workflow log that GitHub drops after ~90 days and that nothing reads across ticks. The same
+    records are already normalized here, so the distribution is published into the payload instead
+    and becomes a standing board observable.
+
+    The row set is #701's CLOSED vocabulary, read from the one module that declares it, and EVERY
+    reason emits — zeroes included (AGENTS.md pre-flight item 8). A census that lists only what
+    fired cannot show an operator that a reason has gone to nothing, and it disappears entirely on
+    the quiet tick that is exactly when someone interrogates it.
+
+    `runs` is the population the distribution is OF (never `total`: _assert_no_fleet_composition
+    refuses that key anywhere in the public document), and `since` is the OLDEST no-change run
+    counted — the honest span label, because this reader censuses whatever the ledger still
+    retains rather than a window it chose. It is read off the counted rows themselves, so it never
+    reports the ledger's overall span when the no-change rows cover less of it.
+
+    An absent `why_no_diff` folds to `unspecified`, which is what index 0 of the wire vocabulary
+    MEANS and what `no_change_routing.declared_reasons` already does: a run that declared nothing
+    and a run that declared `unspecified` route identically, so splitting them here would publish
+    Nothing model-authored crosses onto the public page (AGENTS.md pre-flight item 5 — the value
+    ORIGINATES in a file the model writes). `validate_ledger` has already refused any `why_no_diff`
+    outside the vocabulary, and any such field on another exit class; and the labels emitted here
+    are the VOCABULARY's own strings, not the record's — a value this reader did not recognise is
+    counted under `unspecified` and can never be echoed onto the page."""
+    counts = {reason: 0 for reason in health.NO_CHANGE_REASONS}
+    unspecified = health.no_change_routing.UNSPECIFIED
+    oldest = None
+    for record in records:
+        if record.get("exit_class") != health.CLASS_NO_CHANGE:
+            continue
+        reason = record.get("why_no_diff")
+        counts[reason if reason in counts else unspecified] += 1
+        ts = record.get("ts")
+        oldest = ts if oldest is None else min(oldest, ts)
+    return {
+        "runs": sum(counts.values()),
+        "since": _utc_iso(oldest),
+        "reasons": [{"reason": reason, "count": counts[reason]}
+                    for reason in health.NO_CHANGE_REASONS],
+    }
+
+
 def _normalize_ledger_health(document):
     """Canonical model-health ledger, {"records": [...]} (issue #218): validate with the shared
     model-health validator — a malformed ledger fails LOUD, never renders a fabricated check —
     then derive one status per (provider, model): the NEWEST record's exit-class, folded to
     healthy/degraded/unhealthy/unknown. Records without a model alias (zero-dispatch fleet
     signals) carry no per-model information and are skipped; account hashes never reach the
-    output. Output is bounded: one check per distinct (provider, model), newest 20 pairs."""
+    output. Output is bounded: one check per distinct (provider, model), newest 20 pairs.
+
+    Issue #1827: the same validated records also carry the declared no-diff reason, censused by
+    `_no_change_reason_census` into `no_change_reasons` — a bounded 6-row distribution, always
+    present on this (ledger) path."""
     health = _model_health_module()
     try:
         records = health.validate_ledger(document)
@@ -1517,7 +1567,8 @@ def _normalize_ledger_health(document):
     } for (provider, model), record in newest_pairs),
         key=lambda check: (check["provider"], check["model"]))
     generated_at = _utc_iso(max((record["ts"] for record in records), default=None))
-    return {"generated_at": generated_at, "checks": checks}
+    return {"generated_at": generated_at, "checks": checks,
+            "no_change_reasons": _no_change_reason_census(records, health)}
 
 
 def _normalize_model_health(document):
@@ -1560,7 +1611,10 @@ def _normalize_model_health(document):
         })
         if len(checks) == 20:
             break
-    return {"generated_at": generated_at, "checks": checks}
+    # [#1827] NULL IS NOT ZERO. These legacy/ad-hoc shapes carry no health RECORDS, so there is no
+    # population to census — publishing an all-zero distribution here would read as "no worker has
+    # produced a no-change run", which is a measurement this input cannot support.
+    return {"generated_at": generated_at, "checks": checks, "no_change_reasons": None}
 
 
 def _live_leases(leases, now):
@@ -2636,6 +2690,134 @@ def _self_test_throughput_worker(check):
                       ["Repeat no-change", "—", None, "metric-value"]]}])
 
 
+# Issue #1827 — the no-change reason census, from the payload build_dashboard really publishes to
+# the cells an operator reads. `renderHealth` is EXECUTED (the #612 round-4 lesson: a lexical
+# assertion about `renderNoChangeCensus` is satisfied by the comment above it), and the census is
+# reached through `renderHealth` rather than called directly, because the defect this closes is one
+# of PLACEMENT — a census drawn after the per-model strip's empty-state return renders on every
+# board except the one whose ledger is all no-change rows. The `models` field beside it records
+# which branch that surrounding renderer took, so the placement row cannot pass by accident.
+_HEALTH_CENSUS_PAGE_BODY = r"""
+  const out = {};
+  for (const [name, health] of Object.entries(input.cases)) {
+    for (const id of ["health-section", "health-time", "model-health", "health-no-change"]) {
+      ids[id] = element("div#" + id);
+    }
+    scope.renderHealth(health);
+    const panel = ids["health-no-change"];
+    const caption = panel.children[0];
+    const strip = panel.children[1];
+    // Every field below is a SCALAR or a whole array: the rows that read them must never index
+    // into a value a mutant can turn null, or the mutant aborts the suite and scores as a kill
+    // with every later check unrun (AGENTS.md pre-flight item 4, *crash-after-partial-run* —
+    // measured here: the first form of this harness did exactly that on two mutants).
+    const line = caption === undefined || caption === null ? null : String(caption.textContent);
+    // Cut at the span joiner so the half this page composes is compared EXACTLY while the
+    // absolute stamp — rendered by the one `utc()` helper #1343 already pins, under whatever
+    // locale the runner's ICU defaults to — is only required to be present and readable.
+    const cut = line === null ? -1 : line.indexOf(" since ");
+    out[name] = {
+      sectionHidden: ids["health-section"].hidden === true,
+      panelHidden: panel.hidden === true,
+      caption: cut < 0 ? line : line.slice(0, cut),
+      stamp: cut < 0 ? null : line.slice(cut + " since ".length),
+      chips: strip ? strip.children.map((item) => [
+        item.children[0] ? item.children[0].textContent : null,
+        item.children[1] && item.children[1].children[1]
+          ? item.children[1].children[1].textContent : null,
+      ]) : null,
+      models: ids["model-health"].children.map((kid) => flat(kid).filter(Boolean).join("|")),
+    };
+  }
+  process.stdout.write(JSON.stringify(out));
+"""
+
+
+def _self_test_health_census(check, published, zero_census):
+    """Issue #1827 — the declared-reason census on the PAGE, including the tick that has no
+    per-model check at all."""
+    # The vocabulary as this suite expects to SEE it — written out, never imported from
+    # `NO_CHANGE_REASONS` (pre-flight item 2(b)). The "published" row below still spells its six
+    # chips out in full, so this tuple cannot mask a wrong vocabulary: that row and these two would
+    # have to be wrong in the same way, and only one of them is derived from this.
+    vocabulary = ("unspecified", "underspecified", "blocked_on_decision",
+                  "too_large", "already_done", "other")
+
+    def reasons(**counts):
+        return [{"reason": name, "count": counts.get(name, 0)} for name in vocabulary]
+
+    zero_chips = [[name, "0"] for name in vocabulary]
+    page = _executed_page(
+        _page_harness("renderHealth", _HEALTH_CENSUS_PAGE_BODY),
+        {"cases": {
+            # The payload build_dashboard REALLY publishes — the key name is the seam where this
+            # would otherwise be vacuous on both sides at once (pre-flight item 6).
+            "published": published,
+            # The tick this defect was invisible on: a ledger whose only rows are no-change/fleet
+            # signals publishes an EMPTY `checks`, so the per-model strip takes its empty-state
+            # return. Census rows all zero as well, so this is also the "would it emit at 100 %
+            # of one branch" row (pre-flight item 8).
+            "no-model-checks": {"generated_at": None, "checks": [],
+                                "no_change_reasons": zero_census},
+            # A snapshot with checks but NO census (the non-ledger normalizer's null): the panel
+            # is absent, never an all-zero distribution the input cannot support.
+            "no-census": {"generated_at": None, "no_change_reasons": None,
+                          "checks": [{"model": "fable", "provider": "anthropic",
+                                      "status": "healthy", "checked_at": None}]},
+            # One run — the singular, and a span that renders.
+            "one-run": {"generated_at": None, "checks": [],
+                        "no_change_reasons": {"runs": 1, "since": "2025-06-15T14:41:40Z",
+                                              "reasons": reasons(other=1)}},
+            # Unreadable values inside an otherwise well-formed census: the page states what it
+            # cannot read rather than printing `NaN`/`undefined` as a measurement.
+            "unreadable": {"generated_at": None, "checks": [],
+                           "no_change_reasons": {
+                               "runs": "many", "since": None,
+                               "reasons": [{"reason": "other", "count": None},
+                                           {"reason": 5, "count": 2}]}},
+            # No `reasons` array at all: hidden, not raised.
+            "no-rows": {"generated_at": None, "checks": [],
+                        "no_change_reasons": {"runs": 3, "since": None}},
+        }})
+    check("[#1827] EXECUTED: the census dashboard-gen really publishes reaches the page — one chip "
+          "per vocabulary reason IN ORDER, zero rows drawn rather than dropped, the counted runs "
+          "in the caption and a readable span stamp beside them",
+          (page["published"]["panelHidden"], page["published"]["caption"],
+           page["published"]["stamp"] in (None, "", "unknown"), page["published"]["chips"]),
+          (False, "No-change runs by declared reason — 4 runs", False,
+           [["unspecified", "1"], ["underspecified", "0"], ["blocked_on_decision", "0"],
+            ["too_large", "2"], ["already_done", "1"], ["other", "0"]]))
+    check("[#1827] THE PLACEMENT ROW: a ledger with no per-model check still draws the census. The "
+          "strip beside it is on its empty-state line, which is the branch a census drawn after "
+          "that return would have been skipped by — and an all-zero census is still published, "
+          "with its span named as the ledger rather than as a stamp",
+          (page["no-model-checks"]["panelHidden"], page["no-model-checks"]["models"],
+           page["no-model-checks"]["caption"], page["no-model-checks"]["stamp"],
+           page["no-model-checks"]["chips"]),
+          (False, ["No recognized model checks in the snapshot."],
+           "No-change runs by declared reason — 0 runs in the retained health ledger", None,
+           zero_chips))
+    check("[#1827] NULL IS NOT ZERO on the page either: a snapshot whose census is null hides the "
+          "panel, while the per-model strip it sits under still renders",
+          (page["no-census"]["panelHidden"], page["no-census"]["caption"],
+           page["no-census"]["chips"], page["no-census"]["models"],
+           page["no-census"]["sectionHidden"]),
+          (True, None, None, ["fable|anthropic|healthy"], False))
+    check("[#1827] one run reads '1 run', not '1 runs', and carries a span stamp",
+          (page["one-run"]["caption"], page["one-run"]["stamp"] in (None, "", "unknown"),
+           page["one-run"]["chips"]),
+          ("No-change runs by declared reason — 1 run", False,
+           [[name, "1" if name == "other" else "0"] for name in vocabulary]))
+    check("[#1827] an unreadable run count, bucket count or reason LABEL is SAID to be unknown — "
+          "never rendered as a number or a name the payload does not contain, and never dropped, "
+          "which would shorten the distribution — and a census with no reason rows at all hides "
+          "the panel instead of raising out of the render",
+          (page["unreadable"]["caption"], page["unreadable"]["chips"],
+           page["no-rows"]["panelHidden"], page["no-rows"]["chips"]),
+          ("No-change runs by declared reason — count unknown in the retained health ledger",
+           [["other", "—"], ["—", "2"]], True, None))
+
+
 def _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measured_sidecar):
     """Issue #323 — the per-lane dispatch tick counts, from the RUN LOG they are parsed out of, all
     the way to the cell the page renders.
@@ -3518,6 +3700,24 @@ def _self_test():
          "reset_hint": "2025-06-15T18:00:00Z"},
         {"ts": now - 120, "provider": "anthropic", "account": "d" * 16,
          "model_alias": "", "exit_class": "zero-dispatch", "run_id": "r4"},
+        # [#1827] The no-change rows the reason census counts. They are deliberately the OLDEST
+        # rows in the fixture (older than the `transient` at -900) so `since` cannot pass by
+        # reporting the ledger's own span, and none of them is the newest row, so `generated_at`
+        # stays where the pre-#1827 rows put it. Two carry the SAME reason (so the census counts
+        # rather than sets), one carries NO `why_no_diff` at all (the fold to `unspecified`), and
+        # one has an EMPTY model_alias — the per-model strip skips that row, and the census must
+        # not, because a run nobody could attribute to a tier is still a no-change run.
+        {"ts": now - 1500, "provider": "anthropic", "account": "e" * 16,
+         "model_alias": "fable", "exit_class": "no_change", "run_id": "r5",
+         "issue": 1827, "why_no_diff": "too_large"},
+        {"ts": now - 1400, "provider": "anthropic", "account": "f" * 16,
+         "model_alias": "", "exit_class": "no_change", "run_id": "r6",
+         "issue": 1595, "why_no_diff": "too_large"},
+        {"ts": now - 1300, "provider": "openai", "account": "1" * 16,
+         "model_alias": "codex", "exit_class": "no_change", "run_id": "r7", "issue": 738},
+        {"ts": now - 1200, "provider": "anthropic", "account": "2" * 16,
+         "model_alias": "fable", "exit_class": "no_change", "run_id": "r8",
+         "issue": 701, "why_no_diff": "already_done"},
     ]}
     # Issue #78: the serviced set handed in here is deliberately NOT the set of repositories the
     # fixture's leases name. `org/alpha` is serviced AND busy, `org/idle` is serviced and quiet (so
@@ -3528,7 +3728,18 @@ def _self_test():
     ordered = build_dashboard(
         ordered_issues, activity_leases, ordered_usage, [], health_ledger, now, "fixture-salt",
         probe_status=measured_sidecar, serviced=("org/alpha", "org/idle"))
-    check("canonical records ledger -> per-provider/model checks", ordered["model_health"], {
+    # [#1827] The census travels with the checks, through the PRODUCTION call site
+    # (build_dashboard -> _normalize_model_health -> _normalize_ledger_health), and the whole
+    # `model_health` block is compared by equality — a census dropped, renamed, or reshaped reds
+    # this row. Every reason NAME and count is written out here rather than derived from
+    # `NO_CHANGE_REASONS` (pre-flight item 2(b): an expected value read out of the code under test
+    # cannot fail), which also pins the vocabulary's ORDER — it is the #701 wire format, and a
+    # reorder there silently re-labels every previously stored index.
+    check("canonical records ledger -> per-provider/model checks, and [#1827] the declared "
+          "no-change reason census beside them: counted (not set-ified), zero rows kept, an "
+          "absent declaration folded to `unspecified`, an unattributable run still counted, and "
+          "`since` reading the OLDEST no-change run rather than the ledger's own span",
+          ordered["model_health"], {
         "generated_at": _utc_iso(now - 120),
         "checks": [
             {"model": "fable", "provider": "anthropic", "status": "healthy",
@@ -3536,7 +3747,43 @@ def _self_test():
             {"model": "codex", "provider": "openai", "status": "degraded",
              "checked_at": _utc_iso(now - 300)},
         ],
+        "no_change_reasons": {
+            "runs": 4,
+            "since": _utc_iso(now - 1500),
+            "reasons": [
+                {"reason": "unspecified", "count": 1},
+                {"reason": "underspecified", "count": 0},
+                {"reason": "blocked_on_decision", "count": 0},
+                {"reason": "too_large", "count": 2},
+                {"reason": "already_done", "count": 1},
+                {"reason": "other", "count": 0},
+            ],
+        },
     })
+    # ...and the ZERO row, which is the mutant item 3 exists for: a census emitted only
+    # `if runs` reads identically to a healthy board on the quiet tick that is exactly when an
+    # operator interrogates it. Same ledger shape, no no-change rows in it at all.
+    quiet_census = _normalize_model_health({"records": [
+        {"ts": now - 300, "provider": "openai", "account": "9" * 16,
+         "model_alias": "codex", "exit_class": "success", "run_id": "z1"}]}).get(
+             # `.get`, not `[...]`: a mutant that DROPS the key must red the row below by name,
+             # never abort the suite here and score as a kill with 291 checks unrun (pre-flight
+             # item 4, *crash-after-partial-run* — measured on exactly that mutant).
+             "no_change_reasons")
+    check("[#1827] a ledger with NO no-change runs still publishes the census — every reason at "
+          "zero and a null span, never an omitted or empty block",
+          quiet_census,
+          {"runs": 0, "since": None,
+           "reasons": [{"reason": "unspecified", "count": 0},
+                       {"reason": "underspecified", "count": 0},
+                       {"reason": "blocked_on_decision", "count": 0},
+                       {"reason": "too_large", "count": 0},
+                       {"reason": "already_done", "count": 0},
+                       {"reason": "other", "count": 0}]})
+    # The PAGE half, driven by the two payloads pinned immediately above rather than by fixtures
+    # written to match it (pre-flight item 11: a census that normalizes perfectly and is never
+    # drawn has delivered nothing).
+    _self_test_health_census(check, ordered["model_health"], quiet_census)
     try:
         _normalize_model_health({"records": [
             {"ts": now, "provider": "anthropic", "account": "acct01",
@@ -5671,10 +5918,14 @@ esac
         "generated_at": now,
         "models": [{"model": "fable", "provider": "anthropic", "status": "ok"}],
     })
-    check("optional model-health normalization", health,
+    check("optional model-health normalization, and [#1827] NULL IS NOT ZERO: a non-ledger shape "
+          "carries no records to census, so the census is null — an all-zero distribution here "
+          "would publish 'no worker has produced a no-change run' off an input that cannot say it",
+          health,
           {"generated_at": "2025-06-15T15:06:40Z",
            "checks": [{"model": "fable", "provider": "anthropic",
-                       "status": "healthy", "checked_at": None}]})
+                       "status": "healthy", "checked_at": None}],
+           "no_change_reasons": None})
 
     # --- observability normalization (issue #246): accept path is a GOLDEN fixture (every field
     # class exercised, every malformed row visibly dropped), reject paths are explicit. ---------

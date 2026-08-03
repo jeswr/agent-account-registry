@@ -115,6 +115,8 @@ main > section { padding-top: 42px; }
 .health-item { min-width: 152px; padding: 12px 14px; border-radius: 12px; }
 .health-model { margin: 0 0 7px; font-family: "SFMono-Regular", Consolas, monospace; font-size: .8rem; }
 .health-meta { display: flex; align-items: center; justify-content: space-between; gap: 9px; color: var(--muted); font-size: .67rem; }
+/* Issue #1827: the no-change reason census, ruled off under the per-model strip above it. */
+.census-caption { margin: 15px 0 9px; padding-top: 13px; border-top: 1px solid var(--line); color: var(--muted); font-size: .72rem; }
 
 .table-wrap { overflow-x: auto; border-radius: var(--radius); }
 table { width: 100%; border-collapse: collapse; min-width: 590px; }
