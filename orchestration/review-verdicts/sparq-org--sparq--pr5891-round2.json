@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5891,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5a3230c3edc89e97550030a134aa705e97e7ab25",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "apply_leg_statuses keeps a successful job in state ok whenever status.outcomes is true and ratchet_exit is zero. But cargo-mutants writes outcomes.json incrementally, so a sweep that dies after producing some mutants can leave that file. The workflow then runs mutants-gate.py --check; that checker intentionally does not fail closed on incomplete or unverifiable completeness (notably for unseeded crates), so ratchet_exit may still be zero. The resulting leg is reported as having produced a verdict and its crate remains seedable even though the sweep was truncated. The new tests cover no outcomes.json and a ratchet regression, but omit this documented partial-artifact path.",
+    "file": "scripts/nightly/mutants_leg_report.py",
+    "fix_hint": "Record and validate completion explicitly, using mutants.json versus outcomes.json (or another cargo-mutants completion signal) in the producer, and require that completion flag in apply_leg_statuses. Add an integration-shaped test where cargo-mutants exits nonzero, a partial outcomes.json exists, --check is non-fatal/informational, and the reporter must mark the leg incomplete and the crate unseedable. Do not infer completion solely from outcomes.json existence or ratchet_exit.",
+    "severity": "major",
+    "title": "Partial outcomes.json is incorrectly accepted as a complete verdict"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 is improving: skipped legs are now correctly fail-closed, and the new status artifact exposes suppressed step outcomes. However, the status record still equates the mere presence of outcomes.json with a completed mutation verdict. That file is written incrementally, so an interrupted cargo-mutants run can leave a partial outcomes.json; mutants-gate.py --check deliberately treats truncation as informational, especially for unseeded crates. Such a leg can therefore remain successful and seedable despite an incomplete sweep, leaving the central hidden-failure defect unresolved for this real path.",
+  "verdict": "request_changes"
+ }
+}
