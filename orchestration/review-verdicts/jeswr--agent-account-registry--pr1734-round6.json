@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1734,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7102c7717f5b9f2494df335715f441f981a283b4",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change remains correct and complete. The refused Anthropic credential format is rejected during worker-prep's initial format admission, before the worker tree is created or the source credential is spooled, and is independently rejected at the container-delivery seam. The Codex pre-flight now has no stored-document fallback: refresh and dry-run skip both derive minimal mount material, and the materialized file is checked unconditionally for refresh-shaped fields and the original durable token value. The tests are substantive: they prove the expired-token skip path exchanges nothing while stripping the token, verify the refused fixture actually contains the durable sentinel, require refusal before any sentinel or mount material is written, preserve an opaque-token positive control, and assert the launcher's exact non-dying format set. I found no correctness, fail-closed, security, injection, or test-validity defect. Round 5 also had no findings, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
