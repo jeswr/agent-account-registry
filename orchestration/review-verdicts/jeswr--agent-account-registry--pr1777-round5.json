@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1777,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8c9afdabd8dc2e8c4529fcdeca2352b052990c1d",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe workflow now derives the protected manifest and its retirement approvals from one resolvable commit contained in the graded merge tree, so a lagging merge ref no longer compares that tree against later base-tip enrollments. The fail-closed empty/unresolvable guard remains intact, and entries enrolled at the selected baseline remain protected. The accompanying YAML-object pin is independently typed, rejects ambiguous/missing named steps, includes step-level keys, and has faithful plus non-crashing mutant fixtures; the real-history checks separately demonstrate the false-refusal case, genuine unapproved removal, and approved removal. The later PR-head merge-base materialization is included in the frozen region consistently. The research-only addition explicitly records unresolved platform facts and makes no behavioral authorization by itself. I found no blocker or major correctness, soundness, test-validity, or security defect in the diff.",
+  "verdict": "approve"
+ }
+}
