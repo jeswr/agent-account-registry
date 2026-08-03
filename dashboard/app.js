@@ -462,6 +462,28 @@ const SPARK_KEYS = ["net_pr_flow", "issues_ready", "prs_open"];
 // not double-counted.
 const SPARK_HISTORY = 24;
 const trendBuffers = new Map();
+// Issue #1585: the worker-health half of the snapshot. metrics.py has published
+// `worker_attempts_1h` + `worker_success_rate_1h` since the collector shipped and this card drew
+// NEITHER, so the wasted-run picture was readable only by opening the raw JSON. The no-change
+// family (issue #987) is drawn by the same row and is PRESENCE-GATED on these keys: a snapshot
+// that does not carry them renders no no-change cells at all — three permanent em-dashes would
+// claim a signal the collector is not yet emitting — and the cells appear on their own the tick
+// it starts emitting them.
+const NO_CHANGE_KEYS = ["worker_no_change_1h", "worker_no_change_rate_1h",
+                        "worker_no_change_by_reason_1h", "worker_no_change_repeat_issues_1h"];
+// The tone reads the VERDICT metrics.py publishes beside the numbers, never a ceiling re-declared
+// here: every ceiling that produces one of these classifications is a policy threshold
+// (metrics.py DEFAULT_THRESHOLDS, per-target overridable in policy/repos.toml [repos.*].throughput)
+// and the public snapshot does not carry it. A number copied into this file would be a second
+// definition of a threshold this page cannot see, and it would disagree with the alert row beside
+// it the moment one target overrides it. Both names are matched EXACTLY: a classification is one
+// closed constant on metrics.py's side (BACKLOG_GROWING, ..., WORKER_FAILING), so a substring test
+// would tone off an unrelated or malformed value that merely contains the name and would quietly
+// stop the two files sharing one auditable vocabulary.
+const WORKER_FAILING_ALERT = "worker-failing";
+const NO_CHANGE_ALERT = "worker-no-change";
+// A truncated list must SAY it was truncated (AGENTS.md: no silent caps).
+const REPEAT_ISSUE_LIMIT = 4;
 
 function num(value, fallback = null) {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
@@ -477,6 +499,41 @@ function fmtSigned(value) {
   const n = num(value);
   if (n === null) return "—";
   return `${n > 0 ? "+" : ""}${n.toFixed(n % 1 ? 1 : 0)}`;
+}
+
+// NULL IS NOT ZERO. Every rate in the worker family is `null` when nothing concluded this hour,
+// and `0%` for "no signal" reads as a total-failure hour — the opposite of a quiet one. (Panel-
+// local by the same convention that gives the observability panel its own `obsNum`/`obsPct`: each
+// panel in this file is independently built and reaches nothing outside itself.)
+function fmtPct(value) {
+  const n = num(value);
+  if (n === null) return "—";
+  const pct = n * 100;
+  return `${pct.toFixed(pct % 1 ? 1 : 0)}%`;
+}
+
+// The repeat-offender issue numbers, bounded. Absent/unreadable => `—` (no claim); an empty list
+// is a real, published finding — no issue burned a run twice this hour — so it reads `none`.
+function fmtIssueList(value) {
+  if (!Array.isArray(value)) return "—";
+  const numbers = value.map((entry) => num(entry)).filter((entry) => entry !== null);
+  if (!numbers.length) return value.length ? "—" : "none";
+  const shown = numbers.slice(0, REPEAT_ISSUE_LIMIT).map((n) => `#${n}`).join(" ");
+  return numbers.length > REPEAT_ISSUE_LIMIT
+    ? `${shown} +${numbers.length - REPEAT_ISSUE_LIMIT} more`
+    : shown;
+}
+
+// The largest `worker_no_change_by_reason_1h` bucket — the "why" that makes the rate actionable.
+function topReason(byReason) {
+  if (!byReason || typeof byReason !== "object" || Array.isArray(byReason)) return null;
+  let best = null;
+  for (const [reason, count] of Object.entries(byReason)) {
+    const n = num(count);
+    if (n === null) continue;
+    if (best === null || n > best[1]) best = [String(reason).slice(0, 24), n];
+  }
+  return best === null ? null : `top ${best[0]} ${best[1]}`;
 }
 
 function recordTrend(targets, stamp) {
@@ -578,7 +635,39 @@ function laneLight(health) {
   return wrap;
 }
 
-function throughputCard(repo, m, trend) {
+// The classifications FIRING for one target. `alerts` is the caller's already-fire-filtered list,
+// so the `fire === false` recovery rule stays defined in exactly one place; the `target` match is
+// what keeps another repository's failing lane from tinting this card.
+function firingFor(alerts, repo) {
+  return new Set(alerts
+    .filter((alert) => alert && alert.target === repo && typeof alert.classification === "string")
+    .map((alert) => alert.classification));
+}
+
+function workerRow(m, firing) {
+  const grid = node("div", "metric-grid worker-grid");
+  const attempts = num(m.worker_attempts_1h);
+  grid.append(metricCell("Worker success / 1h", fmtPct(m.worker_success_rate_1h), {
+    sub: attempts === null ? "attempts unknown" : `${attempts} attempt${attempts === 1 ? "" : "s"}`,
+    tone: firing.has(WORKER_FAILING_ALERT) ? "bad" : "",
+  }));
+  if (!NO_CHANGE_KEYS.some((key) => m[key] !== undefined)) return grid;
+
+  const noChange = num(m.worker_no_change_1h);
+  const parts = [
+    noChange === null ? null : `${noChange} run${noChange === 1 ? "" : "s"}`,
+    topReason(m.worker_no_change_by_reason_1h),
+  ].filter((part) => part !== null);
+  grid.append(metricCell("No-change / 1h", fmtPct(m.worker_no_change_rate_1h), {
+    sub: parts.length ? parts.join(" · ") : "no signal",
+    tone: firing.has(NO_CHANGE_ALERT) ? "bad" : "",
+  }));
+  grid.append(metricCell("Repeat no-change",
+    fmtIssueList(m.worker_no_change_repeat_issues_1h)));
+  return grid;
+}
+
+function throughputCard(repo, m, trend, firing = new Set()) {
   const card = node("article", "throughput-card");
   const top = node("div", "card-top");
   top.append(node("h3", "throughput-target", repo));
@@ -605,6 +694,8 @@ function throughputCard(repo, m, trend) {
   closeCell.append(node("span", "rate-label", "close+merge /hr"), node("span", "rate-value", fmtRate(m.pr_close_rate)));
   rate.append(openCell, node("span", "rate-arrow", "vs"), closeCell);
   card.append(rate);
+
+  card.append(workerRow(m, firing));
 
   const foot = node("div", "throughput-foot");
   foot.append(laneLight(m.review_lane_health));
@@ -657,7 +748,7 @@ function renderThroughput(metrics) {
   entries.sort(([a], [b]) => a.localeCompare(b));
   for (const [repo, m] of entries) {
     if (!m || typeof m !== "object") continue;
-    host.append(throughputCard(repo, m, trendBuffers.get(repo)));
+    host.append(throughputCard(repo, m, trendBuffers.get(repo), firingFor(alerts, repo)));
   }
 }
 

@@ -164,6 +164,9 @@ td.degraded { color: var(--warn); }   /* [#1106] an unreadable dispatch history,
 .metric-value .metric-sub { display: block; margin-top: 1px; color: var(--muted); font-size: .7rem; font-weight: 600; letter-spacing: 0; }
 .metric-value.good { color: var(--good); }
 .metric-value.bad { color: var(--bad); }
+/* Issue #1585: the worker-health band, ruled off from the backlog counts above it. */
+.worker-grid { padding-top: 14px; border-top: 1px solid var(--line); }
+.worker-grid .metric-value { font-size: 1.1rem; }
 
 .rate-row { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 10px; padding: 12px 14px; margin-bottom: 14px; border: 1px solid var(--line); border-radius: 12px; background: rgba(11, 15, 20, .35); }
 .rate-cell { display: flex; flex-direction: column; gap: 2px; }

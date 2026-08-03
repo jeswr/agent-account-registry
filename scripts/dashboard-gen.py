@@ -2277,6 +2277,11 @@ function element(tag) {
     // quietly weaker than it reads, which is the fidelity property #1107 exists to hold.
     get childElementCount() { return self.children.length; },
     append: (...kids) => { for (const kid of kids) self.children.push(kid); },
+    // [#1585] ORDER-SENSITIVE, and not a synonym for append: the throughput card's sparkline is
+    // built and then has its caption `prepend`ed, so a shim missing this method threw out of any
+    // harness that rendered that panel (which is how this one was found), and a shim that aliased
+    // it to append would silently render the caption below the chart it labels.
+    prepend: (...kids) => { self.children = [...kids, ...self.children]; },
     replaceChildren: (...kids) => { self.children = [...kids]; },
     setAttribute: (name, value) => { self.attributes[name] = value; },
     classList: { add: (name) => self.classes.add(name), remove: (name) => self.classes.delete(name),
@@ -2404,6 +2409,11 @@ def _self_test_page_shim(check):
   // [#1880] The count the page BRANCHES on, read at three sizes: a stub answering any constant
   // (0 was the pre-#1880 `undefined`) sends `obsFlowCard`/`renderObservability` down their
   // empty-state branch on a panel that has content, or the reverse.
+  // [#1585] `prepend` puts its children FIRST — aliasing it to append reverses every caption the
+  // page places above the element it already built.
+  const ordered = document.createElement("ol");
+  ordered.append(document.createTextNode("second"));
+  ordered.prepend(document.createTextNode("first"));
   const counter = document.createElement("ul");
   const counted = [counter.childElementCount];
   counter.append(document.createElement("li"), document.createElement("li"));
@@ -2412,6 +2422,7 @@ def _self_test_page_shim(check):
   counted.push(counter.childElementCount);
   process.stdout.write(JSON.stringify({
     before, counted,
+    prepended: ordered.children.map((kid) => kid.textContent),
     after: { degraded: degraded(el), contains: el.classList.contains("degraded") },
     attribute: el.attributes["data-lane"] === undefined ? null : el.attributes["data-lane"],
     replaced: el.children.map((kid) => kid.textContent),
@@ -2429,11 +2440,12 @@ def _self_test_page_shim(check):
         # goes red by name instead of aborting the suite with every later check unrun.
         shim = {"page script raised": str(exc)[:200]}
     check("[#1107] EXECUTED: the shared DOM shim RECORDS what the page does to an element — a "
-          "class added and removed, an attribute, a child REPLACED rather than appended, the "
-          "child COUNT the page branches on, and id identity all read back, and a class added to "
-          "a child reaches an ancestor's walk",
+          "class added and removed, an attribute, a child REPLACED rather than appended, a child "
+          "PREPENDED ahead of one already there, the child COUNT the page branches on, and id "
+          "identity all read back, and a class added to a child reaches an ancestor's walk",
           shim,
           {"before": {"degraded": True, "contains": True}, "counted": [0, 2, 1],
+           "prepended": ["first", "second"],
            "after": {"degraded": False, "contains": False},
            "attribute": "worker", "replaced": ["kept"], "inherited": True, "memoized": True,
            "namespaced": "svg", "text": "kept", "loaded": "function"})
@@ -2453,6 +2465,175 @@ def _self_test_page_shim(check):
            len(re.findall(r'^const source = fs\.readFileSync\(__APP_JS__, "utf8"\);$',
                           module_source, re.M))),
           (1, 1, 1, 1))
+
+
+# Issue #1585 — the worker-health row of the throughput card. `metrics.py` has published
+# `worker_attempts_1h` + `worker_success_rate_1h` since the collector shipped and the card drew
+# neither, so this is the first coverage the throughput panel has had at all; a lexical assertion
+# about `workerRow` would be satisfiable by the comment above it (the #612 round-4 lesson), so the
+# page is EXECUTED through `renderThroughput` — its ONE production call site — and the rows below
+# read the cells an operator sees. Rendering through the call site is deliberate (AUTHOR pre-flight
+# item 2a): dropping the alert argument there, not in `workerRow`, is how the tone would really be
+# lost, and it reds the toned rows below.
+_THROUGHPUT_WORKER_PAGE_BODY = r"""
+  const out = {};
+  for (const [name, snapshot] of Object.entries(input.snapshots)) {
+    for (const id of ["throughput-section", "throughput-time", "throughput-alerts",
+                      "throughput-targets"]) {
+      ids[id] = element("div#" + id);
+    }
+    scope.renderThroughput(snapshot);
+    out[name] = ids["throughput-targets"].children.map((card) => {
+      const grids = (card.children || []).filter(
+        (kid) => String(kid.className || "").split(" ").includes("worker-grid"));
+      const top = card.children[0];
+      return {
+        repo: top && top.children[0] ? top.children[0].textContent : null,
+        rows: grids.length,
+        cells: grids.flatMap((grid) => grid.children.map((cell) => [
+          cell.children[0] ? cell.children[0].textContent : null,
+          cell.children[1] ? cell.children[1].textContent : null,
+          cell.children[1] && cell.children[1].children[0]
+            ? cell.children[1].children[0].textContent : null,
+          cell.children[1] ? cell.children[1].className : null,
+        ])),
+      };
+    });
+  }
+  process.stdout.write(JSON.stringify(out));
+"""
+
+_THROUGHPUT_BACKLOG_FIXTURE = {
+    "issues_open": 1, "issues_ready": 1, "issues_closed_1h": 0,
+    "prs_open": 1, "prs_draft": 0, "prs_merged_1h": 0, "prs_merged_24h": 0,
+    "review_changes_backlog": 0, "needs_user_parked": 0, "review_lane_health": "ok",
+    "pr_open_rate": 0, "pr_close_rate": 0, "net_pr_flow": 0,
+}
+
+
+def _self_test_throughput_worker(check):
+    """Issue #1585 — the worker-health metrics the public page is SERVED but never drew."""
+    def target(**worker):
+        return {**_THROUGHPUT_BACKLOG_FIXTURE, **worker}
+
+    def snapshot(targets, alerts=()):
+        return {"generated_at": "2025-06-15T15:06:40Z", "schema_version": 1,
+                "targets": targets, "alerts": list(alerts)}
+
+    def alert(target_repo, classification, fire=True):
+        return {"target": target_repo, "classification": classification, "fire": fire,
+                "summary": "fixture", "metrics": {}}
+
+    page = _executed_page(
+        _page_harness("renderThroughput", _THROUGHPUT_WORKER_PAGE_BODY),
+        {"snapshots": {
+            # What metrics.py publishes TODAY: the two worker fields, no no-change family.
+            "served-today": snapshot({
+                "owner/alpha": target(worker_attempts_1h=4, worker_success_rate_1h=0.75)}),
+            # A target the collector has said nothing about — no worker key at all.
+            "collector-quiet": snapshot({"owner/beta": target()}),
+            # The #987 family served on BOTH targets, with the two alerts naming one target each:
+            # worker-failing names delta, worker-no-change names gamma. Each card must take the
+            # tone of ITS OWN alert and neither of the other's — asserted in both directions.
+            # delta ALSO carries a FIRING near-match classification on its OWN target
+            # (`worker-no-change-sustained` — a name no rule publishes). A tone that tested
+            # containment rather than the exact classification would turn delta's no-change cell
+            # bad on it, so this row is the control that keeps the exact match load-bearing.
+            "no-change-served": snapshot(
+                {"owner/delta": target(
+                    worker_attempts_1h=5, worker_success_rate_1h=0.2,
+                    worker_no_change_1h=2, worker_no_change_rate_1h=0.4,
+                    # An unreadable bucket count is skipped, not ranked: `other` is the top reason
+                    # here only because `already-done`'s count cannot be read.
+                    worker_no_change_by_reason_1h={"already-done": None, "other": 2},
+                    worker_no_change_repeat_issues_1h=[42, 99]),
+                 "owner/gamma": target(
+                     worker_attempts_1h=6, worker_success_rate_1h=0.5,
+                     worker_no_change_1h=3, worker_no_change_rate_1h=0.5,
+                     worker_no_change_by_reason_1h={"already-done": 2, "blocked_on_decision": 1},
+                     worker_no_change_repeat_issues_1h=[1174, 1509, 396, 987, 1585])},
+                [alert("owner/delta", "worker-failing"),
+                 alert("owner/delta", "worker-no-change-sustained"),
+                 alert("owner/gamma", "worker-no-change")]),
+            # The family served with NO signal in it: every value null.
+            "nulls-served": snapshot({"owner/zeta": target(
+                worker_attempts_1h=1, worker_success_rate_1h=None,
+                worker_no_change_1h=None, worker_no_change_rate_1h=None,
+                worker_no_change_by_reason_1h=None, worker_no_change_repeat_issues_1h=None)}),
+            # RECOVERED alerts (fire=false) on this very target, and an empty repeat list.
+            "recovered-alert": snapshot(
+                {"owner/eta": target(
+                    worker_attempts_1h=4, worker_success_rate_1h=0.25,
+                    worker_no_change_1h=1, worker_no_change_rate_1h=0.125,
+                    worker_no_change_by_reason_1h={"other": 1},
+                    worker_no_change_repeat_issues_1h=[])},
+                [alert("owner/eta", "worker-failing", fire=False),
+                 alert("owner/eta", "worker-no-change", fire=False)]),
+            # A REAL ZERO, an unreadable repeat list, and an alert row whose classification is not
+            # a string (the page must not tone off it, and must not raise on it either).
+            "zero-and-unreadable": snapshot(
+                {"owner/theta": target(
+                    worker_attempts_1h=2, worker_success_rate_1h=0,
+                    worker_no_change_1h=0, worker_no_change_rate_1h=0,
+                    # EVERY bucket unreadable, so skipping them has to leave NO top reason. A map
+                    # that merely mixes one unreadable bucket in cannot kill the skip: the
+                    # readable bucket outranks it either way (measured — that mutant survived).
+                    worker_no_change_by_reason_1h={"unreadable": None},
+                    worker_no_change_repeat_issues_1h=["#12", None])},
+                [alert("owner/theta", None)]),
+        }})
+
+    check("[#1585] EXECUTED: the card draws the two worker fields metrics.py serves TODAY — a "
+          "success PERCENTAGE with the attempt count that qualifies it. Neither reached the page "
+          "before this row",
+          page["served-today"],
+          [{"repo": "owner/alpha", "rows": 1,
+            "cells": [["Worker success / 1h", "75%", "4 attempts", "metric-value"]]}])
+    check("[#1585] a snapshot carrying NO worker_no_change_* key renders NO no-change cell — three "
+          "permanent em-dashes would claim a signal the collector is not emitting",
+          page["collector-quiet"],
+          [{"repo": "owner/beta", "rows": 1,
+            "cells": [["Worker success / 1h", "—", "attempts unknown", "metric-value"]]}])
+    check("[#1585] the #987 family drawn: rate, run count + top reason, and the repeat-offender "
+          "issue numbers — CAPPED with the overflow stated on gamma (no silent cap), listed whole "
+          "on delta. Each card takes the tone of ITS OWN alert in BOTH directions: worker-failing "
+          "names delta, so delta's success cell is bad and gamma's is plain; worker-no-change "
+          "names gamma, so gamma's no-change cell is bad and delta's is plain — and delta's stays "
+          "plain under a FIRING near-match classification on delta itself, so only the EXACT "
+          "classification tones",
+          page["no-change-served"],
+          [{"repo": "owner/delta", "rows": 1,
+            "cells": [["Worker success / 1h", "20%", "5 attempts", "metric-value bad"],
+                      ["No-change / 1h", "40%", "2 runs · top other 2", "metric-value"],
+                      ["Repeat no-change", "#42 #99", None, "metric-value"]]},
+           {"repo": "owner/gamma", "rows": 1,
+            "cells": [["Worker success / 1h", "50%", "6 attempts", "metric-value"],
+                      ["No-change / 1h", "50%", "3 runs · top already-done 2", "metric-value bad"],
+                      ["Repeat no-change", "#1174 #1509 #396 #987 +1 more", None,
+                       "metric-value"]]}])
+    check("[#1585] NULL IS NOT ZERO: a served-but-null rate reads '—', never '0%' — a quiet hour "
+          "and a total-failure hour must not render identically",
+          page["nulls-served"],
+          [{"repo": "owner/zeta", "rows": 1,
+            "cells": [["Worker success / 1h", "—", "1 attempt", "metric-value"],
+                      ["No-change / 1h", "—", "no signal", "metric-value"],
+                      ["Repeat no-change", "—", None, "metric-value"]]}])
+    check("[#1585] a RECOVERED alert (fire=false) on this target tones nothing, and an EMPTY "
+          "repeat list is a published finding ('none'), not an absent one ('—')",
+          page["recovered-alert"],
+          [{"repo": "owner/eta", "rows": 1,
+            "cells": [["Worker success / 1h", "25%", "4 attempts", "metric-value"],
+                      ["No-change / 1h", "12.5%", "1 run · top other 1", "metric-value"],
+                      ["Repeat no-change", "none", None, "metric-value"]]}])
+    check("[#1585] ...and the converse of that row: a MEASURED zero reads '0%', not '—'. A reason "
+          "map with nothing readable in it contributes no top reason, a repeat list whose entries "
+          "cannot be read as issue numbers claims nothing, and an alert row with no string "
+          "classification tones nothing rather than raising",
+          page["zero-and-unreadable"],
+          [{"repo": "owner/theta", "rows": 1,
+            "cells": [["Worker success / 1h", "0%", "2 attempts", "metric-value"],
+                      ["No-change / 1h", "0%", "0 runs", "metric-value"],
+                      ["Repeat no-change", "—", None, "metric-value"]]}])
 
 
 def _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measured_sidecar):
@@ -3067,6 +3248,7 @@ def _self_test():
         "2025-01-01Z defer owner/repo#2: busy\n"
         "2025-01-01Z dispatcher complete: 1 worker/review/fix run(s) launched\n"), (1, 1, None))
     _self_test_page_shim(check)
+    _self_test_throughput_worker(check)
     _self_test_dispatch_lanes(check, history, issues, leases, usage, now, measured_sidecar)
     _self_test_history_fetch(check, issues, leases, usage, now, measured_sidecar)
     check("raw identity absent", handle not in json.dumps(got) and email not in json.dumps(got), True)
