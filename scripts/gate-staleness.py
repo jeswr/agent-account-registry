@@ -323,11 +323,18 @@ def report_step_name(job):
     """RAISES unless the seam holds; returns the `name:` of the ONE step that prints the receipt.
 
     WHY A CONSUMER NEEDS THIS (issue #1238). A run log is written by the pull request's own code:
-    any step of the `gate` job can print a line spelling `gate-staleness:`. A retrospective
-    crosstab that trusted any such line would be reading author-controlled text (AGENTS.md
-    pre-flight item 5), so it filters the log on the (job, step) pair that actually reports —
-    and that step is named HERE, by `assert_report_seam`'s own exactly-one search, never by a
-    second copy of "which step reports" that could start pointing at a different one."""
+    any step of the `gate` job can print a line spelling `gate-staleness:`, so a retrospective
+    crosstab needs to know WHICH step is the reporting one — and that step is named HERE, by
+    `assert_report_seam`'s own exactly-one search, never by a second copy of "which step reports"
+    that could start pointing at a different one.
+
+    WHAT THIS DOES NOT ESTABLISH, stated so no consumer mistakes it for an author filter: for a
+    `pull_request` event this script is checked out from the pull request's OWN merge tree, so the
+    designated step's output is author-controlled too. Naming the step excludes the other steps
+    and NOTHING MORE. Deciding whether the receipt may be quoted as evidence is the consumer's
+    own job, against trusted metadata (AGENTS.md pre-flight item 5) — see
+    `gate-base-lead.attribution_refusal`, which admits a run's receipt only when GitHub's own diff
+    for it shows the pull touched no part of the code this step runs."""
     assert_report_seam(job)
     step = [s for s in job["steps"] if INVOCATION in str(s.get("run") or "")][0]
     name = step.get("name")

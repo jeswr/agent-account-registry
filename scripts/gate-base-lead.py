@@ -47,11 +47,30 @@
 # and exits non-zero rather than exonerating clause (1) on three rows. A single `leads` row, by
 # contrast, is a counterexample and needs no population behind it.
 #
-# WHO WRITES WHAT THIS READS. A run log is written by the pull request's own code, so any step of
-# the `gate` job can print a line spelling `gate-staleness:`. The receipt is therefore mined only
-# from the (job, step) pair that actually reports, with the step NAME taken from the live
-# workflow through `gate-staleness.report_step_name` — and two DIFFERENT receipts in that one step
-# (what a re-run's log carries) refuse the row instead of picking one.
+# WHO WRITES WHAT THIS READS, AND THEREFORE WHICH ROWS ARE EVIDENCE (AGENTS.md pre-flight item 5).
+# For a `pull_request` event GitHub runs the workflow — and every script that workflow invokes —
+# out of the PULL REQUEST'S OWN merge tree. So the receipt is not merely "a line any step of the
+# `gate` job could print": the reporting step itself, `scripts/gate-staleness.py`, and anything
+# `scripts/` can shadow on that script's `sys.path` (`python3 scripts/gate-staleness.py` puts that
+# directory first) are ALL author-controlled for the duration of the run. Mining the log on the
+# reporting (job, step) pair — which this module does, with the step name taken from the live
+# workflow through `gate-staleness.report_step_name` — only excludes lines printed by OTHER steps.
+# It establishes nothing about who wrote the code behind that one, so it is not on its own an
+# author filter and is never treated as one here.
+#
+# A row is ADMITTED AS EVIDENCE only when GitHub's own diff for that run
+# (`compare/<the recorded base sha>...<the run's head sha>` — API metadata at both ends, never
+# anything the run printed) shows the pull touched NO part of that surface. Anything else — a
+# touched path, a file list at GitHub's truncation cap, a diff that cannot be read, a run listing
+# with no head sha — refuses the row as `unprovable`, i.e. as NO evidence, in BOTH directions: a
+# forged `leads` row would indict #940 clause (1) exactly as wrongly as a forged `equal` row would
+# exonerate it. Two DIFFERENT receipts under the one reporting step (what a re-run's log carries)
+# refuse the row as well, rather than picking one.
+#
+# THE COST, STATED. On a repository whose pulls routinely edit `scripts/` — this one — most rows
+# refuse and the sweep reports `insufficient`. That is the honest reading of this evidence path,
+# not a defect in it: a population claim assembled out of receipts the population itself could
+# have written would not be a measurement.
 #
 # READS ONLY, and every one of them idempotent: `gh api` GETs plus `gh run view --log`, through
 # `gh_retry.run_gh`. This module writes nothing, arms nothing, and is wired into no workflow — it
@@ -111,6 +130,17 @@ ROW_STATES = (EQUAL, LAGS, LEADS, DIVERGED, UNPROVABLE)
 #   diverged  neither contains the other
 COMPARE_STATES = {"ahead": LAGS, "behind": LEADS, "identical": EQUAL, "diverged": DIVERGED}
 
+# THE RECEIPT-PRODUCING SURFACE — the paths a pull request cannot touch and still be quoted as
+# evidence about its own run (see "WHO WRITES WHAT THIS READS" above). `scripts/` is a PREFIX, not
+# the one reporter file: the reporter is started as `python3 scripts/gate-staleness.py`, which puts
+# that directory first on `sys.path`, so a pull adding `scripts/re.py` or `scripts/subprocess.py`
+# rewrites what the untouched reporter does. The workflow file is here because it defines the step.
+REPORTER_SURFACE_PREFIXES = ("scripts/",)
+REPORTER_SURFACE_PATHS = (_gate_staleness.PR_GATE_WORKFLOW,)
+# `GET /compare` reports at most 300 files. AT the cap the list may be truncated, so "the reporter
+# surface is untouched" stops being provable — and an unprovable attribution refuses.
+COMPARE_FILE_CAP = 300
+
 REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 CHECK_RUN_URL_RE = re.compile(
     r"https://api\.github\.com/repos/(?P<repo>[^/]+/[^/]+)/check-runs/(?P<id>[0-9]{1,20})")
@@ -148,13 +178,43 @@ def sole_pull_number(check_run):
     return number
 
 
+def untrusted_receipt_reason(comparison):
+    """PURE: "" when a run's receipt is admissible evidence, else the reason it is not.
+
+    `comparison` is GitHub's own `compare/<recorded base>...<head sha>` document — the pull
+    request's diff as the API reports it, NOT anything the run printed. A pull that touched no part
+    of the receipt-producing surface could not have written its own receipt, so the merge parent
+    that receipt names is GitHub's composition rather than the author's claim about it. Every other
+    outcome is UNPROVABLE attribution and refuses: a truncated file list, a malformed document and
+    a touched reporter path are all "this receipt cannot be quoted", never "it can"."""
+    files = comparison.get("files") if isinstance(comparison, dict) else None
+    if not isinstance(files, list):
+        return ("the pull request's own diff carries no file list, so the code that printed this "
+                "run's receipt cannot be established")
+    if len(files) >= COMPARE_FILE_CAP:
+        return (f"the pull request's diff reports {len(files)} file(s), at or over GitHub's "
+                f"{COMPARE_FILE_CAP}-file cap, so it cannot be read as a complete file list")
+    for entry in files:
+        filename = entry.get("filename") if isinstance(entry, dict) else None
+        if not isinstance(filename, str) or not filename:
+            return "the pull request's diff carries a file entry with no usable filename"
+        if filename in REPORTER_SURFACE_PATHS or filename.startswith(REPORTER_SURFACE_PREFIXES):
+            return (f"this pull request changes {filename}, which is code its own reporting step "
+                    "runs — the receipt is then the author's claim about the tree, not evidence "
+                    "of it")
+    return ""
+
+
 def receipt_from_log(log_text, job_name, step_name):
     """PURE: (receipt, "") for the ONE receipt the reporting step printed, else (None, reason).
 
     `gh run view --log` emits `<job>\\t<step>\\t<timestamp> <content>`. Only lines whose job AND
-    step columns match exactly are considered — see this module's "WHO WRITES WHAT THIS READS".
-    Two DIFFERENT receipts under that one step (a re-run's log carries both attempts) refuse the
-    row: which tree the deciding run graded is then genuinely ambiguous."""
+    step columns match exactly are considered, which excludes a line printed by any OTHER step —
+    and NOTHING MORE THAN THAT. It does not establish who wrote the code behind the matched step,
+    which is `attribution_refusal`'s job and is what admits the row as evidence at all (see this
+    module's "WHO WRITES WHAT THIS READS"). Two DIFFERENT receipts under that one step (a re-run's
+    log carries both attempts) refuse the row: which tree the deciding run graded is then
+    genuinely ambiguous."""
     if not isinstance(log_text, str):
         return None, "the run log is unreadable"
     found = []
@@ -265,12 +325,30 @@ def render(repo, rows, table):
 
 
 # ---- THE WALK ----------------------------------------------------------------------------------
+def attribution_refusal(repo, recorded_base, head_sha, api):
+    """The reason this run's receipt may NOT be quoted as evidence, or "" when it may.
+
+    BOTH operands are API metadata — the base sha GitHub stamped on the check-run and the head sha
+    the run listing carries — so this asks GitHub whether the pull request could have written its
+    own receipt, and never asks the run log. One idempotent GET per row."""
+    if not isinstance(head_sha, str) or not _SHA.fullmatch(head_sha):
+        return ("the run listing names no head sha for this run, so the code that printed its "
+                "receipt cannot be identified")
+    try:
+        comparison = api(f"repos/{repo}/compare/{recorded_base}...{head_sha}")
+    except MeasureError as exc:
+        return ("the pull request's own diff is unreadable, so its receipt is unattributable "
+                f"({exc})")
+    return untrusted_receipt_reason(comparison)
+
+
 def row_for_run(repo, run, api, log_reader, step_name):
     """One measured row. EVERY degradation is `unprovable` with a named reason — one unreadable
     run must neither abort the sweep nor be silently counted as agreement."""
     row = {"run": "-", "pr": "-", "recorded_base": "", "tested_base": "", "live_tip": "",
            "state": UNPROVABLE, "reason": ""}
     run_id = run.get("id") if isinstance(run, dict) else None
+    head_sha = run.get("head_sha") if isinstance(run, dict) else None
     if not isinstance(run_id, int) or isinstance(run_id, bool):
         row["reason"] = "the run listing carries a row with no numeric id"
         return row
@@ -305,6 +383,14 @@ def row_for_run(repo, run, api, log_reader, step_name):
         return row
     row["pr"] = number
     row["recorded_base"] = _recorded_base_sha(check_run, number)
+    # WHOSE CODE PRINTED THE RECEIPT — asked BEFORE the log is read, because a row this pull could
+    # have written is not evidence and the log has nothing to add to it. A row with no recorded
+    # base is already `unprovable` at `classify` below, so it needs no diff read to refuse it.
+    if row["recorded_base"]:
+        refusal = attribution_refusal(repo, row["recorded_base"], head_sha, api)
+        if refusal:
+            row["reason"] = refusal
+            return row
     receipt, refusal = receipt_from_log(log_reader(run_id), GATE_JOB, step_name)
     if receipt is None:
         row["reason"] = refusal
@@ -394,8 +480,17 @@ _OLDER = "3e4f" * 10
 _NEWER = "5a6b" * 10
 _OTHER = "7c8d" * 10
 _TIP = "9e0f" * 10
+# One head sha per fixture run, so a run's attribution diff is its OWN document: two runs sharing
+# one key would let a clean pull's diff answer for a forging pull's row.
+_HEAD_PREFIX = "4d5e" * 9
 _SELFTEST_REPO = "registry-selftest-invalid/does-not-exist-1238"
 _STEP = "Report whether this run graded the tree the PR will land on (#920)"
+# A pull that touches neither `scripts/` nor the gate workflow: the only shape admitted as evidence.
+_CLEAN_DIFF = {"files": [{"filename": "README.md"}, {"filename": "policy/routing.toml"}]}
+
+
+def _head_sha(index):
+    return f"{_HEAD_PREFIX}{index:04x}"
 
 
 def _log_line(job, step, content):
@@ -538,12 +633,44 @@ def _self_test():
                   {"state": UNPROVABLE, "reason": "no gate job"}])["refusals"],
         [("no gate job", 1), ("no receipt", 2)])
 
+    # ---- untrusted_receipt_reason: WHO COULD HAVE WRITTEN THE RECEIPT. The (job, step) filter
+    # above narrows WHICH step spoke; this is the control that decides whether what it said is
+    # evidence at all, and it reads GitHub's diff rather than anything the run printed.
+    chk("a pull that touches nothing its reporting step runs is admissible evidence",
+        untrusted_receipt_reason(_CLEAN_DIFF), "")
+    for label, filename in (
+            ("the reporter itself", "scripts/gate-staleness.py"),
+            ("a stdlib name the reporter's own sys.path would shadow", "scripts/subprocess.py"),
+            ("a brand-new file under scripts/", "scripts/whatever-new.py"),
+            ("the workflow that defines the reporting step", _gate_staleness.PR_GATE_WORKFLOW)):
+        reason = untrusted_receipt_reason(
+            {"files": [{"filename": "README.md"}, {"filename": filename}]})
+        chk(f"a pull that changes {label} is NOT admissible, and the refusal names the path",
+            (bool(reason), filename in reason), (True, True))
+    capped = untrusted_receipt_reason(
+        {"files": [{"filename": f"docs/{n}.md"} for n in range(COMPARE_FILE_CAP)]})
+    chk("a diff AT GitHub's file cap may be truncated, so it cannot clear the reporter surface",
+        (bool(capped), str(COMPARE_FILE_CAP) in capped), (True, True))
+    chk("one file below the cap is still a complete list, and still admissible",
+        untrusted_receipt_reason(
+            {"files": [{"filename": f"docs/{n}.md"} for n in range(COMPARE_FILE_CAP - 1)]}), "")
+    for label, document in (("a document with no file list", {"files": None}),
+                            ("a document with no files key at all", {}),
+                            ("a file entry that is not an object", {"files": ["README.md"]}),
+                            ("a file entry with no filename", {"files": [{"status": "added"}]}),
+                            ("a file entry with an empty filename", {"files": [{"filename": ""}]}),
+                            ("nothing at all", None)):
+        chk(f"{label} is inadmissible — an unreadable diff proves nothing about the reporter",
+            bool(untrusted_receipt_reason(document)), True)
+
     # ---- the WALK, over a fake API. Every fixture below is a shape this sweep really meets.
     def _fixture(limit, population):
         """(api, log_reader) over `population` = [(run_id, kind)] — no network, no gh."""
         runs, docs, logs = [], {}, {}
         for index, (run_id, kind) in enumerate(population):
-            runs.append({"id": run_id})
+            head = _head_sha(index)
+            runs.append({"id": run_id} if kind == "no-head-sha" else {"id": run_id,
+                                                                     "head_sha": head})
             check_id = 900000 + index
             url = f"https://api.github.com/repos/{_SELFTEST_REPO}/check-runs/{check_id}"
             if kind == "no-gate-job":
@@ -574,7 +701,10 @@ def _self_test():
                 "jobs": [{"name": GATE_JOB, "check_run_url": url}]}
             entries = [{"number": 1238, "base": {"sha": _OLDER}}]
             recorded, status = _OLDER, "ahead"
-            if kind == "equal":
+            if kind in ("equal", "forged"):
+                # `forged` is the adversarial row: a pull that EDITED the reporter and whose
+                # designated step then printed a flawless receipt naming the recorded base as the
+                # tree it graded — i.e. manufactured `equal`, the exonerating direction.
                 entries, recorded = [{"number": 1238, "base": {"sha": _TESTED}}], _TESTED
             elif kind == "leads":
                 entries, recorded, status = ([{"number": 1238, "base": {"sha": _NEWER}}],
@@ -589,8 +719,21 @@ def _self_test():
             # `unreadable-compare` registers no comparison so the fake api raises exactly as a
             # retry-exhausted read would; `unprovable-receipt` registers none because a correct
             # reader never asks for one — an ASKED comparison is the kill for that row.
-            if kind not in ("unreadable-compare", "unprovable-receipt"):
+            # `unreadable-diff`/`no-head-sha`/`forged` are excluded because they refuse BEFORE
+            # classification: registering a comparison for them would also register it for any
+            # OTHER row sharing those operands, which is how `unreadable-compare` stops being
+            # unreadable.
+            if kind not in ("unreadable-compare", "unprovable-receipt", "forged",
+                            "unreadable-diff", "no-head-sha"):
                 docs[f"repos/{_SELFTEST_REPO}/compare/{recorded}...{_TESTED}"] = {"status": status}
+            # The pull's OWN diff, which decides whether its receipt is evidence at all.
+            # `unreadable-diff` registers none, so the fake api raises as a retry-exhausted read
+            # would; `forged` touches the reporter the run's own step executes.
+            if kind != "unreadable-diff":
+                docs[f"repos/{_SELFTEST_REPO}/compare/{recorded}...{head}"] = (
+                    {"files": [{"filename": "README.md"},
+                               {"filename": "scripts/gate-staleness.py"}]}
+                    if kind == "forged" else _CLEAN_DIFF)
             if kind == "no-receipt":
                 logs[run_id] = _log_line(GATE_JOB, "Set up Python (pinned)", "installing")
             elif kind == "unprovable-receipt":
@@ -632,32 +775,61 @@ def _self_test():
                                                  in rows[5]["reason"]),
          ("receipt appears under" in rows[6]["reason"]), ("check_run_url" in rows[7]["reason"])],
         [True, True, True, True])
-    chk("an EQUAL row costs NO compare request (the shas already answer it)",
-        [path for path in asked if _TESTED + "..." in path], [])
+    chk("an EQUAL row costs no compare beyond the one attributing its receipt (the shas answer it)",
+        sorted(path for path in asked if f"/compare/{_TESTED}..." in path),
+        [f"repos/{_SELFTEST_REPO}/compare/{_TESTED}...{_head_sha(0)}"])
     chk("a non-equal row asks compare with the RECORDED base first — the direction is the reading",
-        sorted(path for path in asked if "/compare/" in path),
+        sorted(path for path in asked if path.endswith("..." + _TESTED)),
         sorted(f"repos/{_SELFTEST_REPO}/compare/{sha}...{_TESTED}"
                for sha in (_OLDER, _NEWER, _OTHER)))
+    # And the OTHER compare: every row that got as far as a recorded base asks GitHub for the
+    # PULL'S OWN diff before quoting its receipt, from the recorded base to that RUN's head sha —
+    # both operands API metadata. Pinned as an exact set, so a row that skipped the attribution
+    # read (or asked it with the wrong head) reds here rather than quietly becoming evidence.
+    chk("each measurable row asks for the pull's own diff, at the RECORDED base and its OWN head",
+        sorted({path for path in asked
+                if "/compare/" in path and not path.endswith("..." + _TESTED)}),
+        sorted({f"repos/{_SELFTEST_REPO}/compare/{sha}...{_head_sha(index)}"
+                for sha, index in ((_TESTED, 0), (_OLDER, 1), (_NEWER, 2), (_OTHER, 3),
+                                   (_OLDER, 6))}))
     chk("the sweep's verdict is driven by the rows it measured", crosstab(rows)["verdict"], LEADS)
 
-    # The three degradations that are read FAILURES rather than shape problems. Kept in their own
+    # ---- THE ADVERSARIAL ROW, and the whole reason the attribution read exists. The receipt below
+    # is printed by the DESIGNATED step of the DESIGNATED job, is well-formed, parses, and is
+    # internally consistent — and it claims the exonerating direction (`equal`). It is refused
+    # anyway, because the pull that produced the run edited the code that printed it. Compare the
+    # second row: same shape, same receipt, a pull that touched neither `scripts/` nor the
+    # workflow — that one IS evidence, so the refusal is attributable to the diff and nothing else.
+    forged_api, forged_log, _ = _fixture(2, [(301, "forged"), (302, "equal")])
+    forged_rows = collect(_SELFTEST_REPO, 2, forged_api, forged_log, _STEP)
+    chk("a FLAWLESS receipt from a pull that edited its own reporter is refused, not counted",
+        (forged_rows[0]["state"], "scripts/gate-staleness.py" in forged_rows[0]["reason"],
+         forged_rows[1]["state"]), (UNPROVABLE, True, EQUAL))
+    chk("and the forged row reports no operands from that receipt at all",
+        (forged_rows[0]["tested_base"], forged_rows[0]["live_tip"]), ("", ""))
+
+    # The degradations that are read FAILURES rather than shape problems. Kept in their own
     # population so the row indices asserted above stay pinned to the population that produced
     # them. Every one of them must refuse THAT row, with its own cause, and never fabricate a
     # verdict from operands it does not have.
     degraded = [(201, "malformed-jobs"), (202, "unreadable-check-run"),
                 (203, "unreadable-compare"), (204, "two-gate-jobs"),
-                (205, "unprovable-receipt")]
-    api_bad, log_bad, asked_bad = _fixture(5, degraded)
-    bad_rows = collect(_SELFTEST_REPO, 5, api_bad, log_bad, _STEP)
+                (205, "unprovable-receipt"), (206, "unreadable-diff"), (207, "no-head-sha")]
+    api_bad, log_bad, asked_bad = _fixture(7, degraded)
+    bad_rows = collect(_SELFTEST_REPO, 7, api_bad, log_bad, _STEP)
     chk("a read failure at ANY stage of a row refuses that row, never guesses at its class",
-        [row["state"] for row in bad_rows],
-        [UNPROVABLE, UNPROVABLE, UNPROVABLE, UNPROVABLE, UNPROVABLE])
-    chk("and each of the five names its own stage",
+        [row["state"] for row in bad_rows], [UNPROVABLE] * 7)
+    chk("and each of the seven names its own stage",
         [("job listing is malformed" in bad_rows[0]["reason"]),
          ("check-run is unreadable" in bad_rows[1]["reason"]),
          ("could not be compared" in bad_rows[2]["reason"]),
          ("2 job(s) named" in bad_rows[3]["reason"]),
-         ("no merge-ref base tip" in bad_rows[4]["reason"])], [True, True, True, True, True])
+         ("no merge-ref base tip" in bad_rows[4]["reason"]),
+         # The two attribution failures. An UNREADABLE diff and a run listing with NO head sha both
+         # leave "could this pull have written its own receipt?" unanswered, and unanswered is a
+         # refusal — never an admitted row.
+         ("diff is unreadable" in bad_rows[5]["reason"]),
+         ("names no head sha" in bad_rows[6]["reason"])], [True] * 7)
     chk("a row whose bases could not be compared still reports both operands it DID read",
         (bad_rows[2]["recorded_base"], bad_rows[2]["tested_base"]), (_OLDER, _TESTED))
     # The `-` an unprovable receipt carries is TRUTHY. It must never reach a request path, and it
@@ -731,6 +903,11 @@ def _self_test():
     code, out = run_main([(200 + n, "equal") for n in range(24)])
     chk("CLI on 24 clean rows: exit 0 and clause (1) is exonerated in as many words",
         (code, "verdict=equal" in out, "exactly right as written" in out), (0, True, True))
+    code, out = run_main([(400 + n, "forged") for n in range(24)])
+    chk("CLI on 24 rows whose pulls could have written their OWN receipts: NON-ZERO, no evidence, "
+        "and nothing exonerated (PR #1961 review r1)",
+        (code, "verdict=insufficient" in out, "equal=0" in out, "unprovable=24" in out),
+        (1, True, True, True))
     code, out = run_main([(300 + n, "equal") for n in range(23)])
     chk("CLI on 23 clean rows: NON-ZERO, because too little evidence must not read as safe",
         (code, "verdict=insufficient" in out, "exonerates nothing" in out), (1, True, True))
