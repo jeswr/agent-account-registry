@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5775,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ec204bbc1cc1f006e374be7fbb648959f7f0dc55",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_CARGO_INSTALL_RE = r\"\\bcargo\\s+install\\s+wasm-pack\\b\"` only detects commands where `wasm-pack` immediately follows `install`. Cargo accepts options before the crate argument, for example `cargo install --locked wasm-pack` or `cargo install --version 0.14.0 wasm-pack`. Such a workflow command is a real install site but contributes neither a site nor an offence; because the repository has other recognized sites, the global non-vacuity check still passes. This contradicts the stated `with any flag order` behavior and leaves the skew guard bypassable by an ordinary command reordering. The self-test has no case for this valid spelling.",
+    "file": "scripts/check-wasm-pack-pin.py",
+    "fix_hint": "Parse each live command sufficiently to identify `cargo install` invocations whose crate argument is `wasm-pack` regardless of option ordering, then validate the associated `--version` value. Add self-tests for at least `cargo install --locked wasm-pack` (must fail as unpinned), `cargo install --version 0.15.0 --locked wasm-pack` (must pass), and a wrong pre-crate version (must fail).",
+    "severity": "major",
+    "title": "Scanner misses cargo options placed before the crate name"
+   }
+  ],
+  "progress": null,
+  "summary": "The central pin and current workflow edits are consistent, and both the self-test and repository scan pass. However, the new gate does not recognize a valid cargo-install spelling that its own comments claim to support, so future workflow edits can introduce an unpinned wasm-pack install without failing the gate.",
+  "verdict": "request_changes"
+ }
+}
