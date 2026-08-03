@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5798,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b9061d09cbd8377fa42a6f6b1f9da1ece9969721",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`executable_run_text` removes only a small allowlist of data commands (`echo`, `printf`, `:`, `true`, `false`), after which `check_pinned_steps` still performs an unrestricted substring search. Replacing a required invocation with `test -n 'python3 scripts/sweeper.py --self-test'` (and similarly for the test-suite needle) leaves the needle in the retained command, exits successfully, and never runs the guard. Equivalent bypasses exist through many data-consuming commands. Thus the checker and registry still overclaim that `requires_run` proves the named commands execute; the added fixtures cover only three spellings of the broader bypass.",
+    "file": "scripts/check-workflow-step-guards.py",
+    "fix_hint": "Stop trying to infer execution from substring membership in a reduced shell scalar. Prefer an exact pinned representation of the guard step's `run` body (with only explicitly defined normalization), or parse command positions and require each needle to match an actual command invocation rather than an argument. Add a negative fixture using a successful non-allowlisted data consumer such as `test -n '<required text>'`; it must fail. If robust shell recognition remains out of scope, narrow the public claim accordingly, but the pin must still fail closed for ambiguous command positions.",
+    "severity": "major",
+    "title": "S1 still accepts required command text as data to arbitrary commands"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 is improving: the S3 same-job lane hole is fixed with lane-granular coverage and a meaningful negative fixture, and the new comment/echo/heredoc mutations address the specific inert-text examples from round 1. However, S1 still treats substring presence in almost any non-whitelisted shell command as proof that the required guard ran. A successful data-consuming command such as `test -n 'scripts/triage-area.py --self-test'` therefore satisfies the pin without executing the self-test, so the central EXECUTES guarantee remains unsound.",
+  "verdict": "request_changes"
+ }
+}
