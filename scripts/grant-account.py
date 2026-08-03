@@ -1106,12 +1106,39 @@ def _self_test():
 
     def refuses(fn, *args, needle="", **kwargs):
         """True iff `fn` raises GrantError whose message contains `needle` — so a check can never
-        pass on an unrelated crash."""
+        pass on an unrelated crash.
+
+        ANY OTHER exception becomes a legible failing VALUE (`"<Type>: <message>"`) instead of
+        escaping: same broad-catch shape, and same reason, as `real_parser` further down. A
+        non-GrantError propagating out of here aborts `_self_test` mid-run, so the asserting row is
+        never PRINTED and every row below it silently never executes — AGENTS.md AUTHOR pre-flight
+        item 4's FALSE KILL, where a partial run reads as a narrower pass. MEASURED on #1100:
+        deleting either of two `issue_form_prefill` guards (TypeError on a non-text document,
+        IndexError on `heads[0]` when nothing matched) left the observing row unprinted rather than
+        red, so neither guard was observable at all. The fail direction stays CLOSED: an unrelated
+        crash can only ever yield a non-True value, never a pass."""
         try:
             fn(*args, **kwargs)
         except GrantError as exc:
             return needle in str(exc)
+        except Exception as exc:  # noqa: BLE001 - a non-GrantError escape IS the failure signal
+            return f"{type(exc).__name__}: {exc}"
         return False
+
+    # NON-VACUITY OF `refuses` ITSELF (#1248). It backs ~100 rows below, so a fail-open form of it
+    # (`return True`) would green all of them at once and cost nothing else; and the broad arm above
+    # must never launder an unrelated crash INTO that pass. All three verdicts are observed here, on
+    # the shipped refusal path: no exception at all, a GrantError whose message does NOT carry the
+    # needle, and a non-GrantError escape — which must read as the named exception and let the suite
+    # keep running, never as True and never as a traceback that takes every later row down with it.
+    def _escapes_as_type_error():
+        raise TypeError("not a GrantError")
+
+    check("[#1248] `refuses` can return non-True, and a non-GrantError escape reds (never aborts)",
+          (refuses(targets_from_labels, ["grant:o/target"]),
+           refuses(targets_from_labels, ["grant:not-a-repo"], needle="carried by no message"),
+           refuses(_escapes_as_type_error)),
+          (False, False, "TypeError: not a GrantError"))
 
     pool = lambda text, row: tomllib.loads(text)["repos"][row]["account_pool"]  # noqa: E731
 
@@ -1890,53 +1917,54 @@ def _self_test():
            prefilled["max_concurrent_workers"] if isinstance(prefilled, dict) else prefilled,
            int(defaults_for(prefilled_provider or "anthropic")[2])),
           ("anthropic", 4, 4))
-    # `refuses` converts only a GrantError into a verdict; ANY other exception escapes it and takes
-    # the whole suite down mid-run — AGENTS.md item 4's FALSE KILL, where a mutant "dies" to a
-    # traceback while every later row silently never executes. Two of the guards below raise from
-    # INSIDE the extractor once deleted (TypeError on a non-text document, IndexError on `heads[0]`
-    # when nothing matched), so without this wrapper NEITHER is observed: MEASURED, deleting either
-    # one leaves this row never printed at all rather than red. A non-GrantError escape lands as
-    # False — a legible RED here — and the rest of the suite still runs.
-    def prefill_refuses(*args, needle=""):
-        try:
-            return refuses(issue_form_prefill, *args, needle=needle)
-        except Exception:                                          # noqa: BLE001 - see above
-            return False
-
+    # Two of the guards below raise from INSIDE the extractor once deleted (TypeError on a non-text
+    # document, IndexError on `heads[0]` when nothing matched). #1100 needed a local wrapper here to
+    # keep either from aborting the suite instead of reddening this row; #1248 moved that broad catch
+    # into `refuses` itself — where the other ~100 rows in this file were exposed to the same false
+    # kill — so these call the shared helper directly and there is only one catch policy to audit.
     check("[#883] a renamed field, or a prefill deleted from it, fails the extraction LOUDLY",
-          (prefill_refuses(account_form, "no-such-field", needle="found 0"),
+          (refuses(issue_form_prefill, account_form, "no-such-field", needle="found 0"),
            # ...and a DUPLICATED field is an ambiguity, never "the first one wins". This is the arm
            # of the count guard a missing field cannot reach, and the one that fails WITHOUT
            # raising, so it observes the guard itself rather than the traceback its absence causes.
-           prefill_refuses("- type: textarea\n  id: spec\n  attributes:\n"
-                           "    value: |\n      provider: anthropic\n"
-                           "- type: textarea\n  id: spec\n  attributes:\n"
-                           "    value: |\n      provider: openai\n", "spec", needle="found 2"),
+           refuses(issue_form_prefill,
+                   "- type: textarea\n  id: spec\n  attributes:\n"
+                   "    value: |\n      provider: anthropic\n"
+                   "- type: textarea\n  id: spec\n  attributes:\n"
+                   "    value: |\n      provider: openai\n", "spec", needle="found 2"),
            # ...and a field with no prefill refuses even when a LATER element has one: the scan is
            # scoped to the named field, so this can never assert against a neighbour's text.
-           prefill_refuses("- type: textarea\n  id: spec\n  attributes:\n"
-                           "    label: x\n- type: textarea\n  id: other\n  attributes:\n"
-                           "    value: |\n      provider: openai\n", "spec",
-                           needle="no block `value: |` prefill"),
+           refuses(issue_form_prefill,
+                   "- type: textarea\n  id: spec\n  attributes:\n"
+                   "    label: x\n- type: textarea\n  id: other\n  attributes:\n"
+                   "    value: |\n      provider: openai\n", "spec",
+                   needle="no block `value: |` prefill"),
            # ...and an INLINE `value:` scalar is NOT a prefill — only a block `|` opener may be
            # dedented as one. MEASURED: without this row, loosening the opener pattern to any
            # `value:` swallows the following lines as a body and RETURNS text where the extractor
            # must refuse, which is how a mis-scoped prefill would reach the assertions above.
-           prefill_refuses("- type: textarea\n  id: spec\n  attributes:\n"
-                           "    value: max_concurrent_workers: 1\n      trailing: kept\n"
-                           "- type: input\n", "spec", needle="no block `value: |` prefill"),
-           prefill_refuses("- type: textarea\n  id: spec\n  attributes:\n"
-                           "    value: |\n- type: input\n", "spec", needle="EMPTY prefill"),
-           prefill_refuses(None, "spec", needle="non-text document")),
+           refuses(issue_form_prefill,
+                   "- type: textarea\n  id: spec\n  attributes:\n"
+                   "    value: max_concurrent_workers: 1\n      trailing: kept\n"
+                   "- type: input\n", "spec", needle="no block `value: |` prefill"),
+           refuses(issue_form_prefill,
+                   "- type: textarea\n  id: spec\n  attributes:\n"
+                   "    value: |\n- type: input\n", "spec", needle="EMPTY prefill"),
+           refuses(issue_form_prefill, None, "spec", needle="non-text document")),
           (True, True, True, True, True, True))
-    # NON-VACUITY OF THAT WRAPPER. It is what turns a would-be traceback into a red, so a fail-open
-    # form of it (`return True` in either arm) would green all six elements above at once and cost
-    # nothing else. Both arms are therefore observed on inputs that must NOT read as a refusal: the
-    # real form under its real field id (which refuses nothing), and a non-string `field_id`, which
-    # raises TypeError out of `re.escape` — the one shipped input that reaches the except arm.
-    check("[#883] the refusal wrapper can return False (a fail-open form greens the row above)",
-          (prefill_refuses(account_form, "spec"), prefill_refuses(account_form, None)),
-          (False, False))
+    # NON-VACUITY OF THE HELPER'S BROAD ARM ON A SHIPPED INPUT — the general form of this row lives
+    # beside `refuses` above; this one pins the extractor's OWN escape, which is what #1100 measured.
+    # A fail-open helper would green all six elements above at once and cost nothing else, so both
+    # directions are observed on inputs that must NOT read as a refusal: the real form under its real
+    # field id (which refuses nothing), and a non-string `field_id`, which raises TypeError out of
+    # `re.escape` — the one shipped input that reaches the broad arm. It must surface AS that named
+    # exception; asserting the type alone keeps the row off CPython's `re` message wording.
+    prefill_escape = refuses(issue_form_prefill, account_form, None)
+    check("[#883] the refusal helper reds a non-GrantError escape (a fail-open form greens the row"
+          " above)",
+          (refuses(issue_form_prefill, account_form, "spec"),
+           prefill_escape.split(":")[0] if isinstance(prefill_escape, str) else prefill_escape),
+          (False, "TypeError"))
     # ...and the body stops at the FIRST line back at the opener's OWN indent, so a sibling
     # attribute written after `value: |` is never spliced into the record. Only an assertion on the
     # extracted TEXT can see this: the shipped form happens to carry no sibling below its block, so
