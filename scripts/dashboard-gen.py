@@ -1692,11 +1692,22 @@ def _obs_minutes(value):
 
 def _obs_mean(value):
     """A non-negative finite arithmetic mean, rounded — `review_rounds.mean` is a FLOAT reading,
-    not a count, so it cannot go through `_obs_count`. Same fail-closed None as its siblings."""
-    if (isinstance(value, bool) or not isinstance(value, (int, float))
-            or not math.isfinite(value) or value < 0):
+    not a count, so it cannot go through `_obs_count`. Same fail-closed None as its siblings.
+
+    The conversion is TOTAL over every type accepted above it, which is why it happens FIRST and
+    inside a `try`: Python's JSON decoder preserves an arbitrary-precision integer, and both
+    `float(10**400)` and `math.isfinite(10**400)` raise `OverflowError` converting it. Reading the
+    range off the raw value therefore turns an unreadable collector mean into a DEAD BUILD instead
+    of the dropped stat this seam promises — `_obs_minutes` is safe only by accident, because its
+    `0 <= value < 10_000_000` compares the integer without ever converting it.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return round(float(value), 2)
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return round(number, 2) if math.isfinite(number) and number >= 0 else None
 
 
 def _obs_text(value, cap):
@@ -5578,6 +5589,12 @@ esac
             return _normalize_observability(document)
         except DashboardError as error:
             return ObsRefusal(refused=str(error))
+        except Exception as error:  # noqa: BLE001 — see below; never re-raised, always one red row
+            # [#1880] ANY other exception out of this seam is itself the defect (a reader that
+            # RAISES on a collector value is not a fail-closed reader), so it must red the row that
+            # provoked it rather than abort every row below — the same crash-after-partial-run
+            # shape ObsRefusal exists for. Rendered, not swallowed: no expectation equals this.
+            return ObsRefusal(raised=f"{type(error).__name__}: {error}"[:200])
 
     check("observability golden normalization (bad rows dropped, top-N sorted, links pinned)",
           obs_normalized(obs_fixture), obs_expected)
@@ -6052,6 +6069,8 @@ esac
                 document = _normalize_observability(fixture)
         except DashboardError as error:
             document = ObsRefusal(refused=str(error))
+        except Exception as error:  # noqa: BLE001 — [#1880], as in obs_normalized above
+            document = ObsRefusal(raised=f"{type(error).__name__}: {error}"[:200])
         return (document["flow"][key],
                 [line for line in stream.getvalue().splitlines()
                  if line.startswith("dashboard-gen: dropped observability flow stat")])
@@ -6111,6 +6130,14 @@ esac
         ("a NEGATIVE review-round mean", "review_rounds",
          {"mean": -1.4, "max": 3, "budget_exhausted_1h": 0},
          "field `mean` (type float) is not a non-negative finite number"),
+        # ...and it has to reject that direction WITHOUT RAISING. `json.loads` hands back an
+        # arbitrary-precision int, and this one is unconvertible: `float(10**400)` and
+        # `math.isfinite(10**400)` both raise `OverflowError`. A reader that range-checks the raw
+        # value never returns None here at all — it takes the build down (see the row below).
+        # The literal is written out as `10 ** 400`, tied to nothing the module defines.
+        ("an OVERSIZED review-round mean — an integer too large to convert to float",
+         "review_rounds", {"mean": 10 ** 400, "max": 3, "budget_exhausted_1h": 0},
+         "field `mean` (type int) is not a non-negative finite number"),
         # `isinstance(True, int)` is what `_obs_count` exists to reject: a boolean exhaustion flag
         # would otherwise publish as the count 1, or as the reassuring `0 budget-exhausted / 1h`.
         ("a BOOLEAN budget-exhausted flag", "review_rounds",
@@ -6163,6 +6190,32 @@ esac
            [row["class"] for row in stat_tolerated["queue"]]),
           (None, {"mean": 1.44, "max": 3, "budget_exhausted_1h": 0},
            {"p50": 18.0, "p90": 55.5, "samples": 9}, {"mean": 0.6, "max": 0.8}, ["2a", "4"]))
+    # ...and the oversized mean has to be tolerated the SAME way, which is a strictly stronger
+    # claim than "the reader returns None": an `OverflowError` out of `_obs_mean` is not a
+    # DashboardError, so it escapes `_normalize_observability` uncaught and kills the whole
+    # dashboard build — every sibling group on this document goes with it, and the panel an
+    # operator reads goes dark rather than dropping one stat. Asserted on the WHOLE flow group,
+    # because the row above proves only that `review_rounds` itself hid.
+    oversized_mean = copy.deepcopy(obs_fixture)
+    oversized_mean["flow"]["review_rounds"]["mean"] = 10 ** 400
+    with contextlib.redirect_stdout(io.StringIO()):
+        oversized_flow = obs_normalized(oversized_mean)["flow"]
+    # The queue is projected only if it IS one: on a refusal every subscript above yields the
+    # ObsRefusal itself, and iterating THAT raises out of this row — which would abort the suite
+    # from the very row proving the seam does not abort. Measured: reverting `_obs_mean` to the
+    # raw-value range check took the run from 358 checks to 324 — a kill that hid 34 unrun rows —
+    # until this projection was guarded (AUTHOR pre-flight item 4).
+    oversized_queue = oversized_flow["queue"]
+    check("[#1880] an UNCONVERTIBLE integer mean drops its stat and leaves the BUILD standing — "
+          "range-checking the raw value raises `OverflowError` past this seam's DashboardError "
+          "contract, so the park counts, the arm→merge percentiles and the queue below all "
+          "vanish with it instead of publishing around the hole",
+          (oversized_flow["review_rounds"], oversized_flow["parks_1h"],
+           oversized_flow["arm_to_merge_minutes_24h"],
+           [row["class"] for row in oversized_queue]
+           if isinstance(oversized_queue, list) else oversized_queue),
+          (None, {"needs_user": 2, "needs_orchestrator": 1},
+           {"p50": 18.0, "p90": 55.5, "samples": 9}, ["2a", "4"]))
     # ...and the PAGE is what the drop has to DELIVER INTO (AGENTS.md pre-flight item 11). The
     # generator's build-log announcement is evidence nobody reads on a green build, so the fix only
     # counts if the false-healthy METRIC is gone from the panel: `obsFlowCard` renders every count
