@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1949,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c6cc18108b772df5d6c76249f3a6e080e65944f9",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 8.1 calls `key=` a digest of the WHOLE decision input, but its proposed preimage contains only the published evidence projection, per-entry age bits, `chain`/`remaining` counts, arm, and cause flag. `retry_decision` also depends on the ordered aliases in the resolved chain and each recent row's `model_alias`. Neither is bound. Two different chains of equal length, or two evidence sets whose unpublished aliases exclude different tiers but leave the same count, can therefore produce the same proposed key whenever the arm/flag match. The second tick is then suppressed even though the actual routing input and eligible tier sequence changed. This is especially material for `retry-other-tier`: equal `remaining=<n>` does not identify which model can be selected next. The text explicitly admits the counts are bot-asserted, but that disclosure does not make the simultaneous claim of whole-input identity or the resulting distinct-decision denominator true.",
+    "file": "research/1828-no-change-routing-outcome-correlation.md",
+    "fix_hint": "Bind non-sensitive canonical digests of the ordered resolved chain and the computed ordered remaining chain (or an equivalently complete tier/exclusion projection) into `key=` and define where their preimages remain auditable without disclosing aliases. If that cannot be made publicly verifiable, explicitly scope the artifact to an outcome-projection receipt rather than a whole-decision binding, specify the possible collisions, and do not use distinct keys as a count of distinct routing decisions. Add the missing fields to the repeated-decision cases and denominator definition consistently.",
+    "severity": "major",
+    "title": "The idempotence key still omits routing inputs that determine tier exclusion"
+   }
+  ],
+  "progress": "improving",
+  "summary": "The revision fixes the prior round's opaque-membership problem by defining the public evidence digest over a reconstructible projection, and it correctly adds evaluation time/recency to prevent a six-hour cutoff transition from being deduplicated. One major completeness gap remains: the proposed `key=` still does not bind the resolved chain or the row-to-tier exclusion input, only counts and time bits. Those lossy projections can collide across materially different routing inputs, so the record's repeated-decision/idempotence claims remain unsound. This is improving because one prior major is resolved and the remaining one is narrower, but approval still requires a complete or honestly re-scoped decision identity.",
+  "verdict": "request_changes"
+ }
+}
