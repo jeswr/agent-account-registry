@@ -1996,17 +1996,44 @@ def _obs_flow(flow):
     #   * the decision-22 label check is unconditional over the rows that ARE present. Supplying
     #     the aggregate is not a way to smuggle an unvalidated row past it, and a collector that
     #     regresses to writing rows is still caught the moment a raw handle appears in one.
+    #
+    # [#1571] ...and every input this legacy path CANNOT read is announced, like every other seam on
+    # this document. It is the one seam where the loss hides twice over: an unreadable container, or
+    # rows that all drop, publishes `lease_utilization_1h: None` — indistinguishable from the
+    # pre-#841 collector that sends no lease data at all — and a SINGLE unreadable `utilization_1h`
+    # publishes a mean/max computed over only the rows that survived, i.e. a load-balance stat
+    # quietly taken over the wrong sample set. Both properties above are untouched: the decision-22
+    # check still raises on every object row, and rows-first precedence is still keyed on the
+    # PRESENCE of `leases`, not on what this log said about it. A present-but-null container is
+    # announced rather than excused, because unlike an absent one it overrides the aggregate the
+    # collector may also have sent — the same rule the `queue` seam above applies inside this group.
     lease_utilizations = []
-    for item in flow.get("leases") if isinstance(flow.get("leases"), list) else []:
+    lease_row_drops = _ObsDropLog("observability lease rows")
+    raw_leases = flow.get("leases")
+    if "leases" in flow and not isinstance(raw_leases, list):
+        _obs_drop(lease_row_drops, "lease-row",
+                  f"`flow.leases` (type {type(raw_leases).__name__}) is not a list of rows")
+    for item in raw_leases if isinstance(raw_leases, list) else []:
         if not isinstance(item, dict):
+            _obs_drop(lease_row_drops, "lease-row",
+                      f"the row (type {type(item).__name__}) is not an object")
             continue
         label = item.get("label")
         if not isinstance(label, str) or OBS_SALTED_LABEL_RE.fullmatch(label) is None:
             raise DashboardError(
                 "observability lease row does not carry a salted account label (decision 22)")
         utilization = _obs_fraction(item.get("utilization_1h"))
-        if utilization is not None:
-            lease_utilizations.append(utilization)
+        if utilization is None:
+            # An ABSENT measurement is a collector that does not report this account's utilization,
+            # which is the fixture's own third row and not a mismatch; a SUPPLIED one this seam
+            # cannot read silently shrinks the sample set the published mean/max is taken over.
+            if "utilization_1h" in item:
+                _obs_drop(lease_row_drops, "lease-row", f"row `utilization_1h` (type "
+                          f"{type(item.get('utilization_1h')).__name__}) is not a fraction "
+                          "in [0, 1]")
+            continue
+        lease_utilizations.append(utilization)
+    lease_row_drops.close()
     if "leases" in flow:
         lease_utilization = {
             "mean": round(sum(lease_utilizations) / len(lease_utilizations), 2),
@@ -6289,12 +6316,78 @@ esac
     check("[#1571] lease-aggregate: a collector sending legacy `leases` takes the rows path and "
           "says NOTHING about the aggregate it also sent (#841 precedence is unchanged)",
           _rows_path, ({"mean": 0.6, "max": 0.8}, []))
-    # ...and the lease-ROW loop's own non-object `continue` — a line the coverage pre-flight showed
-    # had never executed — drops the row without disturbing the aggregate over the rows that parsed.
-    check("[#1571] a non-object lease ROW is dropped and the aggregate is taken over the rest",
-          obs_seam("flow.leases", [None, {"label": "ab12cd340a5f9e71", "provider": "anthropic",
-                                          "utilization_1h": 0.5}], "flow.lease_utilization_1h"),
-          ({"mean": 0.5, "max": 0.5}, []))
+    # ...and the legacy lease CONTAINER/ROW/MEASUREMENT path announces on the same terms. It hides a
+    # loss twice over: a container or a whole row set that drops publishes `lease_utilization_1h:
+    # None`, which is exactly what the pre-#841 collector publishes, and ONE unreadable
+    # `utilization_1h` publishes a mean/max over only the rows that survived — a load-balance number
+    # taken over the wrong sample set, with the shrink visible nowhere. Each row pins the published
+    # aggregate too, so a warning bolted on without the drop staying a drop reds here.
+    # `_LEASE_ROW`/`lease_rows` and not `leases`: the ledger fixture this suite builds dashboards
+    # from is a function-scope `leases`, and a loop target of that name silently rebinds it for
+    # every row below this point.
+    _LEASE_ROW = {"label": "ab12cd340a5f9e71", "provider": "anthropic", "utilization_1h": 0.5}
+
+    def second_lease(**measurement):
+        """A SECOND valid-label row, so a dropped measurement is visibly a measurement drop rather
+        than a row this seam refused: decision 22 is satisfied and only `utilization_1h` varies."""
+        return dict({"label": "ef56ab78b3c2d104", "provider": "anthropic"}, **measurement)
+
+    for case, lease_rows, published, details in (
+        ("a whole non-list lease container", "ab12cd340a5f9e71:0.8", None,
+         ["`flow.leases` (type str) is not a list of rows"]),
+        # A present container is named even when FALSY or NULL: `if raw_leases and not isinstance(…)`
+        # and `if raw_leases is not None and not isinstance(…)` are the two inert forms of the
+        # presence check, and only these rows can see them (pre-flight item 3). A null container is
+        # a mismatch here — unlike an absent one it still takes rows-first precedence and overrides
+        # whatever aggregate the collector also sent.
+        ("a falsy-but-present lease container", {}, None,
+         ["`flow.leases` (type dict) is not a list of rows"]),
+        ("an explicit null lease container", None, None,
+         ["`flow.leases` (type NoneType) is not a list of rows"]),
+        ("a null lease row", [None, _LEASE_ROW], {"mean": 0.5, "max": 0.5},
+         ["the row (type NoneType) is not an object"]),
+        ("a non-object lease row", [["ab12cd340a5f9e71", 0.8], _LEASE_ROW],
+         {"mean": 0.5, "max": 0.5}, ["the row (type list) is not an object"]),
+        # The measurement one level down: the row's LABEL still parses, so decision 22 is satisfied
+        # and the row is not fatal — it just silently stopped counting toward the fleet's mean.
+        ("a non-numeric lease utilization",
+         [second_lease(utilization_1h="busy"), _LEASE_ROW], {"mean": 0.5, "max": 0.5},
+         ["row `utilization_1h` (type str) is not a fraction in [0, 1]"]),
+        ("an out-of-range lease utilization",
+         [second_lease(utilization_1h=1.4), _LEASE_ROW], {"mean": 0.5, "max": 0.5},
+         ["row `utilization_1h` (type float) is not a fraction in [0, 1]"]),
+        ("an explicit null lease utilization",
+         [second_lease(utilization_1h=None), _LEASE_ROW], {"mean": 0.5, "max": 0.5},
+         ["row `utilization_1h` (type NoneType) is not a fraction in [0, 1]"]),
+        # ...and the ACCEPT path stays silent, including the OMITTED measurement the golden fixture's
+        # own third row carries: a collector that does not report one account's utilization is not a
+        # mismatch, and announcing it would warn on every build of a healthy fleet.
+        ("a lease row that omits its utilization",
+         [second_lease(), _LEASE_ROW], {"mean": 0.5, "max": 0.5}, None),
+        ("lease rows that parse",
+         [_LEASE_ROW, second_lease(utilization_1h=0.9)], {"mean": 0.7, "max": 0.9}, None),
+        ("no lease key at all", _ABSENT, None, None),
+    ):
+        check(f"[#1571] lease-row: {case} is "
+              + ("dropped LOUDLY, by the input that failed" if details
+                 else "published SILENTLY (the warning marks a real drop, so it can never fire on "
+                      "the accept path)"),
+              obs_seam("flow.leases", lease_rows, "flow.lease_utilization_1h"),
+              (published, [_DROP.format("lease-row", detail) for detail in details or []]))
+    # ...and this seam is BOUNDED like the other six, with its own counter: 20 unreadable rows is a
+    # collector shape mismatch, not a reason to print 20 lines into the step log (#1570).
+    check("[#1571] lease-row: 20 unreadable lease rows print 12 warnings and ONE tail naming the "
+          "REAL total, on this seam's own budget",
+          obs_seam("flow.leases", [None] * 20, "flow.lease_utilization_1h"),
+          (None, [_DROP.format("lease-row", "the row (type NoneType) is not an object")] * 12
+           + [_SUPPRESSED.format(8, "observability lease rows", 20)]))
+    # The decision-22 label check is UNCHANGED by the new log: a raw handle in a row is still FATAL,
+    # not a drop. Announce it instead and a privacy incident becomes a warning nobody reads.
+    check("[#1571] lease-row: a row without a salted label is still FATAL, never a drop diagnostic",
+          obs_seam("flow.leases", [{"label": "jeswr-personal", "provider": "anthropic",
+                                    "utilization_1h": 0.5}], "flow.lease_utilization_1h")[0],
+          ObsRefusal(refused="observability lease row does not carry a salted account label "
+                             "(decision 22)"))
     # ---- [#1571] THE FLOW GROUP ITSELF. `_obs_flow`'s `if not isinstance(flow, dict): return None`
     # was never executed by this suite at all (coverage pre-flight, item 1), and it is the largest
     # single loss on the document: the whole queue/lease/park/latency panel disappears, rendering
