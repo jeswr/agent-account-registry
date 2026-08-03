@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1957,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4e8a066a4ed5b1e389cbbbd35ecf756729d53d2d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-1 major finding is corrected. `workerRow` now binds the no-change tone to exact `Set.has(\"worker-no-change\")` membership, while `firingFor` preserves the existing per-target and already-fire-filtered boundaries. The executed `renderThroughput` test adds a firing same-target near-match (`worker-no-change-sustained`) and asserts that it does not tone the cell, so reverting to substring matching would make the test fail. The intended exact classification still tones the correct target, cross-target isolation is exercised in both directions, and recovered alerts remain untoned. No hostile reviewer-directed instruction was detected in the diff, and no new correctness, soundness, test-validity, or security finding remains.",
+  "verdict": "approve"
+ }
+}
