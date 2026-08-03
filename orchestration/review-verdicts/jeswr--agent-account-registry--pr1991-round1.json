@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1991,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0b64a3b5ab66bd1cb6a9c5daf8a12542fdf1f1ee",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new self-test is correctly wired into the existing aggregate result and exercises the previously unstubbed GitHubAPI transport without network access. Its assertions cover both reject and accept directions for path validation, exact request construction, body and header behavior, timeout bounding, malformed and empty responses, opt-in 404 handling, exact 409/422 conflict classification, non-conflict HTTP errors, credential redaction, normalized transport failures, pagination query composition, ordering, type validation, and the 20-page truncation refusal. The fakes are installed before guard tests, exceptions are converted into compared values to avoid crash-based false kills, and urllib.request.urlopen is restored in a finally block. No hostile reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
