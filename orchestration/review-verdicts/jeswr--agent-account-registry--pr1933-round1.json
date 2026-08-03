@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1933,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c1898c54d9165b4378c14d2c784997b9dd6699d8",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 7 says `worker_min_samples` should gate on the count of attributed no-change rows rather than `worker_attempts_1h`. For `worker_no_change_rate_1h = attributed_no_change / worker_attempts`, the attempts are the observations and therefore the sample size. The proposed guard instead counts only positive outcomes, making alert eligibility outcome-dependent: e.g. 100 attributable attempts with 2 no-change outcomes is a 100-run sample but would be treated as only two samples. Attribution quality is a separate completeness property and cannot be represented by counting only joined no-change rows. The surrounding recommendation also calls the prospective high-bad threshold `worker_no_change_floor`; a no-change alert should fire above a ceiling, not below a floor, unless a different predicate is explicitly defined.",
+    "file": "research/987-no-change-telemetry.md",
+    "fix_hint": "Keep the minimum-sample guard on the rate denominator (`worker_attempts_1h`). Track attribution completeness separately (for example, an always-emitted unattributed count and/or coverage ratio), and defer/refuse alert evaluation when attribution is not sufficiently trustworthy. Specify a high-side threshold with consistent naming such as `worker_no_change_ceiling`, including its exact predicate and boundary behavior.",
+    "severity": "major",
+    "title": "Alert sample guard counts outcomes instead of observations"
+   }
+  ],
+  "progress": null,
+  "summary": "The record usefully identifies the missing repository dimension and several publication/retention seams, but its recommended alert design contains a material statistical error. It proposes using the number of attributed no-change rows as the minimum-sample guard for a rate whose denominator is worker attempts. That counts positive outcomes rather than observations and makes the alert's eligibility depend on the outcome being detected. The threshold direction/name is also left inconsistent: no-change is bad when high, whereas a `floor` convention describes a low-side trigger. This needs correction before the document is safe to use as the implementation design.",
+  "verdict": "request_changes"
+ }
+}
