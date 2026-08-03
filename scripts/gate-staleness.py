@@ -78,6 +78,10 @@ BASE_REF_ENV = "PR_BASE_REF"
 HEAD_SHA_EXPR = "${{ github.event.pull_request.head.sha }}"
 BASE_REF_EXPR = "${{ github.event.pull_request.base.ref }}"
 
+# THE RECEIPT GRAMMAR, declared ONCE and shared by the renderer and the parser below (#1238).
+RECEIPT_MARKER = "gate-staleness:"
+RECEIPT_KEYS = ("state", "base_ref", "tested_base", "live_tip", "behind")
+
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 # Deliberately narrower than git's own ref grammar. The base ref reaches this script from the event
 # payload and is spliced into a ref name handed to `git`, so a value starting with `-` would be read
@@ -156,11 +160,41 @@ def freshness(head_sha, base_ref, cwd, git=_git):
 
 def receipt(result, base_ref):
     """PURE: the one machine-readable line every run prints, stale or not (#920's crosstab)."""
-    return ("gate-staleness: state={state} base_ref={ref} tested_base={base} live_tip={tip} "
-            "behind={behind}").format(
-                state=result["state"], ref=base_ref if valid_base_ref(base_ref) else "-",
-                base=result["tested_base"] or "-", tip=result["live_tip"] or "-",
-                behind="-" if result["behind"] is None else result["behind"])
+    values = {"state": result["state"],
+              "base_ref": base_ref if valid_base_ref(base_ref) else "-",
+              "tested_base": result["tested_base"] or "-",
+              "live_tip": result["live_tip"] or "-",
+              "behind": "-" if result["behind"] is None else result["behind"]}
+    return RECEIPT_MARKER + " " + " ".join(f"{key}={values[key]}" for key in RECEIPT_KEYS)
+
+
+def parse_receipt(line):
+    """PURE: the five fields of one receipt line as strings, or None when it is not a receipt.
+
+    The exact INVERSE of `receipt()`, and it lives BESIDE it deliberately (issue #1238): the only
+    retrospective reading of the merge-ref base tip is this line in a run log, so a consumer that
+    mined it with its own grammar would be a second definition of the receipt — and the producer
+    moving one field would silently make that consumer measure something else.
+
+    STRICT, AND THE KEY SEQUENCE IS PINNED EXACTLY rather than searched for. `gh run view --log`
+    prefixes every line with `<job>\\t<step>\\t<timestamp> `, so the marker is FOUND rather than
+    anchored at column 0 — but everything after it must be exactly the documented five
+    `key=value` words in the documented order. A line carrying four of them, six of them, a
+    renamed field or the same five reordered is not a receipt this parser will speak for."""
+    if not isinstance(line, str):
+        return None
+    marker = line.find(RECEIPT_MARKER)
+    if marker < 0:
+        return None
+    words = line[marker + len(RECEIPT_MARKER):].split()
+    if len(words) != len(RECEIPT_KEYS):
+        return None
+    fields = {}
+    for key, word in zip(RECEIPT_KEYS, words):
+        if not word.startswith(key + "="):
+            return None
+        fields[key] = word[len(key) + 1:]
+    return fields
 
 
 def annotation(result, base_ref):
@@ -283,6 +317,26 @@ def assert_report_seam(job):
             raise AssertionError(f"env {name} is {env.get(name)!r}, want {expression!r} — the "
                                  "merge-ref base tip is not `base.sha` (issue #920)")
     return True
+
+
+def report_step_name(job):
+    """RAISES unless the seam holds; returns the `name:` of the ONE step that prints the receipt.
+
+    WHY A CONSUMER NEEDS THIS (issue #1238). A run log is written by the pull request's own code:
+    any step of the `gate` job can print a line spelling `gate-staleness:`. A retrospective
+    crosstab that trusted any such line would be reading author-controlled text (AGENTS.md
+    pre-flight item 5), so it filters the log on the (job, step) pair that actually reports —
+    and that step is named HERE, by `assert_report_seam`'s own exactly-one search, never by a
+    second copy of "which step reports" that could start pointing at a different one."""
+    assert_report_seam(job)
+    step = [s for s in job["steps"] if INVOCATION in str(s.get("run") or "")][0]
+    name = step.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise AssertionError(
+            f"the step invoking {INVOCATION} carries no usable `name:` — a run-log consumer "
+            "filters the receipt on the step column, so an unnamed step makes it unattributable "
+            "(issue #1238)")
+    return name
 
 
 def assert_merge_ref_inputs(job):
@@ -476,6 +530,37 @@ def _self_test():
         chk("the receipt of an unresolved reading has no shas to claim",
             receipt(unprovable, "master"),
             "gate-staleness: state=unprovable base_ref=master tested_base=- live_tip=- behind=-")
+
+        # ---- THE PARSER, the inverse of the two rows above (#1238). It is DRIVEN by the
+        # producer's own output — a parser must speak for what `receipt()` actually emits, not for
+        # a hand-written approximation of it — while every EXPECTED value is a fixture sha read out
+        # of the git repository, so the round trip cannot be satisfied tautologically.
+        chk("the receipt parses back to the fields it was rendered from",
+            parse_receipt(receipt(stale, "master")),
+            {"state": STALE, "base_ref": "master", "tested_base": sha["A"],
+             "live_tip": sha["B2"], "behind": "2"})
+        chk("a receipt carried on a `gh run view --log` line still parses, tip included",
+            parse_receipt("gate\tReport staleness\t2026-08-01T00:00:00.0000000Z "
+                          + receipt(fresh, "master")),
+            {"state": FRESH, "base_ref": "master", "tested_base": sha["A"],
+             "live_tip": sha["A"], "behind": "0"})
+        chk("an unresolved receipt parses to the dashes it claims, never to a sha",
+            parse_receipt(receipt(unprovable, "master")),
+            {"state": UNPROVABLE, "base_ref": "master", "tested_base": "-", "live_tip": "-",
+             "behind": "-"})
+        # The reject direction. Each of these is a line a log realistically carries, and every one
+        # of them would hand a crosstab a WRONG tested_base if the parser searched instead of
+        # pinning the exact word sequence.
+        for label, line in (
+                ("a log line with no marker at all", "gate\tstep\t2026-08-01 nothing here"),
+                ("a truncated receipt", f"{RECEIPT_MARKER} state=stale base_ref=master"),
+                ("a receipt with an extra trailing word", receipt(stale, "master") + " behind=0"),
+                ("a reordered receipt",
+                 f"{RECEIPT_MARKER} base_ref=master state=stale tested_base=- live_tip=- behind=-"),
+                ("a receipt with a renamed field",
+                 f"{RECEIPT_MARKER} state=stale base_ref=master base=- live_tip=- behind=-"),
+                ("a non-string line", None)):
+            chk(f"{label} is NOT a receipt", parse_receipt(line), None)
         chk("the summary line of a stale run says so, and a fresh one does not",
             ("stale base" in summary_markdown(stale, "master"),
              "stale base" in summary_markdown(fresh, "master")), (True, False))
@@ -638,6 +723,20 @@ def _self_test():
         chk(f"the checkout check REFUSES when {name}",
             bool(_refused(assert_merge_ref_inputs, mutate(mutation))), True)
 
+    # ---- WHICH step prints the receipt (#1238). A consumer filters a run log on this name, so
+    # naming the wrong step, or no step, must refuse rather than return something plausible.
+    chk("the reporting step names itself, and it is the step invoking this script",
+        report_step_name(good), "Report staleness")
+    for name, mutation in (
+            ("the step's name is dropped", lambda j: j["steps"][1].pop("name")),
+            ("the step's name is blank", lambda j: j["steps"][1].update({"name": "   "})),
+            ("the step's name is not a string", lambda j: j["steps"][1].update({"name": 920})),
+            ("the reporting step is duplicated, so `which step` is ambiguous",
+             lambda j: j["steps"].append(copy.deepcopy(j["steps"][1]))),
+            ("the reporting step is gone", lambda j: j["steps"].pop(1))):
+        chk(f"report_step_name REFUSES when {name}",
+            bool(_refused(report_step_name, mutate(mutation))), True)
+
     # A job that is absent or step-less must REFUSE, not read as satisfied: this is the shape a
     # renamed job or a trimmed workflow presents, and it is exactly where a checker fails open.
     for shape, job in (("an absent job", None), ("a step-less job", {}),
@@ -665,6 +764,8 @@ def _self_test():
         _refused(assert_report_seam, live_job), "")
     chk("LIVE pr-gate.yml still checks out the merge ref with full history",
         _refused(assert_merge_ref_inputs, live_job), "")
+    chk("LIVE pr-gate.yml's reporting step is NAMED — a log consumer filters on it (#1238)",
+        _refused(report_step_name, live_job), "")
 
     print("gate-staleness self-test", "PASSED" if ok else "FAILED", f"({checks} checks)")
     return 0 if ok else 1
