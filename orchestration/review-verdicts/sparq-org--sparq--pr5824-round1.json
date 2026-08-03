@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5824,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "609b7a429e429d832310f3ee3342e17dc59d6d1a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The module promises that an unusable API payload exits 2 and that there is no exit 1, but collect_fixture does not validate each runs entry or that runs/jobs are lists, and decompose_run calls job.get before decompose_job can validate the item. For example, a fixture with runs containing null raises AttributeError at run.get, while jobs containing null raises at job.get; main catches only InventoryError, so both leak a traceback and exit 1. Equivalent malformed list shapes from the API have the same problem. This directly contradicts the documented fail-loud behavior for unusable payloads.",
+    "file": "scripts/ci_leg_inventory.py",
+    "fix_hint": "Validate that runs and jobs are lists and that every run/job is an object before accessing .get, raising InventoryError with context on failure. Add CLI-level tests for malformed run and job entries asserting exit 2, empty stdout, and a concise stderr diagnostic. Also validate the workflow_runs and jobs collections returned by _gh before slicing or iterating.",
+    "severity": "major",
+    "title": "Malformed payload shapes violate the no-exit-1 contract"
+   }
+  ],
+  "progress": null,
+  "summary": "The accounting and classification paths are well covered and the 56-test hermetic suite passes, but the advertised fail-loud exit contract is incomplete: malformed fixture/API container shapes escape as ordinary Python exceptions and produce exit 1 with a traceback instead of the promised diagnostic exit 2. Because handling unusable payloads is a stated load-bearing contract of this measurement tool, this needs correction before approval.",
+  "verdict": "request_changes"
+ }
+}
