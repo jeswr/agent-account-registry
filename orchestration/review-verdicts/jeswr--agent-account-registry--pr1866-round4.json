@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1866,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "56b9109222d05451e3335fdb37ca7985b0296ead",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The implementation remains `for key in sorted(str(k) for k in raw_histogram)[:12]`, so it caps raw keys before validating them. A malformed bucket sorted after twelve other keys is never inspected or announced, and a malformed key or count inside the first twelve consumes a display slot and can displace a later valid bucket. This still contradicts the stated contract that every unreadable supplied bucket is announced and only well-formed display rows are silently truncated. The new histogram cases contain only one bucket each, so they cannot detect either failure mode.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Validate and announce every supplied bucket first, collect the readable buckets, and only then apply the 12-bucket display cap. Add literal mixed over-cap tests with (1) a malformed raw key/count after twelve sortable keys and (2) malformed early entries plus enough later valid buckets, asserting that every malformed input is diagnosed and that twelve valid buckets remain publishable.",
+    "severity": "major",
+    "title": "Histogram cap still drops unreadable buckets before validation"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 major finding remains unchanged. The cache-histogram loop still applies `[:12]` to the sorted raw keys before validating bucket keys and counts. Consequently malformed buckets beyond the first twelve remain silent, while malformed early buckets consume the cap and displace later valid evidence. The added tests still cover only small histograms and do not exercise the mixed over-cap cases requested last round. Because the same major correctness and test-validity defect remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
