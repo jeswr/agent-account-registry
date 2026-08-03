@@ -2329,7 +2329,13 @@ function element(tag) {
     // property read `undefined` on every element, so both branches took their empty side and a
     // harness that renders the flow panel found no metrics to assert on — an EXECUTED assertion
     // quietly weaker than it reads, which is the fidelity property #1107 exists to hold.
-    get childElementCount() { return self.children.length; },
+    // [#1838] ELEMENT children only, which is what the DOM property means: `createTextNode`
+    // returns a node with no `tagName`, and the page DOES mix the two inside one parent (the
+    // lane-light chip, `laneLight`). A shim counting text nodes reports an element the browser
+    // calls empty as non-empty — the same fidelity gap in the opposite direction.
+    get childElementCount() {
+      return self.children.filter((kid) => kid.tagName !== undefined).length;
+    },
     append: (...kids) => { for (const kid of kids) self.children.push(kid); },
     // [#1585] ORDER-SENSITIVE, and not a synonym for append: the throughput card's sparkline is
     // built and then has its caption `prepend`ed, so a shim missing this method threw out of any
@@ -2474,6 +2480,9 @@ def _self_test_page_shim(check):
   counted.push(counter.childElementCount);
   counter.replaceChildren(document.createElement("li"));
   counted.push(counter.childElementCount);
+  // [#1838] ...and a TEXT node is not an element child, so the count does not move.
+  counter.append(document.createTextNode("not an element"));
+  counted.push(counter.childElementCount);
   process.stdout.write(JSON.stringify({
     before, counted,
     prepended: ordered.children.map((kid) => kid.textContent),
@@ -2495,10 +2504,11 @@ def _self_test_page_shim(check):
         shim = {"page script raised": str(exc)[:200]}
     check("[#1107] EXECUTED: the shared DOM shim RECORDS what the page does to an element — a "
           "class added and removed, an attribute, a child REPLACED rather than appended, a child "
-          "PREPENDED ahead of one already there, the child COUNT the page branches on, and id "
-          "identity all read back, and a class added to a child reaches an ancestor's walk",
+          "PREPENDED ahead of one already there, the ELEMENT-child COUNT the page branches on "
+          "(text nodes excluded, as the DOM excludes them), and id identity all read back, and a "
+          "class added to a child reaches an ancestor's walk",
           shim,
-          {"before": {"degraded": True, "contains": True}, "counted": [0, 2, 1],
+          {"before": {"degraded": True, "contains": True}, "counted": [0, 2, 1, 1],
            "prepended": ["first", "second"],
            "after": {"degraded": False, "contains": False},
            "attribute": "worker", "replaced": ["kept"], "inherited": True, "memoized": True,
@@ -6174,6 +6184,69 @@ esac
         check(f"[#1557] {case} hides the panel SILENTLY — the warning names a producer/consumer "
               "mismatch, and 'the collector has not landed' is not one",
               obs_cache(*args), (None, []))
+    # ---- [#1838] THE EMPTY STATE IS A BRANCH, AND BOTH OF ITS SIDES HAVE TO BE ASSERTABLE.
+    # `renderObservability` decides it with `if (!grid.childElementCount)`, so before the shim
+    # carried that property (#1880) the read was `undefined` on every element and the
+    # "no renderable groups yet" line was appended to EVERY render — including the three-card one
+    # asserted above, which is why THAT row has to filter `obs-grid` to `article`. A filter is a
+    # workaround, not a check: with it in place an assertion that the panel DOES show its empty
+    # state, or that it does NOT, passes whatever the page does. That is the #1107 finding ("a shim
+    # that silently swallows what the page does to it makes an EXECUTED assertion quietly weaker
+    # than it reads") in a shape #1107 did not cover. The two rows below therefore read `obs-grid`
+    # UNFILTERED and exhaustively, so neither side of the branch can hide behind a card filter, and
+    # the expected text is a literal written here rather than read back off the page (pre-flight
+    # 2(b)). Both documents are real `_normalize_observability` output: the hollow one is what a
+    # deployed collector publishes before any group it feeds has a producer.
+    _OBS_EMPTY_STATE_PAGE_BODY = r"""
+  const out = {};
+  for (const [name, document] of Object.entries(input.documents)) {
+    for (const id of ["obs-section", "obs-grid", "obs-time", "obs-triggers"]) {
+      ids[id] = element(id);
+    }
+    let error = null;
+    try {
+      scope.renderObservability(document);
+    } catch (raised) {
+      error = String((raised && raised.message) || raised);
+    }
+    out[name] = {
+      error,
+      hidden: ids["obs-section"].hidden === true,
+      // EVERY child of the grid, in render order, as [tag.class, its heading or its own text] —
+      // no `article` filter, so a stray empty-state `<p>` beside real cards is visible here.
+      children: ids["obs-grid"].children.map((kid) => [
+        `${kid.tagName}.${kid.className}`,
+        kid.children[0] ? kid.children[0].textContent : kid.textContent,
+      ]),
+    };
+  }
+  process.stdout.write(JSON.stringify(out));
+"""
+    with contextlib.redirect_stdout(io.StringIO()):
+        obs_hollow = obs_normalized({"schema": OBS_SCHEMA, "generated_at": now})
+    empty_state_page = _executed_page(
+        _page_harness("renderObservability", _OBS_EMPTY_STATE_PAGE_BODY),
+        {"documents": {"groups": copy.deepcopy(obs_measured), "hollow": obs_hollow}})
+
+    def obs_grid_children(name):
+        rendered = empty_state_page[name]
+        return (rendered.get("children"), rendered.get("hidden"), rendered.get("error"))
+
+    check("[#1838] EXECUTED page script: a snapshot WITH renderable groups renders its three cards "
+          "and NOTHING else — the `Observability snapshot has no renderable groups yet.` line is "
+          "absent from a grid that is not empty, which is what a shim without `childElementCount` "
+          "could not say (the property read `undefined`, so the empty branch fired on EVERY "
+          "render)",
+          obs_grid_children("groups"),
+          ([["article.obs-card", "Cache effectiveness"],
+            ["article.obs-card", "Agent-run health"],
+            ["article.obs-card", "Queue & flow"]], False, None))
+    check("[#1838] ...and the other side of the same branch still fires: a snapshot the collector "
+          "published with no renderable group at all leaves the panel VISIBLE and carrying the "
+          "empty-state line alone — never a silently blank grid",
+          obs_grid_children("hollow"),
+          ([["p.empty subtle",
+             "Observability snapshot has no renderable groups yet."]], False, None))
     # ---- [#1879] AN UNMEASURED LANE WINDOW MUST NOT RENDER AS A HEALTHY ZERO. `_obs_lane_rows`
     # publishes `None` for a 1h/24h window it could not read — the same shape a window the collector
     # never sent publishes — but `obsHealthCard()` read it as `obsNum(hour.success, 0)`, so BOTH
