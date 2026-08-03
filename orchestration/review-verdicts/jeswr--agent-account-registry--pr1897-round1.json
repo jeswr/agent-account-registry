@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1897,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "70053570ef1370ec5de1bd9ef0ab89f0a09a2174",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The added self-test exercises the previously uncovered production write seam end to end while keeping reads faked at the correct boundary. It restores both subprocess.run and GH_DEBUG on all paths, verifies exact executed argv shapes, the SHA-bound relatch mutation, absence of arm/admin/label hazards, minted-token propagation with debug scrubbing, non-zero process return-code propagation, and stdout normalization. The anti-vacuity checks ensure the write-path assertions cannot pass merely because no writes occurred, and the existing flow tests separately pin failure sequencing. No correctness, soundness, security, or test-validity issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
