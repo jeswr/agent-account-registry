@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5848,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a696ac94580e20edd6791e6e9dce3c71a9c84900",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The release gui-bundle job now installs an exactly versioned wasm-pack through a SHA-pinned, architecture-aware prebuilt installer before the wasm build. The added hermetic test meaningfully checks the load-bearing properties against the real workflow: arm64 matrix presence, absence of the source-install path and architecture-blind action, exact tool selection, action pinning, uniqueness, and ordering. The test executes successfully, and the docs-quality workflow runs it. No correctness, soundness, test-validity, or security defect is evident in the scoped change.",
+  "verdict": "approve"
+ }
+}
