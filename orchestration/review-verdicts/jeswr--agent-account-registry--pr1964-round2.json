@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1964,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3e1112566f12eefad98da0eb7a34411468025b4b",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 producer/consumer-seam finding is resolved honestly rather than hidden: the change now explicitly states in code, workflow commentary, documentation, and CLI output that no binding producer exists in this tree, treats `bindings=0` as non-evidence, and tests that disclosure through the real command path. The consumer remains fail-closed for unreadable or malformed in-namespace listings, reads all evidence before printing, paginates the added listing, does not expose binding components, and keeps bindings as annotations rather than exclusions. The tests independently exercise bound/unbound, zero/nonzero, malformed, privacy, pagination, and report-only behavior without deriving their key expected strings from the production constants. As scoped now, this is a safe preparatory reader whose operational limitation is conspicuous, not a claim that the future producer already exists.",
+  "verdict": "approve"
+ }
+}
