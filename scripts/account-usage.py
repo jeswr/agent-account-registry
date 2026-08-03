@@ -25,6 +25,15 @@
 # Claude-Code-shaped fable probe whose 7d_oi headroom gates fable-model routing specifically. If that probe
 # is rejected or returns no 7d_oi headers, the account is fail-closed for FABLE only (its 5h/7d base signal
 # from the haiku probe still governs non-fable routing).
+#
+# [#1644] OBSERVATION LANE (design record research/720-opus5-premium-quota-gating.md, Stage A): an
+# anthropic entry ALSO carries a namespaced, UNREAD carry-through of every parsed rate-limit header
+# (`raw_hdr_*`), plus — for accounts whose catalog `models` lists `opus5` — the outcome and headers
+# of a third probe addressed to `claude-opus-5` itself (`opus5_probe`, `opus5_raw_hdr_*`). Nothing
+# downstream reads any of it, and Stage A is exactly the change that emits nothing readable: see the
+# OBSERVATION blocks at `_raw_header_fields` and `_assemble_opus5` for why gating a SOLE-tier
+# premium bucket before it has ever been observed is a fleet outage rather than a safeguard, and for
+# what the extra probe costs.
 import contextlib
 import importlib.util
 import io
@@ -96,13 +105,63 @@ def _probe_headers(token, model, claude_code=False):
     return _parse_rate_headers(proc.stdout)
 
 
+# --- [SPARQ agent] RAW HEADER OBSERVATION (registry #1644, design record #720 Stage A) ------------
+# OBSERVATION ONLY — nothing below is read by any consumer.
+#
+# `_parse_rate_headers` already keeps EVERY `anthropic-ratelimit-unified-*` key, but `_assemble_usage`
+# hand-built its entry from a fixed key list and dropped the rest. So a window the provider publishes
+# under a name this file does not enumerate — which is exactly the open question about
+# `claude-opus-5` (#720 §5 row 1) — was parsed and then forgotten, on every probe, forever.
+#
+# The carried keys are NAMESPACED under a prefix no consumer reads. That is what makes the
+# carry-through gating-neutral BY CONSTRUCTION rather than by inspection: every key it emits begins
+# with the prefix, and not one admission or monitoring key does (`status`, `5h_util`, `7d_util`,
+# `5h_reset`, `7d_reset`, `5h_limit`, `7d_limit`, `fable_ok`, `fable_7d_oi_*`, `exempt`,
+# `reachability`, `backoff_*`), so no provider header can be NAMED such that carrying it forges or
+# overwrites an input to select-and-claim.usage_eligible / usage-alert.classify /
+# dashboard-gen._availability. The named fields are also merged LAST, so the trusted values win
+# even if that disjointness were ever broken. --self-test asserts both against a HOSTILE header map.
+#
+# Header NAMES are not credential material (#720 §7 Stage A item 1) and neither adds a handle or a
+# count to the snapshot (locked decision 22b). VALUES are provider-controlled text that outlives the
+# probe in a snapshot file, so they are grammar-filtered and bounded here rather than trusted.
+RAW_HEADER_PREFIX = "raw_hdr_"
+RAW_HEADER_MAX_KEYS = 64          # a runaway/hostile header SET cannot inflate the snapshot ...
+RAW_HEADER_MAX_VALUE = 128        # ... nor can a single runaway VALUE
+RAW_HEADER_NAME_RE = re.compile(r"[a-z0-9][a-z0-9._:-]{0,63}")
+
+
+def _raw_header_fields(hdr, prefix):
+    """PURE: the namespaced carry-through of a parsed header map -> {prefix + name: value}.
+
+    Deterministic and bounded: names are taken in sorted order, only well-formed lowercase header
+    names are carried (`_parse_rate_headers` already lowercases and strips the vendor prefix, so a
+    name outside that grammar is not a header this probe understands), each value is truncated to
+    RAW_HEADER_MAX_VALUE characters, and at most RAW_HEADER_MAX_KEYS keys are emitted. A non-string
+    value cannot come out of the parser and is refused rather than trusted into the snapshot.
+    Unit-tested by --self-test."""
+    fields = {}
+    if not isinstance(hdr, dict):
+        return fields
+    for name in sorted(key for key in hdr if isinstance(key, str)):
+        if len(fields) >= RAW_HEADER_MAX_KEYS:
+            break
+        value = hdr[name]
+        if RAW_HEADER_NAME_RE.fullmatch(name) is None or not isinstance(value, str):
+            continue
+        fields[prefix + name] = value[:RAW_HEADER_MAX_VALUE]
+    return fields
+
+
 def _assemble_usage(hdr):
     """Build the per-account usage entry from a parsed header map. Includes the raw *-limit header
     values when the provider exposes them (capacity-model measurement: the per-account tier limits
-    were 'TBD' — persisting the live limits stops admission flying blind). Pure — unit-tested."""
-    entry = {"status": hdr.get("status"),
-             "5h_util": hdr.get("5h-utilization"), "5h_reset": hdr.get("5h-reset"),
-             "7d_util": hdr.get("7d-utilization"), "7d_reset": hdr.get("7d-reset")}
+    were 'TBD' — persisting the live limits stops admission flying blind), plus the OBSERVATION-ONLY
+    namespaced carry-through of every parsed header (registry #1644). Pure — unit-tested."""
+    entry = _raw_header_fields(hdr, RAW_HEADER_PREFIX)
+    entry.update({"status": hdr.get("status"),
+                  "5h_util": hdr.get("5h-utilization"), "5h_reset": hdr.get("5h-reset"),
+                  "7d_util": hdr.get("7d-utilization"), "7d_reset": hdr.get("7d-reset")})
     for key, source in (("5h_limit", "5h-limit"), ("7d_limit", "7d-limit")):
         if hdr.get(source) is not None:
             entry[key] = hdr.get(source)
@@ -187,6 +246,70 @@ def _probe_fable(token):
     drift is caught by the self-test."""
     hdr = _probe_headers(token, "claude-fable-5", claude_code=True)
     return _assemble_fable(hdr)
+
+
+# --- [SPARQ agent] CLAUDE-OPUS-5 OBSERVATION PROBE (registry #1644, #720 Stage A item 2) ----------
+# The fleet had ZERO observations of the model it actually runs on: the base probe is addressed to
+# `claude-haiku-4-5` and the premium probe to the now-retired `claude-fable-5`. Per the `7d_oi`
+# empirical note at the top of this file, a premium sub-quota window appears ONLY on a
+# Claude-Code-shaped request NAMING the premium model, so the haiku base probe cannot surface an
+# opus5 bucket even if one exists — the only way to learn whether `claude-opus-5` publishes its own
+# window is to address a request to it.
+#
+# STRICTLY OBSERVATION-ONLY, and that bound is the whole point of this change (#720 §4). No field
+# emitted here is read by ANY consumer, and there is deliberately NO `opus5_ok` flag paralleling
+# `fable_ok`: `fable_ok` is an ELIGIBILITY input (select-and-claim._fable_eligible), fable was one
+# rung of a multi-rung chain, and opus5 is the SOLE remaining anthropic tier. A premium gate armed
+# before every account is KNOWN to probe successfully would read as `effective_cap == 0` fleet-wide
+# and machine-park every escalate-tier issue at once — indistinguishable from the exhaustion it was
+# built to prevent. Gating is Stage B, after at least one full weekly window of this data.
+#
+# COST, stated because it is real (#720 §5 row 4): every probe is a live `max_tokens:1` request, so
+# an account whose catalog `models` still lists `fable` alongside `opus5` now costs THREE requests
+# per tick, against the sole remaining anthropic tier — quota spent to measure quota. The
+# measurement is SELF-PRICING rather than self-reported: this probe runs last, so its own response
+# carries the whole-account windows AFTER the tick's earlier probes, and differencing
+# `opus5_raw_hdr_5h-utilization` against the entry's `5h_util` prices a tick's probing directly, per
+# account, with no extra request and no counter to maintain. Retiring the now-dead `fable` probe
+# (#720 §7 Stage A item 3) is the reduction; it changes behaviour, so it is deliberately not here.
+OPUS5_MODEL = "claude-opus-5"
+OPUS5_ALIAS = "opus5"                      # the catalog `models` entry that selects this probe
+OPUS5_RAW_PREFIX = "opus5_raw_hdr_"        # namespaced apart from the base probe's carry-through
+OPUS5_OUTCOME_KEY = "opus5_probe"
+OPUS5_HEADERS = "headers"
+OPUS5_NO_HEADERS = "no-headers"
+OPUS5_TRANSPORT_ERROR = "transport-error"
+
+
+def _assemble_opus5(hdr):
+    """PURE: the observation-only opus5 fields for a parsed probe header map.
+
+    The THREE-way outcome split is the one #720 §4.1 calls load-bearing, recorded now so Stage B
+    does not have to re-derive it from an ambiguous absence: a TRANSPORT failure is evidence about
+    the prober (counting it would let one broken runner drive every account to a refusing state), a
+    completed response carrying NO rate-limit headers is evidence about the account/model, and
+    neither is the same as a window that was present. `_probe_headers` already distinguishes them
+    (None vs {}) and that distinction is otherwise lost the moment it returns.
+
+    Unlike `_assemble_fable` this NEVER returns None: it renders no verdict, so its failure modes
+    are DATA, not a fail-closed omission. Every key is namespaced (`opus5_probe`,
+    `opus5_raw_hdr_*`), so merging the result into a probed entry can neither add nor overwrite an
+    admission input. Unit-tested by --self-test."""
+    if hdr is None:
+        return {OPUS5_OUTCOME_KEY: OPUS5_TRANSPORT_ERROR}
+    entry = {OPUS5_OUTCOME_KEY: OPUS5_HEADERS if hdr else OPUS5_NO_HEADERS}
+    entry.update(_raw_header_fields(hdr, OPUS5_RAW_PREFIX))
+    return entry
+
+
+def _probe_opus5(token, fetch=None):
+    """Probe `claude-opus-5` with the Claude-Code request shape and record what came back.
+
+    Observation-only: it never omits an account and never blocks routing, whatever it observes.
+    `fetch` is injectable for the self-test ONLY — it is what lets the suite assert the MODEL and
+    the request SHAPE this probe is addressed with, which is the part a network-only entry point
+    otherwise leaves unexecuted."""
+    return _assemble_opus5((fetch or _probe_headers)(token, OPUS5_MODEL, claude_code=True))
 
 
 def _load_account_catalog(script_dir):
@@ -298,14 +421,15 @@ def _is_exempt_provider(provider):
 REACHABILITY_UNPROVEN = "unproven"
 
 
-def _probe_account(account, secrets, probe=None, fable_probe=None):
+def _probe_account(account, secrets, probe=None, fable_probe=None, opus5_probe=None):
     """Probed usage entry for ONE non-exempt account, or None (fail-closed omit). The provider
     MUST normalize to `anthropic` BEFORE the secret is even dereferenced (cross-provider review
     r3 finding 3): the probe below is addressed to the Anthropic API, so a missing, misspelled,
     or unknown provider (e.g. `openia`) previously TRANSMITTED that account's token to a provider
     the catalog never named — and admitted the account on the response. Unknown providers now
     never reach a probe; the omitted entry surfaces as UNAVAILABLE in usage-alert (loud), like
-    every other fail-closed omit. `probe`/`fable_probe` are injectable for the self-test ONLY."""
+    every other fail-closed omit. `probe`/`fable_probe`/`opus5_probe` are injectable for the
+    self-test ONLY."""
     if str(account.get("provider") or "").strip().lower() != "anthropic":
         return None
     ref = account.get("secret_ref")
@@ -327,13 +451,24 @@ def _probe_account(account, secrets, probe=None, fable_probe=None):
     probed = (probe or _probe_anthropic)(token)
     if probed is None:
         return None
+    # A catalog row carrying `models: null` used to raise TypeError HERE (`"fable" in None`), which
+    # kills the whole sweep -> the workflow writes '{}' -> EVERY account fail-closes. One malformed
+    # row must cost one row, so the list is normalized once for both model-conditional probes.
+    models = account.get("models") or []
     # [FABLE-5] Only fable-capable accounts need the extra Claude-Code-shaped fable probe. A missing
     # or failed fable probe leaves the fable sub-quota fields absent -> usage_eligible fail-closes FABLE
     # routing for this account, while its base 5h/7d signal still admits it for non-fable models.
-    if "fable" in account.get("models", []):
+    if "fable" in models:
         fable = (fable_probe or _probe_fable)(token)
         if fable is not None:
             probed.update(fable)
+    # [#1644] OBSERVATION ONLY (#720 Stage A item 2): record what `claude-opus-5` returns for
+    # accounts the catalog says serve it. Unlike the fable probe this feeds NO eligibility decision
+    # — its keys are namespaced and unread — so it can neither omit the account nor change any
+    # verdict the base probe already reached; a failure is recorded as data and routing continues.
+    # It runs LAST so its own whole-account windows price the tick's probing (see OPUS5_MODEL).
+    if OPUS5_ALIAS in models:
+        probed.update((opus5_probe or _probe_opus5)(token))
     return probed
 
 
@@ -854,6 +989,63 @@ def _self_test(escaped=None):
     chk("assemble includes exposed limit", entry.get("5h_limit"), "1000000")
     chk("assemble omits absent limit", "7d_limit" in entry, False)
     chk("assemble keeps util fields", entry.get("5h_util"), "0.42")
+    # ---- [#1644] OBSERVATION-ONLY raw header carry-through (#720 Stage A item 1) ----
+    #   The parser already kept every anthropic-ratelimit-unified-* key; the loss was in
+    #   _assemble_usage's fixed key list. Expectations are LITERAL (never `RAW_HEADER_PREFIX + ...`),
+    #   so a renamed/removed prefix reds these rows instead of being compared against itself.
+    chk("assemble carries the WHOLE parsed header set through, namespaced",
+        {key: value for key, value in entry.items() if key.startswith("raw_hdr_")},
+        {"raw_hdr_status": "allowed", "raw_hdr_5h-utilization": "0.42",
+         "raw_hdr_5h-limit": "1000000", "raw_hdr_7d-utilization": "0.1"})
+    #   an UNENUMERATED window — precisely the shape a distinct claude-opus-5 bucket would take —
+    #   used to be parsed and dropped on the floor on every probe, forever
+    unknown_window = _assemble_usage(_parse_rate_headers(
+        "anthropic-ratelimit-unified-status: allowed\r\n"
+        "anthropic-ratelimit-unified-7d_o5-utilization: 0.33\r\n"
+        "anthropic-ratelimit-unified-7d_o5-reset: 1737072000\r\n"))
+    chk("assemble no longer discards an unenumerated window",
+        (unknown_window.get("raw_hdr_7d_o5-utilization"),
+         unknown_window.get("raw_hdr_7d_o5-reset")), ("0.33", "1737072000"))
+    chk("carried keys land ONLY under the namespace, never under the raw provider name",
+        [key for key in unknown_window if key.startswith("7d_o5")], [])
+    #   THE SCOPE BOUND (#720 §4). A provider header must not be NAMEABLE such that carrying it
+    #   forges or overwrites an admission input. Each name below is read by a live consumer
+    #   (select-and-claim.usage_eligible / usage-alert.classify / dashboard-gen._availability).
+    hostile_hdr = _parse_rate_headers(
+        "anthropic-ratelimit-unified-status: allowed\r\n"
+        "anthropic-ratelimit-unified-5h-utilization: 0.42\r\n"
+        "anthropic-ratelimit-unified-7d-utilization: 0.1\r\n"
+        "anthropic-ratelimit-unified-fable_ok: true\r\n"
+        "anthropic-ratelimit-unified-exempt: true\r\n"
+        "anthropic-ratelimit-unified-reachability: live\r\n"
+        "anthropic-ratelimit-unified-backoff_until: 0\r\n"
+        "anthropic-ratelimit-unified-fable_7d_oi_util: 0.0\r\n"
+        "anthropic-ratelimit-unified-5h_util: 0.99\r\n")
+    hostile_entry = _assemble_usage(hostile_hdr)
+    chk("hostile header NAMES forge no admission input",
+        sorted(key for key in hostile_entry
+               if key in ("fable_ok", "exempt", "reachability", "backoff_until",
+                          "fable_7d_oi_util", "fable_7d_oi_reset")), [])
+    chk("hostile header names cannot overwrite the trusted windows",
+        (hostile_entry.get("status"), hostile_entry.get("5h_util"), hostile_entry.get("7d_util")),
+        ("allowed", "0.42", "0.1"))
+    #   bounded, because these are provider-controlled values that outlive the probe in a snapshot
+    #   file. Inputs sit far past the caps and the expectations are LITERAL, so RAISING a cap reds
+    #   these rows rather than being silently absorbed by an input derived from the same constant.
+    capped_keys = _raw_header_fields({f"h{i:03d}": "v" for i in range(200)}, "raw_hdr_")
+    chk("carry-through caps the key COUNT, keeping the deterministic first names",
+        (len(capped_keys), "raw_hdr_h000" in capped_keys, "raw_hdr_h063" in capped_keys,
+         "raw_hdr_h064" in capped_keys), (64, True, True, False))
+    #   (`.get`, not `[]`: a mutant that drops the namespace must red THIS row too, not raise a
+    #   KeyError that aborts the suite and leaves every row below it unrun — AGENTS.md item 4's
+    #   crash-after-partial-run, which records as a kill while measuring nothing)
+    chk("carry-through caps the value LENGTH",
+        len(_raw_header_fields({"7d_o5-utilization": "x" * 500}, "raw_hdr_")
+            .get("raw_hdr_7d_o5-utilization", "")), 128)
+    chk("carry-through drops names outside the header grammar and non-string values",
+        _raw_header_fields({"ok-name": "1", "bad name": "2", "UPPER": "3", "": "4",
+                            "x" * 100: "5", "num": 6}, "raw_hdr_"), {"raw_hdr_ok-name": "1"})
+    chk("carry-through of a non-map is empty (no crash)", _raw_header_fields(None, "raw_hdr_"), {})
     # limits front-matter line + idempotent upsert
     chk("limits line", _limits_line({"5h_limit": "10", "7d_limit": "70"}),
         "limits: 5h_limit=10 7d_limit=70")
@@ -898,6 +1090,68 @@ def _self_test(escaped=None):
         "anthropic-ratelimit-unified-7d_oi-utilization: 0.3\r\n"))
     chk("fable good sans limit: fable_ok", (fable_nolimit or {}).get("fable_ok"), True)
     chk("fable good sans limit: no limit key", "fable_7d_oi_limit" in (fable_nolimit or {}), False)
+    # ---- [#1644] claude-opus-5 OBSERVATION probe (#720 Stage A item 2) ----
+    #   (a) the request SHAPE. The premium window appears only on a Claude-Code-shaped request that
+    #   NAMES the model, and the credential must still never reach argv (issue #195).
+    oargs, ostdin = _probe_curl_command("sk-secret-tok", "claude-opus-5", claude_code=True)
+    chk("opus5 probe: token absent from argv", any("sk-secret-tok" in a for a in oargs), False)
+    chk("opus5 probe: token carried on stdin only", ostdin,
+        "Authorization: Bearer sk-secret-tok\n")
+    chk("opus5 probe: Claude-Code UA + system prompt + the opus5 model all in the request",
+        (any(_CLAUDE_CODE_UA in a for a in oargs), any(_CLAUDE_CODE_SYSTEM in a for a in oargs),
+         any('"claude-opus-5"' in a for a in oargs)), (True, True, True))
+    #   (b) `_probe_opus5` addresses the RIGHT model with the RIGHT shape. Asserted on the RECORDED
+    #   call rather than on the module constants, so probing haiku (the pre-#1644 state — no request
+    #   was ever addressed to the model the fleet runs on) or dropping claude_code=True reds here.
+    opus_calls = []
+
+    def _rec_fetch(result):
+        def fetch(token, model, claude_code=False):
+            opus_calls.append((token, model, claude_code))
+            return result
+        return fetch
+
+    good_opus = _parse_rate_headers(
+        "HTTP/2 200\r\n"
+        "anthropic-ratelimit-unified-status: allowed\r\n"
+        "anthropic-ratelimit-unified-5h-utilization: 0.44\r\n"
+        "anthropic-ratelimit-unified-7d_o5-utilization: 0.25\r\n"
+        "anthropic-ratelimit-unified-7d_o5-reset: 1737072000\r\n")
+    observed_opus = _probe_opus5("tok", fetch=_rec_fetch(good_opus))
+    chk("opus5 probe is addressed to claude-opus-5 with the Claude-Code shape",
+        opus_calls, [("tok", "claude-opus-5", True)])
+    chk("opus5 probe records the observed window under its own namespace",
+        (observed_opus.get("opus5_probe"), observed_opus.get("opus5_raw_hdr_7d_o5-utilization"),
+         observed_opus.get("opus5_raw_hdr_7d_o5-reset")), ("headers", "0.25", "1737072000"))
+    #   the cost of the tick's probing is priced from this probe's OWN whole-account window against
+    #   the base entry's — no extra request, no counter (#720 §5 row 4)
+    chk("opus5 probe carries the post-probe whole-account window (the cost measurement)",
+        observed_opus.get("opus5_raw_hdr_5h-utilization"), "0.44")
+    #   (c) the THREE-way outcome split #720 §4.1 calls load-bearing: a TRANSPORT failure is
+    #   evidence about the prober (counting it as account evidence is how one broken runner kills
+    #   the fleet in N ticks), an empty header set is evidence about the account, and neither is a
+    #   window. Collapsing any two loses the distinction Stage B's streak counter is built on.
+    chk("opus5 outcome: transport failure is recorded as such",
+        _assemble_opus5(None), {"opus5_probe": "transport-error"})
+    chk("opus5 outcome: a response carrying NO rate-limit headers is a distinct state",
+        _assemble_opus5({}), {"opus5_probe": "no-headers"})
+    chk("opus5 outcome: a present window is a third, distinct state",
+        _assemble_opus5(good_opus).get("opus5_probe"), "headers")
+    #   (d) THE SCOPE BOUND: no eligibility-shaped field, however the provider names its headers.
+    #   There is deliberately no `opus5_ok` — `fable_ok` IS an eligibility input, and arming a
+    #   premium gate on the sole remaining tier before it is known to probe is #720 §4's outage.
+    hostile_opus = _assemble_opus5(_parse_rate_headers(
+        "anthropic-ratelimit-unified-fable_ok: true\r\n"
+        "anthropic-ratelimit-unified-opus5_ok: true\r\n"
+        "anthropic-ratelimit-unified-exempt: true\r\n"
+        "anthropic-ratelimit-unified-status: allowed\r\n"
+        "anthropic-ratelimit-unified-5h_util: 0.0\r\n"))
+    chk("opus5 observation emits exactly ONE non-namespaced key, and it is not a verdict",
+        sorted(key for key in hostile_opus if not key.startswith("opus5_raw_hdr_")),
+        ["opus5_probe"])
+    chk("opus5 observation forges no eligibility field from hostile header names",
+        sorted(key for key in hostile_opus
+               if key in ("opus5_ok", "fable_ok", "exempt", "status", "5h_util")), [])
     # [ISSUE #196] the SAME strict validator now guards the BASE 5h/7d windows (previously only the
     # Fable sub-quota): a malformed base window / empty status OMITS the account (fail-closed) rather
     # than being emitted to fail open as eligible capacity downstream. `good_base` is the parsed
@@ -1118,6 +1372,118 @@ def _self_test(escaped=None):
         (_probe_account({"provider": "anthropic", "secret_ref": "ACCT01_TOKEN", "models": ["haiku"]},
                         {"ACCT01_TOKEN": "tok"}, probe=_rec_probe, fable_probe=_rec_probe)), None)
     probe_calls.clear()
+    # ---- [#1644] the opus5 OBSERVATION probe: wired, conditional, priced, and unable to gate ----
+    #   The third probe is recorded on its OWN list so the number of live max_tokens:1 requests per
+    #   account per tick is ASSERTED rather than assumed — #720 §5 row 4 is a cost this change adds
+    #   against the very tier it measures, so the arithmetic belongs in the suite.
+    opus5_calls = []
+
+    def _rec_opus5(token):
+        opus5_calls.append(token)
+        return {"opus5_probe": "headers", "opus5_raw_hdr_7d_o5-utilization": "0.25"}
+
+    def _anthropic_row(models):
+        return {"handle": "acct01", "provider": "anthropic", "secret_ref": "ACCT01_TOKEN",
+                "models": models}
+
+    opus5_probed = _probe_account(_anthropic_row(["opus5"]), stub_secrets, probe=_rec_probe,
+                                  fable_probe=_rec_probe, opus5_probe=_rec_opus5)
+    chk("an opus5 account gets the observation probe and its fields reach the entry",
+        (probe_calls, opus5_calls, opus5_probed.get("opus5_raw_hdr_7d_o5-utilization")),
+        (["tok"], ["tok"], "0.25"))
+    chk("the observation leaves the base signal exactly as the base probe assembled it",
+        (opus5_probed.get("status"), opus5_probed.get("5h_util")), ("allowed", "0.1"))
+    #   pinned at the MERGE SITE, not just in the pure classifier: the probed entry's un-namespaced
+    #   key set must be exactly what the base probe produced. This is the row that reds if a later
+    #   change bolts an `opus5_ok`-shaped verdict onto the entry here rather than in _assemble_opus5.
+    chk("the probed entry gains NO un-namespaced key from the observation",
+        sorted(key for key in opus5_probed
+               if not key.startswith(("raw_hdr_", "opus5_raw_hdr_")) and key != "opus5_probe"),
+        ["5h_util", "status"])
+    #   ... and it is CONDITIONAL on the catalog naming opus5 — a row that does not must not pay
+    probe_calls.clear()
+    opus5_calls.clear()
+    _probe_account(_anthropic_row(["haiku"]), stub_secrets, probe=_rec_probe,
+                   fable_probe=_rec_probe, opus5_probe=_rec_opus5)
+    chk("a non-opus5 account never pays for the observation probe",
+        (probe_calls, opus5_calls), (["tok"], []))
+    #   THE COST, measured: a row still carrying the retired `fable` alias alongside `opus5` now
+    #   costs THREE live requests per tick. Retiring the dead fable probe is #720 Stage A item 3 and
+    #   is a behaviour change deliberately outside this observation-only lane.
+    probe_calls.clear()
+    opus5_calls.clear()
+    _probe_account(_anthropic_row(["fable", "opus5"]), stub_secrets, probe=_rec_probe,
+                   fable_probe=_rec_probe, opus5_probe=_rec_opus5)
+    chk("cost: a fable+opus5 catalog row now costs THREE probes per account per tick",
+        (len(probe_calls) + len(opus5_calls), probe_calls, opus5_calls),
+        (3, ["tok", "tok"], ["tok"]))
+    #   a FAILED observation must never omit the account or move its base signal: this lane renders
+    #   no verdict, so its failure is DATA. Flipping it fail-closed is #720 §4's fleet outage.
+    probe_calls.clear()
+    opus5_calls.clear()
+    failed_observation = _probe_account(_anthropic_row(["opus5"]), stub_secrets, probe=_rec_probe,
+                                        fable_probe=_rec_probe,
+                                        opus5_probe=lambda _token: _assemble_opus5(None))
+    chk("a FAILED observation probe still admits the account, recording only the outcome",
+        (failed_observation.get("status"), failed_observation.get("5h_util"),
+         failed_observation.get("opus5_probe")), ("allowed", "0.1", "transport-error"))
+    #   the observation is reached only AFTER the base probe succeeds: an account already being
+    #   fail-closed omitted must not first be charged a request against the tier it is losing
+    probe_calls.clear()
+    opus5_calls.clear()
+    chk("a base-probe failure omits the account BEFORE the observation probe is paid for",
+        (_probe_account(_anthropic_row(["opus5"]), stub_secrets, probe=lambda _token: None,
+                        fable_probe=_rec_probe, opus5_probe=_rec_opus5), opus5_calls), (None, []))
+    chk("a token-less opus5 account is omitted with no probe of any kind",
+        (_probe_account(_anthropic_row(["opus5"]), {}, probe=_rec_probe, fable_probe=_rec_probe,
+                        opus5_probe=_rec_opus5), probe_calls, opus5_calls), (None, [], []))
+    #   a malformed `models: null` row costs ONE row, not the sweep: `"fable" in None` raises
+    #   TypeError, which kills main(), and the workflow then writes '{}' — every account in the
+    #   fleet fail-closes off one bad catalog record. The second model-conditional probe added here
+    #   would have been a second site for it.
+    probe_calls.clear()
+    opus5_calls.clear()
+    #   The raise is CAUGHT and reported as a row value: an uncaught TypeError here aborts the
+    #   whole suite, which records as a kill while leaving every row below it unrun (AGENTS.md
+    #   item 4's crash-after-partial-run). The row must red by NAME, with the check count intact.
+    try:
+        null_models = _probe_account(_anthropic_row(None), stub_secrets, probe=_rec_probe,
+                                     fable_probe=_rec_probe, opus5_probe=_rec_opus5)
+        null_outcome = (null_models or {}).get("status")
+    except Exception as exc:
+        null_outcome = type(exc).__name__
+    chk("a `models: null` catalog row degrades to the base probe instead of killing the sweep",
+        (null_outcome, probe_calls, opus5_calls), ("allowed", ["tok"], []))
+    probe_calls.clear()
+    opus5_calls.clear()
+    # ---- [#1644] the observation is inert AT THE CONSUMER, not merely by inspection ----
+    #   Stage A's whole scope bound is "emit no field any consumer gates on", so it is asserted
+    #   against the two live readers of this snapshot — the ADMISSION gate and the ALERT classifier
+    #   — rather than by reading the key names. Merging the FULL observation, hostile header names
+    #   included, must move neither verdict, for an admitted entry OR a capped one: a producer field
+    #   that a consumer half-reads is exactly how #720 §4's fleet-wide outage happens by accident.
+    #   The baseline verdicts are pinned to literals too, so a both-sides-broken pair still reds.
+    allocator = _load_account_catalog(script_dir)
+    alerter = _load_sibling(script_dir, "usage-alert.py", "registry_usage_alert")
+    admitted_entry = {"status": "allowed", "5h_util": 0.1, "5h_reset": 5000,
+                      "7d_util": 0.1, "7d_reset": 9000}
+    capped_entry = {**admitted_entry, "7d_util": 0.99}
+    observation = {**_raw_header_fields(hostile_hdr, "raw_hdr_"), **observed_opus, **hostile_opus}
+    chk("the observation moves NO admission verdict (admitted and capped alike)",
+        [(allocator.usage_eligible(dict(base)), allocator.usage_eligible({**base, **observation}))
+         for base in (admitted_entry, capped_entry)], [(True, True), (False, False)])
+    for label, base, want in (("admitted", admitted_entry, (1, True)),
+                              ("capped", capped_entry, (0, False))):
+        plain = alerter.classify(["h"], {"h": dict(base)}, 0.10, now=0)
+        merged = alerter.classify(["h"], {"h": {**base, **observation}}, 0.10, now=0)
+        chk(f"the observation moves NO usage-alert row ({label})",
+            (plain == merged, plain[0], plain[1][0][2]), (True, *want))
+    #   cross-script parity: the probe must never be addressed to a RETIRED model, and the catalog
+    #   alias it keys on is the SHARED successor — both read from deprecated_models, not restated.
+    deprecated = _load_sibling(script_dir, "deprecated_models.py", "registry_deprecated_models")
+    chk("the observation probe names the live successor tier, never a retired model",
+        (OPUS5_ALIAS == deprecated.SUCCESSOR, OPUS5_MODEL in deprecated.DEPRECATED_PROVIDER_MODELS,
+         OPUS5_ALIAS in deprecated.DEPRECATED_ALIASES), (True, False, False))
     # ---- tier-limit persistence: honest failure propagation + no silent overwrite (issue #198) ----
     class _R:  # a tiny CompletedProcess stand-in for the fake gh runner
         def __init__(self, rc, out=""):
