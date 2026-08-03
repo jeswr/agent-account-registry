@@ -9,7 +9,8 @@
 ## 1. Verdict
 
 **Qualified yes — but it is a provisioning migration with a code change attached, not a code change,
-and it is gated on one offline measurement that can kill the whole increment.**
+and it is gated on one lifetime measurement (§4 M1) that can kill the whole increment — of which
+only the first, bounding half is offline.**
 
 Three findings decide it, and each is a correction to what §5.E assumed:
 
@@ -86,27 +87,61 @@ and most of them say so by raising.
 
 Two options once a fresh anthropic access token exists host-side:
 
-- **(a) reuse the existing env delivery.** Write only `claudeAiOauth.accessToken` to
-  `~/.claude/worker-token` and let `worker-live.sh:430-449` export it as `CLAUDE_CODE_OAUTH_TOKEN`
-  exactly as today. **No document reaches the container at all**, so `assert_no_refresh_material`
-  is satisfied by construction rather than by a guard — strictly better than the codex shape, which
-  must mount a minimized document with a deliberately-empty `refresh_token` field. Unknown: whether
-  the CLI accepts an OAuth **access** token in that variable, and whether the value satisfies the
-  `^sk-ant-[A-Za-z0-9_-]+$` shape check at `worker-prep.sh:291`. That pair is measurement **M2**.
+- **(a) deliver only the access token, through the existing env *shape*.** The host writes only
+  `claudeAiOauth.accessToken` — one line, no document — to `~/.claude/worker-token`, and the
+  container receives it as `CLAUDE_CODE_OAUTH_TOKEN`, the same value shape
+  `worker-live.sh:430-433` exports today. **No document reaches the container at all**, so
+  `assert_no_refresh_material` is satisfied by construction rather than by a guard — strictly
+  better than the codex shape, which must mount a minimized document with a deliberately-empty
+  `refresh_token` field. Unknown: whether the CLI accepts an OAuth **access** token in that
+  variable, and whether the value satisfies the `^sk-ant-[A-Za-z0-9_-]+$` shape check at
+  `worker-prep.sh:291`. That pair is measurement **M2**.
 - **(b) mount a minimized `.credentials.json`.** Requires an anthropic `minimal_worker_credential`
   and the CLI's required-field set for that document. codex's needed `refresh_token` **present but
   empty** — a *measured* fact (`broker-refresh.py:336-340`); the anthropic analogue is unmeasured.
 
-(a) is the recommendation if M2 passes: it needs no new mount shape, no new self-test seam at
-`_credential_mount_args`, and it leaves `worker-live.sh`'s claude arm untouched.
+(a) is the recommendation if M2 passes — but "reuse the env delivery" describes the *value shape*,
+not an absence of code. Spelling the control flow out, because it is exactly where a plausible
+design goes wrong:
 
-⚠️ **But (a) collides with the exact-equality gate.** Under (a) the *stored* format
-(`claude-credentials-json`) and the *delivered* format (`claude-oauth-token`) differ, while
-`worker.yml:912` compares one string against `routing.toml`'s alias. Increment 2 must therefore
-either (i) keep the two identical and let the alias declare the stored format — the simple option,
-and the one this record recommends — or (ii) introduce a stored/delivered distinction, which adds a
-second field to a gate that is deliberately one exact comparison. **(ii) weakens a trust check for
-implementation convenience and should be refused.**
+⚠️ **There is exactly ONE format string end to end, and it is the dispatch key.**
+`worker-live.sh:429` switches on the **routed/claimed** `credential_format` — the same string
+`worker.yml:912` compares for exact equality against the alias in `routing.toml`. It cannot be
+`claude-credentials-json` at the gate and `claude-oauth-token` at the dispatch. So:
+
+- **(i) one format, `claude-credentials-json`, all the way through — the design this record
+  recommends.** The alias declares it, the account issue records it, the claim carries it, and
+  `worker.yml:912` stays exactly one string comparison, unwidened. The consequence, stated plainly:
+  **the `claude-credentials-json` arm at `worker-live.sh:444` is what changes.** It stops being a
+  `die` and becomes the two lines the `claude-oauth-token` arm already runs — read
+  `$credential_path`, export `CLAUDE_CODE_OAUTH_TOKEN` — over a file `worker-prep.sh` has already
+  stripped to a single token, which also means adding the format to the `CREDENTIAL_PATH` mapping at
+  `worker-prep.sh:299-302` so it resolves to that same `~/.claude/worker-token` file (today only
+  `:301`'s two opaque formats do). **That arm's input contract is "one line matching `^sk-ant-…`, not
+  a document", and it must `die` on anything else**: a `claudeAiOauth` document arriving there means
+  the host-side strip did not run, and the arm is the last place that can still fail closed.
+- **(ii) a stored-format / delivered-format distinction**, adding a second field to a gate that is
+  deliberately one exact comparison. **(ii) weakens a trust check for implementation convenience and
+  should be refused.**
+
+So what (a) saves over (b) is the **mount shape**, not the code: no anthropic
+`minimal_worker_credential`, no new `_credential_mount_args` case, no required-field discovery for a
+mounted document. It costs one rewritten `case` arm and the tests that pin it — which is cheaper
+than (b), not free.
+
+**The test surface at that seam** — this is where §6's re-pointing of the #1675 self-tests lands:
+
+- **strip holds:** a `claude-credentials-json` account whose pre-flight ran yields a container
+  credential that is one `sk-ant-…` line, and the refresh **sentinel** from the source document
+  appears nowhere in the prepared tree or the exported value;
+- **negative (fail-closed):** that same arm, handed a file that still parses as a `claudeAiOauth`
+  document, `die`s rather than exporting it — so a regression in `worker-prep.sh` cannot be silently
+  absorbed downstream;
+- **control (no widening):** `claude-oauth-token` and `anthropic-api-key` still reach their own
+  arms, and the format set parsed from the launcher's own body (`worker-live.sh:6873` onward) is
+  still asserted as an **exact set**, never a containment check — so admitting one format does not
+  quietly admit another, and the assertion must be updated to the new expected set rather than
+  loosened.
 
 ## 4. Q3 — the lifetime, and the measurement that gates everything
 
@@ -121,12 +156,40 @@ invent one.** What it can state is the decision rule, which is already encoded i
 - The credential is minted at pre-flight and must still be valid at the **end** of the container
   run, so the requirement is `nominal_lifetime > 90 min + (pre-flight → container start)`.
 
-**M1 — nominal lifetime (offline, no network, no token printed).** From any
-`~/.claude/.credentials.json`, read `claudeAiOauth.expiresAt/1000 - now`. Read it **twice with a
-forced refresh in between**: a single read yields the *residual*, not the nominal lifetime, and a
-residual can pass a threshold the nominal fails.
+**M1 — nominal lifetime.** The decision rule needs the lifetime of a **freshly minted** access
+token. A `~/.claude/.credentials.json` already on disk yields `claudeAiOauth.expiresAt/1000 - now`,
+which is the **residual**, not the nominal, lifetime. Residual ≤ nominal, so one read is a *lower
+bound* and nothing more. Establishing the nominal lifetime requires a fresh mint, and **minting
+contacts the provider** — there is no offline form of that half, and this record does not pretend
+otherwise. Hence two measurements, of which only the second can end the increment:
 
-Three outcomes, and the increment's fate differs in each:
+- **M1a — residual bound (genuinely offline: no network, no token value read).** Read the single
+  integer `claudeAiOauth.expiresAt` and subtract `now`. Nothing is exchanged or refreshed; no token
+  field is opened. Being a lower bound, M1a can **confirm** but never kill: a residual already above
+  2 h proves nominal > 2 h, which is the bottom row of the table below, and no further lifetime
+  measurement is needed. Anything less is **inconclusive** — equally consistent with a long-lived
+  token read late and a short-lived one read early.
+- **M1b — nominal, by forced refresh (networked; only if M1a is inconclusive).** Read `expiresAt`,
+  force a refresh, read `expiresAt` again immediately. Constraints, because this one leaves the box:
+  - **Environment and authorization.** Not in CI, and **never against a live registry account's
+    stored secret**: the refresh **rotates** the grant (`README.md:449-450`), so measuring on a live
+    account consumes it and can kill the chain. It runs on a maintainer's own box against a
+    **throwaway, registry-owned, isolated-`HOME` `claude` login** — i.e. it is only safe *after*
+    **M3** has shown such a login can exist, which reorders the sequence in §6.
+  - **Redaction.** Only derived integers are recorded: `expiresAt` before and after, and their
+    difference. No `accessToken` or `refreshToken` value is read into a variable, echoed, logged, or
+    pasted into an issue.
+  - **Verifying the refresh really happened, without printing either token.** `expiresAt` must
+    strictly increase **and** the SHA-256 digest of the `accessToken` field must differ between the
+    two reads. The digest proves a new mint while revealing nothing; `expiresAt` alone cannot
+    distinguish a real refresh from a no-op that rewrote the file — which is precisely
+    `refresh_via_cli`'s anthropic-arm hazard (§8), so a measurement that cannot tell them apart
+    would validate the exact failure this record warns about.
+  - **If no networked refresh is authorized, M1b does not happen and the nominal lifetime is not
+    known.** The honest record is then: M1a's bound only, **feasibility unresolved**, increment 2
+    does not start. An assumed lifetime is not a substitute.
+
+Three outcomes for the nominal lifetime, and the increment's fate differs in each:
 
 | measured nominal lifetime | consequence |
 |---|---|
@@ -190,8 +253,12 @@ increment 2:
   *admit-without-strip*, one routing line from delivering a durable grant. *Admit-with-strip* is
   latent code that is correct when it goes live.
 
-Order: **M1 → M3 → M2 → code (pre-flight + strip + re-admission, one diff) → §5's cutover.** M1
-first because it is free, offline, and it is the only one that can end the increment.
+Order: **M1a → M3 → M1b → M2 → code (pre-flight + strip + re-admission, one diff) → §5's cutover.**
+M1a first because it is free and offline, and because a residual above 2 h settles the lifetime
+question outright and skips M1b. M3 **before** M1b, not after: M1b's forced refresh rotates the
+grant it runs against, so it needs the throwaway registry-owned login that M3 is the test of (§4) —
+running it against a maintainer's interactive chain is the `README.md:447-451` hazard, not a
+measurement.
 
 ## 7. What increment 2 is actually worth — a correction to §5.E
 
@@ -233,8 +300,9 @@ not written against a benefit that was assumed rather than measured.
 
 ## 9. Follow-ups this record files
 
-1. **M1/M2/M3 as a measurement task** — the three facts above, recorded here as an appendix. M1
-   alone decides whether increment 2 exists.
+1. **M1a/M1b/M2/M3 as a measurement task** — the facts above, recorded here as an appendix. Note
+   that M1b and M3 need a networked, human-authorized session on a throwaway login and cannot be
+   run by a PR. The lifetime pair alone decides whether increment 2 exists.
 2. **Per-account serialization of the host-side refresh** — asked of the live codex lane first
    (§8), since the hazard predates this increment.
 
