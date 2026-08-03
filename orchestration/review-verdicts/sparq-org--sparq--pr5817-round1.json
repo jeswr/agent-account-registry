@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5817,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "69662a73456a080cdf64607e424899c0acd5d39d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`scan_text()` calls `truncation_offence()` independently for each physical line, while `_NAME_RE` only recognizes the line containing `name:` or `run-name:`. A valid YAML plain scalar may continue on a more-indented following line, for example `- name: Publish cadence\n          for issue #1135`; YAML treats the whitespace-prefixed `#1135` as a comment, but the continuation line does not match `_NAME_RE`, so the gate reports no offence. This contradicts the stated rule that every affected plain-scalar mapping entry is flagged and leaves a silent false-negative in a gating check.",
+    "file": "scripts/check-workflow-step-names.py",
+    "fix_hint": "Track indentation and plain-scalar continuation lines after an unquoted `name:`/`run-name:` entry until the mapping value ends, checking those continuation lines for the comment trigger. Add a self-test containing a multiline plain scalar with ` #1234` on a continuation line, plus a safe multiline case, and verify the reported intended/truncated values.",
+    "severity": "major",
+    "title": "Multiline plain-scalar names bypass the truncation gate"
+   }
+  ],
+  "progress": null,
+  "summary": "The remediation quotes the currently known truncated workflow names, and both the bundled self-test and live scan pass. However, the lexical gate does not cover multiline plain scalars even though its documented rule promises to flag every unquoted `name:`/`run-name:` plain scalar containing a whitespace-prefixed `#`. YAML permits a plain scalar to continue on subsequent indented lines, where the issue reference can be silently consumed as a comment; the scanner examines only the mapping's first line and therefore passes that defect. Add continuation-aware scanning and a regression fixture before making this gating.",
+  "verdict": "request_changes"
+ }
+}
