@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5822,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e56053f7d4f89a46a19258e90723a5381abb1a01",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 6 concludes that validity is settled and states that GitHub accepts the file, but the evidence described is limited to permissive language-service and SchemaStore schemas. Those schemas can show that an editor/schema validator permits the syntax; they do not demonstrate that GitHub's workflow ingestion service registers a `workflow_run` trigger with no `workflows` filter. This distinction matters because the only contrary executable evidence cited is actionlint's explicit rejection, while public examples always supply `workflows:`. If service ingestion rejects or ignores the workflow, the same silent stage-1 failure attributed to routing occurs, so the claimed resolution and blanket instruction to waive future lint failures are not soundly supported.",
+    "file": "research/ci-gate-slotless-aggregation.md",
+    "fix_hint": "Describe both service acceptance and unfiltered routing as unresolved static-evidence questions, and make the stage-1 observation decide the combined operational invariant: the workflow is registered and fires for multiple distinct sibling workflows. Remove or narrow the unconditional statement that no lane may enforce actionlint; any waiver should be scoped to the experimental stage and retired after the observation or fallback. If available, cite direct empirical evidence from an actual GitHub run before retaining the stronger acceptance claim.",
+    "severity": "major",
+    "title": "Static schemas do not prove that GitHub's service accepts the trigger"
+   }
+  ],
+  "progress": null,
+  "summary": "The document usefully separates trigger routing from required-check rollout, but it overstates what the cited static schemas prove. A permissive editor/schema model establishes schema acceptance only; it does not establish that GitHub's service accepts and registers the workflow, especially when actionlint enforces the opposite constraint and the public documentation provides no unfiltered example or default semantics. The proposed stage-1 observation can resolve both service acceptance and routing, so the decision should preserve both as uncertainty until that observation succeeds rather than declaring validity settled and pre-authorizing a lint waiver.",
+  "verdict": "request_changes"
+ }
+}
