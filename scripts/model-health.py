@@ -1687,10 +1687,18 @@ def classify_records(records, provider_accounts, now, open_alerts=()):
     for provider in sorted(providers):
         # Ordered by RECORD time so "later" is well defined for the per-account invalidation
         # rules below (prune() sorts, but classify_records must not rely on caller ordering).
+        #
+        # [#1109] `prov_records` is NON-EMPTY by construction and needs no emptiness guard:
+        # `providers` is derived from `records` above and this re-selects from that SAME list by
+        # equality on the provider that put the key there, so every provider in the loop has at
+        # least the record it came from. An `if not prov_records: continue` guard used to sit here
+        # and was unreachable: `python3 -m trace --count --missing` over `--self-test` scored its
+        # `continue` as never executed, which made it an unkillable line that every mutation sweep
+        # of this function had to re-derive as equivalent. The invariant is pinned by a self-test
+        # check (no provider in the window is skipped), and the `prov_records[-1]` reads below fail
+        # LOUDLY rather than silently if a future edit ever breaks it.
         prov_records = sorted((r for r in records if r.get("provider") == provider),
                               key=lambda r: r["ts"])
-        if not prov_records:
-            continue
 
         # ---- zero-dispatch (fleet pseudo-provider) --------------------------------------------
         # Consecutiveness is over the TICK SEQUENCE: dispatch.yml records a dispatch-SUCCESS
@@ -3284,6 +3292,41 @@ def _self_test():
     chk("capped absent without fleet map",
         any(a["condition"] == "provider-capped" for a in classify_records(all_capped, {}, now + 100)),
         False)
+    # NON-ENABLED accounts are filtered OUT of the cap scan (#1761). A rotated-out / disabled /
+    # newly-unenrolled account can still have limit records inside the window, and the number this
+    # guard protects is the RESET HINT — the capacity-restore time the maintainer reads to decide
+    # when to resume dispatch. Without these rows, neutering the filter surfaces a reset sourced
+    # from an account that is not in the fleet at all and the whole suite stays green.
+    # The literals below appear nowhere else in the harness (value-identical-survivor guard) and
+    # the expectations are written out, not re-derived from the fixture by the code's own logic.
+    rotated_reset = "03:19 rotated-out"          # sorts BEFORE every enabled hint here
+    capped_rot = [rec("anthropic", "acct01", CLASS_LIMIT, dt=0, reset="09:07 enabled-restore"),
+                  rec("anthropic", "acct91", CLASS_LIMIT, dt=30, reset=rotated_reset),
+                  rec("anthropic", "acct02", CLASS_LIMIT, dt=60, reset="11:23 enabled-restore")]
+    rot_act = _action(classify_records(capped_rot, fleet, now + 200),
+                      "provider-capped", "anthropic")
+    chk("capped ACT (all ENABLED capped; a rotated-out account in the window is not fleet)",
+        rot_act["fire"], True)
+    chk("capped surfaces the earliest ENABLED reset, not a non-enabled account's earlier one",
+        rot_act["reset_hint"], "09:07 enabled-restore")
+    chk("capped never surfaces a non-enabled account's reset anywhere in the action",
+        rotated_reset in repr(rot_act), False)
+    # ...and the same filter guards the loop's SUCCESS arm: a non-enabled account's success is
+    # skipped before `capped.pop`. (The pop itself is a no-op for a non-enabled account — nothing
+    # non-enabled is ever inserted — so the kill here comes from the LATER limit record this row
+    # places after it, plus the CHURN COUNT, which is the reason an operator reads when the alert
+    # does NOT fire.)
+    churn_rot = [rec("anthropic", "acct91", SUCCESS, dt=0),
+                 rec("anthropic", "acct01", CLASS_LIMIT, dt=30, reset="09:07 enabled-restore"),
+                 rec("anthropic", "acct91", CLASS_LIMIT, dt=60, reset=rotated_reset)]
+    churn_act = _action(classify_records(churn_rot, fleet, now + 200),
+                        "provider-capped", "anthropic")
+    chk("capped DO-NOTHING (1/2 enabled capped; a non-enabled cap is not fleet churn)",
+        churn_act["fire"], False)
+    chk("capped churn count counts ENABLED accounts only",
+        churn_act["reason"], "1/2 accounts capped (normal churn)")
+    chk("capped churn reset is the ENABLED account's, not the non-enabled account's",
+        churn_act["reset_hint"], "09:07 enabled-restore")
 
     # ---- PROVIDER-CAPPED EVIDENCE FRESHNESS (issue #1594) ------------------------------------
     # The AGE of the capping evidence is a decided property of the CONDITION, not a leftover of
@@ -3442,6 +3485,20 @@ def _self_test():
         {("provider-capped", "anthropic")})
     chk("open capped marker for an in-window provider without a fleet map is left untouched",
         any(a["condition"] == "provider-capped" for a in present_no_fleet), False)
+
+    # [#1109] The complement of the orphan pass: a provider PRESENT in the window is never silently
+    # skipped. classify_records derives its provider set from the records and re-selects each
+    # provider's slice from that same list, so the slice cannot be empty — which is why the loop
+    # carries no emptiness guard (the one that used to sit there was unreachable dead code). Pin
+    # the property directly, including the `fleet` pseudo-provider, whose lane `continue`s out of
+    # that same loop: a regression skipping any of them silently drops that provider's conditions,
+    # and #205's orphan pass would not cover the loss (it only fires for providers ABSENT here).
+    every_provider = [rec("anthropic", "acct01", CLASS_TRANSIENT, dt=0),
+                      rec("openai", "acct02", SUCCESS, dt=10),
+                      zrec(CLASS_ZERO_DISPATCH, 20)]
+    chk("every provider present in the window is classified (none silently skipped)",
+        {a["provider"] for a in classify_records(every_provider, {}, now + 30)},
+        {"anthropic", "openai", "fleet"})
     # already-covered markers are not double-emitted (the record-driven action wins)
     covered = classify_records(burst, {}, now + 200, {("persistent-transient", "anthropic")})
     chk("an already-covered open marker is not double-emitted",
@@ -5862,7 +5919,17 @@ def _test_firing_supersede(chk):
     marker), and pins both the surviving issue AND the absence of a close/comment against it —
     retiring that copy would retire the only open alert. `open_marker_routes` states the operator-
     visible invariant directly, per route rather than per repository state list: exactly ONE route
-    carries an open marker for one (condition, provider)."""
+    carries an open marker for one (condition, provider).
+
+    Phases 5b and 5c close issue #1704: both ERROR/degenerate arms of _close_superseded_alert were
+    at ZERO line coverage across the whole suite, so the dedup's fail-safe behaviour was unpinned
+    in both directions. 5b drives the UNREADABLE fallback tracker (a raising _find_marker_issue)
+    and pins that a failed dedup stays out of `undelivered`, closes nothing, and is announced;
+    5c drives the enumerated-but-VANISHED marker and pins that it is a silent no-op rather than a
+    create or a close. Both are reached through the real _deliver_alerts caller AND asserted on
+    the helper's own documented return value, which the caller deliberately discards."""
+    import contextlib
+    import io
     import types
     global _gh
     real_gh = _gh
@@ -5985,6 +6052,49 @@ def _test_firing_supersede(chk):
         fail_close["repos"] = set()
         chk("supersede: the next tick closes the still-open duplicate",
             (_deliver_alerts([fire], "m", {key}), states(reg_repo)), ([], ["closed"]))
+
+        # phase 5b (issue #1704): the ERROR arm of the dedup. The primary write CONFIRMED and the
+        # marker was enumerated, but the fallback tracker read FAILS (its token is unusable), so
+        # _find_marker_issue raises rather than report a failed/possibly-truncated read as "not
+        # found" (#203). The dedup is best-effort: the alert already reached the maintainer on the
+        # primary, so this must stay OUT of `undelivered` — folding it in turns a cosmetic dedup
+        # failure into a red run, and via _cmd_decide into a nonzero exit on every tick the
+        # fallback token is unusable. It must also close NOTHING: the read that would identify the
+        # copy is the read that just failed, so any close from here is blind. The duplicate is left
+        # open, which is what makes the next tick retry it.
+        bad_tokens.add("priv")
+        chk("supersede: the retry REOPENS the fallback copy (unreadable-tracker precondition)",
+            (_deliver_alerts([fire], "m", {key}), states(reg_repo)), ([], ["open"]))
+        bad_tokens.clear()
+        bad_tokens.add("amb")
+        calls[:] = []
+        chk("supersede: an UNREADABLE fallback tracker keeps the alert DELIVERED, copy still open",
+            (_deliver_alerts([fire], "m", {key}), states(priv_repo), states(reg_repo)),
+            ([], ["open"], ["open"]))
+        chk("supersede: an unreadable fallback tracker closes/comments on NOTHING (no blind close)",
+            [c for c in calls if c[0] in ("close", "comment")], [])
+        heard = io.StringIO()
+        with contextlib.redirect_stdout(heard):
+            unreadable = _close_superseded_alert(fire, reg_repo, "amb")
+        chk("supersede: an unreadable fallback tracker reports the duplicate still open, LOUDLY",
+            (unreadable, "::warning::" in heard.getvalue(),
+             fire["condition"] in heard.getvalue()), (False, True, True))
+
+        # phase 5c (issue #1704): the DEGENERATE arm. `fallback_open` is a snapshot taken a tick
+        # ago by a reader that fails OPEN to the empty set, so an enumerated marker can already be
+        # gone — closed by the recovery path, or by hand. Finding nothing here is the dedup's goal
+        # state, so it is a SILENT no-op: nothing is minted to close, nothing is closed by number,
+        # nothing is commented on, and the fallback repository is left exactly as found.
+        bad_tokens.clear()
+        repos[reg_repo] = {}
+        calls[:] = []
+        chk("supersede: a VANISHED fallback copy is a no-op — no create, no close, still delivered",
+            (_deliver_alerts([fire], "m", {key}), states(priv_repo), repos[reg_repo]),
+            ([], ["open"], {}))
+        chk("supersede: the vanished copy draws one READ on the fallback and no mutation",
+            [c[0] for c in calls if c[1] == reg_repo], ["list"])
+        chk("supersede: nothing open on the fallback reports the dedup as already satisfied",
+            _close_superseded_alert(fire, reg_repo, "amb"), True)
 
         # phase 6 (review round 1 of #1455): ALERT_REPO == REGISTRY_REPO with a DISTINCT
         # ALERT_TOKEN. The credential fallback stays armed (the pairs differ), but both routes name

@@ -191,19 +191,95 @@ jobs:
             echo "::error::base commit $base is unresolvable; refusing to derive the self-test suite"
             exit 1
           fi
+          # [PR #1777 r3] THE PROTECTED BASELINE IS THE BASE COMMIT THE GRADED TREE CONTAINS, NOT
+          # THE MOVING TIP. `base.sha` is the base branch tip AT EVENT TIME, but the tree this job
+          # grades is `refs/pull/N/merge`, which GitHub does NOT recompute when the base moves — the
+          # measured premise of the compose-gate step below (#756/#1304). Read the baseline from the
+          # tip and the two operands describe DIFFERENT base compositions, so every entry the base
+          # branch ENROLLED after this PR branched is indistinguishable from an entry THIS PR
+          # REMOVED, and _derive_full_selftest_suite refuses `<entry> was removed without prior
+          # base-branch retirement approval` on a PR that removed nothing.
+          #
+          # MEASURED on #1777, a research-document-only PR: its head tree is 59/59 green and every
+          # other step of this job passes on it, while its base gained `ledger-identity-watch.py`
+          # and `ratelimit-alert.py` after the last head push — so the required `gate` reds here and
+          # no later step ever runs. Nothing about the tree under test is wrong.
+          #
+          # The merge base is exactly "the newest base-branch commit the graded tree contains", so
+          # the comparison becomes the one the rule is actually about: what did THIS PR remove
+          # relative to the base state it was written against. It cannot LOOSEN the check — an entry
+          # enrolled before the branch point is in the merge-base manifest too, so a real removal is
+          # still a removal — and when the merge ref is fresh the merge base IS `$base`, making the
+          # healthy case byte-for-byte today's behaviour. Base-tip staleness itself remains the
+          # gate-staleness (#920) and compose-gate (#1304) steps' business, not this one's.
+          #
+          # Both halves come from the SAME commit on purpose: the manifest and the approvals that
+          # authorise removing from it are one baseline, and reading them from two different commits
+          # would let a tip that enrols one entry authorise a different entry's retirement.
+          #
+          # WHO CAN WRITE WHAT THIS READS (AGENTS.md item 5): nobody the PR controls. `$base` is set
+          # by GitHub, not from the payload's author-controlled text, and the merge base is computed
+          # locally over commits. An author cannot move the baseline BACKWARD to escape an approval:
+          # `refs/pull/N/merge` has the base commit as a PARENT, so whenever GitHub has composed it
+          # the merge base IS `$base` no matter what the branch looks like. Merging the base branch
+          # in moves the baseline FORWARD, which only ever tightens. The one input that selects an
+          # older baseline is GitHub's own merge-ref lag, which is what this reads correctly.
+          baseline_sha=$(git merge-base "$base" HEAD 2>/dev/null) || baseline_sha=''
+          if [[ -z "$baseline_sha" ]]; then
+            echo "::error::the graded tree shares no merge base with base commit $base; refusing to derive the self-test suite"
+            exit 1
+          fi
+          echo "protected self-test baseline: $baseline_sha (base tip $base)"
           # Bootstrap only: the introducing PR's base has no shared manifest yet, so its current
           # complete manifest is the protected baseline. Every later PR reads the base-branch copy.
-          if git cat-file -e "$base:scripts/selftest-suite.txt" 2>/dev/null; then
-            git show "$base:scripts/selftest-suite.txt" > "$base_manifest"
+          if git cat-file -e "$baseline_sha:scripts/selftest-suite.txt" 2>/dev/null; then
+            git show "$baseline_sha:scripts/selftest-suite.txt" > "$base_manifest"
           else
             cp scripts/selftest-suite.txt "$base_manifest"
           fi
-          if git cat-file -e "$base:scripts/selftest-retirements.txt" 2>/dev/null; then
-            git show "$base:scripts/selftest-retirements.txt" > "$base_retirements"
+          if git cat-file -e "$baseline_sha:scripts/selftest-retirements.txt" 2>/dev/null; then
+            git show "$baseline_sha:scripts/selftest-retirements.txt" > "$base_retirements"
           else
             : > "$base_retirements"
           fi
-          suite=$(bash scripts/worker-live.sh print-selftest-suite "$base_manifest" "$base_retirements")
+          # [issue #1834] The MERGE BASE's copy, which is what tells the two causes of a missing
+          # baseline entry apart: deleted on this branch (a real retirement, approval required) vs
+          # added on the base branch after this branch point (the branch is simply BEHIND BASE and
+          # removed nothing). Both still refuse; without this the second is reported as the first,
+          # the author greps a diff that contains no such deletion, and the obvious repair from
+          # inside the PR tree is to retire somebody else's brand-new self-test.
+          # Unresolvable => refuse, exactly as an unresolvable base does above: the classification
+          # is part of a REQUIRED gate's verdict and must not be guessed. A merge base with no
+          # manifest at all is not an error but the extreme of the same case — the branch predates
+          # the manifest's introduction, so nothing was enrolled there and every baseline entry is
+          # correctly attributed to the base branch.
+          #
+          # [PR #1865 r1] The branch point is computed from the PR HEAD, never from `HEAD`. This job
+          # runs on `pull_request`, where actions/checkout's default ref is `refs/pull/N/merge` — a
+          # SYNTHETIC MERGE COMMIT whose two parents are the PR head and the base branch, which is
+          # exactly the tree the report above says this suite grades. `$base` is therefore an
+          # ANCESTOR of `HEAD`, so `git merge-base HEAD "$base"` returns `$base` itself, the
+          # merge-base manifest is a byte copy of the base manifest, and every behind-base entry is
+          # found there and re-diagnosed as the unapproved removal it is not — the classifier reads
+          # green in fixtures and does nothing in production. `head` is validated the same way
+          # `$base` is, and for the same reason: a branch point this job cannot resolve is a verdict
+          # it must refuse to guess, not fall back to a tree that answers a different question.
+          head='${{ github.event.pull_request.head.sha }}'
+          if ! git cat-file -e "$head^{commit}" 2>/dev/null; then
+            echo "::error::head commit $head is unresolvable; refusing to derive the self-test suite"
+            exit 1
+          fi
+          mb_manifest="$RUNNER_TEMP/mergebase-selftest-suite.txt"
+          if ! merge_base=$(git merge-base "$head" "$base") || [ -z "$merge_base" ]; then
+            echo "::error::the merge base of $head and $base is unresolvable; refusing to derive the self-test suite"
+            exit 1
+          fi
+          if git cat-file -e "$merge_base:scripts/selftest-suite.txt" 2>/dev/null; then
+            git show "$merge_base:scripts/selftest-suite.txt" > "$mb_manifest"
+          else
+            : > "$mb_manifest"
+          fi
+          suite=$(bash scripts/worker-live.sh print-selftest-suite "$base_manifest" "$base_retirements" "$mb_manifest")
           # [issue #1371] THE #824 DEPENDENCY PREFLIGHT, in the lane where the green is
           # load-bearing. registry_selftest_gate OPENS with this check — "an unrunnable row must
           # never be confused with a failing one" — but this step calls the CLI arms directly, so

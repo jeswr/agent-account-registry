@@ -700,6 +700,36 @@ function obsPct(value) {
   return n === null ? "—" : `${(n * 100).toFixed(n * 100 % 1 ? 1 : 0)}%`;
 }
 
+// Issue #1879. A lane window the generator could not read publishes `null` — the same shape a
+// window the collector never sent publishes, and a DIFFERENT FACT from a window that measured zero
+// runs. Every consumer of a lane window goes through these two so the difference survives to the
+// page: `obsNum(hour.success, 0)` on a missing window renders an unmeasured lane as `0 / 0 / 0`,
+// pixel-identical to a genuinely idle one, and the generator's build-log announcement of the drop
+// is not something anybody reads on a green build.
+function obsWindow(window) {
+  return window && typeof window === "object" && !Array.isArray(window) ? window : null;
+}
+
+function obsWindowCounts(window) {
+  const measured = obsWindow(window);
+  return measured === null ? null
+    : `${obsNum(measured.success, 0)} / ${obsNum(measured.failure, 0)} / ${obsNum(measured.defer, 0)}`;
+}
+
+// The fleet-wide 1h defer total, or null when ANY lane's 1h window is unmeasured: the total is then
+// unknowable, not smaller. Folding the missing window in as a zero draws a reassuring dip in the
+// defer sparkline out of a measurement that never arrived. obsSparkline already drops a null point
+// from its series, which is what "unknown" has to look like there.
+function obsLaneDefers(lanes) {
+  let total = 0;
+  for (const lane of lanes) {
+    const hour = obsWindow(lane && lane["1h"]);
+    if (hour === null) return null;
+    total += obsNum(hour.defer, 0);
+  }
+  return total;
+}
+
 function obsThresholds(o) {
   const supplied = o && typeof o.thresholds === "object" && o.thresholds ? o.thresholds : {};
   const out = { ...OBS_DEFAULT_THRESHOLDS };
@@ -719,7 +749,7 @@ function obsRecordTrend(o) {
   obsTrend.points.push({
     read: obsNum(cache.prompt_cache_read_fraction_1h),
     warm: obsNum(cache.warm_drain_rate_1h),
-    defers: lanes.reduce((sum, lane) => sum + obsNum(lane["1h"] && lane["1h"].defer, 0), 0),
+    defers: obsLaneDefers(lanes),
     queue: queue.reduce((sum, row) => sum + obsNum(row.depth, 0), 0),
   });
   if (obsTrend.points.length > OBS_SPARK_POINTS) {
@@ -850,20 +880,29 @@ function obsHealthCard(lanes, deferReasons, exitClasses, thresholds) {
     head.append(node("th", "", title));
   }
   table.append(head);
+  // Both count columns render an UNMEASURED window as the same em dash the 24h column has always
+  // used for one, muted and titled — never as the `0 / 0 / 0` of a lane that ran nothing (#1879).
+  const countCell = (window) => {
+    const counts = obsWindowCounts(window);
+    if (counts !== null) return node("td", "", counts);
+    const cell = node("td", "obs-unmeasured", "—");
+    cell.setAttribute("title", "no measurement for this window");
+    return cell;
+  };
   for (const lane of lanes) {
-    const hour = lane["1h"] || {};
-    const day = lane["24h"];
-    const success = obsNum(hour.success, 0);
-    const failure = obsNum(hour.failure, 0);
-    const attempts = success + failure;
-    const rate = attempts ? failure / attempts : null;
+    const hour = obsWindow(lane["1h"]);
+    let rate = null;
+    if (hour !== null) {
+      const failure = obsNum(hour.failure, 0);
+      const attempts = obsNum(hour.success, 0) + failure;
+      rate = attempts ? failure / attempts : null;
+    }
     const row = node("tr");
     row.append(node("td", "obs-lane", String(lane.lane)));
-    row.append(node("td", "", `${success} / ${failure} / ${obsNum(hour.defer, 0)}`));
+    row.append(countCell(lane["1h"]));
     const tone = rate === null ? "" : rate >= thresholds.workflow_failure_rate ? "bad" : "good";
     row.append(node("td", tone, rate === null ? "—" : obsPct(rate)));
-    row.append(node("td", "", day
-      ? `${obsNum(day.success, 0)} / ${obsNum(day.failure, 0)} / ${obsNum(day.defer, 0)}` : "—"));
+    row.append(countCell(lane["24h"]));
     table.append(row);
   }
   card.append(table);

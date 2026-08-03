@@ -1697,6 +1697,26 @@ def _obs_minutes(value):
     return round(float(value), 1) if 0 <= value < 10_000_000 else None
 
 
+def _obs_mean(value):
+    """A non-negative finite arithmetic mean, rounded — `review_rounds.mean` is a FLOAT reading,
+    not a count, so it cannot go through `_obs_count`. Same fail-closed None as its siblings.
+
+    The conversion is TOTAL over every type accepted above it, which is why it happens FIRST and
+    inside a `try`: Python's JSON decoder preserves an arbitrary-precision integer, and both
+    `float(10**400)` and `math.isfinite(10**400)` raise `OverflowError` converting it. Reading the
+    range off the raw value therefore turns an unreadable collector mean into a DEAD BUILD instead
+    of the dropped stat this seam promises — `_obs_minutes` is safe only by accident, because its
+    `0 <= value < 10_000_000` compares the integer without ever converting it.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return round(number, 2) if math.isfinite(number) and number >= 0 else None
+
+
 def _obs_text(value, cap):
     text = str(value or "").strip()
     return text[:cap] if text and text.isprintable() else ""
@@ -1928,6 +1948,55 @@ def _obs_drop(drops, seam, detail):
     drops.drop(f"observability {seam} input ({detail})")
 
 
+def _obs_stat(drops, name, source, fields):
+    """[#1880] One flow-panel statistic (`review_rounds` / `parks_1h` / `arm_to_merge_minutes_24h`)
+    read FAIL-CLOSED out of the collector's dict, as ``{field: value}`` or None.
+
+    `fields` is one ``(field, reader, default, accepts)`` row per published field, where `accepts`
+    describes the reader's contract for the drop line. Three cases, and the difference between the
+    first two is the whole point:
+
+    * The collector did NOT send the field (absent, or an explicit null — #1557 settled that an
+      explicit null is "no value", not a shape mismatch): the field takes its `default` and nothing
+      is announced. A collector that has not shipped a field yet is the expected state.
+    * The collector SENT it and this build cannot read it: a producer/consumer mismatch. EVERY such
+      field is announced through this seam's `_ObsDropLog`, and the WHOLE statistic publishes None
+      so the panel stat HIDES. Dropping only the field would not be enough — the page reads each
+      count as `obsNum(value, 0)`, so a null park count still renders `0 user · 0 orch`, the
+      false-healthy panel this guard exists to prevent (AGENTS.md pre-flight item 11; #1879 is the
+      same read one seam over). This replaces `_obs_count(...) or 0`, which published a confident
+      ZERO for a park/sample count nobody could read, and bare `_obs_count(...)`, which hid a stat
+      with no diagnostic at all — so a collector that RENAMED a field looked exactly like a
+      collector that has not shipped it yet.
+    * The stat itself is present but is not an object: same announcement, same None (the container
+      check `_obs_drop_queue` already makes on `flow.queue`, for the same reason).
+
+    Only the SHAPE reaches the build log — this build's own field name and a Python type name — so
+    a malformed snapshot cannot inject lines into the log it is being diagnosed in.
+
+    Tolerance is unchanged: a malformed stat is dropped, never fatal.
+    """
+    if source is None:
+        return None
+    if not isinstance(source, dict):
+        drops.drop(f"observability flow stat `{name}` "
+                   f"(the stat (type {type(source).__name__}) is not an object)")
+        return None
+    published, readable = {}, True
+    for field, reader, default, accepts in fields:
+        raw = source.get(field)
+        if raw is None:
+            published[field] = default
+            continue
+        value = reader(raw)
+        if value is None:
+            drops.drop(f"observability flow stat `{name}` (field `{field}` "
+                       f"(type {type(raw).__name__}) is not {accepts})")
+            readable = False
+        published[field] = value
+    return published if readable else None
+
+
 def _obs_flow(flow):
     """Queue depth/age per class, fleet-wide lease utilization, review rounds, park rates,
     arm→merge latency, target-CI congestion. A lease row whose label is not the canonical 16-hex
@@ -2049,31 +2118,31 @@ def _obs_flow(flow):
     else:
         lease_utilization = None
 
-    rounds = flow.get("review_rounds")
-    review_rounds = None
-    if isinstance(rounds, dict):
-        mean = rounds.get("mean")
-        review_rounds = {
-            "mean": round(float(mean), 2)
-            if isinstance(mean, (int, float)) and not isinstance(mean, bool)
-            and math.isfinite(mean) and mean >= 0
-            else None,
-            "max": _obs_count(rounds.get("max")),
-            "budget_exhausted_1h": _obs_count(rounds.get("budget_exhausted_1h")),
-        }
-
-    parks = flow.get("parks_1h")
-    parks_1h = None
-    if isinstance(parks, dict):
-        parks_1h = {key: _obs_count(parks.get(key)) or 0
-                    for key in ("needs_user", "needs_orchestrator")}
-
-    latency = flow.get("arm_to_merge_minutes_24h")
-    arm_to_merge = None
-    if isinstance(latency, dict):
-        arm_to_merge = {"p50": _obs_minutes(latency.get("p50")),
-                        "p90": _obs_minutes(latency.get("p90")),
-                        "samples": _obs_count(latency.get("samples")) or 0}
+    # [#1880] The three flow STATS share one seam and one drop log — separate from the queue rows
+    # above, which count and cap on their own (`_ObsDropLog`: a queue snapshot that floods its
+    # budget must not silence the stat warnings on the same document). Each field a collector SENT
+    # must be readable or the whole stat hides and says so; only a field it did not send takes the
+    # default. See `_obs_stat` for why the drop is the STAT rather than the field.
+    stat_drops = _ObsDropLog("observability flow stats")
+    counted, minutes = "a non-negative integer", "a non-negative number of minutes"
+    review_rounds = _obs_stat(stat_drops, "review_rounds", flow.get("review_rounds"), (
+        ("mean", _obs_mean, None, "a non-negative finite number"),
+        ("max", _obs_count, None, counted),
+        ("budget_exhausted_1h", _obs_count, None, counted)))
+    parks_1h = _obs_stat(stat_drops, "parks_1h", flow.get("parks_1h"), (
+        ("needs_user", _obs_count, 0, counted),
+        ("needs_orchestrator", _obs_count, 0, counted)))
+    arm_to_merge = _obs_stat(
+        stat_drops, "arm_to_merge_minutes_24h", flow.get("arm_to_merge_minutes_24h"), (
+            ("p50", _obs_minutes, None, minutes),
+            ("p90", _obs_minutes, None, minutes),
+            ("samples", _obs_count, 0, counted)))
+    # Closed for symmetry with the other seams, and it is deliberately UNKILLABLE today: this seam
+    # is BOUNDED at three stats of at most three fields, so it can announce at most 8 drops and can
+    # never reach OBS_DROP_WARN_MAX. The tail line therefore cannot fire, and no self-test row can
+    # distinguish this call from `pass` (an equivalent survivor, AGENTS.md pre-flight item 4). It
+    # stays because a fourth stat, or an unbounded one, would make it load-bearing again.
+    stat_drops.close()
 
     # [#1571] The target-CI congestion seam counts SEPARATELY from the queue seam above (#1570): a
     # flooded `flow.queue` must not consume this loop's warning budget, or one invisible loss is
@@ -2389,6 +2458,13 @@ function element(tag) {
   const self = {
     tagName: tag, children: [], attributes: {}, style: {}, hidden: false, textContent: "",
     className: "", classes: new Set(),
+    // [#1880] A real element counts its children, and the page BRANCHES on that count:
+    // `obsFlowCard` attaches its metric grid only `if (grid.childElementCount)`, and
+    // `renderObservability` falls back to an empty-state line the same way. Without this the
+    // property read `undefined` on every element, so both branches took their empty side and a
+    // harness that renders the flow panel found no metrics to assert on — an EXECUTED assertion
+    // quietly weaker than it reads, which is the fidelity property #1107 exists to hold.
+    get childElementCount() { return self.children.length; },
     append: (...kids) => { for (const kid of kids) self.children.push(kid); },
     replaceChildren: (...kids) => { self.children = [...kids]; },
     setAttribute: (name, value) => { self.attributes[name] = value; },
@@ -2514,8 +2590,17 @@ def _self_test_page_shim(check):
   parent.append(child);
   const before = { degraded: degraded(el), contains: el.classList.contains("degraded") };
   el.classList.remove("degraded");
+  // [#1880] The count the page BRANCHES on, read at three sizes: a stub answering any constant
+  // (0 was the pre-#1880 `undefined`) sends `obsFlowCard`/`renderObservability` down their
+  // empty-state branch on a panel that has content, or the reverse.
+  const counter = document.createElement("ul");
+  const counted = [counter.childElementCount];
+  counter.append(document.createElement("li"), document.createElement("li"));
+  counted.push(counter.childElementCount);
+  counter.replaceChildren(document.createElement("li"));
+  counted.push(counter.childElementCount);
   process.stdout.write(JSON.stringify({
-    before,
+    before, counted,
     after: { degraded: degraded(el), contains: el.classList.contains("degraded") },
     attribute: el.attributes["data-lane"] === undefined ? null : el.attributes["data-lane"],
     replaced: el.children.map((kid) => kid.textContent),
@@ -2533,10 +2618,11 @@ def _self_test_page_shim(check):
         # goes red by name instead of aborting the suite with every later check unrun.
         shim = {"page script raised": str(exc)[:200]}
     check("[#1107] EXECUTED: the shared DOM shim RECORDS what the page does to an element — a "
-          "class added and removed, an attribute, a child REPLACED rather than appended, and id "
-          "identity all read back, and a class added to a child reaches an ancestor's walk",
+          "class added and removed, an attribute, a child REPLACED rather than appended, the "
+          "child COUNT the page branches on, and id identity all read back, and a class added to "
+          "a child reaches an ancestor's walk",
           shim,
-          {"before": {"degraded": True, "contains": True},
+          {"before": {"degraded": True, "contains": True}, "counted": [0, 2, 1],
            "after": {"degraded": False, "contains": False},
            "attribute": "worker", "replaced": ["kept"], "inherited": True, "memoized": True,
            "namespaced": "svg", "text": "kept", "loaded": "function"})
@@ -5692,6 +5778,12 @@ esac
             return _normalize_observability(document)
         except DashboardError as error:
             return ObsRefusal(refused=str(error))
+        except Exception as error:  # noqa: BLE001 — see below; never re-raised, always one red row
+            # [#1880] ANY other exception out of this seam is itself the defect (a reader that
+            # RAISES on a collector value is not a fail-closed reader), so it must red the row that
+            # provoked it rather than abort every row below — the same crash-after-partial-run
+            # shape ObsRefusal exists for. Rendered, not swallowed: no expectation equals this.
+            return ObsRefusal(raised=f"{type(error).__name__}: {error}"[:200])
 
     check("observability golden normalization (bad rows dropped, top-N sorted, links pinned)",
           obs_normalized(obs_fixture), obs_expected)
@@ -5838,6 +5930,130 @@ esac
         check(f"[#1557] {case} hides the panel SILENTLY — the warning names a producer/consumer "
               "mismatch, and 'the collector has not landed' is not one",
               obs_cache(*args), (None, []))
+    # ---- [#1879] AN UNMEASURED LANE WINDOW MUST NOT RENDER AS A HEALTHY ZERO. `_obs_lane_rows`
+    # publishes `None` for a 1h/24h window it could not read — the same shape a window the collector
+    # never sent publishes — but `obsHealthCard()` read it as `obsNum(hour.success, 0)`, so BOTH
+    # collapsed to `0 / 0 / 0` with a `—` fail rate: pixel-identical to a genuinely idle lane. The
+    # generator-side drop announcement is real evidence and nobody reads a green build's log, so the
+    # fix has to land on the layer an operator actually looks at (AGENTS.md pre-flight item 11).
+    # `obsRecordTrend()` had the same shape one function over, folding an unreadable window into the
+    # defer sparkline as a zero. Both are EXECUTED below against dashboard/app.js under the shared
+    # DOM shim — a lexical assertion here is satisfiable by a comment (the #612 round-4 lesson).
+    _OBS_LANE_WINDOW_PAGE_BODY = r"""
+  const out = {};
+  for (const [name, documents] of Object.entries(input.scenarios)) {
+    // A FRESH page per scenario: obsTrend is module state that accumulates across renders, so one
+    // shared scope would carry one scenario's sparkline points into the next.
+    const page = new Function(source + "; return { renderObservability };")();
+    await new Promise((resolve) => setImmediate(resolve));
+    for (const id of ["obs-section", "obs-grid", "obs-time", "obs-triggers", "warning"]) {
+      ids[id] = element(id);
+    }
+    let error = null;
+    try {
+      for (const document of documents) page.renderObservability(document);
+    } catch (raised) {
+      error = String((raised && raised.message) || raised);
+    }
+    const card = ids["obs-grid"].children.find((kid) =>
+      kid.tagName === "article" && kid.children[0]
+      && kid.children[0].textContent === "Agent-run health");
+    const table = card ? card.children.find((kid) => kid.tagName === "table") : null;
+    const spark = card ? card.children.find((kid) =>
+      kid.className === "obs-spark-wrap" && flat(kid).join(" ").includes("defers / 1h trend")) : null;
+    out[name] = {
+      error,
+      // The header row is children[0]; every row below it is one lane, cell text beside cell class.
+      rows: table ? table.children.slice(1).map((row) =>
+        row.children.map((cell) => [flat(cell).join("").trim(), cell.className])) : null,
+      defersPlotted: spark ? spark.children.some((kid) => kid.tagName === "svg") : null,
+    };
+  }
+  process.stdout.write(JSON.stringify(out));
+"""
+
+    def obs_lane_scenario(lanes, inject=None):
+        """Two published snapshots one minute apart carrying `lanes` — two ticks, because the defer
+        sparkline needs two recorded points before it plots anything at all. `inject` post-edits the
+        PUBLISHED document, for window shapes this generator cannot emit but the page must survive;
+        it is skipped on a refusal so a broken fixture reds a named row instead of aborting."""
+        documents = []
+        for offset in (0, 60):
+            fixture = copy.deepcopy(obs_fixture)
+            fixture["generated_at"] = now + offset
+            fixture["lanes"] = copy.deepcopy(lanes)
+            with contextlib.redirect_stdout(io.StringIO()):
+                document = obs_normalized(fixture)
+            if inject is not None and isinstance(document.get("lanes"), list):
+                inject(document)
+            documents.append(document)
+        return documents
+
+    _ZERO_WINDOW = {"success": 0, "failure": 0, "defer": 0}
+    # `unread` carries the SAME zeroed 24h window as `idle`, and `idle`'s own 1h window is a real
+    # measurement of zero runs: the ONLY thing differing between those two rendered rows is whether
+    # the 1h window was readable. Asserting them together is what makes this non-vacuous — a page
+    # that dashes everything, or one that zeroes everything, fails on the other row.
+    _QUIET_LANES = {"idle": {"1h": dict(_ZERO_WINDOW), "24h": dict(_ZERO_WINDOW)}}
+    obs_window_page = _executed_page(
+        _page_harness("renderObservability", _OBS_LANE_WINDOW_PAGE_BODY),
+        {"scenarios": {
+            "measured": obs_lane_scenario(obs_fixture["lanes"]),
+            "quiet": obs_lane_scenario(_QUIET_LANES),
+            "unread": obs_lane_scenario({
+                **copy.deepcopy(_QUIET_LANES),
+                "hot": {"1h": {"success": 0, "failure": 3, "defer": 1},
+                        "24h": dict(_ZERO_WINDOW)},
+                # A string where the collector should have sent an object: `_obs_lane_rows` drops
+                # it to None, which is exactly what an unsent window publishes.
+                "unread": {"1h": "3 ok / 1 failed", "24h": dict(_ZERO_WINDOW)}}),
+            # data.json is a public document and its windows are only ever an object or null from
+            # THIS generator; a hand-edited or future producer's array/number window must still not
+            # read as a measured zero, so the page's own window guard is exercised directly.
+            "hostile": obs_lane_scenario(_QUIET_LANES, inject=lambda document: document["lanes"]
+                                         .append({"lane": "alien", "1h": [], "24h": 0}))}})
+
+    def obs_window(name, field):
+        rendered = obs_window_page.get(name)
+        return rendered.get(field) if isinstance(rendered, dict) else obs_window_page
+
+    check("[#1879] EXECUTED page script: a lane whose 1h window the generator could NOT read renders "
+          "an explicitly unmeasured cell, while a lane that genuinely ran nothing still renders its "
+          "zeroes — the two rows are no longer identical",
+          obs_window("unread", "rows"),
+          [[["hot", "obs-lane"], ["0 / 3 / 1", ""], ["100%", "bad"], ["0 / 0 / 0", ""]],
+           [["idle", "obs-lane"], ["0 / 0 / 0", ""], ["—", ""], ["0 / 0 / 0", ""]],
+           [["unread", "obs-lane"], ["—", "obs-unmeasured"], ["—", ""], ["0 / 0 / 0", ""]]])
+    # ...and the measured lanes are untouched by the fix, including the 24h column that already
+    # dashed an absent window (`review-fix` sends no 24h at all) — a regression there would swap the
+    # bug from "unmeasured reads as zero" to "measured reads as unmeasured".
+    check("[#1879] EXECUTED page script: the golden lanes still render every count, both fail-rate "
+          "tones and the 24h column, with only the window the collector never sent dashed",
+          obs_window("measured", "rows"),
+          [[["review-fix", "obs-lane"], ["1 / 0 / 0", ""], ["0%", "good"], ["—", "obs-unmeasured"]],
+           [["worker", "obs-lane"], ["3 / 1 / 2", ""], ["25%", "good"], ["30 / 4 / 9", ""]]])
+    # The defer sparkline, both directions. `quiet` is the control the non-vacuity rests on: its
+    # fleet-wide defer total is a MEASURED zero and it must still plot, so "plots nothing" cannot be
+    # satisfied by a helper that simply treats every zero as unknown. Pre-fix, `unread` summed its
+    # missing window as 0 and plotted a reassuring line.
+    check("[#1879] EXECUTED page script: an unreadable 1h window makes the fleet defer total "
+          "UNKNOWN and the sparkline plots nothing, while a fleet that genuinely deferred ZERO "
+          "times still plots its flat line",
+          (obs_window("quiet", "defersPlotted"), obs_window("measured", "defersPlotted"),
+           obs_window("unread", "defersPlotted"), obs_window("hostile", "defersPlotted")),
+          (True, True, False, False))
+    check("[#1879] EXECUTED page script: a window of the wrong TYPE altogether is unmeasured too — "
+          "an array is `typeof 'object'`, so a bare truthiness test would read `[]` as a lane that "
+          "successfully ran nothing",
+          obs_window("hostile", "rows"),
+          [[["idle", "obs-lane"], ["0 / 0 / 0", ""], ["—", ""], ["0 / 0 / 0", ""]],
+           [["alien", "obs-lane"], ["—", "obs-unmeasured"], ["—", ""], ["—", "obs-unmeasured"]]])
+    check("[#1879] ...and no scenario raised while rendering — a page that throws is the finding, "
+          "never a silently absent health table",
+          {name: rendered.get("error") if isinstance(rendered, dict) else rendered
+           for name, rendered in (obs_window_page.items()
+                                  if isinstance(obs_window_page, dict) else ())},
+          {"measured": None, "quiet": None, "unread": None, "hostile": None})
     # ---- [#982] A DROPPED QUEUE ROW MUST BE ANNOUNCED. `flow.queue: []` renders identically to
     # an idle queue, so the pre-#982 silent `continue` turned a producer/consumer shape mismatch
     # into a green build, a green self-test and a panel reading `no backlog` — the loss visible
@@ -6433,12 +6649,251 @@ esac
         check(f"[#1571] a {case} lane name is not echoed into the build log that diagnoses it",
               obs_seam("lanes", {lane_name: {"1h": {"success": 1}}}, "lanes"),
               ([], [_DROP.format("lane", f"lane name {quoted} is not a safe token")]))
+    # ---- [#1880] A FLOW STAT THE COLLECTOR SENT AND THIS BUILD CANNOT READ MUST NOT PUBLISH AS A
+    # HEALTHY NUMBER. `_obs_count(...) or 0` mapped every unreadable park/sample count to 0, so
+    # `parks_1h: {"needs_user": "lots", "needs_orchestrator": -3}` published `0 user · 0 orch` on
+    # the panel an operator reads to decide whether the fleet is stuck on humans — and printed
+    # nothing. The milder form is the same failure: an unreadable `mean`/`max`/`p50` became None
+    # with no diagnostic, so a collector that RENAMED a field is indistinguishable from one that
+    # has not shipped it yet. Every input below is a JSON literal and every expected string is a
+    # literal: reading either back off the module under test is the tautology AGENTS.md pre-flight
+    # 2(b) names, and deriving an input from the code's own field tuple is 2(c).
+    _STAT_DROP = "dashboard-gen: dropped observability flow stat `{}` ({})"
+    _NOT_COUNT = "field `{}` (type {}) is not a non-negative integer"
+
+    def obs_stat(key, value, present=True):
+        """(published `flow.<key>`, the flow-stat warnings this build printed)."""
+        fixture = copy.deepcopy(obs_fixture)
+        if present:
+            fixture["flow"][key] = value
+        else:
+            del fixture["flow"][key]
+        stream = io.StringIO()
+        try:                       # same crash-after-partial-run guard as ObsRefusal above
+            with contextlib.redirect_stdout(stream):
+                document = _normalize_observability(fixture)
+        except DashboardError as error:
+            document = ObsRefusal(refused=str(error))
+        except Exception as error:  # noqa: BLE001 — [#1880], as in obs_normalized above
+            document = ObsRefusal(raised=f"{type(error).__name__}: {error}"[:200])
+        return (document["flow"][key],
+                [line for line in stream.getvalue().splitlines()
+                 if line.startswith("dashboard-gen: dropped observability flow stat")])
+
+    check("[#1880] the park counts from this issue — a STRING and a NEGATIVE where the collector "
+          "should have sent counts — hide the park stat and name BOTH fields, instead of "
+          "publishing the `0 user · 0 orch` of a fleet parked on nobody",
+          obs_stat("parks_1h", {"needs_user": "lots", "needs_orchestrator": -3}),
+          (None, [_STAT_DROP.format("parks_1h", _NOT_COUNT.format("needs_user", "str")),
+                  _STAT_DROP.format("parks_1h",
+                                    _NOT_COUNT.format("needs_orchestrator", "int"))]))
+    # The accept path is what makes the row above non-vacuous: a guard that hid every zero, or one
+    # that announced on every read, satisfies the reject rows while erasing the quiet hour an
+    # operator interrogates (AGENTS.md pre-flight item 8 — a census must emit its zero row).
+    check("[#1880] a REAL zero-park hour still publishes its zeroes, SILENTLY — 0 is a reading, "
+          "not an absence, and the warning marks a producer/consumer mismatch",
+          obs_stat("parks_1h", {"needs_user": 0, "needs_orchestrator": 0}),
+          ({"needs_user": 0, "needs_orchestrator": 0}, []))
+    check("[#1880] a field the collector did NOT send takes its default and says nothing — a "
+          "collector that has not shipped a field yet is not a mismatch",
+          obs_stat("parks_1h", {"needs_user": 4}),
+          ({"needs_user": 4, "needs_orchestrator": 0}, []))
+    check("[#1880] an explicit null is 'no value' rather than a shape mismatch (the rule #1557 "
+          "settled for the cache key): a 24h window with no merges publishes its dashed "
+          "percentiles and the ZERO its sample count defaults to, with no warning",
+          obs_stat("arm_to_merge_minutes_24h", {"p50": None, "p90": None, "samples": None}),
+          ({"p50": None, "p90": None, "samples": 0}, []))
+    # ...and the defaults are per FIELD, not one shared value: a park count nobody sent is 0 (the
+    # panel reads counts through `obsNum(value, 0)` either way), while an unsent mean/max is None
+    # so the stat renders `—` instead of a fabricated `0 avg`.
+    check("[#1880] the review-round fields the collector did not send default to None — a shared "
+          "0 default would publish `0 avg · max 0` for a collector that sends only the exhaustion "
+          "count",
+          obs_stat("review_rounds", {"budget_exhausted_1h": 2}),
+          ({"mean": None, "max": None, "budget_exhausted_1h": 2}, []))
+    check("[#1880] a review-round stat whose every field parses publishes all three, SILENTLY",
+          obs_stat("review_rounds", {"mean": 0, "max": 0, "budget_exhausted_1h": 0}),
+          ({"mean": 0.0, "max": 0, "budget_exhausted_1h": 0}, []))
+    # One row per (stat, reader), each the ONLY row that reds if its own field stops being checked
+    # — and each carries a SIBLING field that parses, so "the stat hides" cannot be satisfied by a
+    # guard that only ever looks at the first field, and the published value can never be the
+    # half-real `{"mean": None, "max": 3}` this issue is about.
+    for case, key, value, detail in (
+        ("a stringified p90 (the arm→merge sub-label)", "arm_to_merge_minutes_24h",
+         {"p50": 18, "p90": "55.5", "samples": 9},
+         "field `p90` (type str) is not a non-negative number of minutes"),
+        ("a negative sample count", "arm_to_merge_minutes_24h",
+         {"p50": 18, "p90": 55.5, "samples": -3}, _NOT_COUNT.format("samples", "int")),
+        ("a stringified review-round mean", "review_rounds",
+         {"mean": "1.4", "max": 3, "budget_exhausted_1h": 0},
+         "field `mean` (type str) is not a non-negative finite number"),
+        ("a negative review-round max", "review_rounds",
+         {"mean": 1.4, "max": -1, "budget_exhausted_1h": 0}, _NOT_COUNT.format("max", "int")),
+        # A mean is the one FLOAT field of the three, so its reader is `_obs_mean` rather than
+        # `_obs_count` — and it has to reject the same directions: a negative average number of
+        # review rounds is not a measurement any collector can have taken.
+        ("a NEGATIVE review-round mean", "review_rounds",
+         {"mean": -1.4, "max": 3, "budget_exhausted_1h": 0},
+         "field `mean` (type float) is not a non-negative finite number"),
+        # ...and it has to reject that direction WITHOUT RAISING. `json.loads` hands back an
+        # arbitrary-precision int, and this one is unconvertible: `float(10**400)` and
+        # `math.isfinite(10**400)` both raise `OverflowError`. A reader that range-checks the raw
+        # value never returns None here at all — it takes the build down (see the row below).
+        # The literal is written out as `10 ** 400`, tied to nothing the module defines.
+        ("an OVERSIZED review-round mean — an integer too large to convert to float",
+         "review_rounds", {"mean": 10 ** 400, "max": 3, "budget_exhausted_1h": 0},
+         "field `mean` (type int) is not a non-negative finite number"),
+        # `isinstance(True, int)` is what `_obs_count` exists to reject: a boolean exhaustion flag
+        # would otherwise publish as the count 1, or as the reassuring `0 budget-exhausted / 1h`.
+        ("a BOOLEAN budget-exhausted flag", "review_rounds",
+         {"mean": 1.4, "max": 3, "budget_exhausted_1h": True},
+         _NOT_COUNT.format("budget_exhausted_1h", "bool")),
+    ):
+        check(f"[#1880] {case} hides its whole stat and names the field — publishing the readable "
+              "siblings beside a silently blanked one is what made a RENAMED collector field look "
+              "like an unshipped one",
+              obs_stat(key, value), (None, [_STAT_DROP.format(key, detail)]))
+    # Each count field is bound to `_obs_count` SPECIFICALLY. A fractional value is the input that
+    # separates it from the seam's other readers — `_obs_minutes`/`_obs_mean` both accept a float —
+    # so a reader swapped at one of these five call sites would otherwise publish `9.5 samples /
+    # 24h` or `1.5 orch` with every other row still green (AGENTS.md pre-flight 2(a): the call site
+    # is where the wiring lives).
+    for key, value, field in (("parks_1h", {"needs_user": 2.5}, "needs_user"),
+                              ("parks_1h", {"needs_orchestrator": 1.5}, "needs_orchestrator"),
+                              ("review_rounds", {"max": 3.5}, "max"),
+                              ("review_rounds", {"budget_exhausted_1h": 0.5},
+                               "budget_exhausted_1h"),
+                              ("arm_to_merge_minutes_24h", {"samples": 9.5}, "samples")):
+        check(f"[#1880] a FRACTIONAL `{field}` is not a count: this field is read by `_obs_count`, "
+              "and a call site wired to the minutes/mean reader would publish the fraction",
+              obs_stat(key, value),
+              (None, [_STAT_DROP.format(key, _NOT_COUNT.format(field, "float"))]))
+    for key, value, container in (("parks_1h", "lots", "str"),
+                                  ("review_rounds", [1.44, 3, 0], "list"),
+                                  ("arm_to_merge_minutes_24h", 18, "int")):
+        check(f"[#1880] a `{key}` the collector sent as a {container} names itself once and "
+              "publishes nothing — the container check `_obs_drop_queue` already makes on "
+              "`flow.queue`, for the same reason",
+              obs_stat(key, value),
+              (None, [_STAT_DROP.format(key, f"the stat (type {container}) is not an object")]))
+    for case, args in (("no `parks_1h` key at all", ("parks_1h", None, False)),
+                       ("an explicit null `parks_1h`", ("parks_1h", None))):
+        check(f"[#1880] {case} hides the stat SILENTLY — 'the collector has not landed' is not a "
+              "producer/consumer mismatch, and the panel has always hidden an unsent stat",
+              obs_stat(*args), (None, []))
+    # ...and a dropped stat is a drop diagnostic, not a new fatality and NOT contagious: the build
+    # stays green and every sibling of the hole publishes unchanged. Turning the drop into a raise,
+    # or into a `flow: None`, turns this row red.
+    stat_dropped = copy.deepcopy(obs_fixture)
+    stat_dropped["flow"]["parks_1h"] = {"needs_user": "lots", "needs_orchestrator": 1}
+    with contextlib.redirect_stdout(io.StringIO()):
+        stat_tolerated = obs_normalized(stat_dropped)["flow"]
+    check("[#1880] a snapshot whose park stat is dropped is still TOLERATED — the queue, the lease "
+          "aggregate and both sibling stats are published unchanged around the hole",
+          (stat_tolerated["parks_1h"], stat_tolerated["review_rounds"],
+           stat_tolerated["arm_to_merge_minutes_24h"], stat_tolerated["lease_utilization_1h"],
+           [row["class"] for row in stat_tolerated["queue"]]),
+          (None, {"mean": 1.44, "max": 3, "budget_exhausted_1h": 0},
+           {"p50": 18.0, "p90": 55.5, "samples": 9}, {"mean": 0.6, "max": 0.8}, ["2a", "4"]))
+    # ...and the oversized mean has to be tolerated the SAME way, which is a strictly stronger
+    # claim than "the reader returns None": an `OverflowError` out of `_obs_mean` is not a
+    # DashboardError, so it escapes `_normalize_observability` uncaught and kills the whole
+    # dashboard build — every sibling group on this document goes with it, and the panel an
+    # operator reads goes dark rather than dropping one stat. Asserted on the WHOLE flow group,
+    # because the row above proves only that `review_rounds` itself hid.
+    oversized_mean = copy.deepcopy(obs_fixture)
+    oversized_mean["flow"]["review_rounds"]["mean"] = 10 ** 400
+    with contextlib.redirect_stdout(io.StringIO()):
+        oversized_flow = obs_normalized(oversized_mean)["flow"]
+    # The queue is projected only if it IS one: on a refusal every subscript above yields the
+    # ObsRefusal itself, and iterating THAT raises out of this row — which would abort the suite
+    # from the very row proving the seam does not abort. Measured: reverting `_obs_mean` to the
+    # raw-value range check took the run from 358 checks to 324 — a kill that hid 34 unrun rows —
+    # until this projection was guarded (AUTHOR pre-flight item 4).
+    oversized_queue = oversized_flow["queue"]
+    check("[#1880] an UNCONVERTIBLE integer mean drops its stat and leaves the BUILD standing — "
+          "range-checking the raw value raises `OverflowError` past this seam's DashboardError "
+          "contract, so the park counts, the arm→merge percentiles and the queue below all "
+          "vanish with it instead of publishing around the hole",
+          (oversized_flow["review_rounds"], oversized_flow["parks_1h"],
+           oversized_flow["arm_to_merge_minutes_24h"],
+           [row["class"] for row in oversized_queue]
+           if isinstance(oversized_queue, list) else oversized_queue),
+          (None, {"needs_user": 2, "needs_orchestrator": 1},
+           {"p50": 18.0, "p90": 55.5, "samples": 9}, ["2a", "4"]))
+    # ...and the PAGE is what the drop has to DELIVER INTO (AGENTS.md pre-flight item 11). The
+    # generator's build-log announcement is evidence nobody reads on a green build, so the fix only
+    # counts if the false-healthy METRIC is gone from the panel: `obsFlowCard` renders every count
+    # through `obsNum(value, 0)`, so dropping the unreadable FIELD alone would still have printed
+    # `0 user · 0 orch`. Executed against dashboard/app.js under the shared DOM shim, never
+    # asserted lexically (the #612 round-4 lesson).
+    _OBS_FLOW_STAT_PAGE_BODY = r"""
+  const out = {};
+  for (const [name, document] of Object.entries(input.documents)) {
+    for (const id of ["obs-section", "obs-grid", "obs-time", "obs-triggers", "warning"]) {
+      ids[id] = element(id);
+    }
+    let error = null;
+    try {
+      scope.renderObservability(document);
+    } catch (raised) {
+      error = String((raised && raised.message) || raised);
+    }
+    const card = ids["obs-grid"].children.find((kid) =>
+      kid.tagName === "article" && kid.children[0]
+      && kid.children[0].textContent === "Queue & flow");
+    const grid = card ? card.children.find((kid) => kid.className === "obs-metric-grid") : null;
+    out[name] = {
+      error,
+      // [label, the value cell INCLUDING its sub-label] per metric, in render order.
+      metrics: grid ? grid.children.map((cell) => [cell.children[0].textContent,
+                                                   flat(cell.children[1]).join(" ").trim()]) : null,
+    };
+  }
+  process.stdout.write(JSON.stringify(out));
+"""
+    with contextlib.redirect_stdout(io.StringIO()):
+        flow_measured = obs_normalized(copy.deepcopy(obs_fixture))
+        flow_unreadable = obs_normalized(stat_dropped)
+    flow_stat_page = _executed_page(
+        _page_harness("renderObservability", _OBS_FLOW_STAT_PAGE_BODY),
+        {"documents": {"measured": flow_measured, "unreadable": flow_unreadable}})
+
+    def flow_metrics(name):
+        rendered = flow_stat_page[name]
+        return (rendered.get("metrics"), rendered.get("error"))
+
+    check("[#1880] EXECUTED page script: the golden flow stats all render — the control the row "
+          "below rests on, since a panel that dropped every metric would satisfy it",
+          flow_metrics("measured"),
+          ([["Review rounds", "1.44 avg max 3 · 0 budget-exhausted / 1h"],
+            ["Parked / 1h", "2 user · 1 orch"],
+            ["Arm → merge", "18m p50 55.5m p90 · 9 samples / 24h"],
+            ["CI queue · sparq-org/sparq", "5 pending target CI runs"]], None))
+    check("[#1880] EXECUTED page script: a park stat this build could not read leaves NO "
+          "`Parked / 1h` metric on the panel at all — never the `0 user · 0 orch` an operator "
+          "would read as a fleet that is not waiting on any human — and every other metric, "
+          "including the ORCHESTRATOR park count that WAS readable, is unaffected",
+          flow_metrics("unreadable"),
+          ([["Review rounds", "1.44 avg max 3 · 0 budget-exhausted / 1h"],
+            ["Arm → merge", "18m p50 55.5m p90 · 9 samples / 24h"],
+            ["CI queue · sparq-org/sparq", "5 pending target CI runs"]], None))
     overflow = copy.deepcopy(obs_fixture)
     overflow["flow"]["review_rounds"]["mean"] = 1e309       # JSON 1e309 decodes to +Infinity
     overflow["thresholds"]["workflow_failure_rate"] = 1e309
-    overflow_normalized = obs_normalized(overflow)
-    check("non-finite review-round mean is rejected, never published",
-          overflow_normalized["flow"]["review_rounds"]["mean"], None)
+    with contextlib.redirect_stdout(io.StringIO()) as overflow_log:
+        overflow_normalized = obs_normalized(overflow)
+    # [#1880] The rejection is unchanged; what the rejection PUBLISHES is not. `+Infinity` used to
+    # blank the mean and publish it beside the real `max 3`, which reads as a collector that does
+    # not send a mean. The stat now hides and the seam names the field.
+    check("non-finite review-round mean is rejected, never published — and since #1880 the whole "
+          "review-round stat hides and says so, instead of a dashed mean beside a confident max",
+          (overflow_normalized["flow"]["review_rounds"],
+           [line for line in overflow_log.getvalue().splitlines()
+            if line.startswith("dashboard-gen: dropped observability flow stat")]),
+          (None, [_STAT_DROP.format(
+              "review_rounds",
+              "field `mean` (type float) is not a non-negative finite number")]))
     check("non-finite threshold is dropped, never published",
           "workflow_failure_rate" in overflow_normalized["thresholds"], False)
     for bad_document in ({"schema": "wrong/v0"}, ["not", "a", "dict"], {}):

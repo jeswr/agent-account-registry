@@ -1491,6 +1491,150 @@ def _self_test():
         "verbatim and so must carry `gh` -- the scan can fail",
         len(_leading_gh_argvs({"post_marker", "disarm", "rearm"})), 3)
 
+    # -- (s) THE PRODUCTION WRITE PATH, driven end to end. --------------------------------------
+    # (r)'s mirror image, and the same hole. Every flow block above injects `gh_write=fake.write`,
+    # so `_default_write` -- the ONLY write path a live run takes -- had ZERO line coverage: after
+    # the #1137 fix `python3 -m trace --count --missing` reported its two statements as the entire
+    # uncovered remainder of the read/write seam, and nothing anywhere asserted the argv the
+    # marker / disarm / relatch mutations actually hand to the OS. The two seams are OPPOSITES:
+    # `_default_read` goes through `run_gh`, which prepends the binary itself, while
+    # `_default_write` execs the argv VERBATIM, so these argvs must carry the leading "gh". Row
+    # (r)'s static control pins that shape in the SOURCE; only this block pins what is EXECUTED,
+    # which is what a change routing the write seam through a prepending helper -- #1137 in mirror
+    # image -- would break while shipping green. So this block injects NOTHING at the write seam:
+    # it stubs the process boundary beneath it and reads back what the OS was handed.
+    real_run_w = subprocess.run
+    written, written_env = [], []
+
+    def _record_write(cmd, **kwargs):
+        written.append(list(cmd))
+        written_env.append(dict(kwargs.get("env") or {}))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    # The reads stay faked, so the ONLY thing reaching the stubbed process boundary is a write.
+    # `gh_write` is left UNSET -- that omission is the entire point of the block.
+    fake17 = _FakeGh(reads={"query=": prs_json, "check-runs": gate_json, "comments": "[]"})
+    livew = Watchdog(apply_changes=True, grace_seconds=DEFAULT_GRACE_SECONDS,
+                     required_check="gate", deny_labels=DEFAULT_DENY_LABELS,
+                     require_label="review:pass", max_actions_per_head=2, max_actions_per_run=5,
+                     marker_actor="sparq-bot[bot]",
+                     clock=lambda: parse_iso("2026-07-28T08:46:00Z"), gh_read=fake17.read)
+    # GH_DEBUG is REALLY set for the window: the scrub assertion below would otherwise pass
+    # vacuously on any host that simply never had it, which is every CI runner.
+    had_debug, write_error, livew_rc = os.environ.get("GH_DEBUG"), None, None
+    try:
+        os.environ["GH_DEBUG"] = "api"
+        subprocess.run = _record_write
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            livew_rc = livew.run(["sparq-org/latch-watchdog-fixture-repo"], {"sparq-org": "t"}, 0)
+    except Exception as exc:
+        # Named, never propagated: a traceback out of here records as a crash rather than a kill
+        # and prints no row at all (AGENTS.md pre-flight 4, "crash-after-partial-run").
+        write_error = "%s: %s" % (type(exc).__name__, exc)
+    finally:
+        subprocess.run = real_run_w
+        if had_debug is None:
+            os.environ.pop("GH_DEBUG", None)
+        else:
+            os.environ["GH_DEBUG"] = had_debug
+
+    def _wargv(index):
+        """Defensive, like (r): a mutant that writes nothing FAILS BY NAME instead of raising."""
+        return written[index] if len(written) > index else []
+
+    # ANTI-VACUITY FIRST: the rescue really ran the whole way through the production seam. Every
+    # argv row below is satisfiable by an empty log, so this is what makes them mean anything.
+    chk("WRITE PATH: an apply-mode rescue driven through the PRODUCTION write seam completes, "
+        "spawns exactly three processes, and is censused as one rescue",
+        (write_error, livew_rc, len(written),
+         (livew.census[0] if livew.census else {}).get("rescued")), (None, 0, 3, 1))
+    # THE ROW A MIRROR-IMAGE #1137 WOULD RED. Not "an argv was built" -- the argv the OS was
+    # handed. Routing `_default_write` through a helper that prepends the binary reads
+    # [['gh','gh'], ...] here while every flow block above stays green.
+    chk("WRITE PATH: the write seam execs the argv VERBATIM, so each executed write starts at the "
+        "binary and carries EXACTLY ONE `gh` token",
+        [(cmd[:2], cmd.count("gh")) for cmd in written],
+        [(["gh", "pr"], 1), (["gh", "pr"], 1), (["gh", "api"], 1)])
+    chk("WRITE PATH: the executed marker comment is exactly "
+        "`gh pr comment <n> --repo <repo> --body <body>`, 8 tokens, body carrying the head sha",
+        (_wargv(0)[:7], len(_wargv(0)), "head=cd0ca3f" in (_wargv(0)[7:8] or [""])[0]),
+        (["gh", "pr", "comment", "999000617", "--repo",
+          "sparq-org/latch-watchdog-fixture-repo", "--body"], 8, True))
+    # EXACT LIST EQUALITY, not containment: an appended token is the whole hazard here, and a
+    # containment check is what let `--max-actions-per-run 5 -> 500` survive elsewhere (item 6).
+    chk("WRITE PATH: the executed disarm is EXACTLY `gh pr merge <n> --repo <repo> "
+        "--disable-auto` and nothing else",
+        _wargv(1), ["gh", "pr", "merge", "999000617", "--repo",
+                    "sparq-org/latch-watchdog-fixture-repo", "--disable-auto"])
+    chk("WRITE PATH: the executed relatch is `gh api graphql` carrying the node id and the head "
+        "CAS, in 9 tokens",
+        (_wargv(2)[:3], [t for t in _wargv(2) if t.startswith(("pr=", "oid="))], len(_wargv(2))),
+        (["gh", "api", "graphql"], ["pr=PR_kwFLIVEFLOWnodeid", "oid=cd0ca3f"], 9))
+    chk("WRITE PATH: the graphql document that reached the process is the relatch MUTATION",
+        [t[:len("query=mutation($pr:ID!,$oid:GitObjectID!){enablePullRequestAutoMerge(")]
+         for t in _wargv(2) if t.startswith("query=")],
+        ["query=mutation($pr:ID!,$oid:GitObjectID!){enablePullRequestAutoMerge("])
+    # The arm-adjacent surface, asserted over what was EXECUTED. Block (q) proves no call site can
+    # spell these; this proves none reaches the OS, which is the property that actually matters
+    # and the only form that survives a future non-literal argv builder.
+    chk("WRITE PATH: no `--auto`, `--admin` or label flag reaches the process on any write",
+        sorted({t for cmd in written for t in cmd
+                if t in ("--auto", "--admin", "--add-label", "--remove-label", "--label",
+                         "--edit")}), [])
+    chk("WRITE PATH CONTROL: the same scan DOES see the one flag that IS issued, so it can fail",
+        sorted({t for cmd in written for t in cmd if t == "--disable-auto"}), ["--disable-auto"])
+    chk("WRITE PATH: every executed write carries the MINTED token in its own environment and "
+        "never GH_DEBUG (which can echo a request body containing that token)",
+        [(env.get("GH_TOKEN"), "GH_DEBUG" in env) for env in written_env], [("t", False)] * 3)
+
+    # The seam must return the PROCESS's return code, not a constant. Without this row a
+    # `_default_write` that returned `0, ""` unconditionally would swallow every failed mutation
+    # -- the run would green while the PR stayed disarmed, which is strictly worse than found.
+    def _fail_the_disarm(cmd, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd, 9 if "--disable-auto" in cmd else 0, stdout="", stderr="")
+
+    fake18 = _FakeGh(reads={"query=": prs_json, "check-runs": gate_json, "comments": "[]"})
+    dog17 = Watchdog(apply_changes=True, grace_seconds=DEFAULT_GRACE_SECONDS,
+                     required_check="gate", deny_labels=DEFAULT_DENY_LABELS,
+                     require_label="review:pass", max_actions_per_head=2, max_actions_per_run=5,
+                     marker_actor="sparq-bot[bot]",
+                     clock=lambda: parse_iso("2026-07-28T08:46:00Z"), gh_read=fake18.read)
+    rc17 = None
+    try:
+        subprocess.run = _fail_the_disarm
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc17 = dog17.run(["sparq-org/latch-watchdog-fixture-repo"], {"sparq-org": "t"}, 0)
+    except Exception:
+        pass
+    finally:
+        subprocess.run = real_run_w
+    chk("WRITE PATH: a non-zero exit from the real process propagates out of the write seam -- "
+        "the run reds, the rescue is not booked, and the relatch never runs",
+        (rc17, (dog17.census[0] if dog17.census else {}).get("errors"),
+         (dog17.census[0] if dog17.census else {}).get("rescued")), (1, 1, 0))
+
+    # ...and the second half of that same return statement: a process that produced no stdout
+    # yields the empty STRING, never None -- every caller does `code, _ = self.gh_write(...)`
+    # today, so only a direct call can pin it.
+    direct = Watchdog(apply_changes=True, grace_seconds=1, required_check="gate",
+                      deny_labels=DEFAULT_DENY_LABELS, require_label="review:pass",
+                      max_actions_per_head=2, max_actions_per_run=5, marker_actor="b[bot]")
+    direct_write = None
+    try:
+        subprocess.run = lambda cmd, **kwargs: subprocess.CompletedProcess(
+            cmd, 4, stdout=None, stderr="")
+        direct_write = direct._default_write(["gh", "pr", "comment", "1"], "tok")
+    except Exception as exc:
+        # Measured, not hypothetical: the mirror-#1137 mutant makes this call raise out of
+        # `run_gh`'s own doubled-binary guard, which aborted the suite one row short and recorded
+        # as a kill with a SMALLER total check count (AGENTS.md pre-flight 4).
+        direct_write = "%s: %s" % (type(exc).__name__, exc)
+    finally:
+        subprocess.run = real_run_w
+    chk("WRITE PATH: the seam returns the process's OWN return code and normalises a None stdout "
+        "to the empty string", direct_write, (4, ""))
+
     print("latch-watchdog self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 

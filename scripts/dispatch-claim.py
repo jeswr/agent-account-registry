@@ -341,8 +341,47 @@ FIX_TTL = _lease_ttl("fix")         # 10+10+60+10+15 = 105m (was 60m — exactly
 # These MIRROR the `cap=` literals in review-fix.yml's `claim` job; `_review_fix_workflow_values`
 # parses them back out and `_self_test` asserts equality, so a one-sided edit on either side turns
 # the self-test red exactly as a one-sided `ttl=` edit already does.
+#
+# ---- ISSUE #396: THERE IS NO DISPATCHER-SIDE NUMBER TO RECONCILE THESE AGAINST ----------------
+# #396 reads the fix cap as DRIFT: "review-fix.yml sets 3 while dispatch-claim.py sets
+# FIX_MAX_CONCURRENT = 8, and the review pair (10/10) matches, so the fix pair should be 8 too."
+# That premise is stale, and the coincidence in it is the trap. The history:
+#
+#   * `REVIEW_MAX_CONCURRENT = 10` / `FIX_MAX_CONCURRENT = 8` were the DISPATCHER's static
+#     fleet-wide ceilings. #449 (2026-07-19) DELETED BOTH when it replaced the coarse ceiling with
+#     the CAS-enforced live per-account slot bound described above. Neither name exists in this
+#     module any more; `_self_test` pins that (`_static_lane_ceilings`).
+#   * So the review pair does not "match" — 10 and the deleted 10 were never one value with two
+#     copies, and `SELF_CLAIM_REVIEW_CAP` is not a mirror of anything on the dispatcher side. It
+#     is the codex slot count for the review lane, and it would be 10 had the dispatcher constant
+#     never existed. Reading the two 10s as a sync invariant is what makes 3-vs-8 look like drift.
+#
+# The two paths therefore differ INTENTIONALLY and STRUCTURALLY (static prefix cap vs. live-slot
+# bound), not numerically, and raising the fix cap to 8 "for parity" would loosen the only honest
+# ceiling the unprobed CLI path has, against a constant that no longer exists — the opposite of
+# fail-closed. A lower self-claim cap only ever DEFERS a manual/CLI dispatch (rc=3, no failure),
+# so 3 is the safe direction to be wrong in.
+#
+# These caps are still free to move — they are lane slot counts, not derived values. But move one
+# on EVIDENCE about that lane's live account records, recorded here, never to restore parity with
+# the other lane or with a dispatcher constant.
 SELF_CLAIM_REVIEW_CAP = 10
 SELF_CLAIM_FIX_CAP = 3
+
+
+def _static_lane_ceilings(namespace):
+    """[SPARQ agent] Issue #396: the names in `namespace` that look like a DISPATCHER-side static
+    per-mode concurrency ceiling — the `REVIEW_MAX_CONCURRENT` / `FIX_MAX_CONCURRENT` pair #449
+    deleted in favour of the live per-account slot bound.
+
+    The SELF_CLAIM_*_CAP record above rests on that pair being gone: while it is, the self-claim
+    caps have no dispatcher-side counterpart to drift from, and #396's "reconcile them" reading is
+    a category error. Resurrect either name and the record IS stale — two static numbers for one
+    lane, which is the drift #396 describes. Returned sorted so the assertion message names them.
+    """
+    return sorted(name for name in namespace if name.endswith("_MAX_CONCURRENT"))
+
+
 MISSED_FIX_LIMIT = 6  # consecutive missed fix dispatches per round before needs-user (decision 13)
 # "not probed yet" sentinel for the per-PR readmission-cutoff memo (#555 recurrence gap): the
 # cutoff's own falsy value (None = no proven human gesture) is a MEANINGFUL result, so it cannot
@@ -10057,6 +10096,33 @@ def _self_test():
                          "FAIL the #581 extractor, but it parsed cleanly")
     except AssertionError:
         pass
+    # ---- ISSUE #396: THE PREMISE THE #581 RECORD RESTS ON, PINNED -------------------------------
+    # #396 reads the self-claim fix cap as DRIFT from a dispatcher-side `FIX_MAX_CONCURRENT = 8`.
+    # #449 deleted that constant and its review twin when it replaced the coarse fleet-wide ceiling
+    # with the live per-account slot bound, so there is no dispatcher number to reconcile
+    # against — exactly what the SELF_CLAIM_*_CAP record above says. That record is only TRUE while
+    # the pair stays deleted: resurrect either name and this lane really does carry two static
+    # numbers, the drift #396 describes. Assert the premise so the record cannot rot into a lie.
+    _lane_ceilings = _static_lane_ceilings(globals())
+    assert _lane_ceilings == [], (
+        f"a dispatcher-side static per-mode concurrency ceiling is back ({_lane_ceilings}); #449 "
+        "replaced it with the live per-account slot bound and the SELF_CLAIM_*_CAP record assumes "
+        "it is gone — update that record, or drop the constant (#396)")
+    # NON-VACUITY, and TWO probes because a detector can be inert in two different shapes. Fed only
+    # a namespace that satisfies it, the assert above can never fail, so drive the detector in the
+    # OTHER direction: the SMALL literal namespace catches an implementation that only ever reads
+    # this module's own globals, and the FULL one (this module's real namespace with exactly the
+    # deleted pair injected) catches an inert form keyed on the namespace's SIZE or membership,
+    # which the small probe alone sails past. The expected list is spelled out here, never read
+    # back off the input, so neither probe can pass by agreeing with the code under test.
+    for _ceiling_probe in ({"FIX_MAX_CONCURRENT": 8, "REVIEW_MAX_CONCURRENT": 10,
+                            "SELF_CLAIM_FIX_CAP": 3, "MISSED_FIX_LIMIT": 6},
+                           {**globals(), "FIX_MAX_CONCURRENT": 8, "REVIEW_MAX_CONCURRENT": 10}):
+        assert _static_lane_ceilings(_ceiling_probe) == [
+            "FIX_MAX_CONCURRENT", "REVIEW_MAX_CONCURRENT"], (
+                "_static_lane_ceilings must NAME the exact pair #449 deleted (and nothing else) "
+                f"or the assertion above is vacuous: {_static_lane_ceilings(_ceiling_probe)} "
+                f"(probe size {len(_ceiling_probe)}) (#396)")
     # NON-VACUITY for the #363 adopt pins, by the same mutation idiom: an equality assert against a
     # literal the extractor stopped finding reads green forever.
     for _adopt_from, _adopt_to, _adopt_field in (
