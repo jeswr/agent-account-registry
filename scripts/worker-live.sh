@@ -435,7 +435,14 @@ _run_headless_harness() {
             ANTHROPIC_API_KEY="$(<"$credential_path")"
             export ANTHROPIC_API_KEY
             ;;
-          claude-credentials-json) ;;
+          claude-credentials-json)
+            # [#1675] Refused HERE too, at the seam where the format decides container delivery.
+            # worker-prep.sh refuses this format outright, so this arm is unreachable in every live
+            # lane — but a silently-accepting `;;` arm is exactly the shape that kept #1675 latent:
+            # it reads as "supported, nothing to export" when what it meant was "the durable
+            # anthropic refresh token rides in on the read-only mount instead of an env var".
+            die 'claude-credentials-json is refused: it would deliver the durable anthropic refresh token to the model container on the read-only credential mount, and no host-side pre-flight strips it (issue #1675)'
+            ;;
           *) die 'Claude received an incompatible credential format' ;;
         esac
         local -a credential_env=()
@@ -6771,6 +6778,135 @@ print(repr(json.load(open(sys.argv[1]))["tokens"]["refresh_token"]))' "$pfroot/h
   chk "(b) the materialized path still builds the READ-ONLY in-HOME mount" \
     "${pf_mount[*]}" \
     "--mount type=bind,src=$pfroot/home/.codex/auth.json,dst=/home/worker/.codex/auth.json,readonly"
+
+  # --- (c) THE DRY-RUN PRE-FLIGHT (`WORKER_PREFLIGHT_REFRESH=skip`, the branch worker.yml selects for
+  # `inputs.dry_run`). It had NO row of its own, which is how a branch that touches the credential
+  # mount went unmeasured; #1675 removed its redundant format condition, so it gets one now. The
+  # fixture's access token is EXPIRED on purpose: that is what makes the row prove the SKIP branch
+  # ran, because the refresh branch would have to attempt a token exchange on it (and this suite has
+  # no egress), so a `skip` that silently fell through to `refresh` cannot pass. Hermetic either way.
+  local dryroot="$tmp/pf-dryrun" dry_cred dry_rc
+  dry_cred=$(_preflight_fixture "$dryroot" -3600 'REFRESH-TOKEN-SENTINEL-DRYRUN')
+  if (
+    export WORKER_ROOT="$dryroot" WORKER_ACCOUNT=acctexample WORKER_PROVIDER=openai \
+           WORKER_HARNESS=codex WORKER_CREDENTIAL_FORMAT=codex-auth-json \
+           WORKER_PREFLIGHT_REFRESH=skip WORKER_ACCOUNT_CREDENTIAL="$dry_cred" \
+           GITHUB_ENV="$tmp/pf-dryrun.env" GITHUB_OUTPUT="$tmp/pf-dryrun.out"
+    unset GITHUB_PATH
+    bash "$SCRIPT_DIR/worker-prep.sh"
+  ) > "$tmp/pf-dryrun.log" 2>&1; then dry_rc=0; else dry_rc=$?; fi
+  chk "(c) the dry-run pre-flight materializes a mount from an EXPIRED token without any exchange" \
+    "$dry_rc:$(grep -c 'pre-flight SKIPPED (dry run)' "$tmp/pf-dryrun.log" || true)" "0:1"
+  chk "(c) ...and the dry run consumed nothing: no rotation marker, no durable material" \
+    "$([[ -e "$dryroot/.credential-rotated" || -e "$dryroot/.credential-durable" ]] \
+      && printf rotated || printf clean)" "clean"
+  # The whole point of the skip branch: it strips even though it exchanges nothing. VALUE, not key.
+  chk "(c) ...and the refresh-token VALUE still appears NOWHERE under the mounted worker HOME" \
+    "$(grep -rlF -- 'REFRESH-TOKEN-SENTINEL-DRYRUN' "$dryroot/home" 2>/dev/null | wc -l | tr -d ' ')" \
+    "0"
+
+  # --- [#1675] `claude-credentials-json` IS REFUSED, and the refusal IS the containment. That format
+  # is a `.credentials.json` snapshot whose `claudeAiOauth.refreshToken` is the DURABLE anthropic
+  # grant, and #596's minimal-derived-document pre-flight — the thing that keeps the codex refresh
+  # token host-side above — is openai-only in broker-refresh (`minimal_worker_credential`,
+  # `merge_refreshed`, `TOKEN_ENDPOINTS`). So worker-prep could only ever have materialized this one
+  # UNMODIFIED into the HOME it read-only bind-mounts into the model container: #596's hole, the
+  # other provider. Latent rather than live (routing pins every anthropic model to
+  # `claude-oauth-token`), which is precisely why closing it is cheap.
+  #
+  # NON-VACUITY: the second row does not look for a refresh-shaped KEY, it searches the ENTIRE
+  # prepared tree for the fixture's refresh-token VALUE — the same serialized-form property
+  # `broker.assert_no_refresh_material` enforces. Re-admitting the format to either case arm in
+  # worker-prep.sh puts that sentinel on disk whether the document is copied verbatim, renamed,
+  # nested, or folded into `accessToken`, and every one of those turns this red. ---
+  local ccroot="$tmp/pf-ccjson" cc_rc cc_cred cc_ok_rc
+  local cc_sentinel='REFRESH-TOKEN-SENTINEL-CCJSON'
+  rm -rf -- "$ccroot"
+  mkdir -p "$ccroot/cli/node_modules/.bin"
+  printf '#!/bin/sh\nexit 0\n' > "$ccroot/cli/node_modules/.bin/claude"
+  chmod +x "$ccroot/cli/node_modules/.bin/claude"
+  cc_cred=$(python3 -c '
+import json, sys
+print(json.dumps({"claudeAiOauth": {"accessToken": "ACCESS-TOKEN-FIXTURE",
+                                    "refreshToken": sys.argv[1],
+                                    "expiresAt": 1900000000000,
+                                    "scopes": ["user:inference", "user:profile"],
+                                    "subscriptionType": "max"}}))' "$cc_sentinel")
+  # The fixture must really carry the sentinel where the anthropic layout keeps the durable grant,
+  # or the absence rows below are absence-of-a-thing-never-present.
+  chk "(#1675) the fixture is a real claude-credentials-json document carrying the refresh sentinel" \
+    "$(python3 -c '
+import json, sys
+print(json.loads(sys.argv[1])["claudeAiOauth"]["refreshToken"])' "$cc_cred" 2>&1)" "$cc_sentinel"
+  if (
+    export WORKER_ROOT="$ccroot" WORKER_ACCOUNT=acctexample WORKER_PROVIDER=anthropic \
+           WORKER_HARNESS=claude WORKER_CREDENTIAL_FORMAT=claude-credentials-json \
+           WORKER_ACCOUNT_CREDENTIAL="$cc_cred" GITHUB_ENV="$tmp/pf-ccjson.env" \
+           GITHUB_OUTPUT="$tmp/pf-ccjson.out"
+    unset GITHUB_PATH
+    bash "$SCRIPT_DIR/worker-prep.sh"
+  ) > "$tmp/pf-ccjson.log" 2>&1; then cc_rc=0; else cc_rc=$?; fi
+  chk "(#1675) worker-prep REFUSES claude-credentials-json" \
+    "$([[ "$cc_rc" -ne 0 ]] && printf refused || printf accepted)" "refused"
+  chk "(#1675) ...naming the format it refused (an operator can act on the message)" \
+    "$(grep -c 'claude-credentials-json is refused' "$tmp/pf-ccjson.log" || true)" "1"
+  # The whole prepared tree, not just `home`: the refusal has to land BEFORE the source credential
+  # is spooled to `$WORKER_ROOT/.selected-credential`, so moving it any later also turns this red.
+  chk "(#1675) ...and the refresh-token VALUE was written NOWHERE in the prepared tree" \
+    "$(grep -rlF -- "$cc_sentinel" "$ccroot" 2>/dev/null | wc -l | tr -d ' ')" "0"
+  chk "(#1675) ...and nothing was materialized for the container to mount" \
+    "$([[ -e "$ccroot/home/.claude" ]] && printf materialized || printf none)" "none"
+  # CONTROL — the refusal is keyed on the FORMAT, not on "anthropic" or "a claude HOME". Without
+  # this row, deleting the whole anthropic branch from worker-prep would leave every row above green.
+  rm -rf -- "$ccroot/home"
+  if (
+    export WORKER_ROOT="$ccroot" WORKER_ACCOUNT=acctexample WORKER_PROVIDER=anthropic \
+           WORKER_HARNESS=claude WORKER_CREDENTIAL_FORMAT=claude-oauth-token \
+           WORKER_ACCOUNT_CREDENTIAL='sk-ant-CCJSON-CONTROL-0000' GITHUB_ENV="$tmp/pf-ccok.env" \
+           GITHUB_OUTPUT="$tmp/pf-ccok.out"
+    unset GITHUB_PATH
+    bash "$SCRIPT_DIR/worker-prep.sh"
+  ) > "$tmp/pf-ccok.log" 2>&1; then cc_ok_rc=0; else cc_ok_rc=$?; fi
+  chk "(#1675 control) the SAME tree still prepares a claude-oauth-token account" \
+    "$cc_ok_rc:$([[ -f "$ccroot/home/.claude/worker-token" ]] && printf mounted || printf missing)" \
+    "0:mounted"
+  # ...and the launcher's own credential-format seam accepts EXACTLY the two opaque anthropic
+  # formats. An EXACT set, not a containment check (AGENTS.md AUTHOR pre-flight 6): restoring the
+  # silently-accepting `claude-credentials-json) ;;` arm — the shape #1675 found — turns this red,
+  # and so does quietly widening the seam to any other format. Parsed from the launcher's own body,
+  # so it measures the shipped control rather than a copy of it.
+  local _hh_accepts
+  sed -n '/^_run_headless_harness() {/,/^}/p' "$SCRIPT_DIR/worker-live.sh" > "$tmp/hh-body.sh"
+  _hh_accepts=$(python3 - "$tmp/hh-body.sh" <<'PY'
+import re
+import sys
+
+body = open(sys.argv[1], encoding="utf-8").read()
+block = re.search(r'case "\$credential_format" in\n(.*?)\n\s*esac', body, re.S)
+if block is None:
+    print("NO-CREDENTIAL-FORMAT-CASE")
+    raise SystemExit(0)
+arms, label, buf = [], None, []
+for line in block.group(1).splitlines():
+    line = line.strip()
+    if not line or line.startswith("#"):
+        continue
+    if label is None:
+        match = re.match(r"^([^()]+)\)(.*)$", line)
+        if match is None:
+            continue
+        label, line = match.group(1).strip(), match.group(2).strip()
+        buf = []
+    buf.append(line)
+    if line.endswith(";;"):
+        arms.append((label, " ".join(buf)))
+        label = None
+# An arm that does not `die` is an arm that lets this format reach the container.
+print(" ".join(sorted(name for name, arm in arms if not re.search(r"\bdie\b", arm))))
+PY
+)
+  chk "(#1675) the launcher's claude credential seam accepts EXACTLY the two opaque formats" \
+    "$_hh_accepts" "anthropic-api-key claude-oauth-token"
 
   # --- [issue #232] THE HAND-OFF. worker-prep used to append HOME, CODEX_HOME, the raw account
   # handle, the credential path and the rotation baseline to $GITHUB_ENV, which is JOB-WIDE: every
