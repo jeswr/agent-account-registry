@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5718,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "977f316c04875f6d5ad75e2ea2bd242c2dfcfc71",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The generated-companion registry and checker remain coherent and fail closed. C1 validates required metadata and resolvable companion/source/anchor/recipe paths; C2 checks every expanded anchor for both the scope marker and exact companion path; C3 ratchets the declared golden-file surface. The focused mutation table and direct unit tests exercise each load-bearing check through both aggregate and individual paths, while live-repository tests confirm the registry is complete and clean. The fast-fix workflow golden matches its source. No correctness, soundness, test-validity, or security defect was found. The self-test and all 14 focused tests pass at the PR head.",
+  "verdict": "approve"
+ }
+}
