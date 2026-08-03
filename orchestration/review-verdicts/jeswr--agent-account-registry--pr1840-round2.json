@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1840,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f0922c89ffa2fdbbb4458123f5e6e0190b918b54",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-1 major finding is resolved. The live account path now reads the shared deprecation register, skips the retired fable probe fail-closed, and retains an explicitly tested un-retirement path. The cost assertion now pins a legacy-fable + opus5 row to exactly two requests (base plus opus5 observation), so the new measurement no longer adds the known dead request. The added observation fields remain bounded and namespaced, and the tests exercise both producer merge behavior and the live admission/alert consumers with literal expectations. I found no blocker, major, or lower-severity defect in the diff.",
+  "verdict": "approve"
+ }
+}
