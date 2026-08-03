@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1917,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6b4742fdb399bd78738b53486209e44292dfa78e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_obs_mean` calls `math.isfinite(value)` directly for every integer. Python JSON decoding preserves arbitrary-size integers, and `math.isfinite(10**400)` raises `OverflowError` while converting that integer to a float. Thus a collector snapshot such as `review_rounds.mean = 10**400` aborts `_normalize_observability` rather than returning `None`, logging the field mismatch, and hiding only `review_rounds`. This violates the diff's explicit claims that malformed stats are dropped rather than fatal and that `_obs_mean` has the same fail-closed `None` behavior as its siblings. The added tests cover `Infinity` as a float but not the distinct oversized-integer path.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Make `_obs_mean` conversion total for accepted Python numeric types, for example by catching `OverflowError` around float conversion (as well as rejecting non-finite/negative results), and add a literal oversized-integer self-test asserting the whole stat hides, the expected diagnostic is emitted, and sibling flow stats remain published.",
+    "severity": "major",
+    "title": "Oversized integer means escape the fail-closed reader as an exception"
+   }
+  ],
+  "progress": null,
+  "summary": "The new fail-closed stat seam is generally well structured and the tests exercise field wiring, defaults, diagnostics, whole-stat hiding, and the rendered page. However, the new `_obs_mean` reader does not actually uphold the stated malformed-input tolerance: a JSON integer too large to convert to a C double raises `OverflowError` in `math.isfinite` and aborts normalization instead of dropping the statistic. Because collector data is untrusted/tolerated data and this contradicts the helper and seam contracts, the change is not complete.",
+  "verdict": "request_changes"
+ }
+}
