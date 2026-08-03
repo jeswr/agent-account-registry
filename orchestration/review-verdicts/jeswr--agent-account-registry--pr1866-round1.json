@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1866,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "996ab2fd2abf18e73bd0544f0b382f5baf6f74a7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_obs_lane_rows` announces an invalid lane container, name, or row, but it still silently accepts malformed data below that row. A non-object `1h`/`24h` value becomes `None` without a diagnostic, and each invalid/missing/negative `success`, `failure`, or `defer` value is converted to `0` by `_obs_count(...) or 0`. For example, `{'worker': {'1h': {'success': 'many', 'failure': -1, 'defer': null}}}` publishes a worker lane with all three counts at zero and prints no warning. That is precisely the false-healthy presentation the new announced-drop contract says it prevents. The added lane cases test only an invalid whole row and a fully valid row, so deleting diagnostics/validation for nested lane measurements remains outside the evidence path.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Validate each present lane window and each counter with an independently bounded lane-seam drop log before defaulting absent values. Announce present-but-unreadable windows/counters while preserving the intended policy for genuinely absent fields. Add literal-input/literal-expected self-test cases for malformed window containers and malformed/negative counters, plus a valid silent control, so each guard's wrong answer turns a named check red.",
+    "severity": "major",
+    "title": "Malformed lane windows and counters still fail open as healthy data"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change makes several top-level observability shape losses visible, but the lane seam still silently converts malformed nested measurements into healthy-looking zeros. Because the new tests cover only the lane container/name/row guards, they do not establish the stated every-drop-announced contract for the data that actually supplies lane health. This is a major, non-vacuity/completeness gap in the marquee behavior.",
+  "verdict": "request_changes"
+ }
+}
