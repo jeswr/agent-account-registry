@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1709,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ce464d7bc145b001dbbf8ecdf0455c48b4c4231b",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_park_call_site` still builds `iter_names` with `ast.walk(loop.iter)` and accepts the loop when any bound target name occurs anywhere in that expression. Consequently both `for target in targets and []:` and `for target in [] and targets:` retain `targets` syntactically, contain no slice, and expose the live park call in the loop body, so the checker returns `dispatch`; at runtime each iterable is always empty and no holder is parked. `_live_nodes` does not repair this because it is used to find the `For`, while the iterable-equivalence check remains an unrestricted descendant-name test. Neither shape appears in the added refusal tests, so the same bypass and test gap reported in round 3 remain.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Require the loop to directly iterate the bound target collection, or conservatively reject iterable expression shapes whose equivalence to that collection is not proved. Add explicit synthetic refusals for both `targets and []` and `[] and targets`, demonstrate that the current checker accepts them, and keep an acceptance test for the exact production iterable shape.",
+    "severity": "blocker",
+    "title": "The prior dead iterable bypass remains accepted"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 leaves the prior blocker materially unchanged. The new live-tree traversal addresses dead branches around the loop and park call, but the iterable binding proof still accepts a bound collection name anywhere inside an arbitrary iterable expression. Thus a loop that is guaranteed to yield no targets can still certify the production park batch. The new synthetic battery does not exercise either short-circuit iterable from the prior finding. Progress is stagnant because the same blocker remains at the same severity.",
+  "verdict": "request_changes"
+ }
+}
