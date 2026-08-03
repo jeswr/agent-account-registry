@@ -2095,14 +2095,39 @@ def _obs_trigger_rows(items):
     [#1570] `items` is UNBOUNDED here — `rows[:20]` truncates on the way OUT, after every row has
     been walked — and each row contributes up to 8 evidence drops, so the announcement is capped
     per BUILD rather than per row: a hoisted-into-the-loop counter would still let N rows write 8N
-    lines."""
+    lines.
+
+    [#1867] The ROW drops are announced too, which REVERSES the decision #1570 asserted (that a
+    non-object fire row stays silent). The evidence drops were loud while the row CARRYING them was
+    not, so a collector that spells a rule with a space (`worker failure rate`) lost the whole alarm
+    — panel row, summary and every link — with the loss visible nowhere: the exact `flow.queue`
+    shape #982 fixed, one seam over, and it reads worse here because a fire row that never arrives
+    renders identically to an alarm that never fired.
+
+    Two seams, counted SEPARATELY, for the reason `_ObsDropLog` keeps the queue and evidence seams
+    apart: a malformed ROW never reaches the evidence loop, so one shared budget would let a flood
+    of unreadable rows silence every link warning on the same document — trading one invisible loss
+    for another."""
     rows = []
+    row_drops = _ObsDropLog("observability trigger fire rows")
     drops = _ObsDropLog("observability evidence links")
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict):
+            row_drops.drop("observability trigger fire input "
+                           f"(the row (type {type(item).__name__}) is not an object)")
             continue
         rule = item.get("rule")
-        if not isinstance(rule, str) or OBS_TOKEN_RE.fullmatch(rule) is None:
+        # [#1867] One warning per drop REASON, as on `flow.queue`: a collector that omitted `rule`
+        # and one that spelled it with a space are different mistakes and must not read alike. Only
+        # the SHAPE reaches the build log — a type name, or the `_obs_text` sanitized and BOUNDED
+        # form of the rule — so a malformed snapshot cannot inject lines into the log diagnosing it.
+        if not isinstance(rule, str):
+            row_drops.drop("observability trigger fire input "
+                           f"(row `rule` (type {type(rule).__name__}) is not a rule-name STRING)")
+            continue
+        if OBS_TOKEN_RE.fullmatch(rule) is None:
+            row_drops.drop("observability trigger fire input "
+                           f"(row `rule` {_obs_text(rule, 64)!r} is not a safe token)")
             continue
         evidence = []
         for link in (item.get("evidence") if isinstance(item.get("evidence"), list) else [])[:8]:
@@ -2119,6 +2144,7 @@ def _obs_trigger_rows(items):
             "enqueued_task": task if isinstance(task, str)
             and OBS_TOKEN_RE.fullmatch(task) else None,
         })
+    row_drops.close()
     drops.close()
     rows.sort(key=lambda row: row["fired_at"] or "", reverse=True)
     return rows[:20]
@@ -6626,19 +6652,114 @@ esac
                       "evidence": ["https://evil.example/exfil"]}])[2],
           [_INT_CLASS] * 12 + [_SUPPRESSED.format(8, "observability queue rows", 20)]
           + [_EVIDENCE_DROP])
-    # The accept path of the evidence seam stays SILENT — the branch a `--self-test` line-coverage
-    # run showed had never executed at all (pre-flight 1) is the non-object fire row, so it rides
-    # along here: it is dropped without a diagnostic today and must not grow a tail line either.
-    check("[#1570] a fire row whose links all parse prints NOTHING, and a non-object fire row is "
-          "still dropped silently — a tail line on a build that withheld nothing is noise",
+    # The accept path of BOTH trigger seams stays SILENT — a build that dropped nothing may print
+    # neither a per-row line nor a tail, or the warning marks nothing. ([#1867] rewrote this row:
+    # it used to ride a `None` fire row along and assert the row drop was silent, which is the
+    # decision that issue reverses. The accept-path half is unchanged and is what keeps the loud
+    # rows below non-vacuous — an unconditional print, or an unconditional `close()`, reds here.)
+    check("[#1570] a fire row whose links all parse prints NOTHING — a tail line on a build that "
+          "withheld nothing is noise",
           obs_drops([{"class": "2a", "depth": 1}],
-                    [None, {"rule": "quiet-rule", "fired_at": now - 300, "summary": "s",
-                            "evidence": ["https://github.com/jeswr/agent-account-registry/"
-                                         "actions/runs/7"]}]),
+                    [{"rule": "quiet-rule", "fired_at": now - 300, "summary": "s",
+                      "evidence": ["https://github.com/jeswr/agent-account-registry/"
+                                   "actions/runs/7"]}]),
           ([{"class": "2a", "depth": 1, "oldest_age_minutes": None}],
            [{"rule": "quiet-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "s",
              "evidence": ["https://github.com/jeswr/agent-account-registry/actions/runs/7"],
              "enqueued_task": None}], []))
+    # ---- [#1867] A DROPPED FIRE ROW MUST NAME ITSELF. The evidence-LINK drops above are loud while
+    # the row CARRYING them was not, so a collector that spells a rule with a space lost the whole
+    # alarm — panel row, summary, every link — on a green build with the loss visible nowhere. That
+    # reads worse than the `flow.queue` case #982 fixed: an alarm that was dropped and an alarm that
+    # never fired both render as an absent trigger row. Every expected string below is a test-side
+    # literal (reading the message back off the module is pre-flight 2(b)'s tautology) and every
+    # input is a literal (2(c)); the capture is `obs_drops`, which keeps EVERY `dashboard-gen:` line
+    # in order and unfiltered, so a line printed to the wrong seam or with the wrong text reds.
+    _FIRE_DROP = "dashboard-gen: dropped observability trigger fire input ({})"
+    _FIRE_ROWS = "observability trigger fire rows"
+    _KEPT_FIRE = {"rule": "kept-rule", "fired_at": now - 300, "summary": "s", "evidence": []}
+    _KEPT_PUBLISHED = {"rule": "kept-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "s",
+                       "evidence": [], "enqueued_task": None}
+    # THE REGRESSION, in the shape the issue names. Both directions in one row: the unreadable rule
+    # is announced, AND the row beside it still publishes — this is a drop diagnostic, not a new
+    # fatality and not a reason to fail the panel.
+    check("[#1867] a rule spelled with a SPACE loses its whole alarm — row, summary and links — "
+          "and now names itself instead of vanishing from the trigger panel on a green build",
+          obs_drops([], [{"rule": "worker failure rate", "fired_at": now - 300,
+                          "summary": "worker failure rate 67% over 3 consecutive runs",
+                          "evidence": ["https://github.com/jeswr/agent-account-registry/"
+                                       "actions/runs/9"]},
+                         copy.deepcopy(_KEPT_FIRE)]),
+          ([], [_KEPT_PUBLISHED],
+           [_FIRE_DROP.format("row `rule` 'worker failure rate' is not a safe token")]))
+    # One warning per drop REASON, each naming what failed: a single shared message would leave a
+    # missing `rule` reading as a misspelled one. The null/missing cases are here because their
+    # wrongly-typed siblings do not cover them — pre-flight item 3's #938 shape, and null is the
+    # likeliest thing a JSON producer actually emits.
+    for case, fires, detail in (
+        ("a non-object row", [["worker-failure-rate", 3]], "the row (type list) is not an object"),
+        ("a null row", [None], "the row (type NoneType) is not an object"),
+        ("a missing rule", [{"summary": "s"}],
+         "row `rule` (type NoneType) is not a rule-name STRING"),
+        ("an explicitly null rule", [{"rule": None, "summary": "s"}],
+         "row `rule` (type NoneType) is not a rule-name STRING"),
+        ("a non-string rule", [{"rule": 7, "summary": "s"}],
+         "row `rule` (type int) is not a rule-name STRING"),
+        ("an empty rule", [{"rule": "", "summary": "s"}], "row `rule` '' is not a safe token"),
+        ("a punctuated rule", [{"rule": "bad rule!", "summary": "s"}],
+         "row `rule` 'bad rule!' is not a safe token"),
+    ):
+        check(f"[#1867] {case} is dropped LOUDLY, by the reason that failed",
+              obs_drops([], fires), ([], [], [_FIRE_DROP.format(detail)]))
+    # ...and the ONE collector value these messages quote is sanitized and BOUNDED on the way out.
+    # Echo `rule` raw instead of `_obs_text(rule, 64)` and a hostile or merely enormous rule writes
+    # itself into the build log that is diagnosing it — the capture is unfiltered, so a forged line
+    # would arrive as a second entry here.
+    for case, rule, quoted in (
+        ("non-printable", "ok\ndashboard-gen: dropped observability trigger fire input (forged)",
+         "''"),
+        ("4000 characters long", "9" * 4000, "'" + "9" * 64 + "'"),
+    ):
+        check(f"[#1867] a {case} rule is not echoed into the build log that diagnoses it",
+              obs_drops([], [{"rule": rule, "summary": "s"}]),
+              ([], [], [_FIRE_DROP.format(f"row `rule` {quoted} is not a safe token")]))
+    # `items` is unbounded on the way IN (`rows[:20]` cuts on the way OUT), so this seam needs the
+    # #1570 cap as much as the queue seam does: 20 unreadable rows print 12 warnings and ONE tail
+    # naming the REAL total. Sizes and expected strings are literals — deriving either from
+    # OBS_DROP_WARN_MAX is the #941 tautology. The 21st row still publishes: capping a WARNING must
+    # never cap the DATA.
+    check("[#1867] 20 unreadable fire rows print 12 warnings and ONE tail naming the real total — "
+          "an unbounded diagnostic floods the log it exists to make legible",
+          obs_drops([], [{"rule": "bad rule!", "summary": "s"} for _ in range(20)]
+                    + [copy.deepcopy(_KEPT_FIRE)]),
+          ([], [_KEPT_PUBLISHED],
+           [_FIRE_DROP.format("row `rule` 'bad rule!' is not a safe token")] * 12
+           + [_SUPPRESSED.format(8, _FIRE_ROWS, 20)]))
+    # The row seam and the evidence seam count SEPARATELY, for the reason the queue and evidence
+    # seams do. A malformed ROW never reaches the evidence loop, so a single shared counter would
+    # let a flood of unreadable rows silence every link warning on the same document — trading one
+    # invisible loss for another — and would print one tail naming the wrong seam. Order is fixed:
+    # the good row is last, so its link warning prints inside the loop, before either tail.
+    check("[#1867] a flooded row seam does not consume the evidence seam's budget: the lone bad "
+          "link still names itself, and each seam closes with its own tail",
+          obs_drops([], [{"rule": "bad rule!", "summary": "s"} for _ in range(20)]
+                    + [{"rule": "kept-rule", "fired_at": now - 300, "summary": "s",
+                        "evidence": ["https://evil.example/exfil"]}])[2],
+          [_FIRE_DROP.format("row `rule` 'bad rule!' is not a safe token")] * 12
+          + [_EVIDENCE_DROP] + [_SUPPRESSED.format(8, _FIRE_ROWS, 20)])
+    # Both seams over their budget on ONE document, which is the only shape that pins the whole
+    # interleaving: 12 row lines, then the link lines from the two rows that survived, then TWO
+    # tails, each naming its own seam with its own two numbers. A shared counter, a tail attributed
+    # to the wrong seam, or a total that counted the other seam's drops reds this row.
+    check("[#1867] both seams over budget on one document: each caps at 12, and each closes with "
+          "its OWN tail carrying its OWN real total",
+          obs_drops([], [{"rule": "bad rule!", "summary": "s"} for _ in range(20)]
+                    + [{"rule": f"kept-rule-{index}", "fired_at": now - 300, "summary": "s",
+                        "evidence": ["https://evil.example/exfil"] * 8} for index in range(2)])[2],
+          [_FIRE_DROP.format("row `rule` 'bad rule!' is not a safe token")] * 12
+          + [_EVIDENCE_DROP] * 12
+          + [_SUPPRESSED.format(8, _FIRE_ROWS, 20),
+             _SUPPRESSED.format(4, "observability evidence links", 16)])
     # ---- [#1880] A FLOW STAT THE COLLECTOR SENT AND THIS BUILD CANNOT READ MUST NOT PUBLISH AS A
     # HEALTHY NUMBER. `_obs_count(...) or 0` mapped every unreadable park/sample count to 0, so
     # `parks_1h: {"needs_user": "lots", "needs_orchestrator": -3}` published `0 user · 0 orch` on
