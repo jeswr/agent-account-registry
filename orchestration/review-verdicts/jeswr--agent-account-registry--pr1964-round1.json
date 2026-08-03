@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1964,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f25e51dd4eba04f340e02dba5a6bde22f666a928",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new consumer assumes enrollment writes `refs/acct-requests/<request>/<handle>/<provider>/<format>/<digest>` immediately before `gh secret set`, but the checkout contains no writer for `refs/acct-requests/`. In `.github/workflows/set-up-account.yml`, the live store step creates only `refs/acct-claims/$cand`, performs the absence probes, and then invokes `gh secret set`; it never creates the binding described here. A repository-wide search likewise finds this namespace only in the files added/edited by this reporting change. Thus real failed enrollments cannot produce the evidence `binding_ref_handles()` consumes, `bindings=0` is the effective steady state, and the two burned-slot cases still print identically. The tests fabricate binding API rows, so they prove the consumer against an impossible fixture rather than binding the producer/consumer seam.",
+    "file": "scripts/groom.py",
+    "fix_hint": "Implement the SHA/ref creation in the actual enrollment workflow at the documented point before credential storage, with fail-closed error handling and retry/resume semantics, and add a seam test that asserts the production workflow writes the exact ref grammar consumed here. Alternatively, if another real producer exists outside this checkout, include and bind verifiable evidence of that producer's exact ref shape before claiming this report is operational.",
+    "severity": "major",
+    "title": "The binding report has no producer in the enrollment path"
+   }
+  ],
+  "progress": null,
+  "summary": "The report-side parser, fail-closed handling, pagination, privacy checks, and end-to-end report tests are internally careful, but the marquee behavior is not delivered by this checkout. The registry's enrollment workflow does not create any `refs/acct-requests/` binding before storing the credential, and no other repository code writes that namespace. Consequently the new inventory will remain empty for real enrollments and burned slots will never receive the promised resumable annotation. The README and comments describe a protocol that the actual producer does not implement.",
+  "verdict": "request_changes"
+ }
+}
