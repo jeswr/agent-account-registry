@@ -848,6 +848,29 @@ _assert_worktree_unchanged_by_gate() {
     "${expected:0:12}"
 }
 
+# [issue #255] KNOWN RESIDUAL — GATE EGRESS. Stated here because this is the seam that exists: #255
+# asks for it in a `_gate_container_argv` header, and there is no gate container. This body runs the
+# TARGET's own build scripts and tests directly on the runner, as the runner user, inside the tree
+# the model wrote — with unrestricted outbound network and a stdout/stderr stream surfaced verbatim
+# in a PUBLIC job log while the run is live. The pre-gate purge (`purge_credentials`, below in this
+# file, run strictly before this in both lanes) removes the credential TREE under $WORKER_ROOT; it
+# does not and cannot see an ENCODED copy the model stashed in $TARGET_DIR, and no
+# content scan here could (the encoding is the attacker's choice). So gate code that finds such a
+# copy can send it out immediately — which is strictly more than the publish path exposes, where the
+# work is staged into a DRAFT PR that only an INDEPENDENT cross-provider approve can arm, host-side,
+# bound to the reviewed SHA and audited (worker-pr.ready_and_arm). Name that boundary precisely: this
+# target sets arm_auto_merge=true and Decision 7 made approve ITSELF the arm on every surface,
+# trust-surface hits included (they feed the post-arm audit trail, not a human park) — so it is
+# DELAYED + REVIEWED + SHA-BOUND, not a human arm. The gate's is neither: no reviewer, no record.
+#
+# NOT closed by what surrounds this: #248's post-gate seal refuses a gate that WRITES the tree,
+# #575 ensures nothing token-bearing FOLLOWS the gate, and #91's command-file quarantine is
+# explicitly defence-in-depth at the same uid. None of them touch READ + EGRESS.
+#
+# The decided shape, the mechanisms rejected as false closes (output filters, a second literal scan,
+# a read-only target mount, a bare HTTPS_PROXY), and what a landing increment must measure live are
+# in research/255-gate-egress-containment.md. Do not add an egress mitigation here without reading
+# §6-§7 of it first.
 run_gate() {
   require_target
   local profile=${GATE_PROFILE:-}
