@@ -333,19 +333,86 @@ _credential_mount_args() {
 # mounts the launcher writes LITERALLY. The one mount added indirectly (the credential mount, via
 # `container+=`) has its own contract rows against `_credential_mount_args`, and the caller pins the
 # number of indirect appends so a NEW indirect mount cannot slip past this scan either.
+#
+# SYNTAX COVERAGE — the scan must be exhaustive over the ways docker accepts a host path, or the
+# "exact" list is not exact: an earlier version keyed on the literal text `type=bind,...`, so adding
+# `--volume "$SCRIPT_DIR/..:/registry"` (or the `-v` short form) mounted the writable registry
+# checkout into the model while every row below stayed green. So this NORMALIZES rather than
+# pattern-matches: `--mount`/`--volume`/`-v` (space-separated, `--flag=value`, and `-vSPEC`
+# attached) are structurally parsed into the same `<src> <dst> <rw|readonly>` record, and any other
+# form that can put a host path (or a device) in the container — `--volumes-from`, `--device`,
+# `--privileged`, a non-`bind` `--mount` type, an unknown mount option key, a malformed spec — emits
+# an `UNRECOGNIZED ...` record instead of being skipped. An UNRECOGNIZED record can never equal the
+# caller's expected list, so an unrecognized form fails the containment assertion CLOSED rather than
+# passing silently. `--tmpfs` is the one deliberately-skipped form: it is memory-backed and maps no
+# host path, so it cannot expose the registry checkout.
 _model_container_binds() {
   local file=$1
   [[ -f "$file" ]] || { printf 'worker-live: launcher source missing: %s\n' "$file" >&2; return 1; }
-  awk '
+  # -v q="'" so the unquoter can strip single quotes without embedding one in this awk program.
+  awk -v q="'" '
+    function unquote(s) { gsub(/"/, "", s); gsub(q, "", s); return s }
+    # --mount: comma-separated key=value; only a complete type=bind spec built from known keys is a
+    # recognized record. Unknown key, missing src/dst, or a non-bind type => fail closed.
+    function emit_mount(spec,   n, i, p, eq, k, v, type, src, dst, ro) {
+      n = split(spec, p, /,/); ro = "rw"
+      for (i = 1; i <= n; i++) {
+        if (p[i] == "readonly" || p[i] == "ro" || p[i] == "readonly=true" || p[i] == "ro=true") {
+          ro = "readonly"; continue
+        }
+        if (p[i] == "readonly=false" || p[i] == "ro=false") continue
+        eq = index(p[i], "=")
+        if (eq == 0) { print "UNRECOGNIZED --mount " spec; return }
+        k = substr(p[i], 1, eq - 1); v = substr(p[i], eq + 1)
+        if (k == "type") type = v
+        else if (k == "src" || k == "source") src = v
+        else if (k == "dst" || k == "destination" || k == "target") dst = v
+        else { print "UNRECOGNIZED --mount " spec; return }
+      }
+      if (type != "bind" || src == "" || dst == "") { print "UNRECOGNIZED --mount " spec; return }
+      print src " " dst " " ro
+    }
+    # --volume/-v: src:dst[:opts]. A 1-part spec is an anonymous volume, a 4+-part spec is not a
+    # form we model, and any option beyond ro/rw is unmodelled => fail closed.
+    function emit_volume(spec,   n, p, m, o, i, src, dst, ro) {
+      n = split(spec, p, /:/); ro = "rw"
+      if (n < 2 || n > 3) { print "UNRECOGNIZED --volume " spec; return }
+      src = p[1]; dst = p[2]
+      if (n == 3) {
+        m = split(p[3], o, /,/)
+        for (i = 1; i <= m; i++) {
+          if (o[i] == "ro") ro = "readonly"
+          else if (o[i] == "rw") ro = "rw"
+          else { print "UNRECOGNIZED --volume " spec; return }
+        }
+      }
+      if (src == "" || dst == "") { print "UNRECOGNIZED --volume " spec; return }
+      print src " " dst " " ro
+    }
     /^_run_headless_harness\(\) \{/ { inside=1; next }
     !inside { next }
     /^\}/ { exit }
     /^[[:space:]]*#/ { next }
-    match($0, /type=bind,[^"]*/) {
-      spec = substr($0, RSTART, RLENGTH)
-      src = spec; sub(/.*,src=/, "", src); sub(/,.*$/, "", src)
-      dst = spec; sub(/.*,dst=/, "", dst); sub(/,.*$/, "", dst)
-      print src " " dst " " (spec ~ /,readonly$/ ? "readonly" : "rw")
+    {
+      nt = split($0, tok, /[ \t]+/)
+      for (ti = 1; ti <= nt; ti++) {
+        t = tok[ti]; flag = ""; spec = ""
+        if (t == "--mount" || t == "--volume" || t == "-v" || t == "--tmpfs" ||
+            t == "--volumes-from" || t == "--device") {
+          flag = t; spec = (ti < nt ? tok[ti + 1] : ""); ti++
+        }
+        else if (t ~ /^--mount=/)  { flag = "--mount";  spec = substr(t, 9) }
+        else if (t ~ /^--volume=/) { flag = "--volume"; spec = substr(t, 10) }
+        else if (t ~ /^--tmpfs=/)  { flag = "--tmpfs";  spec = substr(t, 9) }
+        else if (t ~ /^-v./ && t !~ /^--/) { flag = "--volume"; spec = substr(t, 3) }
+        else if (t == "--privileged") { print "UNRECOGNIZED --privileged"; continue }
+        else continue
+        spec = unquote(spec)
+        if (flag == "--tmpfs") continue                     # memory-backed; maps no host path
+        else if (flag == "--mount") emit_mount(spec)
+        else if (flag == "--volume" || flag == "-v") emit_volume(spec)
+        else print "UNRECOGNIZED " flag " " spec
+      }
     }
   ' "$file"
 }
@@ -4419,10 +4486,13 @@ $worker_root/cli /opt/model-cli readonly'
   chk "#300: ...and the file really does carry type=bind text outside the launcher (bounded scan)" \
     "$([[ "$(grep -c 'type=bind' "$hh_src" || true)" -gt 4 ]] && printf outside || printf none)" "outside"
 
-  # NON-VACUITY — three line-anchored mutants of the SHIPPED launcher, each verified to have changed
-  # the tree before its verdict is read (mutation-run hygiene: a `str.replace` that hit nothing
-  # reports a phantom survivor). The first of them — the registry checkout handed to the model as a
-  # writable mount — is the exact shape #300 describes.
+  # NON-VACUITY — line-anchored mutants of the SHIPPED launcher, each verified to have changed the
+  # tree AND to still be valid shell before its verdict is read (mutation-run hygiene: a
+  # `str.replace` that hit nothing reports a phantom survivor, and a mutant that no longer parses
+  # would be caught by `bash -n` in the gate rather than by the assertion under test). The first
+  # three mount the registry checkout the way #300 describes — via `--mount`, via `--volume`, and
+  # via the `-v` short form — because docker accepts all three and a text scan keyed on
+  # `type=bind` sees only the first.
   local hh_anchor_cli='    --mount "type=bind,src=$worker_root/cli,dst=/opt/model-cli,readonly"'
   local hh_anchor_git='    --mount "type=bind,src=$TARGET_DIR/.git,dst=/workspace/.git,readonly"'
   # Counted inside the LAUNCHER BODY, and every mutation below is a whole-LINE equality test: these
@@ -4436,19 +4506,114 @@ $worker_root/cli /opt/model-cli readonly'
   awk -v anchor="$hh_anchor_cli" '{ print } $0 == anchor {
       print "    --mount \"type=bind,src=$SCRIPT_DIR/..,dst=/registry\"" }' \
     "$hh_src" > "$hh_mut/registry-mounted.sh"
+  awk -v anchor="$hh_anchor_cli" '{ print } $0 == anchor {
+      print "    --volume \"$SCRIPT_DIR/..:/registry\"" }' \
+    "$hh_src" > "$hh_mut/registry-volume.sh"
+  awk -v anchor="$hh_anchor_cli" '{ print } $0 == anchor {
+      print "    -v \"$SCRIPT_DIR/..:/registry:rw\"" }' \
+    "$hh_src" > "$hh_mut/registry-volume-short.sh"
+  awk -v anchor="$hh_anchor_cli" '{ print } $0 == anchor {
+      print "    --mount \"type=volume,src=regvol,dst=/registry,volume-opt=o=bind\"" }' \
+    "$hh_src" > "$hh_mut/registry-volume-driver.sh"
   awk -v anchor="$hh_anchor_cli" '$0 != anchor { print }' "$hh_src" > "$hh_mut/cli-unmounted.sh"
   awk -v anchor="$hh_anchor_git" '{ if ($0 == anchor) { sub(/,readonly"$/, "\""); } print }' \
     "$hh_src" > "$hh_mut/git-writable.sh"
   local hh_mutant
-  for hh_mutant in registry-mounted cli-unmounted git-writable; do
+  for hh_mutant in registry-mounted registry-volume registry-volume-short \
+    registry-volume-driver cli-unmounted git-writable; do
     chk "#300 ($hh_mutant): the mutant really differs from the shipped launcher" \
       "$(cmp -s "$hh_src" "$hh_mut/$hh_mutant.sh" && printf same || printf changed)" "changed"
+    chk "#300 ($hh_mutant): the mutant is still valid shell (a real edit, not a parse error)" \
+      "$(bash -n "$hh_mut/$hh_mutant.sh" 2>/dev/null && printf parses || printf broken)" "parses"
     chk "#300 ($hh_mutant): the exact-list assertion CATCHES it (non-vacuous)" \
       "$([[ "$(_model_container_binds "$hh_mut/$hh_mutant.sh")" == "$hh_binds_expected" ]] \
         && printf missed || printf caught)" "caught"
   done
+  # ...and CAUGHT for the right reason: the volume forms are STRUCTURALLY normalized into the same
+  # record shape (so the extra registry mount is visible as a mount, not merely as a parse failure),
+  # while a docker mount form this scan does not model degrades to an UNRECOGNIZED record — which
+  # can never equal the expected list, i.e. an unmodelled syntax fails closed instead of silently.
+  chk "#300: a --volume registry mount normalizes into the pinned record shape" \
+    "$(_model_container_binds "$hh_mut/registry-volume.sh" | tail -n 1)" \
+    '$SCRIPT_DIR/.. /registry rw'
+  chk "#300: the -v short form normalizes identically (opts parsed, not ignored)" \
+    "$(_model_container_binds "$hh_mut/registry-volume-short.sh" | tail -n 1)" \
+    '$SCRIPT_DIR/.. /registry rw'
+  chk "#300: an unmodelled docker mount form degrades to an UNRECOGNIZED record (fails closed)" \
+    "$(_model_container_binds "$hh_mut/registry-volume-driver.sh" | tail -n 1)" \
+    'UNRECOGNIZED --mount type=volume,src=regvol,dst=/registry,volume-opt=o=bind'
   chk "#300: the launcher scan fails CLOSED on an unreadable source (never an empty pass)" \
     "$(_model_container_binds "$tmp/no-such-launcher.sh" 2>/dev/null; printf '%s' "$?")" "1"
+
+  # SYNTAX COVERAGE. The mutants above only exercise the three forms they insert, and every other
+  # branch of the normalizer is a never-executed line — which is exactly where the previous
+  # `type=bind`-text scan hid its hole (AGENTS.md AUTHOR pre-flight item 1). One synthetic launcher
+  # drives EVERY branch at once and its whole record list is pinned literally, so a normalizer that
+  # silently skips (rather than refuses) any docker form goes red here instead of in production.
+  # The fixture's OPENING line is composed at runtime on purpose: a second literal
+  # `^_run_headless_harness() {` in this file would extend the
+  # `sed -n '/^_run_headless_harness() {/,/^}/p'` ranges that other rows use to read the real body.
+  local hh_syntax="$tmp/hh-syntax-fixture.sh" hh_syntax_expected
+  { printf '%s() {\n' _run_headless_harness
+    cat <<'FIXTURE'
+  local -a container=(
+    docker run --rm --read-only
+    --tmpfs /tmp:rw,size=1g
+    --tmpfs=/scratch:rw
+    --mount "type=bind,src=/a,dst=/a1"
+    --mount type=bind,source=/b,target=/b1,readonly
+    --mount "type=bind,src=/c,dst=/c1,ro=true"
+    --mount "type=bind,src=/d,dst=/d1,readonly=false"
+    --mount=type=bind,src=/e,dst=/e1
+    --mount "type=bind,src=/f"
+    --mount "type=bind,src=/g,dst=/g1,bind-propagation=rslave"
+    --mount "type=volume,src=v,dst=/v1"
+    --mount "type=bind,src=/h,dst=/h1,junk"
+    --volume /i:/i1
+    --volume "/j:/j1:ro"
+    --volume=/k:/k1:rw
+    -v /l:/l1
+    -v/m:/m1
+    --volume /n
+    --volume "/o:/o1:z"
+    --volume "/p:/p1:ro:extra"
+    --volumes-from helper
+    --device /dev/x:/dev/y
+    --privileged
+  )
+  # CONTROL: a commented-out --volume /nope:/nope must stay invisible to the scan.
+}
+FIXTURE
+  } > "$hh_syntax"
+  hh_syntax_expected='/a /a1 rw
+/b /b1 readonly
+/c /c1 readonly
+/d /d1 rw
+/e /e1 rw
+UNRECOGNIZED --mount type=bind,src=/f
+UNRECOGNIZED --mount type=bind,src=/g,dst=/g1,bind-propagation=rslave
+UNRECOGNIZED --mount type=volume,src=v,dst=/v1
+UNRECOGNIZED --mount type=bind,src=/h,dst=/h1,junk
+/i /i1 rw
+/j /j1 readonly
+/k /k1 rw
+/l /l1 rw
+/m /m1 rw
+UNRECOGNIZED --volume /n
+UNRECOGNIZED --volume /o:/o1:z
+UNRECOGNIZED --volume /p:/p1:ro:extra
+UNRECOGNIZED --volumes-from helper
+UNRECOGNIZED --device /dev/x:/dev/y
+UNRECOGNIZED --privileged'
+  chk "#300: every docker mount form normalizes or REFUSES — none is silently skipped" \
+    "$(_model_container_binds "$hh_syntax")" "$hh_syntax_expected"
+  # ...and the two rows that would make the list above lie if they were wrong, asserted directly:
+  # `--tmpfs` is the ONE deliberately-skipped form (memory-backed, maps no host path), and the
+  # bounded/comment skipping still holds, so "not in the list" means "cannot expose a host path".
+  chk "#300: --tmpfs (both spellings) is the only silently-skipped form, and it maps no host path" \
+    "$(_model_container_binds "$hh_syntax" | grep -c -e tmpfs -e scratch || true)" "0"
+  chk "#300: ...and a commented-out mount stays invisible (the scan is not a raw text grep)" \
+    "$(_model_container_binds "$hh_syntax" | grep -c nope || true)" "0"
 
   # --- telemetry: claude stream-json fixture (with transcript content that must NOT cross) ---
   cat > "$tmp/claude.log" <<'LOG'
