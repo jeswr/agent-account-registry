@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1807,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "eb61663c1a5f8f2b402e7bf178676b8ec4984394",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe post-gate seal remains correct and complete. Both live gate steps consume the exact pre-gate output emitted by their own sealing phase; malformed or absent expectations fail before target-controlled code runs; every gate profile reaches the post-body comparison; and recomputation fails closed. The throwaway-index digest preserves the real HEAD/index/worktree, covers tracked edits, deletions, and untracked publishable files while excluding ignored build output, and the worker lane additionally binds it to the exact patch bytes later published. The self-tests exercise the helper, end-to-end mutation and deletion refusals, ignored-output success, missing/malformed/unreadable failure arms, output-name seams, and exact workflow wiring with a deletion control. I found no correctness, soundness, test-vacuity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
