@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1917,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "313dcd979929a210ecde0e7af8223df17bb8c7cc",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The prior round's oversized-integer failure is resolved correctly: `_obs_mean` now converts accepted numeric input inside an `OverflowError` guard, rejects non-finite and negative results, and returns the fail-closed `None` expected by `_obs_stat`. The new literal `10 ** 400` coverage checks both the field diagnostic/whole-stat hiding behavior and the stronger end-to-end contract that sibling flow data and the queue remain published, with a guarded projection that prevents a crash from masquerading as a kill. The broader stat seam remains fail-closed, distinguishes absent/null fields from malformed sent values, avoids logging collector-controlled content, and its executed page checks verify that unreadable counts do not render as false-healthy zeroes. I found no remaining correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
