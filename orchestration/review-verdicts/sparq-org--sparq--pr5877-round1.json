@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5877,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f3b3df25aaa3e804a6dbf6c07d9eff0792285682",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The wasm-pack version alignment is correct and the added regression coverage is substantive: it discovers both existing direct action call sites, rejects missing or floating version inputs, and enforces a single shared version. The focused test suite passes, and the workflow change preserves the pinned action SHA while updating only the requested tool version.",
+  "verdict": "approve"
+ }
+}
