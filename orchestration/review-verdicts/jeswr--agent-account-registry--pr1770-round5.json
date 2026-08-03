@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1770,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ae2caaa499c53b30baceb03fb359a4219d2899a4",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-5 diff is correct and complete. The added self-tests exercise the production provider-capped scan with a literal enabled-fleet map and distinct, literal expectations. They cover both relevant outcomes: all enabled accounts capped despite a non-enabled record, and partial enabled-fleet churn despite non-enabled success/limit records. The checks independently pin the fire decision, reset hint, enabled-only churn count, and absence of the hostile non-enabled reset from the action, so removing or bypassing the enabled-account filter is observable. Expected values are not derived from production constants or fixture transformations. The test-only change weakens no trust control, exposes no sensitive data, and contains no instruction-like injection. There are no review findings.",
+  "verdict": "approve"
+ }
+}
