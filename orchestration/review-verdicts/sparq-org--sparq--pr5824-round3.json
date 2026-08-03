@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5824,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "94a4a2c0fa79085bfc06c048c0e2683e8402d101",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "classify_step checks `pinned not in CLASS_OF_BUCKET` before validating the override value's type. A valid JSON object such as `{\"clippy (deny warnings)\": []}` therefore attempts to hash a list and raises TypeError outside the InventoryError boundary, producing the traceback/exit-1 behavior the module explicitly promises to eliminate. The new unusable-file tests cover JSON syntax and top-level shape, but not malformed values inside an otherwise valid overrides object.",
+    "file": "scripts/ci_leg_inventory.py",
+    "fix_hint": "Require every override value to be a string (and a known bucket) when loading overrides, or make classify_step validate the type before membership lookup. Add a CLI-level test using an array-valued override and assert exit 2, empty stdout, one-line stderr, and no traceback. Include null explicitly as well so it cannot silently mean 'no override'.",
+    "severity": "major",
+    "title": "Malformed override values can still escape as exit 1"
+   },
+   {
+    "body": "argparse accepts `--max-unclassified nan` as a float. IEEE comparisons with NaN are false, so `unknown > args.max_unclassified` never fires, even when most or all measured step time is unclassified. The command then emits the plausible wrong steering table that this threshold is specifically meant to prevent. The under/over tests use only finite thresholds and do not exercise malformed numeric limits.",
+    "file": "scripts/ci_leg_inventory.py",
+    "fix_hint": "Validate --max-unclassified with `math.isfinite` and an intentional range (normally 0..100), converting invalid values to InventoryError/exit 2. Add CLI tests showing NaN cannot bypass a fully drifted sample and that invalid infinities/range values fail without output or traceback.",
+    "severity": "major",
+    "title": "NaN disables the fail-loud unclassified-time guard"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 fixes the prior round's concrete fixture/override file-loading and malformed steps-shape failures and adds meaningful CLI-level coverage for them. However, the advertised fail-loud boundary remains bypassable through two ordinary CLI inputs: a JSON override whose value is an array raises an uncaught TypeError, and NaN for --max-unclassified disables the classifier-health guard. Because these are new major correctness findings in the steering instrument's load-bearing failure behavior, progress is regressing under the required comparison scale.",
+  "verdict": "request_changes"
+ }
+}
