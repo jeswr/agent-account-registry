@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5860,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d6ab8e632acbc6f2cedc00a0c3a124291401b098",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "select_open_issue() accepts `marker in title and key in title`, so a requested key such as `suite=sparq` also matches `suite=sparq-engine`, and analogous prefix collisions exist in the copied lane/shard predicates. The title format has a delimiter after the key, but the predicate does not enforce it. A collision makes the filer comment on an unrelated issue and skip creation of the issue for the actual failure, violating the one-rolling-issue-per-key contract. The new tests cover marker separation and missing keys but not key-boundary collisions.",
+    "file": "scripts/bench-triage.py",
+    "fix_hint": "Match the complete structured title prefix or parse the key up to its delimiter, e.g. require `title.startswith(f\"{marker} {key}:\")` where that format is canonical. Apply the same exact-boundary rule to the lane and shard selectors in all changed filers, and add negative tests proving `foo` does not match `foobar` (plus the corresponding suite/cluster prefix case).",
+    "severity": "major",
+    "title": "Substring key matching conflates prefix-related dedupe keys"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The prior pagination defect is fixed: the changed filers now exhaust the label-scoped REST listing, filter pull requests, and the new tests place the match beyond the first page. However, the title predicate still uses raw substring containment for structured keys. This can conflate prefix-related lanes, shards, suites, or clusters (for example, lane=foo matches a title containing lane=foobar), causing a real new failure to be commented onto the wrong issue and suppressing its own issue. Because this is a newly identified major correctness finding, progress is regressing under the required scale despite the round-1 issue being resolved.",
+  "verdict": "request_changes"
+ }
+}
