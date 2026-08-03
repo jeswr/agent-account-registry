@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1979,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1cf295b9845996173bc853ae983e68307e49ec29",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [
+   {
+    "body": "`_assert_issue_form_valid` checks an element ID only when the `id` key is present. GitHub issue forms require `id` on input, textarea, dropdown, and checkboxes elements; markdown is the exception. The validator therefore accepts renderer-invalid forms containing non-markdown elements with no ID. The new `no-ids.yml` fixture does not close the prior finding: it asserts that this invalid shape is accepted, making the test enforce the bug. The invalid/duplicate-ID and attribute/nested-option checks are useful, but they do not compensate for the missing required-ID check.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Require `id` for every element type except `markdown`, then validate its string syntax and uniqueness. Replace the test expecting all non-markdown IDs to be optional with focused negative fixtures for a missing ID on each supported non-markdown type (or a representative fixture plus a schema-wide assertion), while retaining the positive markdown-without-ID case and the invalid/duplicate-ID tests.",
+    "severity": "major",
+    "title": "Non-markdown elements still pass without required IDs"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-1 major finding remains: the validator deliberately treats `id` as optional for every element, but GitHub's issue-form schema requires an `id` for each non-markdown input element. Consequently, touched forms can still pass this gate while violating the renderer schema, and the new `no-ids.yml` test codifies the incorrect behavior. The attribute-shape and nested-option portions of the prior finding have been addressed with focused tests. The diff also contains reviewer-directed imperative text (`do not \"fix\" this to required`), so injection detection is set. Changes are still required.",
+  "verdict": "request_changes"
+ }
+}
