@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1969,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b719e87c72be1316ee50b5753871639c360c3b16",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains correct and complete. The census is derived only after the canonical health ledger passes the shared fail-closed validator; it counts every no_change record, folds an absent declaration to the shared unspecified bucket, emits the closed vocabulary in stable order with zero rows preserved, and derives its span from the counted population. Legacy health shapes expose a null census rather than fabricating a zero measurement. The renderer distinguishes unavailable from zero, retains malformed display rows without echoing untrusted labels, and is invoked before the empty model-check return. The tests independently pin the vocabulary, counts, ordering, oldest timestamp, production payload seam, legacy null behavior, zero census, malformed display values, and the executed placement branch, so the assertions are non-vacuous. No trust check, permission boundary, workflow surface, or token/PII handling is weakened, and the diff contains no reviewer-directed instruction. With no prior-round findings and no new findings, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
