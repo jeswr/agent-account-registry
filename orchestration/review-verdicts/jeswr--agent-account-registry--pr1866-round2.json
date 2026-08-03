@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1866,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "11a37b5396b4d87aae9ae29221d760f1443fa9eb",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The change claims to announce every remaining silent observability drop, but the legacy `flow.leases` loop still silently skips every non-object row (`if not isinstance(item, dict): continue`). It also silently ignores an unreadable present `utilization_1h` because only non-`None` parsed fractions are appended, and a present non-list `leases` container is silently treated as no rows. These losses can publish `lease_utilization_1h: None` or an aggregate over only the surviving rows with no indication that supplied measurements were discarded. The added test `a non-object lease ROW is dropped...` explicitly expects an empty diagnostic list, so it makes this omission contractual instead of testing the marquee every-drop-announced behavior. This is the same false-healthy/incomplete-aggregate class the patch fixes at the lane and aggregate seams.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Give the legacy lease container/row/measurement path its own bounded `_ObsDropLog`. Announce a present non-list container, each non-object row, and each present unreadable utilization while retaining the decision-22 fatal label check and rows-first precedence. Replace the silent non-object-row expectation with literal loud-drop cases for container, row, and utilization plus a valid silent control and bounded-tail check.",
+    "severity": "major",
+    "title": "Legacy lease rows remain a deliberately silent drop seam"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe prior round's malformed lane-window/counter finding is fixed with literal, non-vacuous reject and accept cases. However, the expanded every-drop-announced claim still has a directly acknowledged silent loss in the legacy lease-row path: malformed rows and measurements are discarded without diagnostics, and the new self-test explicitly blesses that silence. This is a new major completeness and evidence-path gap, so under the required round-to-round scale progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
