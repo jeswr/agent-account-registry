@@ -3130,7 +3130,16 @@ def _self_test():
     # The ENVELOPE is where the reason crosses the sanitized handoff: index in, name out.
     chk("the envelope decodes a reason INDEX to its vocabulary name",
         _parse_no_change_envelope("no-change-v1 issue:500,why:3")["why_no_diff"], "too_large")
-    chk("the envelope decodes index 0 to the unspecified default",
+    # [#1950] FIXTURE-SIDE COVERAGE OF A PRODUCER-UNREACHABLE ARM, named so nobody reads this row
+    # as evidence that the value occurs. worker-live's `_no_change_health_envelope` omits `why`
+    # entirely for index 0 — absent, unparseable and an explicit `{"why": "unspecified"}` alike —
+    # and this envelope is the only ingress (the CLI flag is withheld above, `_cmd_record`), so no
+    # LIVE record carries `why_no_diff: "unspecified"`. The decoder must still accept the index:
+    # it is the wire format's "no signal" arm, and a producer/consumer skew has to decode
+    # deterministically rather than raise. dashboard-gen's reason census reads its `unspecified`
+    # row as "declared nothing, or nothing parseable" on the strength of that omission.
+    chk("the envelope decodes index 0 to the unspecified default (fixture-only: the live producer "
+        "never emits why:0 — #1950)",
         _parse_no_change_envelope("no-change-v1 issue:500,why:0")["why_no_diff"], "unspecified")
     chk("an OUT-OF-VOCABULARY reason index is REFUSED, never folded to a default",
         _raises(lambda: _parse_no_change_envelope(

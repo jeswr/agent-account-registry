@@ -4528,6 +4528,17 @@ print(", ".join(v for v in m.NO_CHANGE_REASONS if v != "unspecified"))' "$SCRIPT
   chk "an ABSENT declaration yields no why field (never a decompose reason)" \
     "$(_no_change_health_envelope "$tmp/nodiff-telemetry.json" 42 "$tmp/does-not-exist.json")" \
     "no-change-v1 issue:42"
+  # [#1950] THE THIRD INGRESS FOR INDEX 0, and the only one nothing pinned: a WELL-FORMED,
+  # IN-VOCABULARY `unspecified` declaration. Index 0 is the ABSENCE of a signal, so it must be
+  # unemittable however it arrives — which is what makes a PRESENT `why_no_diff` in the ledger mean
+  # the model really declared something, and what lets dashboard-gen's reason census read its
+  # `unspecified` row as "declared nothing, or nothing parseable" rather than as a bucket the fleet
+  # can fill. Whoever reds this row is changing that contract, not fixing a test: index 0 becoming
+  # storable makes the census's `unspecified` two populations again (registry #1950 / #1595).
+  printf '{"why": "unspecified"}' > "$tmp/nd-unspec.json"
+  chk "an EXPLICIT in-vocabulary unspecified declaration yields no why field either" \
+    "$(_no_change_health_envelope "$tmp/nodiff-telemetry.json" 42 "$tmp/nd-unspec.json")" \
+    "no-change-v1 issue:42"
   for _bad in 'not json' '{"why": "too_large_ish"}' '{"why": 3}' '[]' '{"why": "TOO_LARGE"}'; do
     printf '%s' "$_bad" > "$tmp/nd-bad.json"
     chk "a malformed declaration ($_bad) yields no why field" \

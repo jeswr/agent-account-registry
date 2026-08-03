@@ -1514,7 +1514,26 @@ def _no_change_reason_census(records, health):
 
     An absent `why_no_diff` folds to `unspecified`, which is what index 0 of the wire vocabulary
     MEANS and what `no_change_routing.declared_reasons` already does: a run that declared nothing
-    and a run that declared `unspecified` route identically, so splitting them here would publish
+    and a run that declared `unspecified` route identically, so splitting them here would publish a
+    distinction the router does not make.
+
+    [#1950] AND THE FOLD IS TOTAL — READ THIS ROW AS "DECLARED NOTHING", NEVER AS "DECLARED
+    `unspecified`". A *stored* `why_no_diff == "unspecified"` is PRODUCER-UNREACHABLE: worker-live's
+    `_no_change_health_envelope` builds the fields as `[("why", why)] if why else []` over the
+    vocabulary INDEX, so index 0 is omitted whether the declaration was absent, unparseable, or an
+    explicit `{"why": "unspecified"}` — a word the task prompt does not even offer, since it builds
+    that clause from the vocabulary MINUS index 0. And that envelope is the ONLY ingress, since
+    `why_no_diff` has no CLI flag on purpose (`model-health.py` `_cmd_record`). All three producer
+    directions are pinned by worker-live's own self-test; `model-health`'s index-0 decode is
+    FIXTURE-side coverage of a wire arm production never writes, and says so where it sits.
+
+    So this row counts absences and nothing else, and it must not be split into stored-vs-absent:
+    the stored half would be a structural zero published beside a real number, which reads as a
+    measurement and is not one. The honest cost of the fold, stated because the census is a
+    denominator argument: a seam that DROPPED a declared reason would land here too, so this row
+    bounds "no signal" from above rather than measuring it exactly — the producer self-test above
+    is what makes that a tested-against failure and not an assumption.
+
     Nothing model-authored crosses onto the public page (AGENTS.md pre-flight item 5 — the value
     ORIGINATES in a file the model writes). `validate_ledger` has already refused any `why_no_diff`
     outside the vocabulary, and any such field on another exit class; and the labels emitted here
@@ -3819,6 +3838,31 @@ def _self_test():
           quiet_census,
           {"runs": 0, "since": None,
            "reasons": [{"reason": "unspecified", "count": 0},
+                       {"reason": "underspecified", "count": 0},
+                       {"reason": "blocked_on_decision", "count": 0},
+                       {"reason": "too_large", "count": 0},
+                       {"reason": "already_done", "count": 0},
+                       {"reason": "other", "count": 0}]})
+    # [#1950] WHAT THE `unspecified` ROW MEANS, pinned so a later reader cannot re-split it. The
+    # producer omits index 0 from the envelope for EVERY ingress (worker-live's own self-test pins
+    # the absent, the unparseable and the explicit `{"why": "unspecified"}` directions), so a
+    # STORED `unspecified` never arrives from the live fleet — but the ledger schema admits one, so
+    # the reader has to put it somewhere. Both facts land in ONE bucket: a change that gave the
+    # stored form its own row would publish a structural zero beside a real number, and reds here
+    # rather than shipping. The two rows are otherwise IDENTICAL apart from the field, so nothing
+    # but the fold can produce the count below.
+    fold_census = _normalize_model_health({"records": [
+        {"ts": now - 1700, "provider": "openai", "account": "8" * 16, "model_alias": "codex",
+         "exit_class": "no_change", "run_id": "u1", "issue": 1950},
+        {"ts": now - 1600, "provider": "openai", "account": "8" * 16, "model_alias": "codex",
+         "exit_class": "no_change", "run_id": "u2", "issue": 1950,
+         "why_no_diff": "unspecified"}]}).get("no_change_reasons")
+    check("[#1950] an ABSENT declaration and a (producer-unreachable) STORED `unspecified` are ONE "
+          "bucket — the census never splits 'declared nothing' into a real number beside the "
+          "structural zero the live producer can never fill",
+          fold_census,
+          {"runs": 2, "since": _utc_iso(now - 1700),
+           "reasons": [{"reason": "unspecified", "count": 2},
                        {"reason": "underspecified", "count": 0},
                        {"reason": "blocked_on_decision", "count": 0},
                        {"reason": "too_large", "count": 0},
