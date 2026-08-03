@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1961,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e5745190671e7ba0480b7c12259044cc074c0000",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-three diff remains correct, complete, and fail-closed. The new measurement uses the guard's own recorded-base reader and the receipt producer's own parser, preserves the asymmetric compare direction, refuses malformed or ambiguous rows, and requires a non-vacuous evidence floor before making a population claim. Receipt attribution is checked against GitHub metadata for the full scripts import surface and the defining workflow, with touched, malformed, unreadable, or file-cap comparisons excluded in both the exonerating and counterexample directions. The designated reporting step is derived through the existing exactly-one workflow seam, and the tests exercise forged receipts, compare direction, per-stage read failures, evidence thresholds, live workflow binding, output, and CLI exits. The receipt parser is strict and shared with its renderer. No trust check is weakened, no workflow permissions or execution surface are expanded, and no reviewer-directed prompt injection appears in the diff.",
+  "verdict": "approve"
+ }
+}
