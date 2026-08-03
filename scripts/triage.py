@@ -1550,9 +1550,20 @@ def area_park_clearance(repo, number, labels, fetch_events=None, warn=None):
     return True
 
 
-def _bound_area_clearance(repo, number, view, warn=None):
-    """This issue's live labels PLUS the `needs:area` clearance PROVEN AGAINST THEM — the pair
-    `_apply_cli` plans from, and the answer to PR #1848 review round 1.
+def _park_applications(events, park_policy):
+    """The `labeled needs:area` APPLICATIONS in `events`, in payload order — the identity of the
+    hold a strip is authorised against, and the thing `_confirm_area_strip` compares.
+
+    Only `labeled` rows: this module's own strip lands an `unlabeled` row, so the list is invariant
+    across the write it is used to check, and ANY new application — remove+re-apply included, which
+    leaves the label SET identical — changes it. Raises whatever `_event_rows` raises."""
+    return tuple(row for row in park_policy._event_rows(events, "needs:area")  # noqa: SLF001
+                 if row[1] == "labeled")
+
+
+def _bound_area_clearance(repo, number, view, fetch_events=None, warn=None):
+    """This issue's live labels, the `needs:area` clearance PROVEN AGAINST THEM, and the exact
+    park APPLICATIONS that proof was taken over — the triple `_apply_cli` plans from.
 
     WHY THE PROOF IS TAKEN TWICE. `area_park_clearance` answers "who applied this park" from ONE
     timeline read, and the strip that answer authorises is issued later. A human who removes and
@@ -1565,18 +1576,85 @@ def _bound_area_clearance(repo, number, view, warn=None):
     revision comparison: `updatedAt` is second-granular and a remove+re-apply leaves the label SET
     identical, so a state comparison can miss exactly the write this must catch.
 
-    IT IS NOT A COMPARE-AND-SWAP, and nothing available here could make it one: GitHub's label API
-    has no conditional write, so the final interval before `gh issue edit` cannot be closed by any
-    client. What this removes is the UNBOUNDED gap. Everything `_apply_cli` runs between the
-    confirming proof and the mutation is pure in-process code (`triage`, `validate_plan`,
-    `reduced_write_is_safe`); the only I/O left inside the window is `apply_triage`'s role-add
-    verification, which cannot itself apply a `needs:area`.
+    THIS IS NOT, AND CANNOT BE, A COMPARE-AND-SWAP — and moving it later would not make it one
+    (PR #1848 review round 2). GitHub's label API exposes no conditional/precondition delete, so
+    SOME interval before `gh issue edit` is unclosable by any client, and the interval is not the
+    "pure in-process work" an earlier draft of this docstring claimed: `apply_triage` phase 1 can
+    itself issue a role-label add AND a verifying re-read before the phase-3 edit that carries the
+    strip. **So this pair does not make the removal race-safe on its own.** It narrows the window
+    and supplies the AUTHORISED APPLICATION SET; what actually preserves a hold applied inside the
+    remaining window is `_confirm_area_strip`, the post-strip half, which re-reads the timeline
+    AFTER the write and RESTORES a park whose application set moved.
+
+    The two halves are not a duplicated guard (AGENTS.md pre-flight 4) — they answer at different
+    times and each is killable alone. Delete the POST half and a hold applied inside the final
+    window is destroyed outright. Delete THIS half and the hold is still restored, but only after
+    the run has deleted it and published `status:ready` on a held issue for the width of a GitHub
+    round trip, which is long enough for the dispatcher to select it; the self-test kills that one
+    on the EDIT LOG, since the final labels are identical either way.
     """
+    fetch = fetch_events or _timeline_events
+    captured = []
+
+    def capturing_fetch(fetch_repo, fetch_number):
+        events = fetch(fetch_repo, fetch_number)
+        captured.append(events)
+        return events
+
     labels = view()
-    if not area_park_clearance(repo, number, labels, warn=warn):
-        return labels, False
+    if not area_park_clearance(repo, number, labels, fetch_events=capturing_fetch, warn=warn):
+        return labels, False, None
     labels = view()
-    return labels, area_park_clearance(repo, number, labels, warn=warn)
+    if not area_park_clearance(repo, number, labels, fetch_events=capturing_fetch, warn=warn):
+        return labels, False, None
+    return labels, True, _park_applications(captured[-1], _park_policy())
+
+
+def _confirm_area_strip(repo, number, authorised, view, edit, fetch_events=None, warn=None):
+    """THE REMOVAL-BOUNDARY HALF (PR #1848 review round 2). Called AFTER the edit that stripped
+    `needs:area`: did the hold the strip was authorised against survive it, or did a new one appear
+    inside the window no client can close? Returns True when the strip stands, False when a hold
+    was RESTORED.
+
+    A pre-check cannot answer this — whatever it reads, a write can still land between the read and
+    the edit. This is therefore a POST-condition with a REPAIR, the shape `apply_triage` phase 4
+    already uses on the role invariant: read the timeline again, and if the park's APPLICATION SET
+    is not the one the clearance attested over, re-apply `needs:area` and withdraw the promotion it
+    authorised. The hold is restored rather than never-deleted — that is the honest strongest
+    guarantee available against an API with no conditional delete — and the property that holds in
+    every interleaving is the one that matters: **this run never leaves a human's `needs:area`
+    application deleted.** An application landing after this final read is not a race at all; it is
+    simply a later hold, and nothing here ever removes it.
+
+    Fails CLOSED: an unreadable/malformed confirming timeline restores the park, because a park
+    this run cannot prove it still owns is a human's to remove. The restored park is machine-owned
+    and therefore clearable by the next `labeled` event, so the failure direction is recoverable.
+    `authorised=None` — no clearance attested, which today cannot co-occur with a strip — likewise
+    compares as MOVED, so a future second producer of the strip fails toward restoring the hold."""
+    emit = warn or (lambda _message: None)
+    try:
+        observed = _park_applications((fetch_events or _timeline_events)(repo, number),
+                                      _park_policy())
+        moved = observed != authorised
+        detail = f"{len(authorised)} application(s) -> {len(observed)}"
+    except Exception as exc:                     # noqa: BLE001 — unprovable is unowned
+        moved, detail = True, f"confirming timeline unreadable ({type(exc).__name__}: {exc})"
+    if not moved:
+        return True
+    live = view()
+    add, remove = {"needs:area"}, {"status:ready"} & live
+    if remove:
+        add.add("status:untriaged")
+    add -= live
+    if add or remove:
+        # DELIBERATELY UNGUARDED: `live_gh`'s edit raises on failure, and a restore that does not
+        # land is the one outcome of this function that must not be swallowed — it leaves a human's
+        # hold deleted. The exception reaches the workflow step and reds it (registry #582's rule).
+        edit(sorted(add), sorted(remove))
+    emit(f"needs:area park RESTORED on {repo}#{number}: it was stripped under a clearance that no "
+         f"longer describes the park ({detail}) — a hold applied inside the unclosable "
+         f"proof->edit window is the applier's, not this run's to delete (PR #1848 review round 2)")
+    return False
 
 
 def _apply_cli(repo, number, issue_type):
@@ -1586,15 +1664,15 @@ def _apply_cli(repo, number, issue_type):
     """
     read_state, view, edit, warn = live_gh(repo, number)
     # The repository's label set is read BEFORE the ownership proof on purpose (PR #1848 review
-    # round 1): its round trip is then outside the proof->mutation window, and nothing between the
-    # confirming proof below and `apply_triage` touches the network.
+    # round 1): its round trip is then outside the proof->mutation window.
     known = repo_label_set(repo)
     # registry #1462: the ONE caller allowed to attest that the `needs:area` park is clearable, and
     # it proves it from the issue's OWN TIMELINE — never from the event that woke this run, whose
     # actor says nothing about who applied the park. The attestation is BOUND to the label set it is
-    # planned against (`_bound_area_clearance`): a proof read once and carried across the rest of
-    # the run would authorise deleting a hold a human re-applied in the meantime.
-    current, clearable = _bound_area_clearance(repo, number, view, warn=warn)
+    # planned against (`_bound_area_clearance`), and — because no pre-check can close the last
+    # interval before `gh issue edit` (PR #1848 review round 2) — the strip it authorises is
+    # CONFIRMED AFTERWARDS against `authorised_park`, restoring any hold that appeared inside it.
+    current, clearable, authorised_park = _bound_area_clearance(repo, number, view, warn=warn)
     try:
         result = triage(current, issue_type, trusted=True, known_labels=known,
                         area_park_clearable=clearable)
@@ -1626,7 +1704,17 @@ def _apply_cli(repo, number, issue_type):
         print(f"triage #{number}: role={result['role']} ready={result['ready']} "
               f"add=[] remove=[] dropped={dropped} {UNSAFE_DROP_REASON}")
         return 0
+    stripped_park = "needs:area" in result["remove"]
     outcome = apply_triage(current, result, edit, view, warn, read_state=read_state)
+    # THE REMOVAL BOUNDARY (PR #1848 review round 2). The strip has now been issued, so this is the
+    # first moment a read can see everything that raced it — including a write landing inside
+    # `apply_triage`'s own phase-1 role-add round trip. A restore is a normal concurrent-write
+    # outcome, not a defect: it logs and exits 0, exactly as the #1490 reduced-write path does.
+    if stripped_park and not _confirm_area_strip(repo, number, authorised_park, view, edit,
+                                                 warn=warn):
+        print(f"::warning title=triage #{number}::a `needs:area` hold appeared while this run was "
+              f"clearing the park; the hold was RESTORED and status:ready withdrawn (PR #1848 "
+              f"review round 2)")
     print(f"triage #{number}: role={result['role']} ready={result['ready']} "
           f"add={sorted(result['add'])} remove={sorted(result['remove'])}")
     return 0 if outcome["ok"] else 1
@@ -3222,7 +3310,12 @@ def _self_test():
     def _drive_apply1462(module=None, timeline=None, concurrent_write=None):
         """Run the REAL `_apply_cli` over a fake issue whose TIMELINE is read through the real
         `area_park_clearance` -> `_timeline_events` -> `_gh_read` seam. Returns (exit code, the
-        issue's FINAL labels, the `gh` argvs the proof issued).
+        issue's FINAL labels, the `gh` argvs the proof issued, the EDITS it issued).
+
+        The EDIT LOG is returned because the final label set is not the whole outcome (PR #1848
+        review round 2): a run that strips a human's hold and then restores it lands on the same
+        labels as a run that never stripped it, while TRANSIENTLY publishing `status:ready` on a
+        held issue. Only the sequence of writes tells those two apart.
 
         `concurrent_write(labels, state, nth_read)` models ANOTHER ACTOR writing to the live issue
         WHILE this run holds it (PR #1848 review round 1). It fires AFTER the payload the proof is
@@ -3230,10 +3323,11 @@ def _self_test():
         which is the only way to reproduce a verdict that is stale the instant it is computed."""
         namespace = module if module is not None else globals()
         labels = {"priority:P1", "role:docs", "area:docs", "needs:area", "status:untriaged"}
-        revision, reads = [0], []
+        revision, reads, edits = [0], [], []
         state = {"rows": _bot_row if timeline is None else timeline}
 
         def edit(add, remove):
+            edits.append((sorted(add), sorted(remove)))
             labels.update(add)
             labels.difference_update(remove)
             revision[0] += 1
@@ -3255,23 +3349,25 @@ def _self_test():
             code = namespace["_apply_cli"]("o/r", "7", "Documentation")
         finally:
             namespace.update(saved)
-        return code, sorted(labels), reads
+        return code, sorted(labels), reads, edits
 
     _TIMELINE_ARGV1462 = ["api", "repos/o/r/issues/7/timeline?per_page=100", "--paginate"]
-    _code1462, _final1462, _reads1462 = _drive_apply1462()
+    _STRIP_EDIT1462 = (["status:ready"], ["needs:area", "status:untriaged"])
+    _code1462, _final1462, _reads1462, _edits1462 = _drive_apply1462()
     chk("[#1462] THE BINDING LAYER: the real `--apply` proves ownership from the real timeline argv "
-        "and the park ACTUALLY leaves the issue, which is the transition this delivers into — "
-        "TWICE, because the strip is authorised by a CONFIRMING proof (PR #1848 review round 1)",
-        (_code1462, _final1462, _reads1462),
+        "and the park ACTUALLY leaves the issue, which is the transition this delivers into — on "
+        "THREE reads: the cost gate, the CONFIRMING proof (PR #1848 r1), and the post-strip "
+        "CONFIRMATION at the removal boundary (r2), which finds nothing moved and restores nothing",
+        (_code1462, _final1462, _reads1462, _edits1462),
         (0, ["area:docs", "priority:P1", "role:docs", "status:ready"],
-         [_TIMELINE_ARGV1462, _TIMELINE_ARGV1462]))
-    _hcode1462, _hfinal1462, _hreads1462 = _drive_apply1462(
+         [_TIMELINE_ARGV1462] * 3, [_STRIP_EDIT1462]))
+    _hcode1462, _hfinal1462, _hreads1462, _hedits1462 = _drive_apply1462(
         timeline=[_ev1462("jeswr", "2026-08-01T10:00:00Z")])
     chk("[#1462] ...and over a HUMAN-applied park the same run writes NOTHING and still exits 0 — "
-        "on ONE timeline read: a refusal has nothing to confirm, so the second proof is not paid for",
-        (_hcode1462, _hfinal1462, _hreads1462),
+        "on ONE timeline read: a refusal has nothing to confirm, and no strip to bound",
+        (_hcode1462, _hfinal1462, _hreads1462, _hedits1462),
         (0, ["area:docs", "needs:area", "priority:P1", "role:docs", "status:untriaged"],
-         [_TIMELINE_ARGV1462]))
+         [_TIMELINE_ARGV1462], []))
 
     # ---- THE RACE THE PROOF IS BOUND AGAINST (PR #1848 review round 1) ----
     # The ownership proof and the strip it authorises are two separate API interactions. These rows
@@ -3285,21 +3381,61 @@ def _self_test():
             labels.add("needs:area")
             state["rows"] = list(state["rows"]) + [_ev1462("jeswr", "2026-08-01T11:00:00Z")]
 
-    _rcode1462, _rfinal1462, _rreads1462 = _drive_apply1462(
+    _rcode1462, _rfinal1462, _rreads1462, _redits1462 = _drive_apply1462(
         concurrent_write=_human_reapplies1462)
-    chk("[#1848 r1] a human RE-APPLIES the park between the proof and the strip: the confirming "
-        "proof reads the issue's freshest timeline, sees the human as the newest applier, and the "
-        "human's NEW hold SURVIVES — the issue is not promoted",
-        (_rcode1462, _rfinal1462, _rreads1462),
+    chk("[#1848 r1] a human RE-APPLIES the park between the FIRST proof and the strip: the "
+        "confirming proof reads the issue's freshest timeline, sees the human as the newest "
+        "applier, and the run never issues the strip at all — the hold is not even transiently lost",
+        (_rcode1462, _rfinal1462, _rreads1462, _redits1462),
         (0, ["area:docs", "needs:area", "priority:P1", "role:docs", "status:untriaged"],
-         [_TIMELINE_ARGV1462, _TIMELINE_ARGV1462]))
+         [_TIMELINE_ARGV1462, _TIMELINE_ARGV1462], []))
+
+    # ---- THE RACE NO PRE-CHECK CAN SEE (PR #1848 review round 2) ----
+    # The finding: a proof taken BEFORE the edit — however late — is not bound to the edit. GitHub
+    # has no conditional label delete, and `apply_triage` phase 1 may itself round-trip to the API
+    # (role add + verifying re-read) before the phase-3 edit that carries the strip. So the hold is
+    # preserved by a POST-strip confirmation + restore, and THIS row injects the human application
+    # after the CONFIRMING timeline response has been captured — i.e. in the window the pre-checks
+    # provably cannot cover — and asserts the new hold SURVIVES the run.
+    def _human_reapplies_late1462(labels, state, nth_read):
+        """A HUMAN re-applies `needs:area` after the CONFIRMING proof's payload was captured and
+        before the edit that strips it. Both proofs attest; the strip is issued against a hold that
+        no longer exists."""
+        if nth_read == 2:
+            labels.add("needs:area")
+            state["rows"] = list(state["rows"]) + [_ev1462("jeswr", "2026-08-01T11:00:00Z")]
+
+    _lcode1462, _lfinal1462, _lreads1462, _ledits1462 = _drive_apply1462(
+        concurrent_write=_human_reapplies_late1462)
+    chk("[#1848 r2] THE REMOVAL BOUNDARY: a human applies the hold AFTER the confirming proof and "
+        "BEFORE the strip — both proofs attest, the strip lands, and the post-strip confirmation "
+        "sees the park's application set has MOVED and RESTORES the hold, withdrawing the "
+        "promotion it authorised. The human's NEW hold survives the run",
+        (_lcode1462, _lfinal1462, _lreads1462, _ledits1462),
+        (0, ["area:docs", "needs:area", "priority:P1", "role:docs", "status:untriaged"],
+         [_TIMELINE_ARGV1462] * 3,
+         [_STRIP_EDIT1462, (["needs:area", "status:untriaged"], ["status:ready"])]))
+    chk("[#1848 r2] ...and the RESTORED state is one ready-issues refuses to enumerate — the "
+        "restore is not cosmetic, it puts the issue back behind the gate",
+        bool(load_sibling("ready-issues.py", "registry_ready_issues_1848").exclusion_reason(
+            _lfinal1462)), True)
+    # FAIL-CLOSED at the confirming read itself: a timeline this run cannot read cannot prove the
+    # park is still the one it was authorised to strip, so the park is restored, not assumed intact.
+    _ucode1462, _ufinal1462, _, _uedits1462 = _drive_apply1462(
+        concurrent_write=lambda labels, state, nth: state.update(rows="not-a-page-sequence")
+        if nth == 2 else None)
+    chk("[#1848 r2] an UNREADABLE confirming timeline restores the park too — unprovable ownership "
+        "is not permission, and the restored park is machine-owned so the next event re-clears it",
+        (_ucode1462, _ufinal1462, _uedits1462),
+        (0, ["area:docs", "needs:area", "priority:P1", "role:docs", "status:untriaged"],
+         [_STRIP_EDIT1462, (["needs:area", "status:untriaged"], ["status:ready"])]))
 
     def _area_withdrawn1462(labels, state, nth_read):
         """A human withdraws the `area:*` label mid-run — the park's one fact becomes TRUE again."""
         if nth_read == 1:
             labels.discard("area:docs")
 
-    _wcode1462, _wfinal1462, _ = _drive_apply1462(concurrent_write=_area_withdrawn1462)
+    _wcode1462, _wfinal1462, _, _ = _drive_apply1462(concurrent_write=_area_withdrawn1462)
     chk("[#1848 r1] ...and the LABEL SET the plan is built from is re-read with the confirming "
         "proof: an `area:*` withdrawn mid-run makes the park's fact true again, so the park stands "
         "and the issue is NOT promoted area-less",
@@ -3385,40 +3521,106 @@ def _self_test():
         "                        area_park_clearable=clearable)\n",
         "        result = triage(current, issue_type, trusted=True, known_labels=known)\n",
         "attestation-not-wired")
-    _n7code, _n7final, _n7reads = _drive_apply1462(module=_n7)
+    _n7code, _n7final, _n7reads, _ = _drive_apply1462(module=_n7)
     chk("[#1462] MUTANT attestation-not-wired still PAYS for the proof and then discards it — the "
         "park survives a clearance the run had already proven",
         (_n7code, _n7final, _n7reads),
         (0, ["area:docs", "needs:area", "priority:P1", "role:docs", "status:untriaged"],
          [_TIMELINE_ARGV1462, _TIMELINE_ARGV1462]))
-    # (n8) THE BINDING, DELETED (PR #1848 review round 1): the first proof's verdict is carried
-    # straight to the strip. Every row that is not racing stays green — only a concurrent write can
-    # see it, and what it sees is a human's fresh hold being deleted.
-    _BINDING1462 = ("    labels = view()\n"
-                    "    return labels, area_park_clearance(repo, number, labels, warn=warn)\n")
-    _n8 = _mutant1462(_BINDING1462, "    return labels, True\n", "binding-reproof-deleted")
-    _n8code, _n8final, _n8reads = _drive_apply1462(
+    # (n8) THE PRE-STRIP BINDING, DELETED (PR #1848 review round 1): the first proof's verdict is
+    # carried straight to the strip. The post-strip confirmation (r2) still restores the hold, so
+    # the FINAL LABELS are identical to the pristine tree's — this mutant is invisible to every
+    # state assertion and is caught only by the EDIT LOG, which shows a human's live hold being
+    # deleted and `status:ready` published on a held issue before the restore claws both back.
+    _CONFIRM_PROOF1462 = (
+        "    labels = view()\n"
+        "    if not area_park_clearance(repo, number, labels, fetch_events=capturing_fetch,"
+        " warn=warn):\n"
+        "        return labels, False, None\n"
+        "    return labels, True, _park_applications(captured[-1], _park_policy())\n")
+    _n8 = _mutant1462(
+        _CONFIRM_PROOF1462,
+        "    return labels, True, _park_applications(captured[-1], _park_policy())\n",
+        "binding-reproof-deleted")
+    _n8code, _n8final, _n8reads, _n8edits = _drive_apply1462(
         module=_n8, concurrent_write=_human_reapplies1462)
-    chk("[#1848 r1] MUTANT binding-reproof-deleted DELETES the hold the human re-applied under the "
-        "run, on a proof taken before it existed, and promotes the issue",
-        (_n8code, _n8final, _n8reads),
-        (0, ["area:docs", "priority:P1", "role:docs", "status:ready"], [_TIMELINE_ARGV1462]))
-    # (n9) the binding is made CONDITIONALLY INERT instead — the confirming proof still runs (so the
-    # row above and every ownership row stay green) but it is re-proven against the STALE label set,
-    # so the plan is built from labels that have already moved.
+    chk("[#1848 r1] MUTANT binding-reproof-deleted lands on the SAME final labels as the pristine "
+        "tree, on the same read count — and the edit log shows why it is still a defect: it "
+        "DELETES the hold the human re-applied and publishes status:ready on a held issue, where "
+        "the shipped tree never issues a write at all",
+        (_n8code, _n8final, _n8edits, _redits1462),
+        (0, ["area:docs", "needs:area", "priority:P1", "role:docs", "status:untriaged"],
+         [_STRIP_EDIT1462, (["needs:area", "status:untriaged"], ["status:ready"])], []))
+    # (n9) the pre-strip binding is made CONDITIONALLY INERT instead — the confirming proof still
+    # runs (so the row above and every ownership row stay green) but it is re-proven against the
+    # STALE label set, so the plan is built from labels that have already moved.
     _n9 = _mutant1462(
-        _BINDING1462, "    return labels, area_park_clearance(repo, number, labels, warn=warn)\n",
+        _CONFIRM_PROOF1462,
+        "    if not area_park_clearance(repo, number, labels, fetch_events=capturing_fetch,"
+        " warn=warn):\n"
+        "        return labels, False, None\n"
+        "    return labels, True, _park_applications(captured[-1], _park_policy())\n",
         "binding-reads-stale-labels")
-    _n9code, _n9final, _n9reads = _drive_apply1462(
+    _n9code, _n9final, _n9reads, _ = _drive_apply1462(
         module=_n9, concurrent_write=_area_withdrawn1462)
     chk("[#1848 r1] MUTANT binding-reads-stale-labels still pays for BOTH proofs and still refuses "
         "the human race, yet clears the park on a withdrawn `area:*` and ships an AREA-LESS issue "
         "to status:ready",
         (_n9code, _n9final, _n9reads,
          _drive_apply1462(module=_n9, concurrent_write=_human_reapplies1462)[1]),
-        (0, ["priority:P1", "role:docs", "status:ready"],
-         [_TIMELINE_ARGV1462, _TIMELINE_ARGV1462],
+        (0, ["priority:P1", "role:docs", "status:ready"], [_TIMELINE_ARGV1462] * 3,
          ["area:docs", "needs:area", "priority:P1", "role:docs", "status:untriaged"]))
+
+    # ---- (n10..n13) THE REMOVAL-BOUNDARY HALF (PR #1848 review round 2), deleted and made
+    # conditionally inert. Every row above stays green under all four: only the LATE race — a hold
+    # applied after the confirming proof — can see them, and what it sees is that hold destroyed.
+    _LATE_KILL1462 = (0, ["area:docs", "priority:P1", "role:docs", "status:ready"])
+
+    # (n10) THE CALL SITE (pre-flight 2a): the confirmation is never reached. Non-crashing, and the
+    # timeline read it would have paid for disappears, so the read count sees it too.
+    _n10 = _mutant1462("    stripped_park = \"needs:area\" in result[\"remove\"]\n",
+                       "    stripped_park = False\n", "removal-boundary-not-wired")
+    _n10code, _n10final, _n10reads, _ = _drive_apply1462(
+        module=_n10, concurrent_write=_human_reapplies_late1462)
+    chk("[#1848 r2] MUTANT removal-boundary-not-wired never confirms the strip: the hold applied "
+        "inside the unclosable window is DELETED and the issue promoted",
+        (_n10code, _n10final, _n10reads),
+        _LATE_KILL1462 + ([_TIMELINE_ARGV1462] * 2,))
+    # (n11) CONDITIONALLY INERT: the confirming read is still PAID FOR and the comparison still
+    # runs, it just never concludes the park moved. The read count is unchanged — only the outcome
+    # of the race can kill this one.
+    _n11 = _mutant1462("        moved = observed != authorised\n", "        moved = False\n",
+                       "removal-boundary-never-fires")
+    _n11code, _n11final, _n11reads, _ = _drive_apply1462(
+        module=_n11, concurrent_write=_human_reapplies_late1462)
+    chk("[#1848 r2] MUTANT removal-boundary-never-fires still pays for all three reads and still "
+        "compares, yet never restores — the same hold is lost with the API cost fully paid",
+        (_n11code, _n11final, _n11reads),
+        _LATE_KILL1462 + ([_TIMELINE_ARGV1462] * 3,))
+    # (n12) the FAIL-CLOSED direction of the confirming read: an unreadable timeline reads as "the
+    # park is intact" instead of as "unprovable". Only the unreadable-timeline row can see it.
+    _n12 = _mutant1462(
+        "        moved, detail = True, f\"confirming timeline unreadable ",
+        "        moved, detail = False, f\"confirming timeline unreadable ",
+        "removal-boundary-fails-open")
+    _n12code, _n12final, _, _ = _drive_apply1462(
+        module=_n12,
+        concurrent_write=lambda labels, state, nth: state.update(rows="not-a-page-sequence")
+        if nth == 2 else None)
+    chk("[#1848 r2] MUTANT removal-boundary-fails-open treats a timeline it could not read as "
+        "proof the park never moved, and ships the strip anyway",
+        (_n12code, _n12final), _LATE_KILL1462)
+    # (n13) the restore is made PARTIAL — the park comes back but the promotion it authorised is
+    # not withdrawn, leaving a `needs:area`+`status:ready` pair no lane owns. The label RESTORE
+    # assertion above would still pass; only the withdrawal half can see this.
+    _n13 = _mutant1462("    add, remove = {\"needs:area\"}, {\"status:ready\"} & live\n",
+                       "    add, remove = {\"needs:area\"}, set()\n", "restore-keeps-promotion")
+    _n13code, _n13final, _, _ = _drive_apply1462(
+        module=_n13, concurrent_write=_human_reapplies_late1462)
+    chk("[#1848 r2] MUTANT restore-keeps-promotion restores the hold but leaves the issue "
+        "status:ready behind it — a parked-and-ready pair",
+        (_n13code, _n13final),
+        (0, ["area:docs", "needs:area", "priority:P1", "role:docs", "status:ready"]))
 
     # -----------------------------------------------------------------------------------------------
     # THE LIVE `gh` ARGV live_gh builds (shared by triage --apply and retriage --apply): an EMPTY

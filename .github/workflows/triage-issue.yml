@@ -37,7 +37,11 @@ on:
     # SECOND, confirming read taken only when the first one attests, because the proof has to be
     # bound to the label set the strip is issued against (`_bound_area_clearance`, PR #1848 review
     # round 1: a human who re-applies the park mid-run must not lose the hold to a verdict computed
-    # before it existed). So: 0 reads on an ordinary event, 1 on a refusal, 2 on the one event in an
+    # before it existed), plus a THIRD read AFTER the strip. The third one is what actually makes
+    # the delete safe (PR #1848 review round 2): GitHub has no conditional label delete, so no
+    # pre-check can be bound to the edit, and `_confirm_area_strip` therefore re-reads the park's
+    # application set once the write has landed and RESTORES the hold — withdrawing the promotion —
+    # if it moved. So: 0 reads on an ordinary event, 1 on a refusal, 3 on the one event in an
     # issue's life that actually clears the park — and none of them
     # needs a permission this job does not already hold (`issues: write` covers the read; the
     # collaborator-permission probe the trust step uses is deliberately NOT reused, see the
