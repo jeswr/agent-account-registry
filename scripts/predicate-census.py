@@ -55,9 +55,14 @@
 # narrowing is CORRECT — only whether it is COMPLETE, and whether the asymmetries someone wrote
 # down still hold. It governs the predicates enrolled below and says nothing about any other.
 # #1315's closing constraint is the binding one — "a guard that fires on everything is worse than
-# none" — so a signature is built from a copy's own line and its ENCLOSING block-openers ALONE: a
-# sibling statement, a comment, a blank line, a renamed local, or a reflow elsewhere in the same
-# function moves nothing. That noise floor is asserted in the self-test, in both directions.
+# none" — so a signature is built from a copy's own line and its ENCLOSING block-openers ALONE,
+# where an opener is identified BY SYNTAX and never by indentation alone: a sibling statement, a
+# continuation of a multi-line statement, a closing `fi`/`esac`, a comment, a blank line, a renamed
+# local, or a reflow elsewhere in the same function moves nothing — at ANY column, including one
+# further LEFT than the copy. That noise floor is asserted in the self-test, in both directions, and
+# both directions were live defects before it was: a dedented line that governs nothing could
+# conceal a copy left behind by a narrowing, and could equally invent a disagreement between two
+# byte-identical copies.
 #
 # THIS FILE IS SCANNED TOO, and carries no copy of anything it governs: every shell/YAML fixture
 # below is COMPOSED from a fragment that does not match the detector, so the census can read its
@@ -137,26 +142,89 @@ def _indent(line):
     return len(line) - len(line.lstrip())
 
 
+# ---- what SYNTACTICALLY OPENS A BLOCK ------------------------------------------------------------
+# Decreasing indentation alone does NOT identify an enclosing block. Two kinds of line dedent
+# without opening anything, and both are live in this tree:
+#
+#   a CONTINUATION of a multi-line statement — dispatch.yml's governed copy is the second physical
+#     line of `app_pr = (head_repo == repo` / `and re.match(r"^sparq-agent/…", ref) is not None)`,
+#     so the copy's own line is indented TEN columns deeper than the statement it belongs to; and
+#   an UNRELATED STATEMENT at an outer level — anything earlier in the same unit that happens to be
+#     less indented than the copy.
+#
+# Admitting either into a signature is the defect this block fixes, and it fails in BOTH directions.
+# MEASURED on the shipped tree: reconstruct #1275 (leave `run_review`'s copy strict) and add one
+# unrelated `unrelated_marker=1` at column 0 inside `run_review`, and the census reported ZERO
+# findings — the copy left behind by the narrowing was hidden by a line that governs nothing. The
+# mirror is a false alarm: the same line beside `push_fix` alone made the write-path cell
+# "DISAGREE WITH ITSELF" while all three copies were byte-identical and unguarded.
+#
+# So a line joins a guard only if it is a block opener BY SYNTAX. The classifier is deliberately NOT
+# selected by file suffix: every file here is already multi-lingual, and reading an inner language
+# with the outer one's grammar is what admitted the continuation line above. dispatch.yml is YAML
+# holding a shell `run:` body holding a python heredoc — the governed copy is three languages deep —
+# and dispatch-claim.py quotes worker-live.sh's shell inside python string literals. A line is an
+# opener if ANY of the three grammars says so.
+_PY_OPENER = re.compile(
+    r"^(?:async\s+)?(?:if|elif|else|for|while|with|try|except|finally|def|class|match|case)\b"
+    # ...then either the `:` that opens the suite (a trailing comment is still the same line), or an
+    # unclosed bracket/comma/backslash where the HEADER ITSELF continues onto the next line
+    # (`for _why, _wl_broken in (` — dispatch-claim's #1288 probe opens a real block that way).
+    r".*(?::\s*(?:#.*)?$|[(\[{,\\]$)")
+_SH_OPENER = re.compile(
+    r"^(?:if|elif|while|until|for|select)\b.*(?:\bthen|\bdo|&&|\|\||\\|\()\s*$"
+    r"|^case\b.*\bin\s*$"
+    r"|^(?:then|do|else)\s*$"
+    r"|^(?:(?:function\s+)?[A-Za-z_][\w:.-]*\s*(?:\(\s*\))?\s*)?\{\s*$")
+# A `case` ARM opens a block too, and a narrowing is free to use one. Its pattern is a bare glob
+# alternation ending in `)`, so it is admitted only with NO whitespace and no `(` of its own —
+# `verdict|ci|rebase)` yes, `linked.update(int(number) for number in re.findall(` no.
+_SH_CASE_ARM = re.compile(r"^[^\s()#]+\)\s*$")
+# A YAML key whose value is a nested block or a block scalar (`run: |`). A key with an INLINE value
+# opens nothing, so `shell: bash` is not an opener and `- name: <step>` — which is the unit anchor
+# anyway — is not either. The key must be a PLAIN scalar name: allowing any text before the `:`
+# would read the `):` that closes a multi-line python `def` header as a block opener of its own.
+_YAML_OPENER = re.compile(r"^(?:-\s+)?[A-Za-z_][\w.-]*\s*:\s*(?:[|>][-+]?\d*)?\s*$")
+
+
+def is_block_opener(stripped):
+    """PURE: does this line OPEN a block that more-indented lines below it sit INSIDE?
+
+    False for a continuation line, a sibling statement, a closer (`fi`/`esac`/`)`) and a comment —
+    every one of which can dedent without enclosing anything."""
+    return bool(_PY_OPENER.match(stripped) or _SH_OPENER.match(stripped)
+                or _SH_CASE_ARM.match(stripped) or _YAML_OPENER.match(stripped))
+
+
 def guard_prefix(lines, index, anchor):
     """PURE: the chain of BLOCK-OPENERS enclosing ``lines[index]``, outermost first.
 
-    Walking up from the copy and keeping only lines at strictly DECREASING indentation yields
-    exactly the conditionals and loops the copy sits inside, and nothing else: a sibling statement,
-    a closing `fi`/`esac`, a comment or a blank line is at the same or greater indent and is
-    skipped. That is what keeps this from firing on every unrelated edit, and it is
-    language-agnostic — the same rule reads shell, Python and a YAML `run:` body.
+    Walking up from the copy, a line at strictly lower indentation BOUNDS the copy's scope — nothing
+    at or above that column can be entered again — so it always lowers the threshold; but it joins
+    the guard only if `is_block_opener` says it opens a block. A sibling statement, a continuation
+    of a multi-line statement, a closing `fi`/`esac`, a comment and a blank line therefore move
+    NOTHING, which is what keeps this from firing on every unrelated edit. Lowering the threshold on
+    a non-opener is load-bearing in its own right: it is what stops a continuation line's deep
+    column from re-admitting an `if` that closed before the copy (dispatch.yml, exactly).
 
     It is also precisely the fact a narrowing changes. #1275's fix wrapped ONE of four identical
     copies in `if [[ "$self_attested" != true ]]; then` and left the other three alone; this
-    function is where that shows up as a difference."""
+    function is where that shows up as a difference.
+
+    RESIDUAL, NAMED: enclosure is inferred from INDENTATION, which is the real structure in python
+    and YAML and a convention in shell. A block opener spelled in a form no grammar above matches is
+    read as a plain statement, so a copy it encloses looks unguarded — the same direction as a
+    narrowing left behind, and the reason the opener forms are asserted directly in the self-test
+    rather than only through a census row."""
     current, openers = _indent(lines[index]), []
     for line_no in range(index - 1, anchor, -1):
         stripped = lines[line_no].strip()
         if not stripped or stripped.startswith("#"):
             continue
         if _indent(lines[line_no]) < current:
-            openers.append(stripped)
             current = _indent(lines[line_no])
+            if is_block_opener(stripped):
+                openers.append(stripped)
     return tuple(reversed(openers))
 
 
@@ -412,6 +480,11 @@ _WAIVED_COPY = ('  if [[ "$self_attested" != true ]]; then\n'
                 f'    [[ "$head_branch" =~ ^{_SHAPE}$ ]] ||\n'
                 f"      {_DIE}\n"
                 "  fi\n")
+# The line immediately above ONE write-path copy, so an edit can be aimed at that copy alone.
+_PUSH_FIX_ANCHOR = '  mkdir -p "$worker_root"\n'
+# A statement that dedents PAST the copies it sits beside and opens nothing at all — the shape that
+# concealed a left-behind copy in one direction and invented a disagreement in the other.
+_DEDENTED_NOISE = "unrelated_marker=1\n"
 WORKER_LIVE = "scripts/worker-live.sh"
 
 
@@ -478,6 +551,39 @@ def _self_test():
              "    GATE here", "  fi", "  local after=2", "}"]
     chk("sibling statements, comments and blanks do not enter the guard",
         guard_prefix(noisy, 5, 0), ("if [[ x ]]; then",))
+    # ...and the floor holds at LOWER indentation too, which `noisy` cannot test because every line
+    # in it sits at or below the copy's own column. A line that DEDENTS without opening a block
+    # governs nothing, so adding or removing it must leave the signature BYTE-IDENTICAL — asserted
+    # against the same fixture WITHOUT the line, never against a hand-copied expectation.
+    nested = ["fn_a() {", "  if [[ x ]]; then", "    GATE here", "  fi", "}"]
+    dedented = ["fn_a() {", "unrelated_marker=1", "  if [[ x ]]; then", "    GATE here",
+                "  fi", "}"]
+    chk("a lower-indented NON-OPENER before a nested copy leaves the signature unchanged",
+        guard_prefix(dedented, 3, 0), guard_prefix(nested, 2, 0))
+    chk("...and that unchanged signature is still the REAL enclosing block, not an empty one",
+        guard_prefix(dedented, 3, 0), ("if [[ x ]]; then",))
+    # The CONTINUATION case, which is dispatch.yml's governed copy exactly: the copy is the second
+    # physical line of a statement whose own column is ten to its left. Neither that statement nor
+    # the `if` that closed before it began encloses the copy, so the guard is the `for` alone.
+    continued = ["def linked(pulls, repo):", "    for pull in pulls:", "        if not ok(pull):",
+                 "            raise SystemExit('malformed')", "        app_pr = (head_repo == repo",
+                 "                  and re.match('GATE', ref) is not None)"]
+    chk("a copy on a CONTINUATION line derives its enclosing block, not its own statement",
+        guard_prefix(continued, 5, 0), ("for pull in pulls:",))
+    # THE CLASSIFIER ITSELF, both ways — an opener form it fails to recognise reads as a plain
+    # statement, so a copy that form encloses looks UNGUARDED, which is the same direction as a
+    # narrowing left behind. Every form below is one this repository actually writes.
+    for opener in ('if [[ "$x" != true ]]; then', "while read -r line; do", 'case "$x" in',
+                   "verdict|ci|rebase)", "else", "run_review() {", "if not ok(head):", "try:",
+                   "for _why, _wl_broken in (", "def linked_issue_numbers(pulls, repo):", "run: |"):
+        chk(f"a block opener is recognised: {opener!r}", is_block_opener(opener), True)
+    for plain in ("app_pr = (head_repo == repo", "unrelated_marker=1", "local fix_round=${X:-}",
+                  "fi", "esac", "done", "}", ";;", "_wl_live.replace(", "shell: bash",
+                  "):", '"the waiver is REVIEW-ONLY": {',
+                  '("the waiver is deleted — the shipped defect this row exists to catch",',
+                  "die 'unsafe pull request head branch'",
+                  '[[ "$head_branch" =~ ^x$ ]] ||'):
+        chk(f"a line that opens NO block is rejected: {plain!r}", is_block_opener(plain), False)
     chk("a module-level python copy is named by its constant, not by the module",
         unit_at("x.py", ["import re", "HEAD_RE = re.compile(r'GATE')"], 1)[0], "const:HEAD_RE")
     chk("a python copy inside a function is named by that function",
@@ -525,6 +631,17 @@ def _self_test():
     chk("...and COMPLETING that narrowing is GREEN again", census(completed), [])
     chk("...having restored the shipped text (the completion is #1275's fix, not a different one)",
         completed[WORKER_LIVE] == live[WORKER_LIVE], True)
+    # ...and the SAME reconstruction with one unrelated, dedented, non-opening line inside
+    # `run_review` ALONE — text that governs nothing and that now differs between the two units.
+    # MEASURED on the shipped tree before the opener classifier existed: this census returned ZERO
+    # findings, so a line no reviewer would look twice at concealed the exact defect the gate is
+    # for. The cells named must be the same two, or the unrelated line moved a signature.
+    hidden = _replace_once(live, WORKER_LIVE, _WAIVED_COPY, _DEDENTED_NOISE + _STRICT_COPY, 1)
+    findings = reds_with("#1275 reconstructed BEHIND an unrelated dedented line", hidden,
+                         "are declared to be governed DIFFERENTLY but now derive the SAME guard")
+    chk("...and it collapses the SAME two cells, so the unrelated line altered no signature",
+        [cell for cell in ("worker-live/review", "worker-live/write path")
+         if not any(cell in finding for finding in findings)], [])
 
     # ---- (3) the OTHER direction: a narrowing that stops part-way through ONE cell ---------------
     # #1288's own known mutant — the waiver LEAKS into run_fix, which pushes commits. run_fix is
@@ -589,6 +706,13 @@ def _self_test():
         '    # an unrelated comment adjacent to a governed copy\n'
         '    owner = target_repo.split("/", 1)[0]\n', 1)
     chk("an unrelated edit ADJACENT to a governed copy stays GREEN", census(adjacent), [])
+    # ...including one that DEDENTS past the copy — the false-alarm mirror of the hidden-defect row
+    # in (2). The same line beside push_fix's copy alone previously made the write-path cell
+    # DISAGREE WITH ITSELF while all three of its copies stayed byte-identical and unguarded, which
+    # is a required gate reding on an edit that changed no guard anywhere.
+    outdented = _replace_once(live, WORKER_LIVE, _PUSH_FIX_ANCHOR + _STRICT_COPY,
+                              _PUSH_FIX_ANCHOR + _DEDENTED_NOISE + _STRICT_COPY, 1)
+    chk("an unrelated DEDENTED line beside ONE copy of a cell stays GREEN", census(outdented), [])
 
     # ---- (5b) THE ENTRY POINT, driven for real ---------------------------------------------------
     # AGENTS.md item 1: helpers get tested because they are easy to call; ENTRY POINTS get skipped
