@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5859,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "704a3d8ee999e3dee61e9bc1badd30fac335493c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly centralizes timestamp conversion and paginated reaction retrieval in scripts/promote.py, uses `gh api --paginate --slurp` with a larger page size, normalizes the nested REST reaction payload, and fails closed when the API command fails. The workflow consumes the normalized rows and memoizes collaborator permission checks without changing promotion semantics. The added hermetic self-test exercises the load-bearing page-2 maintainer approval path, pins the nested user shape, verifies the pagination flags and fail-closed behavior, and is wired into the docs-quality gate. No correctness, soundness, security, or test-validity defect is apparent in the diff.",
+  "verdict": "approve"
+ }
+}
