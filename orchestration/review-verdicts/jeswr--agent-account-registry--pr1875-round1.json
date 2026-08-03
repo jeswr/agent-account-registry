@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 1875,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "52af70388843af1df560ff3a9e9fac6dbb361df0",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4.2 says that an absent ledger record means `none`, so no backfill is required, while step 2 only dual-writes future W1-W5 events and step 3 switches readers to the ledger. Any PR whose current body already contains a 40-hex reviewed SHA but experiences no write during step 2 will still have no ledger record at step 3. It will therefore become UNBOUND: R1/R2 can disarm an otherwise valid latch, and the review readers can re-admit already-reviewed heads. This is not a harmless compatibility default; it discards live state at migration.",
+    "file": "research/389-reviewed-sha-binding-store.md",
+    "fix_hint": "Specify a complete, auditable bootstrap before cutover: enumerate every in-scope open PR, validate and copy its current binding into a ledger record, zero-seal/count the census, and make step 3 fail closed unless coverage is proven. Alternatively define a bounded compatibility read with an explicit retirement invariant, but do not equate missing migrated state with a genuine retraction.",
+    "severity": "blocker",
+    "title": "Absent-as-none loses every existing reviewed binding at cutover"
+   },
+   {
+    "body": "Section 6.1 says the ledger is authoritative from the first commit that writes it and the body is decoration, but step 2 says readers still read the body. Both cannot be true. Moreover, W1-W5 cannot update two independent stores atomically: a crash after either write leaves them divergent, and the document does not define write order, retry/reconciliation ownership, or which value gates must use during that interval. Saying disagreement is never consulted is unsupported when step-2 readers explicitly consult the body.",
+    "file": "research/389-reviewed-sha-binding-store.md",
+    "fix_hint": "Define one precise authority transition and prove each partial-failure state safe. State write order, durable retry/reconciliation behavior, and cutover preconditions. If readers remain body-backed through step 2, call the body authoritative until an atomic resolver cutover; if ledger authority begins earlier, switch all security readers at that same boundary.",
+    "severity": "major",
+    "title": "The dual-write sequence has contradictory authority and an unsafe failure seam"
+   },
+   {
+    "body": "The proposed writer re-reads the blob SHA and increments `epoch` on conflict, but that only serializes writes. It does not establish semantic ordering. A stale W3-W5 retraction can conflict with a newer W1 review bind, retry against the new blob, and then overwrite it with `none`; conversely an old W1 bind can overwrite a later justified retraction. The resulting epoch is monotone and the stale overwrite is fully accepted, so the claim that stale-read overwrite is detectable is not backed by a reader or invariant that rejects it.",
+    "file": "research/389-reviewed-sha-binding-store.md",
+    "fix_hint": "Give every operation a semantic compare precondition and stop/re-derive on conflict\u2014for example expected prior binding plus head/verdict identity, with retractions proving the exact binding they invalidate. Specify how conflicts are classified and add tests where bind and retract race in both orders, asserting that an older operation cannot overwrite the newer justified state.",
+    "severity": "major",
+    "title": "Blob-SHA CAS and epoch do not prevent a stale operation from winning a retry"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe option analysis identifies useful constraints, especially the split UNKNOWN disposition, but the proposed ledger migration is not yet sound. It omits migration of already-bound PRs, contradicts itself about which store is authoritative during dual-write, and treats CAS plus an epoch as sufficient protection against semantically stale retries. Those gaps can cause fleet-wide re-review/disarm or let an older bind/retraction overwrite a newer state.",
+  "verdict": "request_changes"
+ }
+}
