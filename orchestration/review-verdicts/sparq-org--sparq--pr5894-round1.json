@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5894,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "82a5d83bc9ee7d1a5357f2777f4475b478eed5f7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`spurious = sorted(have - want)` treats every native GitHub dependency not represented by bd as removable, explicitly including edges with unmapped endpoints. Such edges have no bd identity/provenance and may be legitimate dependencies created natively in GitHub; absence from `want` is not evidence that this migration tool owns them. Passing `--apply --remove-spurious` therefore permits deletion of unrelated repository data. The already-computed `have_mapped` is not used to constrain removal, and no provenance/ownership check protects this destructive operation.",
+    "file": "scripts/audit-issue-deps.py",
+    "fix_hint": "Restrict removal candidates to edges for which both endpoints are authenticated bd-migration mappings (for example, derive candidates from `have_mapped - want`), and preferably require explicit migration provenance for both endpoints. Report unmapped native edges separately as unowned/unverifiable and never delete them. Add a self-test proving an unmapped native edge is excluded from the removal plan.",
+    "severity": "blocker",
+    "title": "Removal set includes dependencies outside the bd-managed graph"
+   },
+   {
+    "body": "The CLI documents `--limit` as capping the number of writes in a run, but applies it only to `to_add`. When `--remove-spurious` is enabled, the deletion loop iterates over all `spurious` edges without applying the limit. An operator using a small limit as a safety canary can therefore still trigger an unbounded batch of DELETE requests, made especially hazardous by the overbroad removal set.",
+    "file": "scripts/audit-issue-deps.py",
+    "fix_hint": "Use one shared remaining-write budget across additions and removals, or explicitly slice the removal work by the remaining limit. Add a plan-level/self-test covering mixed additions and removals and asserting that total attempted mutations never exceeds `--limit`.",
+    "severity": "major",
+    "title": "--limit does not cap destructive removals"
+   }
+  ],
+  "progress": null,
+  "summary": "The read-only audit and edge-addition path is broadly coherent, and the self-test covers orientation, edge-type filtering, cycles, and marker provenance. However, the opt-in destructive repair path is not safely scoped: it classifies every repository-native dependency absent from the bd projection as spurious, including dependencies whose endpoints are not bd-mapped, and its advertised write limit does not constrain deletions. In combination, `--apply --remove-spurious` can erase legitimate GitHub-native dependency data at repository scale. These are blocking safety defects in a repair tool and must be corrected before approval.",
+  "verdict": "request_changes"
+ }
+}
