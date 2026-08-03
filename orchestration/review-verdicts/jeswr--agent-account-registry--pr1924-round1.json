@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1924,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "06a64049ce48633188a70ffaadac1f6e5f01e271",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly limits the new hand-off comment to self-attested orchestrator-class request-changes outcomes where the live review-state mutation actually returned `applied`. Worker-lane outcomes remain silent, and converged or refused human-hold outcomes do not receive misleading relabel instructions. The comment gives the load-bearing push-before-relabel ordering and exact `review:changes` to `review:needs` transition. Tests exercise the production call site, emitted body, lane discriminator, state-result gate, direction/order/round content, and the real label primitive's return vocabulary with independent literals. No trust check is weakened and no untrusted text is introduced into an executable context.",
+  "verdict": "approve"
+ }
+}
