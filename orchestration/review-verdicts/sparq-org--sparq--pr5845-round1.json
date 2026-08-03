@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5845,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9713c91ebce92903e5ff910ddd0ca205bc21ace2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_pins()` records a workflow even when a matched wasm-pack action block has zero `version:` lines, while `test_single_version_across_workflows()` flattens only the values that exist. For example, deleting `version:` from the ci.yml action leaves `ci.yml` present (so the anti-vacuity test passes) and leaves the distinct set as `{\"v0.15.0\"}` from js.yml (so the equality test also passes). Thus the regression this test is intended to prevent can recur as an unpinned/default-version CI lane without making the test red.",
+    "file": "scripts/tests/test_js_wasm_pack_install.py",
+    "fix_hint": "Validate every matched action block has exactly one non-empty exact version before comparing versions (for example, retain per-step entries and assert `len(versions) == 1` for each block). Add a mutation-style test or otherwise demonstrate that removing ci.yml's `version:` causes this suite to fail.",
+    "severity": "major",
+    "title": "Repo-wide version test permits action steps with no version"
+   }
+  ],
+  "progress": null,
+  "summary": "The workflow pin update itself is consistent, but the new repo-wide regression test is vacuous for a key failure mode: an action step can omit its version input and still satisfy the single-distinct-version assertion. Because the stated property is that every wasm-pack action requests the same explicit version, the test does not completely enforce the claimed invariant.",
+  "verdict": "request_changes"
+ }
+}
