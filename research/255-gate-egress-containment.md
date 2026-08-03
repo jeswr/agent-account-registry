@@ -23,9 +23,18 @@
 > stdout/stderr to the job log.*
 
 The conclusion #255 draws from that chain is correct and is **not** what this record disputes: gate
-egress is real-time and reviewed by nobody, whereas the publish path stages a diff into a DRAFT PR a
-human must arm. Where #255 is stale is in **what the gate is**, and the staleness makes the residual
-worse, not better.
+egress is real-time and reviewed by nobody, whereas the publish path first stages a diff into a
+DRAFT PR that goes nowhere until an **independent cross-provider reviewer** approves it, and then
+only through the host-side arm, bound to the reviewed SHA with an audit trail
+(`worker-pr.ready_and_arm`, `scripts/worker-pr.py:5450`). That boundary has to be named precisely,
+because on **this** target it is not a human one: `policy/repos.toml:198` sets `arm_auto_merge = true` for
+`jeswr/agent-account-registry`, and Decision 7 (maintainer, 2026-07-18) made approve *itself* the
+arm decision on every surface — a live trust-surface hit now feeds the post-arm audit trail
+(`_apply_trust_surface_audit`) instead of parking for a human. So the publish path is **delayed,
+independently reviewed and SHA-bound**; it is not "a human must arm". That is still categorically
+unlike the gate, which talks mid-run with no reviewer and no record — which is the comparison #255
+is actually making. Where #255 is stale is in **what the gate is**, and the staleness makes the
+residual worse, not better.
 
 ## 2. Corrected premise — the sandboxed gate #255 names never landed
 
@@ -281,10 +290,17 @@ rather than assumed:
    read-only?
 5. **Adversarially, and this is the one that decides whether increment 1 is real:** with the denial
    in place, plant a marker in the target tree in a pre-gate fixture step and have the gate body
-   attempt to send it out — over TCP, over DNS, and by printing it. Record which of the three
-   succeeded. **A run where all three fail is the only pass for the network half; the print
-   succeeding is the expected, documented residual (§5.B) and must be reported as such rather than
-   quietly omitted.**
+   attempt to send it out three ways — over TCP, over DNS, and by printing it. Record each outcome
+   **separately**; the three attempts do **not** share one pass condition. Explicitly:
+   - **The network half passes only if BOTH network attempts fail.** TCP must find no route
+     off-host, and DNS must fail — including the §8.3 checks that no resolver is still reachable and
+     no covert DNS route survives the denial. Either one succeeding is a failed increment 1, to be
+     reported as such and not as a caveat.
+   - **The print must SUCCEED, and it is not part of that pass condition.** Increment 1 deliberately
+     leaves the public-log channel open (§5.B), so the marker landing in the job log is the known,
+     documented residual and must be reported rather than quietly omitted. It is also the run's
+     positive control: a print that *fails* means the fixture never executed, so the two network
+     results prove nothing and the run must be repeated before the denial can be called real.
 
 ## 9. Follow-on issues filed from this record
 

@@ -857,7 +857,11 @@ _assert_worktree_unchanged_by_gate() {
 # does not and cannot see an ENCODED copy the model stashed in $TARGET_DIR, and no
 # content scan here could (the encoding is the attacker's choice). So gate code that finds such a
 # copy can send it out immediately — which is strictly more than the publish path exposes, where the
-# work is staged into a DRAFT PR a human must arm.
+# work is staged into a DRAFT PR that only an INDEPENDENT cross-provider approve can arm, host-side,
+# bound to the reviewed SHA and audited (worker-pr.ready_and_arm). Name that boundary precisely: this
+# target sets arm_auto_merge=true and Decision 7 made approve ITSELF the arm on every surface,
+# trust-surface hits included (they feed the post-arm audit trail, not a human park) — so it is
+# DELAYED + REVIEWED + SHA-BOUND, not a human arm. The gate's is neither: no reviewer, no record.
 #
 # NOT closed by what surrounds this: #248's post-gate seal refuses a gate that WRITES the tree,
 # #575 ensures nothing token-bearing FOLLOWS the gate, and #91's command-file quarantine is
