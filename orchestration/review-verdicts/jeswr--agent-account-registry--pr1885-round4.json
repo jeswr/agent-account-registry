@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1885,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "76202c93f28cf38f862f582969082660e80363fc",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4c calls strict HEAD_RE + same-repo head + an App-bot author the exact producer conjunction, cites backfill-provenance.py:828, and asks self-tests to reject only a non-bot author. But line 828 is only a coarse prefilter: it accepts every login ending in [bot]. The actual backfill admission later derives the provenance job's exact --verify-bot-login and requires live_author == anchored[\"bot_login\"] (run_identity_from_log); the source explicitly says any *[bot] is not enough. Thus a PR opened by different-bot[bot] on a strict numeric same-repo branch satisfies the proposed manifest predicate but cannot be recovered as a worker record. Enumerating it creates a permanent partial-evidence gap, contradicting the document's exact-population requirement.",
+    "file": "research/1027-expected-record-manifest-generation.md",
+    "fix_hint": "Define how the generator identifies the exact expected App-bot author independently and include that equality in the recommended predicate, or account for the run-bound author validation in another sound way. Correct the backfill citation/claim and add a negative self-test using a strict-shaped, same-repo PR authored by a different [bot] login; a generic non-bot negative does not exercise this boundary.",
+    "severity": "major",
+    "title": "Worker author predicate admits records the producer rejects"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-3 orchestrator finding is fixed: the recommendation now refuses every target with non-empty review_enrolment_authors until that population's full mint eligibility contract is implemented, so drafts and PRs without an admissible source issue are no longer falsely enumerated. However, the worker population is still described as exact when its author predicate is not exact. The cited backfill prefilter accepts any login ending in [bot], while the actual recovery path later requires the live author to equal the specific --verify-bot-login echoed by the provenance job. A different App bot can therefore create a same-repo, strict-shaped PR that the proposed generator would require forever even though the producer validation would reject it and no record is owed. This is the same permanent over-enumeration failure the design says must be avoided. Because this is a new major finding after a round with one different major finding, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
