@@ -1,15 +1,15 @@
 {
-  "generated_at": "2026-08-03T10:20:13Z",
+  "generated_at": "2026-08-03T10:41:08Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 2117,
+      "issues_open": 2120,
       "issues_ready": 247,
       "issues_closed_1h": 0,
       "issues_closed_24h": 9,
-      "prs_open": 143,
-      "prs_draft": 125,
-      "prs_opened_1h": 1,
+      "prs_open": 144,
+      "prs_draft": 126,
+      "prs_opened_1h": 2,
       "prs_closed_1h": 0,
       "prs_merged_1h": 0,
       "prs_merged_24h": 2,
@@ -17,35 +17,47 @@
       "needs_user_parked": 16,
       "review_lane_health": "ok",
       "review_lane_runs_1h": 3,
-      "worker_attempts_1h": 1,
+      "worker_attempts_1h": 2,
       "worker_success_rate_1h": 1.0,
-      "pr_open_rate": 1.0,
+      "pr_open_rate": 2.0,
       "pr_close_rate": 0.0,
-      "net_pr_flow": 1.0
+      "net_pr_flow": 2.0
     },
     "jeswr/agent-account-registry": {
       "issues_open": 920,
       "issues_ready": 555,
       "issues_closed_1h": 3,
-      "issues_closed_24h": 35,
-      "prs_open": 53,
-      "prs_draft": 37,
+      "issues_closed_24h": 36,
+      "prs_open": 51,
+      "prs_draft": 35,
       "prs_opened_1h": 2,
-      "prs_closed_1h": 0,
+      "prs_closed_1h": 1,
       "prs_merged_1h": 3,
-      "prs_merged_24h": 35,
+      "prs_merged_24h": 36,
       "review_changes_backlog": 8,
       "needs_user_parked": 12,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 5,
+      "review_lane_runs_1h": 11,
       "worker_attempts_1h": 3,
       "worker_success_rate_1h": 0.6667,
       "pr_open_rate": 2.0,
-      "pr_close_rate": 3.0,
-      "net_pr_flow": -1.0
+      "pr_close_rate": 4.0,
+      "net_pr_flow": -2.0
     }
   },
   "alerts": [
+    {
+      "target": "sparq-org/sparq",
+      "classification": "backlog-growing",
+      "fire": true,
+      "summary": "open PRs 144 > 40 and net PR flow +2.0/hr (open 2.0 > close 0.0) sustained over 2 snapshots",
+      "metrics": {
+        "prs_open": 144,
+        "net_pr_flow": 2.0,
+        "pr_open_rate": 2.0,
+        "pr_close_rate": 0.0
+      }
+    },
     {
       "target": "sparq-org/sparq",
       "classification": "ready-starved",
