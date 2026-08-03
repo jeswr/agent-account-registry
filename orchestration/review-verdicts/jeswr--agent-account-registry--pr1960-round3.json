@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1960,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8d57cce64f44dc9c6e2ed2cefb93123a1a1a927c",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_model_target_checkout_ref` counts only a literal unquoted `path: target` line. YAML scalars such as `path: \"target\"` (or `path: 'target'`) materialize the same directory for `actions/checkout` but do not set `is_target`. An adversarial workflow mutation can insert the correctly pinned, unquoted decoy tested here, change the real model checkout to `path: \"target\"`, and revert its `ref` to the moving default branch. The extractor sees exactly one match and returns the decoy's expected ref; the producer checks and action pinning remain green, while the later quoted-path checkout overwrites the model working tree with the unbound revision. Thus the round-2 mutually masking duplicate remains possible through semantically equivalent YAML.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Determine target checkout uniqueness from parsed YAML values, or normalize and validate supported scalar spellings before comparison, then fail closed unless exactly one checkout step resolves to destination `target`. Add a mutant with a pinned unquoted decoy plus a real checkout using quoted `path: \"target\"` and a moving/default ref, and require `<ambiguous>` or another refusal. Include both single- and double-quoted equivalents so the assertion tests semantic value rather than one textual representation.",
+    "severity": "major",
+    "title": "Raw path spelling still lets an equivalent target checkout evade uniqueness"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-2 exact decoy mutant is now rejected, but the uniqueness check still compares raw YAML spelling rather than the parsed checkout destination. A second checkout can materialize the same `target` directory using an equivalent quoted scalar while remaining invisible to `nmatch`; the exact-spelling decoy can then satisfy the expected-ref guard while the checkout actually consumed by later steps is unbound. This is materially the same major masking finding as round 2, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
