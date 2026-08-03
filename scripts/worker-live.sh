@@ -2081,9 +2081,10 @@ _workflow_steps_referencing() {
 # lease. The property is therefore about ONE line, so the caller pins it by EXACT MATCH
 # (AGENTS.md item 6) rather than by containment.
 #
-# Three absences are named rather than printed as the empty string an exact-match row would compare
-# against nothing: `<none>` when the step exists with NO `ref:`, `<missing>` when there is no such
-# step in the job, and `<not-checkout>` (below) when the selected step is not the pinned checkout.
+# Four defect shapes are NAMED rather than printed as the empty string an exact-match row would
+# compare against nothing: `<none>` when the step exists with NO `ref:`, `<missing>` when there is
+# no such step in the job, `<not-checkout>` (below) when the selected step is not the pinned
+# checkout, and `<ambiguous>` when the job materializes `path: target` more than once.
 # `ref:` absent is the fail-OPEN shape specifically — actions/checkout reads an empty `ref` as "the
 # repository's default branch", which is the exact defect being removed, so it must read as a defect
 # here too.
@@ -2097,6 +2098,15 @@ _workflow_steps_referencing() {
 # carry. This is a STEP-LOCAL binding of the marquee trust surface — the repo-wide
 # `_assert_workflow_actions_pinned` establishes only that references are commit-pinned, never WHICH
 # action this particular step is — so neither guard can stand in for the other.
+#
+# [#441 review r2] Selection is by UNIQUENESS, not by first match. Returning the first matching
+# step let a second one mask it: a pinned decoy `path: target` checkout inserted ABOVE the real step
+# answers with the expected pinned ref while the real checkout is reverted to the moving default
+# branch — every exact-ref row below stays green, the YAML parses, and both actions are commit
+# pinned, so no other guard sees it. The whole job is therefore scanned and a second matching step
+# is a REFUSAL (`<ambiguous>`), never a tie broken in the file's favour. Matching is on `path:
+# target` alone (the `uses:` binding is applied afterwards, to the one selected step) so that a
+# decoy is counted whatever action it names.
 #
 # The job is matched EXACTLY as a string (never a regex) and its two-space-indented key closes the
 # scan, because each lane has a SECOND `path: target` checkout in its isolated publish job that
@@ -2123,7 +2133,7 @@ _model_target_checkout_ref() {
       return (ref == "" ? "<none>" : ref)
     }
     function endstep() {
-      if (started && is_target) { print verdict(); found=1; exit }
+      if (started && is_target) { nmatch++; if (nmatch == 1) first = verdict() }
       started=0; is_target=0; ref=""; uses=""
     }
     /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
@@ -2141,10 +2151,10 @@ _model_target_checkout_ref() {
       ln=$0; sub(/^[[:space:]]*ref:[[:space:]]*/,"",ln); sub(/[[:space:]]+$/,"",ln); ref=ln
     }
     END {
-      if (!found) {
-        if (injob && started && is_target) print verdict()
-        else print "<missing>"
-      }
+      if (injob) endstep()
+      if (nmatch == 0) print "<missing>"
+      else if (nmatch > 1) print "<ambiguous>"
+      else print first
     }
   ' "$file"
 }
@@ -5717,6 +5727,43 @@ WFFIX
     "$(for _m in "$rf_swapped" "$rf_nouses" "$rf_tagged"; do
          cmp -s "$rf_wf" "$_m" && printf 'same ' || printf 'diff '; done)" \
     "diff diff diff "
+
+  # ...and the MASKING duplicate, which no row above could see: a correctly pinned DECOY target
+  # checkout inserted ABOVE the real step, whose ref is reverted to the moving default branch at the
+  # same time. Under first-match selection the extractor answers with the decoy's pinned ref and the
+  # marquee row stays green on a lane whose model tree is unbound again; the job must be REFUSED
+  # instead. The decoy is emitted as literal lines (so the real ref line remains the single input
+  # match rewritten by the second rule), off the step-name anchor whose count is asserted above.
+  local rf_decoy="$tmp/review-fix-decoy-target.yml"
+  awk -v anchor="$rf_anchor_step" -v old="$rf_anchor_ref" -v ck="$ck_uses" '
+    $0 == anchor {
+      print "      - name: Checkout target (decoy)"
+      print ck
+      print "        with:"
+      print "          ref: ${{ needs.resolve.outputs.target_sha }}"
+      print "          path: target"
+      print; next
+    }
+    $0 == old { print "          ref: ${{ steps.target.outputs.default_branch }}"; next }
+    { print }' "$rf_wf" > "$rf_decoy"
+  chk "#441 r2: a pinned DECOY target checkout MASKING an unbound real one is REPORTED (non-vacuous)" \
+    "$(_model_target_checkout_ref "$rf_decoy" run)" "<ambiguous>"
+  # ...and the mutant really is the masking shape rather than a harmless duplicate: two target
+  # checkouts in the run job, the real one unbound, and the file changed at all.
+  chk "#441 r2: ...and that mutant really unbinds the real checkout behind the decoy (hygiene)" \
+    "$(cmp -s "$rf_wf" "$rf_decoy" && printf same || printf diff):$(grep -Fxc "$rf_anchor_ref" "$rf_decoy" || true):$(grep -Fxc '          ref: ${{ steps.target.outputs.default_branch }}' "$rf_decoy" || true)" \
+    "diff:1:1"
+  # A decoy is a defect whatever action it names, so the count is taken BEFORE the `uses:` binding:
+  # a second `path: target` step that is not a checkout at all must refuse too, not be silently
+  # discounted so the real (unbound) step becomes unique again.
+  local rf_decoy_notck="$tmp/rf-decoy-not-checkout.yml"
+  printf 'jobs:\n  run:\n    steps:\n      - name: Stage target\n        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0\n        with:\n          path: target\n      - name: Checkout target\n%s\n        with:\n          path: target\n' \
+    "$ck_uses" > "$rf_decoy_notck"
+  chk "#441 r2: ...a NON-checkout second 'path: target' step refuses too, never discounted" \
+    "$(_model_target_checkout_ref "$rf_decoy_notck" run)" "<ambiguous>"
+  # (Uniqueness is JOB-scoped, not file-scoped: each shipped lane has a legitimate SECOND target
+  # checkout in its publish job, so a file-wide count would refuse the real workflows. The two
+  # pinned-ref rows above are exactly that proof and stay green.)
 
   # --- [issue #568] publish only ever runs from a snapshot re-attested IN THE FRESH PUBLISHER.
   # The pre-model `trust` step ran before the (tens-of-minutes) model + gate, so the publish/PR
