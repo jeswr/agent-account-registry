@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1855,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "23650df69eed31e695ce0ac335cd46e394c13ab1",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 1's author-forgery blocker is resolved. The report no longer reads the author-editable PR body as review evidence: it derives the reviewed head from a bot-login-filtered, line-anchored `human-arm` park receipt through the shared parser, whose quoted/fenced-context stripping and cause/class validation preserve the authority boundary. Missing identity, malformed heads, absent receipts, malformed comment history, and mismatched heads all refuse; only an authenticated exact 40-lower-hex head match admits. The CLI now requires the bot identity, the exit decision includes approval coverage, and the census zero-seals and separates approval refusals from gate-freshness refusals. The added end-to-end cases specifically keep a forged live-head body marker present while varying authenticated evidence, including an author-authored look-alike receipt and unreadable history, so the prior defect is tested non-vacuously.",
+  "verdict": "approve"
+ }
+}
