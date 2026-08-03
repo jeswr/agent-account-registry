@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1927,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1a7992e95f23012ad7561011733c5ce92e2eddca",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_pat_before_target_code` treats every `secrets.REGISTRY_SECRETS_PAT` occurrence before `_first_target_code_line` as safe. That is unsound for GitHub Actions YAML: placing `REGISTRY_SECRETS_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}` in the job-level `env` near the top of the job puts the expansion on an early source line, so this function returns `ordered`, but the PAT is inherited by every step, including rustup and `worker-live.sh gate`. The function's own comment explicitly claims job-wide `env` is caught, but the implementation cannot distinguish job-, step-, or command-level scope. The mutation tests only add a second step-level expansion after target code, so they remain green under this unsafe job-level mutant.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Parse or structurally delimit the gate-running job and its YAML environment scopes, and reject any job-level PAT binding (or otherwise prove it is removed before target-controlled steps). Add a non-crashing mutant that moves the sole existing PAT expansion to the job-level `env` above all steps and require a non-`ordered` verdict; also cover indirect propagation if an early step exports the PAT for later steps.",
+    "severity": "blocker",
+    "title": "Line ordering does not detect a job-scoped PAT exposed to target code"
+   }
+  ],
+  "progress": null,
+  "summary": "The proposed checks do not establish the headline PAT-containment property. `_pat_before_target_code` compares the source line of each secret expansion with the first target-code line, but YAML environment scope is not line scope. In particular, a job-level PAT declaration above the steps passes as `ordered` while making the PAT available to the rustup and gate steps. The self-tests exercise only added step-level expansions and therefore miss this dangerous case. Round 1, so progress is null.",
+  "verdict": "request_changes"
+ }
+}
