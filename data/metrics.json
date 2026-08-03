@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-03T22:04:02Z",
+  "generated_at": "2026-08-03T22:30:13Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
@@ -16,33 +16,33 @@
       "review_changes_backlog": 10,
       "needs_user_parked": 16,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 3,
-      "worker_attempts_1h": 1,
-      "worker_success_rate_1h": 1.0,
+      "review_lane_runs_1h": 4,
+      "worker_attempts_1h": 2,
+      "worker_success_rate_1h": 0.5,
       "pr_open_rate": 2.0,
       "pr_close_rate": 0.0,
       "net_pr_flow": 2.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 961,
-      "issues_ready": 599,
+      "issues_open": 962,
+      "issues_ready": 600,
       "issues_closed_1h": 1,
-      "issues_closed_24h": 49,
-      "prs_open": 48,
-      "prs_draft": 32,
-      "prs_opened_1h": 1,
+      "issues_closed_24h": 50,
+      "prs_open": 47,
+      "prs_draft": 31,
+      "prs_opened_1h": 2,
       "prs_closed_1h": 1,
       "prs_merged_1h": 1,
-      "prs_merged_24h": 46,
+      "prs_merged_24h": 47,
       "review_changes_backlog": 6,
       "needs_user_parked": 14,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 1,
-      "worker_attempts_1h": 4,
-      "worker_success_rate_1h": 0.25,
-      "pr_open_rate": 1.0,
+      "review_lane_runs_1h": 3,
+      "worker_attempts_1h": 5,
+      "worker_success_rate_1h": 0.4,
+      "pr_open_rate": 2.0,
       "pr_close_rate": 2.0,
-      "net_pr_flow": -1.0
+      "net_pr_flow": 0.0
     }
   },
   "alerts": [
@@ -72,10 +72,10 @@
       "target": "jeswr/agent-account-registry",
       "classification": "worker-failing",
       "fire": true,
-      "summary": "worker success rate 25% < 50% floor over 2 snapshots (4 attempts this hour)",
+      "summary": "worker success rate 40% < 50% floor over 2 snapshots (5 attempts this hour)",
       "metrics": {
-        "worker_success_rate_1h": 0.25,
-        "worker_attempts_1h": 4
+        "worker_success_rate_1h": 0.4,
+        "worker_attempts_1h": 5
       }
     }
   ]
