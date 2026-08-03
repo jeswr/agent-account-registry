@@ -101,7 +101,6 @@ OBS_SCHEMA = "registry-observability/v1"
 OBS_SALTED_LABEL_RE = re.compile(r"[0-9a-f]{16}")
 OBS_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:+-]{0,63}")
 OBS_QUEUE_CLASS_RE = re.compile(r"[1-4][a-z]?")   # the #243 queue classes (1, 2, 2a..2d, 3, 4)
-OBS_HISTOGRAM_KEY_RE = re.compile(r"\d{1,2}\+?")
 OBS_EVIDENCE_RE = re.compile(r"https://github\.com/[A-Za-z0-9_.~!$&'()*+,;=:@/?#%-]{1,220}")
 OBS_THRESHOLD_KEYS = {"workflow_failure_rate", "defer_reason_hourly",
                       "queue_age_clamp_minutes", "merge_stall_minutes"}
@@ -109,12 +108,26 @@ OBS_THRESHOLD_KEYS = {"workflow_failure_rate", "defer_reason_hourly",
 # either: `data/cache-affinity.json` is documented as "a rolling {account -> [{package,role,model,
 # at}]} affinity", but nothing in this repo has ever written it (README.md / data/README.md now say
 # so). Cache affinity is DERIVED at claim time from the lease ledger by
-# select-and-claim.choose_account, which keeps no history, so `warm_drain_rate_1h`, `drained_1h` and
-# `chain_length_histogram` have no source in the tree today and the prompt-cache read fraction has
-# to come from the provider usage responses the account-usage probe already reads.
-# The consumer contract is deliberately NOT narrowed to what exists — a collector that grows any
-# one of these fields is still published. What changed is that a `cache` key with nothing readable
-# in it no longer publishes zeros: see `_normalize_observability`.
+# select-and-claim.choose_account, which keeps no history.
+# [#1839] SO THE GROUP IS NOW USAGE-DERIVED ONLY, and its three affinity-CHAIN fields —
+# `warm_drain_rate_1h`, `drained_1h`, `chain_length_histogram` — are RETIRED. #1557 left the consumer
+# contract deliberately open because the group's fate was an undecided question; this is the decision,
+# and it is the only one this seam can take alone. The two surviving fields are sourceable TODAY from
+# the provider usage responses `account-usage.py` already reads (a cache-read input-token count per
+# request). The three retired ones need affinity-chain HISTORY that nothing keeps: affinity is
+# re-derived per claim and a released lease leaves only its receipt comment, so there is no source at
+# all — not a late producer, an absent one. A contract field no producer can ever fill is not an open
+# seam, it is a promise, and it renders as a confident number the moment anything half-fills it.
+# Re-opening it is a PRODUCER-FIRST change (durably record the chain transitions through the same CAS
+# discipline as the other ledger writers, never a `run_gh`-wrapped write), then re-add the field it
+# feeds — not the reverse.
+# A collector built against the pre-#1839 shape is not punished for it: the retired keys are ignored
+# (never republished, and never measurement enough to publish the group) and NAMED on stdout, so the
+# mismatch lands in the build log instead of nowhere. The tuple's order IS the order they are named
+# in, so the announcement is stable across builds.
+OBS_CACHE_RETIRED_FIELDS = ("chain_length_histogram", "drained_1h", "warm_drain_rate_1h")
+OBS_CACHE_RETIRED = ("dashboard-gen: ignored retired observability cache field(s) {} — "
+                     "affinity-chain history has no producer (issue #1839)")
 OBS_CACHE_DROP = ("dashboard-gen: dropped the observability cache group (type {}) — "
                   "no field it publishes was measured")
 
@@ -2127,34 +2140,29 @@ def _normalize_observability(document):
     cache_source = document.get("cache")
     cache = None
     if isinstance(cache_source, dict):
-        histogram = {}
-        raw_histogram = cache_source.get("chain_length_histogram")
-        if isinstance(raw_histogram, dict):
-            for key in sorted(str(k) for k in raw_histogram)[:12]:
-                count = _obs_count(raw_histogram.get(key))
-                if OBS_HISTOGRAM_KEY_RE.fullmatch(key) and count is not None:
-                    histogram[key] = count
+        # [#1839] Keyed on the KEY's PRESENCE, never on whether its value would have parsed: a
+        # collector still sending a retired field has a stale contract whether or not that send was
+        # well-formed, and the retirement is exactly the thing it needs told.
+        retired = [key for key in OBS_CACHE_RETIRED_FIELDS if key in cache_source]
+        if retired:
+            print(OBS_CACHE_RETIRED.format(", ".join(retired)))
         read_fraction = _obs_fraction(cache_source.get("prompt_cache_read_fraction_1h"))
         usage_samples = _obs_count(cache_source.get("usage_samples_1h"))
-        warm_drain = _obs_fraction(cache_source.get("warm_drain_rate_1h"))
-        drained = _obs_count(cache_source.get("drained_1h"))
-        # [#1557] An UNMEASURED group must not publish as a MEASURED ZERO. `usage_samples_1h` and
-        # `drained_1h` are coerced to 0 below, so a `cache` key carrying nothing this seam can read
-        # used to render a confident "Warm drains — of 0 drained / 1h" card built entirely out of
-        # that coercion. Publication therefore requires at least ONE field to have parsed; parsed
-        # is not truthy, so a genuine all-zero hour (0.0 fractions, 0 counts) still publishes (a
-        # census must always emit its zero row — AGENTS.md pre-flight item 8). The drop is
-        # ANNOUNCED for the same reason #982 announced a dropped queue row: `cache: {}` and "no
-        # collector at all" render identically as a hidden panel, so a producer/consumer shape
-        # mismatch would otherwise be visible nowhere.
-        if (read_fraction is not None or usage_samples is not None or warm_drain is not None
-                or drained is not None or histogram):
+        # [#1557] An UNMEASURED group must not publish as a MEASURED ZERO. `usage_samples_1h` is
+        # coerced to 0 below, so a `cache` key carrying nothing this seam can read used to render a
+        # confident "Warm drains — of 0 drained / 1h" card built entirely out of that coercion (and
+        # out of the retired `drained_1h`, whose own coercion is what made that card readable).
+        # Publication therefore requires at least ONE of the two SURVIVING fields to have parsed;
+        # parsed is not truthy, so a genuine all-zero hour (0.0 fraction, 0 samples) still
+        # publishes (a census must always emit its zero row — AGENTS.md pre-flight item 8). A group
+        # carrying only retired fields measures nothing this panel publishes, so it drops like any
+        # other unreadable group. The drop is ANNOUNCED for the same reason #982 announced a
+        # dropped queue row: `cache: {}` and "no collector at all" render identically as a hidden
+        # panel, so a producer/consumer shape mismatch would otherwise be visible nowhere.
+        if read_fraction is not None or usage_samples is not None:
             cache = {
                 "prompt_cache_read_fraction_1h": read_fraction,
                 "usage_samples_1h": usage_samples or 0,
-                "warm_drain_rate_1h": warm_drain,
-                "drained_1h": drained or 0,
-                "chain_length_histogram": histogram,
             }
     if cache is None and cache_source is not None:
         print(OBS_CACHE_DROP.format(type(cache_source).__name__))
@@ -5942,6 +5950,9 @@ esac
     obs_fixture = {
         "schema": "registry-observability/v1",
         "generated_at": now,
+        # [#1839] The three chain/drain keys stay in the FIXTURE on purpose, well-formed and in the
+        # shape a collector built against the pre-#1839 contract emits: the golden row below is what
+        # proves a retired field is ignored rather than republished.
         "cache": {"prompt_cache_read_fraction_1h": 0.62, "usage_samples_1h": 7,
                   "warm_drain_rate_1h": "0.5", "drained_1h": 12,
                   "chain_length_histogram": {"1": 4, "2": 3, "5+": 1, "bogus": 2, "3": -1}},
@@ -5981,9 +5992,9 @@ esac
     }
     obs_expected = {
         "generated_at": "2025-06-15T15:06:40Z",
-        "cache": {"prompt_cache_read_fraction_1h": 0.62, "usage_samples_1h": 7,
-                  "warm_drain_rate_1h": 0.5, "drained_1h": 12,
-                  "chain_length_histogram": {"1": 4, "2": 3, "5+": 1}},
+        # [#1839] TWO fields, not five: the retired chain/drain keys the fixture still sends do not
+        # survive normalization at all, so nothing downstream of here can render them.
+        "cache": {"prompt_cache_read_fraction_1h": 0.62, "usage_samples_1h": 7},
         "lanes": [
             {"lane": "review-fix", "1h": {"success": 1, "failure": 0, "defer": 0}, "24h": None},
             {"lane": "worker", "1h": {"success": 3, "failure": 1, "defer": 2},
@@ -6046,19 +6057,33 @@ esac
     # ---- [#1557] THE CACHE GROUP IS THE ONE OBSERVABILITY GROUP WITH NO PRODUCER ANYWHERE: the
     # file the docs named as its source (`data/cache-affinity.json`) has never been written by
     # anything in this repo, and affinity itself is derived from the lease ledger at claim time and
-    # kept nowhere. Two of the group's five fields are coerced to 0 on the way out, so a collector
+    # kept nowhere. Two of the group's five fields were coerced to 0 on the way out, so a collector
     # that shipped the KEY without the measurements rendered `Prompt-cache read —` beside a
     # confident `of 0 drained / 1h`: an unmeasured group wearing a measured zero. Publication now
     # requires at least one field to have PARSED — parsed, NOT truthy, so a genuinely quiet hour
     # still emits its zero row — and the drop is ANNOUNCED, because `cache: {}` and "no collector
     # at all" are the same hidden panel otherwise (#982's lesson, same seam).
-    # Every input below is a JSON literal and the message is a literal too: reading either back off
-    # the module under test is the tautology AGENTS.md pre-flight 2(b) names.
+    # ---- [#1839] AND THE GROUP IS NOW TWO FIELDS, NOT FIVE. `warm_drain_rate_1h`, `drained_1h` and
+    # `chain_length_histogram` are RETIRED: they measure affinity-CHAIN history, and there is no
+    # source for one anywhere in the repo — not a producer that has not landed, an impossible one,
+    # because affinity is re-derived per claim and a released lease keeps nothing. #1557 left the
+    # contract open pending this decision; the rows below are the decision, and they are written so
+    # that BOTH directions red. A retired field is no longer measurement (it cannot publish a card
+    # on its own any more, which it could before), it is never republished, and it is NAMED rather
+    # than silently swallowed, so a collector on the stale contract learns of the mismatch.
+    # Every input below is a JSON literal and both messages are literals too: reading either back
+    # off the module under test is the tautology AGENTS.md pre-flight 2(b) names.
     _CACHE_DROP = ("dashboard-gen: dropped the observability cache group (type {}) — "
                    "no field it publishes was measured")
+    _CACHE_RETIRED = ("dashboard-gen: ignored retired observability cache field(s) {} — "
+                      "affinity-chain history has no producer (issue #1839)")
+    _ALL_RETIRED = {"warm_drain_rate_1h": 0.5, "drained_1h": 12,
+                    "chain_length_histogram": {"2": 6}}
+    _ALL_RETIRED_NAMED = _CACHE_RETIRED.format(
+        "chain_length_histogram, drained_1h, warm_drain_rate_1h")
 
     def obs_cache(source, present=True):
-        """(published `cache` group, the cache-drop warnings this build printed)."""
+        """(published `cache` group, the cache-drop warnings, the retired-field warnings)."""
         fixture = copy.deepcopy(obs_fixture)
         if present:
             fixture["cache"] = source
@@ -6070,55 +6095,68 @@ esac
                 document = _normalize_observability(fixture)
         except DashboardError as error:
             document = ObsRefusal(refused=str(error))
+        printed = stream.getvalue().splitlines()
         return (document["cache"],
-                [line for line in stream.getvalue().splitlines()
-                 if line.startswith("dashboard-gen: dropped the observability cache group")])
+                [line for line in printed
+                 if line.startswith("dashboard-gen: dropped the observability cache group")],
+                [line for line in printed
+                 if line.startswith("dashboard-gen: ignored retired observability cache field")])
 
     check("[#1557] a MEASURED all-zero hour still PUBLISHES: 0.0 and 0 are readings, not absences. "
           "Guarding on truthiness instead of on `is not None` hides exactly the quiet hour an "
           "operator interrogates (AGENTS.md pre-flight item 8)",
-          obs_cache({"prompt_cache_read_fraction_1h": 0.0, "usage_samples_1h": 0,
-                     "warm_drain_rate_1h": 0.0, "drained_1h": 0}),
-          ({"prompt_cache_read_fraction_1h": 0.0, "usage_samples_1h": 0,
-            "warm_drain_rate_1h": 0.0, "drained_1h": 0, "chain_length_histogram": {}}, []))
+          obs_cache({"prompt_cache_read_fraction_1h": 0.0, "usage_samples_1h": 0}),
+          ({"prompt_cache_read_fraction_1h": 0.0, "usage_samples_1h": 0}, [], []))
     # Each row below is the ONLY row that reds if its own disjunct is dropped from the publication
-    # guard, so no field of the group can quietly stop counting as a measurement. The contract stays
-    # OPEN to a collector that grows just one of them — narrowing it to what exists today would
-    # close the seam this issue asked to keep honest, not fix it.
+    # guard, so neither SURVIVING field can quietly stop counting as a measurement.
     for case, source, published in (
         ("a lone usage-sample count", {"usage_samples_1h": 3},
-         {"prompt_cache_read_fraction_1h": None, "usage_samples_1h": 3,
-          "warm_drain_rate_1h": None, "drained_1h": 0, "chain_length_histogram": {}}),
-        ("a lone drain count", {"drained_1h": 4},
-         {"prompt_cache_read_fraction_1h": None, "usage_samples_1h": 0,
-          "warm_drain_rate_1h": None, "drained_1h": 4, "chain_length_histogram": {}}),
+         {"prompt_cache_read_fraction_1h": None, "usage_samples_1h": 3}),
         ("a lone prompt-cache read fraction", {"prompt_cache_read_fraction_1h": 0.25},
-         {"prompt_cache_read_fraction_1h": 0.25, "usage_samples_1h": 0,
-          "warm_drain_rate_1h": None, "drained_1h": 0, "chain_length_histogram": {}}),
-        ("a lone warm-drain rate", {"warm_drain_rate_1h": 0.5},
-         {"prompt_cache_read_fraction_1h": None, "usage_samples_1h": 0,
-          "warm_drain_rate_1h": 0.5, "drained_1h": 0, "chain_length_histogram": {}}),
-        ("a lone chain-length histogram", {"chain_length_histogram": {"2": 6}},
-         {"prompt_cache_read_fraction_1h": None, "usage_samples_1h": 0,
-          "warm_drain_rate_1h": None, "drained_1h": 0, "chain_length_histogram": {"2": 6}}),
+         {"prompt_cache_read_fraction_1h": 0.25, "usage_samples_1h": 0}),
     ):
-        check(f"[#1557] {case} is measurement enough to publish the group, SILENTLY (the warning "
-              "marks a real drop, so it can never fire on the accept path)",
-              obs_cache(source), (published, []))
+        check(f"[#1557] {case} is measurement enough to publish the group, SILENTLY (both warnings "
+              "mark a real defect, so neither can fire on the accept path)",
+              obs_cache(source), (published, [], []))
+    # The RETIRED side of the same guard, one row per field: before #1839 each of these three
+    # published a whole card on its own. Re-adding any one of them as a disjunct reds exactly its
+    # own row, so the retirement cannot be half-reverted unnoticed.
+    for field, value in (("warm_drain_rate_1h", 0.5), ("drained_1h", 4),
+                         ("chain_length_histogram", {"2": 6})):
+        check(f"[#1839] a lone `{field}` — a RETIRED field, WELL-FORMED — is not a measurement any "
+              "more: nothing publishes, the retirement is named, and the drop is named",
+              obs_cache({field: value}),
+              (None, [_CACHE_DROP.format("dict")], [_CACHE_RETIRED.format(field)]))
+    check("[#1839] all three retired fields together — the exact shape a collector built against "
+          "the pre-#1839 contract emits — still publish NOTHING, and are named in one line",
+          obs_cache(copy.deepcopy(_ALL_RETIRED)),
+          (None, [_CACHE_DROP.format("dict")], [_ALL_RETIRED_NAMED]))
+    check("[#1839] retired fields alongside a REAL measurement neither reach the published group "
+          "nor vanish quietly: the two usage-derived fields publish alone, the retirement is named, "
+          "and no drop is claimed. A normalizer that keeps copying them through reds here",
+          obs_cache({"prompt_cache_read_fraction_1h": 0.4, "usage_samples_1h": 2,
+                     **copy.deepcopy(_ALL_RETIRED)}),
+          ({"prompt_cache_read_fraction_1h": 0.4, "usage_samples_1h": 2}, [],
+           [_ALL_RETIRED_NAMED]))
+    check("[#1839] the notice keys on the retired KEY's PRESENCE, not on whether its value would "
+          "have parsed: a stale contract is a stale contract, and reading the value to decide would "
+          "leave the noisiest producers unnamed",
+          obs_cache({"prompt_cache_read_fraction_1h": 0.4, "drained_1h": "not a count"}),
+          ({"prompt_cache_read_fraction_1h": 0.4, "usage_samples_1h": 0}, [],
+           [_CACHE_RETIRED.format("drained_1h")]))
+    # None of these four carries a retired key, so the third slot is the empty list in every one:
+    # the retirement notice marks a producer on the OLD contract, and neither an unreadable group
+    # nor a group of the wrong TYPE is that.
     for case, source, container in (
         ("an EMPTY cache group", {}, "dict"),
-        ("a group in which every field is unreadable", {"prompt_cache_read_fraction_1h": "abc",
-                                                        "usage_samples_1h": -2,
-                                                        "warm_drain_rate_1h": 1.5,
-                                                        "drained_1h": True}, "dict"),
-        ("a histogram whose every key/count is malformed",
-         {"chain_length_histogram": {"bogus": 2, "3": -1}}, "dict"),
+        ("a group in which every surviving field is unreadable",
+         {"prompt_cache_read_fraction_1h": "abc", "usage_samples_1h": -2}, "dict"),
         ("a cache group sent as a list", ["prompt_cache_read_fraction_1h", 0.62], "list"),
         ("a cache group sent as a JSON string", "0.62", "str"),
     ):
         check(f"[#1557] {case} publishes NOTHING and names itself once — never a fabricated "
-              "`0 drained / 1h` on a panel no producer has ever filled",
-              obs_cache(source), (None, [_CACHE_DROP.format(container)]))
+              "measured zero on a panel no producer has ever filled",
+              obs_cache(source), (None, [_CACHE_DROP.format(container)], []))
     # ...and the whole snapshot still normalizes around the hole: this is a drop diagnostic, not a
     # new fatality. Turning the drop into a raise turns this row red.
     with contextlib.redirect_stdout(io.StringIO()):
@@ -6130,8 +6168,16 @@ esac
           (None, 90, ["review-fix", "worker"]))
     # ...and the PAGE is what the drop has to DELIVER INTO (AGENTS.md pre-flight item 11): a group
     # normalized to None must leave the panel with no cache CARD at all — not a card whose numbers
-    # merely read `—` beside the `of 0 drained / 1h` sub-label this issue is about. Executed against
+    # merely read `—` beside the `of 0 drained / 1h` sub-label #1557 is about. Executed against
     # dashboard/app.js under the shared DOM shim, never asserted lexically (the #612 round-4 lesson).
+    # [#1839] The page is also the LAST hop, and the retirement has a second, independent half here:
+    # dropping the retired READS from `obsCacheCard` is invisible to any document this generator
+    # produces (it no longer emits those keys), which is exactly the equivalent-survivor shape
+    # AGENTS.md pre-flight item 4 names. So a third document is rendered: `legacy`, hand-written in
+    # the pre-#1839 published shape — the `site/data.json` a browser holds from before this build, or
+    # any stale copy of it. It must render the read fraction and NOTHING chain/drain-shaped.
+    # The card's own metric cells and sparkline captions are enumerated (not substring-searched), so
+    # a retired metric or trend reappearing anywhere inside the card reds the row.
     _OBS_CACHE_PAGE_BODY = r"""
   const out = {};
   for (const [name, document] of Object.entries(input.documents)) {
@@ -6144,12 +6190,19 @@ esac
     } catch (raised) {
       error = String((raised && raised.message) || raised);
     }
+    const cards = ids["obs-grid"].children.filter((card) => card.tagName === "article");
+    const cache = cards.find((card) => card.children[0]
+      && card.children[0].textContent === "Cache effectiveness");
+    const owned = (className) => (cache ? cache.children : [])
+      .filter((kid) => kid.className === className);
     out[name] = {
       error,
-      cards: ids["obs-grid"].children
-        .filter((card) => card.tagName === "article")
-        .map((card) => card.children[0].textContent),
+      cards: cards.map((card) => card.children[0].textContent),
+      metrics: owned("obs-metric-grid").flatMap((grid) =>
+        grid.children.map((cell) => text(cell).trim().replace(/\s+/g, " "))),
+      sparks: owned("obs-spark-wrap").map((wrap) => wrap.children[0].textContent),
       drained: text(ids["obs-grid"]).includes("drained / 1h"),
+      chains: text(ids["obs-grid"]).includes("cache-chain lengths"),
     };
   }
   process.stdout.write(JSON.stringify(out));
@@ -6157,10 +6210,18 @@ esac
     with contextlib.redirect_stdout(io.StringIO()):
         obs_measured = obs_normalized(copy.deepcopy(obs_fixture))
         obs_unmeasured = obs_normalized({**copy.deepcopy(obs_fixture), "cache": {}})
+    # The same `generated_at` as the normalized pair on purpose: `obsRecordTrend` keys on it, so all
+    # three renders share ONE accumulated trend point and every sparkline reports the same
+    # "collecting trend…" state — the document under test cannot perturb the others' captions.
+    obs_legacy = {"generated_at": obs_measured["generated_at"],
+                  "cache": {"prompt_cache_read_fraction_1h": 0.62, "usage_samples_1h": 7,
+                            "warm_drain_rate_1h": 0.5, "drained_1h": 12,
+                            "chain_length_histogram": {"1": 4, "2": 3, "5+": 1}}}
     try:
         obs_page = _node_json(_page_harness("renderObservability", _OBS_CACHE_PAGE_BODY),
                               {"documents": {"measured": obs_measured,
-                                             "unmeasured": obs_unmeasured}})
+                                             "unmeasured": obs_unmeasured,
+                                             "legacy": obs_legacy}})
     except DashboardError as exc:
         # A page that throws while rendering IS the finding; reporting it as the row's value keeps
         # the row named and red instead of aborting the suite mid-run.
@@ -6171,19 +6232,41 @@ esac
         return ((rendered.get("cards"), rendered.get("drained"), rendered.get("error"))
                 if isinstance(rendered, dict) else obs_page)
 
+    def obs_cache_card(name):
+        rendered = obs_page.get(name)
+        return ((rendered.get("metrics"), rendered.get("sparks"), rendered.get("chains"),
+                 rendered.get("drained"), rendered.get("error"))
+                if isinstance(rendered, dict) else obs_page)
+
     check("[#1557] the measured group still renders its card, and the DROPPED one leaves the panel "
-          "with no Cache-effectiveness card at all — the `of 0 drained / 1h` sub-label this issue "
-          "is about is gone from the page, not merely blanked",
+          "with no Cache-effectiveness card at all — not a card whose numbers merely read `—`. The "
+          "`drained / 1h` flag is now False on BOTH sides, because #1839 removed that sub-label from "
+          "the page outright; the CARD LIST is what separates the two",
           (obs_rendered("measured"), obs_rendered("unmeasured")),
-          ((["Cache effectiveness", "Agent-run health", "Queue & flow"], True, None),
+          ((["Cache effectiveness", "Agent-run health", "Queue & flow"], False, None),
            (["Agent-run health", "Queue & flow"], False, None)))
+    check("[#1839] the surviving card is USAGE-DERIVED ONLY: exactly one metric (the read fraction "
+          "over its sample count) and one trend. The `Warm drains` metric and the `warm-drain trend` "
+          "sparkline are gone from the page, and the expected strings are literals written here "
+          "rather than read back off the card (pre-flight 2(b))",
+          obs_cache_card("measured"),
+          (["Prompt-cache read 62% 7 usage samples / 1h"], ["read fraction trend"],
+           False, False, None))
+    check("[#1839] and a LEGACY data.json — one published before the retirement, still carrying all "
+          "three chain/drain fields with credible values — renders the SAME one metric and one "
+          "trend: the page itself stops reading them, so a stale snapshot cannot resurrect the card "
+          "this retires. Compared against the literals, not against the row above, so this cannot "
+          "pass by agreeing with an equally-wrong render",
+          obs_cache_card("legacy"),
+          (["Prompt-cache read 62% 7 usage samples / 1h"], ["read fraction trend"],
+           False, False, None))
     # The two ABSENCES are silent: a collector that has no cache group yet is the expected state
     # (there is no producer), and only a SUPPLIED-but-unreadable group is the mismatch worth naming.
     for case, args in (("no cache key at all", (None, False)),
                        ("an explicit null cache key", (None,))):
-        check(f"[#1557] {case} hides the panel SILENTLY — the warning names a producer/consumer "
+        check(f"[#1557] {case} hides the panel SILENTLY — the warnings name a producer/consumer "
               "mismatch, and 'the collector has not landed' is not one",
-              obs_cache(*args), (None, []))
+              obs_cache(*args), (None, [], []))
     # ---- [#1838] THE EMPTY STATE IS A BRANCH, AND BOTH OF ITS SIDES HAVE TO BE ASSERTABLE.
     # `renderObservability` decides it with `if (!grid.childElementCount)`, so before the shim
     # carried that property (#1880) the read was `undefined` on every element and the
@@ -6481,6 +6564,12 @@ esac
         fixture = copy.deepcopy(obs_fixture)
         fixture["flow"]["queue"] = queue_rows
         fixture["trigger_fires"] = trigger_rows
+        # [#1839] The golden fixture's cache group deliberately still sends the RETIRED chain/drain
+        # keys, which makes it announce itself — a line about a different seam entirely. This capture
+        # is unfiltered on purpose, so it is the FIXTURE that is quietened here rather than the
+        # capture: a silent, publishing cache group, so any line these rows do see belongs to the
+        # queue or evidence seam under test.
+        fixture["cache"] = {"prompt_cache_read_fraction_1h": 0.62, "usage_samples_1h": 7}
         stream = io.StringIO()
         try:                       # same crash-after-partial-run guard as ObsRefusal above
             with contextlib.redirect_stdout(stream):

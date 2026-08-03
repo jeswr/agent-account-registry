@@ -881,7 +881,6 @@ function obsRecordTrend(o) {
   const queue = o.flow && Array.isArray(o.flow.queue) ? o.flow.queue : [];
   obsTrend.points.push({
     read: obsNum(cache.prompt_cache_read_fraction_1h),
-    warm: obsNum(cache.warm_drain_rate_1h),
     defers: obsLaneDefers(lanes),
     queue: queue.reduce((sum, row) => sum + obsNum(row.depth, 0), 0),
   });
@@ -968,6 +967,12 @@ function obsRenderTriggers(fires) {
   }
 }
 
+// Issue #1839. USAGE-DERIVED ONLY: `warm_drain_rate_1h`, `drained_1h` and `chain_length_histogram`
+// are retired from the observability contract — they measure affinity-chain history, and nothing in
+// the registry keeps any (affinity is re-derived from the live lease ledger at each claim). This
+// page is the LAST hop on the public surface, so it stops READING them as well: a `data.json` from
+// before the retirement, or one hand-edited, must not resurrect the `Warm drains — of 0 drained /
+// 1h` card, which was built entirely out of a `null`-to-`0` coercion of a field no producer fills.
 function obsCacheCard(cache) {
   const card = obsCard("Cache effectiveness");
   const grid = node("div", "obs-metric-grid");
@@ -975,32 +980,10 @@ function obsCacheCard(cache) {
   grid.append(
     obsMetric("Prompt-cache read", obsPct(cache.prompt_cache_read_fraction_1h),
       { sub: samples ? `${samples} usage sample${samples === 1 ? "" : "s"} / 1h` : "no harness usage signal" }),
-    obsMetric("Warm drains", obsPct(cache.warm_drain_rate_1h),
-      { sub: `of ${obsNum(cache.drained_1h, 0)} drained / 1h` }),
   );
   card.append(grid);
-  const histogram = cache.chain_length_histogram || {};
-  const entries = Object.entries(histogram)
-    .filter(([, count]) => Number.isInteger(count) && count >= 0);
-  if (entries.length) {
-    const peak = Math.max(...entries.map(([, count]) => count), 1);
-    const bars = node("div", "obs-bars");
-    bars.append(node("p", "obs-spark-caption", "cache-chain lengths"));
-    for (const [length, count] of entries) {
-      const rowEl = node("div", "obs-bar-row");
-      rowEl.append(node("span", "obs-bar-label", `×${length}`));
-      const track = node("div", "obs-bar-track");
-      const fill = node("span", "obs-bar-fill");
-      fill.style.width = `${Math.max(4, (count / peak) * 100)}%`;
-      track.append(fill);
-      rowEl.append(track, node("span", "obs-bar-count", String(count)));
-      bars.append(rowEl);
-    }
-    card.append(bars);
-  }
   card.append(
     obsSparkline("read fraction trend", obsTrend.points.map((p) => p.read), "var(--accent)"),
-    obsSparkline("warm-drain trend", obsTrend.points.map((p) => p.warm), "var(--accent-2)"),
   );
   return card;
 }

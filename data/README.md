@@ -55,11 +55,12 @@ copy is `{"accounts":{}}` and there is no `ledger`-branch counterpart to read.
 Prompt-cache affinity is **derived at claim time** from the lease ledger by
 `select-and-claim.choose_account` (most-recent lease for the same `package`+`role`), so it needs no
 store — but it also keeps **no history**, which is what a rolling affinity file would have provided.
-Until something durably records affinity chains, the observability `cache` group's
-`warm_drain_rate_1h`, `drained_1h` and `chain_length_histogram` have no source in this repo, and
-`prompt_cache_read_fraction_1h` has to come from the provider usage responses the account-usage
-probe already reads. The dashboard seam is honest about this rather than silently zero-filling it —
-see the next section. Do not build a collector against this file.
+So the observability `cache` group's `warm_drain_rate_1h`, `drained_1h` and `chain_length_histogram`
+had no source in this repo, and issue #1839 **retired all three** rather than leave three contract
+fields open against a producer that cannot exist while affinity is re-derived per claim.
+`prompt_cache_read_fraction_1h` / `usage_samples_1h` stay, and come from the provider usage responses
+the account-usage probe already reads. Do not build a collector against this file — and re-opening
+the retired fields is producer-first: record the chain transitions durably, then re-add the field.
 
 ## `data/observability.json` — agent-run observability snapshot (issue #246)
 
@@ -76,11 +77,15 @@ golden fixture; collector authors: build against it, not this prose). Root shape
 "defer_reasons_1h", "model_exit_classes_1h", "flow", "trigger_fires", "thresholds"}` — every
 group optional, and an optional group means **omit it** — a group supplied with nothing readable
 in it is not a group of zeros. `cache` is the one that had this backwards (issue #1557):
-`usage_samples_1h` / `drained_1h` are coerced to `0` on publication, so a `cache` key with no
+`usage_samples_1h` / `drained_1h` were coerced to `0` on publication, so a `cache` key with no
 parseable field rendered a confident `of 0 drained / 1h` on a panel no producer has ever filled.
-It now publishes only when **at least one** of its five fields parses — a measured `0`/`0.0` is a
-reading and still publishes, an unreadable or empty group is dropped and NAMED on stdout. Validation
-is otherwise FAIL-CLOSED as before: an absent file hides the panel; a present document
+It now publishes only when **at least one** of its fields parses — a measured `0`/`0.0` is a
+reading and still publishes, an unreadable or empty group is dropped and NAMED on stdout. **And the
+group is TWO fields, not five (issue #1839): `prompt_cache_read_fraction_1h` and `usage_samples_1h`.**
+`warm_drain_rate_1h`, `drained_1h` and `chain_length_histogram` are RETIRED — send one and it is
+ignored (never republished, and never measurement enough to publish the group) and named on stdout,
+so a collector on the old contract hears about it rather than watching its data vanish.
+Validation is otherwise FAIL-CLOSED as before: an absent file hides the panel; a present document
 with the wrong `schema` fails the dashboard build LOUD; malformed rows inside a well-formed
 document are dropped (the model-health tolerance) — EXCEPT privacy violations, which are
 always fatal (decision 22): a `flow.leases[].label` that is not the salted account fingerprint
