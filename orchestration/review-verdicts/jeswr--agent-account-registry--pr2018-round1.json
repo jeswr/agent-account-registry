@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2018,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6c6422780b0bad4e71c2e2f419c6d3beec3e40f4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The repository policy says model-qualified source provenance markers such as `[OPUS-5]` are legacy and must migrate to `[SPARQ agent]` when touched. This diff removes `[OPUS-5]` entirely, leaving the source header without the required model-agnostic provenance marker.",
+    "file": "scripts/regate-sweep.py",
+    "fix_hint": "Replace `[OPUS-5]` with `[SPARQ agent]` on the header line, preserving the rest of the comment.",
+    "severity": "major",
+    "title": "Legacy provenance header is deleted instead of migrated"
+   }
+  ],
+  "progress": null,
+  "summary": "The change removes a legacy model-qualified provenance marker but does not migrate it to the repository-required model-agnostic marker. The code behavior is otherwise untouched, but this provenance-only change is incomplete and conflicts with the standing source-header policy.",
+  "verdict": "request_changes"
+ }
+}
