@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1921,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5e970f9adf86047e24108270793c208fa18f21b1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The removed branch is provably unreachable: the provider set and each provider slice are derived from the same post-filter record list using the same provider equality predicate. Removing the guard therefore preserves behavior and makes an invariant violation fail loudly. The added self-test is non-vacuous for provider-processing regressions: it exercises two ordinary providers plus the fleet pseudo-provider and asserts the exact set represented in emitted actions. No fail-open path, weakened trust check, workflow expansion, or security issue is introduced.",
+  "verdict": "approve"
+ }
+}
