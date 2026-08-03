@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1777,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8c9afdabd8dc2e8c4529fcdeca2352b052990c1d",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe protected suite baseline is consistently derived from the merge base of the event base commit and the graded checkout, and both the manifest and retirement approvals are read from that single resolvable commit. The empty/unresolvable case remains fail-closed. The YAML seam test independently types the expected named-step object, includes non-run step keys, rejects duplicate or missing named steps and unterminated regions, and exercises faithful plus non-crashing weakening fixtures. The real-history checks separately establish the stale-tip false refusal, acceptance at the branch-point baseline, continued refusal of a genuine unapproved removal, and acceptance only with baseline retirement approval. The later PR-head merge-base materialization is included in the frozen region and covered by dedicated mutants. The research document makes no behavioral authorization and explicitly leaves the retention decision to the maintainer. I found no blocker or major correctness, soundness, test-validity, or security defect in the diff.",
+  "verdict": "approve"
+ }
+}
