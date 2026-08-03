@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5885,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ebadd8a415ec1cf2fa9f9d32ab650bf2ee69aedf",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The refactor centralizes native dependency-summary validation without changing fail-closed behavior, and the new warning path is correctly limited to well-formed native summaries whose open-blocker count differs from validated legacy markers. Absent and malformed summaries are deliberately excluded from duplicate drift warnings, counts remain the max of both channels, and the added self-tests cover native-only, marker-only, agreement, closed markers, absent/malformed summaries, and unchanged dispatch counts. No correctness, security, or test-validity defect is apparent in the diff.",
+  "verdict": "approve"
+ }
+}
