@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1945,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1b10feac726ad1368ea31851a790fa54620185cb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`read_ticks` requests only the first 100 artifacts for each run and immediately feeds that page to `tick_records`, without checking the response's `total_count` or fetching another page. A run may have more than 100 artifacts after re-runs. In that case the visible page can omit the latest marker, expose an older marker, or omit the marker entirely; the crawl then either scores stale evidence or silently continues to older runs and treats the resulting ticks as adjacent. This can fabricate a threshold skip streak or bury a recovery. The source comment claims an overfull run contributes no tick, but the implementation neither detects an overfull response nor prevents a marker present in its partial page from contributing. The tests also omit this boundary, so they stay green if this incomplete evidence is trusted.",
+    "file": "scripts/groom-mint-alert.py",
+    "fix_hint": "Use the response's pagination metadata to prove the run's artifact listing is complete (for example, validate `total_count <= len(artifacts)`), or fetch all required pages with a strict bound. If completeness cannot be proved, treat that run like the existing refused-read hole: stop before older runs and return no evidence for a newest-run hole or `truncated=true` for a mid-crawl hole. Add a test with `total_count > 100` whose first page contains a plausible stale marker and assert that it cannot contribute evidence or allow ticks behind the hole to be spliced forward.",
+    "severity": "major",
+    "title": "A truncated per-run artifact page is accepted as complete evidence"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe per-run scoping removes the repository-wide artifact-storm failure mode and the new tests cover ordering, exact endpoints, provenance binding, and refused reads well. However, the new single-page per-run read does not verify that the response is complete. That leaves the evidence path able to consume a partial run and contradicts the stated fail-closed behavior, so this round cannot be approved.",
+  "verdict": "request_changes"
+ }
+}
