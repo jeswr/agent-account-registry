@@ -2130,8 +2130,299 @@ def _self_test():
     finally:
         subprocess.run = real_run
 
+    # ---- the alert-route CONTRACT (#1667, extending #1021) ---------------------------------
+    _test_alert_route_contract(chk)
+
     print("pat-validity self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
+
+
+def _test_alert_route_contract(chk):
+    """#1667 (extending #1021): the router's PROSE must match what the router ENFORCES, and this
+    module must carry exactly ONE copy of the router.
+
+    #1021 found one sentence — "the private repo is the destination ONLY when ALERT_TOKEN can
+    write there" — copied verbatim across seven alert scripts whose routers branch on nothing but
+    the TRUTHINESS of ALERT_TOKEN, where any single copy could drift back while the suite stayed
+    green on the others (the #945 mutually-masking-duplicate shape applied to prose). This router
+    was excluded from that census because its prose was already accurate, which is exactly why
+    nothing stops the drift arriving here (#1667).
+
+    THIS COPY IS THE HARDENED ONE, so the drift that matters runs the OTHER WAY. `_alert_route`
+    here is the only one in the estate that genuinely verifies its destination — distinct from the
+    registry AND `"private": true` under the route token — and the thing it gates is a CREDENTIAL
+    verdict. Weakening it to presence-only would fail OPEN: a same-repo or public ALERT_REPO would
+    publish `REGISTRY_SECRETS_PAT`'s validity and calendar expiry on a public board. So guard 1
+    pins the docstring that states the strong contract, and the behavioural rows below assert the
+    REJECT directions, not just the accept one.
+
+      1. CANONICAL PROSE, pinned CLOSED (phrasing-independent, load-bearing). The router's ENTIRE
+         docstring is pinned by EQUALITY against the verbatim copy below (whitespace-flattened, so
+         re-wrapping is free). Adding a sentence, dropping one, or rewording one reds this file
+         whatever words it chooses — no list of banned phrasings is consulted, so no unanticipated
+         phrasing escapes. CONTAINMENT would not do: #1021's review round 2 measured that pinning
+         the approved sentences proves only that they are PRESENT, so a claim worded outside every
+         enumerated phrasing could simply be added beside them and stay green.
+      2. ENUMERATED TRIPWIRE (phrasing-dependent, defence in depth), over the prose guard 1 does
+         not reach — a fixed list of write-capability phrasings scoped to ALERT_TOKEN on EITHER
+         side of the phrase, catching a stronger claim that lands in an UNPINNED comment or a
+         rendered body. It is a tripwire, not a proof, and the row that reports it says so.
+
+         ⚠️ ONE occurrence is EXPECTED and is scanned SEPARATELY rather than allowlisted away.
+         `render_alert`'s REDACTED public body tells the maintainer to "configure a private
+         `ALERT_REPO` together with an `ALERT_TOKEN` secret that can write to it". That is operator
+         CONFIGURATION GUIDANCE — a true prerequisite for the alert to land — and not a claim about
+         what the router verifies; the same clause states the routing rule honestly beside it. So
+         the module is scanned in two disjoint halves: everything outside `render_alert` must be
+         CLEAN, and `render_alert` itself is pinned to EXACTLY that one phrasing together with its
+         scoping clause. The two halves read the scan DIFFERENTLY on purpose — the outside half
+         asserts an empty SET, where membership is the whole property, while the hint half asserts
+         the counted occurrence LIST, because "exactly one" is a claim about multiplicity that a
+         deduped set cannot make. A second occurrence, a different phrasing, or the same phrasing
+         appearing anywhere else in the module all red — which an allowlist keyed on the phrase
+         alone could not do.
+
+    Both scans exclude THIS FUNCTION'S OWN LINES, so the banned phrases and the detector fixtures
+    can be written literally below without the census matching itself; the exclusion is derived
+    from the parsed AST and its own row reds if it cannot find this function. Every row below is
+    independently killable: edit the pinned docstring on one side only, weaken the pin back to
+    containment, blunt the claim detector so it cannot fire, drop a phrasing or one scoping
+    direction from it, widen its scope so it fires on unrelated prose, collapse the hint half's
+    counted occurrences back into a set so a duplicated guard reads as one, move the hint out
+    of `render_alert`, paste a second router into this file, drop the visibility test, or make the
+    visibility probe run under the wrong credential. The SAME-REPO half of the route is deliberately
+    NOT restated here: `_self_test`'s own routing rows already kill it, and a second copy of one
+    assertion is what makes each copy individually unkillable (#945)."""
+    import ast  # noqa: PLC0415 — self-test only; the census needs the module's own parsed source
+
+    # GUARD 1 — the router's docstring, copied here VERBATIM and compared by EQUALITY (both sides
+    # whitespace-flattened, so re-wrapping the source is free and every other edit is not).
+    canonical_route_doc = """
+    (repo, token, redact) for the CREDENTIAL alert (sol-audit issue #204; hardened in review
+    round 1 of #432). The DETAILED body — the verdict, the free-text detail, and the token's
+    calendar expiry — is emitted ONLY over a POSITIVELY VERIFIED private route: ALERT_REPO and
+    ALERT_TOKEN both set, ALERT_REPO distinct from the public registry repo (case-insensitive —
+    a "private route" naming the registry itself IS the public repo), AND the destination
+    CONFIRMED private by a live GET /repos/{ALERT_REPO} under ALERT_TOKEN.
+    Configuration alone (two non-empty strings) is NOT verification: it would fail OPEN on a
+    same-repo or public ALERT_REPO. EVERY other shape — unconfigured, half-configured, same-repo,
+    public, or a failed/indeterminate visibility lookup — falls back to the public registry with
+    redact=True: a generic "needs attention" signal carrying no verdict, no detail, and no expiry,
+    because a public issue must never publish credential validity or lifecycle. token=None means
+    "use the ambient GH_TOKEN". The probe-unavailable page (issue #207) and the streak variable
+    carry NO validity/expiry, so they stay on the registry with the ambient token — this route
+    governs only the credential alert. `confirmed_private` is injectable for the self-test; the
+    default performs the live lookup, and it is only consulted once both halves of the route are
+    set (a half-configured route needs no API call to be rejected).
+    """
+
+    def flat(text):
+        """One whitespace-collapsed line — the normal form both sides of the guard-1 pin are
+        compared in, so re-wrapping or re-indenting the governed prose is free and rewording it is
+        not."""
+        return " ".join((text or "").split())
+
+    def matches_canonical(doc):
+        """THE comparison guard 1 makes — named, so the non-vacuity rows below drive the SAME
+        predicate the live pin uses. Re-typing `==` beside those rows instead would leave them
+        green while the live pin degraded to containment; that mutant survived the first version
+        of this census (AGENTS.md AUTHOR pre-flight #2b — an expected value must come from the
+        same place the code reads it)."""
+        return flat(doc) == flat(canonical_route_doc)
+
+    # GUARD 2 — ENUMERATED, and kept inside this function so the census's own exclusion covers
+    # these literals. The list is deliberately identical in every alert script carrying this guard.
+    # `capable of writing` is NOT on it: honest prose in these routers may quote that phrase in
+    # order to DISCLAIM it, and a lexical scan cannot tell a quotation from an assertion — guard 1
+    # is what covers the pinned sentences.
+    phrasings = ("can write there", "can write to", "write access", "able to write",
+                 "may write there", "permission to write", "write permission",
+                 "authorized to write", "authorised to write", "authorized to create",
+                 "authorised to create", "able to create", "can create issues",
+                 "allowed to write", "rights to write", "writable by")
+
+    def route_claim_matches(text):
+        """Every ENUMERATED write-capability phrasing OCCURRENCE in `text` that is ABOUT THE ALERT
+        ROUTE, WITH MULTIPLICITY. A tripwire over the list above — NOT a decision procedure for
+        "does this text claim write capability", which is why the canonical-contract row is the
+        load-bearing guard.
+
+        `text` is flattened to one whitespace-collapsed lowercase string first, so a claim broken
+        across a wrapped comment or docstring line is still found; a hit then counts only when
+        ALERT_TOKEN is named within 160 characters (~two wrapped lines) on EITHER side, since the
+        capability can be stated before the token names it as easily as after. BOTH directions of
+        that scoping are exercised below, and so is the unscoped false positive the window exists
+        to suppress."""
+        blob = flat(text).lower()
+        found = []
+        for claim in phrasings:
+            cursor = blob.find(claim)
+            while cursor != -1:
+                if "alert_token" in blob[max(0, cursor - 160):cursor + len(claim) + 160]:
+                    found.append(claim)
+                cursor = blob.find(claim, cursor + 1)
+        return found
+
+    def claims_about_the_route(text):
+        """The SET view of the above, sorted: WHICH phrasings occur, not how many times. Used ONLY
+        for the half of the module that must contain NONE of them, where set membership IS the
+        property asserted. The maintainer-hint half pins EXACTLY ONE occurrence, so it reads
+        `route_claim_matches` instead — collapsing duplicates there would let a SECOND copy of the
+        expected sentence sail through the row that exists to forbid it, since `sorted(set(...))`
+        reports `["can write to"]` for one occurrence and for ten alike (review round 1 of #1667).
+        """
+        return sorted(set(route_claim_matches(text)))
+
+    def exactly_the_maintainer_hint(text):
+        """THE predicate the maintainer-hint row pins with — named so the non-vacuity row below
+        drives the SAME one the live pin uses, rather than a re-typed `==` that could stay green
+        while the pin degraded (AGENTS.md AUTHOR pre-flight #2b). Exactly ONE enumerated
+        occurrence, and it is the expected phrasing: a second copy of it, a different phrasing, or
+        an extra phrasing beside it each make this False."""
+        return route_claim_matches(text) == ["can write to"]
+
+    # VALIDATE THE DETECTOR BEFORE TRUSTING ITS SILENCE. On a clean tree every `find` returns -1,
+    # so without these fixtures the whole scoping loop above never executes even once and the
+    # census below reports `[]` whatever it is pointed at — an instrument that cannot fire has said
+    # nothing (AGENTS.md AUTHOR pre-flight #1, which is how this hole was found in #1021).
+    chk("#1667: the claim detector FIRES on route prose that makes the claim, including when the "
+        "claim wraps onto the line after ALERT_TOKEN",
+        claims_about_the_route("the private ALERT_REPO is the destination\n"
+                               "ONLY when ALERT_TOKEN\ncan write there; otherwise the registry"),
+        ["can write there"])
+    chk("#1667: ... and on the SYNONYMS of that claim, not just the one wording #1021 removed",
+        (claims_about_the_route("ALERT_TOKEN has permission to write there"),
+         claims_about_the_route("the route needs an ALERT_TOKEN authorized to create issues in "
+                                "the private repo")),
+        (["permission to write"], ["authorized to create"]))
+    chk("#1667: ... and when the capability is stated BEFORE ALERT_TOKEN names it (the scope "
+        "window reaches both ways)",
+        claims_about_the_route("the destination is private, so a credential able to write there "
+                               "is required; that credential is ALERT_TOKEN"),
+        ["able to write"])
+    chk("#1667: ... and stays SILENT on a write-capability sentence about something that is not "
+        "the route",
+        claims_about_the_route("the canary environment is writable by the PAT under test, so it "
+                               "is the authoritative store probe"), [])
+    chk("#1667: ... and on one where ALERT_TOKEN appears but is far out of scope (a widened "
+        "window would swallow this and make the census fire on unrelated prose)",
+        claims_about_the_route("ALERT_TOKEN names the private route. " + "Unrelated prose. " * 12
+                               + "The runner needs write access to the checkout."), [])
+
+    chk("#1667: ... and every phrasing in the enumerated list is LIVE — each one, dropped into "
+        "route prose, is reported — with the list still at its full #1021 reach, so shrinking it "
+        "to make a red row green is a diff-visible act and never a silent one",
+        (len(phrasings),
+         [claims_about_the_route(f"the route needs an ALERT_TOKEN {claim} it")
+          for claim in phrasings]),
+        (16, [[claim] for claim in phrasings]))
+
+    # MULTIPLICITY is the property the maintainer-hint pin below rests on, so validate it here:
+    # the exactly-one predicate must REJECT a second scoped copy of the very phrasing it expects.
+    # The deduped view is measured on the same fixture to show WHY that pin cannot use it — it
+    # reports the same `["can write to"]` for one occurrence and for two, so a duplicated guard
+    # inside `render_alert` would have stayed green (review round 1 of #1667).
+    doubled_hint = ("configure a private ALERT_REPO with an ALERT_TOKEN secret that can write to "
+                    "it; the alert lands only when that ALERT_TOKEN can write to the destination")
+    chk("#1667: ... and OCCURRENCES are counted, not collapsed: the exactly-one predicate the "
+        "maintainer-hint row pins with REJECTS a second scoped copy of the expected phrasing, "
+        "which the deduped set view cannot distinguish from the first",
+        (route_claim_matches(doubled_hint), exactly_the_maintainer_hint(doubled_hint),
+         claims_about_the_route(doubled_hint),
+         exactly_the_maintainer_hint("an ALERT_TOKEN that can write to it")),
+        (["can write to", "can write to"], False, ["can write to"], True))
+
+    source = open(__file__, encoding="utf-8").read()
+    definitions = [node for node in ast.walk(ast.parse(source))
+                   if isinstance(node, ast.FunctionDef)]
+    routers = [node for node in definitions if node.name == "_alert_route"]
+    chk("#1667: exactly ONE _alert_route definition in this module (a second copy makes each copy "
+        "individually unkillable)", len(routers), 1)
+    live_route_doc = ast.get_docstring(routers[0]) or ""
+    chk("#1667: the router's docstring is EXACTLY the canonical contract — pinned by EQUALITY, so "
+        "the governed prose is CLOSED: nothing can be added beside the approved sentences, and no "
+        "clause of the verified-private contract can be quietly dropped",
+        (matches_canonical(live_route_doc), flat(live_route_doc)),
+        (True, flat(canonical_route_doc)))
+    # NON-VACUITY of that equality, and of its CLOSEDNESS specifically. `flat(x) == flat(y)` would
+    # also hold with both sides empty, and a containment form would pass every input here except
+    # the appended one — which is worded OUTSIDE `phrasings` on purpose, so the tripwire cannot be
+    # what catches it. The dropped-clause input is the one that matters most here: it removes the
+    # sentence that forbids treating configuration as verification. It asserts its anchor occurs
+    # exactly ONCE first, because a `.replace()` that matched nothing would leave that row
+    # comparing the text with itself (AGENTS.md mutation-run hygiene).
+    anchor = "Configuration alone (two non-empty strings) is NOT verification"
+    dropped = canonical_route_doc.replace(anchor, "")
+    appended = canonical_route_doc + (
+        "\n    ALERT_TOKEN has issue-creation privileges at ALERT_REPO.\n")
+    chk("#1667: ... and that equality REJECTS an appended capability claim no phrasing list "
+        "anticipates, a dropped configuration-is-not-verification clause, and an empty docstring "
+        "— while ACCEPTING a re-wrapped copy, so it pins the WORDS and not the line breaks",
+        (canonical_route_doc.count(anchor),
+         matches_canonical(appended),
+         matches_canonical(dropped),
+         matches_canonical(""),
+         matches_canonical("\n\n  ".join(canonical_route_doc.split()))),
+        (1, False, False, False, True))
+    census = [node for node in definitions if node.name == "_test_alert_route_contract"]
+    renderers = [node for node in definitions if node.name == "render_alert"]
+    chk("#1667: the prose census can locate its own body, and the one function whose hint is "
+        "scanned separately, to partition the module between them",
+        (len(census), len(renderers)), (1, 1))
+    lines = source.splitlines()
+
+    def without(nodes):
+        """`source` with every named node's own line span removed — the AST-derived exclusion, so
+        neither half of the scan can be widened or narrowed by editing a hard-coded line number."""
+        cut = set()
+        for node in nodes:
+            cut.update(range(node.lineno - 1, node.end_lineno))
+        return "\n".join(line for index, line in enumerate(lines) if index not in cut)
+
+    outside = without(census + renderers)
+    hint = "\n".join(lines[renderers[0].lineno - 1:renderers[0].end_lineno])
+    # Each verdict is pinned TOGETHER WITH properties of the text it was measured on, because `[]`
+    # is also what an empty input returns: a census pointed at nothing would otherwise read exactly
+    # like a clean module (AGENTS.md pre-flight #3's conditionally-inert mutant). `def
+    # _alert_route(` proves the scan covered the router; the ABSENCE of this function's own nested
+    # helper name and of `def render_alert(` proves the exclusion removed exactly those two spans.
+    chk("#1667: none of the ENUMERATED write-capability phrasings survives in this module's "
+        "alert-route prose OUTSIDE the maintainer hint — a tripwire over a fixed list, not a proof "
+        "that no stronger claim can be worded (the canonical-contract row above is that guard) — "
+        "measured over a scan that demonstrably covers the router and excludes only two spans",
+        (claims_about_the_route(outside), "def _alert_route(" in outside,
+         "claims_about_the_route" in outside, "def render_alert(" in outside),
+        ([], True, False, False))
+    chk("#1667: ... and EXACTLY ONE occurrence — counted, not deduped — is pinned exactly where "
+        "it belongs: render_alert's redacted public body, as operator configuration guidance "
+        "stated beside the honest routing rule, never as a claim about what the router verified. "
+        "A duplicated guard, a reworded one, or a second phrasing beside it all red",
+        (exactly_the_maintainer_hint(hint), route_claim_matches(hint),
+         "(the private route is used only when BOTH are set)" in hint),
+        (True, ["can write to"], True))
+    # Behavioural statement of the contract the prose is pinned to. These literals appear nowhere
+    # else in this harness, so a substituted value cannot collide with another fixture's. The
+    # REJECT directions are the ones that matter: this route gates a credential verdict, so every
+    # unverified shape must land redacted on the public registry.
+    probed = []
+    chk("#1667: PRESENCE IS NOT THE WHOLE TEST HERE — the private route is taken only once the "
+        "destination is CONFIRMED private, and the probe runs against the ALERT repo under the "
+        "ALERT token",
+        (_alert_route("org/priv-1667", "tok-1667", "org/reg-1667",
+                      confirmed_private=lambda repo, token: probed.append((repo, token)) or True),
+         probed),
+        (("org/priv-1667", "tok-1667", False), [("org/priv-1667", "tok-1667")]))
+    chk("#1667: ... so a fully CONFIGURED but unconfirmed destination still falls back to the "
+        "public registry and REDACTS — configuration alone must never publish a credential verdict",
+        _alert_route("org/priv-1667", "tok-1667", "org/reg-1667",
+                     confirmed_private=lambda repo, token: False),
+        ("org/reg-1667", None, True))
+    unprobed = []
+    chk("#1667: ... and a half-configured route is rejected with NO visibility call at all",
+        (_alert_route("org/priv-1667", "", "org/reg-1667",
+                      confirmed_private=lambda repo, token: unprobed.append(repo) or True),
+         unprobed),
+        (("org/reg-1667", None, True), []))
 
 
 if __name__ == "__main__":
