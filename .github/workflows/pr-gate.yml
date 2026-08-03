@@ -191,15 +191,54 @@ jobs:
             echo "::error::base commit $base is unresolvable; refusing to derive the self-test suite"
             exit 1
           fi
+          # [PR #1777 r3] THE PROTECTED BASELINE IS THE BASE COMMIT THE GRADED TREE CONTAINS, NOT
+          # THE MOVING TIP. `base.sha` is the base branch tip AT EVENT TIME, but the tree this job
+          # grades is `refs/pull/N/merge`, which GitHub does NOT recompute when the base moves — the
+          # measured premise of the compose-gate step below (#756/#1304). Read the baseline from the
+          # tip and the two operands describe DIFFERENT base compositions, so every entry the base
+          # branch ENROLLED after this PR branched is indistinguishable from an entry THIS PR
+          # REMOVED, and _derive_full_selftest_suite refuses `<entry> was removed without prior
+          # base-branch retirement approval` on a PR that removed nothing.
+          #
+          # MEASURED on #1777, a research-document-only PR: its head tree is 59/59 green and every
+          # other step of this job passes on it, while its base gained `ledger-identity-watch.py`
+          # and `ratelimit-alert.py` after the last head push — so the required `gate` reds here and
+          # no later step ever runs. Nothing about the tree under test is wrong.
+          #
+          # The merge base is exactly "the newest base-branch commit the graded tree contains", so
+          # the comparison becomes the one the rule is actually about: what did THIS PR remove
+          # relative to the base state it was written against. It cannot LOOSEN the check — an entry
+          # enrolled before the branch point is in the merge-base manifest too, so a real removal is
+          # still a removal — and when the merge ref is fresh the merge base IS `$base`, making the
+          # healthy case byte-for-byte today's behaviour. Base-tip staleness itself remains the
+          # gate-staleness (#920) and compose-gate (#1304) steps' business, not this one's.
+          #
+          # Both halves come from the SAME commit on purpose: the manifest and the approvals that
+          # authorise removing from it are one baseline, and reading them from two different commits
+          # would let a tip that enrols one entry authorise a different entry's retirement.
+          #
+          # WHO CAN WRITE WHAT THIS READS (AGENTS.md item 5): nobody the PR controls. `$base` is set
+          # by GitHub, not from the payload's author-controlled text, and the merge base is computed
+          # locally over commits. An author cannot move the baseline BACKWARD to escape an approval:
+          # `refs/pull/N/merge` has the base commit as a PARENT, so whenever GitHub has composed it
+          # the merge base IS `$base` no matter what the branch looks like. Merging the base branch
+          # in moves the baseline FORWARD, which only ever tightens. The one input that selects an
+          # older baseline is GitHub's own merge-ref lag, which is what this reads correctly.
+          baseline_sha=$(git merge-base "$base" HEAD 2>/dev/null) || baseline_sha=''
+          if [[ -z "$baseline_sha" ]]; then
+            echo "::error::the graded tree shares no merge base with base commit $base; refusing to derive the self-test suite"
+            exit 1
+          fi
+          echo "protected self-test baseline: $baseline_sha (base tip $base)"
           # Bootstrap only: the introducing PR's base has no shared manifest yet, so its current
           # complete manifest is the protected baseline. Every later PR reads the base-branch copy.
-          if git cat-file -e "$base:scripts/selftest-suite.txt" 2>/dev/null; then
-            git show "$base:scripts/selftest-suite.txt" > "$base_manifest"
+          if git cat-file -e "$baseline_sha:scripts/selftest-suite.txt" 2>/dev/null; then
+            git show "$baseline_sha:scripts/selftest-suite.txt" > "$base_manifest"
           else
             cp scripts/selftest-suite.txt "$base_manifest"
           fi
-          if git cat-file -e "$base:scripts/selftest-retirements.txt" 2>/dev/null; then
-            git show "$base:scripts/selftest-retirements.txt" > "$base_retirements"
+          if git cat-file -e "$baseline_sha:scripts/selftest-retirements.txt" 2>/dev/null; then
+            git show "$baseline_sha:scripts/selftest-retirements.txt" > "$base_retirements"
           else
             : > "$base_retirements"
           fi
