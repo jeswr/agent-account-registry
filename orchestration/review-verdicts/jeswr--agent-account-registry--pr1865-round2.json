@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1865,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "66bc70e56ff26e8decc66ca9d1c014b9111937ac",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 production-topology defect is fixed. pr-gate now validates and uses github.event.pull_request.head.sha as the branch-side input to git merge-base, while the checkout already provides full history via fetch-depth: 0; it therefore reads the manifest from the PR-head/base branch point rather than collapsing onto the current base tip through refs/pull/N/merge. The new workflow-seam test executes the extracted production derivation in a synthetic merge-ref topology, proves the fixed and defective inputs select different manifests, carries both through to the user-visible diagnosis, and covers an unresolvable head fail-closed. The CLI arity and exact workflow-call assertions independently pin the new evidence input. No hostile reviewer-directed instruction was detected in the diff.",
+  "verdict": "approve"
+ }
+}
