@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1945,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "86ad31d0517ebac2081e994738da51c5c30f7324",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`artifacts_complete` returns true for every integer `total_count <= len(artifacts)`. Equality can prove that a one-page response contains the complete set, but a smaller count contradicts the endpoint's stated meaning: for example, `{\"total_count\": 0, \"artifacts\": [<valid marker>]}` and even a negative count are accepted. `read_ticks` can therefore score a marker from a malformed/internally inconsistent response instead of treating that run as an evidence hole. In a trust-plane evidence reader, an impossible count/list relationship must fail closed; the current tests cover equality and `total_count > len`, but omit `total_count < len` and negative values.",
+    "file": "scripts/groom-mint-alert.py",
+    "fix_hint": "Require a non-negative integer `total_count` exactly equal to `len(artifacts)` for this single-page reader. Add tests with a valid-looking marker where `total_count` is smaller than the returned list length, plus a negative count, and assert that newest and mid-crawl instances are handled as holes rather than scored.",
+    "severity": "major",
+    "title": "Inconsistent artifact counts are accepted as proof of completeness"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe prior round's markerless-run adjacency defect is fixed: settled runs with no usable marker now stop the crawl, and the new newest- and mid-crawl checks pin both the false-recovery and fabricated-streak cases. However, the new page-completeness predicate is not fail-closed for internally inconsistent counts. It accepts any integer `total_count` below the number of returned entries, including negative counts, even though such a response cannot prove that the page is a complete representation of the run. Because this is a new major finding while the prior major was resolved, progress is `regressing` under the required scale.",
+  "verdict": "request_changes"
+ }
+}
