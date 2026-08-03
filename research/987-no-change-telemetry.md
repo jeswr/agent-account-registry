@@ -200,10 +200,25 @@ Adding a fifth classification is more than a predicate. The surfaces that must a
 | threshold **type** validation | `_thresholds_of`, `metrics.py:357-377` — note the `int`-unless-`worker_success_floor` branch at `:372-376`; a second float key must be added there or it is rejected as "must be a positive integer" |
 | policy schema prose | `policy/repos.toml` throughput block |
 
-`worker_min_samples` (default 3) is the right guard and #987 is correct to reuse it — but reuse the
-**name**, not the value blindly: with the Option A join, `min_samples` should gate on the count of
-*attributed* no_change rows, not on `worker_attempts_1h`, or a target with 20 attempts and 1
-attributable row alerts off a single sample.
+`worker_min_samples` (default 3) is the right guard and #987 is correct to reuse it. Gate it on
+`worker_attempts_1h` — the rate's **denominator** — exactly as `_worker_failing_pred` already does
+(`metrics.py:255-262`, whose comment names the reason: "a single failed run (attempts=1) is noise").
+The attempts are the observations, so they are the sample size; a guard on the *attributed no_change
+count* would gate eligibility on the outcome, treating 100 attributable attempts that produced 2
+no-change rows as a 2-sample hour rather than a 100-run one. It also fails at the anti-noise job it
+was meant to do, in the direction that matters: an hour with 4 attempts that were all no_change
+clears a 3-row numerator guard while still being a 4-observation sample — precisely the spiky tick
+the guard exists to suppress.
+
+**Attribution completeness is a separate property and needs its own control.** A target with 20
+attempts and 1 attributable row is not a small sample; it is a rate of 0.05, which a high-side
+alert would not fire on anyway. The hazard there is the §5.2/§4 one — dropped rows bias the rate
+DOWN, so the alert under-fires — and no minimum-sample guard can see it, because a silent join miss
+and a genuine absence of no-change runs are numerically identical. Carry it separately instead:
+emit the unattributed-row count **always** (a real zero, not an omitted key) alongside a coverage
+ratio, and **refuse to evaluate** the alert for that tick when coverage is below a declared bar,
+rather than evaluating a rate known to be incomplete. Deferring is the fail-closed direction:
+it withholds a verdict instead of publishing a confidently wrong low one.
 
 Every rule in this file is SUSTAINED over K snapshots with `recover_snapshots` hysteresis
 (`_sustained`, `metrics.py:231-238`). A no-change rate is *exactly* the kind of metric that flaps
@@ -218,13 +233,31 @@ point-in-time.
    the `run_id` prefix, emit `worker_no_change_1h` (int) and `worker_no_change_rate_1h`
    (float|null, `None` at zero attempts) plus `worker_no_change_by_reason_1h` (a dict over all six
    `NO_CHANGE_REASONS`, absent folded to `unspecified`, always fully populated so a zero is a real
-   zero). `::warning::` the unattributed-row count. **No new alert class.** This alone satisfies
-   #466 AC3's "observable" and gives the ring the history a threshold needs to be chosen from
-   evidence rather than guessed.
+   zero). Emit `worker_no_change_unattributed_1h` (int, always present) as a snapshot field, not
+   only as a `::warning::` — bead 2's coverage bar (§7) has to read it from the ring, and a log line
+   is not in the ring. Warn on it as well, per the no-silent-caps convention. **No new alert
+   class.** This alone satisfies #466 AC3's "observable" and gives the ring the history a threshold
+   needs to be chosen from evidence rather than guessed.
 2. **Bead 2 — alert, once bead 1 has ring history.** Add the classification, the threshold key,
-   and the mutation-check. Picking `worker_no_change_floor` before any snapshot exists means
-   picking it from the #466-era ~75% recollection, which is a measurement of a different lane at a
-   different time.
+   and the mutation-check. The key is a **ceiling**, not a floor: a no-change alert fires when the
+   rate is too HIGH, the opposite direction to `worker_success_floor` (`wsr < floor`,
+   `metrics.py:261`). Name it `worker_no_change_ceiling`, with the predicate
+
+   ```
+   isinstance(rate, (int, float))
+       and worker_attempts_1h >= worker_min_samples
+       and rate > worker_no_change_ceiling
+   ```
+
+   Strictly `>`, mirroring `open_pr_alert_threshold` (`prs_open > th[...]`, `metrics.py:240`),
+   so the boundary value itself does NOT fire and a ceiling of `1.0` is a coherent way to disable
+   the rule. Being a float, it must join `worker_success_floor` in the `_thresholds_of` float branch
+   (`metrics.py:372-374`) or it is rejected as "must be a positive integer" (`:376`) — the same
+   trap flagged in §7's table.
+
+   Picking the ceiling's *value* before any snapshot exists means picking it from the #466-era ~75%
+   recollection, which is a measurement of a different lane at a different time. That is what bead 1
+   ships first to avoid.
 
 Reject the repeat-offender list **in this shape**. The value is real, but a public per-issue
 league table is a maintainer decision (§6), and the same information is already actionable through
