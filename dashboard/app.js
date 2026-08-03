@@ -393,6 +393,43 @@ function renderOutcomes(outcomes, fetchOutcome) {
   }
 }
 
+// Issue #1827: the declared-reason distribution of `no_change` runs, censused out of the health
+// ledger by dashboard-gen. Every reason in #701's closed vocabulary is a row the payload carries,
+// zeroes included, so this draws exactly what it is served and never decides for itself which
+// buckets are worth showing.
+function renderNoChangeCensus(census) {
+  const panel = byId("health-no-change");
+  panel.replaceChildren();
+  // A NULL census means the snapshot carried no health ledger to count (the legacy model-health
+  // shapes have no records), which is not the same fact as a ledger holding zero no-change runs —
+  // the zero case renders below, with its zeroes visible.
+  if (!census || !Array.isArray(census.reasons)) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  const runs = Number.isFinite(census.runs) ? census.runs : null;
+  const span = census.since ? `since ${utc(census.since)}` : "in the retained health ledger";
+  panel.append(node("p", "census-caption", runs === null
+    ? `No-change runs by declared reason — count unknown ${span}`
+    : `No-change runs by declared reason — ${runs} run${runs === 1 ? "" : "s"} ${span}`));
+  const strip = node("div", "health-strip");
+  for (const row of census.reasons) {
+    const item = node("article", "health-item");
+    // A row whose reason is not a vocabulary NAME is a malformed payload, not a reason called
+    // "null"/"5": say the label cannot be read rather than printing the coercion, and keep the
+    // row — a bucket dropped here would silently shorten the distribution.
+    item.append(node("p", "health-model",
+                     row && typeof row.reason === "string" ? row.reason : "—"));
+    const meta = node("div", "health-meta");
+    meta.append(node("span", "", "runs"),
+                node("span", "badge", Number.isFinite(row && row.count) ? String(row.count) : "—"));
+    item.append(meta);
+    strip.append(item);
+  }
+  panel.append(strip);
+}
+
 function renderHealth(health) {
   const section = byId("health-section");
   if (!health) {
@@ -402,6 +439,11 @@ function renderHealth(health) {
   section.hidden = false;
   byId("health-time").textContent = health.generated_at
     ? `Checked ${relative(health.generated_at)} · ${utc(health.generated_at)}` : "Check time unknown";
+  // [#1827] Drawn BEFORE the per-model strip's empty-state return on purpose. A ledger whose only
+  // rows are `no_change` (or fleet signals) publishes NO per-model check at all, and that is
+  // precisely the tick whose reason distribution an operator wants; a census placed after that
+  // return would vanish on the boards that most need it.
+  renderNoChangeCensus(health.no_change_reasons);
   const strip = byId("model-health");
   strip.replaceChildren();
   if (!health.checks.length) {
