@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1865,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0387d2528f192a79cd5e5eabc1ebe2b7580440ea",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "actions/checkout's pull_request default checks out refs/pull/N/merge, and this workflow explicitly documents that the suite grades that merge ref. Because github.event.pull_request.base.sha is an ancestor/parent of that synthetic HEAD, git merge-base HEAD $base returns $base itself. Thus mb_manifest duplicates base_manifest. For the target case where a self-test was added to base after the PR branch point, the required entry appears in this supposed merge-base manifest, so _derive_full_selftest_suite emits the old 'removed without approval' diagnosis. The marquee behavior therefore does not work in production despite the pure-function fixtures passing.",
+    "file": ".github/workflows/pr-gate.yml",
+    "fix_hint": "Compute the merge base using github.event.pull_request.head.sha (validated/resolved fail-closed) and the base SHA, not checkout HEAD. Add a workflow-seam test that models the synthetic merge topology (base and PR head as the merge commit's two parents) and proves the selected manifest comes from the PR-head/base branch point rather than from the current base tip.",
+    "severity": "major",
+    "title": "Merge base is computed from the synthetic merge commit, not the PR head"
+   }
+  ],
+  "progress": null,
+  "summary": "The new classifier is well exercised at the shell-function seam, but its production workflow supplies the wrong commit as the branch side of the merge-base calculation. This job intentionally checks out refs/pull/N/merge, so HEAD already contains the base commit. Consequently git merge-base HEAD $base resolves to $base, the generated merge-base manifest is just the current base manifest, and the behind-base condition this PR is meant to diagnose remains classified as a genuine removal. The workflow test pins the text of the faulty call but does not model the checkout topology, so it cannot catch this failure.",
+  "verdict": "request_changes"
+ }
+}
