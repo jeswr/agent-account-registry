@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1821,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a7c1ae36a115d7eea5205c256dff7b260a20cfaf",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "census() classifies every limit == 0 bucket as inapplicable, breached() returns no reasons, and main() therefore treats a payload with zero measured rows as healthy. If an alert is already open, decide([], true) selects close even though the ambient token has no usable bucket and the watchdog has no affirmative evidence of budget health. This violates the stated fail-closed recovery rule. The end-to-end test only asserts that this case emits a census row; it does not assert that it must not close an open alert, and the current decision path would close one.",
+    "file": "scripts/ratelimit-alert.py",
+    "fix_hint": "Represent a valid payload with zero measurable buckets as indeterminate/unhealthy for lifecycle decisions, or explicitly refuse the tick before decide(). Add an end-to-end test using an all-limit-zero payload plus an existing marked alert that asserts no comment/close mutation occurs and a non-success or explicit unreadable/deferred outcome is reported. Keep individual limit-zero buckets inapplicable when at least one other bucket is measurable.",
+    "severity": "major",
+    "title": "An all-inapplicable census can falsely close an active alert"
+   }
+  ],
+  "progress": null,
+  "summary": "The watchdog is generally careful about malformed payloads, unconditional census emission, workflow wiring, and failed reads. However, it treats an all-inapplicable payload as affirmative health. When every reported resource has limit 0, census() produces no measured rows and no breach reasons; main() then calls decide([], true) and closes an existing alert. A token with no usable resource bucket has not proved the shared REST budget healthy, so this is a fail-open recovery path. The self-test currently pins that behavior instead of rejecting it.",
+  "verdict": "request_changes"
+ }
+}
