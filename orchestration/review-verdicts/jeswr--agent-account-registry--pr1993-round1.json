@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1993,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6a7d97e3889224070da86a508589e9979ded97b0",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe retirement is implemented consistently across normalization, browser rendering, styling, and the documented contract. The normalizer ignores and names retired keys, does not let them count as measurements, preserves genuine zero values for the two surviving fields, and drops an otherwise unmeasured cache group. The page also independently stops reading the retired fields, including for legacy snapshots. The self-test coverage exercises each retired field alone, all retired fields together, coexistence with valid surviving measurements, malformed retired values, stable warning ordering, zero-valued surviving measurements, and legacy browser rendering against literal expectations. I found no correctness, fail-closed, test-vacuity, or security defect in the diff.",
+  "verdict": "approve"
+ }
+}
