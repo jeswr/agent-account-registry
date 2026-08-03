@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1840,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a19285bde0dc0873e6fad085851e30a835712ecb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The cited design's Stage A item 3 requires retiring `_probe_fable` (or conditioning it on a genuinely live model), but `_probe_account` still runs it whenever the legacy `fable` alias remains and then runs the new opus5 probe. The patch acknowledges that this costs three live `max_tokens:1` requests per affected account per tick and adds a test requiring exactly three. This is not merely deferred gating: it is an immediate live quota cost against the sole remaining Anthropic tier and leaves the declared Stage A incomplete. Encoding the known transitional waste as a passing assertion makes the omission harder to correct later.",
+    "file": "scripts/account-usage.py",
+    "fix_hint": "Complete Stage A by removing the retired fable probe from the live path, or gate it on authoritative evidence that the account genuinely serves a live fable model. Update the call-count test to require only the base plus opus5 observation requests for rows carrying the legacy `fable` and current `opus5` aliases, while retaining focused tests that non-opus5 rows do not pay for the new probe.",
+    "severity": "major",
+    "title": "Stage A adds the opus5 request without retiring the dead fable request"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe observation fields are well namespaced, bounded, and tested against the current admission and alert consumers. However, the change is not a complete implementation of the Stage A design it cites: it adds the opus5 request while deliberately retaining the retired fable request. That raises the live cost to three requests per affected account per tick against the scarce tier being measured, whereas research/720 Stage A item 3 explicitly requires retiring that dead probe in the same stage. The new self-test even locks the incomplete three-request behavior in as expected. This must be corrected before approval.",
+  "verdict": "request_changes"
+ }
+}
