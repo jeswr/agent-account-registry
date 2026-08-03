@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1744,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c7283eeebbb28fa3edf54b14bf73750d9df29e1b",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The added #1121 regression test exercises the real run_sweep terminal-reap path at the load-bearing fresh-read boundary. Its three cases hold the lease and empty snapshot constant while varying only the direct issue response: a freshly confirmed open, non-terminal issue retains its claim, while a true absence and a closed response release it. The assertions cover both the reap count and exact released-claim set, and the helper turns exceptions into mismatching values so a crash cannot masquerade as a valid result. The rationale accurately scopes the oldest-first pagination residual and the direct-read safety boundary. No production behavior or trust check is weakened, and no correctness, soundness, security, or test-vacuity defect is evident. With no findings in either round 4 or round 5, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
