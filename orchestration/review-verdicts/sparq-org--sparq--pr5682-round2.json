@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5682,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "198d1c04791776a6c2d46ceef380ad8ca49c28eb",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior minor finding. The workflow comments and branch-protection documentation now explicitly distinguish the four guarded ci-select callers from the unguarded vectorized workflow, state that the wider selection lasts only until the next subscribed event, and acknowledge that any later labeled event can narrow vectorized scope before a push. The focused test now accurately limits its guarantee to trigger membership and no longer claims to prove persistence behavior. The YAML changes and test assertions consistently retain labeled/default triggers while forbidding unlabeled across all five affected workflows.",
+  "verdict": "approve"
+ }
+}
