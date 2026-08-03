@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1717,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d222437e1ea3747158c8fa3d88b80a3db038abcc",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`summarize_no_change` applies `rec.get(\"exit_class\") != NO_CHANGE_CLASS` before records are grouped by `_health_run_key`. It therefore selects the newest record only among no-change rows, rather than selecting the newest validated record of any exit class for each attributed base workflow-run ID and then deciding whether that winner is no-change. In `_test_no_change_telemetry`, `9001.1` has an older no-change record at `ts=100` and a newer `limit` record at `ts=500`, but the asserted count remains three. That assertion encodes the bug instead of detecting it, allowing stale outcomes to inflate the wasted-run alert and its reason/repeat breakdown.",
+    "file": "scripts/metrics.py",
+    "fix_hint": "For every validated record whose base run ID is in `run_ids`, first choose the newest record regardless of exit class; only afterward retain winners whose `exit_class` is `no_change`. Change the test so the older `9001` no-change followed by the newer non-no-change is excluded, and add the inverse ordering where a newer no-change supersedes an older non-no-change. Use an authoritative ordering field and cover ties explicitly.",
+    "severity": "major",
+    "title": "Newer non-no-change reruns still do not supersede stale no-change attempts"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-4 major finding remains unresolved. `summarize_no_change` still filters out non-`no_change` records before grouping by the base workflow-run ID, so it cannot observe a newer rerun outcome that supersedes an older no-change attempt. The revised telemetry test explicitly preserves the faulty expectation: run `9001` has a no-change row at `ts=100` and a newer `limit` row at `ts=500`, yet the test still expects that run to contribute to a total of three. Consequently the metric can overstate wasted runs, misreport reasons and repeat issues, and falsely fire `worker-no-change`.",
+  "verdict": "request_changes"
+ }
+}
