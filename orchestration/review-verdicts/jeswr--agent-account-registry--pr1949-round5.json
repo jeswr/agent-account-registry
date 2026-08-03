@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1949,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9852a32149eec34bf921e5fa38085eaa1663aa0f",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-4 approval remains supported. The record now consistently distinguishes a fully chain-bound idempotence key from the scoped-down outcome-projection variant, limits the latter to a lower-bound denominator, and avoids claiming that unpublished alias preimages are timeline-verifiable. Its proposed full key covers the semantically relevant retry_decision inputs and derived routing result: ordered evidence membership and reasons, evaluation-time recency partition, ordered resolved chain and remaining chain, arm, and decomposition cause. The record also explicitly preserves the partial-denominator warning if proceed receipts are suppressed. No blocker or major correctness, soundness, test-validity, or security issue is evident in this findings-only design change.",
+  "verdict": "approve"
+ }
+}
