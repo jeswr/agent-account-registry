@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5827,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f7502a746d09fab114459672bd284178c3ea45c2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The two hermetic guards are preserved as the first executable checks after checkout in the existing gating gui-mock-ipc job, which has no advisory registry entry, continue-on-error, if, or needs condition. Removing the standalone job therefore retains the guards' blocking behavior while avoiding a separate runner. The policy and advisory-registry references are updated consistently, and the registry test now protects the actual gating job name from accidental advisory declaration. No correctness, security, or test-validity defect is evident in the scoped change.",
+  "verdict": "approve"
+ }
+}
