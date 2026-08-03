@@ -880,6 +880,11 @@ jobs:
           # parses these `cap=` / `ttl=` literals and its self-test pins them to
           # SELF_CLAIM_REVIEW_CAP / SELF_CLAIM_FIX_CAP and REVIEW_TTL / FIX_TTL. Editing one side
           # only turns that self-test RED — change both, or don't change either.
+          # The two caps below are LANE SLOT COUNTS, not two copies of one number: the review
+          # lane's 10 and the fix lane's 3 are independent, and neither mirrors any dispatcher
+          # constant (#449 deleted the dispatcher's static ceilings entirely). Issue #396 read the
+          # gap between them as drift and proposed raising the fix lane "for parity" — do not;
+          # the reasoning is recorded beside SELF_CLAIM_*_CAP in dispatch-claim.py.
           if [[ "$MODE" == review ]]; then
             prefix="review:"; cap=10; ttl=4200; role=review
           else
