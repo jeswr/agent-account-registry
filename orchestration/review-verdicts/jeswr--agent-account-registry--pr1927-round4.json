@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1927,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6968cbe282ca6e662a4efea3dc7400c3a9a4febe",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_model_container_binds` recognizes mount options only when the flag and specification appear as literal whitespace-delimited source tokens. `_run_headless_harness` can assign, for example, `local registry_flag=--volume registry_spec=\"$SCRIPT_DIR/..:/registry\"` and then place `\"$registry_flag\" \"$registry_spec\"` in the initial `container=(...)` array. This is valid shell: Docker receives a writable bind of the registry checkout, but the awk scanner ignores the assignments and expansions, still emits exactly the four expected records, and the `container+=(` assertion still sees one append. Thus the model can gain write access to the script later executed with `REGISTRY_SECRETS_PAT` while every added containment row remains green. The new synthetic fixture covers literal Docker mount syntaxes, not the shell composition seam identified in round 3.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Validate the effective argv passed to Docker, or tightly constrain and structurally validate every construct that can produce elements of the launcher array, including variable/array/function/command-substitution expansion. Add a valid, non-crashing mutant that builds `--volume` and its specification in variables and expands them into the initial `container` array, and require the containment assertion to fail. A lexical inventory of literal Docker spellings cannot establish an exact runtime argv contract.",
+    "severity": "blocker",
+    "title": "Exact mount assertion still misses shell-composed Docker arguments"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-3 blocker remains unchanged. `_model_container_binds` still lexically scans whitespace-delimited literal tokens in the source of `_run_headless_harness`; it does not validate the container argv after shell expansion. A mount flag and bind specification can therefore be assigned to ordinary shell variables and expanded as elements of the initial `container=(...)` array. Docker receives the writable registry mount, while the scanner skips both the assignments and expansions, the expected four records remain unchanged, and the separate `container+=(` count remains one. The added syntax fixtures comprehensively exercise literal Docker spellings, but they do not exercise shell argument construction, so the claimed exact filesystem-view assertion is still incomplete. This is materially the same blocker at the same severity as round 3, therefore progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
