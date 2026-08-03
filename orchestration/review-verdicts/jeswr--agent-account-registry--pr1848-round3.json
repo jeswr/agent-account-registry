@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1848,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "075d41b0efe5367a56313d538dc476b942d8fd75",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "When `_confirm_area_strip` detects that the application set moved, it restores `needs:area` with `edit`. That edit is performed by the workflow bot and creates a newer `labeled needs:area` timeline event than the human application that triggered the repair. On the next `labeled` workflow run, `area_park_clearance` applies newest-application-wins, sees the bot restoration as newest, returns true, and clears the park even though the human never withdrew their hold. The code and test explicitly describe the restored park as machine-owned and clearable on the next event, but that is precisely the ownership laundering the safeguard must prevent. The late-race test stops after the first invocation, so it proves only transient restoration, not that the human hold remains authoritative across the next real trigger.",
+    "file": "scripts/triage.py",
+    "fix_hint": "Do not re-apply the human-applicable label in a way that replaces its ownership evidence. Persist an ownership identity that distinguishes the raced human application from the compensating bot write, and make future clearance consult that durable evidence, or defer automatic deletion once this race is observed. Add a binding-layer test that runs a second ordinary labeled-event triage after the repair and asserts that `needs:area` still stands until a subsequent human removal/reapplication changes the ownership state.",
+    "severity": "major",
+    "title": "Repair converts the raced human hold into a machine-owned park"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 adds a real post-strip check and repair, so the concurrent human application survives this invocation. However, the repair re-applies `needs:area` as the workflow bot. Under the same newest-application-wins ownership rule used to authorize clearing, that bot restoration becomes the newest application and converts the human hold into a machine-clearable park. The next labeled-event triage can therefore delete it without a new human removal. The prior round's trust-plane defect is displaced to the following run rather than resolved, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
