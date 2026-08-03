@@ -4546,6 +4546,8 @@ def _self_test():
 
     # ---- #739: the READ/WRITE posture split across the rolling-upgrade seam -------------------
     ok = _test_forward_compatibility(chk) and ok
+    # ---- #1922: the REAL transport under the stubs (path guard, 404/409/422, paging) ---------
+    ok = _test_transport(chk) and ok
     # ---- CAS writer against a stub API (create + append + conflict retry) --------------------
     ok = _test_cas(chk) and ok
     # ---- #200: CAS writer is idempotent (dedup) + bounded jittered retry ---------------------
@@ -4847,6 +4849,240 @@ def _test_forward_compatibility(chk):
     with contextlib.redirect_stderr(quiet):
         _outcome(lambda: validate_ledger({"records": [rec()]}))
     chk("[#739] ...and a ledger this reader fully understands stays quiet", quiet.getvalue(), "")
+    return True
+
+
+def _test_transport(chk):
+    """[#1922] The REAL `GitHubAPI` transport, which every other test here stubs past.
+
+    `_StubAPI` stands in for the contents/issues API everywhere else, so `GitHubAPI` itself ran at
+    0 % LINE coverage: the URL-path safety guard, the 404 allowance, the 409/422 -> HealthConflict
+    mapping the CAS retry loop keys on, the malformed-JSON backstop and the whole paging helper
+    were never constructed. That is AGENTS.md AUTHOR pre-flight §1 exactly — helpers get tested
+    because they are easy to call, transports get skipped because the test has to build the real
+    world, which is where a fabricating bug survives. Measured before this test existed:
+    `exc.code in {409, 422}` -> `{409}` and dropping `\\r` from the path guard both left the suite
+    green.
+
+    NO NETWORK, and no monkeypatch of the module under test: `__init__` captures `Request` on the
+    instance (so it is injectable per instance) and `request()` re-imports `urlopen` from
+    `urllib.request` on every call (so patching the module attribute reaches it). The fake urlopen
+    is installed BEFORE the first assertion and serves a SUCCESSFUL response by default — so a
+    mutant that deletes the path guard returns a value rather than failing to reach the network,
+    which would otherwise read as a false kill (AGENTS.md §4).
+
+    Every exception row goes through `_outcome`, which folds the escaping exception's CLASS NAME
+    into the compared value: `HealthConflict` subclasses `HealthError`, so `_raises` cannot tell
+    the CAS-retry signal from a terminal failure, and a mutant that raises some third class reds
+    one named row instead of aborting the suite below it."""
+    import urllib.error
+    import urllib.request
+
+    calls = []      # every Request the transport CONSTRUCTED
+    served = []     # every (request, timeout) that actually reached urlopen
+
+    class _FakeRequest:
+        def __init__(self, url, data=None, method=None, headers=None):
+            self.full_url, self.data, self.method = url, data, method
+            self.headers = dict(headers or {})
+            calls.append(self)
+
+    class _Response:
+        def __init__(self, raw):
+            self._raw = raw
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def read(self, amt=None):
+            return self._raw
+
+    def serve(payload):
+        """Install a urlopen that RAISES `payload` when it is an exception and otherwise returns it
+        as the response body."""
+        def _urlopen(request, timeout=None):
+            served.append((request, timeout))
+            if isinstance(payload, BaseException):
+                raise payload
+            return _Response(payload)
+        urllib.request.urlopen = _urlopen
+
+    def serve_pages(by_number):
+        """Install a urlopen answering each `page=N` from `by_number` (default: an empty page)."""
+        def _urlopen(request, timeout=None):
+            served.append((request, timeout))
+            number = int(request.full_url.rsplit("page=", 1)[1])
+            return _Response(json.dumps(by_number.get(number, [])).encode())
+        urllib.request.urlopen = _urlopen
+
+    def http_error(code):
+        return urllib.error.HTTPError("https://api.github.com/x", code, f"HTTP {code}", {}, None)
+
+    def message(fn):
+        """The HealthError text `fn` fails with ('' if it does not fail)."""
+        try:
+            fn()
+        except HealthError as exc:
+            return str(exc)
+        return ""
+
+    real_urlopen = urllib.request.urlopen
+    try:
+        serve(b'{"reached": true}')      # the DEFAULT is success — see the docstring
+        # ---- construction fails CLOSED on a missing token; a client is never anonymous --------
+        chk("[#1922] the transport refuses an empty token",
+            _outcome(lambda: GitHubAPI("")), "HealthError")
+        chk("[#1922] the transport refuses a None token",
+            _outcome(lambda: GitHubAPI(None)), "HealthError")
+        chk("[#1922] a real client builds real urllib Requests",
+            GitHubAPI("t0ken")._Request is urllib.request.Request, True)
+
+        api = GitHubAPI("t0ken")
+        api._Request = _FakeRequest
+
+        # ---- URL-path safety guard: refuse BEFORE anything reaches the network ---------------
+        # A deleted guard does not fail here, it SUCCEEDS (the default urlopen above), so each row
+        # goes red on the value rather than passing on an incidental transport error.
+        # NOT asserted, deliberately: `..` and `//` segments are NOT rejected, and asserting a
+        # rejection this code does not perform would be a fabricated row. Neither crosses a trust
+        # boundary — the path is concatenated onto a literal `https://api.github.com`, so both stay
+        # PATH on that host (`//evil.example/x` parses with netloc `api.github.com`) and every
+        # production path here is composed from module constants plus $REGISTRY_REPO.
+        for name, path in (("no leading slash", "repos/o/r/contents/x"),
+                           ("absolute URL to another host", "https://evil.example/x"),
+                           ("embedded LF (header injection)", "/repos/o/r\nHost: evil.example"),
+                           ("embedded CR (header injection)", "/repos/o/r\rHost: evil.example"),
+                           ("trailing CR", "/repos/o/r/contents/x\r")):
+            del calls[:], served[:]
+            chk(f"[#1922] unsafe path REFUSED ({name})",
+                _outcome(lambda p=path: api.request("GET", p)), "HealthError")
+            chk(f"[#1922] ...and nothing was composed or sent ({name})",
+                (len(calls), len(served)), (0, 0))
+
+        # ---- the accept direction: a legitimate path is composed EXACTLY and sent -------------
+        # (without these, a maximally strict guard — `if True: raise` — would survive every row
+        # above.)
+        del calls[:], served[:]
+        serve(b'{"sha": "abc", "content": "e30="}')
+        chk("[#1922] a GET parses the response body",
+            _outcome(lambda: api.request(
+                "GET", "/repos/o/r/contents/data/ledger.json?ref=ledger")),
+            {"sha": "abc", "content": "e30="})
+        chk("[#1922] the target URL is api.github.com + the path VERBATIM (no rewriting)",
+            calls[0].full_url,
+            "https://api.github.com/repos/o/r/contents/data/ledger.json?ref=ledger")
+        chk("[#1922] the method is carried through and a bodyless GET sends no data",
+            (calls[0].method, calls[0].data), ("GET", None))
+        chk("[#1922] the token is sent as a Bearer credential",
+            calls[0].headers.get("Authorization"), "Bearer t0ken")
+        chk("[#1922] the pinned API version + JSON Accept are sent",
+            (calls[0].headers.get("Accept"), calls[0].headers.get("X-GitHub-Api-Version")),
+            ("application/vnd.github+json", "2022-11-28"))
+        chk("[#1922] a bodyless request declares no Content-Type",
+            "Content-Type" in calls[0].headers, False)
+        chk("[#1922] the request is bounded by a timeout (never an unbounded hang)",
+            served[0][1], 30)
+
+        del calls[:], served[:]
+        chk("[#1922] a PUT body is JSON-encoded onto the request",
+            _outcome(lambda: api.request("PUT", "/repos/o/r/contents/x",
+                                         body={"branch": "ledger", "sha": "s"})) is not None, True)
+        chk("[#1922] ...as the exact payload",
+            json.loads(calls[0].data.decode()), {"branch": "ledger", "sha": "s"})
+        chk("[#1922] ...and a body request declares JSON Content-Type",
+            calls[0].headers.get("Content-Type"), "application/json")
+
+        # ---- body parsing: empty reads as absent, malformed REFUSES (never a silent None) -----
+        serve(b"")
+        chk("[#1922] an empty response body reads as None, not a parse error",
+            _outcome(lambda: api.request("DELETE", "/repos/o/r/contents/x")), None)
+        serve(b"<html>502 Bad Gateway</html>")
+        chk("[#1922] a malformed body is a HealthError, never a silent None",
+            _outcome(lambda: api.request("GET", "/repos/o/r/contents/x")), "HealthError")
+
+        # ---- the 404 allowance is OPT-IN and 404-ONLY ----------------------------------------
+        serve(http_error(404))
+        chk("[#1922] 404 under allow_404 reads as absent (None)",
+            _outcome(lambda: api.request("GET", "/repos/o/r/contents/x", allow_404=True)), None)
+        chk("[#1922] 404 WITHOUT allow_404 raises (an unasked-for absence is a failure)",
+            _outcome(lambda: api.request("GET", "/repos/o/r/contents/x")), "HealthError")
+        for code in (401, 403, 410, 500):
+            serve(http_error(code))
+            chk(f"[#1922] allow_404 does NOT swallow HTTP {code} (a denial is never 'absent')",
+                _outcome(lambda: api.request("GET", "/repos/o/r/contents/x", allow_404=True)),
+                "HealthError")
+
+        # ---- 409/422 -> HealthConflict: the signal append_record's CAS retry loop keys on -----
+        # Mutants this pins: `{409, 422}` -> `{409}` or `{422}` reds one of the first rows;
+        # dropping the `retry_conflict and` conjunct reds the second; widening the set to any
+        # other 4xx/5xx reds the third block.
+        for code in (409, 422):
+            serve(http_error(code))
+            chk(f"[#1922] HTTP {code} under retry_conflict is a CAS conflict (retryable)",
+                _outcome(lambda: api.request("PUT", "/repos/o/r/contents/x", body={},
+                                             retry_conflict=True)), "HealthConflict")
+            chk(f"[#1922] HTTP {code} WITHOUT retry_conflict stays terminal (no phantom retry)",
+                _outcome(lambda: api.request("PUT", "/repos/o/r/contents/x", body={})),
+                "HealthError")
+        for code in (400, 403, 404, 412, 500, 502):
+            serve(http_error(code))
+            chk(f"[#1922] HTTP {code} is NOT a CAS conflict even under retry_conflict",
+                _outcome(lambda: api.request("PUT", "/repos/o/r/contents/x", body={},
+                                             retry_conflict=True)), "HealthError")
+
+        # ---- the failure an operator reads names the status and never the credential ---------
+        serve(http_error(503))
+        text = message(lambda: api.request("GET", "/repos/o/r/contents/x"))
+        chk("[#1922] the failure names the status code an operator must act on",
+            ("503" in text, "GET" in text), (True, True))
+        chk("[#1922] ...and never echoes the bearer token", "t0ken" in text, False)
+
+        # ---- transport-level failures normalize to HealthError -------------------------------
+        serve(urllib.error.URLError("name resolution failed"))
+        chk("[#1922] a URLError normalizes to HealthError",
+            _outcome(lambda: api.request("GET", "/repos/o/r/contents/x")), "HealthError")
+        serve(TimeoutError("socket timed out"))
+        chk("[#1922] a socket TimeoutError normalizes to HealthError",
+            _outcome(lambda: api.request("GET", "/repos/o/r/contents/x")), "HealthError")
+
+        # ---- paginate: page composition, concatenation, the short-page stop, both refusals ----
+        del calls[:], served[:]
+        serve_pages({1: [{"number": 1}]})
+        chk("[#1922] paginate returns a short first page",
+            _outcome(lambda: api.paginate("/repos/o/r/issues")), [{"number": 1}])
+        chk("[#1922] ...stopping after ONE request", len(calls), 1)
+        chk("[#1922] ...with the page query appended by '?' on an unqueried path",
+            calls[0].full_url, "https://api.github.com/repos/o/r/issues?per_page=100&page=1")
+
+        del calls[:], served[:]
+        serve_pages({1: []})
+        _outcome(lambda: api.paginate("/repos/o/r/issues?state=open"))
+        chk("[#1922] ...and by '&' when the path already carries a query",
+            calls[0].full_url,
+            "https://api.github.com/repos/o/r/issues?state=open&per_page=100&page=1")
+
+        full = [{"number": i} for i in range(100)]
+        del calls[:], served[:]
+        serve_pages({1: full, 2: [{"number": 100}, {"number": 101}]})
+        got = _outcome(lambda: api.paginate("/repos/o/r/issues"))
+        chk("[#1922] a full page is followed and concatenated IN ORDER",
+            (len(got), got[0]["number"], got[-1]["number"], len(calls)), (102, 0, 101, 2))
+
+        del calls[:], served[:]
+        serve_pages({number: full for number in range(1, 30)})
+        chk("[#1922] an unending feed REFUSES rather than silently truncating the snapshot",
+            _outcome(lambda: api.paginate("/repos/o/r/issues")), "HealthError")
+        chk("[#1922] ...after reading exactly the 20-page bound", len(calls), 20)
+
+        del calls[:], served[:]
+        serve_pages({1: {"message": "Not Found"}})
+        chk("[#1922] a non-list page REFUSES (an error envelope is never data)",
+            _outcome(lambda: api.paginate("/repos/o/r/issues")), "HealthError")
+    finally:
+        urllib.request.urlopen = real_urlopen
     return True
 
 
