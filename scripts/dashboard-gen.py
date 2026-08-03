@@ -117,6 +117,13 @@ OBS_THRESHOLD_KEYS = {"workflow_failure_rate", "defer_reason_hourly",
 # in it no longer publishes zeros: see `_normalize_observability`.
 OBS_CACHE_DROP = ("dashboard-gen: dropped the observability cache group (type {}) — "
                   "no field it publishes was measured")
+# [#1571] The FLOW group is the cache group's failure one panel over: `_obs_flow` returns None for
+# ANY non-object, which hides the whole queue/lease/park/latency panel — rendering identically to a
+# collector that sends no `flow` key at all. Announced on exactly the cache group's terms: a
+# SUPPLIED-but-unreadable group is a producer/consumer mismatch worth naming, while an absent or
+# explicitly-null one is "the collector has not landed", which is not one.
+OBS_FLOW_DROP = ("dashboard-gen: dropped the observability flow group (type {}) — "
+                 "not an object of queue/lease/park/latency rows")
 
 # [#1570] How many per-row drop warnings ONE seam may print before it stops naming rows and prints
 # a single counting tail instead. The drop diagnostics (#982 on `flow.queue`, and the evidence-link
@@ -1698,14 +1705,33 @@ def _obs_text(value, cap):
 def _obs_lane_rows(lanes):
     """Per-workflow (worker/review-fix/drain/groom/...) run outcomes over the 1h/24h windows.
     Lane names are declared by the collector, validated as safe tokens here — a new lane appears
-    on the dashboard without a UI change. Malformed rows are dropped, not fatal."""
+    on the dashboard without a UI change. Malformed rows are dropped, not fatal.
+
+    [#1571] ...and every drop is now ANNOUNCED, on #982's terms. This seam is WORSE than the queue
+    it copies: an empty queue panel at least reads as "no backlog", whereas a lane the collector
+    spells in a shape this seam cannot read simply is not on the page, and a run-health panel with
+    nothing on it reads as a HEALTHY fleet. The tolerance is unchanged — a malformed lane never
+    fails the build — and the 12-lane DISPLAY cap stays silent, because a truncation of well-formed
+    rows is this seam's documented contract rather than a producer/consumer mismatch."""
     rows = []
+    drops = _ObsDropLog("observability lane rows")
     if not isinstance(lanes, dict):
+        if lanes is not None:
+            _obs_drop(drops, "lane",
+                      f"`lanes` (type {type(lanes).__name__}) is not an object of lane rows")
+        drops.close()
         return rows
     for name in sorted(str(key) for key in lanes):
         row = lanes.get(name)
-        if (len(rows) == 12 or OBS_TOKEN_RE.fullmatch(name) is None
-                or not isinstance(row, dict)):
+        if len(rows) == 12:
+            continue
+        if OBS_TOKEN_RE.fullmatch(name) is None:
+            _obs_drop(drops, "lane",
+                      f"lane name {_obs_text(name, 32)!r} is not a safe token")
+            continue
+        if not isinstance(row, dict):
+            _obs_drop(drops, "lane", f"lane {_obs_text(name, 32)!r} (type "
+                      f"{type(row).__name__}) is not an object of 1h/24h windows")
             continue
         out = {"lane": name}
         for window in ("1h", "24h"):
@@ -1716,41 +1742,76 @@ def _obs_lane_rows(lanes):
             out[window] = {key: _obs_count(source.get(key)) or 0
                            for key in ("success", "failure", "defer")}
         rows.append(out)
+    drops.close()
     return rows
 
 
-def _obs_counted_rows(items, key_field, cap):
-    """[{<key_field>, count}] sorted by count descending (the TOP-N contract for defer reasons)."""
+def _obs_counted_rows(items, key_field, cap, seam, path):
+    """[{<key_field>, count}] sorted by count descending (the TOP-N contract for defer reasons).
+
+    [#1571] `seam`/`path` are REQUIRED rather than defaulted: this helper is generic over
+    `key_field`, so a second caller that inherited a default would announce its own dropped rows
+    under the defer-reason seam's name. The TOP-N truncation on the way out is the contract and
+    stays silent; only rows this seam could not READ are announced."""
     rows = []
+    drops = _ObsDropLog(f"observability {seam} rows")
+    if not isinstance(items, list) and items is not None:
+        _obs_drop(drops, seam, f"`{path}` (type {type(items).__name__}) is not a list of rows")
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict):
+            _obs_drop(drops, seam, f"the row (type {type(item).__name__}) is not an object")
             continue
         key = item.get(key_field)
         count = _obs_count(item.get("count"))
-        if not isinstance(key, str) or OBS_TOKEN_RE.fullmatch(key) is None or count is None:
+        if not isinstance(key, str) or OBS_TOKEN_RE.fullmatch(key) is None:
+            _obs_drop(drops, seam, f"row `{key_field}` {_obs_text(key, 32)!r} (type "
+                      f"{type(key).__name__}) is not a safe token")
+            continue
+        if count is None:
+            _obs_drop(drops, seam, f"row `count` (type {type(item.get('count')).__name__}) is "
+                      "not a non-negative integer")
             continue
         rows.append({key_field: key, "count": count})
+    drops.close()
     rows.sort(key=lambda row: (-row["count"], row[key_field]))
     return rows[:cap]
 
 
 def _obs_exit_rows(items):
+    """[#1571] Per-model exit-class counts, with the same announced-drop contract as every other
+    seam on this document: an exit-class panel that renders empty because the collector spelled
+    `model` in a shape SAFE_MODEL_RE cannot read is indistinguishable from a fleet whose runs all
+    succeeded."""
     rows = []
+    drops = _ObsDropLog("observability model-exit rows")
+    if not isinstance(items, list) and items is not None:
+        _obs_drop(drops, "model-exit", f"`model_exit_classes_1h` (type "
+                  f"{type(items).__name__}) is not a list of rows")
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict):
+            _obs_drop(drops, "model-exit", f"the row (type {type(item).__name__}) is not an object")
             continue
         model, exit_class = item.get("model"), item.get("exit_class")
         count = _obs_count(item.get("count"))
-        if (not isinstance(model, str) or SAFE_MODEL_RE.fullmatch(model) is None
-                or not isinstance(exit_class, str)
-                or OBS_TOKEN_RE.fullmatch(exit_class) is None or count is None):
+        if not isinstance(model, str) or SAFE_MODEL_RE.fullmatch(model) is None:
+            _obs_drop(drops, "model-exit", f"row `model` {_obs_text(model, 32)!r} (type "
+                      f"{type(model).__name__}) is not a safe model alias")
+            continue
+        if not isinstance(exit_class, str) or OBS_TOKEN_RE.fullmatch(exit_class) is None:
+            _obs_drop(drops, "model-exit", f"row `exit_class` {_obs_text(exit_class, 32)!r} (type "
+                      f"{type(exit_class).__name__}) is not a safe token")
+            continue
+        if count is None:
+            _obs_drop(drops, "model-exit", f"row `count` (type "
+                      f"{type(item.get('count')).__name__}) is not a non-negative integer")
             continue
         rows.append({"model": model, "exit_class": exit_class, "count": count})
+    drops.close()
     rows.sort(key=lambda row: (-row["count"], row["model"], row["exit_class"]))
     return rows[:16]
 
 
-def _obs_lease_aggregate(value):
+def _obs_lease_aggregate(value, drops):
     """A lease-utilization aggregate the COLLECTOR computed, i.e. the row-free form of the input
     (issue #841). Same published shape as the rows-derived one: ``{"mean", "max"}``.
 
@@ -1758,12 +1819,27 @@ def _obs_lease_aggregate(value):
     fields must be real fractions and ``max >= mean``, which no aggregate over real samples can
     violate. DROPPING rather than raising is the tolerance this document already declares: inside
     a well-formed snapshot a malformed row is dropped and only a privacy violation is fatal, and
-    this value carries no identity to violate."""
+    this value carries no identity to violate.
+
+    [#1571] ...and the drop is ANNOUNCED, by the field that failed. `drops` is required, and the
+    caller only reaches here when `flow.lease_utilization_1h` is actually PRESENT: a collector that
+    sends no aggregate at all is the expected pre-#841 state, not a mismatch. The three reasons are
+    named separately because they are different collector bugs — an unreadable fraction is a type
+    error, while ``max < mean`` is an aggregate computed over the wrong sample set."""
     if not isinstance(value, dict):
+        _obs_drop(drops, "lease-aggregate", f"`flow.lease_utilization_1h` (type "
+                  f"{type(value).__name__}) is not an object of mean/max fractions")
         return None
     mean = _obs_fraction(value.get("mean"))
     maximum = _obs_fraction(value.get("max"))
-    if mean is None or maximum is None or maximum < mean:
+    if mean is None or maximum is None:
+        _obs_drop(drops, "lease-aggregate", f"`mean` (type {type(value.get('mean')).__name__}) "
+                  f"and `max` (type {type(value.get('max')).__name__}) are not both fractions "
+                  "in [0, 1]")
+        return None
+    if maximum < mean:
+        _obs_drop(drops, "lease-aggregate", "`max` is below `mean`, which no aggregate over real "
+                  "samples can be")
         return None
     return {"mean": round(mean, 2), "max": round(maximum, 2)}
 
@@ -1802,8 +1878,8 @@ class _ObsDropLog:
                   f"({self.dropped} dropped in total)")
 
 
-def _obs_drop_queue(drops, detail):
-    """[#982] Announce a dropped observability queue input instead of swallowing it.
+def _obs_drop(drops, seam, detail):
+    """[#982] Announce a dropped observability input instead of swallowing it.
 
     `_obs_trigger_rows` already sets this precedent on the same collector document. It matters
     more here: a dropped queue row leaves `flow.queue` EMPTY, and an empty queue panel is exactly
@@ -1811,13 +1887,19 @@ def _obs_drop_queue(drops, detail):
     over the natural `queue_stats()` shape, whose classes are Python INTEGERS — published a green
     build, a green self-test and a panel reading `no backlog`, with the loss visible nowhere.
 
-    Only the SHAPE is named: a type name, a field name, and for a class string the `_obs_text`
-    sanitized form. No collector value reaches the build log raw, so a malformed snapshot cannot
-    inject lines into the log it is being diagnosed in.
+    Only the SHAPE is named: a type name, a field name, and for a collector string the `_obs_text`
+    sanitized, length-bounded form. No collector value reaches the build log raw, so a malformed
+    snapshot cannot inject lines into the log it is being diagnosed in.
 
-    [#1570] `drops` is this build's queue-seam `_ObsDropLog`: the wording is unchanged, the emission
-    is capped, and the rows past the cap are counted into its tail line rather than printed."""
-    drops.drop(f"observability queue input ({detail})")
+    [#1570] `drops` is the seam's own `_ObsDropLog`: the wording is unchanged, the emission is
+    capped, and the rows past the cap are counted into its tail line rather than printed.
+
+    [#1571] `seam` generalises the identical wording to every OTHER silent-`continue` seam on this
+    document — #982 fixed `flow.queue` alone, leaving six with the same shape, two of them (lanes,
+    defer reasons) WORSE, because those panels render empty for a healthy fleet. One helper rather
+    than one per seam: a message format written seven times is #958's shape, and pre-flight item 4
+    measures duplicated guards as individually unkillable."""
+    drops.drop(f"observability {seam} input ({detail})")
 
 
 def _obs_flow(flow):
@@ -1840,25 +1922,25 @@ def _obs_flow(flow):
     drops = _ObsDropLog("observability queue rows")
     raw_queue = flow.get("queue")
     if "queue" in flow and not isinstance(raw_queue, list):
-        _obs_drop_queue(
-            drops, f"`flow.queue` (type {type(raw_queue).__name__}) is not a list of rows")
+        _obs_drop(drops, "queue",
+                  f"`flow.queue` (type {type(raw_queue).__name__}) is not a list of rows")
     for item in raw_queue if isinstance(raw_queue, list) else []:
         if not isinstance(item, dict):
-            _obs_drop_queue(drops, f"the row (type {type(item).__name__}) is not an object")
+            _obs_drop(drops, "queue", f"the row (type {type(item).__name__}) is not an object")
             continue
         queue_class = item.get("class")
         if not isinstance(queue_class, str):
-            _obs_drop_queue(drops, f"row `class` (type {type(queue_class).__name__}) is not a "
-                            "class STRING such as '1'/'2a'/'4'")
+            _obs_drop(drops, "queue", f"row `class` (type {type(queue_class).__name__}) is not a "
+                      "class STRING such as '1'/'2a'/'4'")
             continue
         if OBS_QUEUE_CLASS_RE.fullmatch(queue_class) is None:
-            _obs_drop_queue(
-                drops, f"row `class` {_obs_text(queue_class, 16)!r} is not one of the queue classes")
+            _obs_drop(drops, "queue", f"row `class` {_obs_text(queue_class, 16)!r} is not one of "
+                      "the queue classes")
             continue
         depth = _obs_count(item.get("depth"))
         if depth is None:
-            _obs_drop_queue(drops, f"row `depth` (type {type(item.get('depth')).__name__}) is not "
-                            "a non-negative integer")
+            _obs_drop(drops, "queue", f"row `depth` (type {type(item.get('depth')).__name__}) is "
+                      "not a non-negative integer")
             continue
         queue.append({"class": queue_class, "depth": depth,
                       "oldest_age_minutes": _obs_minutes(item.get("oldest_age_minutes"))})
@@ -1904,8 +1986,15 @@ def _obs_flow(flow):
             "mean": round(sum(lease_utilizations) / len(lease_utilizations), 2),
             "max": round(max(lease_utilizations), 2),
         } if lease_utilizations else None
+    elif "lease_utilization_1h" in flow:
+        # [#1571] Announced only when the aggregate is actually SENT. `_obs_lease_aggregate(None)`
+        # was the pre-#841 state of every collector and is not a mismatch; a supplied-but-unreadable
+        # aggregate is, and it hides the one load-balance stat this panel still publishes.
+        lease_drops = _ObsDropLog("observability lease-aggregate inputs")
+        lease_utilization = _obs_lease_aggregate(flow["lease_utilization_1h"], lease_drops)
+        lease_drops.close()
     else:
-        lease_utilization = _obs_lease_aggregate(flow.get("lease_utilization_1h"))
+        lease_utilization = None
 
     rounds = flow.get("review_rounds")
     review_rounds = None
@@ -1933,17 +2022,34 @@ def _obs_flow(flow):
                         "p90": _obs_minutes(latency.get("p90")),
                         "samples": _obs_count(latency.get("samples")) or 0}
 
+    # [#1571] The target-CI congestion seam counts SEPARATELY from the queue seam above (#1570): a
+    # flooded `flow.queue` must not consume this loop's warning budget, or one invisible loss is
+    # merely traded for another. An empty target-CI panel reads as "no target repository is
+    # congested", which is the same false HEALTHY reading #982 fixed one field over.
     ci_queue = []
-    for item in (flow.get("target_ci_queue")
-                 if isinstance(flow.get("target_ci_queue"), list) else []):
+    ci_drops = _ObsDropLog("observability target-CI rows")
+    raw_ci_queue = flow.get("target_ci_queue")
+    if "target_ci_queue" in flow and not isinstance(raw_ci_queue, list):
+        _obs_drop(ci_drops, "target-CI", f"`flow.target_ci_queue` (type "
+                  f"{type(raw_ci_queue).__name__}) is not a list of rows")
+    for item in raw_ci_queue if isinstance(raw_ci_queue, list) else []:
         if not isinstance(item, dict):
+            _obs_drop(ci_drops, "target-CI", f"the row (type {type(item).__name__}) is not "
+                      "an object")
             continue
         repository = item.get("repository")
         depth = _obs_count(item.get("depth"))
-        if (not isinstance(repository, str) or depth is None or not re.fullmatch(
+        if (not isinstance(repository, str) or not re.fullmatch(
                 r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", repository)):
+            _obs_drop(ci_drops, "target-CI", f"row `repository` {_obs_text(repository, 40)!r} "
+                      f"(type {type(repository).__name__}) is not an `owner/name` slug")
+            continue
+        if depth is None:
+            _obs_drop(ci_drops, "target-CI", f"row `depth` (type "
+                      f"{type(item.get('depth')).__name__}) is not a non-negative integer")
             continue
         ci_queue.append({"repository": repository, "depth": depth})
+    ci_drops.close()
 
     return {"queue": queue[:12], "lease_utilization_1h": lease_utilization,
             "review_rounds": review_rounds,
@@ -2006,11 +2112,31 @@ def _normalize_observability(document):
     if isinstance(cache_source, dict):
         histogram = {}
         raw_histogram = cache_source.get("chain_length_histogram")
+        # [#1571] A histogram bucket this seam cannot read is dropped, and now SAID SO. It is the
+        # one seam whose loss can be invisible even on a PUBLISHED panel: the cache group survives
+        # on any other measured field, so a collector that keys its buckets `"1-2"` renders a
+        # complete-looking card with the chain distribution silently missing from it. The `[:12]`
+        # slice above the loop stays silent for the same reason the other display caps do — it
+        # truncates well-formed buckets rather than failing to read one.
+        histogram_drops = _ObsDropLog("observability cache-histogram buckets")
+        if raw_histogram is not None and not isinstance(raw_histogram, dict):
+            _obs_drop(histogram_drops, "cache-histogram", f"`cache.chain_length_histogram` (type "
+                      f"{type(raw_histogram).__name__}) is not an object of bucket counts")
         if isinstance(raw_histogram, dict):
             for key in sorted(str(k) for k in raw_histogram)[:12]:
                 count = _obs_count(raw_histogram.get(key))
-                if OBS_HISTOGRAM_KEY_RE.fullmatch(key) and count is not None:
-                    histogram[key] = count
+                if OBS_HISTOGRAM_KEY_RE.fullmatch(key) is None:
+                    _obs_drop(histogram_drops, "cache-histogram", f"bucket key "
+                              f"{_obs_text(key, 16)!r} is not a chain length such as '1'/'5+'")
+                    continue
+                if count is None:
+                    _obs_drop(histogram_drops, "cache-histogram", f"bucket "
+                              f"{_obs_text(key, 16)!r} (type "
+                              f"{type(raw_histogram.get(key)).__name__}) is not a non-negative "
+                              "integer count")
+                    continue
+                histogram[key] = count
+        histogram_drops.close()
         read_fraction = _obs_fraction(cache_source.get("prompt_cache_read_fraction_1h"))
         usage_samples = _obs_count(cache_source.get("usage_samples_1h"))
         warm_drain = _obs_fraction(cache_source.get("warm_drain_rate_1h"))
@@ -2046,13 +2172,23 @@ def _normalize_observability(document):
                     and math.isfinite(value) and value >= 0):
                 thresholds[key] = value
 
+    # [#1571] `_obs_flow` returns None for any non-object, which hides the WHOLE flow panel — the
+    # largest single loss on this document and, until now, the quietest. Named on the cache group's
+    # terms (a supplied-but-unreadable group is the mismatch; an absent or null one is not), and
+    # kept here rather than inside `_obs_flow` because only this seam can tell the two apart.
+    flow_source = document.get("flow")
+    flow = _obs_flow(flow_source)
+    if flow is None and flow_source is not None:
+        print(OBS_FLOW_DROP.format(type(flow_source).__name__))
+
     return {
         "generated_at": _utc_iso(document.get("generated_at")),
         "cache": cache,
         "lanes": _obs_lane_rows(document.get("lanes")),
-        "defer_reasons_1h": _obs_counted_rows(document.get("defer_reasons_1h"), "reason", 16),
+        "defer_reasons_1h": _obs_counted_rows(document.get("defer_reasons_1h"), "reason", 16,
+                                              "defer-reason", "defer_reasons_1h"),
         "model_exit_classes_1h": _obs_exit_rows(document.get("model_exit_classes_1h")),
-        "flow": _obs_flow(document.get("flow")),
+        "flow": flow,
         "trigger_fires": _obs_trigger_rows(document.get("trigger_fires")),
         "thresholds": thresholds,
     }
@@ -5749,6 +5885,31 @@ esac
     _INT_CLASS = _QUEUE_DROP.format(
         "row `class` (type int) is not a class STRING such as '1'/'2a'/'4'")
 
+    def obs_quiet_fixture():
+        """`obs_fixture` with the deliberately-malformed row REMOVED from every seam.
+
+        [#1571] The golden fixture carries one unreadable row per seam on purpose, and since every
+        seam now announces its drops, a fixture-wide capture would mix six unrelated diagnostics
+        into rows that are about the queue and evidence seams. Removing them keeps the capture below
+        UNFILTERED — which is the point of it — while making the absence of any other line an
+        assertion in its own right: every seam's ACCEPT path is silent, in one place.
+        """
+        fixture = copy.deepcopy(obs_fixture)
+        del fixture["cache"]["chain_length_histogram"]["bogus"]
+        del fixture["cache"]["chain_length_histogram"]["3"]
+        del fixture["lanes"]["bad lane!"]
+        fixture["defer_reasons_1h"] = [{"reason": "partial-disarm", "count": 7}]
+        fixture["model_exit_classes_1h"] = [{"model": "fable", "exit_class": "success", "count": 3}]
+        fixture["flow"]["target_ci_queue"] = [{"repository": "sparq-org/sparq", "depth": 5}]
+        fixture["flow"]["queue"] = [{"class": "2a", "depth": 1, "oldest_age_minutes": 12.34},
+                                    {"class": "4", "depth": 9, "oldest_age_minutes": 3}]
+        fixture["trigger_fires"] = [
+            {"rule": "worker-failure-rate", "fired_at": now - 300,
+             "summary": "worker failure rate 67% over 3 consecutive runs",
+             "evidence": ["https://github.com/jeswr/agent-account-registry/actions/runs/1"],
+             "enqueued_task": "heal-2a-0001"}]
+        return fixture
+
     def obs_drops(queue_rows, trigger_rows):
         """(published `flow.queue`, published `trigger_fires`, EVERY `dashboard-gen:` line printed).
 
@@ -5756,7 +5917,7 @@ esac
         a cap that merely relabelled its warnings, or a tail line printed to the wrong seam, would
         be invisible to a prefix-filtered capture.
         """
-        fixture = copy.deepcopy(obs_fixture)
+        fixture = obs_quiet_fixture()
         fixture["flow"]["queue"] = queue_rows
         fixture["trigger_fires"] = trigger_rows
         stream = io.StringIO()
@@ -5828,6 +5989,286 @@ esac
            [{"rule": "quiet-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "s",
              "evidence": ["https://github.com/jeswr/agent-account-registry/actions/runs/7"],
              "enqueued_task": None}], []))
+    # ---- [#1571] EVERY OTHER SEAM ON THIS DOCUMENT HAD THE SAME SILENT `continue`. #982 announced
+    # `flow.queue` alone; the six below kept swallowing malformed rows, and two of them are WORSE
+    # than the queue was — an empty lane panel and an empty defer-reason panel both read as a
+    # HEALTHY fleet, whereas an empty queue at least reads as "no backlog". The rows here pin BOTH
+    # directions for each seam: the reject path names the field that failed, and the accept path
+    # stays silent, so a warning hoisted above its guard (or made unconditional) reds immediately.
+    # Every expected string is a LITERAL and every input is a JSON literal: reading either back off
+    # the module under test is the tautology AGENTS.md pre-flight 2(b)/2(c) names.
+    _DROP = "dashboard-gen: dropped observability {} input ({})"
+    _FLOW_DROP = ("dashboard-gen: dropped the observability flow group (type {}) — "
+                  "not an object of queue/lease/park/latency rows")
+    _ABSENT = object()
+
+    def obs_seam(path, value, read):
+        """(the value published at `read`, EVERY `dashboard-gen:` line this build printed).
+
+        `path`/`read` are dotted so one helper covers all six seams; the capture is UNFILTERED, so
+        a diagnostic attributed to the wrong seam — or one leaking out of a seam this row did not
+        touch — reds the row rather than being filtered away.
+        """
+        fixture = obs_quiet_fixture()
+        target, parts = fixture, path.split(".")
+        for part in parts[:-1]:
+            target = target[part]
+        if value is _ABSENT:
+            del target[parts[-1]]
+        else:
+            target[parts[-1]] = value
+        stream = io.StringIO()
+        try:                       # same crash-after-partial-run guard as ObsRefusal above
+            with contextlib.redirect_stdout(stream):
+                document = _normalize_observability(fixture)
+        except DashboardError as error:
+            document = ObsRefusal(refused=str(error))
+        published = document
+        for part in read.split("."):
+            published = published[part] if isinstance(published, dict) else published
+        return (published, [line for line in stream.getvalue().splitlines()
+                            if line.startswith("dashboard-gen:")])
+
+    # (seam, document path, read path, [(case, input, published, [details])]). A detail of None
+    # means the input must publish that value SILENTLY.
+    for seam, path, read, cases in (
+        # Every seam's container guard carries a FALSY-BUT-PRESENT case (`[]`, `{}`), because the
+        # inert form of a presence check is a truthiness check and it is invisible to a row that
+        # only ever sends a non-empty container. Measured: `if lanes is not None:` -> `if lanes:`
+        # and `if flow is None and flow_source is not None:` -> `... and flow_source:` both survived
+        # this table's first draft — pre-flight item 3's #938 shape, exactly.
+        ("lane", "lanes", "lanes", (
+            ("a whole non-object lane container", ["worker"], [],
+             ["`lanes` (type list) is not an object of lane rows"]),
+            ("a falsy-but-present lane container", [], [],
+             ["`lanes` (type list) is not an object of lane rows"]),
+            ("a lane name that is not a safe token", {"bad lane!": {"1h": {"success": 1}}}, [],
+             ["lane name 'bad lane!' is not a safe token"]),
+            ("a non-object lane row", {"worker": ["1h"]}, [],
+             ["lane 'worker' (type list) is not an object of 1h/24h windows"]),
+            ("a null lane row", {"worker": None}, [],
+             ["lane 'worker' (type NoneType) is not an object of 1h/24h windows"]),
+            ("a lane row that parses", {"worker": {"1h": {"success": 3, "failure": 0, "defer": 0}}},
+             [{"lane": "worker", "1h": {"success": 3, "failure": 0, "defer": 0}, "24h": None}],
+             None),
+            ("an explicit null lane container", None, [], None),
+            ("no lane key at all", _ABSENT, [], None),
+        )),
+        ("defer-reason", "defer_reasons_1h", "defer_reasons_1h", (
+            ("a whole non-list defer container", {"partial-disarm": 7}, [],
+             ["`defer_reasons_1h` (type dict) is not a list of rows"]),
+            ("a falsy-but-present defer container", {}, [],
+             ["`defer_reasons_1h` (type dict) is not a list of rows"]),
+            ("a non-object defer row", [["partial-disarm", 7]], [],
+             ["the row (type list) is not an object"]),
+            ("a null defer row", [None], [], ["the row (type NoneType) is not an object"]),
+            ("a reason that is not a safe token", [{"reason": "bad reason!", "count": 3}], [],
+             ["row `reason` 'bad reason!' (type str) is not a safe token"]),
+            ("a missing reason", [{"count": 3}], [],
+             ["row `reason` '' (type NoneType) is not a safe token"]),
+            ("a non-integer count", [{"reason": "partial-disarm", "count": "x"}], [],
+             ["row `count` (type str) is not a non-negative integer"]),
+            ("a defer row that parses", [{"reason": "partial-disarm", "count": 7}],
+             [{"reason": "partial-disarm", "count": 7}], None),
+            ("an explicit null defer container", None, [], None),
+        )),
+        ("model-exit", "model_exit_classes_1h", "model_exit_classes_1h", (
+            ("a whole non-list exit container", {"fable": 3}, [],
+             ["`model_exit_classes_1h` (type dict) is not a list of rows"]),
+            ("a falsy-but-present exit container", {}, [],
+             ["`model_exit_classes_1h` (type dict) is not a list of rows"]),
+            ("a non-object exit row", [["fable", "success", 3]], [],
+             ["the row (type list) is not an object"]),
+            ("a model alias that is not safe",
+             [{"model": "bad model!", "exit_class": "success", "count": 1}], [],
+             ["row `model` 'bad model!' (type str) is not a safe model alias"]),
+            ("an exit class that is not a safe token",
+             [{"model": "fable", "exit_class": "bad class!", "count": 1}], [],
+             ["row `exit_class` 'bad class!' (type str) is not a safe token"]),
+            ("a negative count", [{"model": "fable", "exit_class": "success", "count": -1}], [],
+             ["row `count` (type int) is not a non-negative integer"]),
+            ("an exit row that parses",
+             [{"model": "fable", "exit_class": "success", "count": 3}],
+             [{"model": "fable", "exit_class": "success", "count": 3}], None),
+            ("an explicit null exit container", None, [], None),
+        )),
+        ("target-CI", "flow.target_ci_queue", "flow.target_ci_queue", (
+            ("a whole non-list target-CI container", {"sparq-org/sparq": 5}, [],
+             ["`flow.target_ci_queue` (type dict) is not a list of rows"]),
+            ("a falsy-but-present target-CI container", {}, [],
+             ["`flow.target_ci_queue` (type dict) is not a list of rows"]),
+            ("a non-object target-CI row", [["sparq-org/sparq", 5]], [],
+             ["the row (type list) is not an object"]),
+            ("a repository that is not an owner/name slug",
+             [{"repository": "not-a-repo", "depth": 2}], [],
+             ["row `repository` 'not-a-repo' (type str) is not an `owner/name` slug"]),
+            ("a missing repository", [{"depth": 2}], [],
+             ["row `repository` '' (type NoneType) is not an `owner/name` slug"]),
+            ("a non-integer depth", [{"repository": "sparq-org/sparq", "depth": "5"}], [],
+             ["row `depth` (type str) is not a non-negative integer"]),
+            ("a target-CI row that parses", [{"repository": "sparq-org/sparq", "depth": 5}],
+             [{"repository": "sparq-org/sparq", "depth": 5}], None),
+            ("no target-CI key at all", _ABSENT, [], None),
+        )),
+        ("cache-histogram", "cache.chain_length_histogram", "cache.chain_length_histogram", (
+            ("a non-object histogram", "1:4", {},
+             ["`cache.chain_length_histogram` (type str) is not an object of bucket counts"]),
+            ("a falsy-but-present histogram", [], {},
+             ["`cache.chain_length_histogram` (type list) is not an object of bucket counts"]),
+            ("a bucket key that is not a chain length", {"bogus": 2}, {},
+             ["bucket key 'bogus' is not a chain length such as '1'/'5+'"]),
+            ("a negative bucket count", {"3": -1}, {},
+             ["bucket '3' (type int) is not a non-negative integer count"]),
+            ("a histogram that parses", {"2": 6}, {"2": 6}, None),
+            ("no histogram key at all", _ABSENT, {}, None),
+        )),
+    ):
+        for case, value, published, details in cases:
+            check(f"[#1571] {seam}: {case} is "
+                  + ("dropped LOUDLY, by the field that failed" if details
+                     else "published SILENTLY (the warning marks a real drop, so it can never "
+                          "fire on the accept path)"),
+                  obs_seam(path, value, read),
+                  (published, [_DROP.format(seam, detail) for detail in details or []]))
+    # The 12-lane DISPLAY cap is deliberately NOT announced: it truncates rows this seam READ, which
+    # is its documented contract, not a producer/consumer mismatch. Announcing it would fire on
+    # every healthy 13-lane fleet. The malformed 13th rides along to pin the ORDER of the two guards
+    # — swap them and a lane past the cap starts naming itself.
+    check("[#1571] a 13th lane is truncated by the display cap SILENTLY, and so is a malformed "
+          "lane sitting past it — the cap bounds the panel, it does not diagnose the collector",
+          obs_seam("lanes", {f"lane-{index:02d}": {"1h": {"success": 1, "failure": 0, "defer": 0}}
+                             for index in range(13)} | {"zz bad lane!": {"1h": {"success": 1}}},
+                   "lanes")[1],
+          [])
+    # ...and every new seam is BOUNDED like #1570's two. An unbounded defer-reason diagnostic is the
+    # same 100k-line step log #1570 fixed, one panel over. Sizes and expected counts are literals.
+    check("[#1571] 20 malformed defer rows print 12 warnings and ONE tail naming the REAL total — "
+          "a new seam that skipped `_ObsDropLog` would print all 20 and no tail",
+          obs_seam("defer_reasons_1h", [{"reason": f"bad reason {index}!", "count": 1}
+                                        for index in range(20)], "defer_reasons_1h"),
+          ([], [_DROP.format("defer-reason", f"row `reason` 'bad reason {index}!' (type str) is "
+                             "not a safe token") for index in range(12)]
+           + [_SUPPRESSED.format(8, "observability defer-reason rows", 20)]))
+    # The seams count SEPARATELY (#1570's property, now across seven seams): a flooded lane panel
+    # must not silence the defer panel on the same document. One shared counter prints 12 lines
+    # total and a single tail naming one seam.
+    _cross = obs_quiet_fixture()
+    _cross["lanes"] = {f"bad lane {index}!": {"1h": {"success": 1}} for index in range(20)}
+    _cross["defer_reasons_1h"] = [{"reason": f"bad reason {index}!", "count": 1}
+                                  for index in range(20)]
+    _cross_stream = io.StringIO()
+    with contextlib.redirect_stdout(_cross_stream):
+        _cross_document = _normalize_observability(_cross)
+    check("[#1571] a flooded lane seam does not consume the defer seam's budget: each closes with "
+          "its own tail, naming its own seam and its own real total",
+          ([line for line in _cross_stream.getvalue().splitlines()
+            if line.startswith("dashboard-gen: ... ")],
+           _cross_document["lanes"], _cross_document["defer_reasons_1h"]),
+          ([_SUPPRESSED.format(8, "observability lane rows", 20),
+            _SUPPRESSED.format(8, "observability defer-reason rows", 20)], [], []))
+    # ---- [#1571] THE LEASE AGGREGATE. Only the row-FREE form (#841) consults it, so the diagnostic
+    # must fire there and NOWHERE else: a collector still sending `leases` takes the legacy path and
+    # a warning there would name a mismatch that does not exist.
+    def obs_aggregate(aggregate, present=True):
+        """(published `flow.lease_utilization_1h`, every `dashboard-gen:` line printed)."""
+        fixture = obs_quiet_fixture()
+        fixture["flow"].pop("leases", None)          # the collector sends NO per-account rows
+        if present:
+            fixture["flow"]["lease_utilization_1h"] = aggregate
+        stream = io.StringIO()
+        try:                       # same crash-after-partial-run guard as ObsRefusal above
+            with contextlib.redirect_stdout(stream):
+                document = _normalize_observability(fixture)
+        except DashboardError as error:
+            document = ObsRefusal(refused=str(error))
+        return (document["flow"]["lease_utilization_1h"],
+                [line for line in stream.getvalue().splitlines()
+                 if line.startswith("dashboard-gen:")])
+
+    for case, aggregate, detail in (
+        ("a non-object aggregate", [0.2, 0.4],
+         "`flow.lease_utilization_1h` (type list) is not an object of mean/max fractions"),
+        # A FALSY-but-present aggregate: `elif flow.get("lease_utilization_1h"):` is the inert form
+        # of the presence check below, and only an empty object can see it (pre-flight item 3).
+        ("an empty aggregate object", {},
+         "`mean` (type NoneType) and `max` (type NoneType) are not both fractions in [0, 1]"),
+        ("a half-supplied aggregate (no max)", {"mean": 0.2},
+         "`mean` (type float) and `max` (type NoneType) are not both fractions in [0, 1]"),
+        ("a non-numeric aggregate", {"mean": "busy", "max": "busy"},
+         "`mean` (type str) and `max` (type str) are not both fractions in [0, 1]"),
+        ("an out-of-range aggregate", {"mean": 0.2, "max": 1.4},
+         "`mean` (type float) and `max` (type float) are not both fractions in [0, 1]"),
+        # An incoherent aggregate is a DIFFERENT collector bug from an unreadable one — the sample
+        # set is wrong, not the type — so it gets its own message. Merging the two would leave a
+        # collector computing max over the wrong window reading as a type error.
+        ("an incoherent aggregate (max < mean)", {"mean": 0.8, "max": 0.4},
+         "`max` is below `mean`, which no aggregate over real samples can be"),
+    ):
+        check(f"[#1571] lease-aggregate: {case} is dropped LOUDLY, by the field that failed",
+              obs_aggregate(aggregate), (None, [_DROP.format("lease-aggregate", detail)]))
+    check("[#1571] lease-aggregate: an aggregate that parses is published SILENTLY",
+          obs_aggregate({"mean": 0.31, "max": 0.77}), ({"mean": 0.31, "max": 0.77}, []))
+    # The two ABSENCES are silent for the cache group's reason: no aggregate at all is every
+    # pre-#841 collector, which is not a mismatch. `leases`-present is the load-bearing one — the
+    # legacy path must never announce, or every rows-sending collector warns on every build.
+    check("[#1571] lease-aggregate: a collector that sends NO aggregate hides the stat SILENTLY",
+          obs_aggregate(None, present=False), (None, []))
+    _rows_path = obs_seam("flow.lease_utilization_1h", {"mean": 0.99, "max": 0.99},
+                          "flow.lease_utilization_1h")
+    check("[#1571] lease-aggregate: a collector sending legacy `leases` takes the rows path and "
+          "says NOTHING about the aggregate it also sent (#841 precedence is unchanged)",
+          _rows_path, ({"mean": 0.6, "max": 0.8}, []))
+    # ...and the lease-ROW loop's own non-object `continue` — a line the coverage pre-flight showed
+    # had never executed — drops the row without disturbing the aggregate over the rows that parsed.
+    check("[#1571] a non-object lease ROW is dropped and the aggregate is taken over the rest",
+          obs_seam("flow.leases", [None, {"label": "ab12cd340a5f9e71", "provider": "anthropic",
+                                          "utilization_1h": 0.5}], "flow.lease_utilization_1h"),
+          ({"mean": 0.5, "max": 0.5}, []))
+    # ---- [#1571] THE FLOW GROUP ITSELF. `_obs_flow`'s `if not isinstance(flow, dict): return None`
+    # was never executed by this suite at all (coverage pre-flight, item 1), and it is the largest
+    # single loss on the document: the whole queue/lease/park/latency panel disappears, rendering
+    # exactly like a collector that sends no `flow`. Announced on the cache group's terms.
+    for case, source, container in (
+        ("a flow group sent as a JSON string", "queue=2a:1", "str"),
+        ("a flow group sent as a list", [{"class": "2a", "depth": 1}], "list"),
+        # ...including a FALSY one: `... and flow_source:` is the inert form of the presence check
+        # and a truthy-only table cannot see it (pre-flight item 3).
+        ("a falsy-but-present flow group", [], "list"),
+    ):
+        check(f"[#1571] {case} hides the whole panel and NAMES itself — pre-#1571 the largest "
+              "loss on this document was also its quietest",
+              obs_seam("flow", source, "flow"), (None, [_FLOW_DROP.format(container)]))
+    for case, source in (("an explicit null flow group", None), ("no flow key at all", _ABSENT)):
+        check(f"[#1571] {case} hides the panel SILENTLY — 'the collector has not landed' is not a "
+              "producer/consumer mismatch",
+              obs_seam("flow", source, "flow"), (None, []))
+    # ...and every one of these is a drop diagnostic, NOT a new fatality: turn any of them into a
+    # raise and this row reds. The lanes/defer/exit/flow inputs below are ALL unreadable at once.
+    _all_bad = obs_quiet_fixture()
+    _all_bad["lanes"] = ["worker"]
+    _all_bad["defer_reasons_1h"] = {"partial-disarm": 7}
+    _all_bad["model_exit_classes_1h"] = "fable=3"
+    _all_bad["flow"] = "queue=2a:1"
+    _all_bad["cache"]["chain_length_histogram"] = "1:4"
+    with contextlib.redirect_stdout(io.StringIO()):
+        _tolerated = obs_normalized(_all_bad)
+    check("[#1571] a snapshot whose lane/defer/exit/flow/histogram inputs are ALL unreadable is "
+          "still TOLERATED — the build stays green and every seam that DID parse is published",
+          (_tolerated["lanes"], _tolerated["defer_reasons_1h"], _tolerated["model_exit_classes_1h"],
+           _tolerated["flow"], _tolerated["cache"]["chain_length_histogram"],
+           _tolerated["cache"]["usage_samples_1h"], _tolerated["thresholds"]["merge_stall_minutes"],
+           [row["rule"] for row in _tolerated["trigger_fires"]]),
+          ([], [], [], None, {}, 7, 90, ["worker-failure-rate"]))
+    # ...and the ONE collector value each new message quotes is sanitized and BOUNDED on the way
+    # out, exactly as #982 requires of the queue class: echo it raw and a hostile or merely enormous
+    # lane name writes itself into the build log that is diagnosing it.
+    for case, lane_name, quoted in (
+        ("non-printable", "w\ndashboard-gen: dropped observability lane input (forged)", "''"),
+        ("4000 characters long", "!" * 4000, f"'{'!' * 32}'"),
+    ):
+        check(f"[#1571] a {case} lane name is not echoed into the build log that diagnoses it",
+              obs_seam("lanes", {lane_name: {"1h": {"success": 1}}}, "lanes"),
+              ([], [_DROP.format("lane", f"lane name {quoted} is not a safe token")]))
     overflow = copy.deepcopy(obs_fixture)
     overflow["flow"]["review_rounds"]["mean"] = 1e309       # JSON 1e309 decodes to +Infinity
     overflow["thresholds"]["workflow_failure_rate"] = 1e309
