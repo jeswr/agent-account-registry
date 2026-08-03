@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5898,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5d4bb89c2fc2e9817ed3c41d544b369898b38774",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new GREEN_DROP_REASONS arm relies entirely on verdict_is_still_for_this_tree(), but verdict_state() timestamps a `committed` event with `committer.date` (falling back to `author.date`). Those are commit metadata, not the time the commit entered the PR. If review:pass is granted and an old-dated commit is subsequently pushed (for example by cherry-picking or preserving dates), `head_moved_at` remains earlier than `review_pass_at`; a later QUEUE_CLEARED/ROLL_BACK then preserves the stale verdict and calls `gh pr merge --auto`. The new tests hand-build chronological dates and therefore do not exercise this failure. This is load-bearing because this arm intentionally requires no watchdog marker or group-head binding.",
+    "file": "scripts/merge-group-watchdog.py",
+    "fix_hint": "Bind the verdict to the actual reviewed head SHA, or derive post-grant movement from timeline event ordering / an event occurrence timestamp rather than commit-authored metadata. Add an end-to-end timeline test where the `labeled` event precedes a `committed` event whose committer/author date predates the label, and assert that QUEUE_CLEARED/ROLL_BACK demotes instead of preserving.",
+    "severity": "major",
+    "title": "Queue-drop preservation can carry a verdict across an unreviewed head change"
+   }
+  ],
+  "progress": null,
+  "summary": "The new markerless preserve route is not safely bound to the reviewed tree. Its sole tree-integrity guard derives ordinary commit movement from the commit's author/committer date, rather than when that commit was added to the PR. A post-approval push of an old-dated commit can therefore pass the guard and have review:pass preserved and the PR automatically re-armed on QUEUE_CLEARED/ROLL_BACK. The tests cover only conveniently ordered timestamps and miss this real timeline case.",
+  "verdict": "request_changes"
+ }
+}
