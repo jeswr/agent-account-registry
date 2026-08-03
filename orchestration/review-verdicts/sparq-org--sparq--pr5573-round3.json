@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5573,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c5dfb011755259c8097b55f2f841050546ff58a4",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding. The classifier now recognizes method-less `gh api` label calls as writes when field/input flags trigger GitHub CLI's implicit POST, while explicit GET/HEAD remains read-only. The positive fixtures exercise both implicit-POST and explicit-method writes with foreign credentials, and the negative fixture covers genuine label reads, including a fielded explicit GET. The self-test passes with 6 positive and 7 negative cases, and the repository enforcement scan passes. No correctness, security, or vacuity issue remains in the diff-scoped change.",
+  "verdict": "approve"
+ }
+}
