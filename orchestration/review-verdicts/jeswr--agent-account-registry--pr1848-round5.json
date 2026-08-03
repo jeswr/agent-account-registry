@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1848,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "075d41b0efe5367a56313d538dc476b942d8fd75",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_confirm_area_strip` restores `needs:area` with `edit`, which creates a newest `labeled needs:area` timeline event attributed to the workflow bot. On the next ordinary `labeled` workflow invocation, `area_park_clearance` applies newest-application-wins and authorizes deletion based on that bot event, even though the restoration represents the human hold that raced the prior strip and the human never withdrew it. The code and unreadable-confirmation test explicitly call the restored park machine-owned and say the next event re-clears it. The new tests stop after restoration; checking `ready-issues` exclusion in that transient state does not prove the hold survives the next binding-layer run. This is materially the same trust defect as round 4.",
+    "file": "scripts/triage.py",
+    "fix_hint": "Preserve durable provenance that the repair represents the raced human application, or make a repaired hold non-clearable until a later human removal/reapplication establishes a new ownership state. Add a binding-layer test that performs the race and repair, appends the bot restoration event as GitHub would, then invokes `_apply_cli` a second time and asserts no edit occurs, `needs:area` remains, and `status:ready` is not published until the human explicitly withdraws the hold.",
+    "severity": "major",
+    "title": "Restored human hold is still laundered into machine ownership"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 5 still repairs a raced human `needs:area` hold by re-applying the label through the workflow bot, then explicitly treats that restored application as machine-owned and clearable on the next event. Because clearance uses newest-application-wins, the bot's repair event supersedes the human application in the evidence used by `area_park_clearance`. A later ordinary `labeled` invocation can therefore strip the restored hold and publish `status:ready` without any intervening human withdrawal. The expanded tests cover the immediate post-strip restoration and downstream exclusion, but still do not run a second real `_apply_cli` invocation over the repaired timeline. The same major trust defect remains, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
