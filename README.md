@@ -442,6 +442,15 @@ REPORT-ONLY and deliberately has no cleanup mode: deleting a claim ref re-opens 
 above. A slot that carries a secret but no issue is NOT reported — that is a stored credential
 whose enrolment died before registration, and it needs the account issue written, not a cleanup.
 
+The same line also counts the credential-binding namespace (`bindings=`, from
+`refs/acct-requests/`) and annotates a burned slot that carries a binding of its own (#1260). That
+annotation is the **resumable** case: an enrolment writes its binding (#534) immediately before the
+credential is stored, so a burned slot with one died in that window, while a burned slot without
+one died before capture. Bindings are counted, never printed (a binding ref names a handle and a credential
+digest), and never deleted — deleting one re-opens the resume gap it closes. If the binding
+listing cannot be read or parsed, the whole report refuses rather than reporting a short set as
+clean.
+
 ### Step 0 — obtain a DURABLE, NON-ROTATING token (do NOT use a subscription blob)
 
 - **Anthropic** (Claude models): run `claude setup-token` while logged into the target account. It
