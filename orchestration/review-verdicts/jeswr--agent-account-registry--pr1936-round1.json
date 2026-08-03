@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1936,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "721fceb6e5f95ddc1a3b19a45782721f0512c746",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change is correct and complete for its stated purpose. It preserves the existing fail-closed self-claim caps, documents why the review and fix lane values are intentionally independent, and adds a non-vacuous premise check that fails if the deleted dispatcher-side `*_MAX_CONCURRENT` ceilings return. The two literal probe namespaces independently verify exact detector output without deriving expectations from the implementation. The workflow-side comment is consistent with the Python constants and existing extractor assertions. No trust check, routing rule, permission, token handling, or execution behavior is weakened.",
+  "verdict": "approve"
+ }
+}
