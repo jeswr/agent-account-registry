@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1821,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "51dd0d80945e79e6048be4a6f4c5fa1b7003c6d6",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 resolution remains correct and complete. A successfully parsed census with zero measurable buckets cannot be treated as evidence of recovery: breach reasons retain precedence, while an all-inapplicable payload defers, emits its census, performs no issue or label mutation, and exits nonzero. The end-to-end checks exercise both an existing marked alert and no-alert cases, assert the exact no-write call set, and separately preserve the all-unreadable fail-closed upsert path. The workflow wiring is independent of the groom sweep, least-privileged, SHA-pinned, sparse-checkout constrained, and self-tests before the continue-on-error live alert step. I found no blocker or major issue in the diff.",
+  "verdict": "approve"
+ }
+}
