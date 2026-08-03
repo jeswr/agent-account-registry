@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5854,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a735573ea60834416455ef33a77ec797002601a1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The contributor-facing wasm-pack install hints consistently pin 0.15.0, matching the exact v0.15.0 pin in the gating JS workflow. The added hermetic test extracts the workflow pin rather than duplicating it, checks all three documented hint sites, and passes alongside the existing workflow guardrails. No correctness, soundness, test-validity, or security issue was found.",
+  "verdict": "approve"
+ }
+}
