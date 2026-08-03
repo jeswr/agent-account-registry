@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5871,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3b06f7a22d66e7b55e42daf269b92bb1c2c8eb88",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The decision-ledger correction is consistent with the current load-bearing advisory registry design and the referenced \u00a76 rollback runbook. It accurately states that demotion requires a registry declaration plus continue-on-error, that name changes no longer control gating, and that C2 rejects advisory-named jobs lacking a registry entry. No correctness, soundness, security, or test-validity issue is introduced by this documentation-only change.",
+  "verdict": "approve"
+ }
+}
