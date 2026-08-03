@@ -610,6 +610,88 @@ jobs:
           MAINTAINER_HANDLE: jeswr
         run: python3 registry/scripts/ci-latency-alert.py
 
+  # [SPARQ agent] WATCH THE SHARED REQUEST BUDGET (issue #1123). Registry #1088 — groom losing
+  # sweeps to a spent REST budget — was diagnosed only after ~9% of sweeps had already been lost,
+  # by sampling failed runs by hand, because nothing watched the budget itself. That budget is
+  # SHARED across groom, dispatch, worker, curate, triage and every other lane on the ambient
+  # Actions token, so without a census the NEXT component whose cost grows with the backlog gets
+  # found exactly the same way: retrospectively, after it has already cost sweeps.
+  #
+  # It changes no gate and throttles nothing. The in-band control stays where #819 put it
+  # (plan-snapshot.py stops at RATE_LIMIT_RESERVE on the `x-ratelimit-remaining` of the response it
+  # was actually charged for); this is the LEADING indicator in front of that stop, and the
+  # script's self-test asserts the alarm point is strictly above the reserve.
+  #
+  # NO `needs:` and NO `if:`, on purpose and asserted by scripts/ratelimit-alert.py's self-test.
+  # The inversion is sharper here than for the sibling watchdogs: a budget alarm suppressed by the
+  # failure of the sweep whose budget it watches would be silenced by exactly the condition it
+  # exists to report. It reads ONE endpoint — `GET /rate_limit`, which is itself not charged
+  # against any bucket — and holds contents:read + issues:write: no arming, no merging, no label
+  # writes of any kind.
+  ratelimit-budget:
+    name: WATCHDOG (is the shared REST request budget heading toward exhaustion?)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # SECRET-EXFIL GUARD (issue #101): reads ALERT_TOKEN/ALERT_REPO (the private-alert routing
+    # secrets), so it is bound to the default-branch-only `dispatch-secrets` environment where
+    # those secrets live, exactly as groom-alert, dispatch-stall and ci-latency are.
+    environment: dispatch-secrets
+    permissions:
+      contents: read   # minimum for the sparse checkout below
+      issues: write    # upsert/close the rolling REST-budget ops-alert issue
+    steps:
+      # KEEP IN SYNC with REQUIRED_FILES in scripts/ratelimit-alert.py — the self-test asserts both
+      # directions, so dropping an input reds instead of making the YAML-seam assertions silently
+      # unreachable on the live path. scripts/plan-snapshot.py is an INPUT, not incidental: the
+      # alarm point is asserted to LEAD its RATE_LIMIT_RESERVE, and that assertion is unreachable
+      # without the file.
+      - name: Check out ONLY the watchdog's inputs (pinned, sparse, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/ratelimit-alert.py
+            scripts/gh_retry.py
+            scripts/plan-snapshot.py
+            scripts/selftest-suite.txt
+            .github/workflows/groom.yml
+          sparse-checkout-cone-mode: false
+      # PyYAML backs the workflow-parse assertions (regex-over-YAML is how five permissive
+      # misparses got into the secrets guard). Probe first so the runner image's own copy is used
+      # when present; the install path is version + sha256 locked to the identical pins pr-gate,
+      # ci-latency and the secrets guard use.
+      - name: Ensure PyYAML for the watchdog's workflow parsing
+        run: |
+          set -euo pipefail
+          if python3 -c 'import yaml' 2>/dev/null; then
+            echo "PyYAML already present; no install needed"
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/ratelimit-requirements.txt" <<'REQ'
+          pyyaml==6.0.2 \
+              --hash=sha256:80bab7bfc629882493af4aa31a4cfa43a4c57c83813253626916b8c7ada83476 \
+              --hash=sha256:1f71ea527786de97d1a0cc0eacd1defc0985dcf6b3f17bb77dcfc8c34bec4dc5
+          REQ
+          python3 -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary=:all: -r "$RUNNER_TEMP/ratelimit-requirements.txt"
+          python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
+      # A detector is never trusted to watch anything before it has proved itself on this tick's
+      # code, so the self-test runs FIRST and is NOT continue-on-error.
+      - name: Self-test the shared REST-budget watchdog (hermetic fixtures)
+        run: python3 registry/scripts/ratelimit-alert.py --self-test
+      - name: Alert maintainer if the shared REST request budget is heading toward exhaustion
+        id: ratelimit-budget
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          ALERT_REPO: ${{ secrets.ALERT_REPO }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MAINTAINER_HANDLE: jeswr
+        run: python3 registry/scripts/ratelimit-alert.py
+
   # [OPUS-5] WATCH THE CREDENTIALS (issue #269). A DEFER THAT NEVER ENDS IS AN OUTAGE WEARING A
   # GREEN CHECK. The issue #168 fix made each per-owner target-token mint continue-on-error, so a
   # missing install on one owner only defers that owner's issue/PR repair — correct, fail-closed,

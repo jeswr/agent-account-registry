@@ -377,6 +377,15 @@ NO_CHANGE_LIMIT_MIN_ISSUES = 2
 BACKOFF_BASE_SECONDS = 15 * 60
 BACKOFF_CAP_SECONDS = 5 * 3600
 BACKOFF_CLASSES = frozenset({CLASS_LIMIT, CLASS_TRANSIENT})
+# PROVIDER-CAPPED EVIDENCE AGE (issue #1594) — DISCLOSURE ONLY, never a gate. The provider-capped
+# condition has no freshness bound tighter than the rolling window (the DECISION and why it is that
+# way are argued at the condition itself in classify_records); what it does have is an obligation to
+# say how old the evidence it pages on is. The line is drawn at BACKOFF_CAP_SECONDS because that is
+# the longest reactive backoff a single capped account can hold: once it is past, every capped
+# account has been free to run again and record something, so a cap still standing describes a
+# provider nobody has OBSERVED rather than one actively refusing work. The alert still fires — an
+# unobserved provider is not a recovered one — but its reason names the age.
+CAPPED_STALE_EVIDENCE_SECONDS = BACKOFF_CAP_SECONDS
 # --- AUTH COOLDOWN (registry #596). `auth` was DELIBERATELY absent from BACKOFF_CLASSES above: a
 # credential problem is not a usage window, and retrying it sooner is harmless. But acct01's codex
 # OAuth access token expires HOURLY while the fleet stores a static snapshot of it, so the fleet's
@@ -1659,7 +1668,9 @@ def classify_records(records, provider_accounts, now, open_alerts=()):
       provider-outage    : >=3 launch fails in 30 min from >= max(2, ceil(enabled-fleet/2))
                            distinct accounts, per-account runs unbroken by their OWN success.
       persistent-transient: >=5 transient/unknown fails in 15 min (even one account).
-      provider-capped    : EVERY enabled account's LATEST limit/success outcome is limit-class.
+      provider-capped    : EVERY enabled account's LATEST limit/success outcome is limit-class, at
+                           ANY age inside the rolling window — the capping evidence is deliberately
+                           NOT required to be fresh (issue #1594; argued at the condition below).
       account-auth-cooldown: >=AUTH_COOLDOWN_MIN consecutive `auth` outcomes put one or more of the
                            provider's accounts in a bounded credential cooldown (registry #596).
       zero-dispatch      : >=3 consecutive zero-dispatch ticks (provider == 'fleet'). An `idle`
@@ -1809,26 +1820,62 @@ def classify_records(records, provider_accounts, now, open_alerts=()):
         # account (records iterated in ts order), so `A limit -> A success -> B limit` caps only
         # B. Individual capped accounts are normal window churn and are deliberately NOT alerted.
         # The earliest known reset is surfaced so the maintainer knows when capacity restores.
+        #
+        # EVIDENCE FRESHNESS IS DECIDED, NOT ACCIDENTAL (issue #1594). The newest capping record may
+        # be of ANY age inside the rolling window: there is deliberately NO analogue of
+        # SUSTAINED_HEALTH_FRESH_SECONDS here, so a 30 h-old cap that nothing has run against since
+        # fires exactly as a 30 s-old one does. Before #743 the count cap evicted those rows after a
+        # few hours, which made the behaviour a property of RETENTION; it is now a property of the
+        # CONDITION, and this is the direction that was chosen:
+        #   * A tighter bound could only be expressed as fire=False, and fire=False CLOSES the
+        #     alert — so "the capping evidence went stale" would read as "the provider recovered".
+        #     This module refuses that inference twice already: SUSTAINED_HEALTH_FRESH_SECONDS
+        #     exists because a fleet that recorded nothing is unobserved, not proven healthy, and
+        #     the #205 orphan pass leaves an in-window provider to its own condition precisely
+        #     because closing on absent evidence "would be a false recovery, not evidence of
+        #     health". An aged cap is absent evidence, not contrary evidence.
+        #   * Both things that DO clear the cap are positive and remain so: a later SUCCESS on the
+        #     account (the invalidation in the walk below), and the rolling window itself — once the
+        #     last capping record ages past WINDOW_SECONDS the provider leaves the window entirely
+        #     and the #205 orphan pass closes the alert. Retention still bounds WHEN the evidence
+        #     expires; it no longer decides WHETHER a cap is fresh enough to page.
+        # What a stale cap DOES change is what the maintainer is told: once the newest standing
+        # capping record is at least CAPPED_STALE_EVIDENCE_SECONDS old, its age is reported in
+        # `stale_evidence_seconds` and named in the reason (and so in the alert body), so a page
+        # raised off aged evidence cannot read as a live rate limit. Disclosure only — the age never
+        # participates in the fire decision.
         if enabled:
-            capped = {}
+            capped = {}                 # account -> (earliest standing reset hint, newest cap ts)
             for r in prov_records:
                 acct = r.get("account")
                 if acct not in enabled:
                     continue
                 if r.get("exit_class") == CLASS_LIMIT:
-                    capped.setdefault(acct, r.get("reset_hint"))
+                    # setdefault semantics on the HINT (the first hint of the standing run is the
+                    # one that names when this account's window reopens); the ts always advances to
+                    # the newest capping observation, which is what the age is measured from.
+                    hint = capped[acct][0] if acct in capped else r.get("reset_hint")
+                    capped[acct] = (hint, r["ts"])
                 elif r.get("exit_class") == SUCCESS:
                     capped.pop(acct, None)   # a LATER success invalidates the stale cap
             all_capped = set(capped) >= enabled and enabled
-            reset_hints = sorted(h for h in capped.values() if h)
+            reset_hints = sorted(hint for hint, _ in capped.values() if hint)
+            newest_cap = max((ts for _, ts in capped.values()), default=None)
+            stale_for = (int(now - newest_cap)
+                         if newest_cap is not None
+                         and (now - newest_cap) >= CAPPED_STALE_EVIDENCE_SECONDS else None)
             actions.append({
                 "condition": "provider-capped",
                 "provider": provider,
                 "fire": bool(all_capped),
-                "reason": (f"all {len(enabled)} enabled {provider} accounts are usage-limited"
+                "reason": ((f"all {len(enabled)} enabled {provider} accounts are usage-limited"
+                            + (f", but the newest standing capping record is {stale_for // 3600} h "
+                               "old — this provider is UNOBSERVED, not confirmed live-limited "
+                               "(nothing has cleared the cap either)" if stale_for else ""))
                            if all_capped
                            else f"{len(capped)}/{len(enabled)} accounts capped (normal churn)"),
                 "reset_hint": reset_hints[0] if reset_hints else None,
+                "stale_evidence_seconds": stale_for,
             })
 
     # ---- orphaned open alerts (issue #205) -----------------------------------------------------
@@ -3237,6 +3284,100 @@ def _self_test():
     chk("capped absent without fleet map",
         any(a["condition"] == "provider-capped" for a in classify_records(all_capped, {}, now + 100)),
         False)
+    # NON-ENABLED accounts are filtered OUT of the cap scan (#1761). A rotated-out / disabled /
+    # newly-unenrolled account can still have limit records inside the window, and the number this
+    # guard protects is the RESET HINT — the capacity-restore time the maintainer reads to decide
+    # when to resume dispatch. Without these rows, neutering the filter surfaces a reset sourced
+    # from an account that is not in the fleet at all and the whole suite stays green.
+    # The literals below appear nowhere else in the harness (value-identical-survivor guard) and
+    # the expectations are written out, not re-derived from the fixture by the code's own logic.
+    rotated_reset = "03:19 rotated-out"          # sorts BEFORE every enabled hint here
+    capped_rot = [rec("anthropic", "acct01", CLASS_LIMIT, dt=0, reset="09:07 enabled-restore"),
+                  rec("anthropic", "acct91", CLASS_LIMIT, dt=30, reset=rotated_reset),
+                  rec("anthropic", "acct02", CLASS_LIMIT, dt=60, reset="11:23 enabled-restore")]
+    rot_act = _action(classify_records(capped_rot, fleet, now + 200),
+                      "provider-capped", "anthropic")
+    chk("capped ACT (all ENABLED capped; a rotated-out account in the window is not fleet)",
+        rot_act["fire"], True)
+    chk("capped surfaces the earliest ENABLED reset, not a non-enabled account's earlier one",
+        rot_act["reset_hint"], "09:07 enabled-restore")
+    chk("capped never surfaces a non-enabled account's reset anywhere in the action",
+        rotated_reset in repr(rot_act), False)
+    # ...and the same filter guards the loop's SUCCESS arm: a non-enabled account's success is
+    # skipped before `capped.pop`. (The pop itself is a no-op for a non-enabled account — nothing
+    # non-enabled is ever inserted — so the kill here comes from the LATER limit record this row
+    # places after it, plus the CHURN COUNT, which is the reason an operator reads when the alert
+    # does NOT fire.)
+    churn_rot = [rec("anthropic", "acct91", SUCCESS, dt=0),
+                 rec("anthropic", "acct01", CLASS_LIMIT, dt=30, reset="09:07 enabled-restore"),
+                 rec("anthropic", "acct91", CLASS_LIMIT, dt=60, reset=rotated_reset)]
+    churn_act = _action(classify_records(churn_rot, fleet, now + 200),
+                        "provider-capped", "anthropic")
+    chk("capped DO-NOTHING (1/2 enabled capped; a non-enabled cap is not fleet churn)",
+        churn_act["fire"], False)
+    chk("capped churn count counts ENABLED accounts only",
+        churn_act["reason"], "1/2 accounts capped (normal churn)")
+    chk("capped churn reset is the ENABLED account's, not the non-enabled account's",
+        churn_act["reset_hint"], "09:07 enabled-restore")
+
+    # ---- PROVIDER-CAPPED EVIDENCE FRESHNESS (issue #1594) ------------------------------------
+    # The AGE of the capping evidence is a decided property of the CONDITION, not a leftover of
+    # retention: an aged cap still fires (a bound could only be expressed as fire=False, which
+    # would close the alert on SILENCE), it DISCLOSES how old its evidence is, and the only things
+    # that clear it stay positive — a later success, or the rolling window.
+    aged_at = now + 60 + 30 * 3600      # the newest capping record is then exactly 30 h old: far
+                                        # past any reactive backoff, still inside the 48 h window
+    aged_acts = classify_records(all_capped, fleet, aged_at)
+    chk("capped ACT on 30 h-old evidence (no freshness bound — silence is not recovery)",
+        fires(aged_acts, "provider-capped", "anthropic"), True)
+    aged_act = next(a for a in aged_acts if a["condition"] == "provider-capped")
+    chk("an aged cap DISCLOSES its evidence age (seconds, reason, body; not when redacted)",
+        (aged_act["stale_evidence_seconds"], "30 h old" in aged_act["reason"],
+         "30 h old" in render_body(aged_act, "m"),
+         "30 h old" in render_body(aged_act, "m", redact=True)),
+        (108000, True, True, False))
+    fresh_act = next(a for a in acts if a["condition"] == "provider-capped")
+    chk("a FRESH cap discloses NO evidence age (the note is conditional, not boilerplate)",
+        (fresh_act["stale_evidence_seconds"], "UNOBSERVED" in fresh_act["reason"]), (None, False))
+    # The age comes from the NEWEST standing capping record while the reset hint still comes from
+    # the EARLIEST: both accounts were first capped 30 h ago and re-capped minutes ago, so the
+    # provider is being observed (no staleness note) and 14:00 is still the reset to publish.
+    recapped_aged = [rec("anthropic", "acct01", CLASS_LIMIT, dt=0, reset="14:00"),
+                     rec("anthropic", "acct02", CLASS_LIMIT, dt=60, reset="15:00"),
+                     rec("anthropic", "acct01", CLASS_LIMIT, dt=60 + 30 * 3600 - 600),
+                     rec("anthropic", "acct02", CLASS_LIMIT, dt=60 + 30 * 3600 - 300)]
+    recapped_act = next(a for a in classify_records(recapped_aged, fleet, aged_at)
+                        if a["condition"] == "provider-capped")
+    chk("age reads the NEWEST standing cap; the reset hint still reads the EARLIEST",
+        (recapped_act["fire"], recapped_act["stale_evidence_seconds"],
+         recapped_act["reset_hint"]),
+        (True, None, "14:00"))
+    # The route #1594 was found on: three aged no_change exits across two issues derive acct01's
+    # #500 cap, which #743 now keeps for the whole window — so a provider that has simply not been
+    # dispatched for 30 h still pages as fully capped.
+    nc_aged = [rec("anthropic", "acct01", CLASS_NO_CHANGE, dt=i * 30, issue=770 + (i % 2),
+                   input_tokens=300000, output_tokens=1000, wall_seconds=70) for i in range(3)]
+    derived_capped = nc_aged + [rec("anthropic", "acct02", CLASS_LIMIT, dt=60, reset="15:00")]
+    chk("capped ACT on a 30 h-old DERIVED #500 cap (the reported #1594 scenario)",
+        fires(classify_records(derived_capped, fleet, aged_at), "provider-capped", "anthropic"),
+        True)
+    chk("...and at that SAME age one success still clears it (time never clears a cap)",
+        fires(classify_records(derived_capped + [rec("anthropic", "acct01", SUCCESS, dt=90)],
+                               fleet, aged_at), "provider-capped", "anthropic"), False)
+    # The one bound that DOES exist is the rolling window: past it the records are gone, the
+    # provider leaves the window entirely and the #205 orphan pass closes the alert. 49 h is a
+    # literal rather than WINDOW_SECONDS, so a widened window is what turns this red.
+    expired_at = now + 49 * 3600
+    expired = prune(all_capped, expired_at)
+    chk("capping evidence past the rolling window leaves NO capped action at all",
+        (expired, any(a["condition"] == "provider-capped"
+                      for a in classify_records(expired, fleet, expired_at))),
+        ([], False))
+    chk("...and an open capped alert then RECOVERS through the #205 orphan pass",
+        [(a["condition"], a["fire"]) for a in
+         classify_records(expired, fleet, expired_at,
+                          open_alerts={("provider-capped", "anthropic")})],
+        [("provider-capped", False)])
 
     # ---- ZERO-DISPATCH: ACT (3 consecutive) / DO-NOTHING (2) / flip -------------------------
     zd = [make_record("fleet", account_hash("z", salt), "", CLASS_ZERO_DISPATCH, str(i), now + i * 60)

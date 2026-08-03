@@ -240,7 +240,17 @@ opaque claim (which secret to use) or `none-free`:
 ## Cache-affinity metadata
 
 Which skills/roles/packages ran recently on each account is tracked **here** (as receipt comments +
-a rolling `data/cache-affinity.json`), never in the public repos.
+the lease ledger), never in the public repos.
+
+Affinity is **derived, not stored** (issue #1557): `select-and-claim.choose_account` reads the
+`package` / `role` / `model` / claim time off the LIVE LEASES it is handed and prefers the account
+that most recently served the same `package`+`role`. There is no separate affinity store and no
+history — a lease that has been released leaves nothing behind but its receipt comment. Earlier
+revisions of this section promised "a rolling `data/cache-affinity.json`"; **no code has ever
+written that file**, and the frozen master copy is an empty placeholder (see `data/README.md`).
+The consequence for the dashboard is recorded with the observability contract in
+`scripts/dashboard-gen.py`: the cache-effectiveness group's chain/drain fields have no source in
+this repo until something durably records affinity chains.
 
 ## Standing routing rules (inherited by onboarded target repos)
 
@@ -661,6 +671,11 @@ Claude-Code-shaped fable probe for fable-capable accounts and merges `fable_ok` 
 into the usage map; `usage_eligible(u, margin, model="fable")` then requires that bucket to have headroom
 **in addition to** the whole-account 5h/7d windows. Fail-closed: a rejected/absent fable probe makes the
 account ineligible for **fable** only — its base signal still admits it for non-fable models.
+**Retired 2026-07-26** (#720 Stage A item 3): `fable` is on the shared deprecation register
+(`scripts/deprecated_models.py`), so that second probe is **no longer issued** — a catalog row still
+listing the legacy alias pays no request for it, and lands in the same fail-closed FABLE state a
+rejected probe already produced. The probe and its classifier are kept behind a register read, so
+un-retiring the alias restores them without a code change.
 
 **Prioritisation policy** (wired into `choose_account`): among eligible accounts prefer `status=allowed`
 with the **soonest whole-account `7d_reset`** (use-it-or-lose-it). Accounts without that weekly reset

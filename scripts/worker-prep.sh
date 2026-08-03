@@ -42,7 +42,29 @@ case "$CREDENTIAL_FORMAT" in
     [[ "$PROVIDER:$HARNESS" == openai:codex ]] ||
       die 'codex-auth-json does not match the resolved provider/harness'
     ;;
-  claude-credentials-json | claude-oauth-token | anthropic-api-key)
+  claude-credentials-json)
+    # REFUSED (issue #1675) — deliberately the fail-closed one of that issue's two acceptable
+    # outcomes, and the ONLY place this format is named in this script.
+    #
+    # This format is a `~/.claude/.credentials.json` snapshot whose `claudeAiOauth.refreshToken` is
+    # the DURABLE anthropic grant. #596's answer to exactly that hazard — exchange the refresh token
+    # HERE, host-side, and materialize a MINIMAL document carrying a fresh access token and NO
+    # refresh token — is implemented for `codex-auth-json` only: broker-refresh's
+    # `minimal_worker_credential`, `merge_refreshed` and `TOKEN_ENDPOINTS` are all openai-only. So
+    # the only thing this script could ever do with this format is materialize it UNMODIFIED into
+    # the isolated HOME that is bind-mounted into the model container, and #596's own rationale then
+    # applies verbatim: `readonly` stops writes, not READS — a prompt-injected model with Bash/Read
+    # could exfiltrate a long-lived credential from its own HOME.
+    #
+    # Refusing costs nothing TODAY and is what keeps it costing nothing: `orchestration/routing.toml`
+    # gives every anthropic model `claude-oauth-token`, so no live run reaches this arm — but
+    # `account-login.sh` still records this format as a login fallback, which left the hole one
+    # routing line from live. Lift this refusal only together with an anthropic host-side pre-flight,
+    # i.e. when the pre-flight arm below can hand this format's mount through
+    # `broker.assert_no_refresh_material` the way it already does for codex.
+    die 'claude-credentials-json is refused: it carries the durable anthropic refresh token and this repo has no host-side pre-flight that can strip it before the read-only container mount (issue #1675). Record the account as claude-oauth-token or anthropic-api-key instead.'
+    ;;
+  claude-oauth-token | anthropic-api-key)
     [[ "$PROVIDER:$HARNESS" == anthropic:claude ]] ||
       die "$CREDENTIAL_FORMAT does not match the resolved provider/harness"
     ;;
@@ -136,11 +158,19 @@ credential_preflight_failed() {
 }
 
 case "$CREDENTIAL_FORMAT" in
-  codex-auth-json | claude-credentials-json)
+  codex-auth-json)
     # Reuse broker-refresh.py's credential-path and mode-600 isolation core. The credential travels
     # through a private file, never argv/stdout.
     #
-    # HOST-SIDE PRE-FLIGHT REFRESH (P0, issue #596) — codex-auth-json only. The stored secret is a
+    # THIS ARM IS THE PRE-FLIGHT ARM, and admission to it is now the SAME decision as being given the
+    # pre-flight (issue #1675). It used to also admit `claude-credentials-json`, while every
+    # pre-flight step inside it was separately gated on `credential_format == "codex-auth-json"` —
+    # so the one format that entered here without an implemented pre-flight was materialized
+    # UNMODIFIED and skipped the leak assertion as well. Nothing inside re-tests the format any
+    # more: whatever is admitted gets refreshed/minimized and must clear
+    # `assert_no_refresh_material`, or the run dies.
+    #
+    # HOST-SIDE PRE-FLIGHT REFRESH (P0, issue #596). The stored secret is a
     # point-in-time snapshot of a credential whose ACCESS token expires, and the credential file is
     # bind-mounted READ-ONLY into the model container (issue #134), so the CLI's own in-place
     # refresh is impossible there (reproduced: `Failed to refresh token: Read-only file system (os
@@ -196,13 +226,15 @@ broker.assert_no_refresh_leak(capability)
 if not isinstance(capability.get("access_token"), str) or not capability["access_token"]:
     raise SystemExit(f"worker-prep: selected {provider} credential has no access token")
 
-mounted = credential
-if credential_format == "codex-auth-json" and preflight_mode == "skip":
+# NO `mounted = credential` DEFAULT (issue #1675): the un-preflighted stored document is exactly
+# what must never reach the mount, so it is not what an unhandled branch falls back to. Every path
+# out of this block binds `mounted` to a derived, refresh-token-free document or raises.
+if preflight_mode == "skip":
     # Dry run: strip the durable secret from the mount, but exchange nothing.
     mounted = broker.minimal_worker_credential(provider, credential)
     print("worker-prep: host-side credential pre-flight SKIPPED (dry run); "
           "the mount carries no refresh token and the stored grant was not consumed")
-elif credential_format == "codex-auth-json":
+else:
     try:
         preflight = broker.refresh_credential_host_side(provider, credential, now=int(time.time()))
     except broker.RefreshFailure as failure:
@@ -237,12 +269,17 @@ path = Path(broker._write_isolated(provider, mounted, home))
 expected = Path(home, broker.cred_relpath(provider))
 if path != expected or not path.is_file() or path.stat().st_mode & 0o077:
     raise SystemExit("worker-prep: broker did not produce the expected mode-600 credential")
-if credential_format == "codex-auth-json":
-    # Fail closed on the materialized FILE, not on the in-memory document: whatever ends up under
-    # the mount must carry no durable refresh material, whatever refactor produced it.
-    with open(path, encoding="utf-8") as handle:
-        broker.assert_no_refresh_material(json.load(handle),
-                                          broker.extract_refresh_token(provider, credential))
+# Fail closed on the materialized FILE, not on the in-memory document: whatever ends up under the
+# mount must carry no durable refresh material, whatever refactor produced it.
+#
+# UNCONDITIONAL (issue #1675). This guard used to be gated on `credential_format ==
+# "codex-auth-json"` while the arm it sits in also admitted `claude-credentials-json` — so the one
+# admitted format whose document still held its refresh token was precisely the one that skipped the
+# check that exists to catch that. A guard that opts out per format is not a guard; this one now
+# covers everything this arm can materialize.
+with open(path, encoding="utf-8") as handle:
+    broker.assert_no_refresh_material(json.load(handle),
+                                      broker.extract_refresh_token(provider, credential))
 PY
     ;;
   claude-oauth-token | anthropic-api-key)
@@ -261,7 +298,6 @@ esac
 
 case "$CREDENTIAL_FORMAT" in
   codex-auth-json) CREDENTIAL_PATH="$HOME_DIR/.codex/auth.json" ;;
-  claude-credentials-json) CREDENTIAL_PATH="$HOME_DIR/.claude/.credentials.json" ;;
   claude-oauth-token | anthropic-api-key) CREDENTIAL_PATH="$HOME_DIR/.claude/worker-token" ;;
 esac
 [[ -f "$CREDENTIAL_PATH" && ! -L "$CREDENTIAL_PATH" ]] ||

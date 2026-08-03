@@ -20,8 +20,13 @@ function parseTime(value) {
 function utc(value) {
   const date = parseTime(value);
   if (!date) return "unknown";
+  // Issue #1343: `hourCycle: "h23"`, NEVER `hour12: false`. The latter resolves to the **h24**
+  // cycle for many locales (en-US on the pinned node 20 among them), which prints the hour after
+  // midnight as hour 24 of the previous day's clock — `00:30Z` rendered as "Jul 18, 2026, 24:30".
+  // Every absolute stamp on this page goes through this one helper, so that read one hour a day
+  // as sitting on the wrong side of a day boundary. h23 is the only spelling that pins 00–23.
   return new Intl.DateTimeFormat(undefined, {
-    timeZone: "UTC", dateStyle: "medium", timeStyle: "short", hour12: false,
+    timeZone: "UTC", dateStyle: "medium", timeStyle: "short", hourCycle: "h23",
   }).format(date) + " UTC";
 }
 
@@ -90,10 +95,20 @@ function renderSummary(data) {
     capacity.append(node("p", "summary-meta", "Eligible capacity unmeasured — see the notice above"));
   }
   summary.append(capacity);
-  summary.append(summaryCard(
-    "Last dispatch sweep", data.fleet.last_sweep_at ? relative(data.fleet.last_sweep_at) : "unknown",
-    data.fleet.last_sweep_at ? utc(data.fleet.last_sweep_at) : "No completed sweep data",
-  ));
+  // Issue #1106: with no sweep to show, "unknown / No completed sweep data" is what a fleet that
+  // has genuinely never dispatched reads AND what a failed `gh` history read reads. The marker is
+  // consulted only here, where the absence of rows is the ambiguous signal.
+  const historyLost = !data.fleet.last_sweep_at && historyUnavailable(data.dispatch_history);
+  const sweepCard = summaryCard(
+    "Last dispatch sweep",
+    data.fleet.last_sweep_at ? relative(data.fleet.last_sweep_at)
+      : (historyLost ? "unavailable" : "unknown"),
+    data.fleet.last_sweep_at ? utc(data.fleet.last_sweep_at)
+      : (historyLost ? `Dispatch history could not be read (${historyDetail(data.dispatch_history)})`
+        + " — this is a fetch failure, not a quiet fleet" : "No completed sweep data"),
+  );
+  if (historyLost) sweepCard.classList.add("degraded");
+  summary.append(sweepCard);
   const probe = usageProbeCard(data.usage_probe);
   if (probe) summary.append(probe);
   summary.append(summaryCard("Data freshness", relative(data.generated_at), utc(data.generated_at)));
@@ -331,12 +346,33 @@ function laneCell(lanes) {
   return cell;
 }
 
-function renderOutcomes(outcomes) {
+// --- Dispatch-history fetch outcome (issue #1106). dashboard-gen shells out to `gh` for the run
+// listing; a non-zero exit or an unparseable body used to become a bare `[]`, which rendered
+// byte-identically to a fleet that has genuinely never dispatched — the #28 failure shape (an infra
+// failure wearing a quiet tick's clothes) on the public surface. The generator now always publishes
+// `dispatch_history` = {outcome, detail, fetched}, and `fetched` is true only for an explicit `ok`.
+// An ABSENT key (older data.json) keeps the pre-#1106 wording rather than crying failure. ---------
+function historyUnavailable(fetchOutcome) {
+  return !!fetchOutcome && typeof fetchOutcome === "object" && fetchOutcome.fetched !== true;
+}
+
+function historyDetail(fetchOutcome) {
+  const outcome = String((fetchOutcome && fetchOutcome.outcome) || "unknown");
+  const detail = fetchOutcome && typeof fetchOutcome.detail === "string" ? fetchOutcome.detail : "";
+  return detail ? `${outcome} · ${detail}` : outcome;
+}
+
+function renderOutcomes(outcomes, fetchOutcome) {
   const body = byId("outcomes");
   body.replaceChildren();
   if (!outcomes.length) {
+    const lost = historyUnavailable(fetchOutcome);
     const row = node("tr");
-    const cell = node("td", "", "No dispatch history is available.");
+    const cell = node("td", "", lost
+      ? `Dispatch history could not be read (${historyDetail(fetchOutcome)})`
+        + " — this is a fetch failure, not a quiet fleet."
+      : "No dispatch history is available.");
+    if (lost) cell.classList.add("degraded");
     cell.colSpan = 5;
     row.append(cell);
     body.append(row);
@@ -960,7 +996,7 @@ function render(data) {
   renderRepositoryAgents(data.active_by_repository, data.fleet.active_agents);
   renderSummary(data);
   renderProviderQuota(data.provider_quota, data.generated_at);
-  renderOutcomes(data.fleet.dispatch_outcomes || []);
+  renderOutcomes(data.fleet.dispatch_outcomes || [], data.dispatch_history);
   renderHealth(data.model_health);
   renderObservability(data.observability);
   updateFreshness(data.generated_at, data.usage_probe);

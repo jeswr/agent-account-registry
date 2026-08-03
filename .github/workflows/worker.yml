@@ -1359,6 +1359,15 @@ jobs:
           TARGET_DIR: ${{ github.workspace }}/target
           GATE_PROFILE: ${{ needs.resolve.outputs.gate_profile }}
           WORKER_PACKAGES: ${{ needs.resolve.outputs.packages }}
+          # [issue #248] POST-GATE TARGET-TREE INTEGRITY. This is a step output of the PRE-GATE
+          # `bundle` step, captured by the runner while the runner was still clean, so nothing this
+          # step's target-controlled code does can alter it. worker-live.sh `gate` recomputes the
+          # sealed snapshot when its profile body returns and DIES on any drift: gate code that
+          # rewrote a source file mid-gate cannot leave behind a green verdict describing a tree the
+          # publisher would not push. An empty value refuses the gate outright rather than skipping
+          # the check — and it cannot legitimately be empty here, since a failed `bundle` step
+          # already skips this one through the implicit `success()`.
+          WORKER_PREGATE_TREE_DIGEST: ${{ steps.bundle.outputs.bundle_tree_digest }}
           # [OPUS-4.8] Credential-safety (security review, finding #3): do NOT `tee` the gate's own
           # stdout+stderr — which is target-CONTROLLED cargo output (build scripts / tests) — into a
           # runner-local file. An earlier revision did that to feed a diagnostics artifact; a hostile

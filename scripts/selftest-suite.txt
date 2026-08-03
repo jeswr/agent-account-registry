@@ -25,6 +25,7 @@ groom.py
 http_transient.py
 latch-watchdog.py
 lease_schema.py
+ledger-identity-watch.py
 ledger-invariant.py
 ledger_retry.py
 metrics-alert.py
@@ -41,6 +42,7 @@ plan-snapshot.py
 policy-resolve.py
 pr-body-ref.py
 predicate-census.py
+ratelimit-alert.py
 readme-runbook-check.py
 ready-issues.py
 reconcile-conflict-park.py
