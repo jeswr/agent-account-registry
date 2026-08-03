@@ -22666,8 +22666,6 @@ def _park_call_site_reachability_self_test():
             for target in targets:
                 ready and park_starved_partition_holder(repo, target, starved)
         """)),
-        # ...and the same two directions for the conditional EXPRESSION: the taken arm runs, and
-        # an undecidable test leaves BOTH arms live.
         # ...and the folded forms at a STATEMENT guard: `True or ready` decides true, while an
         # undecidable operand reached first leaves the whole guard undecided and the body live.
         ("loop under `if True or ...:`", wrap("""
@@ -22698,6 +22696,8 @@ def _park_call_site_reachability_self_test():
                 for target in targets:
                     park_starved_partition_holder(repo, target, starved)
         """)),
+        # ...and the same two directions for the conditional EXPRESSION: the taken arm runs, and
+        # an undecidable test leaves BOTH arms live.
         ("park call in the taken arm of `... if True else ...`", wrap("""
             targets = starvation_park_targets(items, starved, occupancy)
             for target in targets:
