@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1901,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d28392b6f8ac204f15c9513dd9d791573b1c3955",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 1 and 3 describe the publish boundary as a DRAFT PR that a human must arm. That is not the shipped policy for jeswr/agent-account-registry: policy/repos.toml sets arm_auto_merge = true, and review-fix.yml's Decision 7 path readies and auto-arms an approved, SHA-bound trust-surface change after recording its audit trail. The cross-provider review is still a meaningful delayed/reviewed boundary, but it is not a human-arm boundary. Repeating the same incorrect claim in the new run_gate header makes the operational security comparison misleading at the exact implementation seam this PR is documenting.",
+    "file": "research/255-gate-egress-containment.md",
+    "fix_hint": "Describe the real boundary precisely: publication first creates a draft and can proceed only after the independent cross-provider verdict and SHA-bound host-side arm/audit flow; do not claim a human arm for a target whose policy auto-arms on approval. Make the corresponding correction in the added run_gate comment.",
+    "severity": "major",
+    "title": "The publication comparison incorrectly claims a human must arm this target"
+   },
+   {
+    "body": "Section 8.5 requires attempts over TCP, DNS, and printing, then says that a run where all three fail is the only pass for the network half, immediately followed by saying that printing succeeding is the expected documented residual. Those conditions cannot both hold. Printing is not a test of the network half and this design deliberately leaves the public-log channel open in increment 1. Since section 9 makes section 8.5 inseparable from increment 1, an implementer cannot derive a non-vacuous pass condition from the current text.",
+    "file": "research/255-gate-egress-containment.md",
+    "fix_hint": "Specify separate assertions: TCP and DNS exfiltration must fail (including checks that no resolver/covert DNS route remains), while printing the marker must succeed and be recorded as the known log-channel residual. State explicitly that only the two network attempts determine the network-denial pass.",
+    "severity": "major",
+    "title": "The mandatory adversarial acceptance criterion contradicts itself"
+   }
+  ],
+  "progress": null,
+  "summary": "The record correctly identifies the live gate's host/network exposure and explicitly preserves the existing purge, seal, and token-ordering controls. However, two statements at the heart of the trust argument are internally or operationally false: the document says publication waits for a human arm even though this target is configured to auto-arm after cross-provider approval, and its required live acceptance test simultaneously requires the log-print attempt both to fail and to succeed. Because this file is intended to bind the later implementation, those ambiguities must be corrected before it is a sound design record.",
+  "verdict": "request_changes"
+ }
+}
