@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1881,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "fded6e9f61ae4c705d1486f78ea3a67b2797b3e2",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The record correctly derives the feasibility threshold as `nominal_lifetime > 90 min + (pre-flight \u2192 container start)`, yet the verdict says only a lifetime under approximately 90 minutes requires abandonment and the outcome table marks `~90 min \u2013 2 h` viable. At 90 minutes, and for any lifetime below 90 minutes plus the actual startup margin, a maximum-length run necessarily expires before completion. The decision seam therefore remains weaker than its own formula and can authorize increment 2 when it is not viable.",
+    "file": "research/1676-anthropic-short-lived-credential-feasibility.md",
+    "fix_hint": "Use the same measurable threshold in the verdict, M1 procedure, and outcome table: abandon at or below 90 minutes plus a conservatively measured or explicitly bounded pre-flight-to-container-start margin, and begin the viable middle band only above it. If that margin is unknown, make measuring or bounding it part of M1 and leave feasibility unresolved until it is known.",
+    "severity": "major",
+    "title": "Lifetime outcome table still omits the required startup margin"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-4 major remains unresolved. Section 4 still gives the sound requirement as `nominal_lifetime > 90 min + (pre-flight \u2192 container start)`, but the binding outcome table abandons only below approximately 90 minutes and labels the entire `~90 min \u2013 2 h` band viable. A token at 90 minutes, or above 90 minutes but below 90 minutes plus startup delay, cannot survive a maximum-length worker. Because the table translates M1 into the go/no-go decision, it can still authorize the liveness regression the record says must be prevented. Progress is stagnant because the same finding remains at the same severity.",
+  "verdict": "request_changes"
+ }
+}
