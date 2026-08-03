@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1895,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e8869f7cd9906ca1d2d753cae8d9769083dbe7ad",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change preserves the distinction between an unmeasured lane window and a measured zero through both the health table and the defer trend. Window validation rejects null and non-object/array shapes, count cells visibly mark missing measurements, failure-rate styling remains neutral for unknown data, and a missing lane window makes the fleet defer sample unknown instead of lowering the aggregate. The executed page tests are non-vacuous: they assert missing and genuinely-zero controls together, cover valid golden output and hostile window types, exercise both table and trend consumers, use literal expected values, and keep renderer exceptions visible as named failures. The CSS change is narrowly scoped. No trust checks, workflow permissions, secrets, or routing behavior are weakened, and no prompt-injection text is present in the diff.",
+  "verdict": "approve"
+ }
+}
