@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5845,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "294e7673051b2d80dc7155b2b6520a3c8c07c221",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_step_version` scans the whole step block for any stripped line beginning `version:` without checking its YAML parent. A workflow step can therefore omit `with.version` (so wasm-pack-action uses its default) yet contain a valid unrelated key such as `env:\n  version: v0.15.0`; `_step_version` returns `v0.15.0`, the exact-version check passes, and the repo-wide equality check can also pass. The mutation guard covers deletion only when no other same-named key exists, so it does not prove the documented property that every action explicitly receives a version input.",
+    "file": "scripts/tests/test_js_wasm_pack_install.py",
+    "fix_hint": "Parse `version:` only as a direct child of the step's `with:` mapping, using indentation-aware logic like the existing `_has_with_tool` helper. Add a synthetic mutation with no `with.version` but an unrelated nested `version: v0.15.0` (for example under `env:`) and assert it is rejected. Also reject duplicate direct `with.version` entries.",
+    "severity": "major",
+    "title": "Version detection does not require the action's with.version input"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 fixes the exact omitted-line mutation from round 1 and the focused suite passes, but the asserted invariant is still not fully enforced: `_step_version` accepts any `version:` key anywhere in the action step rather than requiring it to be the action's `with.version` input. A valid step with `env:\n  version: v0.15.0` and no `with.version` is still unpinned while all new checks pass. Because one major test-validity finding remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
