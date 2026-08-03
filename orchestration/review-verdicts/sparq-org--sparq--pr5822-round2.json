@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5822,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "40abaa215d89e0c8679c5b23d68598ecca5f905b",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Decision 2 defines PASS as observing events from at least two distinct triggering workflows, but defines FAIL only as observing no `ci-summary-status` run at all. A run caused by exactly one sibling workflow satisfies neither outcome. That case is operationally important: it can indicate partial or otherwise non-universal routing, so the claimed combined invariant has not been demonstrated. Because decision 4 activates its enumerated fallback only on FAIL, this third outcome can leave stage 1 unresolved without the pre-committed remediation the document promises.",
+    "file": "research/ci-gate-slotless-aggregation.md",
+    "fix_hint": "Define FAIL as every observed result that does not meet PASS after a bounded observation window on a qualifying PR whose expected sibling workflows demonstrably completed. In particular, explicitly include zero runs, runs attributable to only one distinct sibling, and any other result that fails to demonstrate the required multiple-sibling routing. State the observation window or completion condition so the decision can be made deterministically, then route all such failures to decision 4's checked enumeration fallback.",
+    "severity": "major",
+    "title": "The observation has an undefined partial-routing outcome"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 1's core concern is substantially addressed: the document now treats both ingestion acceptance and unfiltered routing as unresolved, scopes the actionlint waiver to the experiment, and blocks stage 2 on empirical evidence. However, the named observation is not exhaustive. PASS requires runs from at least two distinct sibling workflows, while FAIL is defined only as no aggregator run at all. If the trigger fires for exactly one sibling workflow, the combined invariant is not established, yet the result is neither PASS nor FAIL and therefore does not activate the pre-committed fallback. This leaves the rollout decision under-specified at the precise partial-routing failure the experiment is meant to detect. Because this is a new major finding relative to round 1, progress is regressing under the required comparison scale.",
+  "verdict": "request_changes"
+ }
+}
