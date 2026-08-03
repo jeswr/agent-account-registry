@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5803,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ad027424aba69e00bc4e3a7f99544f3678f00f1a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`PR_BLOB_LINES` is computed after jq renders `.headRefName + \" \" + .title` as text. A PR title can contain embedded newlines, so one PR can contribute multiple lines. Enough multiline titles can make the count reach `PR_LIST_CAP` even when the `gh pr list` result contains substantially fewer than 1000 PRs, causing `die` and denying frontier dispatch. This also means the asserted quantity is not the page cardinality the truncation argument requires.",
+    "file": "scripts/push-frontier.sh",
+    "fix_hint": "Capture the `gh pr list --json headRefName,title` JSON first, assert `length < PR_LIST_CAP` on that JSON array, and only then derive `PR_BLOB` for matching. Add a shell self-test or equivalent regression test with a multiline PR title proving one record is counted once.",
+    "severity": "major",
+    "title": "Saturation guard counts title lines instead of PR records"
+   }
+  ],
+  "progress": null,
+  "summary": "The fail-closed saturation guards are generally well targeted and are exercised through their real call sites. However, the push-frontier guard does not count PRs: it counts newline-delimited output after concatenating the user-controlled PR title. Since PR titles may contain newlines, fewer than 1000 PRs can appear to saturate the page and halt frontier dispatch. The saturation decision must be made from the JSON array length before titles are rendered for substring matching.",
+  "verdict": "request_changes"
+ }
+}
