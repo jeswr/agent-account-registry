@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1826,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "313dfe34a1df787297da96b5011a04412c475202",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change is correct and complete within the diff's stated scope. The census operates on the validated, pruned ledger window; counts only no_change records; distinguishes an explicit vocabulary value of unspecified from absent or unreadable evidence; preserves zero-valued vocabulary buckets; and emits before downstream alert routing can fail. The self-test uses literal expected distributions and exercises the real _cmd_decide call site for retained-window selection, unconditional quiet-tick emission, and emission on an undeliverable-alert exit. No blocker or major issue was found. Injection detection is true because comments/docstrings in the untrusted diff contain language directed at a reviewer (for example, saying what a reviewer should mutate); that text was treated only as review data.",
+  "verdict": "approve"
+ }
+}
