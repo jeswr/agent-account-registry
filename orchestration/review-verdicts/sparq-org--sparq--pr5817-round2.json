@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 5817,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "cfc7fa8250da2f87dcf6c8469f9ee1309ae46fed",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_NON_PLAIN_START` classifies every value beginning with `&` or `!` as non-plain, but YAML anchors and tags are properties that may prefix a scalar, not complete values. For example, `name: &label Publish for issue #1135` parses as an anchored plain scalar whose issue reference is consumed as a comment, yet `_plain_name_value()` returns `None`. The same applies to a tagged scalar such as `name: !custom Publish for issue #1135`. This leaves a silent false-negative in the gating rule.",
+    "file": "scripts/check-workflow-step-names.py",
+    "fix_hint": "Lexically consume anchor/tag properties and then classify and scan the following node rather than exempting the whole value. Keep aliases separate because an alias is itself a complete node. Add self-tests for anchored and tagged plain names containing ` #1234`, plus quoted or otherwise safe property-prefixed cases.",
+    "severity": "major",
+    "title": "Anchored and tagged plain scalars bypass the gate"
+   },
+   {
+    "body": "`_multiline_truncation_offence()` returns immediately on a blank line, while its own comment acknowledges that YAML can fold blank lines into a continuing plain scalar. Thus a more-indented continuation containing ` #1135` after a blank line can remain part of the same scalar but evade the gate. This conflicts with the file-level promise to flag every affected multiline plain scalar and is the same correctness class as the round-1 finding.",
+    "file": "scripts/check-workflow-step-names.py",
+    "fix_hint": "Model blank lines according to YAML continuation rules instead of terminating unconditionally, and add a regression fixture where a valid plain `name:` scalar resumes after a blank line and contains a whitespace-prefixed issue reference. Include a safe paragraph-style multiline case as well.",
+    "severity": "major",
+    "title": "Blank lines still bypass multiline-scalar detection"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 fixes the previously reported ordinary multiline-continuation bypass and adds a meaningful regression fixture. However, the lexical classifier still exempts YAML anchors and tags even though both may prefix a plain scalar; an issue reference in that scalar can therefore still be silently consumed as a comment. The scanner also deliberately stops at blank lines although YAML plain scalars can resume after them, leaving another continuation bypass. Because these are gating false-negatives against the stated 'every' rule, the change is not complete.",
+  "verdict": "request_changes"
+ }
+}
