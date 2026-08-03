@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1855,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8ba2ae629686aabc27fb58f02a22d78d6d167371",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`attested_review_head` still loops newest-first but returns the first record whose cause is `human-arm`, silently skipping newer authenticated records with another cause. Thus history containing an older `human-arm(head=live)` followed by a newer `injection(head=live)` still returns the older head and lets `approval_coverage` produce `covers-head`, contrary to the documented `Newest receipt wins` rule. The new test matrix does not catch this: its off-cause case contains no older human-arm record, while its supersession case contains two human-arm records. Historical approval evidence therefore remains reusable across a later park episode.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Choose the newest authenticated, well-formed park-reason record first and return its head only when that record has `cause=human-arm`; otherwise return no attestation. Add a literal end-to-end regression with an older matching human-arm receipt followed by a newer authenticated off-cause receipt, asserting it cannot render `covers-head` and cannot exit 0.",
+    "severity": "major",
+    "title": "A newer off-cause park still fails to supersede an older human-arm attestation"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 trust-plane defect remains unchanged. `attested_review_head` still searches backward until it finds any `human-arm` record, rather than allowing the newest authenticated park-reason record to supersede older evidence. The expanded tests cover an off-cause receipt only in isolation and newest-wins only between two `human-arm` receipts; they still omit the decisive older-human-arm/newer-off-cause sequence. Consequently a later injection or other park episode can resurrect an earlier approval binding and permit `covers-head`. This is materially the same major finding at the same severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
