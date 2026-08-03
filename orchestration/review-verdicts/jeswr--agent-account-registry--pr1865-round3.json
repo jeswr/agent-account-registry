@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1865,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "66bc70e56ff26e8decc66ca9d1c014b9111937ac",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 approval remains supported. The workflow resolves and validates the actual pull-request head SHA, computes its merge base with the validated base SHA, and passes the resulting manifest through the now-required CLI argument. The classifier remains fail-closed for unreadable evidence and continues to refuse both genuine unapproved removals and behind-base omissions while giving distinct, accurate diagnoses. The tests independently pin the workflow call, CLI arity, classifier outputs, real synthetic merge-ref topology, end-to-end user-visible diagnosis, and unresolvable-head refusal; the topology control demonstrates that substituting checkout HEAD reproduces the prior defect, so the central assertion is non-vacuous. Checkout retains full history, action pinning and permissions are not weakened, and no reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
