@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5856,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "19dfee42e6c94423154af83c7dcc624974c13e62",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`statements()` splits `cargo test && echo passed` at `&&`, and `analyse_run_body()` then sees `cargo test` with `errexit_here == true`, no D1 discard, and no D3 trailing exit. In Bash, however, `-e` is ignored for every command except the final command of an AND/OR list. Thus a body such as `cargo test && echo passed; echo done` exits successfully when tests fail and produces no finding: the failed test skips `echo passed`, then `echo done` makes the step green. This violates the rule's stated invariant that a gate must remain able to fail.",
+    "file": "scripts/check-workflow-run-swallow.py",
+    "fix_hint": "Preserve AND/OR-list context while parsing and treat a gate command whose failure is consumed as control flow in a non-final list position as potentially swallowed unless the list's resulting status is itself propagated. At minimum, add a negative fixture for `cargo test && echo passed; echo done` and ensure it produces R1; also cover the analogous conditional-list forms (`if cargo test; then ...; fi` / `while ...`) or explicitly narrow and document the checker if those are intentionally out of scope.",
+    "severity": "major",
+    "title": "AND-list commands bypass the swallow checker"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Both round-2 findings are repaired with statement-scoped, one-to-one waiver matching and an inline-capture fixture. However, the checker still misses a common shell failure-swallow form: a verifying command used as a non-final member of an AND-list. Bash suppresses errexit for such commands, but the implementation splits on `&&` and then analyzes the command as though ordinary errexit still applied. This permits a failed gate to be followed by another successful command and leave the step green without an R1 finding. Because this is a new major correctness gap, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
