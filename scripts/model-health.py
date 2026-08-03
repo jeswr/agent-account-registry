@@ -1687,10 +1687,18 @@ def classify_records(records, provider_accounts, now, open_alerts=()):
     for provider in sorted(providers):
         # Ordered by RECORD time so "later" is well defined for the per-account invalidation
         # rules below (prune() sorts, but classify_records must not rely on caller ordering).
+        #
+        # [#1109] `prov_records` is NON-EMPTY by construction and needs no emptiness guard:
+        # `providers` is derived from `records` above and this re-selects from that SAME list by
+        # equality on the provider that put the key there, so every provider in the loop has at
+        # least the record it came from. An `if not prov_records: continue` guard used to sit here
+        # and was unreachable: `python3 -m trace --count --missing` over `--self-test` scored its
+        # `continue` as never executed, which made it an unkillable line that every mutation sweep
+        # of this function had to re-derive as equivalent. The invariant is pinned by a self-test
+        # check (no provider in the window is skipped), and the `prov_records[-1]` reads below fail
+        # LOUDLY rather than silently if a future edit ever breaks it.
         prov_records = sorted((r for r in records if r.get("provider") == provider),
                               key=lambda r: r["ts"])
-        if not prov_records:
-            continue
 
         # ---- zero-dispatch (fleet pseudo-provider) --------------------------------------------
         # Consecutiveness is over the TICK SEQUENCE: dispatch.yml records a dispatch-SUCCESS
@@ -3477,6 +3485,20 @@ def _self_test():
         {("provider-capped", "anthropic")})
     chk("open capped marker for an in-window provider without a fleet map is left untouched",
         any(a["condition"] == "provider-capped" for a in present_no_fleet), False)
+
+    # [#1109] The complement of the orphan pass: a provider PRESENT in the window is never silently
+    # skipped. classify_records derives its provider set from the records and re-selects each
+    # provider's slice from that same list, so the slice cannot be empty — which is why the loop
+    # carries no emptiness guard (the one that used to sit there was unreachable dead code). Pin
+    # the property directly, including the `fleet` pseudo-provider, whose lane `continue`s out of
+    # that same loop: a regression skipping any of them silently drops that provider's conditions,
+    # and #205's orphan pass would not cover the loss (it only fires for providers ABSENT here).
+    every_provider = [rec("anthropic", "acct01", CLASS_TRANSIENT, dt=0),
+                      rec("openai", "acct02", SUCCESS, dt=10),
+                      zrec(CLASS_ZERO_DISPATCH, 20)]
+    chk("every provider present in the window is classified (none silently skipped)",
+        {a["provider"] for a in classify_records(every_provider, {}, now + 30)},
+        {"anthropic", "openai", "fleet"})
     # already-covered markers are not double-emitted (the record-driven action wins)
     covered = classify_records(burst, {}, now + 200, {("persistent-transient", "anthropic")})
     chk("an already-covered open marker is not double-emitted",
