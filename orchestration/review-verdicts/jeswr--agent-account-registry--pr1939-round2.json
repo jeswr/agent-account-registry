@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1939,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6cf68d95a829c94e17f96ff7d42a3c79cb9ab940",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains sound and fail-closed. The GraphQL retry carve-out is confined to the exact `api graphql` position, rejects explicit methods and request bodies, requires exactly one readable `query=` field, and admits only documents whose literal/comment-stripped top-level definitions are queries, fragments, or anonymous query operations, with at least one query operation. Mutation and subscription documents, ambiguous field shapes, incomplete literals, malformed delimiter structure, indirect documents, and non-GraphQL endpoints remain refused. The attached multiline-field parser fix closes the pre-existing replay fail-open, and the tests cover the policy, argv decision site, real retry loop, shell entrypoint, and parser regression with non-vacuous positive and negative assertions. No reviewer-directed instruction appears in the untrusted diff. Round 1 also had no findings, so progress is stagnant by the required scale rather than improving.",
+  "verdict": "approve"
+ }
+}
