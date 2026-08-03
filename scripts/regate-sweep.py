@@ -1100,31 +1100,26 @@ def cron_collisions(minutes, others):
 def main(argv=None, runner=None, clock=None):
     """The CLI entry point. `runner` and `clock` exist so the self-test can exercise THIS function.
 
-    `clock` exists for the same reason, and for a defect the `runner` injection did not cover
-    [OPUS-5]. Every OTHER Sweeper in the suite is built with `clock=lambda: NOW`; this one was
-    built by `main()`, which passed no clock, so the entry-point assertions compared a fixture
-    `merged_at` against the REAL wall clock. `REPAIR_DETAIL`'s stamp is 24h + a few minutes before
-    the failure, so the row passed for exactly one day and then went red on EVERY branch at once —
-    a whole-repository merge lock authored by a test, at a time nobody chose. `None` keeps the
-    production default (Sweeper's own real clock), so this parameter cannot change what a live
-    sweep does.
+    ⚠️ `clock` exists for the same reason, for a defect the `runner` injection did not cover: it is
+    the SECOND injected environment input and the SAME KIND of seam as `runner` — added for the
+    same reason `_pinned_env` exists [SPARQ agent]. Every OTHER Sweeper in the suite is built with
+    `clock=lambda: NOW`; this one was built by `main()`, which passed no clock, so the entry-point
+    assertions compared the fixture's FIXED merge instant (`REPAIR_DETAIL["merged_at"]`) against
+    the REAL wall clock and silently inherited the calendar. That made them decaying tests, in both
+    directions. `REPAIR_DETAIL`'s stamp is 24h + a few minutes before the failure, so inside
+    `REPAIR_LOOKBACK_HOURS` of the fixture date they passed — for exactly one day — and then the
+    same code put every repair `repair-outside-lookback`, which turned the `--bot-slug` wiring row
+    RED on EVERY branch at once: a whole-repository merge lock authored by a test, at a time nobody
+    chose, because that row reddens the required gate for every PR. The same expiry turned the
+    three rows that expect NO write VACUOUSLY green, for the wrong reason — nothing was swept at
+    all. A time-bomb in one direction and vacuity in the other, from one unstated input. `None`
+    (every production call) keeps the production default, Sweeper's own real wall clock, so this
+    parameter cannot change what a live sweep does.
 
     It was at 0% line coverage until a coverage run said so: the CLI-flag gate proves each flag is
     DECLARED, not that it is wired, so a typo in the slug validation, in the `[bot]` login the
     marker scan depends on, or in the repairs-file read would have passed the whole suite and failed
-    only in production.
-
-    ⚠️ `clock` is the SECOND injected environment input, and the SAME KIND of seam as `runner` —
-    added for the same reason `_pinned_env` exists. The self-test's repair fixture is merged at a
-    FIXED instant (`REPAIR_DETAIL["merged_at"]`), and `Sweeper` defaults to the wall clock, so
-    every assertion routed through here silently inherited the calendar. That made them decaying
-    tests: inside `REPAIR_LOOKBACK_HOURS` of the fixture date they passed, and a day later the same
-    code put every repair `repair-outside-lookback` — which turned the `--bot-slug` wiring row RED
-    (reddening the required gate for every PR at a time nobody chose) and turned the three rows
-    that expect NO write VACUOUSLY green, for the wrong reason: nothing was swept at all. A
-    time-bomb in one direction and vacuity in the other, from one unstated input. Passing `None`
-    (every production call) keeps the real wall clock, so this parameter cannot change a live
-    sweep."""
+    only in production."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true",
                         help="run the in-file test suite and exit")
