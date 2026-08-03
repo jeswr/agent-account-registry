@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1949,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c781bf1201b06e83dfff9e85ee19d7c0f35030c7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 1 defines J1 as a per-row join keyed by `(issue, ts)`, but `retry_decision` is called with all validated no-change rows for the issue and may derive its arm from any combination of them. Section 8 then proposes recording only `arm`, the declared reason set, and the decompose cause. A set discards multiplicity and provenance: two rows with different timestamps but the same reason collapse, and when several reasons are present the receipt cannot identify which source row(s) participated in the decision. It also cannot distinguish a later decision over a changed window that happens to yield the same reason set. Consequently the proposed receipt cannot support the record's stated \u201cfor each no_change row\u201d correlation or an auditable denominator, despite the table marking C as satisfying J1.",
+    "file": "research/1828-no-change-routing-outcome-correlation.md",
+    "fix_hint": "Specify a stable evidence binding in the new marker: for example, a bounded digest over the exact validated input rows plus enough non-sensitive row identifiers (at minimum their timestamps/run IDs and reason values) for the study reader to reconstruct and verify membership. Define behavior for duplicate timestamps, multiple reasons, aged-out rows, and repeated decisions over the same evidence, then update the J1 key/table and option-C recommendation to match the actual decision-level cardinality. If the intended metric is decision-level rather than row-level, restate M4 and the joins consistently and define how rows contribute to its denominator.",
+    "severity": "major",
+    "title": "Option C does not preserve the proposed per-row join key"
+   }
+  ],
+  "progress": null,
+  "summary": "The record identifies real structural gaps, but its proposed durable join does not preserve the join it defines. The routing decision consumes the complete validated set of in-window no-change rows for an issue, potentially containing several timestamps and reasons, while option C records only an arm and a reason set. That artifact cannot be joined back to each contributing health row or establish which row/reason drove the decision, so the recommended design can still produce an unauditable correlation. Because choosing the store and join shape is the central deliverable of this design-only PR, this is a major completeness issue.",
+  "verdict": "request_changes"
+ }
+}
