@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1906,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f6172b0b9fc9880331dcbfe7ef17ecab829dc9a1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The design record is internally coherent, explicitly separates verified checkout evidence from unverified GitHub API assumptions, and makes its WONTFIX decision independent of those assumptions. Its key factual claims match the current code: the guarded writer uses body-edit counts and fails on an ambiguous inside-window edit; the schema guard validates shape rather than live secret existence; the persisted limit is consumed only by dashboard-gen as a fallback to live probe limits; and the cited migration is presented as an open, uncosted follow-up rather than a shipped solution. This is documentation-only, weakens no trust check, introduces no executable behavior, and honestly records the remaining operator-warning and API-verification uncertainties. No blocker or major issue is supported by the diff.",
+  "verdict": "approve"
+ }
+}
