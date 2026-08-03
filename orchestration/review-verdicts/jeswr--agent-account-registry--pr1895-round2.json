@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1895,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e8869f7cd9906ca1d2d753cae8d9769083dbe7ad",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The change remains correct and complete. It preserves the distinction between an unmeasured lane window and a measured zero in both health-table columns, keeps the failure-rate cell neutral for unknown data, and propagates any unknown 1h lane window into an unknown fleet defer sample instead of understating the total. The executed page tests are non-vacuous: measured-zero controls and missing/malformed windows are asserted together, golden measured output is pinned literally, both table and trend consumers execute, and renderer failures become named failing values rather than aborting the remainder of the suite. Object/null/array/primitive window shapes are handled consistently with the generator contract. The CSS is narrowly scoped, and the diff does not weaken trust checks, routing, workflow permissions, secret handling, or audit behavior. No prompt-injection text is present. Round 2 has the same zero findings and approval as round 1, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
