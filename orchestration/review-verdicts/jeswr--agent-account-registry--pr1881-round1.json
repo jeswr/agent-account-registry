@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1881,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2da8ec2a028597930aba8f873ec045c43b3f9e58",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Option (a) says to store and route `claude-credentials-json`, avoid a stored/delivered distinction, and reuse the existing env delivery while leaving `worker-live.sh`'s claude arm untouched. Those claims cannot all hold. The selected/routed format is what `worker-live.sh` dispatches on: `claude-oauth-token` reaches the env-export arm, while `claude-credentials-json` reaches the separately refused credential-document arm. If routed and claimed formats remain `claude-credentials-json`, the existing env arm is not selected. Making option (a) work therefore requires changing the `claude-credentials-json` delivery arm (and likely its input contract) or introducing an explicit delivered-format distinction. The record currently calls the latter a trust-check weakening and denies the former is needed, so its recommended implementation has no coherent control-flow path.",
+    "file": "research/1676-anthropic-short-lived-credential-feasibility.md",
+    "fix_hint": "Specify one concrete end-to-end format and dispatch design. If `claude-credentials-json` remains the routed/stored format, explicitly require its worker-live delivery arm to consume only the host-prepared access token and export it, with sentinel/negative tests at that exact seam. Otherwise design and justify a fail-closed stored-versus-delivered mapping without weakening the claimed/routed exact-equality check. Update the cost and test surface accordingly.",
+    "severity": "major",
+    "title": "Recommended env delivery cannot leave the claude arm untouched while formats remain identical"
+   },
+   {
+    "body": "M1 is repeatedly described as `offline, no network`, but its procedure requires reading the credential twice with a forced refresh between reads. Refreshing an OAuth grant requires contacting the provider (or invoking a CLI that does so); merely rereading the local file cannot establish nominal lifetime. Thus the gating measurement as written is not executable under its stated safety/environment constraints. This matters because the record says M1 alone can kill the increment and must run first.",
+    "file": "research/1676-anthropic-short-lived-credential-feasibility.md",
+    "fix_hint": "Separate the genuinely offline residual-lifetime observation from the networked forced-refresh measurement. State the required environment, authorization, redaction rules, and how success is verified without printing either token. If no networked refresh is permitted, do not claim nominal lifetime can be measured; record only a bound from residual lifetime and keep feasibility unresolved.",
+    "severity": "major",
+    "title": "M1 is labeled offline even though it requires a forced token refresh"
+   }
+  ],
+  "progress": null,
+  "summary": "The record usefully confirms several current-tree constraints, but its recommended delivery design is internally inconsistent with the exact format gate and dispatch it cites, and its supposedly offline gating measurement requires a refresh operation that is not offline. Because this document is intended to bind whether and how increment 2 proceeds, those are major feasibility errors rather than editorial nits.",
+  "verdict": "request_changes"
+ }
+}
