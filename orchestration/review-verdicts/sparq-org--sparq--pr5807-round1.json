@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5807,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "fd28abf62ce340373db281bf6e9d68c9827ac1bb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new CI test correctly pins the three existing module-level compiled worker issue head-ref regexes to the canonical byte string, exercises the visibility boundary cases, detects undeclared or stale copies within its explicitly documented AST-recognition scope, includes anti-vacuity coverage, and structurally verifies unconditional CI wiring. The workflow installs PyYAML before invoking the test, and the production declarations currently match the declared set. No correctness, security, or test-validity defect requiring changes was found.",
+  "verdict": "approve"
+ }
+}
