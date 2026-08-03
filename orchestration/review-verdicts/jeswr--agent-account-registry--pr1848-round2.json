@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1848,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "465261cfc7fee9dd40bd4770005fed14ff0874a7",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_bound_area_clearance` re-reads labels and timeline, then returns a boolean that `_apply_cli` carries through `triage`, `validate_plan`, `reduced_write_is_safe`, and into `apply_triage`. The actual removal occurs later in `apply_triage`'s phase-3 edit. A human application or remove/reapplication of `needs:area` after the second timeline read but before that edit is therefore absent from both proofs, yet the stale `clearable=True` still removes the new human hold. The claim that the remaining interval is only pure in-process work does not establish ownership binding; concurrent GitHub writers are not serialized by that work, and `apply_triage` may also perform network reads/writes before phase 3. The added race fixture mutates only when `nth_read == 1`, so the confirming proof sees it and the test does not exercise a write after the confirming read.",
+    "file": "scripts/triage.py",
+    "fix_hint": "Move the fresh ownership proof to the removal boundary and make the removal conditional on that fresh result, ideally using a server-side conditional/CAS mechanism. If GitHub exposes no atomic label-delete precondition, do not represent the operation as race-safe: preserve the human-appliable hold or use an ownership mechanism that can be atomically distinguished. Add a binding-layer test that injects a human application after the confirming timeline response has been captured and before the exact edit that removes `needs:area`, and assert that the new hold survives.",
+    "severity": "major",
+    "title": "Confirming proof is still not bound to the label deletion"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 narrows the stale-proof window and adds a useful regression test for a reapplication during the first timeline read, but it does not bind the ownership proof to the deletion. `_bound_area_clearance` finishes its confirming timeline read before planning and before `apply_triage`; a human can still apply or reapply `needs:area` after that read and before the phase-3 edit removes it. The new test fires the concurrent write only during the first proof, so it cannot detect the remaining race. This is materially the same trust-plane finding at the same severity as round 1.",
+  "verdict": "request_changes"
+ }
+}
