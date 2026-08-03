@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5638,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "095f0160a52bc39c3fb05e65099086bd3f699448",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The new needs_refs extractor recognizes dotted and quoted bracket-index access, fails closed on non-literal or bare needs access, and the mutation-style test demonstrates that single-quoted, double-quoted, and dotted undeclared dependencies change the extracted reference set while opaque access is reported as unclassified. The chain validator now rejects both an altered reference set and any unclassified access, so the previously identified silent bypass is closed. The accompanying workflow comment and research addendum accurately describe the invariant being pinned. No correctness, soundness, test-validity, or security issue remains in the diff-scoped evidence.",
+  "verdict": "approve"
+ }
+}
