@@ -3,12 +3,12 @@
   {
    "account": "f79434c3ffba014f",
    "claim_id": "a4c0d6705c2d4422af1b6d054462be05",
-   "holder": "jeswr/agent-account-registry#1248@dispatch-30847460240.1",
+   "holder": "jeswr/agent-account-registry#1248@30847783333.1",
    "package": "ci",
    "role": "ci",
    "model": "opus5",
-   "issued_at": 1785786836,
-   "expires_at": 1785789536
+   "issued_at": 1785786877,
+   "expires_at": 1785789577
   },
   {
    "account": "dc2d751954080e13",
