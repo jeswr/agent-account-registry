@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5711,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d3635413c0a10fcf87a12675413ca7fd570801e5",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The workflow consistently uses the same `shared-key` for the coverage-engine run matrix and merge job, preserving the existing main-only cache-save policy. The hermetic regression test accurately distinguishes rust-cache's job-composed `key` behavior from cross-job `shared-key` behavior, checks the live workflow wiring, and includes explicit guards against vacuous discovery. The focused test suite passes, and no correctness, soundness, security, or test-validity defect is evident. Round 2 is materially unchanged from the already-clean round 1 review, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
