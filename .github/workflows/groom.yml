@@ -127,9 +127,11 @@ jobs:
       # REPORT-ONLY, and there is no gate mode: groom must never delete a claim ref, because
       # deletion re-opens exactly the credential-overwrite race the claim exists to close — nor a
       # `refs/acct-requests/` binding (#1260), because deleting one re-opens the resume gap #534
-      # closed. The ambient token suffices — claim refs, binding refs and account issues are all
+      # closes. The ambient token suffices — claim refs, binding refs and account issues are all
       # public on this repo — and the burned slots it names back no account, so no handle-privacy
       # question arises (decision 22b); a binding ref is only ever counted, never printed.
+      # NOTE: set-up-account.yml does not write a binding yet (that ships with #534), so this step
+      # reports `bindings=0` and says outright that the zero is not evidence about any burned slot.
       - name: Report orphaned account-slot claim refs
         continue-on-error: true
         env:
