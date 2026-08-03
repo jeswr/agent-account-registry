@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1809,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7b9e3016c4e43f3743278f9f7d9a69100546594a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nBoth round-1 defects are resolved. The workflow is no longer scheduled while its required scanner is absent, and the parsed YAML self-test couples any future cron enablement to the scanner being present while retaining manual dispatch for an honest unverified result. Malformed or non-array issue-list output now returns nonzero without mutation or payload echo, including on both alerting and clean ticks, and the end-to-end tests pin that fail-closed behavior. The remaining workflow wiring, full-history checkout, scanner self-test-before-scan sequence, alert dedupe and recovery paths, public-sink bounds, least-privilege permissions, and SHA-pinned actions are consistent and non-vacuously exercised.",
+  "verdict": "approve"
+ }
+}
