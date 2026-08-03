@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5822,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e46a45e38a0005794ead10f504cc8eaa7dfaf179",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The design says the evaluator must fire for every sibling workflow and treats stage 2 as blocked until that invariant is demonstrated, but PASS requires events from only two distinct triggering workflows. On a qualifying head where five sibling workflows completed, runs caused by two siblings satisfy PASS even if the other three never route to the evaluator. Thus partial routing can still be accepted and the required context enabled without evidence that every expected sibling contributes, risking premature success from an incomplete event set.",
+    "file": "research/ci-gate-slotless-aggregation.md",
+    "fix_hint": "Define the expected sibling set for the qualifying head from the completed workflows used to qualify it, then require the observed distinct `github.event.workflow_run.name` set to cover that entire expected set before PASS. After the settle window, classify any missing expected sibling as FAIL and route it to decision 4. If some completed workflows are intentionally excluded, specify and mechanically derive those exclusions so the comparison is deterministic.",
+    "severity": "major",
+    "title": "PASS demonstrates multiple-sibling routing, not routing from every sibling"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2's undefined exactly-one-sibling outcome is now explicitly classified as FAIL, with a bounded observation condition and a deterministic fallback. However, the revised PASS criterion still does not establish the document's claimed universal routing invariant: on a qualifying head with more than two completed sibling workflows, aggregator runs attributable to any two siblings produce PASS even if other completed siblings never trigger it. That is a new major correctness gap, so progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
