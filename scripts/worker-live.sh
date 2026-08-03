@@ -1417,18 +1417,28 @@ _pr_gate_suite_loop() {
 # then every other key (json-encoded, sorted) -- which is how an inserted step-level `if: false`
 # shows up -- then `run: |` and the run body normalised to stripped, comment-free lines. This is the
 # #941/#956 YAML-seam shape: a mutant here is invisible to every python assertion in this repo.
+#
+# [PR #1777 r3] The reader is PARAMETERISED by step name and shared with _pr_gate_selftest_baseline
+# below, deliberately: this is the only correct answer in the file to "which node does Actions
+# actually run?", and a second hand-rolled copy of it is the #958 shape -- two definitions of one
+# rule, drifting, each individually unkillable (#945). `_pr_gate_yaml_parse_sweep` stays the NAMED
+# entry point for its own frozen block so every mutant row already written against it is unchanged.
 _pr_gate_yaml_parse_sweep() {
-  local file=$1
+  _pr_gate_named_step_object "$1" 'actionlint + yaml-parse every workflow'
+}
+
+_pr_gate_named_step_object() {
+  local file=$1 name=$2
   [[ -f "$file" ]] || return 0
   # stderr is dropped on purpose: EVERY failure path (missing PyYAML included) must reduce to the
   # one observable this function has -- an empty stdout -- rather than to a half-printed block.
-  python3 - "$file" <<'PY' 2>/dev/null
+  python3 - "$file" "$name" <<'PY' 2>/dev/null
 import json
 import sys
 
 import yaml
 
-NAME = "actionlint + yaml-parse every workflow"
+NAME = sys.argv[2]
 
 
 class Strict(yaml.SafeLoader):
@@ -1489,6 +1499,47 @@ if "run" in step:
                if l.strip() and not l.strip().startswith("#"))
 print("\n".join(out))
 PY
+}
+
+# [PR #1777 r3] PURE (self-tested): print pr-gate.yml's PROTECTED-BASELINE MATERIALISATION -- the
+# region of the self-test suite step's `run` body that decides WHICH COMMIT the base-branch manifest
+# and its retirement approvals are read from, anchored from the `baseline_sha=` derivation up to (and
+# excluding) the `suite=` line the preflight pin below owns.
+#
+# WHAT IS AT STAKE. `_derive_full_selftest_suite`'s retirement-approval control is only as sound as
+# the commit its caller hands it, and that choice lives ENTIRELY in YAML -- invisible to every python
+# assertion in this repo (the #941/#956 shape). It fails in BOTH directions, so both are pinned by
+# one exact block:
+#   * repointed at the moving `$base` tip, it FALSE-REFUSES every PR whose base enrolled an entry
+#     after the branch point (measured on #1777: a research-document-only PR, 59/59 green, red gate);
+#   * with the `git cat-file -e` guards defeated so the bootstrap fallback always fires, the baseline
+#     becomes the tree's OWN manifest and the whole control turns TAUTOLOGICAL -- it would then
+#     accept any unapproved retirement while still printing a green step (AGENTS.md item 2(b)).
+# The fail-closed `exit 1` on an unresolvable merge base sits inside the extraction for the same
+# reason: a guard that no longer exits is a guard that is not there.
+#
+# Anchored to the NAMED STEP as a PARSED YAML OBJECT, via the same reader `_pr_gate_yaml_parse_sweep`
+# uses, so the #1680-r2 block-scalar spoof cannot launder it: a verbatim copy of this region parked
+# in an earlier step's `run` text is the VALUE of a step, never a step, so it is not in the step list
+# and cannot mask a weakened real one. Prints nothing -- matching no expected block -- on every input
+# it cannot read unambiguously, plus a missing anchor or a missing `suite=` terminator, both of which
+# would otherwise silently narrow the pinned region.
+#
+# The step's OWN NON-`run` KEYS are printed ahead of the region, so this pin also carries what a
+# body-only slice structurally cannot see: a step-level `if: false` on the step that materialises the
+# baseline. That is #941's measured mutant -- an `if:` on the STEP, not in the shell -- and none of
+# the three line-based pins over this same step can observe it.
+_pr_gate_selftest_baseline() {
+  local file=$1
+  _pr_gate_named_step_object "$file" \
+    'Run the full registry self-test suite (sandboxed — no self-test may reach the real gh)' \
+  | awk '
+      !body { head = head $0 "\n"; if ($0 == "run: |") body = 1; next }
+      !on && $0 ~ /^baseline_sha=/ { on = 1; buf = $0; next }
+      on && $0 ~ /^suite=/ { closed = 1; exit }
+      on { buf = buf "\n" $0 }
+      END { if (closed) printf "%s%s\n", head, buf }
+    '
 }
 
 # [issue #1371] PURE (self-tested): pr-gate.yml's suite DERIVATION line together with the line that
@@ -8976,6 +9027,224 @@ CHANNEL
   chk "preflight check fails CLOSED on an unreadable workflow" \
     "$([[ "$(_pr_gate_suite_preflight "$loopfix/absent.yml" 2>/dev/null | paste -sd'|' -)" == "$expected_preflight" ]] \
        && printf missed || printf caught)" "caught"
+
+  # ---- [PR #1777 r3] WHICH COMMIT THE PROTECTED BASELINE IS READ FROM. `print-selftest-suite`'s
+  # retirement-approval control is only as sound as the baseline its caller materialises, and that
+  # choice is made in YAML, where nothing in this repo could see it. Two independent assertions,
+  # because they fail in different places and neither subsumes the other: the WIRING (the exact block
+  # pr-gate.yml uses to pick that commit) and the RULE ITSELF, driven over a real git history in both
+  # directions against the REAL `_derive_full_selftest_suite`. A perfect rule read from the wrong
+  # commit is the defect this closes; a right commit handed to a rule that refuses nothing is the
+  # same defect wearing a fix.
+  #
+  # The expected block is TYPED here, never derived from pr-gate.yml, so it cannot compare the file
+  # against itself (AGENTS.md item 2(b)). It is deliberately FROZEN: any later edit to this region
+  # reds this row until the new block is written here too. ----
+  local bl_name='Run the full registry self-test suite (sandboxed — no self-test may reach the real gh)'
+  local bl_derive='baseline_sha=$(git merge-base "$base" HEAD 2>/dev/null) || baseline_sha='"''"
+  local bl_guard_if='if [[ -z "$baseline_sha" ]]; then'
+  local bl_guard_msg='echo "::error::the graded tree shares no merge base with base commit $base; refusing to derive the self-test suite"'
+  local bl_guard_exit='exit 1'
+  local bl_fi='fi'
+  local bl_else='else'
+  local bl_report='echo "protected self-test baseline: $baseline_sha (base tip $base)"'
+  local bl_have_manifest='if git cat-file -e "$baseline_sha:scripts/selftest-suite.txt" 2>/dev/null; then'
+  local bl_show_manifest='git show "$baseline_sha:scripts/selftest-suite.txt" > "$base_manifest"'
+  local bl_boot_manifest='cp scripts/selftest-suite.txt "$base_manifest"'
+  local bl_have_retire='if git cat-file -e "$baseline_sha:scripts/selftest-retirements.txt" 2>/dev/null; then'
+  local bl_show_retire='git show "$baseline_sha:scripts/selftest-retirements.txt" > "$base_retirements"'
+  local bl_boot_retire=': > "$base_retirements"'
+  local bl_suite='suite=$(bash scripts/worker-live.sh print-selftest-suite "$base_manifest" "$base_retirements" "$mb_manifest")'
+  local -a bl_body_base=("$bl_derive" "$bl_guard_if" "$bl_guard_msg" "$bl_guard_exit" "$bl_fi" \
+    "$bl_report" "$bl_have_manifest" "$bl_show_manifest" "$bl_else" "$bl_boot_manifest" "$bl_fi" \
+    "$bl_have_retire" "$bl_show_retire" "$bl_else" "$bl_boot_retire" "$bl_fi")
+  # [PR #1865 r1, merged] THE SAME REGION NOW ALSO CARRIES THE BRANCH-POINT DERIVATION. This pin runs
+  # from `baseline_sha=` to the `suite=` terminator, and #1865's head-resolution guard and merge-base
+  # manifest materialisation landed INSIDE that span -- so they are typed here too, exactly as the
+  # FROZEN note above requires. Not redundant with #1865's own block below: that one EXECUTES this
+  # region against a synthetic `refs/pull/N/merge` repository and asserts which commit's manifest
+  # came out, which is blind to a step-level `if: false` and to a faithful copy parked in an earlier
+  # step's `run` text; this one is an exact-match pin over the step as a PARSED YAML OBJECT, which
+  # sees both and cannot observe runtime behaviour. Text pin and execution pin over one region,
+  # neither able to mask the other's mutant.
+  local bl_head_set="head='\${{ github.event.pull_request.head.sha }}'"
+  local bl_head_if='if ! git cat-file -e "$head^{commit}" 2>/dev/null; then'
+  local bl_head_msg='echo "::error::head commit $head is unresolvable; refusing to derive the self-test suite"'
+  local bl_mb_set='mb_manifest="$RUNNER_TEMP/mergebase-selftest-suite.txt"'
+  local bl_mb_if='if ! merge_base=$(git merge-base "$head" "$base") || [ -z "$merge_base" ]; then'
+  local bl_mb_msg='echo "::error::the merge base of $head and $base is unresolvable; refusing to derive the self-test suite"'
+  local bl_mb_have='if git cat-file -e "$merge_base:scripts/selftest-suite.txt" 2>/dev/null; then'
+  local bl_mb_show='git show "$merge_base:scripts/selftest-suite.txt" > "$mb_manifest"'
+  local bl_mb_boot=': > "$mb_manifest"'
+  local -a bl_mb_body=("$bl_head_set" "$bl_head_if" "$bl_head_msg" "$bl_guard_exit" "$bl_fi" \
+    "$bl_mb_set" "$bl_mb_if" "$bl_mb_msg" "$bl_guard_exit" "$bl_fi" \
+    "$bl_mb_have" "$bl_mb_show" "$bl_else" "$bl_mb_boot" "$bl_fi")
+  local -a bl_body=("${bl_body_base[@]}" "${bl_mb_body[@]}")
+  local expected_baseline
+  expected_baseline=$(printf '%s\n' "- name: $bl_name" 'run: |' "${bl_body[@]}" | paste -sd'|' -)
+  chk "pr-gate.yml reads the protected baseline from the MERGE BASE, not the moving base tip (exact block)" \
+    "$(_pr_gate_selftest_baseline "$SCRIPT_DIR/../.github/workflows/pr-gate.yml" | paste -sd'|' -)" \
+    "$expected_baseline"
+  # NON-VACUITY. Every fixture is emitted through ONE step writer from the SAME body lines the
+  # expected block is built from, inside ONE parseable-workflow wrapper, so a mutant differs from
+  # `expected` in exactly its mutation and never records a FALSE KILL on an incidental indentation or
+  # quoting typo (pre-flight item 4). The FAITHFUL fixture is load-bearing: if the step name typed
+  # here ever disagreed with the one the extractor anchors on, every "caught" row below would pass
+  # vacuously on an empty extraction, and only a fixture that is supposed to MATCH detects that.
+  _bl_step() {  # $1 = step name; $2 = one extra step key ('' for none); $3.. = run-body lines
+    local nm=$1 extra=$2; shift 2
+    printf '%s\n' "      - name: $nm"
+    if [[ -n "$extra" ]]; then printf '%s\n' "        $extra"; fi
+    printf '%s\n' '        run: |'
+    printf '          %s\n' "$@"
+  }
+  # The one weakening the masking fixtures below carry, named once: the manifest read repointed at
+  # the moving `$base` tip -- this PR's own defect, a step that still materialises a baseline, still
+  # derives a suite and still exits 0 while false-refusing every PR whose base enrolled an entry.
+  # Every fixture below carries the #1865 merge-base tail VERBATIM unless that tail is what it
+  # mutates, so each differs from `expected` in exactly its own mutation (pre-flight item 4).
+  local -a bl_body_tip=("$bl_derive" "$bl_guard_if" "$bl_guard_msg" "$bl_guard_exit" "$bl_fi" \
+    "$bl_report" "$bl_have_manifest" \
+    'git show "$base:scripts/selftest-suite.txt" > "$base_manifest"' \
+    "$bl_else" "$bl_boot_manifest" "$bl_fi" \
+    "$bl_have_retire" "$bl_show_retire" "$bl_else" "$bl_boot_retire" "$bl_fi" \
+    "${bl_mb_body[@]}")
+  _bl_step "$bl_name" '' "${bl_body[@]}" "$bl_suite" | _yaml_sweep_wf "$loopfix/bl-faithful.yml"
+  _bl_step "$bl_name" '' "${bl_body_tip[@]}" "$bl_suite" | _yaml_sweep_wf "$loopfix/bl-tip.yml"
+  _bl_step "$bl_name" '' "$bl_derive" "$bl_guard_if" "$bl_guard_msg" "$bl_guard_exit" "$bl_fi" \
+    "$bl_report" "$bl_have_manifest" "$bl_show_manifest" "$bl_else" "$bl_boot_manifest" "$bl_fi" \
+    "$bl_have_retire" 'git show "$base:scripts/selftest-retirements.txt" > "$base_retirements"' \
+    "$bl_else" "$bl_boot_retire" "$bl_fi" "${bl_mb_body[@]}" "$bl_suite" \
+    | _yaml_sweep_wf "$loopfix/bl-tip-retire.yml"
+  # The derivation deleted outright and every read back on `$base`: no anchor, so nothing extracts.
+  _bl_step "$bl_name" '' \
+    'if git cat-file -e "$base:scripts/selftest-suite.txt" 2>/dev/null; then' \
+    'git show "$base:scripts/selftest-suite.txt" > "$base_manifest"' "$bl_else" \
+    "$bl_boot_manifest" "$bl_fi" "${bl_mb_body[@]}" "$bl_suite" \
+    | _yaml_sweep_wf "$loopfix/bl-derive-deleted.yml"
+  # The fail-closed guard made conditionally INERT rather than deleted -- non-crashing, so it still
+  # runs and still exits 0 with an empty baseline_sha, which reads every path as the empty tree.
+  _bl_step "$bl_name" '' "$bl_derive" "$bl_guard_if" "$bl_guard_msg" ':' "$bl_fi" "$bl_report" \
+    "$bl_have_manifest" "$bl_show_manifest" "$bl_else" "$bl_boot_manifest" "$bl_fi" \
+    "$bl_have_retire" "$bl_show_retire" "$bl_else" "$bl_boot_retire" "$bl_fi" \
+    "${bl_mb_body[@]}" "$bl_suite" \
+    | _yaml_sweep_wf "$loopfix/bl-guard-inert.yml"
+  # The bootstrap fallback made unconditional: the baseline becomes the tree's OWN manifest, so the
+  # retirement control compares the manifest against itself and can never refuse (item 2(b)).
+  _bl_step "$bl_name" '' "$bl_derive" "$bl_guard_if" "$bl_guard_msg" "$bl_guard_exit" "$bl_fi" \
+    "$bl_report" 'if false; then' "$bl_show_manifest" "$bl_else" "$bl_boot_manifest" "$bl_fi" \
+    "$bl_have_retire" "$bl_show_retire" "$bl_else" "$bl_boot_retire" "$bl_fi" \
+    "${bl_mb_body[@]}" "$bl_suite" \
+    | _yaml_sweep_wf "$loopfix/bl-fallback-always.yml"
+  # The #1865 TAIL's own two mutants. Extending the frozen block over these lines would otherwise
+  # widen the pinned REGION without widening what the pin can KILL -- a wider constant comparing
+  # itself. Both are non-crashing and both still write a manifest and exit 0.
+  #   * the branch point resolved from the checkout `HEAD` instead of the PR head: #1865's measured
+  #     defect. On `refs/pull/N/merge` `$base` is an ANCESTOR of `HEAD`, so the merge base collapses
+  #     onto the base tip and every behind-base entry is re-accused of a removal it did not make.
+  _bl_step "$bl_name" '' "${bl_body_base[@]}" \
+    "$bl_head_set" "$bl_head_if" "$bl_head_msg" "$bl_guard_exit" "$bl_fi" "$bl_mb_set" \
+    'if ! merge_base=$(git merge-base HEAD "$base") || [ -z "$merge_base" ]; then' \
+    "$bl_mb_msg" "$bl_guard_exit" "$bl_fi" \
+    "$bl_mb_have" "$bl_mb_show" "$bl_else" "$bl_mb_boot" "$bl_fi" "$bl_suite" \
+    | _yaml_sweep_wf "$loopfix/bl-mb-from-head.yml"
+  #   * the unresolvable-head refusal made conditionally INERT rather than deleted (item 3): the
+  #     guard still runs, still prints, and then falls through to derive a branch point from a head
+  #     the job could not resolve -- guessing exactly the verdict it must refuse to guess.
+  _bl_step "$bl_name" '' "${bl_body_base[@]}" \
+    "$bl_head_set" "$bl_head_if" "$bl_head_msg" ':' "$bl_fi" \
+    "$bl_mb_set" "$bl_mb_if" "$bl_mb_msg" "$bl_guard_exit" "$bl_fi" \
+    "$bl_mb_have" "$bl_mb_show" "$bl_else" "$bl_mb_boot" "$bl_fi" "$bl_suite" \
+    | _yaml_sweep_wf "$loopfix/bl-head-guard-inert.yml"
+  # A STEP-LEVEL `if: false` -- #941's measured mutant. Invisible to a run-body-only slice, which is
+  # why this pin prints the step's other keys.
+  _bl_step "$bl_name" 'if: false' "${bl_body[@]}" "$bl_suite" \
+    | _yaml_sweep_wf "$loopfix/bl-step-if-false.yml"
+  # [#1680 r2] The block-scalar spoof: a faithful copy parked in an EARLIER step's `run` TEXT while
+  # the real named step is weakened. Text is the value of a step, never a step.
+  { _bl_step 'benign earlier step' '' "- name: $bl_name" 'run: |' "${bl_body[@]}" "$bl_suite"
+    _bl_step "$bl_name" '' "${bl_body_tip[@]}" "$bl_suite"; } \
+    | _yaml_sweep_wf "$loopfix/bl-spoof.yml"
+  # Two steps wearing the pinned name: the reader cannot say which Actions takes last, so an exact
+  # first copy must not launder a weakened second.
+  { _bl_step "$bl_name" '' "${bl_body[@]}" "$bl_suite"
+    _bl_step "$bl_name" '' "${bl_body_tip[@]}" "$bl_suite"; } \
+    | _yaml_sweep_wf "$loopfix/bl-duplicated.yml"
+  # No `suite=` terminator: the region has no end, so the extraction must refuse rather than run on
+  # into whatever follows and pin a silently different span.
+  _bl_step "$bl_name" '' "${bl_body[@]}" | _yaml_sweep_wf "$loopfix/bl-unterminated.yml"
+  chk "baseline check is FAITHFUL: the pinned block extracts from a fixture that carries it" \
+    "$(_pr_gate_selftest_baseline "$loopfix/bl-faithful.yml" | paste -sd'|' -)" "$expected_baseline"
+  local bl_fix bl_outcome=''
+  for bl_fix in bl-tip.yml bl-tip-retire.yml bl-derive-deleted.yml bl-guard-inert.yml \
+                bl-fallback-always.yml bl-mb-from-head.yml bl-head-guard-inert.yml \
+                bl-step-if-false.yml bl-spoof.yml bl-duplicated.yml \
+                bl-unterminated.yml absent.yml; do
+    if [[ "$(_pr_gate_selftest_baseline "$loopfix/$bl_fix" 2>/dev/null | paste -sd'|' -)" \
+          == "$expected_baseline" ]]; then bl_outcome+="$bl_fix:missed "
+    else bl_outcome+="$bl_fix:caught "; fi
+  done
+  chk "baseline check is NON-VACUOUS: every mutant that repoints, inerts or spoofs it is caught" \
+    "$bl_outcome" \
+    "bl-tip.yml:caught bl-tip-retire.yml:caught bl-derive-deleted.yml:caught bl-guard-inert.yml:caught bl-fallback-always.yml:caught bl-mb-from-head.yml:caught bl-head-guard-inert.yml:caught bl-step-if-false.yml:caught bl-spoof.yml:caught bl-duplicated.yml:caught bl-unterminated.yml:caught absent.yml:caught "
+
+  # ---- THE RULE, over a REAL git history. The block above pins WHERE the baseline comes from; this
+  # pins WHAT that choice decides, against the real `_derive_full_selftest_suite` and the real
+  # `git merge-base`. Row 1 is what makes rows 2-4 non-vacuous: the two candidate commits must
+  # genuinely disagree, or "the merge base accepts it" proves nothing. ----
+  local blrepo="$tmp/baseline-history" bl_man
+  git init -q -b main "$blrepo"
+  mkdir -p "$blrepo/scripts"
+  _blgit() { git -C "$blrepo" -c user.name=t -c user.email=t@example.invalid "$@"; }
+  # A REFUSAL IS NOT A VERDICT UNLESS IT NAMES ITS REASON. `_derive_full_selftest_suite` refuses for
+  # five distinct reasons, and the one this fix is about ("removed without prior approval") is the
+  # rarest; a fixture whose manifest and tree disagree refuses on "missing or lost its self-test
+  # entrypoint" instead and would record a FALSE KILL (pre-flight item 4). So these rows assert the
+  # MESSAGE, not merely the exit status -- caught while writing them, on exactly that mistake.
+  _bl_verdict() {  # -> `accepted`, or the refusal's own first line
+    local out
+    if out=$(_derive_full_selftest_suite "$@" 2>&1 >/dev/null); then printf 'accepted'
+    else printf '%s' "${out%%$'\n'*}"; fi
+  }
+  bl_man="$blrepo/scripts/selftest-suite.txt"
+  printf '%s\n' 'if "--self-test" in sys.argv: run_tests()' > "$blrepo/scripts/kept.py"
+  cp "$blrepo/scripts/kept.py" "$blrepo/scripts/retired.py"
+  printf '%s\n' kept.py retired.py > "$bl_man"
+  : > "$blrepo/scripts/selftest-retirements.txt"
+  _blgit add -A && _blgit commit -qm base0
+  # The PR branches HERE and never touches the manifest again.
+  _blgit switch -qc pr
+  _blgit switch -q main
+  # ...then the BASE BRANCH enrols a third entry, exactly as master did before #1777's round 3.
+  cp "$blrepo/scripts/kept.py" "$blrepo/scripts/added-later.py"
+  printf '%s\n' kept.py retired.py added-later.py > "$bl_man"
+  _blgit add -A && _blgit commit -qm base1
+  _blgit switch -q pr   # the graded tree: it never saw added-later.py at all
+  local bl_tip bl_mb bl_tipman="$tmp/bl-tip-manifest" bl_mbman="$tmp/bl-mb-manifest"
+  local bl_appr="$tmp/bl-approvals"
+  bl_tip=$(git -C "$blrepo" rev-parse main)
+  bl_mb=$(git -C "$blrepo" merge-base main HEAD)
+  chk "fixture: the graded tree's merge base is the branch point, NOT the moved tip" \
+    "$([[ "$bl_mb" == "$bl_tip" ]] && printf same || printf differs)" "differs"
+  git -C "$blrepo" show "$bl_tip:scripts/selftest-suite.txt" > "$bl_tipman"
+  git -C "$blrepo" show "$bl_mb:scripts/selftest-suite.txt" > "$bl_mbman"
+  : > "$bl_appr"
+  chk "baseline from the moving TIP false-refuses a PR that removed nothing (the #1777 red)" \
+    "$(_bl_verdict "$blrepo/scripts" "$bl_man" "$bl_tipman" "$bl_appr")" \
+    "suite entry added-later.py was removed without prior base-branch retirement approval"
+  chk "baseline from the MERGE BASE accepts that same PR" \
+    "$(_bl_verdict "$blrepo/scripts" "$bl_man" "$bl_mbman" "$bl_appr")" "accepted"
+  # NON-WEAKENING, the direction that decides whether this is a fix or a hole: the merge-base
+  # baseline must still refuse a removal this branch actually made. `retired.py` was enrolled BEFORE
+  # the branch point, so it is in the merge-base manifest and its retirement is still gated.
+  printf '%s\n' kept.py > "$bl_man"
+  rm "$blrepo/scripts/retired.py"
+  chk "the MERGE-BASE baseline still refuses an unapproved removal this branch made" \
+    "$(_bl_verdict "$blrepo/scripts" "$bl_man" "$bl_mbman" "$bl_appr")" \
+    "suite entry retired.py was removed without prior base-branch retirement approval"
+  printf '%s\n' retired.py > "$bl_appr"
+  chk "the MERGE-BASE baseline accepts that removal once it is approved on the baseline" \
+    "$(_bl_verdict "$blrepo/scripts" "$bl_man" "$bl_mbman" "$bl_appr")" "accepted"
 
   # ---- [PR #1865 r1] WHICH COMMIT'S MANIFEST, MEASURED ON THE REAL TOPOLOGY. The #1834 fixtures
   # far above drive the CLASSIFIER as a pure function and say nothing about which commit's manifest
