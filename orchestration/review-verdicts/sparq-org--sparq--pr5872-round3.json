@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5872,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "36dbb74c7a4def7208e116cf4b11f934daafaf45",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`npm_test_targets()` scans all of `rest` for `--workspaces`, `-ws`, and workspace selectors without stopping at npm's `--` delimiter. Thus `npm test -- --workspaces` returns `ALL_WORKSPACES`, even though `--workspaces` is passed to the test script and npm runs only the test selected by the effective working directory. Likewise, `npm run test -- --workspace packages/x` falsely credits `packages/x`. This is fail-open: a workflow can appear to execute every package test while executing only one.",
+    "file": "scripts/check-package-test-execution.py",
+    "fix_hint": "When parsing npm options, stop recognizing npm flags at the first standalone `--`; tokens after it are script arguments. Add negative tests showing `npm test -- --workspaces` targets only the current working directory and `npm run test -- --workspace packages/x` does not credit `packages/x`, while retaining positive tests for selectors before the delimiter.",
+    "severity": "major",
+    "title": "Script arguments after `--` are misread as npm workspace selectors"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The prior allowlist bypass is fixed with fail-closed validation and meaningful negative tests. However, the npm command parser now has a separate fail-open case: it continues interpreting tokens after npm's `--` argument delimiter as npm workspace flags. A workflow command that runs only its current package's test can therefore be credited as testing an arbitrary package or every workspace. Because this can silently satisfy the repo-wide invariant without executing those packages' tests, the change is not yet safe to approve. This is a new major finding, so progress is regressing under the required comparison scale.",
+  "verdict": "request_changes"
+ }
+}
