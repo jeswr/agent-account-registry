@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1897,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "70053570ef1370ec5de1bd9ef0ab89f0a09a2174",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The production-write-path self-test is sound and non-vacuous. It drives the live write seam through the process boundary, requires exactly three successful writes and a completed rescue, checks exact executed argv shapes (including the SHA-bound GraphQL relatch), excludes arm/admin/label hazards, and verifies minted-token propagation with GH_DEBUG scrubbed. It also directly pins return-code and stdout normalization. The non-zero disarm case verifies error propagation and no rescue booking; the pre-existing flow test independently pins marker/disarm/relatch failure sequencing. Cleanup restores subprocess.run and GH_DEBUG on all paths. No correctness, soundness, security, or test-validity defect is evident. Findings remain empty as in round 1.",
+  "verdict": "approve"
+ }
+}
