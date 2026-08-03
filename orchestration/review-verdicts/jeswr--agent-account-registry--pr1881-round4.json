@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1881,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "fded6e9f61ae4c705d1486f78ea3a67b2797b3e2",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4 derives the actual feasibility threshold as `nominal_lifetime > 90 min + (pre-flight \u2192 container start)`, but line 35 says only a lifetime under approximately 90 minutes requires abandonment and the outcome table marks `~90 min \u2013 2 h` viable. At 90 minutes, or slightly above it but below 90 minutes plus the measured startup margin, a maximum-length worker necessarily expires before completion. The decision table therefore remains weaker than the formula immediately above it and can authorize a liveness regression.",
+    "file": "research/1676-anthropic-short-lived-credential-feasibility.md",
+    "fix_hint": "Use one measurable threshold everywhere. Define the required minimum as 90 minutes plus a conservatively measured or explicitly bounded pre-flight-to-container-start margin; abandon at or below that threshold, and begin the viable middle band only above it. If the margin is not known, add it to the gating measurement and keep feasibility unresolved rather than approximating it away.",
+    "severity": "major",
+    "title": "Lifetime outcome table still drops the required pre-flight margin"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-3 major remains unresolved. Section 4 still states the correct requirement as `nominal_lifetime > 90 min + (pre-flight \u2192 container start)`, while the opening verdict abandons only a lifetime under approximately 90 minutes and the outcome table still labels `~90 min \u2013 2 h` viable. A token at 90 minutes, or slightly above it but below 90 minutes plus the startup margin, cannot survive a maximum-length run. Because this table is the binding measurement-to-decision seam, it can still incorrectly authorize increment 2. Progress is stagnant because the same finding remains at the same severity.",
+  "verdict": "request_changes"
+ }
+}
