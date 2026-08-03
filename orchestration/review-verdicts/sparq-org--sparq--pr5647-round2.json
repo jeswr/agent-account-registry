@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5647,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "35c40c698624ecad7d4f673da459613935c7060e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior major findings. The workflow scanner now covers both .yml and .yaml files and exercises the positive and prose-only paths with controlled fixtures for each extension. The applied-state rule now maps exactly to APPROVED_TARGET, and focused tests reject baseline, adjacent, and arbitrary off-target values while preserving the baseline for blocked and unblocked states. The repository-facing coupling test consumes that exact helper, the marker remains tied to the rendered table, and CI wiring is pinned. No correctness, soundness, test-validity, or security issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
