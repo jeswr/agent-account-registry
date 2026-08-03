@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1744,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c7283eeebbb28fa3edf54b14bf73750d9df29e1b",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The #1121 regression test exercises the real run_sweep terminal-reap path at the load-bearing fresh-read boundary. Its three cases keep the expired lease and empty listing fixed while varying only the direct issue response: an open, non-terminal issue retains its claim, while a true absence and a closed response release it. The assertion checks both the reclaimed count and exact released-claim set, and exceptions become mismatching values rather than aborting the remaining checks. This non-vacuously pins both the fresh-read result and the open-state predicate without changing production behavior or weakening a trust check. The accompanying rationale accurately scopes the oldest-first pagination residual and the direct-read safety boundary. No correctness, soundness, security, or test-validity defect is evident. With no findings in either round 5 or round 6, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
