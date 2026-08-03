@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1881,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "46c56c81e106b9c1fe80335dcb5080dd206067f8",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new \u00a79 item 4 summary calls #1676 qualified yes, gated on \"one offline lifetime measurement that can end the increment.\" The linked record now correctly says the opposite: M1a is only an offline residual lower bound and explicitly \"can confirm but never kill\"; if it is inconclusive, only the networked forced-refresh M1b can establish nominal lifetime and end the increment on a short result. M1b also depends on M3. This is not merely wording: readers following the parent record can treat an inconclusive offline observation as a negative gate result, bypassing the revised authorization, isolation, and redaction constraints for the actual measurement.",
+    "file": "research/249-model-container-egress.md",
+    "fix_hint": "Replace the ANSWERED summary with the actual gate: an offline residual-lifetime bound may confirm feasibility; otherwise M3 and a human-authorized networked forced-refresh measurement are required, and feasibility remains unresolved if that measurement is not authorized. Keep the short summary consistent with \u00a74 and \u00a76 of the linked record.",
+    "severity": "major",
+    "title": "Parent record still says the offline lifetime measurement can end the increment"
+   }
+  ],
+  "progress": "improving",
+  "summary": "The two prior major findings are substantially addressed in the new feasibility record: option (a) now names the exact claude-credentials-json dispatch arm and its one-line input contract, and M1 is honestly split into an offline residual bound and a networked forced-refresh measurement. However, the parent record's binding ANSWERED summary still says that an offline lifetime measurement can end the increment. That directly contradicts the revised record, where M1a can only confirm feasibility and can never kill it; an inconclusive M1a requires the networked M1b (after M3). Because this summary is the entry point that tells implementers what gates increment 2, the stale statement preserves the prior safety/environment error at a consequential seam. Progress is improving because one prior major is resolved and the remaining issue is localized.",
+  "verdict": "request_changes"
+ }
+}
