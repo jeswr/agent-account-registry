@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1770,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ae2caaa499c53b30baceb03fb359a4219d2899a4",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-4 diff remains correct and complete. The added self-tests exercise the production provider-capped scan with literal, distinct expectations and cover both outcomes of the enabled-account filter: an all-enabled-capped firing action and a partial-enabled-capped non-firing action. They independently pin the fire decision, enabled-only churn count, and reset hint, and the hostile non-enabled reset makes removal or bypass of the filter observable. Expectations are not derived from production constants or fixture transformations. The change is test-only, weakens no trust control, exposes no sensitive data, and contains no instruction-like injection. There are no review findings.",
+  "verdict": "approve"
+ }
+}
