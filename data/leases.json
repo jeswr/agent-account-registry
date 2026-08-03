@@ -42,16 +42,6 @@
   },
   {
    "account": "58b7c92faa5b5ca5",
-   "claim_id": "54c81cc17f5843b396cf98e074de994e",
-   "holder": "jeswr/agent-account-registry#1560@30783418892.1",
-   "package": "dashboard",
-   "role": "site",
-   "model": "opus5",
-   "issued_at": 1785729931,
-   "expires_at": 1785732631
-  },
-  {
-   "account": "58b7c92faa5b5ca5",
    "claim_id": "9d01c56bd86f43a59ee3fb2da05ac262",
    "holder": "fix:jeswr/agent-account-registry#1848@dispatch-30783179624.1",
    "package": "workflows",
