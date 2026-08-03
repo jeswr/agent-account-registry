@@ -403,8 +403,17 @@ must be recorded (as a comment at the implementation site or an appendix here) r
 4. **Feasibility: can the anthropic lane carry a short-lived credential at all?** (§5.E) — the
    provisioning question that gates increment 2. Filed as research, not implementation.
    **ANSWERED** (#1676): [`research/1676-anthropic-short-lived-credential-feasibility.md`](1676-anthropic-short-lived-credential-feasibility.md)
-   — qualified yes, gated on one offline lifetime measurement that can end the increment, and
-   costing an all-at-once re-recording of every anthropic account.
+   — qualified yes, costing an all-at-once re-recording of every anthropic account, and gated on a
+   lifetime measurement of which only the *bounding* half is offline. Do not read that gate as
+   "one offline measurement decides it" (§4, §6 of the linked record): the offline half (M1a, a
+   residual lower bound) can **confirm** feasibility but can never kill it, and an inconclusive M1a
+   is not a negative result. Establishing the nominal lifetime — the outcome that can end the
+   increment — then requires the **networked** forced-refresh measurement M1b, which is
+   human-authorized, runs only against a throwaway registry-owned isolated-`HOME` login, records
+   derived integers plus an `accessToken` digest and no token value, and therefore depends on M3
+   landing first. **If that measurement is not authorized, the nominal lifetime is unknown,
+   feasibility is unresolved, and increment 2 does not start** — an assumed lifetime is not a
+   substitute.
 
 Option B is deliberately **not** filed (§5.B): its preconditions are unmeasured, and 1a measures
 them.
