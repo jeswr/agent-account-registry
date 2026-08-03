@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5881,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d0b28fbd19901337fe55cfe0c1f4773d7f4936de",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly makes the executable test harness fail explicitly when its real jq dependency is unavailable, preventing missing jq from masquerading as a workflow credential-guard regression. The precondition is invoked before harness setup, names the missing dependency, and the added tests cover both failure messaging and consistency between the declared dependency list and the extracted ring scripts. No correctness, security, or test-validity defect requiring changes was found.",
+  "verdict": "approve"
+ }
+}
