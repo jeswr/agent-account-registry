@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2010,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "068f9277f7f58b260d5579660e27d1faf74f73de",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe diff changes comments only. The expanded commentary accurately distinguishes the census-reason assertion from the paired injected-clock assertion, identifies their separate non-vacuity properties, and does not alter executable behavior or weaken any trust-plane control or test. The legacy model-qualified marker is correctly migrated to the model-agnostic [SPARQ agent] marker. No blocking correctness, soundness, test-validity, or security issue is present.",
+  "verdict": "approve"
+ }
+}
