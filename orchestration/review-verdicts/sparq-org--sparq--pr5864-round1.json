@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5864,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e0a6e470ead3137d65e811ce5d852ba056805bbb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [
+   {
+    "body": "The merge-group-doorbell pattern and both `macos-15-intel` patterns omit `$`, despite the file's rule that waivers use an anchored message. Because these regexes can match a prefix, they may also silence a later, more specific diagnostic whose text starts the same way. That weakens the intended exact false-positive waiver boundary and makes future actionlint changes easier to hide.",
+    "file": ".github/actionlint.yaml",
+    "fix_hint": "Add `$` to the merge-group-doorbell expression and to each `macos-15-intel` expression, then verify each waiver is load-bearing by running actionlint with and without that exact entry. Keep escaping compatible with YAML single-quoted strings.",
+    "severity": "major",
+    "title": "Three ignore regexes are not fully anchored"
+   }
+  ],
+  "progress": null,
+  "summary": "The configuration is narrowly path-scoped, but three waiver patterns contradict the file's stated exact-and-anchored policy: they lack an end anchor and can suppress future diagnostics that merely begin with the currently known message. This is material for a supply-chain lint waiver file, especially because actionlint does not validate whether these patterns remain appropriately narrow. The diff also contains imperative instructions to run commands, so injection_detected is true under the supplied review protocol.",
+  "verdict": "request_changes"
+ }
+}
