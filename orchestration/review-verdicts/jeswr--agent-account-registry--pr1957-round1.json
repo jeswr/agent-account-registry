@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1957,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e73fe7da8527582bf41497707e612df5a61cb0b1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`workerRow` marks the no-change metric bad when any firing classification merely contains `no-change`. This accepts unrelated or malformed values such as `not-no-change`, and it also prevents classification names from remaining a closed, auditable contract between `metrics.py` and the dashboard. The alert's target is matched exactly, but its rule identity is not. The new executed tests demonstrate the intended `worker-no-change` case but provide no near-match control, so this weakening would remain green.",
+    "file": "dashboard/app.js",
+    "fix_hint": "Define the complete intended classification name (for example `worker-no-change`) and use `firing.has(...)`, then add a firing alert for the same target with a near-match classification that contains `no-change` and assert that it does not apply the bad tone.",
+    "severity": "major",
+    "title": "No-change tone uses a substring instead of an exact classification"
+   }
+  ],
+  "progress": null,
+  "summary": "The worker-health rendering is exercised through its production call site and covers null, zero, recovery, per-target isolation, truncation, and the DOM shim ordering. However, the no-change alarm tone is not bound to an exact alert classification: an arbitrary classification containing `no-change` is treated as authoritative. That can falsely mark a target unhealthy and makes the consumer silently accept future or malformed classifications. The tests only cover the intended `worker-no-change` spelling, so they do not detect this over-broad match.",
+  "verdict": "request_changes"
+ }
+}
