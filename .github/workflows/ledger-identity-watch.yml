@@ -1,0 +1,95 @@
+# [SPARQ agent] STANDING detector: the published `ledger` branch has not re-acquired a raw account
+# identity (registry #1092).
+#
+# #212 stopped the writers emitting raw handles and #536 added `scripts/ledger-history-purge.py`,
+# whose `scan` walks every reachable ledger commit in about a second with no token and no `gh`.
+# Nothing ran it on a schedule, so after the one-shot purge a regression — a new writer that skips
+# `account_fingerprint`, a hand-edited snapshot, a restored old branch — would sit PUBLISHED until
+# somebody thought to look. A one-shot purge is a point measurement; this is the standing one.
+#
+# ⚠️ ORDERING — AND WHY THERE IS NO `schedule:` YET. The scanner is
+# `scripts/ledger-history-purge.py`, which lands with #536 and is NOT on the default branch. A
+# runtime tick without it reports `unverified`, correctly and by design: "could not measure" is an
+# alert here, never a pass, because a detector that reads its own absence as health is the exact
+# failure this lane exists to prevent. But that runtime polarity is not a licence to ENABLE the
+# cron early. A daily tick that can only ever refuse would upsert one permanently-open alert that
+# no maintainer action can clear — a standing false alarm on the `ops-alert` channel, which trains
+# an operator to ignore this lane, rather than the standing measurement #1092 asks for. So the cron
+# is coupled to the scanner's presence and the coupling is ASSERTED, not merely written here:
+# `ledger-identity-watch.py --self-test` reds if a `schedule:` appears while the scanner is absent
+# from the checkout. `workflow_dispatch` stays, so a maintainer can take the measurement — or read
+# the honest `unverified` — on demand today; adding the cron is the one-line follow-up that lands
+# once the scanner is on the default branch.
+#
+# ⚠️ IT IS ITS OWN WORKFLOW FILE ON PURPOSE, following park-stock-alert.yml's standing
+# recommendation from registry #1566: a NEW workflow has ZERO blast radius on existing lanes. If
+# GitHub declines to ingest THIS file, only this detector stops and every other lane is untouched.
+# Hanging it off a ledger-touching lane (dashboard/groom) would also make it invisible on exactly
+# the ticks that lane is failing.
+#
+# ⚠️ `fetch-depth: 0` BELOW IS LOAD-BEARING. `actions/checkout` defaults to a ONE-COMMIT clone, and
+# a scan of a truncated history calls every commit it cannot reach clean — so losing that line
+# would make this lane report a green ledger forever. The script refuses a shallow clone at
+# runtime (`git rev-parse --is-shallow-repository`) and pins the value here in its self-test; the
+# value is `0`, which is FALSY, so a truthiness check would have accepted its deletion.
+#
+# AUTHORITY. `contents: read` is all the scan itself needs — it is a pure read of the branch's own
+# history. `issues: write` is the ALERT TRANSPORT only: the script may create/edit/comment/close
+# exactly ONE `ops-alert` issue and nothing else, which its self-test enforces off the AST. No
+# pull-request, actions, or arming surface is granted.
+#
+# THE PUBLIC SINK. This repo's Actions log and its issues are public. The scanner's report is
+# counts plus object SHAs, with handles counted and never named, so it is safe here; the scanner's
+# stderr has no such contract and is never read.
+name: ledger-identity-watch
+
+on:
+  # The cadence this lane is BUILT for, and takes once the scanner is on the default branch, is
+  # daily off the top of the hour (`schedule: - cron: "23 5 * * *"`): it watches a STOCK (the state
+  # of a published branch), not a run, so a slow cadence loses nothing — a regression stays
+  # detectable until it is fixed. It is not declared yet; see the ORDERING note in the header.
+  workflow_dispatch: {}
+
+permissions:
+  contents: read   # clone the control plane + the ledger branch's full history
+  issues: write    # create/edit/comment/close exactly ONE `ops-alert` issue
+
+# Singleton: an overlapping fire (two manual kicks today; a cron plus a kick after a purge once the
+# schedule is enabled) would race two writers onto the same upserted alert issue and could
+# duplicate it. cancel-in-progress:false so a live run finishes its upsert rather than leaving the
+# alert half-written.
+concurrency:
+  group: ledger-identity-watch-singleton
+  cancel-in-progress: false
+
+jobs:
+  # No `needs:` and no `if:`, on purpose and asserted by the script's self-test over the parsed
+  # YAML: there is no upstream job whose failure may suppress the detector.
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REGISTRY_REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      MAINTAINER_HANDLE: jeswr
+    steps:
+      - name: Checkout the control plane (the watcher and the scanner)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Self-test the ledger identity watch (hermetic fixtures, no network)
+        run: python3 scripts/ledger-identity-watch.py --self-test
+
+      # The FULL history is the subject of the measurement, not an optimisation to trim.
+      - name: Checkout the data-plane ledger branch, FULL history (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: ledger
+          ref: ledger
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Assert the ledger branch carries no raw account identity
+        run: python3 scripts/ledger-identity-watch.py --repo ledger --ref ledger
