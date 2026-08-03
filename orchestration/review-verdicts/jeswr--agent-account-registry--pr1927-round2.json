@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1927,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9589bf4ffb54f38aa0659a304c62d1fe322136ac",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_model_container_binds` extracts only lines matching `type=bind,[^\"]*`. Docker also accepts bind mounts as `--volume host:container` or `-v host:container`. Adding `--volume \"$SCRIPT_DIR/..:/registry\"` to the existing `container` array mounts the writable registry checkout into the model, yet `_model_container_binds` still prints the same four expected records and the `container+=(` count remains one, so every new #300 containment row stays green. The model can then rewrite the registry script that the later PAT-bearing write-back step executes. Thus the asserted exact filesystem view is not exact and the headline PAT containment can fail silently.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Reject every unrecognized Docker mount/volume form in the launcher, or structurally parse and normalize both `--mount` and `--volume`/`-v` arguments before comparing the complete set. Add a non-crashing mutant that inserts a writable registry checkout with `--volume` (and preferably short `-v`) and require the containment assertion to catch it. Keep the expected mount set independent of the extractor.",
+    "severity": "blocker",
+    "title": "Exact mount-set assertion ignores Docker volume bind syntax"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-1 blocker is fixed: `_pat_binding_scopes` distinguishes step scope from outer YAML scope, and the added job-level and `$GITHUB_ENV` mutants demonstrate that those unsafe early bindings are refused. However, the other half of the headline containment remains unsound. `_model_container_binds` calls its result the model's exact filesystem view but recognizes only Docker `--mount` arguments containing `type=bind`; an ordinary `--volume`/`-v` bind can expose the registry checkout without changing any asserted output or the indirect-append count. Because that checkout is later executed with `REGISTRY_SECRETS_PAT`, this bypass defeats the trust property the new check is meant to enforce. A new blocker remains, so under the required round-comparison scale progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
