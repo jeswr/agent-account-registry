@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5891,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "930e669f694c7b83fba7350f69434bfa1ffbcbc6",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding. The producer now measures completion from each incremental outcomes.json against the adjacent mutants.json planned set, records that evidence in the per-leg status artifact, and the reporter fails closed when completeness is false or absent. The integration-shaped tests exercise the exact formerly-missed path: a successful Actions job, nonzero cargo-mutants exit, well-formed partial outcomes.json, non-failing ratchet check, and a truncated planned-vs-finished count; they verify the leg is failed and its crate is unseedable. Negative controls preserve completed sweeps and surviving-mutant exits as valid verdicts, and a drift test compares the implementation with mutants-gate.py on the same artifact. No correctness, soundness, test-validity, or security issue remains in the diff-scoped change.",
+  "verdict": "approve"
+ }
+}
