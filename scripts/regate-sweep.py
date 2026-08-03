@@ -2364,10 +2364,22 @@ def _test_entry_point(chk):
                 "repair's lookback window the same board is inert and censused, not moved",
                 gh_stale.updated(), [])
 
-            # THE OTHER DIRECTION OF THE SAME SEAM, and the one that makes every "nothing moved"
-            # assertion in this section non-vacuous: the ONLY difference from the sweep above is
-            # the instant `main` is handed, so a `main` that ignored `clock` (or read the wall
-            # clock alongside it) would move #903 here and go red — no matter what day it is run.
+            # THE OTHER DIRECTION OF THE SAME SEAM: the ONLY difference from the sweep above is the
+            # instant `main` is handed, and this row additionally asserts the tick SAYS WHY it moved
+            # nobody rather than merely writing nothing.
+            #
+            # ⚠️ NOT A DUPLICATE of the `gh_now`/`gh_expired` row below, and neither subsumes the
+            # other — measured, the two kill DIFFERENT mutants, so pruning either one as redundant
+            # deletes real coverage (#1269). THIS block is the sole guard on the census REASON at
+            # the `main()` seam: drop `skipped={reason}` from `repair_census_line` and this row is
+            # the ONLY red in the suite (1 red with this block, 0 without it). The Sweeper-level
+            # row that compares a whole census line cannot see that mutant — its expected value is
+            # built by the same formatter, so both sides move together (AGENTS.md item 2b).
+            # What this block does NOT kill is the unwired-clock mutant named below: it asserts only
+            # the NEGATIVE direction, so once real time is past the fixture's window an unwired
+            # `main()` reads a wall clock that is outside the lookback too, and this row — like
+            # `stale` above — goes VACUOUSLY green. Measured: removing it leaves that mutant's red
+            # count unchanged.
             aged = NOW + int(REPAIR_LOOKBACK_HOURS * 3600) + 60
             gh_aged, _ = _fixture(comments={903: [spoof]})
             aged_log = _capturing(lambda: _main_total(
@@ -2385,7 +2397,7 @@ def _test_entry_point(chk):
             chk("entry point: and OUR OWN marker read through main() does suppress the move",
                 gh2.updated(), [])
 
-            # [OPUS-5] THE CLOCK IS WIRED, and this is why it has to be. Every other Sweeper in
+            # [SPARQ agent] THE CLOCK IS WIRED, and this is why it has to be. Every other Sweeper in
             # this suite is built with `clock=lambda: NOW`; the ones `main()` built were not, so
             # every assertion above compared REPAIR_DETAIL's fixed `merged_at` against the REAL wall
             # clock. That stamp is 24h + 3min before the lookback expires, so the block passed for
@@ -2393,9 +2405,21 @@ def _test_entry_point(chk):
             # merge lock authored by a test, firing at a time nobody chose and correlating with no
             # change. A suite that cannot be re-run tomorrow and get the same answer is not a suite.
             #
-            # This row is the guard on the wiring itself: same fixture, same argv, only the injected
-            # clock moved past the lookback. Drop `clock=clock` from main()'s Sweeper construction
-            # and the far-future call falls back to the real clock and sweeps [903] — red.
+            # This row is the guard on the WIRING itself, and the ⚠️ NOT-A-DUPLICATE of the `aged`
+            # row above (#1269): same fixture, same argv, only the injected clock moved past the
+            # lookback. The mutant it kills is the UNWIRED CLOCK — drop `clock=clock` from
+            # `main()`'s Sweeper construction — and it is the only row here that reds on ANY day,
+            # because it asserts a PAIR of opposite outcomes from one injected clock: unwired, the
+            # pair disagrees whichever side of the fixture's window the real clock is on ([] where
+            # [903] is required once real time is past it, [903] where [] is required before that).
+            # It does NOT kill the census-reason mutant the `aged` row above owns.
+            # ⚠️ Delete this block and that mutant loses its only day-independent red: the
+            # negative-direction rows above (`stale`, `aged`) are then satisfied VACUOUSLY and what
+            # is left is collateral — measured 2026-08-03, three rows (the `--bot-slug` row, the
+            # dry-run census row, the $APP_SLUG control) that red only because real time is now past
+            # the fixture's lookback. That is the decay this clock exists to remove; those rows go
+            # green again on a run inside the window, so they are not a reliable kill and must not
+            # be counted as coverage.
             gh_now, _ = _fixture()
             _main_total(chk, ["--repo", repo, "--repairs-file", path, "--bot-slug", BOT_SLUG,
                               "--apply"], runner=gh_now, clock=lambda: NOW)
