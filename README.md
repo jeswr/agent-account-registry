@@ -661,6 +661,11 @@ Claude-Code-shaped fable probe for fable-capable accounts and merges `fable_ok` 
 into the usage map; `usage_eligible(u, margin, model="fable")` then requires that bucket to have headroom
 **in addition to** the whole-account 5h/7d windows. Fail-closed: a rejected/absent fable probe makes the
 account ineligible for **fable** only — its base signal still admits it for non-fable models.
+**Retired 2026-07-26** (#720 Stage A item 3): `fable` is on the shared deprecation register
+(`scripts/deprecated_models.py`), so that second probe is **no longer issued** — a catalog row still
+listing the legacy alias pays no request for it, and lands in the same fail-closed FABLE state a
+rejected probe already produced. The probe and its classifier are kept behind a register read, so
+un-retiring the alias restores them without a code change.
 
 **Prioritisation policy** (wired into `choose_account`): among eligible accounts prefer `status=allowed`
 with the **soonest whole-account `7d_reset`** (use-it-or-lose-it). Accounts without that weekly reset

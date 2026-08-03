@@ -25,15 +25,19 @@
 # Claude-Code-shaped fable probe whose 7d_oi headroom gates fable-model routing specifically. If that probe
 # is rejected or returns no 7d_oi headers, the account is fail-closed for FABLE only (its 5h/7d base signal
 # from the haiku probe still governs non-fable routing).
+# RETIRED 2026-07-26 (#720 Stage A item 3): `fable` is on the SHARED deprecation register, so that
+# second probe is no longer ISSUED — a catalog row still carrying the legacy alias pays nothing for
+# it. Not issuing it lands in exactly the fail-closed FABLE state a rejected probe already produced
+# (the sub-quota fields are absent), and un-retiring the alias in `deprecated_models.py` restores
+# the probe without a code change here. See `_retired_aliases`.
 #
 # [#1644] OBSERVATION LANE (design record research/720-opus5-premium-quota-gating.md, Stage A): an
 # anthropic entry ALSO carries a namespaced, UNREAD carry-through of every parsed rate-limit header
 # (`raw_hdr_*`), plus — for accounts whose catalog `models` lists `opus5` — the outcome and headers
-# of a third probe addressed to `claude-opus-5` itself (`opus5_probe`, `opus5_raw_hdr_*`). Nothing
+# of a probe addressed to `claude-opus-5` itself (`opus5_probe`, `opus5_raw_hdr_*`). Nothing
 # downstream reads any of it, and Stage A is exactly the change that emits nothing readable: see the
 # OBSERVATION blocks at `_raw_header_fields` and `_assemble_opus5` for why gating a SOLE-tier
-# premium bucket before it has ever been observed is a fleet outage rather than a safeguard, and for
-# what the extra probe costs.
+# premium bucket before it has ever been observed is a fleet outage rather than a safeguard.
 import contextlib
 import importlib.util
 import io
@@ -243,9 +247,40 @@ def _probe_fable(token):
     (rejected/gated/no or unparseable 7d_oi header) so the caller fail-closes FABLE routing for the
     account. Absence of the extra probe (or a None result) never blocks non-fable routing, which the base
     5h/7d signal governs on its own. Classification is delegated to the pure `_assemble_fable` so shape
-    drift is caught by the self-test."""
+    drift is caught by the self-test.
+
+    NOT CALLED while the `fable` alias is retired — `_probe_account` gates the call on the shared
+    deprecation register (#720 Stage A item 3). Kept, with its classifier, because the gate is a
+    register read rather than a deletion: un-retiring the alias must restore this path in one
+    place, not require re-deriving a probe shape from the header note at the top of this file."""
     hdr = _probe_headers(token, "claude-fable-5", claude_code=True)
     return _assemble_fable(hdr)
+
+
+FABLE_ALIAS = "fable"          # the catalog `models` entry that selects the fable sub-quota probe
+
+
+def _retired_aliases(path=None):
+    """The SHARED deprecation register's retired-alias set (`scripts/deprecated_models.py`),
+    IMPORTED rather than restated — two hand-maintained copies of a deprecation list is exactly how
+    a retired model returns in one of them (the `_retired_aliases` idiom at select-and-claim.py).
+
+    FAIL DIRECTION: an unreadable or broken register reads as "the fable alias IS retired", i.e.
+    skip the probe. Skipping only ever WITHDRAWS a signal — the sub-quota fields are then absent and
+    select-and-claim._fable_eligible fail-closes FABLE routing, exactly as a rejected probe already
+    did — whereas raising out of here kills the whole sweep, the workflow writes '{}', and EVERY
+    account in the fleet fail-closes. Fail toward the smaller blast radius. `path` is injectable for
+    the self-test ONLY, which is what executes the except branch."""
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "registry_deprecated_models",
+            path or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "deprecated_models.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return frozenset(module.DEPRECATED_ALIASES)
+    except Exception:
+        return frozenset((FABLE_ALIAS,))
 
 
 # --- [SPARQ agent] CLAUDE-OPUS-5 OBSERVATION PROBE (registry #1644, #720 Stage A item 2) ----------
@@ -264,14 +299,15 @@ def _probe_fable(token):
 # and machine-park every escalate-tier issue at once — indistinguishable from the exhaustion it was
 # built to prevent. Gating is Stage B, after at least one full weekly window of this data.
 #
-# COST, stated because it is real (#720 §5 row 4): every probe is a live `max_tokens:1` request, so
-# an account whose catalog `models` still lists `fable` alongside `opus5` now costs THREE requests
-# per tick, against the sole remaining anthropic tier — quota spent to measure quota. The
-# measurement is SELF-PRICING rather than self-reported: this probe runs last, so its own response
-# carries the whole-account windows AFTER the tick's earlier probes, and differencing
+# COST, stated because it is real (#720 §5 row 4): every probe is a live `max_tokens:1` request
+# against the sole remaining anthropic tier — quota spent to measure quota. It is PAID FOR by
+# retiring the now-dead `fable` probe in the same change (#720 §7 Stage A item 3), so an account
+# whose catalog `models` still lists the legacy alias alongside `opus5` costs TWO requests per tick,
+# not three: the base probe plus this one, the same count it paid before. The measurement is also
+# SELF-PRICING rather than self-reported: this probe runs last, so its own response carries the
+# whole-account windows AFTER the tick's earlier probes, and differencing
 # `opus5_raw_hdr_5h-utilization` against the entry's `5h_util` prices a tick's probing directly, per
-# account, with no extra request and no counter to maintain. Retiring the now-dead `fable` probe
-# (#720 §7 Stage A item 3) is the reduction; it changes behaviour, so it is deliberately not here.
+# account, with no extra request and no counter to maintain.
 OPUS5_MODEL = "claude-opus-5"
 OPUS5_ALIAS = "opus5"                      # the catalog `models` entry that selects this probe
 OPUS5_RAW_PREFIX = "opus5_raw_hdr_"        # namespaced apart from the base probe's carry-through
@@ -421,15 +457,16 @@ def _is_exempt_provider(provider):
 REACHABILITY_UNPROVEN = "unproven"
 
 
-def _probe_account(account, secrets, probe=None, fable_probe=None, opus5_probe=None):
+def _probe_account(account, secrets, probe=None, fable_probe=None, opus5_probe=None,
+                   retired_aliases=None):
     """Probed usage entry for ONE non-exempt account, or None (fail-closed omit). The provider
     MUST normalize to `anthropic` BEFORE the secret is even dereferenced (cross-provider review
     r3 finding 3): the probe below is addressed to the Anthropic API, so a missing, misspelled,
     or unknown provider (e.g. `openia`) previously TRANSMITTED that account's token to a provider
     the catalog never named — and admitted the account on the response. Unknown providers now
     never reach a probe; the omitted entry surfaces as UNAVAILABLE in usage-alert (loud), like
-    every other fail-closed omit. `probe`/`fable_probe`/`opus5_probe` are injectable for the
-    self-test ONLY."""
+    every other fail-closed omit. `probe`/`fable_probe`/`opus5_probe`/`retired_aliases` are
+    injectable for the self-test ONLY."""
     if str(account.get("provider") or "").strip().lower() != "anthropic":
         return None
     ref = account.get("secret_ref")
@@ -458,7 +495,16 @@ def _probe_account(account, secrets, probe=None, fable_probe=None, opus5_probe=N
     # [FABLE-5] Only fable-capable accounts need the extra Claude-Code-shaped fable probe. A missing
     # or failed fable probe leaves the fable sub-quota fields absent -> usage_eligible fail-closes FABLE
     # routing for this account, while its base 5h/7d signal still admits it for non-fable models.
-    if "fable" in models:
+    # [#720 Stage A item 3] ... and the probe is NOT ISSUED while the alias is retired: it is a live
+    # `max_tokens:1` request addressed to `claude-fable-5`, a model retired on 2026-07-26, charged
+    # per account per tick against the sole remaining tier for a field no reachable route reads
+    # (select-and-claim's premium arm is unreachable — `assert_no_deprecated` rejects any chain
+    # naming fable). Not issuing it withdraws a signal and can never grant one: the absent sub-quota
+    # fields are the same fail-closed FABLE state a rejected probe produced. The gate is a READ of
+    # the shared register rather than a deleted call, so un-retiring the alias restores the probe in
+    # one place — and the register is only loaded for a row that still carries the legacy alias.
+    if FABLE_ALIAS in models and FABLE_ALIAS not in (
+            _retired_aliases() if retired_aliases is None else retired_aliases):
         fable = (fable_probe or _probe_fable)(token)
         if fable is not None:
             probed.update(fable)
@@ -1343,10 +1389,32 @@ def _self_test(escaped=None):
     chk("anthropic account still probes (normalized match)", (got or {}).get("status"), "allowed")
     chk("non-fable account probes exactly once", probe_calls, ["tok"])
     probe_calls.clear()
+    #   [#720 Stage A item 3] the fable sub-quota probe is RETIRED with its alias. A row that still
+    #   carries the legacy alias must not pay a live max_tokens:1 request for `claude-fable-5`, and
+    #   this row runs against the REAL register (no `retired_aliases=` injection) so it is the live
+    #   path that is measured. Deleting the gate reds it.
     _probe_account({"handle": "acct01", "provider": "anthropic", "secret_ref": "ACCT01_TOKEN",
                     "models": ["fable"]}, stub_secrets, probe=_rec_probe, fable_probe=_rec_probe)
-    chk("fable account gets the second (fable) probe", probe_calls, ["tok", "tok"])
+    chk("a retired-alias fable row is NOT charged the second probe", probe_calls, ["tok"])
     probe_calls.clear()
+    #   ... and the gate is the REGISTER, not a deleted call: with `fable` absent from the retired
+    #   set the second probe is issued again, unchanged. Without this row the previous one is also
+    #   satisfied by ripping the fable path out, which would silently drop the sub-quota classifier
+    #   the moment the alias is un-retired.
+    _probe_account({"handle": "acct01", "provider": "anthropic", "secret_ref": "ACCT01_TOKEN",
+                    "models": ["fable"]}, stub_secrets, probe=_rec_probe, fable_probe=_rec_probe,
+                   retired_aliases=frozenset())
+    chk("an UN-retired fable alias still gets the second (fable) probe", probe_calls,
+        ["tok", "tok"])
+    probe_calls.clear()
+    #   the register read itself: the live answer comes from deprecated_models (asserted for parity
+    #   further down), and an UNREADABLE register reads as retired — skipping a probe withdraws a
+    #   signal, while raising here would kill the sweep and fail-close every account in the fleet.
+    chk("the live register reports fable retired and opus5 live",
+        (FABLE_ALIAS in _retired_aliases(), OPUS5_ALIAS in _retired_aliases()), (True, False))
+    chk("an unreadable deprecation register reads as RETIRED (skip), never raises",
+        _retired_aliases(path=os.path.join(script_dir, "no-such-deprecation-register.py")),
+        frozenset({"fable"}))
     chk("non-worker secret_ref still never dereferenced/probed",
         (_probe_account({"handle": "acct01", "provider": "anthropic",
                          "secret_ref": "REGISTRY_ADMIN_APP_KEY"},
@@ -1407,16 +1475,18 @@ def _self_test(escaped=None):
                    fable_probe=_rec_probe, opus5_probe=_rec_opus5)
     chk("a non-opus5 account never pays for the observation probe",
         (probe_calls, opus5_calls), (["tok"], []))
-    #   THE COST, measured: a row still carrying the retired `fable` alias alongside `opus5` now
-    #   costs THREE live requests per tick. Retiring the dead fable probe is #720 Stage A item 3 and
-    #   is a behaviour change deliberately outside this observation-only lane.
+    #   THE COST, measured (#720 §5 row 4): the observation request is PAID FOR by retiring the dead
+    #   fable probe in the same change (Stage A item 3), so a row still carrying the legacy `fable`
+    #   alias alongside `opus5` costs TWO live requests per tick — base + observation — the same
+    #   count it paid before. Run against the REAL register: dropping the Stage A item 3 gate reds
+    #   this row at 3, and dropping the observation probe reds it at 1.
     probe_calls.clear()
     opus5_calls.clear()
     _probe_account(_anthropic_row(["fable", "opus5"]), stub_secrets, probe=_rec_probe,
                    fable_probe=_rec_probe, opus5_probe=_rec_opus5)
-    chk("cost: a fable+opus5 catalog row now costs THREE probes per account per tick",
+    chk("cost: a legacy-fable + opus5 catalog row costs TWO probes per account per tick",
         (len(probe_calls) + len(opus5_calls), probe_calls, opus5_calls),
-        (3, ["tok", "tok"], ["tok"]))
+        (2, ["tok"], ["tok"]))
     #   a FAILED observation must never omit the account or move its base signal: this lane renders
     #   no verdict, so its failure is DATA. Flipping it fail-closed is #720 §4's fleet outage.
     probe_calls.clear()
@@ -1484,6 +1554,12 @@ def _self_test(escaped=None):
     chk("the observation probe names the live successor tier, never a retired model",
         (OPUS5_ALIAS == deprecated.SUCCESSOR, OPUS5_MODEL in deprecated.DEPRECATED_PROVIDER_MODELS,
          OPUS5_ALIAS in deprecated.DEPRECATED_ALIASES), (True, False, False))
+    #   and the RETIRED probe's alias/model pair is the register's, so `_retired_aliases` is reading
+    #   the same fact the rest of the fleet routes on rather than a second copy of it
+    chk("the retired fable probe's alias and model are the register's own",
+        (FABLE_ALIAS in deprecated.DEPRECATED_ALIASES,
+         "claude-fable-5" in deprecated.DEPRECATED_PROVIDER_MODELS,
+         _retired_aliases() == frozenset(deprecated.DEPRECATED_ALIASES)), (True, True, True))
     # ---- tier-limit persistence: honest failure propagation + no silent overwrite (issue #198) ----
     class _R:  # a tiny CompletedProcess stand-in for the fake gh runner
         def __init__(self, rc, out=""):
