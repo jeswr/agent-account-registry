@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5803,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bb00d3b42676d4d6bcb32ef7edc2c23fdffb1221",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major finding is resolved: push-frontier now derives the saturation count from jq's JSON-array length before rendering PR text, flattens title newlines for matching, and exercises the real split/count path with a multiline-title regression test. The other changed enumeration sites consistently bind the requested limit to the asserted cap and refuse saturated snapshots; their tests cover both saturation and cap-minus-one acceptance through the production call sites. No correctness, soundness, test-validity, or security issue remains in the supplied diff.",
+  "verdict": "approve"
+ }
+}
