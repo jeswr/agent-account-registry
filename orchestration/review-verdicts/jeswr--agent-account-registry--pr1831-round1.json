@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1831,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0ccd39f73c495663890b7ece22239f09897a8e03",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The element validation only requires selected attributes and treats `id` as optional for every type. GitHub issue forms require an `id` for each interactive input (`input`, `textarea`, `dropdown`, and `checkboxes`), while `markdown` is the exception. Thus a form such as `name: n; description: d; body: [{type: textarea, attributes: {label: L}}]` is accepted here even though it is not a valid form. The same shallow check accepts `options: [null]`, scalar/non-string labels, and checkbox option mappings without a non-empty `label`; a non-empty list alone does not establish valid dropdown/checkbox options. The tests mirror these omissions: the nominal interactive controls all happen to include ids, and no negative fixture removes an id or corrupts an option item. This leaves the headline renderability/mint-path claim open.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Validate the per-type schema rather than only non-emptiness: require a non-empty, valid, unique id for every non-markdown element (and reject ids on markdown if GitHub's schema does), enforce string types for required text attributes, and validate dropdown/checkbox option item shapes and required labels. Add independent negative fixtures for a missing interactive id, an invalid id, malformed dropdown options, and checkbox options missing labels, plus a positive control for each supported type. Prefer validating against an authoritative pinned schema/tool if one is available so additional GitHub constraints are not reimplemented incompletely.",
+    "severity": "major",
+    "title": "Issue-form validator accepts documents GitHub cannot render"
+   }
+  ],
+  "progress": null,
+  "summary": "The new gate is wired fail-closed and its tests exercise many malformed documents, but the validator does not implement enough of GitHub's issue-form schema to support its renderability guarantee. In particular, it accepts non-markdown interactive controls without an id and accepts structurally invalid options. Those files can therefore pass the registry gate while remaining invalid issue forms, leaving the silent mint-path failure this change is intended to close.",
+  "verdict": "request_changes"
+ }
+}
