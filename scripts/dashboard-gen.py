@@ -1712,7 +1712,15 @@ def _obs_lane_rows(lanes):
     spells in a shape this seam cannot read simply is not on the page, and a run-health panel with
     nothing on it reads as a HEALTHY fleet. The tolerance is unchanged — a malformed lane never
     fails the build — and the 12-lane DISPLAY cap stays silent, because a truncation of well-formed
-    rows is this seam's documented contract rather than a producer/consumer mismatch."""
+    rows is this seam's documented contract rather than a producer/consumer mismatch.
+
+    The announcement reaches the MEASUREMENTS, not just the container: the false-healthy shape this
+    seam publishes is not only an absent lane but a PRESENT one reading `0 / 0 / 0`, and a window
+    or counter the collector sent in a shape this seam cannot read used to become exactly that,
+    silently. So the rule is one level down as well — a field the collector SENT must be readable
+    or it is announced, and only a field it did not send takes the default. An unreadable counter
+    takes its whole window with it (`None`, i.e. what an unsent window publishes) rather than
+    contributing a fabricated `0` to the panel's fail-rate arithmetic."""
     rows = []
     drops = _ObsDropLog("observability lane rows")
     if not isinstance(lanes, dict):
@@ -1735,12 +1743,30 @@ def _obs_lane_rows(lanes):
             continue
         out = {"lane": name}
         for window in ("1h", "24h"):
+            if window not in row:
+                out[window] = None          # a window this collector does not send: not a mismatch
+                continue
             source = row.get(window)
             if not isinstance(source, dict):
+                _obs_drop(drops, "lane", f"lane {_obs_text(name, 32)!r} window `{window}` (type "
+                          f"{type(source).__name__}) is not an object of success/failure/defer "
+                          "counts")
                 out[window] = None
                 continue
-            out[window] = {key: _obs_count(source.get(key)) or 0
-                           for key in ("success", "failure", "defer")}
+            counts = {}
+            for key in ("success", "failure", "defer"):
+                if key not in source:
+                    counts[key] = 0         # a counter this collector does not send: still zero
+                    continue
+                count = _obs_count(source.get(key))
+                if count is None:
+                    _obs_drop(drops, "lane", f"lane {_obs_text(name, 32)!r} window `{window}` "
+                              f"`{key}` (type {type(source.get(key)).__name__}) is not a "
+                              "non-negative integer")
+                    counts = None           # one unreadable counter voids the whole window
+                    break
+                counts[key] = count
+            out[window] = counts
         rows.append(out)
     drops.close()
     return rows
@@ -6048,7 +6074,52 @@ esac
              ["lane 'worker' (type list) is not an object of 1h/24h windows"]),
             ("a null lane row", {"worker": None}, [],
              ["lane 'worker' (type NoneType) is not an object of 1h/24h windows"]),
+            # ...and the MEASUREMENTS below the row, which fail open the same way: a window or a
+            # counter the collector SENT in an unreadable shape used to publish a lane reading
+            # `0 / 0 / 0` — a present, healthy-looking lane — with nothing said. A published `None`
+            # window is what an UNSENT window publishes, so the accept-path rows below are what
+            # separate "absent, defaulted, silent" from "present, unreadable, announced".
+            ("a lane window that is not an object", {"worker": {"1h": "many"}},
+             [{"lane": "worker", "1h": None, "24h": None}],
+             ["lane 'worker' window `1h` (type str) is not an object of success/failure/defer "
+              "counts"]),
+            ("an explicit null lane window", {"worker": {"24h": None}},
+             [{"lane": "worker", "1h": None, "24h": None}],
+             ["lane 'worker' window `24h` (type NoneType) is not an object of "
+              "success/failure/defer counts"]),
+            # The finding's own literal: every counter unreadable prints ONE line, for the first
+            # one, and voids the window rather than publishing three fabricated zeroes.
+            ("a lane counter that is not an integer",
+             {"worker": {"1h": {"success": "many", "failure": -1, "defer": None}}},
+             [{"lane": "worker", "1h": None, "24h": None}],
+             ["lane 'worker' window `1h` `success` (type str) is not a non-negative integer"]),
+            ("a negative lane counter",
+             {"worker": {"1h": {"success": 2, "failure": -1, "defer": 0}}},
+             [{"lane": "worker", "1h": None, "24h": None}],
+             ["lane 'worker' window `1h` `failure` (type int) is not a non-negative integer"]),
+            ("an explicit null lane counter",
+             {"worker": {"1h": {"success": 2, "failure": 0, "defer": None}}},
+             [{"lane": "worker", "1h": None, "24h": None}],
+             ["lane 'worker' window `1h` `defer` (type NoneType) is not a non-negative integer"]),
+            ("a boolean lane counter",
+             {"worker": {"1h": {"success": True, "failure": 0, "defer": 0}}},
+             [{"lane": "worker", "1h": None, "24h": None}],
+             ["lane 'worker' window `1h` `success` (type bool) is not a non-negative integer"]),
+            # ...and one unreadable window does NOT take the lane's other window with it: the
+            # readable half of the row is still worth publishing, and dropping the whole lane here
+            # would delete evidence this seam could read.
+            ("one unreadable window beside a readable one",
+             {"worker": {"1h": {"success": 1, "failure": 0, "defer": 0}, "24h": {"success": "x"}}},
+             [{"lane": "worker", "1h": {"success": 1, "failure": 0, "defer": 0}, "24h": None}],
+             ["lane 'worker' window `24h` `success` (type str) is not a non-negative integer"]),
             ("a lane row that parses", {"worker": {"1h": {"success": 3, "failure": 0, "defer": 0}}},
+             [{"lane": "worker", "1h": {"success": 3, "failure": 0, "defer": 0}, "24h": None}],
+             None),
+            # The DEFAULTS, unchanged and silent — an absent window and an absent counter are a
+            # collector that does not send that field, not a shape mismatch. Announce these and
+            # every partially-reporting collector warns on every build; validate the present ones
+            # against this row and the two policies stay separable.
+            ("a lane window that omits a counter", {"worker": {"1h": {"success": 3}}},
              [{"lane": "worker", "1h": {"success": 3, "failure": 0, "defer": 0}, "24h": None}],
              None),
             ("an explicit null lane container", None, [], None),
