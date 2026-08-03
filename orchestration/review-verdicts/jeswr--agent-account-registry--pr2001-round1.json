@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2001,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "86e0c001cbac3c2ec39195cf21e1a1c6b46d4edb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly makes malformed observability trigger-fire rows visible while preserving valid-row publication and keeping diagnostics bounded. Row-drop and evidence-link budgets are independent, close in deterministic order, and use only bounded/sanitized collector text. The self-tests exercise the named regression, distinct malformed shapes, log-injection and oversized-value cases, silence on the accept path, cap boundaries, continued data publication, and both single- and dual-seam flooding with literal expectations, so the assertions are non-vacuous and pin the intended behavior. No trust check, workflow permission, secret-handling path, or fail-closed control is weakened.",
+  "verdict": "approve"
+ }
+}
