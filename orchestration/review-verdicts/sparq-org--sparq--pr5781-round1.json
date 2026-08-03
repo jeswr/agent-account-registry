@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 5781,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2bfe37e4f2d7692c1b4a361e9c1349bb8addd70e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The workflow change correctly single-sources the archive feature set, adds a fail-closed nextest-list check that the feature-gated SIMD tests were built under the same workspace/target/features configuration as the archive, and verifies each execution runner exposes the x86_64 AVX2+FMA capabilities required for the dispatcher to exercise the audited intrinsic kernel. The relevant in-tree guard checks the real runtime dispatcher and fails under CI when AVX2 is unavailable; the audit register accurately describes that evidence. Quoting and shell failure handling are sound, and the filtered list is non-vacuous because it requires at least one literal simd::tests:: entry.",
+  "verdict": "approve"
+ }
+}
