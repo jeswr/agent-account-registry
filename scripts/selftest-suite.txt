@@ -14,6 +14,7 @@ dispatch-plan.py
 dispatch-secrets-guard.py
 dispatch-stall-alert.py
 dispatch-tick-floor.py
+gate-base-lead.py
 gate-staleness.py
 gh_403.py
 gh_retry.py
