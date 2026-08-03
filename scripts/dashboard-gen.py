@@ -118,6 +118,16 @@ OBS_THRESHOLD_KEYS = {"workflow_failure_rate", "defer_reason_hourly",
 OBS_CACHE_DROP = ("dashboard-gen: dropped the observability cache group (type {}) — "
                   "no field it publishes was measured")
 
+# [#1570] How many per-row drop warnings ONE seam may print before it stops naming rows and prints
+# a single counting tail instead. The drop diagnostics (#982 on `flow.queue`, and the evidence-link
+# warning that set the precedent) emit ONE LINE PER DROPPED ROW, and NEITHER input list is bounded
+# on the way IN — `queue[:12]` / `rows[:20]` truncate on the way OUT, after the loop. So a collector
+# snapshot on the public `ledger` branch carrying 100k malformed rows writes 100k lines into
+# dashboard.yml's step log, which is the failure the diagnostic exists to FIX: a log nobody can read
+# is a log nobody reads. The cap is on the DIAGNOSTIC only — the drop-the-row tolerance, the
+# published rows and the build's exit status are all unchanged.
+OBS_DROP_WARN_MAX = 12
+
 # Usage-probe outcome sidecar (issue #219). dashboard.yml's secret-materialization and probe steps
 # are `continue-on-error`, and a failed probe used to be replaced by `{}` — indistinguishable from
 # "every account is idle". The probe job now PERSISTS its outcome next to the snapshot and the
@@ -1758,7 +1768,41 @@ def _obs_lease_aggregate(value):
     return {"mean": round(mean, 2), "max": round(maximum, 2)}
 
 
-def _obs_drop_queue(detail):
+class _ObsDropLog:
+    """[#1570] A BOUNDED drop-diagnostic printer for one observability seam.
+
+    One instance per seam per build: `drop()` names the first `OBS_DROP_WARN_MAX` dropped rows and
+    counts the rest, `close()` prints the one tail line carrying the counts an operator actually
+    needs — how many warnings were withheld, and how many rows were dropped in TOTAL. Below the cap
+    nothing changes: the same per-row lines print and no tail is emitted, so a two-row shape
+    mismatch still reads exactly as it did before this cap existed.
+
+    The seams count SEPARATELY. A queue snapshot that floods its own budget must not silence the
+    evidence-link warning on the same document — that would trade one invisible loss for another.
+
+    Callers pass a fully-composed message: every value a message quotes is sanitized at its own call
+    site (`_obs_text`), so no collector value reaches the build log raw. The tail line quotes only
+    integers this build counted itself."""
+
+    def __init__(self, seam):
+        self.seam = seam            # plural noun for the tail line, e.g. "observability queue rows"
+        self.dropped = 0            # every drop, including the ones never printed
+        self.printed = 0
+
+    def drop(self, message):
+        self.dropped += 1
+        if self.printed < OBS_DROP_WARN_MAX:
+            self.printed += 1
+            print(f"dashboard-gen: dropped {message}")
+
+    def close(self):
+        suppressed = self.dropped - self.printed
+        if suppressed:
+            print(f"dashboard-gen: ... {suppressed} further dropped {self.seam} suppressed "
+                  f"({self.dropped} dropped in total)")
+
+
+def _obs_drop_queue(drops, detail):
     """[#982] Announce a dropped observability queue input instead of swallowing it.
 
     `_obs_trigger_rows` already sets this precedent on the same collector document. It matters
@@ -1769,8 +1813,11 @@ def _obs_drop_queue(detail):
 
     Only the SHAPE is named: a type name, a field name, and for a class string the `_obs_text`
     sanitized form. No collector value reaches the build log raw, so a malformed snapshot cannot
-    inject lines into the log it is being diagnosed in."""
-    print(f"dashboard-gen: dropped observability queue input ({detail})")
+    inject lines into the log it is being diagnosed in.
+
+    [#1570] `drops` is this build's queue-seam `_ObsDropLog`: the wording is unchanged, the emission
+    is capped, and the rows past the cap are counted into its tail line rather than printed."""
+    drops.drop(f"observability queue input ({detail})")
 
 
 def _obs_flow(flow):
@@ -1788,30 +1835,34 @@ def _obs_flow(flow):
     # but every drop is now ANNOUNCED, one reason at a time, so a shape mismatch is legible
     # instead of arriving as an empty panel. The container check is part of it: `queue_stats()`
     # keyed by the integer classes is a dict, which loses every row before the loop even starts.
+    # [#1570] `raw_queue` is UNBOUNDED (`queue[:12]` truncates on the way out, below), so the
+    # announcement is capped: the first OBS_DROP_WARN_MAX rows are named and the rest are counted.
+    drops = _ObsDropLog("observability queue rows")
     raw_queue = flow.get("queue")
     if "queue" in flow and not isinstance(raw_queue, list):
         _obs_drop_queue(
-            f"`flow.queue` (type {type(raw_queue).__name__}) is not a list of rows")
+            drops, f"`flow.queue` (type {type(raw_queue).__name__}) is not a list of rows")
     for item in raw_queue if isinstance(raw_queue, list) else []:
         if not isinstance(item, dict):
-            _obs_drop_queue(f"the row (type {type(item).__name__}) is not an object")
+            _obs_drop_queue(drops, f"the row (type {type(item).__name__}) is not an object")
             continue
         queue_class = item.get("class")
         if not isinstance(queue_class, str):
-            _obs_drop_queue(f"row `class` (type {type(queue_class).__name__}) is not a class "
-                            "STRING such as '1'/'2a'/'4'")
+            _obs_drop_queue(drops, f"row `class` (type {type(queue_class).__name__}) is not a "
+                            "class STRING such as '1'/'2a'/'4'")
             continue
         if OBS_QUEUE_CLASS_RE.fullmatch(queue_class) is None:
             _obs_drop_queue(
-                f"row `class` {_obs_text(queue_class, 16)!r} is not one of the queue classes")
+                drops, f"row `class` {_obs_text(queue_class, 16)!r} is not one of the queue classes")
             continue
         depth = _obs_count(item.get("depth"))
         if depth is None:
-            _obs_drop_queue(f"row `depth` (type {type(item.get('depth')).__name__}) is not a "
-                            "non-negative integer")
+            _obs_drop_queue(drops, f"row `depth` (type {type(item.get('depth')).__name__}) is not "
+                            "a non-negative integer")
             continue
         queue.append({"class": queue_class, "depth": depth,
                       "oldest_age_minutes": _obs_minutes(item.get("oldest_age_minutes"))})
+    drops.close()
     queue.sort(key=lambda row: row["class"])
 
     # Issue #374: the per-account lease rows are validated but NOT published. A list of up to 40
@@ -1903,8 +1954,14 @@ def _obs_flow(flow):
 def _obs_trigger_rows(items):
     """Auto-fixer trigger fires (fire-only alarm semantics — the collector records each fire; the
     dashboard only displays). Evidence links are pinned to github.com — anything else is dropped
-    loudly rather than published on the public page."""
+    loudly rather than published on the public page.
+
+    [#1570] `items` is UNBOUNDED here — `rows[:20]` truncates on the way OUT, after every row has
+    been walked — and each row contributes up to 8 evidence drops, so the announcement is capped
+    per BUILD rather than per row: a hoisted-into-the-loop counter would still let N rows write 8N
+    lines."""
     rows = []
+    drops = _ObsDropLog("observability evidence links")
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict):
             continue
@@ -1916,7 +1973,7 @@ def _obs_trigger_rows(items):
             if isinstance(link, str) and OBS_EVIDENCE_RE.fullmatch(link):
                 evidence.append(link)
             else:
-                print("dashboard-gen: dropped a non-GitHub observability evidence link")
+                drops.drop("a non-GitHub observability evidence link")
         task = item.get("enqueued_task")
         rows.append({
             "rule": rule,
@@ -1926,6 +1983,7 @@ def _obs_trigger_rows(items):
             "enqueued_task": task if isinstance(task, str)
             and OBS_TOKEN_RE.fullmatch(task) else None,
         })
+    drops.close()
     rows.sort(key=lambda row: row["fired_at"] or "", reverse=True)
     return rows[:20]
 
@@ -5676,6 +5734,100 @@ esac
               obs_queue([{"class": queue_class, "depth": 1}]),
               ([], [_QUEUE_DROP.format(
                   f"row `class` {quoted} is not one of the queue classes")]))
+    # ---- [#1570] THE DIAGNOSTIC ITSELF MUST BE BOUNDED. Both drop warnings above emit ONE LINE
+    # PER DROPPED ROW over a list nothing bounds on the way IN (`queue[:12]` and `rows[:20]` cut on
+    # the way OUT, after the loop), so a snapshot on the public `ledger` branch carrying 100k
+    # malformed rows writes 100k lines into dashboard.yml's step log — the very failure the drop
+    # diagnostic exists to fix. The rows below pin BOTH directions: the cap FIRES, and the tail
+    # line names the REAL total rather than anything derived from the cap.
+    # Every expected string and every input SIZE below is a literal: deriving either from
+    # OBS_DROP_WARN_MAX is pre-flight 2(b)/2(c)'s tautology (#941 set every over-cap input from the
+    # constant it tested, so raising the constant left 76/76 green). Here, moving the constant reds
+    # the over-cap rows, and a cap read off a different seam's counter reds the independence row.
+    _EVIDENCE_DROP = "dashboard-gen: dropped a non-GitHub observability evidence link"
+    _SUPPRESSED = "dashboard-gen: ... {} further dropped {} suppressed ({} dropped in total)"
+    _INT_CLASS = _QUEUE_DROP.format(
+        "row `class` (type int) is not a class STRING such as '1'/'2a'/'4'")
+
+    def obs_drops(queue_rows, trigger_rows):
+        """(published `flow.queue`, published `trigger_fires`, EVERY `dashboard-gen:` line printed).
+
+        Unlike `obs_queue`/`obs_cache` this keeps every diagnostic line, in order and unfiltered —
+        a cap that merely relabelled its warnings, or a tail line printed to the wrong seam, would
+        be invisible to a prefix-filtered capture.
+        """
+        fixture = copy.deepcopy(obs_fixture)
+        fixture["flow"]["queue"] = queue_rows
+        fixture["trigger_fires"] = trigger_rows
+        stream = io.StringIO()
+        try:                       # same crash-after-partial-run guard as ObsRefusal above
+            with contextlib.redirect_stdout(stream):
+                document = _normalize_observability(fixture)
+        except DashboardError as error:
+            document = ObsRefusal(refused=str(error))
+        return (document["flow"]["queue"], document["trigger_fires"],
+                [line for line in stream.getvalue().splitlines()
+                 if line.startswith("dashboard-gen:")])
+
+    # 21 rows in, 20 of them malformed: 12 warnings, then ONE tail carrying the two numbers that
+    # survive the cap. Remove the cap and this row reds with 20 warnings and no tail; count the
+    # suppressed rows as the total (or the total as the cap) and the tail text reds.
+    check("[#1570] 20 malformed queue rows print 12 warnings and ONE tail naming the REAL total — "
+          "an unbounded diagnostic floods the log it exists to make legible",
+          obs_drops([{"class": index, "depth": 1} for index in range(20)]
+                    + [{"class": "2a", "depth": 3}], []),
+          ([{"class": "2a", "depth": 3, "oldest_age_minutes": None}], [],
+           [_INT_CLASS] * 12 + [_SUPPRESSED.format(8, "observability queue rows", 20)]))
+    # The cap is on the DIAGNOSTIC, never on the data: suppressing a warning must not suppress a
+    # row. The good row above publishes, and the build stays green (a refusal would red both).
+    # AT the cap nothing is withheld, so NO tail may print: an unconditional `close()` emission —
+    # or a `<=` comparison — turns this row red, and a "0 further ... suppressed" line on a
+    # 12-row snapshot is exactly the noise this issue is about.
+    check("[#1570] a snapshot exactly AT the cap prints its 12 warnings and NO tail — the tail "
+          "line marks real suppression, so it can never fire when nothing was withheld",
+          obs_drops([{"class": index, "depth": 1} for index in range(12)], []),
+          ([], [], [_INT_CLASS] * 12))
+    check("[#1570] one row PAST the cap: the 13th is withheld and counted, not printed",
+          obs_drops([{"class": index, "depth": 1} for index in range(13)], []),
+          ([], [], [_INT_CLASS] * 12 + [_SUPPRESSED.format(1, "observability queue rows", 13)]))
+    # The evidence seam is the one with the multiplier: each row contributes up to 8 drops, so a
+    # counter scoped to the ROW (the obvious wrong fix) still lets N rows write 8N lines. Three
+    # rows x 8 non-GitHub links = 24 drops; a per-row cap prints all 24 and no tail.
+    _flood_triggers = [{"rule": f"flood-rule-{index}", "fired_at": now - 300,
+                        "summary": "flood", "evidence": ["https://evil.example/exfil"] * 8}
+                       for index in range(3)]
+    _flood_queue, _flood_rows, _flood_lines = obs_drops([], _flood_triggers)
+    check("[#1570] the evidence cap counts per BUILD, not per row: 3 fire rows x 8 non-GitHub "
+          "links each is 24 drops, capped at 12 with the real total in the tail",
+          (_flood_lines, [row["rule"] for row in _flood_rows],
+           [row["evidence"] for row in _flood_rows], _flood_queue),
+          ([_EVIDENCE_DROP] * 12
+           + [_SUPPRESSED.format(12, "observability evidence links", 24)],
+           ["flood-rule-0", "flood-rule-1", "flood-rule-2"], [[], [], []], []))
+    # The two seams count SEPARATELY. One shared counter would let a flooded queue silence the
+    # evidence warning on the same document — trading one invisible loss for another — and would
+    # print a single tail naming the wrong seam. Ordering is fixed: `flow` normalizes before
+    # `trigger_fires`, so the queue seam closes before the evidence line prints.
+    check("[#1570] a flooded queue seam does not consume the evidence seam's budget: the lone "
+          "bad link still names itself, and each seam closes with its own tail",
+          obs_drops([{"class": index, "depth": 1} for index in range(20)],
+                    [{"rule": "lone-rule", "fired_at": now - 300, "summary": "s",
+                      "evidence": ["https://evil.example/exfil"]}])[2],
+          [_INT_CLASS] * 12 + [_SUPPRESSED.format(8, "observability queue rows", 20)]
+          + [_EVIDENCE_DROP])
+    # The accept path of the evidence seam stays SILENT — the branch a `--self-test` line-coverage
+    # run showed had never executed at all (pre-flight 1) is the non-object fire row, so it rides
+    # along here: it is dropped without a diagnostic today and must not grow a tail line either.
+    check("[#1570] a fire row whose links all parse prints NOTHING, and a non-object fire row is "
+          "still dropped silently — a tail line on a build that withheld nothing is noise",
+          obs_drops([{"class": "2a", "depth": 1}],
+                    [None, {"rule": "quiet-rule", "fired_at": now - 300, "summary": "s",
+                            "evidence": ["https://github.com/jeswr/agent-account-registry/"
+                                         "actions/runs/7"]}]),
+          ([{"class": "2a", "depth": 1, "oldest_age_minutes": None}],
+           [{"rule": "quiet-rule", "fired_at": "2025-06-15T15:01:40Z", "summary": "s",
+             "evidence": ["https://github.com/jeswr/agent-account-registry/actions/runs/7"],
+             "enqueued_task": None}], []))
     overflow = copy.deepcopy(obs_fixture)
     overflow["flow"]["review_rounds"]["mean"] = 1e309       # JSON 1e309 decodes to +Infinity
     overflow["thresholds"]["workflow_failure_rate"] = 1e309
