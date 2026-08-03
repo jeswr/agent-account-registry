@@ -22,16 +22,6 @@
   },
   {
    "account": "58b7c92faa5b5ca5",
-   "claim_id": "f759591ade8f4819a52e99a23f5d3510",
-   "holder": "fix:sparq-org/sparq#5629@30780040565.1",
-   "package": "ci",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785725120,
-   "expires_at": 1785731420
-  },
-  {
-   "account": "58b7c92faa5b5ca5",
    "claim_id": "b475d65cdac442ab822abea4d31233c7",
    "holder": "jeswr/agent-account-registry#1462@30780169386.1",
    "package": "workflows",
