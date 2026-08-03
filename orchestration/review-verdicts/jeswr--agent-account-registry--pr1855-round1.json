@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1855,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d6c8ca67aa189d174d0bdea345c7ad7dded6dfcb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`arm_freshness_report` reads `sparq-reviewed-sha` directly from `live[\"body\"]` and treats equality with the live head as `covers-head`. A PR author can edit that body after pushing an unreviewed commit, set the marker to the new head SHA, and suppress both the refusal message and the nonzero exit. The comment's claim that this is harmless because the guard only adds a refusal is incorrect: clearing this newly introduced refusal is exactly what restores the unsafe human-arm presentation this change claims to close. The self-tests inject body text directly and therefore never distinguish a bot-bound review assertion from an author-forged one.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Base the decision on evidence whose writer is authenticated and whose head binding is verified, such as a bot-authored receipt/comment filtered by login and author association with quoted contexts stripped, or a head-bound registry verdict record. Add an end-to-end test in which author-controlled body text claims the live SHA without authenticated review evidence and assert that the report still refuses.",
+    "severity": "blocker",
+    "title": "Author-controlled PR body can forge approval coverage"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new refusal is fail-open against the party it is meant to constrain: it treats an author-editable PR-body marker as proof that the approval covers the live head. An author can write the current head SHA into that marker after an unreviewed push and make the report return success. The tests exercise malformed, missing, moved, and matching values, but never the evidence writer/authority boundary, so they do not establish the advertised protection.",
+  "verdict": "request_changes"
+ }
+}
