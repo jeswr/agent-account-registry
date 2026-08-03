@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 5883,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "295f86b62fa2183641cfdf2c35b7ad27e59d3332",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`build_bead_record` correctly falls back to `args.seed_start`/`args.count` when `parsed[\"seeds\"]` is empty, but `build_issue_body` unconditionally sets `first = \"?\"` and calls `render_replay(args, first, 1)`. For an UPDATE panic or other red run without a `MISMATCH seed=N` line, the issue therefore advertises `update-fuzz --seed-start ? --seed-count 1`, which is not a deterministic or runnable replay. This matters because the script describes the GitHub issue as the reliable channel while the bead commit is best-effort. The added no-seed assertions only call `render_replay` directly and do not exercise `build_issue_body`, so they do not catch the defect.",
+    "file": "scripts/ci-file-differential-failure.py",
+    "fix_hint": "Use the same seed/count selection in `build_issue_body` as in `build_bead_record`: first failing seed with count 1 when seeds exist, otherwise the full `args.seed_start`/`args.count` window. Add a self-test that passes an empty parsed result through `build_issue_body` for the UPDATE template and asserts the emitted command uses `--seed-start 900 --seed-count 300` (and not `?`).",
+    "severity": "major",
+    "title": "Seedless failures produce an invalid GitHub issue replay"
+   }
+  ],
+  "progress": null,
+  "summary": "The custom UPDATE replay template is wired correctly for ordinary mismatch logs, and the self-test passes. However, the failure path explicitly supports red runs with no parsed MISMATCH seed (for example, a panic), and the GitHub issue still emits an invalid replay using seed `?` and count `1` rather than the available seed window. Because the GitHub issue is documented as the reliable filing channel when the bead push is blocked, this leaves a supported failure class without a usable replay and the new tests miss that real output path.",
+  "verdict": "request_changes"
+ }
+}
