@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1875,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0bf985f0e233cf5a47ea20ab2f8c8d1a7b3cccfb",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 remains correct and complete. The design preserves the round-3 fix: W1 carries the admission-time epoch, every bind and retraction advances it, and the same-head ABA race (`none \u2192 head \u2192 none`) makes the older bind stale even while the head and immutable verdict still name the same SHA. Both race orders and byte-identical preservation assertions are required, so the proposed tests are non-vacuous. The wider migration remains fail-closed: absent state is UNKNOWN; disarm readers act while admission readers defer; body authority remains singular through dual-write; cutover requires a sealed, zero-refusal coverage census; and mutable writes combine blob CAS with semantic `(expects_sha, expects_epoch)` preconditions. No hostile reviewer-directed instruction appears in the diff. There are no blocker, major, minor, or nit findings.",
+  "verdict": "approve"
+ }
+}
