@@ -1002,7 +1002,8 @@ _read_selftest_list() {
 
 _derive_full_selftest_suite() {
   local scripts_dir=$1 manifest=$2 baseline_manifest=${3:-} baseline_retirements=${4:-}
-  local file base required enrolled advertised approved baseline
+  local merge_base_manifest=${5:-}
+  local file base required enrolled advertised approved baseline at_merge_base=''
   local -a suite=()
   [[ -d "$scripts_dir" ]] || return 1
   enrolled=$(_read_selftest_list "$manifest") || {
@@ -1046,13 +1047,35 @@ _derive_full_selftest_suite() {
       printf 'base-branch retirement approvals are unavailable: %s\n' "$baseline_retirements" >&2
       return 1
     }
+    # [issue #1834] A baseline entry missing from the PR's manifest has TWO causes, and until the
+    # merge base is consulted they are indistinguishable:
+    #   * the branch DELETED it            -> a real retirement, and it needs base-branch approval;
+    #   * the base branch ADDED it after   -> the branch is BEHIND BASE. It removed nothing, it
+    #     never had the entry, and it CANNOT have it, because the enrolling commit is on the base
+    #     branch and not on this branch.
+    # Reporting the second as the first accuses a diff that contains no such deletion, never states
+    # the real remedy (update from base), and leaves "add it to scripts/selftest-retirements.txt"
+    # -- retiring somebody else's brand-new self-test -- as the one edit that silences it from
+    # inside the PR tree. So classify before reporting. BOTH paths still refuse and the approval
+    # requirement is untouched; only the attribution changes. Absent this manifest (the local gate,
+    # which passes no baseline at all) the original message stands; supplied but UNREADABLE is a
+    # refusal, because a classifier whose input is missing must not silently pick a verdict.
+    if [[ -n "$merge_base_manifest" ]]; then
+      at_merge_base=$(_read_selftest_list "$merge_base_manifest") || {
+        printf 'merge-base self-test manifest is unavailable: %s\n' "$merge_base_manifest" >&2
+        return 1
+      }
+    fi
     while IFS= read -r required; do
       [[ -n "$required" ]] || continue
       grep -Fxq "$required" <<< "$enrolled" && continue
-      grep -Fxq "$required" <<< "$approved" || {
-        printf 'suite entry %s was removed without prior base-branch retirement approval\n' "$required" >&2
+      grep -Fxq "$required" <<< "$approved" && continue
+      if [[ -n "$merge_base_manifest" ]] && ! grep -Fxq "$required" <<< "$at_merge_base"; then
+        printf 'suite entry %s is enrolled on the base branch but was never on this branch (it is absent from the merge base too): this branch is BEHIND BASE, it did not remove a self-test — update the branch from base (merge or rebase) and re-run. Do NOT add it to scripts/selftest-retirements.txt: that would retire a self-test this PR did not author.\n' "$required" >&2
         return 1
-      }
+      fi
+      printf 'suite entry %s was removed without prior base-branch retirement approval\n' "$required" >&2
+      return 1
     done <<< "$baseline"
   fi
   ((${#suite[@]} > 0)) || return 1
@@ -1489,6 +1512,34 @@ _pr_gate_suite_preflight() {
     line ~ /^#/ || line == "" { next }
     !on && line ~ /^suite=/ { on = 1; print line; next }
     on { print line; exit }
+  ' "$file"
+}
+
+# [PR #1865 r1] PURE (self-tested): print pr-gate.yml's MANIFEST DERIVATION -- every line from
+# `base_manifest=` up to (not including) the `suite=` call the preflight pin above anchors on --
+# normalised to stripped, comment-free lines.
+#
+# This one is extracted to be EXECUTED, not eyeballed: the self-test substitutes real SHAs for the
+# two `${{ }}` payload expressions and runs the block inside a synthetic repository reproducing the
+# `refs/pull/N/merge` topology actions/checkout hands a `pull_request` job, then asserts WHICH
+# COMMIT's manifest came out. Nothing weaker catches the defect this was added for: `git merge-base
+# HEAD "$base"` is well-formed shell, it satisfies every containment or exact-line pin one could
+# write, and every fixture-level test of the classifier passes beside it -- yet on a merge ref,
+# whose parents are the PR head and the base branch, `$base` is an ANCESTOR of `HEAD`, so it returns
+# `$base` and the merge-base manifest is a byte copy of the base manifest. The behaviour is only
+# observable through the TOPOLOGY, so the topology is what the self-test builds.
+#
+# Prints nothing when the file or the block is absent; an empty script writes no manifest, so the
+# execution rows fail closed rather than pass over a derivation that never ran.
+_pr_gate_manifest_derivation() {
+  local file=$1
+  [[ -f "$file" ]] || return 0
+  awk '
+    { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+    line ~ /^#/ || line == "" { next }
+    !on && line ~ /^base_manifest=/ { on = 1 }
+    on && line ~ /^suite=/ { exit }
+    on { print line }
   ' "$file"
 }
 
@@ -4671,6 +4722,87 @@ PY
   chk "manifest entries with surrounding whitespace are normalized" \
     "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" >/dev/null 2>&1 && echo accepted) || echo refused)" \
     "accepted"
+
+  # --- [issue #1834] BEHIND-BASE vs REMOVAL. The two rows above prove the refusal; these prove the
+  # ATTRIBUTION, which is the whole defect: a branch that predates a base-branch ADDITION removed
+  # nothing, so "removed without prior base-branch retirement approval" points the author at a diff
+  # that does not contain the deletion and leaves retiring the new entry as the obvious repair.
+  # Driven in BOTH directions off ONE varying input -- the merge base's manifest -- with the PR
+  # manifest, the baseline and the (empty) approvals held identical across the pair, so the only
+  # thing that can move the verdict is the classification under test. Messages are compared, not
+  # just exit codes: both directions refuse, so an exit code cannot tell them apart, and the last
+  # row is the mutation -- collapse the two branches onto one shared message and it goes red.
+  local mb_fixture="$tmp/mergebase-manifest" mb_removal_msg mb_behind_msg
+  printf '%s\n' advertised.py advertised.sh > "$baseline_fixture"
+  printf '%s\n' advertised.py > "$manifest_fixture"
+  : > "$approvals_fixture"
+  # advertised.sh WAS enrolled at the merge base and this branch dropped it -> a real removal.
+  printf '%s\n' advertised.py advertised.sh > "$mb_fixture"
+  mb_removal_msg=$(_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" \
+    "$baseline_fixture" "$approvals_fixture" "$mb_fixture" 2>&1 >/dev/null || true)
+  chk "removal present at the merge base still REFUSES without base-branch approval" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" "$baseline_fixture" \
+         "$approvals_fixture" "$mb_fixture" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "refused"
+  chk "removal present at the merge base keeps TODAY'S message, verbatim" \
+    "$mb_removal_msg" \
+    "suite entry advertised.sh was removed without prior base-branch retirement approval"
+  # No merge-base manifest at all (the local gate's shape) => NO evidence to classify with, so the
+  # original message must stand. An unevidenced "behind base" is the same defect pointing the other
+  # way: it would tell the author of a genuine deletion that the entry is the base branch's doing.
+  chk "with no merge-base manifest the ORIGINAL message stands (nothing is claimed unevidenced)" \
+    "$(_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" "$baseline_fixture" \
+       "$approvals_fixture" 2>&1 >/dev/null || true)" \
+    "suite entry advertised.sh was removed without prior base-branch retirement approval"
+  # Same tree, same baseline, same approvals: only the merge base changes. advertised.sh was ADDED
+  # on the base branch after this branch point, so this branch never had it.
+  printf '%s\n' advertised.py > "$mb_fixture"
+  mb_behind_msg=$(_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" \
+    "$baseline_fixture" "$approvals_fixture" "$mb_fixture" 2>&1 >/dev/null || true)
+  chk "a behind-base entry still REFUSES -- only the attribution changes, nothing is weakened" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" "$baseline_fixture" \
+         "$approvals_fixture" "$mb_fixture" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "refused"
+  chk "a behind-base entry is diagnosed as BEHIND BASE and NAMES the remedy" \
+    "$(grep -c 'BEHIND BASE, it did not remove a self-test — update the branch from base' \
+       <<< "$mb_behind_msg" || true)" "1"
+  chk "a behind-base entry is NOT accused of an unapproved removal" \
+    "$( grep -q 'was removed without prior base-branch retirement approval' <<< "$mb_behind_msg" \
+        && printf accused || printf clean)" "clean"
+  chk "the behind-base diagnosis warns AGAINST the dangerous repair it used to invite" \
+    "$(grep -c 'Do NOT add it to scripts/selftest-retirements.txt' <<< "$mb_behind_msg" || true)" "1"
+  chk "ONE shared message cannot satisfy both directions (the two diagnoses differ)" \
+    "$([[ "$mb_removal_msg" == "$mb_behind_msg" ]] && printf shared || printf distinct)" "distinct"
+  # And with the merge base UNKNOWN the classifier must not pick a verdict. The control row above it
+  # is what makes it non-vacuous: this fixture ACCEPTS when the merge-base manifest is readable, so
+  # the refusal below is the unreadable input and not a removal the other guards already catch.
+  printf '%s\n' advertised.py > "$baseline_fixture"
+  chk "control: nothing is missing from the baseline, so this fixture accepts" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" "$baseline_fixture" \
+         "$approvals_fixture" "$mb_fixture" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "accepted"
+  chk "an UNREADABLE merge-base manifest is refused (the classifier's input must be real)" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" "$baseline_fixture" \
+         "$approvals_fixture" "$tmp/missing-mergebase" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "refused"
+  # THE ARM, EXECUTED, in both directions. The pr-gate.yml seam row far below pins the CALL; this
+  # pins the CALLEE, and neither subsumes the other -- a workflow that drops the argument and an arm
+  # that quietly tolerates losing it are different regressions, and the second one silently restores
+  # the ambiguous message for every caller at once.
+  local psarm_rc psarm_out
+  psarm_out=$(bash "$SCRIPT_DIR/worker-live.sh" print-selftest-suite \
+    "$SCRIPT_DIR/selftest-suite.txt" "$SCRIPT_DIR/selftest-retirements.txt" 2>&1) \
+    && psarm_rc=0 || psarm_rc=$?
+  chk "print-selftest-suite REFUSES a call that supplies no merge-base manifest" \
+    "$([[ "$psarm_rc" -ne 0 ]] && printf refused || printf ran)" "refused"
+  chk "and the refusal names the ARITY the caller must satisfy" \
+    "$(grep -c 'usage: worker-live.sh print-selftest-suite <base-manifest> <base-retirements> <merge-base-manifest>' \
+       <<< "$psarm_out")" "1"
+  psarm_out=$(bash "$SCRIPT_DIR/worker-live.sh" print-selftest-suite \
+    "$SCRIPT_DIR/selftest-suite.txt" "$SCRIPT_DIR/selftest-retirements.txt" \
+    "$SCRIPT_DIR/selftest-suite.txt" 2>&1) && psarm_rc=0 || psarm_rc=$?
+  chk "print-selftest-suite accepts the four-argument form and prints the real suite" \
+    "$psarm_rc:$(grep -cw 'worker-live.sh' <<< "$psarm_out")" "0:1"
 
   # --- registry-selftest gate PURE selector (non-vacuous): classify a fixture diff into the
   # self-test / bash / workflow targets the gate must run. Proves a touched suite script is run,
@@ -8801,14 +8933,14 @@ CHANNEL
   # is the bug this closes, and a called arm that refuses nothing is the same bug wearing a call. ----
   local expected_preflight
   expected_preflight=$(printf '%s\n' \
-    'suite=$(bash scripts/worker-live.sh print-selftest-suite "$base_manifest" "$base_retirements")' \
+    'suite=$(bash scripts/worker-live.sh print-selftest-suite "$base_manifest" "$base_retirements" "$mb_manifest")' \
     'bash scripts/worker-live.sh preflight-selftest-env "$suite"' | paste -sd'|' -)
   chk "pr-gate.yml PREFLIGHTS the suite it derived, before the loop (exact adjacent pair)" \
     "$(_pr_gate_suite_preflight "$SCRIPT_DIR/../.github/workflows/pr-gate.yml" | paste -sd'|' -)" \
     "$expected_preflight"
   # NON-VACUITY of the extractor: the four mutants that keep the call PRESENT-but-useless, plus the
   # deletion. Each must change the extracted pair, or the row above is a constant comparing itself.
-  local pf_derive='          suite=$(bash scripts/worker-live.sh print-selftest-suite "$base_manifest" "$base_retirements")'
+  local pf_derive='          suite=$(bash scripts/worker-live.sh print-selftest-suite "$base_manifest" "$base_retirements" "$mb_manifest")'
   printf '%s\n' "$pf_derive" '          n=0' '          for s in $suite; do' \
     > "$loopfix/pf-deleted.yml"
   printf '%s\n' "$pf_derive" \
@@ -8819,6 +8951,13 @@ CHANNEL
     > "$loopfix/pf-if-false.yml"
   printf '%s\n' "$pf_derive" '          for s in $suite; do' '            :' '          done' \
     '          bash scripts/worker-live.sh preflight-selftest-env "$suite"' > "$loopfix/pf-late.yml"
+  # [issue #1834] The fifth mutant: the derivation still runs, still preflights, still reds a real
+  # removal -- it just stops passing the merge base, so every behind-base branch is accused of
+  # removing a self-test again. This pair is the only STATIC pin on that argument; the arm's own
+  # arity (asserted above, executed) is the independent runtime one.
+  printf '%s\n' \
+    '          suite=$(bash scripts/worker-live.sh print-selftest-suite "$base_manifest" "$base_retirements")' \
+    '          bash scripts/worker-live.sh preflight-selftest-env "$suite"' > "$loopfix/pf-no-mergebase.yml"
   chk "preflight check is NON-VACUOUS: a DELETED preflight no longer matches" \
     "$([[ "$(_pr_gate_suite_preflight "$loopfix/pf-deleted.yml" | paste -sd'|' -)" == "$expected_preflight" ]] \
        && printf missed || printf caught)" "caught"
@@ -8831,9 +8970,94 @@ CHANNEL
   chk "preflight check is NON-VACUOUS: a preflight moved BELOW the loop no longer matches" \
     "$([[ "$(_pr_gate_suite_preflight "$loopfix/pf-late.yml" | paste -sd'|' -)" == "$expected_preflight" ]] \
        && printf missed || printf caught)" "caught"
+  chk "preflight check is NON-VACUOUS: a derivation that drops the merge-base manifest (#1834) no longer matches" \
+    "$([[ "$(_pr_gate_suite_preflight "$loopfix/pf-no-mergebase.yml" | paste -sd'|' -)" == "$expected_preflight" ]] \
+       && printf missed || printf caught)" "caught"
   chk "preflight check fails CLOSED on an unreadable workflow" \
     "$([[ "$(_pr_gate_suite_preflight "$loopfix/absent.yml" 2>/dev/null | paste -sd'|' -)" == "$expected_preflight" ]] \
        && printf missed || printf caught)" "caught"
+
+  # ---- [PR #1865 r1] WHICH COMMIT'S MANIFEST, MEASURED ON THE REAL TOPOLOGY. The #1834 fixtures
+  # far above drive the CLASSIFIER as a pure function and say nothing about which commit's manifest
+  # the workflow hands it -- and that is where the defect lived. This job runs on `pull_request`,
+  # where actions/checkout resolves `refs/pull/N/merge`: a merge commit whose parents are the PR
+  # head and the base branch. `$base` is therefore an ANCESTOR of `HEAD`, `git merge-base HEAD
+  # "$base"` returns `$base`, the merge-base manifest is a byte copy of the base manifest, and the
+  # behind-base branch is found there and re-accused of the removal it did not make. So the
+  # workflow's OWN derivation lines are extracted and RUN -- only the two `${{ }}` payload
+  # expressions substituted -- against a repository built to exactly that shape, in both directions
+  # and through to the message the author would read. ----
+  local mbfix="$tmp/mergebase-topology" mbrun="$tmp/mergebase-run" mbscript="$tmp/mergebase-derive.sh"
+  local mb_head mb_base mb_rc mb_verdict
+  git init -q -b main "$mbfix"
+  _mbgit() { git -C "$mbfix" -c user.name=t -c user.email=t@example.invalid "$@"; }
+  mkdir -p "$mbfix/scripts" "$mbrun"
+  printf '%s\n' advertised.py > "$mbfix/scripts/selftest-suite.txt"
+  : > "$mbfix/scripts/selftest-retirements.txt"
+  _mbgit add -A && _mbgit commit -qm branch-point
+  # The PR branch forks HERE and never touches the manifest: it removed nothing, and it cannot hold
+  # an entry whose enrolling commit is on the base branch.
+  _mbgit switch -qc pr-head
+  printf 'work\n' > "$mbfix/scripts/unrelated.txt"
+  _mbgit add -A && _mbgit commit -qm 'pr work'
+  mb_head=$(_mbgit rev-parse HEAD)
+  # ... and the base branch enrolls a NEW self-test AFTER that fork point.
+  _mbgit switch -q main
+  printf '%s\n' advertised.py advertised.sh > "$mbfix/scripts/selftest-suite.txt"
+  _mbgit add -A && _mbgit commit -qm 'base enrolls advertised.sh'
+  mb_base=$(_mbgit rev-parse HEAD)
+  # What the job is actually checked out at: base tip and PR head as the two parents of one commit.
+  _mbgit checkout -q --detach "$mb_base"
+  _mbgit merge -q --no-ff -m 'pull/N/merge' "$mb_head"
+  # Run the workflow's own lines with ONLY the head payload varying. Feeding it the literal `HEAD`
+  # is not an approximation of the pre-fix code -- it IS the pre-fix expression, reconstructed
+  # through the one value under test, so the pair below shares every other line with production.
+  _mb_derive() {
+    local head_value=$1 out_dir=$2 block
+    block=$(_pr_gate_manifest_derivation "$SCRIPT_DIR/../.github/workflows/pr-gate.yml")
+    block=${block//'${{ github.event.pull_request.base.sha }}'/$mb_base}
+    block=${block//'${{ github.event.pull_request.head.sha }}'/$head_value}
+    rm -rf -- "$out_dir" && mkdir -p "$out_dir"
+    { printf 'set -euo pipefail\n'; printf '%s\n' "$block"; } > "$mbscript"
+    (cd "$mbfix" && RUNNER_TEMP="$out_dir" bash "$mbscript" > "$out_dir/derive.log" 2>&1)
+  }
+  _mb_derive "$mb_head" "$mbrun/fixed" && mb_rc=0 || mb_rc=$?
+  chk "merge-base seam: pr-gate.yml's derivation RUNS against the pull/N/merge topology" "$mb_rc" "0"
+  chk "merge-base seam: the merge-base manifest is the BRANCH POINT's copy" \
+    "$(paste -sd, - < "$mbrun/fixed/mergebase-selftest-suite.txt" 2>/dev/null)" "advertised.py"
+  chk "merge-base seam control: the BASE manifest of the same run is the base TIP's copy" \
+    "$(paste -sd, - < "$mbrun/fixed/base-selftest-suite.txt" 2>/dev/null)" \
+    "advertised.py,advertised.sh"
+  # NON-VACUITY, and the defect itself: resolve the branch point from the checkout HEAD and the
+  # merge-base manifest collapses onto the base tip, entry for entry -- there is nothing left to
+  # classify with. If the workflow still read `HEAD`, the row above would print this same value.
+  _mb_derive HEAD "$mbrun/from-head" && mb_rc=0 || mb_rc=$?
+  chk "merge-base seam NON-VACUOUS: from the checkout HEAD the merge base is the BASE TIP itself" \
+    "$mb_rc:$(paste -sd, - < "$mbrun/from-head/mergebase-selftest-suite.txt" 2>/dev/null)" \
+    "0:advertised.py,advertised.sh"
+  # THROUGH TO THE MESSAGE (AGENTS pre-flight item 9): the marquee claim is enforced through the
+  # EVIDENCE path, so assert on the diagnosis the author reads, driven by the manifests the workflow
+  # actually produced -- not by hand-written fixtures.
+  local mbdir="$tmp/mergebase-scripts"
+  mkdir -p "$mbdir"
+  printf '%s\n' 'import sys' 'if "--self-test" in sys.argv:' '    pass' > "$mbdir/advertised.py"
+  printf '%s\n' advertised.py > "$mbdir/manifest.txt"
+  mb_verdict=$(_derive_full_selftest_suite "$mbdir" "$mbdir/manifest.txt" \
+    "$mbrun/fixed/base-selftest-suite.txt" "$mbrun/fixed/base-selftest-retirements.txt" \
+    "$mbrun/fixed/mergebase-selftest-suite.txt" 2>&1 >/dev/null || true)
+  chk "END TO END: the workflow's own manifests make the gate say BEHIND BASE" \
+    "$(grep -c 'BEHIND BASE, it did not remove a self-test' <<< "$mb_verdict")" "1"
+  mb_verdict=$(_derive_full_selftest_suite "$mbdir" "$mbdir/manifest.txt" \
+    "$mbrun/from-head/base-selftest-suite.txt" "$mbrun/from-head/base-selftest-retirements.txt" \
+    "$mbrun/from-head/mergebase-selftest-suite.txt" 2>&1 >/dev/null || true)
+  chk "END TO END NON-VACUOUS: the HEAD-derived manifests restore the WRONG accusation" \
+    "$(grep -c 'was removed without prior base-branch retirement approval' <<< "$mb_verdict")" "1"
+  # And a head the job cannot resolve is a REFUSAL, not a fallback to the tree it happens to sit on.
+  _mb_derive 0000000000000000000000000000000000000000 "$mbrun/unresolvable" && mb_rc=0 || mb_rc=$?
+  chk "merge-base seam: an UNRESOLVABLE PR head refuses instead of falling back" \
+    "$([[ "$mb_rc" -ne 0 ]] && printf refused || printf ran)" "refused"
+  chk "and the refusal NAMES the head commit it could not resolve" \
+    "$(grep -c '^::error::head commit 0\{40\} is unresolvable' "$mbrun/unresolvable/derive.log")" "1"
 
   # THE ARM, EXECUTED. The REAL requirement table's verdict depends on what this runner happens to
   # have installed -- that is the entire point of the table -- so neither direction could be driven
@@ -8970,9 +9194,14 @@ case "${1:-}" in
   # target-controlled step (rustup honouring the target's toolchain pin, then the gate's build
   # scripts and tests) exists to discover it through $RUNNER_TEMP.
   purge-credentials) purge_credentials ;;
+  # [issue #1834] The merge-base manifest is REQUIRED, not optional: it is the only thing that tells
+  # a genuine self-test removal apart from a branch that predates a base-branch addition, and both
+  # verdicts refuse, so a caller that omitted it would get a refusal blaming the wrong tree. The
+  # arity therefore pins the wiring at this seam as well as at pr-gate.yml's (asserted verbatim by
+  # --self-test), rather than letting a dropped argument fall back to the ambiguous message.
   print-selftest-suite)
-    [[ $# -eq 3 ]] || die 'usage: worker-live.sh print-selftest-suite <base-manifest> <base-retirements>'
-    _derive_full_selftest_suite "$SCRIPT_DIR" "$SELFTEST_MANIFEST" "$2" "$3"
+    [[ $# -eq 4 ]] || die 'usage: worker-live.sh print-selftest-suite <base-manifest> <base-retirements> <merge-base-manifest>'
+    _derive_full_selftest_suite "$SCRIPT_DIR" "$SELFTEST_MANIFEST" "$2" "$3" "$4"
     ;;
   # [issue #1371] The #824 dependency preflight, exposed to the lane that does not go through
   # registry_selftest_gate. pr-gate.yml's suite step drives `print-selftest-suite` + `run-selftest`
