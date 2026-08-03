@@ -33,9 +33,12 @@
 # unambiguously. The bare `groom-mint-tick` prefix is load-bearing on its own: it proves the tick
 # REACHED the mint stage, so a run that died earlier (ledger data-only invariant sweep, the
 # per-owner repo resolve) is not counted as evidence of a mint gap rather than being miscounted as
-# two skipped owners. And recording the `.ok-` side as well as the `.skip-` side is what makes
-# RECOVERY observable: an owner that starts minting again — or that is dropped from the workflow
-# entirely — stops appearing in any skip set on the newest tick, which is the close signal.
+# two skipped owners. That run is EVIDENCE-FREE, which is not the same as harmless: a settled run
+# with no marker establishes no owner's outcome at all, so `read_ticks` stops the crawl there
+# rather than stepping over it and presenting the ticks on either side as adjacent (review round 2).
+# And recording the `.ok-` side as well as the `.skip-` side is what makes RECOVERY observable: an
+# owner that starts minting again — or that is dropped from the workflow entirely — stops appearing
+# in any skip set on the newest tick, which is the close signal.
 #
 # WHERE IT IS HOSTED. groom.yml, as its own job with NO `needs:` and NO `if:`, exactly like the
 # `metrics-stale` and `dispatch-stall` watchdogs it sits beside and for the same reason: a watchdog
@@ -135,6 +138,21 @@ ARTIFACT_PAGE_SIZE = 100
 # (delaying a page), never fabricate a skip.
 ALLOWED_TICK_EVENTS = ("schedule",)
 RUN_PAGE_SIZE = 100
+
+# A RUN THAT HAS NOT SETTLED HAS NO OUTCOME YET (review round 2).
+# The marker is uploaded near the END of the groom sweep, so a run still in flight has no marker —
+# and "no marker yet" is not "no marker ever". The `mint-gap` job has NO `needs:` and runs
+# CONCURRENTLY with that sweep inside the very run this reader is crawling, so the newest validated
+# run is essentially ALWAYS in flight — which is the one-tick detection lag the hosting decision
+# above states and prices. Requiring a marker from it would take the watchdog permanently offline.
+#
+# `status` is the only field that separates "no marker yet" from "no marker ever", so the boundary
+# is drawn there and nowhere else: a run this reader has proved SETTLED must produce exactly one
+# usable tick outcome, and an unsettled one is never asked for a marker at all. Only the exact
+# string `completed` settles a run — an absent, renamed or unknown status is unsettled, so a field
+# this reader stops understanding degrades to a SHORTER provable history, never to "that tick
+# minted fine".
+RUN_SETTLED_STATUS = "completed"
 GH_JSON_ACCEPT = "Accept: application/vnd.github+json"
 
 ALERT_MARKER_PREFIX = "<!-- groom-mint-alert:v1 key=groom-mint-gap owner="
@@ -243,17 +261,20 @@ def artifacts_complete(payload):
 
 
 def tick_runs(payload, default_branch):
-    """The workflow-runs listing -> {run_id: run_created_at} for the runs allowed to produce a
-    marker. Everything else in the repository is denied.
+    """The workflow-runs listing -> {run_id: (run_created_at, settled)} for the runs allowed to
+    produce a marker. Everything else in the repository is denied.
 
     FAIL CLOSED on every field: a run entry that does not EXACTLY name this workflow's path, sit on
     the default branch and carry an allowed event is dropped, so its artifacts are not evidence
     however they are named. An unknown/empty `default_branch` admits NOTHING rather than matching
     every branch — a wildcard here would restore the whole spoof.
 
-    The VALUE is the run's own creation time, never the artifact's upload time: a re-run of an old
-    tick uploads a marker stamped now, and ordering evidence on that would let it jump ahead of
-    newer scheduled ticks and reset a live streak."""
+    The first VALUE element is the run's own creation time, never the artifact's upload time: a
+    re-run of an old tick uploads a marker stamped now, and ordering evidence on that would let it
+    jump ahead of newer scheduled ticks and reset a live streak. The second is whether the run has
+    SETTLED (RUN_SETTLED_STATUS) — an unsettled run is kept in the set rather than dropped from it,
+    because its PLACE in the history is evidence even though its outcome is not: dropping it would
+    silently splice the ticks on either side of it together."""
     runs = {}
     if not isinstance(default_branch, str) or not default_branch:
         return runs
@@ -275,7 +296,7 @@ def tick_runs(payload, default_branch):
         created = entry.get("created_at")
         if not isinstance(created, str) or not created:
             continue
-        runs[run_id] = created
+        runs[run_id] = (created, entry.get("status") == RUN_SETTLED_STATUS)
     return runs
 
 
@@ -489,17 +510,31 @@ def read_tick_runs(repo, default_branch, runner):
 
 
 def newest_runs(runs, limit):
-    """The `limit` newest validated runs, NEWEST FIRST, as [(run_id, created_at)].
+    """The `limit` newest validated runs the crawl must traverse, NEWEST FIRST, as
+    [(run_id, created_at, settled)].
 
     Ordered on the same `(created_at, run_id)` key as `ordered_ticks`, because these are the runs
     whose ticks sit at the FRONT of the history: a selection that ordered on the run id, or on
     whatever order the listing arrived in, could leave the newest tick unread and score a live
     streak off stale evidence. A non-positive limit asks for NOTHING rather than slicing from the
-    wrong end of the list."""
+    wrong end of the list.
+
+    THE LEADING UNSETTLED RUNS ARE STEPPED OVER, and they are the ONLY runs that may be: a run
+    still in flight (RUN_SETTLED_STATUS) — including the one this watchdog is itself running inside
+    — has not produced its tick outcome yet, so the provable history simply starts at the newest
+    SETTLED tick. That is a lag, not a hole; nothing is spliced, because there is no
+    validated tick in front of them to splice to. They are stepped over BEFORE the limit is applied
+    so the in-flight tick cannot eat a slot the streak needs, which keeps the request count at
+    `limit`. An unsettled run BEHIND a settled one is returned instead — `read_ticks` treats it as
+    the hole it is, since the ticks on both sides of it are then no longer adjacent."""
     if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
         return []
-    ordered = sorted(runs.items(), key=lambda item: (item[1], item[0]), reverse=True)
-    return ordered[:limit]
+    ordered = sorted(runs.items(), key=lambda item: (item[1][0], item[0]), reverse=True)
+    rows = [(run_id, created, settled) for run_id, (created, settled) in ordered]
+    start = 0
+    while start < len(rows) and not rows[start][2]:
+        start += 1
+    return rows[start:start + limit]
 
 
 def read_ticks(repo, runner=None, threshold=SKIP_STREAK_THRESHOLD):
@@ -525,13 +560,26 @@ def read_ticks(repo, runner=None, threshold=SKIP_STREAK_THRESHOLD):
     workflow-scoped runs listing: every artifact it returns is put through `tick_records` against
     the SINGLE run it was requested for, so a payload naming any other run contributes nothing.
 
-    A per-run read that is REFUSED — or that comes back a PARTIAL page it cannot prove whole
-    (`artifacts_complete`) — is a HOLE, not a short tail: the runs behind it are OLDER, and
-    carrying them forward would present non-adjacent ticks as consecutive — which could FABRICATE a
-    threshold-length streak out of a blip. Nor may the partial page itself contribute: its newest
-    marker may simply not be on it. So the crawl stops at the hole, keeps only the contiguous
-    newest prefix it has actually validated, and reports `truncated` so a bounded read is stated in
-    the log rather than silently read as a short history.
+    EVERY TRAVERSED RUN MUST YIELD EXACTLY ONE USABLE TICK OUTCOME. Three things deny one, and all
+    three are the SAME hole (review round 2):
+      - the per-run read is REFUSED;
+      - it comes back a PARTIAL page this reader cannot prove whole (`artifacts_complete`) — its
+        newest marker may simply not be on it, and the marker it did return may be an older
+        re-run's, i.e. that tick's stale outcome;
+      - it comes back a COMPLETE page carrying no parseable marker at all. A complete page proves
+        the LISTING is whole; it does not prove a mint outcome EXISTS. A settled groom run that
+        died before the mint stage (or whose marker step failed) is exactly as silent about that
+        owner as a refused read is.
+    A hole is never a short tail: the runs behind it are OLDER, and carrying them forward would
+    present non-adjacent ticks as consecutive — which could FABRICATE a threshold-length streak out
+    of one silent tick, or step over an unknown newest tick to reach an older `ok` and retire a live
+    alert. So the crawl stops at the hole, keeps only the contiguous newest prefix it has actually
+    validated, and reports `truncated` so a bounded read is stated in the log rather than silently
+    read as a short history.
+
+    The ONE run a marker is not demanded of is one that has not SETTLED (RUN_SETTLED_STATUS), and
+    only while it leads the history — see `newest_runs`, and RUN_SETTLED_STATUS for why that
+    boundary is drawn from the run's own status field rather than from the absence of a marker.
 
     `runner` is resolved at CALL time, not bound as a default: a default argument captures the
     function object at definition, which makes the live path unpatchable and every stubbed-flow
@@ -546,13 +594,27 @@ def read_ticks(repo, runner=None, threshold=SKIP_STREAK_THRESHOLD):
     if runs is None:
         return None, False
     records = {}
-    for index, (run_id, created) in enumerate(newest_runs(runs, threshold + 1)):
+
+    def hole():
+        """Stop here. Keyed on what has actually been VALIDATED, not on the loop index: with
+        nothing validated there is no evidence at all (the caller must fail loud rather than read
+        an unknown newest tick as a recovery), and with a prefix validated the older runs behind
+        this hole are not adjacent to it and are deliberately NOT carried forward."""
+        return (ordered_ticks(records), True) if records else (None, False)
+
+    for run_id, created, settled in newest_runs(runs, threshold + 1):
+        if not settled:
+            return hole()
         payload = runner(["api", "-H", GH_JSON_ACCEPT,
                           f"/repos/{repo}/actions/runs/{run_id}/artifacts"
                           f"?per_page={ARTIFACT_PAGE_SIZE}"])
         if payload is None or not artifacts_complete(payload):
-            return (None, False) if index == 0 else (ordered_ticks(records), True)
+            return hole()
         tick_records(payload, {run_id: created}, into=records)
+        # `tick_records` was handed this ONE run, so it can only have keyed on `run_id`: its absence
+        # means the whole page held no marker this reader may score for the run it asked about.
+        if run_id not in records:
+            return hole()
     return ordered_ticks(records), False
 
 
@@ -632,12 +694,14 @@ def main():
         # is no VALIDATED evidence at all, so neither a page nor a close is defensible. The step's
         # continue-on-error keeps the alarm isolated.
         print("::warning::groom-mint: a listing this watchdog needs to VALIDATE mint evidence was "
-              "refused, or answered a partial page it could not prove whole (repo, groom runs, or "
-              "artifacts) — no mint evidence this tick (next tick retries)")
+              "refused, or answered a partial page it could not prove whole, or the newest settled "
+              "groom run uploaded no mint marker at all (repo, groom runs, or artifacts) — no mint "
+              "evidence this tick (next tick retries)")
         return 1
     if truncated:
-        print("::warning::groom-mint: the artifacts of a groom run behind the newest "
-              f"{len(ticks)} tick(s) were refused or could not be proved whole, so only those "
+        print("::warning::groom-mint: a groom run behind the newest "
+              f"{len(ticks)} tick(s) established no mint outcome (refused, unprovable, still "
+              f"running, or no marker uploaded), so only those "
               f"{len(ticks)} are reachable this tick (wanted {SKIP_STREAK_THRESHOLD + 1}) — a "
               "longer streak than that cannot be proved, and the ticks behind that hole are "
               "deliberately NOT carried forward")
@@ -861,9 +925,9 @@ FIXTURE_BRANCH = "trunk-fixture"
 
 
 def _run_row(run_id, created_at="2026-07-29T18:00:00Z", path=GROOM_WORKFLOW, event="schedule",
-             branch=FIXTURE_BRANCH):
+             branch=FIXTURE_BRANCH, status="completed"):
     return {"id": run_id, "created_at": created_at, "path": path, "event": event,
-            "head_branch": branch}
+            "head_branch": branch, "status": status}
 
 
 def _test_provenance(chk):
@@ -874,9 +938,23 @@ def _test_provenance(chk):
         _run_row(101, "2026-07-29T18:00:00Z"),
         _run_row(102, "2026-07-29T18:15:00Z"),
     ]}
-    chk("provenance: a default-branch scheduled run of THIS workflow is the accepted shape",
+    chk("provenance: a default-branch scheduled run of THIS workflow is the accepted shape, "
+        "carrying its creation time AND whether it has settled",
         tick_runs(listing, FIXTURE_BRANCH),
-        {101: "2026-07-29T18:00:00Z", 102: "2026-07-29T18:15:00Z"})
+        {101: ("2026-07-29T18:00:00Z", True), 102: ("2026-07-29T18:15:00Z", True)})
+
+    # SETTLEMENT IS A SEPARATE AXIS from provenance: an in-flight run is still a validated run and
+    # must stay IN the set (dropping it would splice the ticks on either side of it), it is merely
+    # not yet ANSWERABLE. Only the exact status string settles one — the literals are written out
+    # here rather than derived from RUN_SETTLED_STATUS, which could not fail (AGENTS.md item 2b).
+    for label, status in (("a run still queued", "queued"), ("a run in progress", "in_progress"),
+                          ("a run waiting on a deployment gate", "waiting"),
+                          ("a status this reader does not know", "finished"),
+                          ("a status that merely CONTAINS the settled word", "completed-ish"),
+                          ("a run with no status field at all", None)):
+        chk(f"provenance: {label} is admitted as a run but NOT as settled",
+            tick_runs({"workflow_runs": [_run_row(920, status=status)]}, FIXTURE_BRANCH),
+            {920: ("2026-07-29T18:00:00Z", False)})
 
     # One row per rejection reason, so each is a line-anchored kill of its own guard rather than a
     # single row that stays red if any one of them is deleted.
@@ -1121,13 +1199,14 @@ def _test_paging(chk):
     # thing a reader can act on is that the run STATES more than it was handed.
     OVERFULL_TOTAL = 137
 
-    def crawler(markers, runs, refuse=(), overfull=(), countless=()):
+    def crawler(markers, runs, refuse=(), overfull=(), countless=(), unsettled=()):
         """A `gh api` stub for every read the crawl makes. `markers[run_id]` is what THAT run's own
         artifacts endpoint answers with; the runs listing answers only the run ids in `runs`, so
         every fixture is filtered through the real provenance gate rather than past it. `refuse`
         may name `"repo"`, `"runs"`, or any run id. `overfull` names runs whose page states more
-        artifacts than it returned (the silent truncation the live endpoint answers 200 to), and
-        `countless` names runs whose page states no `total_count` at all."""
+        artifacts than it returned (the silent truncation the live endpoint answers 200 to),
+        `countless` names runs whose page states no `total_count` at all, and `unsettled` names
+        runs the listing reports as still IN FLIGHT."""
         asked = []
 
         def runner(args):
@@ -1145,7 +1224,9 @@ def _test_paging(chk):
                 return page
             if "/actions/workflows/" in url:
                 return None if "runs" in refuse else {"workflow_runs": [
-                    _run_row(run_id, created) for run_id, created in sorted(runs.items())]}
+                    _run_row(run_id, created,
+                             status="in_progress" if run_id in unsettled else "completed")
+                    for run_id, created in sorted(runs.items())]}
             if "/actions/artifacts" in url:
                 # The repository-WIDE listing. Answered generously — and as a COMPLETE page, so the
                 # row below stays about the fact that it is never ASKED for rather than passing
@@ -1165,11 +1246,29 @@ def _test_paging(chk):
         return {run_id: [_artifact("groom-mint-tick.skip-jeswr", run_id, created)]
                 for run_id, created in runs.items()}
 
+    def validated(runs, unsettled=()):
+        """`scheduled()` shape -> the {run_id: (created_at, settled)} shape `tick_runs` derives,
+        for the rows that exercise `newest_runs` directly."""
+        return {run_id: (created, run_id not in unsettled) for run_id, created in runs.items()}
+
+    def scored(ticks, owner="jeswr"):
+        """A crawl result read the way main() reads it -> (skip rows, ticks seen, streak, verdict).
+
+        Tolerant of the `None` a refusing crawl returns ON PURPOSE: `len(None)` would abort the
+        whole suite mid-row, and a mutant that empties the history must RED the row it broke rather
+        than record as killed while every check below it never ran (AGENTS.md item 4,
+        crash-after-partial-run — measured here on the head-skip mutants)."""
+        rows = ticks or []
+        streak = skip_streaks(rows, {owner})[owner]
+        return ([sorted(skip) for _ok, skip in rows], len(rows), streak,
+                gap_verdict(streak, len(rows)))
+
     # THE COMPLETENESS PROOF ITSELF. The accept rows come first on purpose: without them the reject
     # rows are all satisfied by a predicate that simply never returns True, which would take the
     # whole watchdog offline while reading as a tightened check.
     chk("page: a run that states exactly what its page returned is proved whole (and an empty run "
-        "is whole too — it died before the mint stage, which is a real, evidence-free tick)",
+        "is whole too — completeness is a property of the LISTING; whether that run established a "
+        "mint outcome at all is the crawl's separate question below)",
         (artifacts_complete({"total_count": 2, "artifacts": [_artifact("a"), _artifact("b")]}),
          artifacts_complete({"total_count": 0, "artifacts": []})), (True, True))
     for label, page in (
@@ -1193,7 +1292,7 @@ def _test_paging(chk):
     ticks, truncated = read_ticks("o/r", runner=runner)
     chk("crawl: exactly THRESHOLD+1 requests, one per validated run, newest first — the cost is a "
         "function of the threshold and NOT of how many runs the repository has",
-        (asked, len(ticks), truncated),
+        (asked, scored(ticks)[1], truncated),
         ([300 + 3 * wanted - 1 - step for step in range(wanted)], wanted, False))
     chk("crawl: an unrelated workflow's artifact storm can no longer truncate the history — the "
         "repository-wide listing is never asked for at all",
@@ -1204,7 +1303,7 @@ def _test_paging(chk):
     runner, asked = crawler(skips(plenty), plenty)
     ticks, truncated = read_ticks("o/r", runner=runner, threshold=2)
     chk("crawl: the run bound is one past the threshold the caller HANDED it, never a baked-in one",
-        (len(asked), len(ticks), truncated), (3, 3, False))
+        (len(asked), scored(ticks)[1], truncated), (3, 3, False))
 
     # NEWEST IS A TIMESTAMP. Ids ASCEND while creation times DESCEND, so the newest ticks are the
     # LOWEST ids: a selection keyed on the run id, or on the order the listing arrived in, picks
@@ -1213,9 +1312,23 @@ def _test_paging(chk):
     runner, asked = crawler(skips(inverted), inverted)
     ticks, _truncated = read_ticks("o/r", runner=runner)
     chk("crawl: 'newest' is the run's own creation TIME, never its id or the listing's order",
-        (asked, len(ticks)), ([600 + step for step in range(wanted)], wanted))
+        (asked, scored(ticks)[1]), ([600 + step for step in range(wanted)], wanted))
     chk("crawl: a non-positive limit asks for NOTHING rather than slicing from the wrong end",
-        (newest_runs(plenty, 0), newest_runs(plenty, -1), newest_runs(plenty, True)), ([], [], []))
+        (newest_runs(validated(plenty), 0), newest_runs(validated(plenty), -1),
+         newest_runs(validated(plenty), True)), ([], [], []))
+
+    # `newest_runs` on its own, so the SETTLEMENT boundary is pinned line-granularly and not only
+    # through the crawl: the leading in-flight runs are stepped over BEFORE the limit is applied,
+    # while one behind a settled run is returned (and flagged unsettled) for the crawl to treat as
+    # the hole it is. Expected rows are arithmetic over the fixture's own construction (item 2b).
+    trio = scheduled(3, 900)
+    chk("crawl: newest_runs steps over the LEADING in-flight runs only, and hands each returned "
+        "run's settlement on rather than dropping the unsettled one out of the history",
+        (newest_runs(validated(trio, unsettled=(902,)), 2),
+         newest_runs(validated(trio, unsettled=(901,)), 3)),
+        ([(901, "2026-07-29T18:01:00Z", True), (900, "2026-07-29T18:00:00Z", True)],
+         [(902, "2026-07-29T18:02:00Z", True), (901, "2026-07-29T18:01:00Z", False),
+          (900, "2026-07-29T18:00:00Z", True)]))
 
     # THE ORDERING KEY THE CRAWL HANDS ON is each RUN's own creation time, and the crawl is now the
     # only place that pairing is made — so it needs its own row. Here the OLDEST-id run is the
@@ -1228,11 +1341,10 @@ def _test_paging(chk):
     recovered[600] = [_artifact("groom-mint-tick.ok-jeswr", 600, "2026-07-29T18:00:00Z")]
     runner, _asked = crawler(recovered, inverted)
     ticks, _truncated = read_ticks("o/r", runner=runner)
-    streak = skip_streaks(ticks, {"jeswr"})["jeswr"]
+    rows, _seen, streak, verdict = scored(ticks)
     chk("crawl: every record is stamped with its RUN's creation time, so the newest tick leads the "
         "history and a recovery cannot be buried behind older skips",
-        ([sorted(skip) for _ok, skip in ticks], streak, gap_verdict(streak, len(ticks))),
-        ([[]] + [["jeswr"]] * (wanted - 1), 0, "recovered"))
+        (rows, streak, verdict), ([[]] + [["jeswr"]] * (wanted - 1), 0, "recovered"))
 
     # THE RUN-SCOPED ENDPOINT IS NOT TRUSTED ALONE. Each payload here names the OTHER validated
     # run, so a crawl that validated against the whole run set instead of the one run it asked for
@@ -1240,10 +1352,11 @@ def _test_paging(chk):
     pair = scheduled(2, 700)
     cross = {700: [_artifact("groom-mint-tick.skip-jeswr", 701, "2026-07-29T18:00:00Z")],
              701: [_artifact("groom-mint-tick.ok-jeswr", 700, "2026-07-29T18:01:00Z")]}
-    runner, _asked = crawler(cross, pair)
+    runner, asked = crawler(cross, pair)
     chk("crawl: a run-scoped payload is still validated against the ONE run it was asked for — an "
-        "artifact naming any other run is not that run's evidence",
-        read_ticks("o/r", runner=runner), ([], False))
+        "artifact naming any other run is not that run's evidence, so the newest run established "
+        "no outcome and the crawl stops there rather than reaching the older run's page",
+        (read_ticks("o/r", runner=runner), asked), ((None, False), [701]))
 
     # No validated run at all: nothing to ask, and a repository full of perfect names is still not
     # evidence. Without this row the crawl could ignore `runs` entirely.
@@ -1258,19 +1371,70 @@ def _test_paging(chk):
     runner, asked = crawler(skips(short), short)
     ticks, truncated = read_ticks("o/r", runner=runner)
     chk("crawl: fewer validated runs than THRESHOLD+1 is a short history, never a truncated read",
-        (len(asked), len(ticks), truncated),
+        (len(asked), scored(ticks)[1], truncated),
         (SKIP_STREAK_THRESHOLD - 1, SKIP_STREAK_THRESHOLD - 1, False))
 
-    # A validated run that died BEFORE the mint stage uploaded no marker. It is not evidence in
-    # either direction: it must not read as a skipped owner, and it must not end the crawl early.
+    # A SETTLED run that uploaded NO MARKER is a HOLE (review round 2). It died before the mint
+    # stage, or its marker step failed — either way it establishes no owner's mint outcome, exactly
+    # like a refused read. A complete page proves the LISTING is whole; it does not prove an outcome
+    # EXISTS. Its artifacts page is deliberately answered as COMPLETE here (and carrying a real,
+    # unrelated artifact) so these rows are about the missing OUTCOME and cannot pass by way of the
+    # completeness check happening to reject the page.
     gapped = scheduled(wanted, 850)
-    markerless = 850 + wanted - 2
+    newest_gapped, silent = 850 + wanted - 1, 850 + wanted - 3
     payloads = skips(gapped)
-    payloads[markerless] = [_artifact("groom-lease-debug", markerless)]
+    payloads[silent] = [_artifact("groom-lease-debug", silent)]
     runner, asked = crawler(payloads, gapped)
     ticks, truncated = read_ticks("o/r", runner=runner)
-    chk("crawl: a validated run that uploaded no marker yields no tick and does not stop the crawl",
-        (len(asked), len(ticks), truncated), (wanted, wanted - 1, False))
+    rows, _seen, streak, verdict = scored(ticks)
+    chk("crawl: a settled run that uploaded no marker MID-crawl stops the crawl, contributes no "
+        "tick of its own, is flagged short, and cannot splice the ticks behind it into a "
+        "threshold-length streak",
+        (asked, rows, truncated, streak, verdict),
+        ([newest_gapped, newest_gapped - 1, silent], [["jeswr"], ["jeswr"]], True, 2, "flapping"))
+
+    # ... and on the NEWEST run it leaves nothing validated. The second-newest tick here is an `ok`,
+    # so a reader that stepped over the silent newest run would score streak 0, call it `recovered`
+    # and CLOSE a live alert while that tick's actual outcome is unknown — the fabrication in the
+    # opposite direction from the streak above.
+    stale_ok = dict(skips(gapped))
+    stale_ok[newest_gapped] = [_artifact("groom-lease-debug", newest_gapped)]
+    stale_ok[newest_gapped - 1] = [
+        _artifact("groom-mint-tick.ok-jeswr", newest_gapped - 1, "2026-07-29T18:03:30Z")]
+    runner, asked = crawler(stale_ok, gapped)
+    chk("crawl: a settled NEWEST run that uploaded no marker leaves nothing validated — an unknown "
+        "newest tick may not be stepped over to reach an older `ok` and retire a live alert",
+        (read_ticks("o/r", runner=runner), asked), ((None, False), [newest_gapped]))
+
+    # THE ONE RUN NO MARKER IS DEMANDED OF is one that has not SETTLED, and only while it LEADS the
+    # history. `mint-gap` carries no `needs:` and runs concurrently with the sweep inside the very
+    # run it crawls, so the newest validated run is essentially always in flight: its marker is not
+    # missing, it does not exist yet. Demanding one would take the watchdog permanently offline —
+    # which is why the boundary is the run's own status and not the absence of a marker.
+    newest_plenty = 300 + 3 * wanted - 1
+    runner, asked = crawler(skips(plenty), plenty, unsettled=(newest_plenty,))
+    ticks, truncated = read_ticks("o/r", runner=runner)
+    _rows, seen, streak, verdict = scored(ticks)
+    chk("crawl: an IN-FLIGHT run leading the history is stepped over — never asked for artifacts, "
+        "never a hole, and stepped over BEFORE the bound so it cannot eat a slot the streak needs",
+        (asked, seen, truncated, streak, verdict),
+        ([newest_plenty - 1 - step for step in range(wanted)], wanted, False, wanted, "gap"))
+
+    # ... but ONLY while it leads. An in-flight run BEHIND a settled one (a re-run resets an older
+    # tick's status) has no established outcome either, and stepping over it would splice
+    # non-adjacent ticks — so it is the same hole a silent run is, and it is not even asked for.
+    runner, asked = crawler(skips(gapped), gapped, unsettled=(silent,))
+    ticks, truncated = read_ticks("o/r", runner=runner)
+    rows, _seen, streak, verdict = scored(ticks)
+    chk("crawl: an in-flight run BEHIND a settled one is a hole rather than a step-over, so the "
+        "ticks behind it are not carried forward",
+        (asked, rows, truncated, streak, verdict),
+        ([newest_gapped, newest_gapped - 1], [["jeswr"], ["jeswr"]], True, 2, "flapping"))
+
+    runner, asked = crawler(skips(gapped), gapped, unsettled=tuple(gapped))
+    chk("crawl: with every validated run still in flight there is no settled tick at all — an "
+        "empty history that neither pages nor closes, and not one artifact request",
+        (read_ticks("o/r", runner=runner), asked, gap_verdict(0, 0)), (([], False), [], "unknown"))
 
     # A REFUSED read is no evidence at all -> None, so main() fails loud instead of reading an
     # empty history as "every owner recovered" and closing live alerts. Each read gets its own row:
@@ -1301,12 +1465,11 @@ def _test_paging(chk):
     ticks, truncated = read_ticks("o/r", runner=runner)
     chk("crawl: a refusal mid-crawl keeps only the contiguous newest prefix, stops at the hole, "
         "and flags the read short",
-        (asked, [sorted(skip) for _ok, skip in ticks], truncated),
+        (asked, scored(ticks)[0], truncated),
         ([newest_id, newest_id - 1, hole], [["jeswr"], ["jeswr"]], True))
-    streak = skip_streaks(ticks, {"jeswr"})["jeswr"]
+    _rows, _seen, streak, verdict = scored(ticks)
     chk("crawl: ... so the ticks behind the hole cannot FABRICATE a threshold-length streak out of "
-        "one refused read",
-        (streak, gap_verdict(streak, len(ticks))), (2, "flapping"))
+        "one refused read", (streak, verdict), (2, "flapping"))
 
     # A PARTIAL page is a HOLE TOO (review round 1). `total_count` is the run's own count of its
     # artifacts while the page carries at most ARTIFACT_PAGE_SIZE of them, so an over-cap run
@@ -1336,11 +1499,10 @@ def _test_paging(chk):
                           ("states no total_count at all", {"countless": (hole,)})):
         runner, asked = crawler(skips(run_ids), run_ids, **kwargs)
         ticks, truncated = read_ticks("o/r", runner=runner)
-        streak = skip_streaks(ticks, {"jeswr"})["jeswr"]
+        rows, _seen, streak, verdict = scored(ticks)
         chk(f"crawl: a mid-crawl page that {label} stops the crawl, contributes no tick of its "
             "own, is flagged short, and cannot fabricate a threshold-length streak",
-            (asked, [sorted(skip) for _ok, skip in ticks], truncated, streak,
-             gap_verdict(streak, len(ticks))),
+            (asked, rows, truncated, streak, verdict),
             ([newest_id, newest_id - 1, hole], [["jeswr"], ["jeswr"]], True, 2, "flapping"))
 
 
