@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1848,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d5714c0fc9d2250f42b381b49cc6a782871222ea",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_apply_cli` reads the current labels, separately reads the timeline to compute `clearable`, and later calls `apply_triage` to remove `needs:area`. There is no compare-and-swap or revalidation tying the newest `needs:area` application used by `area_park_clearance` to the actual removal. If a human removes/reapplies the label after the proof read but before phase 3's edit, the stale `clearable=True` still authorizes deleting the human's new hold. The post-condition's revision-bound reads do not protect this: they occur after the mutation and only validate the role invariant; they neither compare with the pre-proof revision nor re-check ownership. The workflow concurrency group serializes workflow runs but does not serialize a human label write against the running job.",
+    "file": "scripts/triage.py",
+    "fix_hint": "Bind the authorization to the mutation. For example, capture issue revision/state around the ownership proof and re-read immediately before removal, refusing/retrying if it moved, then re-prove ownership on the fresh timeline; ideally use an API conditional/CAS mechanism if one is available. Add a binding-layer test that injects a human `needs:area` reapplication between proof and edit and asserts that the label is not removed.",
+    "severity": "major",
+    "title": "Ownership proof is not bound to the label deletion"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe ownership decision is fail-closed for malformed and ambiguous timeline data, and the direct/mutant tests are substantial. However, the proof is not bound to the subsequent deletion. A human can reapply `needs:area` after the timeline read and before the label mutation, and the applier can then delete that newly human-owned hold. Because this is exactly the trust property introduced to authorize the deletion, it is a major correctness issue.",
+  "verdict": "request_changes"
+ }
+}
