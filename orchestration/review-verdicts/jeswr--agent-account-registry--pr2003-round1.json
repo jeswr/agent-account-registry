@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2003,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "daa6a36bd962d3c4df36ab877f78af61e16bfcd7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe change is correct and complete. The new worker self-test exercises the previously unpinned well-formed explicit `unspecified` ingress and would fail if index 0 were emitted as `why:0`; the dashboard test independently pins the intended fold of absent and schema-valid stored `unspecified` records. The model-health wording accurately distinguishes decoder compatibility coverage from live producer behavior. No production control flow, trust check, workflow permission, or untrusted-text boundary is weakened.",
+  "verdict": "approve"
+ }
+}
