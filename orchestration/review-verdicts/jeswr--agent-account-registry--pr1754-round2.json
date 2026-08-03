@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1754,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6daa722d7e964726275a79a6fd00af997cf87b81",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`guard_prefix` is materially unchanged from round 1: while walking backward it appends any non-comment line whose indentation is lower than the current threshold. It never verifies that the line is a block opener or that its block contains the matched copy. For example, after finding a real `if` at indentation 4 around a copy at indentation 8, it will also append an unrelated assignment at indentation 2 earlier in the function. The new `noisy` test places `local unrelated=1` at the copy's indentation, so it cannot expose this defect. Consequently unrelated lower-indented source can alter a signature, and two genuinely equivalent governed copies can be made to look different without changing their enclosing guards, allowing a false green; harmless edits can also cause false failures.",
+    "file": "scripts/predicate-census.py",
+    "fix_hint": "Derive actual enclosing blocks with language-aware structure (for example AST/token structure for Python and an explicit structural parser for shell/YAML run bodies), or adopt a narrower fingerprint whose enclosure relationship is proven. Add red tests containing an unrelated lower-indented non-opener before a genuinely nested copy; verify adding/removing it leaves the signature unchanged, and verify a reconstructed left-behind narrowing still collapses the relevant cells even when such unrelated lines differ between the units.",
+    "severity": "major",
+    "title": "Guard derivation still treats arbitrary lower-indented statements as block openers"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-one soundness defect remains unchanged. `guard_prefix` still equates every earlier line at a successively lower indentation with an enclosing block opener, without checking that the line opens a block or encloses the copy. The added noise-floor coverage exercises only same-indentation sibling statements, so it does not test the reported case. This can still make signatures depend on unrelated source, produce false failures after harmless edits, and let an incomplete narrowing appear distinct for a non-governance reason. Because this derivation is the basis of a hard trust-plane gate, the change remains unsound and requires correction.",
+  "verdict": "request_changes"
+ }
+}
