@@ -25,6 +25,19 @@ on:
     # by the concurrency group below, or never fire at all for a write made with the repository's
     # own token (see next paragraph) — this trigger just stops the issue being stranded meanwhile.
     #
+    # A `labeled` event also CLEARS the classifier's own `needs:area` park (#1462). That park
+    # asserts exactly one fact — "this issue has no area:*" — and adding the missing label makes it
+    # false, so the strip planned on the readiness branch finally has an effect (it was unreachable
+    # for its whole life: `needs:area` counted itself as a gate, so `ready` could never be True
+    # while it was live). The delete is a delete of a label a HUMAN may have applied, so
+    # `triage.py --apply` proves machine ownership from the issue's OWN TIMELINE first
+    # (`area_park_clearance` -> park_policy.label_application_machine_owned, plus an attributability
+    # requirement) and refuses on every ambiguity. That is ONE extra `GET .../issues/N/timeline`,
+    # made ONLY when the park is live AND already false — never on an ordinary issue event — and it
+    # needs no permission this job does not already hold (`issues: write` covers the read; the
+    # collaborator-permission probe the trust step uses is deliberately NOT reused, see the
+    # `is_human` note in scripts/triage.py). Both directions are pinned by that script's --self-test.
+    #
     # NO SELF-TRIGGER LOOP, for two INDEPENDENT reasons. (1) This job writes labels with
     # `github.token`, and GitHub does not start workflow runs from events the repository
     # GITHUB_TOKEN emitted — the same documented rule dispatch.yml's dead `workflow_run` doorbell

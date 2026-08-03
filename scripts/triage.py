@@ -14,6 +14,9 @@ Given an issue's labels + type, decide the labels to ADD/REMOVE and whether it i
                stated priority (two labels, or one out of range) is declined, not overwritten.
   * package  — the existing `area:<section>` labels are the package. A NO-area issue is parked
                `needs:area` (it would otherwise reserve the serializing __global__ partition).
+               That park has an EXIT (#1462): once an `area:*` label is present its one fact is
+               false, and the live applier may strip it — but only on a proven-machine-owned
+               application (`area_park_clearance`), never on the say-so of the event that woke it.
   * ready    — `status:ready` iff a valid single priority AND a role AND an `area:<section>` AND
                NOT gated (`needs:*` incl. `needs:design`/`needs:user`, `trust:untrusted`) and not
                an epic. Otherwise `status:untriaged` (or `needs:area`-parked).
@@ -462,7 +465,8 @@ def normalize_issue_type(raw):
     return raw.strip().lower() if isinstance(raw, str) else ""
 
 
-def triage(labels, issue_type=DEFAULT_ISSUE_TYPE, trusted=True, known_labels=None):
+def triage(labels, issue_type=DEFAULT_ISSUE_TYPE, trusted=True, known_labels=None,
+           area_park_clearable=False):
     """Return {add:set, remove:set, ready:bool, role:str|None, warnings:list}.
 
     `issue_type` is the issue's RAW GitHub type NAME (#598) — display-cased, `""`/None when the
@@ -478,6 +482,14 @@ def triage(labels, issue_type=DEFAULT_ISSUE_TYPE, trusted=True, known_labels=Non
     keeps the role it has (or, if it has none, stays `status:untriaged`, which retriage can still
     recover) and a loud warning names the issue's missing label. `None` means "label set unknown"
     and keeps the pure-logic behaviour; the applier below always supplies it.
+
+    `area_park_clearable` (registry #1462) is the CALLER'S ATTESTATION that this issue's
+    `needs:area` park is machine-owned and may therefore be deleted — see `area_park_clearance`,
+    which is the only thing allowed to produce it. It does NOT force the strip; it only stops
+    `needs:area` from gating ITSELF, and only while an `area:*` label makes the park's one fact
+    false. Default False is the shipped fail-closed behaviour and keeps every non-attesting caller
+    (`retriage.classify`, `triage-stock-alert`, a direct call, the `reduced_write_is_safe`
+    re-classification) byte-identical.
     """
     labels = set(labels)
     if not trusted or "trust:untrusted" in labels:
@@ -507,7 +519,23 @@ def triage(labels, issue_type=DEFAULT_ISSUE_TYPE, trusted=True, known_labels=Non
             remove |= {lb for lb in existing if lb != target}
     has_area = any(lb.startswith("area:") for lb in labels)
     # ANY needs:* gate (needs:design B2, needs:user, needs:area) blocks ready. kind:epic too.
-    gated = any(lb.startswith("needs:") for lb in labels)
+    #
+    # ...with ONE exception, and it is what makes the `needs:area` strip below reachable at all
+    # (registry #1462). `needs:area` is the only gate this classifier MINTS ITSELF, and it asserts
+    # exactly one fact: "this issue has no area:*". Counting it here while an `area:*` label is
+    # present made the park self-sealing — `ready` could never be True, so the strip on the ready
+    # branch could never remove anything, and the classifier could not clear its OWN park even
+    # though triage-issue.yml re-runs it on the very `labeled` event that supplies the area (#607).
+    # The ungate is deliberately NARROW — it removes `needs:area` from ITS OWN gate test and does
+    # nothing else. It is NOT also conditioned on `has_area` here: `ready` below already requires
+    # `has_area` in its own right, so re-testing the fact at this line would be the
+    # mutually-masking-duplicate shape (AGENTS.md pre-flight 4) — a second copy of a guard that
+    # neither copy could then be killed for losing. The fact is enforced twice where the two checks
+    # are independently killable instead: by `ready`'s `has_area`, and by `area_park_clearance`,
+    # which refuses to attest at all while the issue carries no `area:*`.
+    self_park_stale = area_park_clearable and "needs:area" in labels
+    gated = any(lb.startswith("needs:")
+                for lb in (labels - {"needs:area"} if self_park_stale else labels))
     # The derived priority is part of the label set the rest of this function reasons over, exactly
     # as a derived `role:*` is — `effective`, not `labels`, is what "does this issue have a
     # priority" now means. Deriving it but testing the UNDERIVED set is the vacuous shape: the
@@ -540,6 +568,9 @@ def triage(labels, issue_type=DEFAULT_ISSUE_TYPE, trusted=True, known_labels=Non
             add.add("status:ready")
         remove.add("status:untriaged")
         remove.add("needs:area")
+        # ^ REACHABLE WITH EFFECT only via `self_park_stale` above (registry #1462). Without the
+        # ungate `ready` implies `not gated` implies `needs:area` is absent, so `remove & labels`
+        # below dropped this entry every time: the park's exit was dead code for its whole life.
     else:
         add.add("status:untriaged")
         remove.add("status:ready")
@@ -1408,6 +1439,117 @@ def live_gh(repo, number, title="triage"):
     return read_state, view, edit, warn
 
 
+# ---------------------------------------------------------------------------------------------------
+# THE `needs:area` PARK'S OWN EXIT (registry #1462).
+#
+# `triage()` mints `needs:area` for a triage-complete, area-less issue and plans the matching strip
+# on its readiness branch. That strip was DEAD: `gated` counted `needs:area` itself, so while the
+# park was live `ready` was always False, and once the park was gone `remove & labels` filtered the
+# entry out. triage-issue.yml fires on `labeled` (#607), so supplying the missing `area:*` DOES
+# re-run this classifier — and the classifier still could not clear its own park.
+#
+# Making the strip live is a DELETE of a label a HUMAN may have applied. park_policy is unambiguous
+# about that class of write: `needs:area` is the most prevalent human-appliable `needs:*` hold
+# measured on the sibling repo (200 live), and every other lane that deletes a park proves machine
+# ownership from the issue's own timeline first. So the ungate is OPT-IN, its default is the old
+# fail-closed behaviour, and only `area_park_clearance` below may attest it.
+#
+# THE PROOF IS A CONJUNCTION OF TWO INDEPENDENT FACTS. Neither implies the other, and dropping
+# either one alone flips a real timeline from refused to cleared:
+#   * NEWEST-APPLICATION-WINS — park_policy.label_application_machine_owned, the SHARED rule every
+#     other park-deleting lane runs, so a human who applies the park LAST always wins (including on
+#     an exact instant tie, which resolves toward human). Called with `is_human=lambda _l: True`
+#     ON PURPOSE: this decision needs "is the newest applier a MACHINE", not "is it a MAINTAINER",
+#     and treating every named non-App, non-`[bot]` actor as human is both strictly more
+#     conservative than the collaborator-permission probe AND free of a permission read this job's
+#     `contents: read` token may not be able to make — a probe that cannot run would degrade every
+#     human application to "not human", which is exactly the wrong direction for a delete.
+#   * ATTRIBUTABILITY — every application in the park's history has a NAMED actor. park_policy's
+#     `_is_proven_human` short-circuits on `bool(login)`, so an application whose actor field is
+#     missing/unreadable (`_event_rows` preserves it as login "") reads as "not human", i.e. as
+#     PERMISSION, at every consumer of the ownership answer. Absence of an attributable actor must
+#     never authorise a delete, so an unattributable application refuses the clearance outright.
+# Adding a THIRD conjunct here would be the mutually-masking-duplicate shape (AGENTS.md pre-flight
+# 4): "a machine ever applied it" is already implied by the two above, so it could not be killed.
+#
+# WHO CAN WRITE THE EVIDENCE (AGENTS.md pre-flight 5)? GitHub, not the issue author: the actor and
+# `performed_via_github_app` on a timeline event are set by the API, a `[bot]` suffix cannot appear
+# in a user login (GitHub logins admit no brackets), and only an identity with issues:write on this
+# repository can emit a `labeled` event at all. So the widest reading of "machine" here is "some
+# App or bot the OWNER installed cleared a park whose one fact is already false" — an owner-scoped
+# trust, on a transition that only ever hands an otherwise triage-complete issue to the readiness
+# engine. It is NOT the author-controlled-text shape that #681/#937/sparq#4743 were.
+
+
+def _park_policy():
+    """`park_policy.py` as a module. It is a sibling SCRIPT, not an installed package, so it is
+    imported by path exactly as the hyphenated siblings are."""
+    return load_sibling("park_policy.py", "registry_park_policy")
+
+
+def _timeline_events(repo, number):
+    """The issue's timeline, paginated, through the shared bounded-retry layer (an idempotent GET).
+
+    RAISES on an unreadable payload — `area_park_clearance` fails closed on the exception rather
+    than treating a short/garbled read as "no human ever applied this park".
+
+    `per_page=100` is carried in the PATH, exactly as `reconcile-conflict-park.py` reads the same
+    endpoint: `--paginate` walks whatever page size the URL asks for and defaults to 30, so leaving
+    it off would triple the round trips on a long-lived issue."""
+    entries, reason = _decode_api_pages(
+        _gh_read(["api", f"repos/{repo}/issues/{number}/timeline?per_page=100", "--paginate"]))
+    if reason is not None:
+        raise RuntimeError(f"timeline payload {reason}")
+    return entries
+
+
+def _applications_attributable(events, label, park_policy):
+    """Does EVERY `labeled <label>` application in `events` name an actor?
+
+    An App-driven event counts as attributable even with no login (the App IS the actor); an event
+    with neither is unattributable and proves nothing about who owns the park. Raises whatever
+    `_event_rows` raises on a malformed timeline — the caller fails closed on it."""
+    return all(bool(login) or via_app
+               for _created, kind, login, via_app
+               in park_policy._event_rows(events, label)      # noqa: SLF001 — the shared normalizer
+               if kind == "labeled")
+
+
+def area_park_clearance(repo, number, labels, fetch_events=None, warn=None):
+    """May THIS live issue's `needs:area` park be stripped? The ONLY producer of `triage()`'s
+    `area_park_clearable` attestation, and False on every ambiguity.
+
+    `fetch_events(repo, number)` returns the issue's timeline events; the default reads them live.
+    Injected so the self-test drives the whole decision — and the API-call COUNT — against a fake.
+    """
+    emit = warn or (lambda _message: None)
+    labels = set(labels)
+    # A COST GUARD, not a second copy of a trust check: no API call unless the question is live —
+    # the park must be ON the issue and its one fact must ALREADY be false. Every other issue event,
+    # the overwhelming majority, costs exactly what it always did. Its CORRECTNESS twin is `ready`'s
+    # own `has_area`, which is what actually stops an area-less issue being promoted; this line is
+    # therefore killable only by the CALL COUNT, and the self-test kills it that way.
+    if "needs:area" not in labels or not any(lb.startswith("area:") for lb in labels):
+        return False
+    try:
+        park_policy = _park_policy()
+        events = (fetch_events or _timeline_events)(repo, number)
+        attributable = _applications_attributable(events, "needs:area", park_policy)
+        owned = park_policy.label_application_machine_owned(
+            repo, number, "needs:area", lambda _repo, _number: events,
+            is_human=lambda _login: True, log=emit)
+    except Exception as exc:                     # noqa: BLE001 — nothing proven is nothing cleared
+        emit(f"needs:area park NOT cleared on {repo}#{number}: its ownership could not be read "
+             f"({type(exc).__name__}: {exc}) — the park stands (registry #1462)")
+        return False
+    if not (owned and attributable):
+        emit(f"needs:area park NOT cleared on {repo}#{number}: newest-application-machine-owned="
+             f"{owned}, every-application-attributable={attributable} — a park this run cannot "
+             f"prove a machine owns is a human's to remove (registry #1462)")
+        return False
+    return True
+
+
 def _apply_cli(repo, number, issue_type):
     """`--apply`: read the live issue + label set, plan, and mutate fail-closed. Exit 1 loudly on
     any invariant/post-condition failure so the workflow step turns red instead of silently
@@ -1416,8 +1558,13 @@ def _apply_cli(repo, number, issue_type):
     read_state, view, edit, warn = live_gh(repo, number)
     current = view()
     known = repo_label_set(repo)
+    # registry #1462: the ONE caller allowed to attest that the `needs:area` park is clearable, and
+    # it proves it from the issue's OWN TIMELINE — never from the event that woke this run, whose
+    # actor says nothing about who applied the park.
+    clearable = area_park_clearance(repo, number, current, warn=warn)
     try:
-        result = triage(current, issue_type, trusted=True, known_labels=known)
+        result = triage(current, issue_type, trusted=True, known_labels=known,
+                        area_park_clearable=clearable)
     except RoleInvariantError as exc:
         print(f"::error title=triage #{number}::{exc}")
         return 1
@@ -2846,12 +2993,17 @@ def _self_test():
     with open(_self_path, encoding="utf-8") as _fh:
         _src = _fh.read()
 
-    def _mutant(old, new, label):
+    def _mutant_module(old, new, label):
+        """The mutated module's whole NAMESPACE. `_mutant` is the `triage`-only projection; the
+        #1462 rows below mutate `area_park_clearance` and the ungate, so they need the module."""
         mutated = _src.replace(old, new)
-        assert mutated != _src, f"[#1054] mutation target moved ({label}) — refusing to pass"
+        assert mutated != _src, f"mutation target moved ({label}) — refusing to pass"
         namespace = {"__name__": "triage_mutant", "__file__": _self_path}
         exec(compile(mutated, f"<mutant:{label}>", "exec"), namespace)  # noqa: S102
-        return namespace["triage"]
+        return namespace
+
+    def _mutant(old, new, label):
+        return _mutant_module(old, new, label)["triage"]
 
     # (m1) the constant survives by NAME but is emptied — the "name inside a zero-valued counter"
     # shape: every structural check for DISPATCHER_OWNED_STATUS still finds it.
@@ -2898,6 +3050,269 @@ def _self_test():
         "row above can kill it",
         sorted(_m5(["area:dispatch", "priority:P1", "role:impl", "status:untriaged"],
                    "task")["add"]), ["status:ready"])
+
+    # -----------------------------------------------------------------------------------------------
+    # [#1462] THE `needs:area` PARK'S OWN EXIT — the strip on the readiness branch, which was DEAD
+    # CODE for its whole life (`gated` counted the park itself, so `ready` could never be True while
+    # it was live; once it was gone `remove & labels` filtered the entry out). Both directions are
+    # pinned: LIVE under a proven attestation, WITHHELD without one — and the attestation itself is
+    # proven from the issue's own timeline, fail-closed, at zero API cost when the question is dead.
+    _parked1462 = ["priority:P1", "role:docs", "area:docs", "needs:area", "status:untriaged"]
+    _dead1462 = triage(_parked1462, "task")
+    chk("[#1462] WITHOUT the attestation the park still gates ITSELF and the strip removes NOTHING "
+        "— the shipped default, and what every non-attesting caller (retriage.classify, "
+        "triage-stock-alert, reduced_write_is_safe) keeps",
+        (_dead1462["ready"], sorted(_dead1462["add"]), sorted(_dead1462["remove"])),
+        (False, [], []))
+    _live1462 = triage(_parked1462, "task", area_park_clearable=True)
+    chk("[#1462] WITH it the strip is LIVE: the park's one fact is false, so it stops gating, the "
+        "issue classifies READY and needs:area is ACTUALLY removed",
+        (_live1462["ready"], sorted(_live1462["add"]), sorted(_live1462["remove"])),
+        (True, ["status:ready"], ["needs:area", "status:untriaged"]))
+    # The ungate is conditioned on the FACT, not on the attestation: with no `area:*` the park's one
+    # fact is still TRUE, so it keeps gating however loudly the caller attests.
+    _stilltrue1462 = triage(["priority:P1", "role:docs", "needs:area"], "task",
+                            area_park_clearable=True)
+    chk("[#1462] the attestation does NOT ungate a park whose fact is still true (no area:*)",
+        (_stilltrue1462["ready"], "needs:area" in _stilltrue1462["remove"],
+         "status:ready" in _stilltrue1462["add"]), (False, False, False))
+    # ...and it ungates `needs:area` ALONE. A second gate is somebody else's park.
+    _other1462 = triage(_parked1462 + ["needs:design"], "task", area_park_clearable=True)
+    chk("[#1462] the attestation ungates needs:area ALONE — needs:design still blocks ready, and a "
+        "still-gated issue keeps its park",
+        (_other1462["ready"], "needs:area" in _other1462["remove"],
+         "status:ready" in _other1462["add"]), (False, False, False))
+    # THE CASCADE ARGUMENT triage-issue.yml relies on (no self-trigger loop) must survive the live
+    # strip: replaying the classifier over its OWN post-state plans nothing, under BOTH postures.
+    _post1462 = (set(_parked1462) | _live1462["add"]) - _live1462["remove"]
+    _fix1462 = triage(_post1462, "task", area_park_clearable=True)
+    _fix1462_off = triage(_post1462, "task")
+    chk("[#1462] the post-state is a FIXED POINT under BOTH postures (triage-issue.yml's "
+        "no-self-trigger-cascade argument survives the strip going live)",
+        (sorted(_post1462), sorted(_fix1462["add"]), sorted(_fix1462["remove"]),
+         sorted(_fix1462_off["add"]), sorted(_fix1462_off["remove"])),
+        (["area:docs", "priority:P1", "role:docs", "status:ready"], [], [], [], []))
+
+    # ---- the ATTESTATION itself: area_park_clearance, against a fake timeline ----
+    _BOT1462 = "agent-account-registry[bot]"
+
+    def _ev1462(login, stamp, label="needs:area", kind="labeled", via_app=None, actor=True):
+        """One timeline event. `actor=False` omits the actor field entirely — the UNATTRIBUTABLE
+        shape park_policy._event_rows preserves as login "" and _is_proven_human reads as
+        'not human', i.e. as permission."""
+        row = {"event": kind, "created_at": stamp, "label": {"name": label},
+               "performed_via_github_app": via_app}
+        if actor:
+            row["actor"] = {"login": login}
+        return row
+
+    _fetched1462 = []
+
+    def _clearance1462(labels, rows, module=None, raises=False):
+        """`area_park_clearance` over a stubbed timeline, recording every fetch it performs."""
+
+        def fetch(repo, number):
+            _fetched1462.append((repo, number))
+            if raises:
+                raise RuntimeError("timeline unreadable")
+            return rows
+
+        clearance = (module or globals())["area_park_clearance"]
+        return clearance("o/r", 7, labels, fetch_events=fetch,
+                         warn=lambda _message: None)
+
+    _AREA1462 = ["area:docs", "priority:P1", "role:docs"]
+    _PARK1462 = _AREA1462 + ["needs:area"]
+    _bot_row = [_ev1462(_BOT1462, "2026-08-01T10:00:00Z")]
+    chk("[#1462] no park on the issue -> NOT clearable, and the timeline is never read",
+        (_clearance1462(_AREA1462, _bot_row), _fetched1462), (False, []))
+    chk("[#1462] a park whose fact is still TRUE (no area:*) -> NOT clearable, timeline unread",
+        (_clearance1462(["priority:P1", "role:docs", "needs:area"], _bot_row), _fetched1462),
+        (False, []))
+    chk("[#1462] park live + fact false + newest application by a [bot] -> CLEARABLE (and the "
+        "timeline is read exactly once)",
+        (_clearance1462(_PARK1462, _bot_row), _fetched1462), (True, [("o/r", 7)]))
+    _fetched1462.clear()
+    chk("[#1462] ...an App-driven application with no login is attributable (the App IS the actor)",
+        _clearance1462(_PARK1462, [_ev1462("", "2026-08-01T10:00:00Z", via_app={"slug": "x"})]),
+        True)
+    chk("[#1462] a HUMAN applied it -> NOT clearable (the whole reason the strip is opt-in)",
+        _clearance1462(_PARK1462, [_ev1462("jeswr", "2026-08-01T10:00:00Z")]), False)
+    chk("[#1462] NEWEST-WINS, both directions: human-then-bot clears, bot-then-human does not",
+        (_clearance1462(_PARK1462, [_ev1462("jeswr", "2026-08-01T09:00:00Z"),
+                                    _ev1462(_BOT1462, "2026-08-01T10:00:00Z")]),
+         _clearance1462(_PARK1462, [_ev1462(_BOT1462, "2026-08-01T09:00:00Z"),
+                                    _ev1462("jeswr", "2026-08-01T10:00:00Z")])),
+        (True, False))
+    chk("[#1462] an exact-instant tie resolves toward the HUMAN -> NOT clearable",
+        _clearance1462(_PARK1462, [_ev1462(_BOT1462, "2026-08-01T10:00:00Z"),
+                                   _ev1462("jeswr", "2026-08-01T10:00:00+00:00")]), False)
+    chk("[#1462] an UNATTRIBUTABLE application refuses the clearance even though a [bot] applied "
+        "the park earlier — absence of an actor is not permission",
+        _clearance1462(_PARK1462, [_ev1462(_BOT1462, "2026-08-01T09:00:00Z"),
+                                   _ev1462(None, "2026-08-01T10:00:00Z", actor=False)]), False)
+    chk("[#1462] no `labeled needs:area` event at all -> NOT clearable (nothing proves ownership)",
+        (_clearance1462(_PARK1462, []),
+         _clearance1462(_PARK1462, [_ev1462(_BOT1462, "2026-08-01T10:00:00Z", label="needs:user")]),
+         _clearance1462(_PARK1462, [_ev1462(_BOT1462, "2026-08-01T10:00:00Z", kind="unlabeled")])),
+        (False, False, False))
+    chk("[#1462] an UNREADABLE timeline and a MALFORMED one both refuse, they never default open",
+        (_clearance1462(_PARK1462, _bot_row, raises=True),
+         _clearance1462(_PARK1462, ["not an event object"]),
+         _clearance1462(_PARK1462, [_ev1462(_BOT1462, "not-a-timestamp")])),
+        (False, False, False))
+
+    # ---- the LIVE read seam, and the BINDING LAYER `--apply` ----
+    # Every row above injects `fetch_events`, so `_timeline_events` — the only thing that ever runs
+    # in production — was unexecuted (AGENTS.md pre-flight 1: the entry point is where a fabricating
+    # bug survives). Its refusal direction is the load-bearing half: a payload it accepted as an
+    # empty board would read as "no human ever applied this park", i.e. as permission.
+    def _timeline_verdict(payload):
+        real_read = globals()["_gh_read"]
+        try:
+            globals()["_gh_read"] = lambda _args: payload
+            try:
+                return _timeline_events("o/r", 7)
+            except Exception as exc:                  # noqa: BLE001 — the row REPORTS, never aborts
+                return type(exc).__name__
+        finally:
+            globals()["_gh_read"] = real_read
+
+    chk("[#1462] _timeline_events RAISES on any payload that is not a page sequence, and decodes a "
+        "MULTI-PAGE `--paginate` body (concatenated arrays) into one flat event list",
+        (_timeline_verdict('{"message": "Not Found"}'), _timeline_verdict("<html>"),
+         _timeline_verdict("[]"),
+         _timeline_verdict('[{"event": "labeled"}]\n[{"event": "unlabeled"}]')),
+        ("RuntimeError", "RuntimeError", [],
+         [{"event": "labeled"}, {"event": "unlabeled"}]))
+
+    def _drive_apply1462(module=None, timeline=None):
+        """Run the REAL `_apply_cli` over a fake issue whose TIMELINE is read through the real
+        `area_park_clearance` -> `_timeline_events` -> `_gh_read` seam. Returns (exit code, the
+        issue's FINAL labels, the `gh` argvs the proof issued)."""
+        namespace = module if module is not None else globals()
+        labels = {"priority:P1", "role:docs", "area:docs", "needs:area", "status:untriaged"}
+        revision, reads = [0], []
+        rows = _bot_row if timeline is None else timeline
+
+        def edit(add, remove):
+            labels.update(add)
+            labels.difference_update(remove)
+            revision[0] += 1
+
+        def gh_read(args):
+            reads.append(list(args))
+            return json.dumps(rows) + "\n" + json.dumps([])
+
+        saved = {name: namespace[name] for name in ("live_gh", "repo_label_set", "_gh_read")}
+        try:
+            namespace["live_gh"] = lambda repo, number, title="triage": (
+                lambda: (set(labels), revision[0]), lambda: set(labels), edit,
+                lambda _message: None)
+            namespace["repo_label_set"] = lambda repo: set(REAL)
+            namespace["_gh_read"] = gh_read
+            code = namespace["_apply_cli"]("o/r", "7", "Documentation")
+        finally:
+            namespace.update(saved)
+        return code, sorted(labels), reads
+
+    _code1462, _final1462, _reads1462 = _drive_apply1462()
+    chk("[#1462] THE BINDING LAYER: the real `--apply` proves ownership from the real timeline argv "
+        "and the park ACTUALLY leaves the issue, which is the transition this delivers into",
+        (_code1462, _final1462, _reads1462),
+        (0, ["area:docs", "priority:P1", "role:docs", "status:ready"],
+         [["api", "repos/o/r/issues/7/timeline?per_page=100", "--paginate"]]))
+    _hcode1462, _hfinal1462, _ = _drive_apply1462(
+        timeline=[_ev1462("jeswr", "2026-08-01T10:00:00Z")])
+    chk("[#1462] ...and over a HUMAN-applied park the same run writes NOTHING and still exits 0",
+        (_hcode1462, _hfinal1462),
+        (0, ["area:docs", "needs:area", "priority:P1", "role:docs", "status:untriaged"]))
+    # WHAT THE TRANSITION DELIVERS INTO (AGENTS.md pre-flight 11). Un-parking into a state the
+    # readiness engine still cannot enumerate would have produced nothing, so the question is put to
+    # the ENGINE ITSELF rather than re-derived here — the same authority retriage's sweep asks.
+    # BOTH directions: the cleared post-state is enumerable, the still-parked one is not.
+    _ready1462 = load_sibling("ready-issues.py", "registry_ready_issues_1462")
+    chk("[#1462] the cleared post-state is ENUMERABLE by ready-issues' own predicate, and the park "
+        "that stands is still excluded BY NAME",
+        (_ready1462.exclusion_reason(_final1462),
+         bool(_ready1462.exclusion_reason(_hfinal1462))), (None, True))
+
+    # ---- MUTATION: every guard above, deleted and made conditionally inert, one at a time ----
+    def _mutant1462(old, new, label):
+        assert _src.count(old) == 1, f"[#1462] mutation anchor {label!r} is not unique in the "\
+                                     f"source ({_src.count(old)} occurrences) — refusing to pass"
+        return _mutant_module(old, new, label)
+
+    # (n1) the ungate stops reading the ATTESTATION — the #606 hazard shipped: any `labeled` event
+    # overrides whoever applied the park.
+    _n1 = _mutant1462(
+        "    self_park_stale = area_park_clearable and \"needs:area\" in labels\n",
+        "    self_park_stale = \"needs:area\" in labels\n", "ungate-ignores-proof")
+    chk("[#1462] MUTANT ungate-ignores-proof strips the park with NO attestation",
+        (_n1["triage"](_parked1462, "task")["ready"],
+         "needs:area" in _n1["triage"](_parked1462, "task")["remove"]), (True, True))
+    # (n2) the ungate widens from `needs:area` to EVERY gate — somebody else's park (needs:design,
+    # needs:user) stops blocking readiness the moment this one is proven clearable.
+    _n2 = _mutant1462(
+        "                for lb in (labels - {\"needs:area\"} if self_park_stale else labels))\n",
+        "                for lb in (set() if self_park_stale else labels))\n", "ungate-too-wide")
+    _r_n2 = _n2["triage"](_parked1462 + ["needs:design"], "task", area_park_clearable=True)
+    chk("[#1462] MUTANT ungate-too-wide promotes an issue that is still needs:design-gated",
+        (_r_n2["ready"], "status:ready" in _r_n2["add"]), (True, True))
+    # (n3) the strip is deleted while the ungate stays — `ready` still moves, so a ready-only
+    # assertion cannot see it; only the `remove` set can.
+    _n3 = _mutant1462(
+        "        remove.add(\"needs:area\")\n        # ^ REACHABLE WITH EFFECT",
+        "        # (removed by mutation)\n        # ^ REACHABLE WITH EFFECT", "strip-deleted")
+    _r_n3 = _n3["triage"](_parked1462, "task", area_park_clearable=True)
+    chk("[#1462] MUTANT strip-deleted still classifies READY — the park just never goes away",
+        (_r_n3["ready"], "needs:area" in _r_n3["remove"]), (True, False))
+    # (n4) the ATTRIBUTABILITY conjunct is dropped: the shared newest-wins rule alone reads an
+    # actor-less application as "not human", i.e. as permission.
+    _n4 = _mutant1462("    if not (owned and attributable):\n", "    if not owned:\n",
+                      "attributability-dropped")
+    chk("[#1462] MUTANT attributability-dropped clears a park whose newest application has NO actor",
+        _clearance1462(_PARK1462, [_ev1462(_BOT1462, "2026-08-01T09:00:00Z"),
+                                   _ev1462(None, "2026-08-01T10:00:00Z", actor=False)],
+                       module=_n4), True)
+    # (n5) the SHARED newest-wins rule is dropped: attributability alone happily clears a park a
+    # human applied last.
+    _n5 = _mutant1462("    if not (owned and attributable):\n", "    if not attributable:\n",
+                      "ownership-rule-dropped")
+    chk("[#1462] MUTANT ownership-rule-dropped clears a park a HUMAN applied last",
+        _clearance1462(_PARK1462, [_ev1462(_BOT1462, "2026-08-01T09:00:00Z"),
+                                   _ev1462("jeswr", "2026-08-01T10:00:00Z")], module=_n5), True)
+    # (n6) the cost guard is made conditionally inert (NOT deleted — it still returns False for the
+    # dead question, so every verdict above is unchanged): only the CALL COUNT can see it.
+    _n6 = _mutant1462(
+        "    if \"needs:area\" not in labels or not any(lb.startswith(\"area:\") for lb in labels):\n"
+        "        return False\n",
+        "    if False:\n        return False\n", "cost-guard-inert")
+    _fetched1462.clear()
+    _pristine_n6 = _clearance1462(_AREA1462, [])
+    _pristine_calls_n6 = list(_fetched1462)
+    _fetched1462.clear()
+    _n6_verdict = _clearance1462(_AREA1462, [], module=_n6)
+    chk("[#1462] MUTANT cost-guard-inert returns the SAME VERDICT as the pristine tree for a dead "
+        "question yet reads the timeline anyway — one API call per issue event, forever; only the "
+        "CALL COUNT can see it",
+        (_pristine_n6, _pristine_calls_n6, _n6_verdict, _fetched1462),
+        (False, [], False, [("o/r", 7)]))
+    _fetched1462.clear()
+    # (n7) THE CALL SITE (pre-flight 2a). The attestation is computed, the timeline read is PAID
+    # FOR, and the result is dropped on the floor one argument short of the classifier — every row
+    # that calls `triage()` or `area_park_clearance()` directly stays green.
+    _n7 = _mutant1462(
+        "        result = triage(current, issue_type, trusted=True, known_labels=known,\n"
+        "                        area_park_clearable=clearable)\n",
+        "        result = triage(current, issue_type, trusted=True, known_labels=known)\n",
+        "attestation-not-wired")
+    _n7code, _n7final, _n7reads = _drive_apply1462(module=_n7)
+    chk("[#1462] MUTANT attestation-not-wired still PAYS for the proof and then discards it — the "
+        "park survives a clearance the run had already proven",
+        (_n7code, _n7final, _n7reads),
+        (0, ["area:docs", "needs:area", "priority:P1", "role:docs", "status:untriaged"],
+         [["api", "repos/o/r/issues/7/timeline?per_page=100", "--paginate"]]))
 
     # -----------------------------------------------------------------------------------------------
     # THE LIVE `gh` ARGV live_gh builds (shared by triage --apply and retriage --apply): an EMPTY
